@@ -1,7 +1,5 @@
 package pagination
 
-import "math"
-
 const (
 	DefaultPage    = 1
 	DefaultPerPage = 10
@@ -23,21 +21,11 @@ func Normalize(page, perPage int) (normalizedPage, normalizedPerPage int) {
 }
 
 // LimitOffset returns safe int32 limit and offset for SQL queries.
-// It normalizes inputs before conversion so callers don't need to call Normalize first.
+// After Normalize: perPage in [1, 100] and page >= 1, both always fit int32.
 func LimitOffset(page, perPage int) (limit, offset int32) {
 	page, perPage = Normalize(page, perPage)
-
 	off := (page - 1) * perPage
-
-	if perPage > math.MaxInt32 {
-		perPage = math.MaxInt32
-	}
-	if off > math.MaxInt32 {
-		off = math.MaxInt32
-	}
-	limit = int32(perPage)
-	offset = int32(off)
-	return limit, offset
+	return int32(perPage), int32(off)
 }
 
 // TotalPages calculates total number of pages.

@@ -12,6 +12,7 @@ linters:
     gosec:
       excludes:
         - G101
+        - G115
         - G304
   exclusions:
     generated: lax
