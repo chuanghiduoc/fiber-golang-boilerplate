@@ -74,7 +74,20 @@ Request flow: `Client → Middleware → Handler → Service → Repository → 
 
 ## Quick Start
 
-### With Docker (recommended)
+### 1. Create your project
+
+Click **"Use this template"** on GitHub, then:
+
+```bash
+git clone https://github.com/yourname/yourproject.git
+cd yourproject
+./scripts/rename-module.sh github.com/yourname/yourproject
+go mod tidy
+```
+
+### 2. Run
+
+**With Docker (recommended):**
 
 ```bash
 cp .env.example .env
@@ -83,9 +96,7 @@ make docker-run
 
 Services: API (:8080), PostgreSQL (:5432), Redis (:6379), MinIO (:9000/:9001)
 
-### Without Docker
-
-Prerequisites: Go 1.25+, PostgreSQL running locally.
+**Without Docker** (requires Go 1.25+, PostgreSQL):
 
 ```bash
 cp .env.example .env

@@ -75,4 +75,8 @@ seed:
 swagger:
 	@swag init -g cmd/api/main.go -o docs
 
-.PHONY: all build run test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed
+# Rename module path (usage: make rename-module mod=github.com/yourname/yourproject)
+rename-module:
+	@bash scripts/rename-module.sh $(mod)
+
+.PHONY: all build run test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed rename-module
