@@ -20,7 +20,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.1
+          version: v2.4
 
       - name: Install swag
         run: go install github.com/swaggo/swag/cmd/swag@latest
