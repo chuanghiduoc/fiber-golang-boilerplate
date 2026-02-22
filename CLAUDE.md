@@ -73,8 +73,17 @@ Storage (`pkg/storage`), Cache (`pkg/cache`), Email (`pkg/email`) — each has a
 ### JWT
 `pkg/token` — `Generate(userID, role, secret, expireHour)` and `Parse(tokenStr, secret)`. Includes `iss`/`aud` claims for cross-service protection.
 
+### Safe Int Conversion
+Use `pagination.clampInt32()` for `int → int32` casts. Never cast directly — gosec G115 is enabled globally to catch unsafe conversions.
+
+### Rate Limiting
+Tiered rate limiters in `internal/router/v1.go`: `strictLimiter` (auth endpoints), `normalLimiter` (mutations), `relaxedLimiter` (reads). Configured via `RATE_LIMIT_*` env vars.
+
 ### Soft Delete
 Users and files use soft delete (`deleted_at` column). Partial indexes (`WHERE deleted_at IS NULL`) on frequently queried columns.
+
+### Lint
+golangci-lint v2 config at `.golangci.yml`. Excluded gosec rules: G101 (false positive on variable names), G304 (file paths from config). Generated code (`internal/sqlc/`, `docs/`) is excluded.
 
 ## Adding a New Entity
 
