@@ -1,5 +1,7 @@
 package pagination
 
+import "math"
+
 const (
 	DefaultPage    = 1
 	DefaultPerPage = 10
@@ -27,15 +29,14 @@ func LimitOffset(page, perPage int) (limit, offset int32) {
 
 	off := (page - 1) * perPage
 
-	const maxVal = int(^uint32(0) >> 1) // 2147483647
-	if off > maxVal {
-		off = maxVal
+	if perPage > math.MaxInt32 {
+		perPage = math.MaxInt32
 	}
-	if perPage > maxVal {
-		perPage = maxVal
+	if off > math.MaxInt32 {
+		off = math.MaxInt32
 	}
-	limit = int32(perPage)  //nolint:gosec // perPage is clamped to MaxPerPage (100) above
-	offset = int32(off)    //nolint:gosec // off is clamped to maxVal (math.MaxInt32) above
+	limit = int32(perPage)
+	offset = int32(off)
 	return limit, offset
 }
 
