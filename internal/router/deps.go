@@ -3,9 +3,9 @@ package router
 import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"fiber-golang-boilerplate/config"
-	"fiber-golang-boilerplate/internal/handler"
-	"fiber-golang-boilerplate/pkg/health"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 )
 
 type Deps struct {

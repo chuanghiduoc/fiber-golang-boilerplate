@@ -11,13 +11,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/repository"
-	"fiber-golang-boilerplate/internal/sqlc"
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/cache"
-	"fiber-golang-boilerplate/pkg/database"
-	"fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 const (

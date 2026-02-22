@@ -21,22 +21,22 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/config"
-	"fiber-golang-boilerplate/internal/handler"
-	"fiber-golang-boilerplate/internal/repository"
-	"fiber-golang-boilerplate/internal/router"
-	"fiber-golang-boilerplate/internal/seed"
-	"fiber-golang-boilerplate/internal/service"
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/cache"
-	"fiber-golang-boilerplate/pkg/database"
-	"fiber-golang-boilerplate/pkg/email"
-	"fiber-golang-boilerplate/pkg/health"
-	"fiber-golang-boilerplate/pkg/logger"
-	"fiber-golang-boilerplate/pkg/oauth"
-	"fiber-golang-boilerplate/pkg/storage"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/router"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/seed"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 
-	_ "fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
+	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
 )
 
 func main() {

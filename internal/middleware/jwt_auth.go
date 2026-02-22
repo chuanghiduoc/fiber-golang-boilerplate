@@ -5,8 +5,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/token"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 func JWTAuth(secret string) fiber.Handler {

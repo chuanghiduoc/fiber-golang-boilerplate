@@ -1,4 +1,4 @@
-module fiber-golang-boilerplate
+module github.com/chuanghiduoc/fiber-golang-boilerplate
 
 go 1.25.6
 

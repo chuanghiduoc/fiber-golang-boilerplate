@@ -7,7 +7,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/pkg/response"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
 // ErrNotFound is a sentinel error returned by repositories when a record is not found.

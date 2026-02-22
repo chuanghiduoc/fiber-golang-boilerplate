@@ -11,11 +11,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/middleware"
-	"fiber-golang-boilerplate/internal/sqlc"
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/token"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 // mockUserService is a manual mock for testing handlers.

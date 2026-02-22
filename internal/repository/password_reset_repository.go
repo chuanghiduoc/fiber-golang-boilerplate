@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 )
 
 type PasswordResetRepository interface {

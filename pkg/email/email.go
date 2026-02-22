@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
 type Message struct {

@@ -6,10 +6,10 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/pagination"
-	"fiber-golang-boilerplate/pkg/validator"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 // paramID extracts and validates a required int64 path parameter.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 
 	"github.com/redis/go-redis/v9"
 )

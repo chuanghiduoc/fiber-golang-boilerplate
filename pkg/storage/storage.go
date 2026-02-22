@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
 type Storage interface {

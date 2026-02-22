@@ -3,8 +3,8 @@ package router
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
 )
 
 func RegisterV1Routes(v1 fiber.Router, deps Deps) {

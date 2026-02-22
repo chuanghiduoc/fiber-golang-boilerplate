@@ -10,8 +10,8 @@ import (
 	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	_ "fiber-golang-boilerplate/docs"
-	"fiber-golang-boilerplate/internal/middleware"
+	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/docs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
 )
 
 func SetupRoutes(app *fiber.App, deps Deps) {

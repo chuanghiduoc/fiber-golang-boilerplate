@@ -3,7 +3,7 @@ package response
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 type Response struct {

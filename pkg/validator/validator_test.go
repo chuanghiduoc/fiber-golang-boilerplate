@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 type passwordReq struct {

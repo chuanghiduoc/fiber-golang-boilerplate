@@ -14,14 +14,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/middleware"
-	"fiber-golang-boilerplate/internal/repository"
-	"fiber-golang-boilerplate/internal/service"
-	"fiber-golang-boilerplate/internal/testutil"
-	"fiber-golang-boilerplate/pkg/apperror"
-	"fiber-golang-boilerplate/pkg/response"
-	"fiber-golang-boilerplate/pkg/token"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 func setupIntegrationApp(t *testing.T) (*fiber.App, func()) {

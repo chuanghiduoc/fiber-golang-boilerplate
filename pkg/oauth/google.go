@@ -11,7 +11,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 
-	"fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
 const googleUserInfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"

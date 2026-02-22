@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"fiber-golang-boilerplate/internal/sqlc"
-	"fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 func newTestUploadService(repo *mockFileRepo, store *mockStorage) UploadService {

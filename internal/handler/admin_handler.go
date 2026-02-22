@@ -3,9 +3,9 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/service"
-	"fiber-golang-boilerplate/pkg/response"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
 type AdminHandler struct {

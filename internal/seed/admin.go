@@ -8,10 +8,10 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	"fiber-golang-boilerplate/config"
-	"fiber-golang-boilerplate/internal/dto"
-	"fiber-golang-boilerplate/internal/repository"
-	"fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 )
 
 // Admin creates an admin user if ADMIN_EMAIL and ADMIN_PASSWORD are set

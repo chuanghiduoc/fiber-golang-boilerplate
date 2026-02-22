@@ -8,11 +8,11 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
-	"fiber-golang-boilerplate/config"
-	"fiber-golang-boilerplate/internal/repository"
-	"fiber-golang-boilerplate/internal/seed"
-	"fiber-golang-boilerplate/pkg/database"
-	"fiber-golang-boilerplate/pkg/logger"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/seed"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
 
 func main() {
