@@ -111,35 +111,46 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 }
 
 func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error {
-	// Validate token (outside tx)
-	rt, err := s.resetRepo.GetByToken(ctx, req.Token)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewBadRequest("invalid or expired reset token")
-		}
-		return apperror.NewInternal("failed to verify reset token")
-	}
-
-	if rt.ExpiresAt.Time.Before(time.Now()) {
-		_ = s.resetRepo.Delete(ctx, req.Token)
-		return apperror.NewBadRequest("reset token has expired")
-	}
-
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
 	if err != nil {
 		return apperror.NewInternal("failed to hash password")
 	}
 
-	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository) error {
-		_, err := userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
+	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository, forUpdate bool) error {
+		var rt *sqlc.PasswordResetToken
+		var err error
+		if forUpdate {
+			rt, err = resetRepo.GetByTokenForUpdate(ctx, req.Token)
+		} else {
+			rt, err = resetRepo.GetByToken(ctx, req.Token)
+		}
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewBadRequest("invalid or expired reset token")
+			}
+			return apperror.NewInternal("failed to verify reset token")
+		}
+
+		if rt.ExpiresAt.Time.Before(time.Now()) {
+			if err := resetRepo.Delete(ctx, req.Token); err != nil {
+				slog.Error("failed to delete expired reset token", slog.Any("error", err))
+			}
+			return apperror.NewBadRequest("reset token has expired")
+		}
+
+		_, err = userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			ID:           rt.UserID,
 		})
 		if err != nil {
 			return apperror.NewInternal("failed to update password")
 		}
-		_ = resetRepo.Delete(ctx, req.Token)
-		_ = refreshRepo.DeleteByUserID(ctx, rt.UserID)
+		if err := resetRepo.Delete(ctx, req.Token); err != nil {
+			return apperror.NewInternal("failed to delete reset token")
+		}
+		if err := refreshRepo.DeleteByUserID(ctx, rt.UserID); err != nil {
+			return apperror.NewInternal("failed to revoke refresh tokens")
+		}
 		return nil
 	}
 
@@ -149,9 +160,10 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 				repository.NewUserRepository(tx),
 				repository.NewPasswordResetRepository(tx),
 				repository.NewRefreshTokenRepository(tx),
+				true,
 			)
 		})
 	}
 
-	return doReset(s.userRepo, s.resetRepo, s.refreshRepo)
+	return doReset(s.userRepo, s.resetRepo, s.refreshRepo, false)
 }

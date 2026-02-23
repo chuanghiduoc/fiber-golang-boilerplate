@@ -135,17 +135,15 @@ func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
 }
 
 func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
-	// 1. Try to find by Google ID (outside tx, read-only)
-	user, err := s.repo.GetByGoogleID(ctx, googleID)
-	if err == nil {
-		return user, nil
-	}
-	if !errors.Is(err, apperror.ErrNotFound) {
-		return nil, apperror.NewInternal("failed to find user by google id")
-	}
+	findOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
+		user, err := repo.GetByGoogleID(ctx, googleID)
+		if err == nil {
+			return user, nil
+		}
+		if !errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewInternal("failed to find user by google id")
+		}
 
-	// 2. Find by email + link OR create (transactional when txManager available)
-	linkOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
 		existing, err := repo.GetByEmail(ctx, email)
 		if err == nil {
 			linked, linkErr := repo.LinkGoogleAccount(ctx, sqlc.LinkGoogleAccountParams{
@@ -168,7 +166,7 @@ func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email,
 			AuthProvider: "google",
 		})
 		if err != nil {
-			return nil, apperror.NewInternal("failed to create oauth user")
+			return nil, err
 		}
 		return newUser, nil
 	}
@@ -178,16 +176,30 @@ func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email,
 		txErr := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			txUserRepo := repository.NewUserRepository(tx)
 			var err error
-			result, err = linkOrCreate(txUserRepo)
+			result, err = findOrCreate(txUserRepo)
 			return err
 		})
 		if txErr != nil {
-			return nil, txErr
+			if repository.IsUniqueViolation(txErr) {
+				if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
+					return user, nil
+				}
+			}
+			return nil, apperror.NewInternal("failed to create oauth user")
 		}
 		return result, nil
 	}
 
-	return linkOrCreate(s.repo)
+	result, err := findOrCreate(s.repo)
+	if err != nil {
+		if repository.IsUniqueViolation(err) {
+			if user, retryErr := s.repo.GetByGoogleID(ctx, googleID); retryErr == nil {
+				return user, nil
+			}
+		}
+		return nil, apperror.NewInternal("failed to create oauth user")
+	}
+	return result, nil
 }
 
 func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {

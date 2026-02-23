@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -15,4 +16,10 @@ func wrapErr(err error) error {
 		return apperror.ErrNotFound
 	}
 	return err
+}
+
+// IsUniqueViolation checks whether the error is a PostgreSQL unique constraint violation (23505).
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

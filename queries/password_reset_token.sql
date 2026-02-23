@@ -6,6 +6,9 @@ RETURNING *;
 -- name: GetPasswordResetTokenByToken :one
 SELECT * FROM password_reset_tokens WHERE token = $1;
 
+-- name: GetPasswordResetTokenByTokenForUpdate :one
+SELECT * FROM password_reset_tokens WHERE token = $1 FOR UPDATE;
+
 -- name: DeletePasswordResetToken :exec
 DELETE FROM password_reset_tokens WHERE token = $1;
 
