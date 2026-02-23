@@ -227,6 +227,94 @@ func TestUploadDelete(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+func TestUploadDownload(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		repo := newMockFileRepo()
+		store := newMockStorage()
+		svc := newTestUploadService(repo, store)
+
+		repo.files[1] = &sqlc.File{
+			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
+		}
+		store.files["10/abc.pdf"] = []byte("pdf-content")
+
+		file, reader, err := svc.Download(context.Background(), 1, 10)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if file.OriginalName != "doc.pdf" {
+			t.Errorf("expected doc.pdf, got %s", file.OriginalName)
+		}
+		if reader == nil {
+			t.Fatal("expected non-nil reader")
+		}
+		_ = reader.Close()
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		repo := newMockFileRepo()
+		store := newMockStorage()
+		svc := newTestUploadService(repo, store)
+
+		_, _, err := svc.Download(context.Background(), 999, 10)
+		if err == nil {
+			t.Fatal("expected not found error")
+		}
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected AppError, got %T", err)
+		}
+		if appErr.Code != 404 {
+			t.Errorf("expected 404, got %d", appErr.Code)
+		}
+	})
+
+	t.Run("forbidden - wrong user", func(t *testing.T) {
+		repo := newMockFileRepo()
+		store := newMockStorage()
+		svc := newTestUploadService(repo, store)
+
+		repo.files[1] = &sqlc.File{
+			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
+		}
+
+		_, _, err := svc.Download(context.Background(), 1, 99)
+		if err == nil {
+			t.Fatal("expected forbidden error")
+		}
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected AppError, got %T", err)
+		}
+		if appErr.Code != 403 {
+			t.Errorf("expected 403, got %d", appErr.Code)
+		}
+	})
+
+	t.Run("storage failure", func(t *testing.T) {
+		repo := newMockFileRepo()
+		store := newMockStorage()
+		store.getErr = fmt.Errorf("storage unavailable")
+		svc := newTestUploadService(repo, store)
+
+		repo.files[1] = &sqlc.File{
+			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
+		}
+
+		_, _, err := svc.Download(context.Background(), 1, 10)
+		if err == nil {
+			t.Fatal("expected storage error")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // List
 // ---------------------------------------------------------------------------
 

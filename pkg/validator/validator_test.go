@@ -82,3 +82,84 @@ func repeat(ch byte, n int) string {
 	}
 	return string(b)
 }
+
+// ---------------------------------------------------------------------------
+// formatError branch coverage
+// ---------------------------------------------------------------------------
+
+type emailReq struct {
+	Email string `validate:"required,email"`
+}
+
+func TestValidateStruct_Email(t *testing.T) {
+	err := ValidateStruct(emailReq{Email: "not-email"})
+	if err == nil {
+		t.Fatal("expected error for invalid email")
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T", err)
+	}
+	if appErr.Details == nil {
+		t.Fatal("expected validation details")
+	}
+	details, ok := appErr.Details.(map[string]string)
+	if !ok {
+		t.Fatalf("expected map[string]string details, got %T", appErr.Details)
+	}
+	if _, ok := details["Email"]; !ok {
+		t.Error("expected Email field in details")
+	}
+}
+
+type minReq struct {
+	Name string `validate:"min=3"`
+}
+
+func TestValidateStruct_Min(t *testing.T) {
+	err := ValidateStruct(minReq{Name: "ab"})
+	if err == nil {
+		t.Fatal("expected error for min length violation")
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T", err)
+	}
+}
+
+type maxReq struct {
+	Code string `validate:"max=5"`
+}
+
+func TestValidateStruct_Max(t *testing.T) {
+	err := ValidateStruct(maxReq{Code: "toolongstring"})
+	if err == nil {
+		t.Fatal("expected error for max length violation")
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T", err)
+	}
+}
+
+type urlReq struct {
+	URL string `validate:"url"`
+}
+
+func TestValidateStruct_DefaultTag(t *testing.T) {
+	err := ValidateStruct(urlReq{URL: "not-a-url"})
+	if err == nil {
+		t.Fatal("expected error for invalid url")
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T", err)
+	}
+}
+
+func TestValidateStruct_Valid(t *testing.T) {
+	err := ValidateStruct(emailReq{Email: "valid@example.com"})
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+}

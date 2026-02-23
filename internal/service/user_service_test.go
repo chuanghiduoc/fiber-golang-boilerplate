@@ -522,3 +522,41 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Update email change success path
+// ---------------------------------------------------------------------------
+
+func TestUpdate_EmailChangeSuccess(t *testing.T) {
+	repo := newMockUserRepo()
+	svc := newTestUserService(repo, false)
+
+	repo.users[1] = &sqlc.User{ID: 1, Email: "old@example.com", Name: "User", Role: "user"}
+	repo.nextID = 2
+
+	newEmail := "new@example.com"
+	resp, err := svc.Update(context.Background(), 1, dto.UpdateUserRequest{Email: &newEmail})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if resp.Email != "new@example.com" {
+		t.Errorf("expected email new@example.com, got %s", resp.Email)
+	}
+}
+
+func TestUpdate_SameEmail(t *testing.T) {
+	repo := newMockUserRepo()
+	svc := newTestUserService(repo, false)
+
+	repo.users[1] = &sqlc.User{ID: 1, Email: "same@example.com", Name: "User", Role: "user"}
+	repo.nextID = 2
+
+	sameEmail := "same@example.com"
+	resp, err := svc.Update(context.Background(), 1, dto.UpdateUserRequest{Email: &sameEmail})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if resp.Email != "same@example.com" {
+		t.Errorf("expected email same@example.com, got %s", resp.Email)
+	}
+}
