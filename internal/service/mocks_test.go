@@ -362,6 +362,10 @@ func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*sq
 	return t, nil
 }
 
+func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
+	return m.GetByToken(ctx, token)
+}
+
 func (m *mockPasswordResetRepo) Delete(_ context.Context, token string) error {
 	delete(m.tokens, token)
 	return nil
