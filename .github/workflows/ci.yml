@@ -28,6 +28,7 @@ jobs:
       - name: Check Swagger docs are up to date
         run: |
           swag init -g cmd/api/main.go -o docs
+          git add -N docs/
           git diff --exit-code docs/ || (echo "Swagger docs are outdated. Run 'make swagger' and commit." && exit 1)
 
       - name: Install sqlc
@@ -36,6 +37,7 @@ jobs:
       - name: Check sqlc generated code is up to date
         run: |
           sqlc generate
+          git add -N internal/sqlc/
           git diff --exit-code internal/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
 
   build:
