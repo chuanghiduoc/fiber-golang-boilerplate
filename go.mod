@@ -3,7 +3,7 @@ module github.com/chuanghiduoc/fiber-golang-boilerplate
 go 1.25.7
 
 require (
-	github.com/caarlos0/env/v11 v11.3.1
+	github.com/caarlos0/env/v11 v11.4.0
 	github.com/go-playground/validator/v10 v10.30.1
 	github.com/gofiber/contrib/v3/swagger v1.0.0-rc.1
 	github.com/gofiber/fiber/v3 v3.1.0
