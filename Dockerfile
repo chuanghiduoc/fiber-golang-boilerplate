@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o server ./cmd/api
 
 # ---- Production stage ----
-FROM alpine:3.21 AS prod
+FROM alpine:3.23 AS prod
 
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S appgroup && \
