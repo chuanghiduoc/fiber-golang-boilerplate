@@ -32,6 +32,11 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin123!}
       ADMIN_NAME: ${ADMIN_NAME:-Admin}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,6 +48,11 @@ services:
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
     environment:
       POSTGRES_DB: ${DB_DATABASE:-boilerplate}
       POSTGRES_USER: ${DB_USERNAME:-postgres}
@@ -63,6 +73,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
     ports:
       - "6379:6379"
     volumes:
@@ -79,6 +94,11 @@ services:
   minio:
     image: minio/minio:latest
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
     ports:
       - "9000:9000"
       - "9001:9001"

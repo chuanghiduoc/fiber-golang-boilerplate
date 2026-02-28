@@ -52,7 +52,12 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	})
 	if err != nil {
 		// Cleanup storage on DB failure
-		_ = s.storage.Delete(ctx, storagePath)
+		if delErr := s.storage.Delete(ctx, storagePath); delErr != nil {
+			slog.Error("failed to cleanup storage after DB failure",
+				slog.String("path", storagePath),
+				slog.Any("error", delErr),
+			)
+		}
 		return nil, apperror.NewInternal("failed to save file metadata")
 	}
 

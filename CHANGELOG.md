@@ -6,6 +6,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-02-28
+
+### Fixed
+- Log storage cleanup failure instead of silently ignoring in upload service
+- Log cache errors in login lockout instead of silently ignoring
+- Return email send error from SendVerification so callers can handle it
+- Log refresh token revocation failure when banning users
+- Fix down migration drop order (function before table)
+- Fix password validator to use rune count for min length (Unicode support)
+
+### Security
+- Add Content-Security-Policy header to security middleware
+- Add context-aware timeout (30s) to SMTP sender via net.DialContext
+- Add production warnings in .env.example for CORS, DB_SSLMODE, JWT_SECRET, admin credentials
+
+### Improved
+- Mock repos now enforce email uniqueness, track email content, TTL, and deleted paths
+- Add resource limits (memory/CPU) to all Docker Compose services
+- Add Dependabot for Go modules, GitHub Actions, and Docker base images
+
 ## [1.0.0] - 2026-02-23
 
 ### Added

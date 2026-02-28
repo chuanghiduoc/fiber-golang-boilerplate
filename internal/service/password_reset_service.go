@@ -97,14 +97,18 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	// Set rate limit
 	_ = s.cache.Set(ctx, cacheKey, []byte("1"), 1*time.Minute)
 
-	// Send email
+	// Send email — log failure but return nil to prevent email enumeration.
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", s.frontendURL, token)
 	if err := s.emailSender.Send(ctx, email.Message{
 		To:      []string{user.Email},
 		Subject: "Password Reset Request",
 		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to reset your password. This link expires in 1 hour.</p>", resetURL),
 	}); err != nil {
-		slog.Error("failed to send password reset email", slog.Any("error", err))
+		slog.Warn("failed to send password reset email",
+			slog.Int64("user_id", user.ID),
+			slog.String("email", user.Email),
+			slog.Any("error", err),
+		)
 	}
 
 	return nil

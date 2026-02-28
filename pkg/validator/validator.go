@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-playground/validator/v10"
 
@@ -25,7 +26,7 @@ func instance() *validator.Validate {
 
 func validatePassword(fl validator.FieldLevel) bool {
 	password := fl.Field().String()
-	if len(password) < 8 || len(password) > 72 {
+	if utf8.RuneCountInString(password) < 8 || len(password) > 72 {
 		return false
 	}
 	var hasUpper, hasLower, hasDigit, hasSpecial bool

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
@@ -87,7 +88,12 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 	}
 
 	// Revoke all refresh tokens for banned user
-	_ = s.refreshTokenRepo.DeleteByUserID(ctx, id)
+	if err := s.refreshTokenRepo.DeleteByUserID(ctx, id); err != nil {
+		slog.Warn("failed to revoke refresh tokens for banned user",
+			slog.Int64("user_id", id),
+			slog.Any("error", err),
+		)
+	}
 	return nil
 }
 

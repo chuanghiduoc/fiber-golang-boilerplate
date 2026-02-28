@@ -69,14 +69,20 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 		return fmt.Errorf("create verification token: %w", err)
 	}
 
-	// Send email
+	// Send email — return error so callers (e.g. ResendVerification) can propagate it.
+	// Fire-and-forget callers like the auth handler already ignore the return value.
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", s.frontURL, token)
 	if err := s.sender.Send(ctx, email.Message{
 		To:      []string{userEmail},
 		Subject: "Verify Your Email Address",
 		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to verify your email address. This link expires in 24 hours.</p>", verifyURL),
 	}); err != nil {
-		slog.Error("failed to send verification email", slog.Any("error", err))
+		slog.Error("failed to send verification email",
+			slog.Int64("user_id", userID),
+			slog.String("email", userEmail),
+			slog.Any("error", err),
+		)
+		return fmt.Errorf("send verification email: %w", err)
 	}
 
 	return nil

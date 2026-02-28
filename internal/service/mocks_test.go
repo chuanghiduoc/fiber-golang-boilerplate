@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 
@@ -72,6 +73,12 @@ func (m *mockUserRepo) Count(_ context.Context) (int64, error) {
 }
 
 func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (*sqlc.User, error) {
+	// Enforce email uniqueness like a real database
+	for _, u := range m.users {
+		if u.Email == params.Email {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"users_email_key\"")
+		}
+	}
 	u := &sqlc.User{
 		ID:           m.nextID,
 		Email:        params.Email,
@@ -88,6 +95,12 @@ func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (
 }
 
 func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params sqlc.CreateOAuthUserParams) (*sqlc.User, error) {
+	// Enforce email uniqueness like a real database
+	for _, u := range m.users {
+		if u.Email == params.Email {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"users_email_key\"")
+		}
+	}
 	u := &sqlc.User{
 		ID:           m.nextID,
 		Email:        params.Email,
@@ -434,10 +447,11 @@ func (m *mockPasswordResetRepo) DeleteByUserID(_ context.Context, userID int64) 
 
 type mockCache struct {
 	items map[string][]byte
+	ttls  map[string]time.Duration
 }
 
 func newMockCache() *mockCache {
-	return &mockCache{items: make(map[string][]byte)}
+	return &mockCache{items: make(map[string][]byte), ttls: make(map[string]time.Duration)}
 }
 
 func (m *mockCache) Get(_ context.Context, key string) ([]byte, error) {
@@ -448,8 +462,9 @@ func (m *mockCache) Get(_ context.Context, key string) ([]byte, error) {
 	return v, nil
 }
 
-func (m *mockCache) Set(_ context.Context, key string, value []byte, _ time.Duration) error {
+func (m *mockCache) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
 	m.items[key] = value
+	m.ttls[key] = ttl
 	return nil
 }
 
@@ -471,19 +486,21 @@ func (m *mockCache) Ping(_ context.Context) error { return nil }
 // ---------------------------------------------------------------------------
 
 type mockEmailSender struct {
-	sendErr error
-	sent    int
+	sendErr  error
+	sent     int
+	messages []email.Message
 }
 
 func newMockEmailSender() *mockEmailSender {
 	return &mockEmailSender{}
 }
 
-func (m *mockEmailSender) Send(_ context.Context, _ email.Message) error {
+func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 	if m.sendErr != nil {
 		return m.sendErr
 	}
 	m.sent++
+	m.messages = append(m.messages, msg)
 	return nil
 }
 
@@ -492,11 +509,12 @@ func (m *mockEmailSender) Send(_ context.Context, _ email.Message) error {
 // ---------------------------------------------------------------------------
 
 type mockStorage struct {
-	files   map[string][]byte
-	putErr  error
-	getErr  error
-	delErr  error
-	baseURL string
+	files        map[string][]byte
+	deletedPaths []string
+	putErr       error
+	getErr       error
+	delErr       error
+	baseURL      string
 }
 
 func newMockStorage() *mockStorage {
@@ -530,6 +548,7 @@ func (m *mockStorage) Delete(_ context.Context, path string) error {
 	if m.delErr != nil {
 		return m.delErr
 	}
+	m.deletedPaths = append(m.deletedPaths, path)
 	delete(m.files, path)
 	return nil
 }

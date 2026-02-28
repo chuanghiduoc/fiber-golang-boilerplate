@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -91,7 +92,11 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*sqlc.User, error) {
 	// Check lockout
 	cacheKey := loginAttemptPrefix + req.Email
-	if data, _ := s.cache.Get(ctx, cacheKey); data != nil {
+	data, cacheErr := s.cache.Get(ctx, cacheKey)
+	if cacheErr != nil {
+		slog.Warn("cache error checking login attempts", slog.String("key", cacheKey), slog.Any("error", cacheErr))
+	}
+	if data != nil {
 		attempts, _ := strconv.Atoi(string(data))
 		if attempts >= maxLoginAttempts {
 			return nil, apperror.NewBadRequest(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
@@ -121,17 +126,25 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	}
 
 	// Clear attempts on success
-	_ = s.cache.Delete(ctx, cacheKey)
+	if err := s.cache.Delete(ctx, cacheKey); err != nil {
+		slog.Warn("cache error clearing login attempts", slog.String("key", cacheKey), slog.Any("error", err))
+	}
 	return user, nil
 }
 
 func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
 	attempts := 1
-	if data, _ := s.cache.Get(ctx, key); data != nil {
+	data, err := s.cache.Get(ctx, key)
+	if err != nil {
+		slog.Warn("cache error reading login attempts", slog.String("key", key), slog.Any("error", err))
+	}
+	if data != nil {
 		attempts, _ = strconv.Atoi(string(data))
 		attempts++
 	}
-	_ = s.cache.Set(ctx, key, []byte(strconv.Itoa(attempts)), lockoutDuration)
+	if err := s.cache.Set(ctx, key, []byte(strconv.Itoa(attempts)), lockoutDuration); err != nil {
+		slog.Warn("cache error storing login attempts", slog.String("key", key), slog.Any("error", err))
+	}
 }
 
 func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
