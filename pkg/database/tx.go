@@ -36,7 +36,9 @@ func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error
 	}
 
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback(ctx)
+		if rbErr := tx.Rollback(ctx); rbErr != nil {
+			return fmt.Errorf("rollback failed: %w (original error: %v)", rbErr, err)
+		}
 		return err
 	}
 

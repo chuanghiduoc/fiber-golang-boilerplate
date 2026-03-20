@@ -3,12 +3,14 @@ package service
 import (
 	"context"
 	"errors"
-	"log/slog"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -27,6 +29,7 @@ type adminService struct {
 	fileRepo         repository.FileRepository
 	refreshTokenRepo repository.RefreshTokenRepository
 	storage          storage.Storage
+	txManager        *database.TxManager
 }
 
 func NewAdminService(
@@ -34,10 +37,12 @@ func NewAdminService(
 	fileRepo repository.FileRepository,
 	refreshTokenRepo repository.RefreshTokenRepository,
 	store storage.Storage,
+	txManager *database.TxManager,
 ) AdminService {
 	return &adminService{
 		userRepo: userRepo, fileRepo: fileRepo,
 		refreshTokenRepo: refreshTokenRepo, storage: store,
+		txManager: txManager,
 	}
 }
 
@@ -79,22 +84,28 @@ func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*
 }
 
 func (s *adminService) BanUser(ctx context.Context, id int64) error {
-	_, err := s.userRepo.Delete(ctx, id)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found or already banned")
+	doBan := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		_, err := userRepo.Delete(ctx, id)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found or already banned")
+			}
+			return apperror.NewInternal("failed to ban user")
 		}
-		return apperror.NewInternal("failed to ban user")
+		// Revoke all refresh tokens for banned user
+		if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
+			return apperror.NewInternal("failed to revoke refresh tokens")
+		}
+		return nil
 	}
 
-	// Revoke all refresh tokens for banned user
-	if err := s.refreshTokenRepo.DeleteByUserID(ctx, id); err != nil {
-		slog.Warn("failed to revoke refresh tokens for banned user",
-			slog.Int64("user_id", id),
-			slog.Any("error", err),
-		)
+	if s.txManager != nil {
+		return s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			return doBan(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+		})
 	}
-	return nil
+
+	return doBan(s.userRepo, s.refreshTokenRepo)
 }
 
 func (s *adminService) UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error) {

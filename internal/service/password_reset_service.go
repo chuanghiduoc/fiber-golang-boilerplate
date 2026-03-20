@@ -120,14 +120,9 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		return apperror.NewInternal("failed to hash password")
 	}
 
-	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository, forUpdate bool) error {
-		var rt *sqlc.PasswordResetToken
-		var err error
-		if forUpdate {
-			rt, err = resetRepo.GetByTokenForUpdate(ctx, req.Token)
-		} else {
-			rt, err = resetRepo.GetByToken(ctx, req.Token)
-		}
+	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository) error {
+		// Always use FOR UPDATE to prevent concurrent token reuse
+		rt, err := resetRepo.GetByTokenForUpdate(ctx, req.Token)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewBadRequest("invalid or expired reset token")
@@ -164,10 +159,9 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 				repository.NewUserRepository(tx),
 				repository.NewPasswordResetRepository(tx),
 				repository.NewRefreshTokenRepository(tx),
-				true,
 			)
 		})
 	}
 
-	return doReset(s.userRepo, s.resetRepo, s.refreshRepo, false)
+	return doReset(s.userRepo, s.resetRepo, s.refreshRepo)
 }

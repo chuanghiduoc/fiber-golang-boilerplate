@@ -21,7 +21,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # ---- Production stage ----
 FROM alpine:3.23 AS prod
 
-RUN apk add --no-cache ca-certificates tzdata && \
+RUN apk add --no-cache ca-certificates tzdata curl && \
     addgroup -S appgroup && \
     adduser -S appuser -G appgroup
 
@@ -38,6 +38,6 @@ USER appuser
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
+    CMD curl -f http://localhost:8080/healthz || exit 1
 
 CMD ["./server"]

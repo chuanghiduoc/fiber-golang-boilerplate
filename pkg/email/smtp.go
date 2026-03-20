@@ -31,14 +31,19 @@ func NewSMTPSender(cfg config.EmailConfig) *SMTPSender {
 	}
 }
 
+// sanitizeHeader strips CR and LF characters to prevent SMTP header injection.
+func sanitizeHeader(v string) string {
+	return strings.NewReplacer("\r", "", "\n", "").Replace(v)
+}
+
 func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
 	from := formatAddr(s.fromName, s.from)
 
 	headers := map[string]string{
-		"From":         from,
-		"To":           strings.Join(msg.To, ", "),
-		"Subject":      msg.Subject,
+		"From":         sanitizeHeader(from),
+		"To":           sanitizeHeader(strings.Join(msg.To, ", ")),
+		"Subject":      sanitizeHeader(msg.Subject),
 		"MIME-Version": "1.0",
 	}
 

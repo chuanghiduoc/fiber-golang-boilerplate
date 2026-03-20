@@ -177,14 +177,20 @@ func (cfg *Config) Validate() error {
 	if cfg.App.Port < 1 || cfg.App.Port > 65535 {
 		return fmt.Errorf("APP_PORT must be between 1 and 65535")
 	}
-	if cfg.JWT.Secret == "" || cfg.JWT.Secret == "secret" {
-		if cfg.App.Env != "local" && cfg.App.Env != "test" {
+
+	// JWT validation
+	if cfg.App.Env != "local" && cfg.App.Env != "test" {
+		if cfg.JWT.Secret == "" || cfg.JWT.Secret == "secret" {
 			return fmt.Errorf("JWT_SECRET must be set to a secure value in %s environment", cfg.App.Env)
+		}
+		if len(cfg.JWT.Secret) < 32 {
+			return fmt.Errorf("JWT_SECRET must be at least 32 characters for security")
 		}
 	}
 	if cfg.JWT.ExpireHour < 1 {
 		return fmt.Errorf("JWT_EXPIRE_HOUR must be at least 1")
 	}
+
 	if cfg.App.BodyLimit < 1 {
 		return fmt.Errorf("APP_BODY_LIMIT must be at least 1 byte")
 	}
@@ -197,6 +203,22 @@ func (cfg *Config) Validate() error {
 	if cfg.Storage.MaxFileSize < 1 {
 		return fmt.Errorf("STORAGE_MAX_FILE_SIZE must be at least 1 byte")
 	}
+
+	// SMTP config validation
+	if cfg.Email.Driver == "smtp" {
+		if cfg.Email.SMTPHost == "" {
+			return fmt.Errorf("SMTP_HOST is required when EMAIL_DRIVER=smtp")
+		}
+		if cfg.Email.SMTPPort < 1 || cfg.Email.SMTPPort > 65535 {
+			return fmt.Errorf("SMTP_PORT must be between 1 and 65535")
+		}
+	}
+
+	// CORS: AllowCredentials with wildcard origin is a spec violation
+	if cfg.CORS.AllowCredentials && cfg.CORS.AllowOrigins == "*" {
+		return fmt.Errorf("CORS_ALLOW_CREDENTIALS cannot be true when CORS_ALLOW_ORIGINS is '*'")
+	}
+
 	if cfg.OAuth.GoogleClientID != "" && cfg.OAuth.GoogleClientSecret == "" {
 		return fmt.Errorf("GOOGLE_CLIENT_SECRET is required when GOOGLE_CLIENT_ID is set")
 	}

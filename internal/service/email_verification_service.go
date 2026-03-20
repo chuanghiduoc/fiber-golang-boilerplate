@@ -115,12 +115,13 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 }
 
 func (s *emailVerificationService) ResendVerification(ctx context.Context, emailAddr string) error {
-	// Rate limit
+	// Rate limit — apply BEFORE user lookup to prevent enumeration via timing
 	cacheKey := "email_verification:" + emailAddr
 	exists, _ := s.cache.Exists(ctx, cacheKey)
 	if exists {
 		return apperror.NewBadRequest("please wait before requesting another verification email")
 	}
+	_ = s.cache.Set(ctx, cacheKey, []byte("1"), 1*time.Minute)
 
 	user, err := s.userRepo.GetByEmail(ctx, emailAddr)
 	if err != nil {
@@ -134,8 +135,6 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 	if user.EmailVerifiedAt.Valid {
 		return nil
 	}
-
-	_ = s.cache.Set(ctx, cacheKey, []byte("1"), 1*time.Minute)
 
 	return s.SendVerification(ctx, user.ID, user.Email)
 }

@@ -90,17 +90,14 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 }
 
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*sqlc.User, error) {
-	// Check lockout
+	// Check lockout (fail-closed: deny login if cache is unavailable)
 	cacheKey := loginAttemptPrefix + req.Email
-	data, cacheErr := s.cache.Get(ctx, cacheKey)
+	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
-		slog.Warn("cache error checking login attempts", slog.String("key", cacheKey), slog.Any("error", cacheErr))
+		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
 	}
-	if data != nil {
-		attempts, _ := strconv.Atoi(string(data))
-		if attempts >= maxLoginAttempts {
-			return nil, apperror.NewBadRequest(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
-		}
+	if locked {
+		return nil, apperror.NewBadRequest(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
 	}
 
 	user, err := s.repo.GetByEmail(ctx, req.Email)
@@ -143,8 +140,25 @@ func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
 		attempts++
 	}
 	if err := s.cache.Set(ctx, key, []byte(strconv.Itoa(attempts)), lockoutDuration); err != nil {
-		slog.Warn("cache error storing login attempts", slog.String("key", key), slog.Any("error", err))
+		slog.Error("cache error storing login attempts — brute force protection degraded", slog.String("key", key), slog.Any("error", err))
 	}
+}
+
+// checkLoginLockout verifies that the account is not locked out.
+// Returns an error if the cache read fails (fail-closed to protect against brute force when cache is down).
+func (s *userService) checkLoginLockout(ctx context.Context, cacheKey string) (bool, error) {
+	data, cacheErr := s.cache.Get(ctx, cacheKey)
+	if cacheErr != nil {
+		slog.Error("cache unavailable for login lockout check — denying request for safety", slog.String("key", cacheKey), slog.Any("error", cacheErr))
+		return false, cacheErr
+	}
+	if data != nil {
+		attempts, _ := strconv.Atoi(string(data))
+		if attempts >= maxLoginAttempts {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {

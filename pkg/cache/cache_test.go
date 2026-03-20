@@ -17,13 +17,13 @@ func TestNewCache_Memory(t *testing.T) {
 	_ = c.Close()
 }
 
-func TestNewCache_Default(t *testing.T) {
+func TestNewCache_UnknownDriver(t *testing.T) {
 	c, err := NewCache(config.CacheConfig{Driver: "unknown"})
-	if err != nil {
-		t.Fatalf("NewCache(unknown) returned error: %v", err)
+	if err == nil {
+		_ = c.Close()
+		t.Fatal("NewCache(unknown) should return error for unsupported driver")
 	}
-	if c == nil {
-		t.Fatal("NewCache(unknown) returned nil")
+	if c != nil {
+		t.Fatal("NewCache(unknown) should return nil cache")
 	}
-	_ = c.Close()
 }

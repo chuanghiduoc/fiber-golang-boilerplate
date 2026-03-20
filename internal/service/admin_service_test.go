@@ -44,7 +44,7 @@ func newAdminServiceForTest() (*adminService, *mockUserRepo, *mockFileRepo, *moc
 	fr := newMockFileRepo()
 	rtr := newMockRefreshTokenRepo()
 	st := newMockStorage()
-	svc := NewAdminService(ur, fr, rtr, st).(*adminService)
+	svc := NewAdminService(ur, fr, rtr, st, nil).(*adminService)
 	return svc, ur, fr, rtr, st
 }
 

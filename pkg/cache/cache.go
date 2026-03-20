@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
@@ -23,6 +24,6 @@ func NewCache(cfg config.CacheConfig) (Cache, error) {
 	case "memory":
 		return NewMemoryCache(), nil
 	default:
-		return NewMemoryCache(), nil
+		return nil, fmt.Errorf("unsupported cache driver: %q (supported: memory, redis)", cfg.Driver)
 	}
 }

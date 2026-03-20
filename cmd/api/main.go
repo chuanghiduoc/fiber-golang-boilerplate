@@ -107,8 +107,6 @@ func main() {
 		slog.Info("Google OAuth enabled")
 	}
 
-	defer pool.Close()
-
 	// Transaction manager
 	txManager := database.NewTxManager(pool)
 
@@ -118,7 +116,8 @@ func main() {
 	// Auto-seed admin user (idempotent)
 	if err := seed.Admin(ctx, cfg.Admin, userRepo); err != nil {
 		slog.Error("failed to seed admin user", slog.Any("error", err))
-		return
+		pool.Close()
+		os.Exit(1)
 	}
 
 	refreshTokenRepo := repository.NewRefreshTokenRepository(pool)
@@ -150,7 +149,7 @@ func main() {
 	uploadHandler := handler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
 
 	// Admin
-	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store)
+	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager)
 	adminHandler := handler.NewAdminHandler(adminSvc)
 
 	// Health checker
@@ -176,36 +175,36 @@ func main() {
 	})
 
 	// Graceful shutdown
-	done := make(chan bool, 1)
+	serverErr := make(chan error, 1)
 
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.App.Port)
 		slog.Info("server starting", slog.String("addr", addr), slog.String("env", cfg.App.Env))
-		if err := app.Listen(addr); err != nil {
-			slog.Error("server error", slog.Any("error", err))
-			os.Exit(1)
-		}
+		serverErr <- app.Listen(addr)
 	}()
 
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		<-sigChan
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-		slog.Info("shutting down gracefully, press Ctrl+C again to force")
+	select {
+	case err := <-serverErr:
+		slog.Error("server error", slog.Any("error", err))
+	case sig := <-sigChan:
+		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if err := app.ShutdownWithContext(ctx); err != nil {
+		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
 			slog.Error("server forced to shutdown", slog.Any("error", err))
 		}
+	}
 
-		_ = appCache.Close()
+	// Cleanup all resources
+	if err := appCache.Close(); err != nil {
+		slog.Error("failed to close cache", slog.Any("error", err))
+	}
+	pool.Close()
 
-		done <- true
-	}()
-
-	<-done
 	slog.Info("server exited")
 }
