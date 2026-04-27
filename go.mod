@@ -1,6 +1,6 @@
 module github.com/chuanghiduoc/fiber-golang-boilerplate
 
-go 1.25.9
+go 1.26.2
 
 require (
 	github.com/caarlos0/env/v11 v11.4.0
