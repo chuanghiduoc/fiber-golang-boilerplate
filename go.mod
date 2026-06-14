@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/caarlos0/env/v11 v11.4.1
-	github.com/go-playground/validator/v10 v10.30.2
+	github.com/go-playground/validator/v10 v10.30.3
 	github.com/gofiber/contrib/v3/swagger v1.0.0-rc.1
 	github.com/gofiber/fiber/v3 v3.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
