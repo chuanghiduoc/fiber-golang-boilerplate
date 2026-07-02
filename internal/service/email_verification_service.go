@@ -59,10 +59,11 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 	// Delete old tokens
 	_ = s.verifRepo.DeleteByUserID(ctx, userID)
 
-	// Create with 24 hour expiry
+	// Create with 24 hour expiry. Store only the hash; the plaintext token is
+	// delivered to the user via email so a DB leak cannot be replayed.
 	_, err := s.verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
 		UserID:    userID,
-		Token:     token,
+		Token:     hashToken(token),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
 	})
 	if err != nil {
@@ -89,7 +90,9 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 }
 
 func (s *emailVerificationService) Verify(ctx context.Context, token string) error {
-	vt, err := s.verifRepo.GetByToken(ctx, token)
+	tokenHash := hashToken(token)
+
+	vt, err := s.verifRepo.GetByToken(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewBadRequest("invalid or expired verification token")
@@ -98,7 +101,7 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 	}
 
 	if vt.ExpiresAt.Time.Before(time.Now()) {
-		_ = s.verifRepo.Delete(ctx, token)
+		_ = s.verifRepo.Delete(ctx, tokenHash)
 		return apperror.NewBadRequest("verification token has expired")
 	}
 
@@ -109,7 +112,7 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 	}
 
 	// Delete token
-	_ = s.verifRepo.Delete(ctx, token)
+	_ = s.verifRepo.Delete(ctx, tokenHash)
 
 	return nil
 }

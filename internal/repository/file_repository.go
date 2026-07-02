@@ -10,10 +10,12 @@ type FileRepository interface {
 	Create(ctx context.Context, params sqlc.CreateFileParams) (*sqlc.File, error)
 	GetByID(ctx context.Context, id int64) (*sqlc.File, error)
 	ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]sqlc.File, error)
+	ListByUserCursor(ctx context.Context, userID int64, cur Cursor) ([]sqlc.File, error)
 	CountByUserID(ctx context.Context, userID int64) (int64, error)
 	Delete(ctx context.Context, id int64) (*sqlc.File, error)
 	Restore(ctx context.Context, id int64) (*sqlc.File, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.File, error)
+	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error)
 	AdminCount(ctx context.Context) (int64, error)
 }
 
@@ -51,6 +53,16 @@ func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, 
 	})
 }
 
+func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor) ([]sqlc.File, error) {
+	return r.q.ListFilesByUserCursor(ctx, sqlc.ListFilesByUserCursorParams{
+		UserID:          userID,
+		HasCursor:       cur.HasCursor,
+		CursorCreatedAt: cur.createdAt(),
+		CursorID:        cur.ID,
+		RowLimit:        cur.Limit,
+	})
+}
+
 func (r *fileRepository) CountByUserID(ctx context.Context, userID int64) (int64, error) {
 	return r.q.CountFilesByUserID(ctx, userID)
 }
@@ -75,6 +87,15 @@ func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 	return r.q.AdminListFiles(ctx, sqlc.AdminListFilesParams{
 		Limit:  limit,
 		Offset: offset,
+	})
+}
+
+func (r *fileRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error) {
+	return r.q.AdminListFilesCursor(ctx, sqlc.AdminListFilesCursorParams{
+		HasCursor:       cur.HasCursor,
+		CursorCreatedAt: cur.createdAt(),
+		CursorID:        cur.ID,
+		RowLimit:        cur.Limit,
 	})
 }
 

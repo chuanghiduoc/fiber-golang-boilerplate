@@ -133,8 +133,8 @@ func TestGetFileInfo(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 404 {
-			t.Errorf("expected 404, got %d", appErr.Code)
+		if appErr.Status != 404 {
+			t.Errorf("expected 404, got %d", appErr.Status)
 		}
 	})
 
@@ -156,8 +156,8 @@ func TestGetFileInfo(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 403 {
-			t.Errorf("expected 403, got %d", appErr.Code)
+		if appErr.Status != 403 {
+			t.Errorf("expected 403, got %d", appErr.Status)
 		}
 	})
 }
@@ -220,8 +220,8 @@ func TestUploadDelete(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 403 {
-			t.Errorf("expected 403, got %d", appErr.Code)
+		if appErr.Status != 403 {
+			t.Errorf("expected 403, got %d", appErr.Status)
 		}
 	})
 }
@@ -268,8 +268,8 @@ func TestUploadDownload(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 404 {
-			t.Errorf("expected 404, got %d", appErr.Code)
+		if appErr.Status != 404 {
+			t.Errorf("expected 404, got %d", appErr.Status)
 		}
 	})
 
@@ -291,8 +291,8 @@ func TestUploadDownload(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 403 {
-			t.Errorf("expected 403, got %d", appErr.Code)
+		if appErr.Status != 403 {
+			t.Errorf("expected 403, got %d", appErr.Status)
 		}
 	})
 
@@ -329,12 +329,12 @@ func TestUploadList(t *testing.T) {
 		repo.files[3] = &sqlc.File{ID: 3, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
-		files, total, err := svc.List(context.Background(), 10, 1, 10)
+		files, hasMore, err := svc.List(context.Background(), 10, 10, "")
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		if total != 2 {
-			t.Errorf("expected total 2 for user 10, got %d", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for a full page")
 		}
 		if len(files) != 2 {
 			t.Errorf("expected 2 files, got %d", len(files))

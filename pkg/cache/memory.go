@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -19,9 +20,10 @@ func (e entry) expired() bool {
 }
 
 type MemoryCache struct {
-	mu    sync.RWMutex
-	items map[string]entry
-	done  chan struct{}
+	mu        sync.RWMutex
+	items     map[string]entry
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewMemoryCache() *MemoryCache {
@@ -73,6 +75,27 @@ func (m *MemoryCache) Exists(_ context.Context, key string) (bool, error) {
 	return true, nil
 }
 
+func (m *MemoryCache) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if e, ok := m.items[key]; ok && !e.expired() {
+		n, _ := strconv.ParseInt(string(e.data), 10, 64)
+		n++
+		// Preserve the original expiry so the lockout window is not extended by
+		// each subsequent attempt.
+		m.items[key] = entry{data: []byte(strconv.FormatInt(n, 10)), expiresAt: e.expiresAt}
+		return n, nil
+	}
+
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
+	m.items[key] = entry{data: []byte("1"), expiresAt: expiresAt}
+	return 1, nil
+}
+
 func (m *MemoryCache) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -93,7 +116,7 @@ func (m *MemoryCache) cleanup() {
 }
 
 func (m *MemoryCache) Close() error {
-	close(m.done)
+	m.closeOnce.Do(func() { close(m.done) })
 	return nil
 }
 

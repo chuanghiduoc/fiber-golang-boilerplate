@@ -141,10 +141,11 @@ func TestResetPassword(t *testing.T) {
 		}
 
 		// Create a valid reset token
-		resetRepo.tokens["valid-token"] = &sqlc.PasswordResetToken{
+		// Repo stores only the hash, so key the mock by hashToken(plaintext).
+		resetRepo.tokens[hashToken("valid-token")] = &sqlc.PasswordResetToken{
 			ID:        1,
 			UserID:    1,
-			Token:     "valid-token",
+			Token:     hashToken("valid-token"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(1 * time.Hour), Valid: true},
 		}
 
@@ -177,10 +178,10 @@ func TestResetPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		// Expired token
-		resetRepo.tokens["expired-token"] = &sqlc.PasswordResetToken{
+		resetRepo.tokens[hashToken("expired-token")] = &sqlc.PasswordResetToken{
 			ID:        1,
 			UserID:    1,
-			Token:     "expired-token",
+			Token:     hashToken("expired-token"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-1 * time.Hour), Valid: true},
 		}
 
@@ -235,10 +236,11 @@ func TestResetPassword(t *testing.T) {
 		refreshRepo.tokens["rt1"] = &sqlc.RefreshToken{UserID: 1, Token: "rt1"}
 		refreshRepo.tokens["rt2"] = &sqlc.RefreshToken{UserID: 1, Token: "rt2"}
 
-		resetRepo.tokens["valid-token"] = &sqlc.PasswordResetToken{
+		// Repo stores only the hash, so key the mock by hashToken(plaintext).
+		resetRepo.tokens[hashToken("valid-token")] = &sqlc.PasswordResetToken{
 			ID:        1,
 			UserID:    1,
-			Token:     "valid-token",
+			Token:     hashToken("valid-token"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(1 * time.Hour), Valid: true},
 		}
 

@@ -58,6 +58,21 @@ func (r *RedisCache) Exists(ctx context.Context, key string) (bool, error) {
 	return n > 0, nil
 }
 
+// incrExpireScript increments a key and, on first creation, sets its expiry —
+// atomically, so a crash between INCR and EXPIRE cannot leave a key without a
+// TTL (which would lock the account out permanently).
+var incrExpireScript = redis.NewScript(`
+local v = redis.call('INCR', KEYS[1])
+if v == 1 and tonumber(ARGV[1]) > 0 then
+	redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return v
+`)
+
+func (r *RedisCache) Increment(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	return incrExpireScript.Run(ctx, r.client, []string{key}, ttl.Milliseconds()).Int64()
+}
+
 func (r *RedisCache) Close() error {
 	return r.client.Close()
 }

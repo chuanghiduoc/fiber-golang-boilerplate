@@ -41,35 +41,42 @@ func (h *Checker) Readiness(ctx context.Context) Status {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	// set records a check result under the mutex, keeping the pings themselves
+	// concurrent (the lock only guards the shared map and allUp flag).
+	set := func(key, value string, up bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		details[key] = value
+		if !up {
+			allUp = false
+		}
+	}
+
 	// Check database
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		if err := h.pool.Ping(ctx); err != nil {
+			set("database", fmt.Sprintf("down: %v", err), false)
+			return
+		}
+		stats := h.pool.Stat()
 		mu.Lock()
 		defer mu.Unlock()
-		if err := h.pool.Ping(ctx); err != nil {
-			details["database"] = fmt.Sprintf("down: %v", err)
-			allUp = false
-		} else {
-			stats := h.pool.Stat()
-			details["database"] = "up"
-			details["db_total_conns"] = strconv.Itoa(int(stats.TotalConns()))
-			details["db_idle_conns"] = strconv.Itoa(int(stats.IdleConns()))
-		}
+		details["database"] = "up"
+		details["db_total_conns"] = strconv.Itoa(int(stats.TotalConns()))
+		details["db_idle_conns"] = strconv.Itoa(int(stats.IdleConns()))
 	}()
 
 	// Check cache
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		mu.Lock()
-		defer mu.Unlock()
 		if err := h.cache.Ping(ctx); err != nil {
-			details["cache"] = fmt.Sprintf("down: %v", err)
-			allUp = false
-		} else {
-			details["cache"] = "up"
+			set("cache", fmt.Sprintf("down: %v", err), false)
+			return
 		}
+		set("cache", "up", true)
 	}()
 
 	wg.Wait()

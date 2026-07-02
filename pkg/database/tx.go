@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -37,7 +38,9 @@ func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error
 
 	if err := fn(tx); err != nil {
 		if rbErr := tx.Rollback(ctx); rbErr != nil {
-			return fmt.Errorf("rollback failed: %w (original error: %v)", rbErr, err)
+			// Join so callers can still errors.Is/As the original business error
+			// (e.g. apperror.ErrNotFound) while retaining the rollback failure.
+			return errors.Join(err, fmt.Errorf("rollback failed: %w", rbErr))
 		}
 		return err
 	}

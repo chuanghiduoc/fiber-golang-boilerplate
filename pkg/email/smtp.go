@@ -2,6 +2,7 @@ package email
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/smtp"
@@ -12,22 +13,24 @@ import (
 )
 
 type SMTPSender struct {
-	host     string
-	port     int
-	username string
-	password string
-	from     string
-	fromName string
+	host       string
+	port       int
+	username   string
+	password   string
+	from       string
+	fromName   string
+	requireTLS bool
 }
 
 func NewSMTPSender(cfg config.EmailConfig) *SMTPSender {
 	return &SMTPSender{
-		host:     cfg.SMTPHost,
-		port:     cfg.SMTPPort,
-		username: cfg.SMTPUsername,
-		password: cfg.SMTPPassword,
-		from:     cfg.FromAddress,
-		fromName: cfg.FromName,
+		host:       cfg.SMTPHost,
+		port:       cfg.SMTPPort,
+		username:   cfg.SMTPUsername,
+		password:   cfg.SMTPPassword,
+		from:       cfg.FromAddress,
+		fromName:   cfg.FromName,
+		requireTLS: cfg.SMTPRequireTLS,
 	}
 }
 
@@ -76,6 +79,16 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 		return fmt.Errorf("create SMTP client: %w", err)
 	}
 	defer client.Close()
+
+	// Upgrade to TLS via STARTTLS when the server advertises it, so credentials
+	// and message content (reset/verification links) are not sent in cleartext.
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err := client.StartTLS(&tls.Config{ServerName: s.host, MinVersion: tls.VersionTLS12}); err != nil {
+			return fmt.Errorf("SMTP STARTTLS: %w", err)
+		}
+	} else if s.requireTLS {
+		return fmt.Errorf("SMTP server %q does not support STARTTLS but SMTP_REQUIRE_TLS is enabled", s.host)
+	}
 
 	if s.username != "" {
 		if err := client.Auth(smtp.PlainAuth("", s.username, s.password, s.host)); err != nil {

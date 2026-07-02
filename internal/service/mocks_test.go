@@ -4,14 +4,26 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
+
+// cursorLess reports whether (ts1,id1) sorts before (ts2,id2) in the
+// (created_at DESC, id DESC) order used by cursor pagination.
+func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
+	if ts1.Equal(ts2) {
+		return id1 < id2
+	}
+	return ts1.Before(ts2)
+}
 
 // ---------------------------------------------------------------------------
 // mockUserRepo
@@ -66,6 +78,36 @@ func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User
 		end = len(all)
 	}
 	return all[start:end], nil
+}
+
+func (m *mockUserRepo) ListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
+	return m.listCursor(cur), nil
+}
+
+func (m *mockUserRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
+	return m.listCursor(cur), nil
+}
+
+func (m *mockUserRepo) listCursor(cur repository.Cursor) []sqlc.User {
+	all := make([]sqlc.User, 0, len(m.users))
+	for _, u := range m.users {
+		all = append(all, *u)
+	}
+	// (created_at DESC, id DESC)
+	sort.Slice(all, func(i, j int) bool {
+		return cursorLess(all[j].CreatedAt.Time, all[j].ID, all[i].CreatedAt.Time, all[i].ID)
+	})
+	out := make([]sqlc.User, 0, len(all))
+	for _, u := range all {
+		if cur.HasCursor && !cursorLess(u.CreatedAt.Time, u.ID, cur.CreatedAt, cur.ID) {
+			continue
+		}
+		out = append(out, u)
+		if len(out) >= int(cur.Limit) {
+			break
+		}
+	}
+	return out
 }
 
 func (m *mockUserRepo) Count(_ context.Context) (int64, error) {
@@ -293,6 +335,38 @@ func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offs
 	return result[start:end], nil
 }
 
+func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur repository.Cursor) ([]sqlc.File, error) {
+	return m.listCursor(&userID, cur), nil
+}
+
+func (m *mockFileRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.File, error) {
+	return m.listCursor(nil, cur), nil
+}
+
+func (m *mockFileRepo) listCursor(userID *int64, cur repository.Cursor) []sqlc.File {
+	all := make([]sqlc.File, 0, len(m.files))
+	for _, f := range m.files {
+		if userID != nil && f.UserID != *userID {
+			continue
+		}
+		all = append(all, *f)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return cursorLess(all[j].CreatedAt.Time, all[j].ID, all[i].CreatedAt.Time, all[i].ID)
+	})
+	out := make([]sqlc.File, 0, len(all))
+	for _, f := range all {
+		if cur.HasCursor && !cursorLess(f.CreatedAt.Time, f.ID, cur.CreatedAt, cur.ID) {
+			continue
+		}
+		out = append(out, f)
+		if len(out) >= int(cur.Limit) {
+			break
+		}
+	}
+	return out
+}
+
 func (m *mockFileRepo) CountByUserID(_ context.Context, userID int64) (int64, error) {
 	var count int64
 	for _, f := range m.files {
@@ -476,6 +550,17 @@ func (m *mockCache) Delete(_ context.Context, key string) error {
 func (m *mockCache) Exists(_ context.Context, key string) (bool, error) {
 	_, ok := m.items[key]
 	return ok, nil
+}
+
+func (m *mockCache) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
+	var n int64
+	if v, ok := m.items[key]; ok {
+		n, _ = strconv.ParseInt(string(v), 10, 64)
+	}
+	n++
+	m.items[key] = []byte(strconv.FormatInt(n, 10))
+	m.ttls[key] = ttl
+	return n, nil
 }
 
 func (m *mockCache) Close() error                 { return nil }

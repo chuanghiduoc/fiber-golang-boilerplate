@@ -56,11 +56,11 @@ func NewAuthHandler(
 // @Accept json
 // @Produce json
 // @Param request body dto.RegisterRequest true "Register request"
-// @Success 201 {object} response.Response{data=dto.UserResponse}
-// @Failure 400 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
-// @Failure 500 {object} response.Response
+// @Success 201 {object} dto.UserResponse
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/register [post]
 func (h *AuthHandler) Register(c fiber.Ctx) error {
 	var req dto.RegisterRequest
@@ -90,11 +90,11 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.LoginRequest true "Login request"
-// @Success 200 {object} response.Response{data=dto.LoginResponse}
-// @Failure 401 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
-// @Failure 500 {object} response.Response
+// @Success 200 {object} dto.LoginResponse
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/login [post]
 func (h *AuthHandler) Login(c fiber.Ctx) error {
 	var req dto.LoginRequest
@@ -120,7 +120,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
-		User:         *service.ToUserResponse(user),
+		User:         *user,
 	})
 }
 
@@ -131,11 +131,11 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.RefreshRequest true "Refresh request"
-// @Success 200 {object} response.Response{data=dto.LoginResponse}
-// @Failure 401 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
-// @Failure 500 {object} response.Response
+// @Success 200 {object} dto.LoginResponse
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/refresh [post]
 func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	var req dto.RefreshRequest
@@ -143,7 +143,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return err
 	}
 
-	rt, err := h.refreshSvc.Verify(c.Context(), req.RefreshToken)
+	userID, err := h.refreshSvc.Verify(c.Context(), req.RefreshToken)
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return apperror.NewInternal("failed to revoke refresh token")
 	}
 
-	user, err := h.userSvc.GetByID(c.Context(), rt.UserID)
+	user, err := h.userSvc.GetByID(c.Context(), userID)
 	if err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return apperror.NewInternal("failed to generate access token")
 	}
 
-	newRefreshToken, err := h.refreshSvc.Create(c.Context(), rt.UserID)
+	newRefreshToken, err := h.refreshSvc.Create(c.Context(), userID)
 	if err != nil {
 		return err
 	}
@@ -183,8 +183,8 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 // @Produce json
 // @Param request body dto.RefreshRequest true "Refresh token to revoke"
 // @Success 204
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
 // @Router /auth/logout [post]
 func (h *AuthHandler) Logout(c fiber.Ctx) error {
 	var req dto.RefreshRequest
@@ -203,10 +203,10 @@ func (h *AuthHandler) Logout(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.ForgotPasswordRequest true "Forgot password request"
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
 // @Router /auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 	var req dto.ForgotPasswordRequest
@@ -228,10 +228,10 @@ func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.ResetPasswordRequest true "Reset password request"
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
 // @Router /auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 	var req dto.ResetPasswordRequest
@@ -253,10 +253,10 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.VerifyEmailRequest true "Verify email request"
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
 // @Router /auth/verify-email [post]
 func (h *AuthHandler) VerifyEmail(c fiber.Ctx) error {
 	var req dto.VerifyEmailRequest
@@ -278,10 +278,10 @@ func (h *AuthHandler) VerifyEmail(c fiber.Ctx) error {
 // @Accept json
 // @Produce json
 // @Param request body dto.ResendVerificationRequest true "Resend verification request"
-// @Success 200 {object} response.Response
-// @Failure 400 {object} response.Response
-// @Failure 422 {object} response.Response
-// @Failure 429 {object} response.Response
+// @Success 200 {object} map[string]string
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
 // @Router /auth/resend-verification [post]
 func (h *AuthHandler) ResendVerification(c fiber.Ctx) error {
 	var req dto.ResendVerificationRequest
@@ -301,9 +301,9 @@ func (h *AuthHandler) ResendVerification(c fiber.Ctx) error {
 // @Description Redirects the user to Google's OAuth consent screen
 // @Tags Auth
 // @Success 302
-// @Failure 404 {object} response.Response
-// @Failure 429 {object} response.Response
-// @Failure 500 {object} response.Response
+// @Failure 404 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/google [get]
 func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	if h.googleOAuth == nil {
@@ -335,10 +335,10 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 // @Tags Auth
 // @Param code query string true "Authorization code"
 // @Success 302
-// @Failure 400 {object} response.Response
-// @Failure 404 {object} response.Response
-// @Failure 429 {object} response.Response
-// @Failure 500 {object} response.Response
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/google/callback [get]
 func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if h.googleOAuth == nil {

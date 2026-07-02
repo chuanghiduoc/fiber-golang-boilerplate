@@ -18,7 +18,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 const (
@@ -30,10 +29,10 @@ const (
 
 type UserService interface {
 	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
-	Authenticate(ctx context.Context, req dto.LoginRequest) (*sqlc.User, error)
-	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*sqlc.User, error)
+	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
+	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error)
 	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
-	List(ctx context.Context, page, perPage int) ([]dto.UserResponse, int64, error)
+	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
 	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
 	Delete(ctx context.Context, id int64) error
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
@@ -89,7 +88,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	return ToUserResponse(user), nil
 }
 
-func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*sqlc.User, error) {
+func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
 	// Check lockout (fail-closed: deny login if cache is unavailable)
 	cacheKey := loginAttemptPrefix + req.Email
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
@@ -126,20 +125,13 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	if err := s.cache.Delete(ctx, cacheKey); err != nil {
 		slog.Warn("cache error clearing login attempts", slog.String("key", cacheKey), slog.Any("error", err))
 	}
-	return user, nil
+	return ToUserResponse(user), nil
 }
 
 func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
-	attempts := 1
-	data, err := s.cache.Get(ctx, key)
-	if err != nil {
-		slog.Warn("cache error reading login attempts", slog.String("key", key), slog.Any("error", err))
-	}
-	if data != nil {
-		attempts, _ = strconv.Atoi(string(data))
-		attempts++
-	}
-	if err := s.cache.Set(ctx, key, []byte(strconv.Itoa(attempts)), lockoutDuration); err != nil {
+	// Atomic increment so parallel failed logins cannot race the counter and
+	// slip past the lockout threshold.
+	if _, err := s.cache.Increment(ctx, key, lockoutDuration); err != nil {
 		slog.Error("cache error storing login attempts — brute force protection degraded", slog.String("key", key), slog.Any("error", err))
 	}
 }
@@ -161,7 +153,15 @@ func (s *userService) checkLoginLockout(ctx context.Context, cacheKey string) (b
 	return false, nil
 }
 
-func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
+func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error) {
+	user, err := s.findOrCreateByGoogleUser(ctx, googleID, email, name)
+	if err != nil {
+		return nil, err
+	}
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
 	findOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
 		user, err := repo.GetByGoogleID(ctx, googleID)
 		if err == nil {
@@ -241,26 +241,28 @@ func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse,
 	return ToUserResponse(user), nil
 }
 
-func (s *userService) List(ctx context.Context, page, perPage int) ([]dto.UserResponse, int64, error) {
-	limit, offset := pagination.LimitOffset(page, perPage)
-
-	// Note: List and Count are separate queries; minor pagination inconsistency is acceptable for read-only operations.
-	users, err := s.repo.List(ctx, limit, offset)
+func (s *userService) List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to list users")
+		return nil, false, err
 	}
 
-	total, err := s.repo.Count(ctx)
+	users, err := s.repo.ListCursor(ctx, cur)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to count users")
+		return nil, false, apperror.NewInternal("failed to list users")
+	}
+
+	hasMore := len(users) > pageSize
+	if hasMore {
+		users = users[:pageSize]
 	}
 
 	responses := make([]dto.UserResponse, len(users))
-	for i, u := range users {
-		responses[i] = *ToUserResponse(&u)
+	for i := range users {
+		responses[i] = *ToUserResponse(&users[i])
 	}
 
-	return responses, total, nil
+	return responses, hasMore, nil
 }
 
 func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
@@ -310,8 +312,11 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 			}
 			return apperror.NewInternal("failed to delete user")
 		}
-		// Revoke all refresh tokens
-		_ = refreshRepo.DeleteByUserID(ctx, id)
+		// Revoke all refresh tokens so a deleted user's sessions cannot outlive
+		// the account. Failing here rolls back the delete when run in a tx.
+		if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
+			return apperror.NewInternal("failed to revoke refresh tokens")
+		}
 		return nil
 	}
 

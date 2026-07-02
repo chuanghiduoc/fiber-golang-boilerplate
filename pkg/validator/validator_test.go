@@ -70,8 +70,8 @@ func TestValidateStruct_Required(t *testing.T) {
 	if !errors.As(err, &appErr) {
 		t.Fatalf("expected AppError, got %T", err)
 	}
-	if appErr.Code != 422 {
-		t.Errorf("expected status 422, got %d", appErr.Code)
+	if appErr.Status != 422 {
+		t.Errorf("expected status 422, got %d", appErr.Status)
 	}
 }
 
@@ -100,15 +100,11 @@ func TestValidateStruct_Email(t *testing.T) {
 	if !errors.As(err, &appErr) {
 		t.Fatalf("expected AppError, got %T", err)
 	}
-	if appErr.Details == nil {
-		t.Fatal("expected validation details")
+	if len(appErr.Errors) == 0 {
+		t.Fatal("expected validation field errors")
 	}
-	details, ok := appErr.Details.(map[string]string)
-	if !ok {
-		t.Fatalf("expected map[string]string details, got %T", appErr.Details)
-	}
-	if _, ok := details["Email"]; !ok {
-		t.Error("expected Email field in details")
+	if appErr.Errors[0].Code != "invalid_email" {
+		t.Errorf("expected code invalid_email, got %q", appErr.Errors[0].Code)
 	}
 }
 

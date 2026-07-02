@@ -23,13 +23,12 @@ type GoogleUserInfo struct {
 }
 
 type GoogleOAuth struct {
-	cfg            *oauth2.Config
-	frontendURL    string
-	allowedOrigins map[string]struct{}
+	cfg         *oauth2.Config
+	frontendURL string
 }
 
 func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
-	g := &GoogleOAuth{
+	return &GoogleOAuth{
 		cfg: &oauth2.Config{
 			ClientID:     cfg.GoogleClientID,
 			ClientSecret: cfg.GoogleClientSecret,
@@ -37,16 +36,8 @@ func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
 			Scopes:       []string{"email", "profile"},
 			Endpoint:     google.Endpoint,
 		},
-		frontendURL:    cfg.FrontendURL,
-		allowedOrigins: make(map[string]struct{}),
+		frontendURL: cfg.FrontendURL,
 	}
-
-	if parsed, err := url.Parse(cfg.FrontendURL); err == nil {
-		origin := parsed.Scheme + "://" + parsed.Host
-		g.allowedOrigins[origin] = struct{}{}
-	}
-
-	return g
 }
 
 // ValidateFrontendURL checks that the configured frontend URL is parseable and uses http(s).

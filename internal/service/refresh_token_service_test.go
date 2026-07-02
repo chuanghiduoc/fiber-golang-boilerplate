@@ -55,12 +55,12 @@ func TestRefreshTokenVerify(t *testing.T) {
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(7 * 24 * time.Hour), Valid: true},
 		}
 
-		rt, err := svc.Verify(context.Background(), plain)
+		userID, err := svc.Verify(context.Background(), plain)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if rt.UserID != 1 {
-			t.Errorf("UserID = %d, want 1", rt.UserID)
+		if userID != 1 {
+			t.Errorf("UserID = %d, want 1", userID)
 		}
 	})
 
@@ -75,8 +75,8 @@ func TestRefreshTokenVerify(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *apperror.AppError, got %T", err)
 		}
-		if appErr.Code != 401 {
-			t.Errorf("status = %d, want 401", appErr.Code)
+		if appErr.Status != 401 {
+			t.Errorf("status = %d, want 401", appErr.Status)
 		}
 	})
 
@@ -100,8 +100,8 @@ func TestRefreshTokenVerify(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *apperror.AppError, got %T", err)
 		}
-		if appErr.Code != 401 {
-			t.Errorf("status = %d, want 401", appErr.Code)
+		if appErr.Status != 401 {
+			t.Errorf("status = %d, want 401", appErr.Status)
 		}
 
 		// Expired token should be auto-deleted

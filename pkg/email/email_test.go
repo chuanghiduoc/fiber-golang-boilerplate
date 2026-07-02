@@ -36,13 +36,13 @@ func TestNewSender_Console(t *testing.T) {
 	}
 }
 
-func TestNewSender_Default(t *testing.T) {
+func TestNewSender_UnknownDriver(t *testing.T) {
 	sender, err := NewSender(config.EmailConfig{Driver: "unknown"})
-	if err != nil {
-		t.Fatalf("NewSender(unknown) returned error: %v", err)
+	if err == nil {
+		t.Fatal("NewSender(unknown) should return an error for an unknown driver")
 	}
-	if sender == nil {
-		t.Fatal("NewSender(unknown) returned nil")
+	if sender != nil {
+		t.Fatal("NewSender(unknown) should return a nil sender on error")
 	}
 }
 

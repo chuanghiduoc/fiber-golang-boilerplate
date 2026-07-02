@@ -11,16 +11,15 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 type AdminService interface {
-	ListUsers(ctx context.Context, page, perPage int) ([]dto.UserResponse, int64, error)
+	ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
 	UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error)
 	BanUser(ctx context.Context, id int64) error
 	UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error)
-	ListFiles(ctx context.Context, page, perPage int) ([]dto.FileResponse, int64, error)
+	ListFiles(ctx context.Context, limit int, startingAfter string) ([]dto.FileResponse, bool, error)
 	GetStats(ctx context.Context) (*dto.AdminStatsResponse, error)
 }
 
@@ -46,26 +45,28 @@ func NewAdminService(
 	}
 }
 
-func (s *adminService) ListUsers(ctx context.Context, page, perPage int) ([]dto.UserResponse, int64, error) {
-	limit, offset := pagination.LimitOffset(page, perPage)
-
-	// Note: List and Count are separate queries; minor pagination inconsistency is acceptable for read-only operations.
-	users, err := s.userRepo.AdminList(ctx, limit, offset)
+func (s *adminService) ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to list users")
+		return nil, false, err
 	}
 
-	total, err := s.userRepo.AdminCount(ctx)
+	users, err := s.userRepo.AdminListCursor(ctx, cur)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to count users")
+		return nil, false, apperror.NewInternal("failed to list users")
+	}
+
+	hasMore := len(users) > pageSize
+	if hasMore {
+		users = users[:pageSize]
 	}
 
 	responses := make([]dto.UserResponse, len(users))
-	for i, u := range users {
-		responses[i] = *ToUserResponse(&u)
+	for i := range users {
+		responses[i] = *ToUserResponse(&users[i])
 	}
 
-	return responses, total, nil
+	return responses, hasMore, nil
 }
 
 func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error) {
@@ -120,22 +121,25 @@ func (s *adminService) UnbanUser(ctx context.Context, id int64) (*dto.UserRespon
 	return ToUserResponse(user), nil
 }
 
-func (s *adminService) ListFiles(ctx context.Context, page, perPage int) ([]dto.FileResponse, int64, error) {
-	limit, offset := pagination.LimitOffset(page, perPage)
-
-	// Note: List and Count are separate queries; minor pagination inconsistency is acceptable for read-only operations.
-	files, err := s.fileRepo.AdminList(ctx, limit, offset)
+func (s *adminService) ListFiles(ctx context.Context, limit int, startingAfter string) ([]dto.FileResponse, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to list files")
+		return nil, false, err
 	}
 
-	total, err := s.fileRepo.AdminCount(ctx)
+	files, err := s.fileRepo.AdminListCursor(ctx, cur)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to count files")
+		return nil, false, apperror.NewInternal("failed to list files")
+	}
+
+	hasMore := len(files) > pageSize
+	if hasMore {
+		files = files[:pageSize]
 	}
 
 	responses := make([]dto.FileResponse, len(files))
-	for i, f := range files {
+	for i := range files {
+		f := files[i]
 		responses[i] = dto.FileResponse{
 			ID:           f.ID,
 			OriginalName: f.OriginalName,
@@ -146,7 +150,7 @@ func (s *adminService) ListFiles(ctx context.Context, page, perPage int) ([]dto.
 		}
 	}
 
-	return responses, total, nil
+	return responses, hasMore, nil
 }
 
 func (s *adminService) GetStats(ctx context.Context) (*dto.AdminStatsResponse, error) {

@@ -50,6 +50,9 @@ func main() {
 	// Setup structured logging
 	logger.Setup(cfg.App.Env, cfg.App.LogLevel)
 
+	// Base URL for RFC 9457 problem "type" links in error responses.
+	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
+
 	// Create database pool
 	ctx := context.Background()
 	pool, err := database.NewPool(ctx, cfg.DB)
@@ -156,12 +159,19 @@ func main() {
 	healthChecker := health.NewChecker(pool, appCache)
 
 	// Create Fiber app
-	app := fiber.New(fiber.Config{
-		ServerHeader: "fiber-golang-boilerplate",
+	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
 		ErrorHandler: apperror.FiberErrorHandler,
 		BodyLimit:    cfg.App.BodyLimit,
-	})
+	}
+	// Behind a reverse proxy, only trust X-Forwarded-* from configured proxies
+	// so c.IP() (used for rate limiting) cannot be spoofed by clients.
+	if cfg.App.TrustProxy {
+		fiberCfg.TrustProxy = true
+		fiberCfg.ProxyHeader = fiber.HeaderXForwardedFor
+		fiberCfg.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: cfg.App.TrustedProxiesList()}
+	}
+	app := fiber.New(fiberCfg)
 
 	// Setup routes
 	router.SetupRoutes(app, router.Deps{

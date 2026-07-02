@@ -213,9 +213,9 @@ func TestRequestID_Generated(t *testing.T) {
 		t.Fatalf("app.Test failed: %v", err)
 	}
 
-	requestID := resp.Header.Get("X-Request-ID")
+	requestID := resp.Header.Get("X-Request-Id")
 	if requestID == "" {
-		t.Error("X-Request-ID should be generated when not provided")
+		t.Error("X-Request-Id should be generated when not provided")
 	}
 }
 
@@ -226,16 +226,16 @@ func TestRequestID_Passthrough(t *testing.T) {
 	})
 
 	req, _ := http.NewRequest("GET", "/test", http.NoBody)
-	req.Header.Set("X-Request-ID", "my-custom-id")
+	req.Header.Set("X-Request-Id", "my-custom-id")
 
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
 
-	requestID := resp.Header.Get("X-Request-ID")
+	requestID := resp.Header.Get("X-Request-Id")
 	if requestID != "my-custom-id" {
-		t.Errorf("X-Request-ID = %q, want my-custom-id", requestID)
+		t.Errorf("X-Request-Id = %q, want my-custom-id", requestID)
 	}
 }
 
@@ -337,8 +337,8 @@ func TestRecovery_PanicRecovered(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if result["success"] != false {
-		t.Error("success should be false")
+	if result["code"] != "internal_error" {
+		t.Errorf("code = %v, want internal_error", result["code"])
 	}
 }
 

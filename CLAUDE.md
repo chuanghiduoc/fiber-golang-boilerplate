@@ -38,17 +38,20 @@ Each layer depends only on the layer below via **interfaces** (constructor injec
 
 ## Error Handling
 
-- Return `*apperror.AppError` from services/handlers — auto-handled by `apperror.FiberErrorHandler` in Fiber config.
-- Constructors: `NewBadRequest`, `NewUnauthorized`, `NewForbidden`, `NewNotFound`, `NewInternal`, `NewValidation`.
+- Return `*apperror.AppError` from services/handlers — auto-rendered as RFC 9457 Problem Details (`application/problem+json`) by `apperror.FiberErrorHandler`.
+- Constructors: `NewBadRequest`, `NewUnauthorized`, `NewForbidden`, `NewNotFound`, `NewConflict`, `NewInternal`, `NewValidation(detail, []FieldError)`.
+- Problem fields: `type` (from `ERROR_DOCS_BASE_URL` + `/errors/<kebab-code>`), `title`, `status`, `code` (snake_case i18n key), `detail`, `instance`, `requestId`, `timestamp`, `errors[]` (validation/business).
 - Sentinel: `apperror.ErrNotFound` — repositories return this for missing records, services check with `errors.Is(err, apperror.ErrNotFound)`.
 
 ## Response Format
 
 Use `pkg/response` — never write raw JSON in handlers:
-- `response.Success(c, data)` — 200
-- `response.Created(c, data)` — 201
+- `response.Success(c, data)` — 200, resource returned directly (no envelope)
+- `response.Created(c, data)` — 201, resource directly
 - `response.NoContent(c)` — 204
-- `response.SuccessWithMeta(c, data, meta)` — 200 with pagination metadata
+- `response.List(c, data, hasMore)` — 200 Stripe-style `{object:"list", url, data, hasMore}`
+
+JSON keys are camelCase; the correlation header is `X-Request-Id`.
 
 ## Key Patterns
 
@@ -62,7 +65,7 @@ Use `pkg/response` — never write raw JSON in handlers:
 Constants in `internal/dto/role.go`: `dto.RoleUser`, `dto.RoleAdmin`. Use these instead of magic strings.
 
 ### Pagination
-`dto.PaginationQuery` embedded in list request DTOs. Use `pkg/pagination.Normalize()`, `LimitOffset()`, `TotalPages()`.
+List endpoints use forward-only cursor pagination (`dto.CursorQuery`: `limit` + `startingAfter`). Services call `buildCursor()`, repos expose `*Cursor` query methods backed by `(created_at, id)` indexes, handlers return `response.List(c, data, hasMore)`. Cursor helpers: `pagination.EncodeCursor/DecodeCursor/NormalizeLimit/RowLimit`. Offset helpers (`Normalize`, `LimitOffset`, `TotalPages`) remain for small tables on demand.
 
 ### Transactions
 `pkg/database.TxManager.WithTx(ctx, func(tx pgx.Tx) error { ... })` — pass `tx` to repository constructors inside the callback.

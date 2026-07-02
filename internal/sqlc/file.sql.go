@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const adminCountFiles = `-- name: AdminCountFiles :one
@@ -31,6 +33,54 @@ type AdminListFilesParams struct {
 
 func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) ([]File, error) {
 	rows, err := q.db.Query(ctx, adminListFiles, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []File{}
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OriginalName,
+			&i.StoragePath,
+			&i.MimeType,
+			&i.Size,
+			&i.CreatedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const adminListFilesCursor = `-- name: AdminListFilesCursor :many
+SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT $4::int
+`
+
+type AdminListFilesCursorParams struct {
+	HasCursor       bool               `json:"has_cursor"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCursorParams) ([]File, error) {
+	rows, err := q.db.Query(ctx, adminListFilesCursor,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +195,57 @@ func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
+SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE user_id = $1::bigint AND deleted_at IS NULL
+  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT $5::int
+`
+
+type ListFilesByUserCursorParams struct {
+	UserID          int64              `json:"user_id"`
+	HasCursor       bool               `json:"has_cursor"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUserCursorParams) ([]File, error) {
+	rows, err := q.db.Query(ctx, listFilesByUserCursor,
+		arg.UserID,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []File{}
+	for rows.Next() {
+		var i File
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OriginalName,
+			&i.StoragePath,
+			&i.MimeType,
+			&i.Size,
+			&i.CreatedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listFilesByUserID = `-- name: ListFilesByUserID :many

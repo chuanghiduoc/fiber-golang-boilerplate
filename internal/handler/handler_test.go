@@ -15,7 +15,6 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -37,9 +36,9 @@ func (m *mockUserService) Register(_ context.Context, req dto.RegisterRequest) (
 	return &dto.UserResponse{ID: 2, Email: req.Email, Name: req.Name, Role: "user"}, nil
 }
 
-func (m *mockUserService) Authenticate(_ context.Context, req dto.LoginRequest) (*sqlc.User, error) {
+func (m *mockUserService) Authenticate(_ context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
 	if req.Email == "test@example.com" && req.Password == "Password1!" {
-		return &sqlc.User{ID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
+		return &dto.UserResponse{ID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
 }
@@ -52,12 +51,12 @@ func (m *mockUserService) GetByID(_ context.Context, id int64) (*dto.UserRespons
 	return user, nil
 }
 
-func (m *mockUserService) List(_ context.Context, _, _ int) ([]dto.UserResponse, int64, error) {
+func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]dto.UserResponse, bool, error) {
 	users := make([]dto.UserResponse, 0, len(m.users))
 	for _, u := range m.users {
 		users = append(users, *u)
 	}
-	return users, int64(len(users)), nil
+	return users, false, nil
 }
 
 func (m *mockUserService) Update(_ context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
@@ -79,8 +78,8 @@ func (m *mockUserService) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string) (*sqlc.User, error) {
-	return &sqlc.User{ID: 1, Email: email, Name: name, Role: "user"}, nil
+func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string) (*dto.UserResponse, error) {
+	return &dto.UserResponse{ID: 1, Email: email, Name: name, Role: "user"}, nil
 }
 
 func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.ChangePasswordRequest) error {
@@ -94,11 +93,11 @@ func (m *mockRefreshTokenService) Create(_ context.Context, _ int64) (string, er
 	return "mock-refresh-token", nil
 }
 
-func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (*sqlc.RefreshToken, error) {
+func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (int64, error) {
 	if tokenStr == "valid-refresh-token" {
-		return &sqlc.RefreshToken{ID: 1, UserID: 1, Token: tokenStr}, nil
+		return 1, nil
 	}
-	return nil, apperror.NewUnauthorized("invalid refresh token")
+	return 0, apperror.NewUnauthorized("invalid refresh token")
 }
 
 func (m *mockRefreshTokenService) Revoke(_ context.Context, _ string) error {
@@ -462,8 +461,8 @@ func newMockAdminService() *mockAdminService {
 	}
 }
 
-func (m *mockAdminService) ListUsers(_ context.Context, _, _ int) ([]dto.UserResponse, int64, error) {
-	return m.users, int64(len(m.users)), nil
+func (m *mockAdminService) ListUsers(_ context.Context, _ int, _ string) ([]dto.UserResponse, bool, error) {
+	return m.users, false, nil
 }
 
 func (m *mockAdminService) UpdateRole(_ context.Context, id int64, role string) (*dto.UserResponse, error) {
@@ -494,8 +493,8 @@ func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (*dto.UserResp
 	return nil, apperror.NewNotFound("user not found")
 }
 
-func (m *mockAdminService) ListFiles(_ context.Context, _, _ int) ([]dto.FileResponse, int64, error) {
-	return m.files, int64(len(m.files)), nil
+func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]dto.FileResponse, bool, error) {
+	return m.files, false, nil
 }
 
 func (m *mockAdminService) GetStats(_ context.Context) (*dto.AdminStatsResponse, error) {
@@ -733,20 +732,20 @@ func (m *mockUploadService) GetFileInfo(_ context.Context, id, _ int64) (*dto.Fi
 	return f, nil
 }
 
-func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*sqlc.File, io.ReadCloser, error) {
+func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*dto.FileResponse, io.ReadCloser, error) {
 	if _, ok := m.files[id]; !ok {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
-	return &sqlc.File{ID: id, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
+	return &dto.FileResponse{ID: id, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
 		io.NopCloser(bytes.NewReader([]byte("file content"))), nil
 }
 
-func (m *mockUploadService) List(_ context.Context, _ int64, _, _ int) ([]dto.FileResponse, int64, error) {
+func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string) ([]dto.FileResponse, bool, error) {
 	files := make([]dto.FileResponse, 0, len(m.files))
 	for _, f := range m.files {
 		files = append(files, *f)
 	}
-	return files, int64(len(files)), nil
+	return files, false, nil
 }
 
 func (m *mockUploadService) Delete(_ context.Context, id, _ int64) error {

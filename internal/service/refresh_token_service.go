@@ -17,7 +17,8 @@ import (
 
 type RefreshTokenService interface {
 	Create(ctx context.Context, userID int64) (string, error)
-	Verify(ctx context.Context, token string) (*sqlc.RefreshToken, error)
+	// Verify validates the token and returns the associated user ID.
+	Verify(ctx context.Context, token string) (int64, error)
 	Revoke(ctx context.Context, token string) error
 	RevokeAllByUserID(ctx context.Context, userID int64) error
 }
@@ -57,21 +58,21 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64) (string,
 	return plainToken, nil // Return plaintext to client
 }
 
-func (s *refreshTokenService) Verify(ctx context.Context, token string) (*sqlc.RefreshToken, error) {
+func (s *refreshTokenService) Verify(ctx context.Context, token string) (int64, error) {
 	rt, err := s.repo.GetByToken(ctx, hashToken(token)) // Lookup by hash
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewUnauthorized("invalid refresh token")
+			return 0, apperror.NewUnauthorized("invalid refresh token")
 		}
-		return nil, apperror.NewInternal("failed to verify refresh token")
+		return 0, apperror.NewInternal("failed to verify refresh token")
 	}
 
 	if rt.ExpiresAt.Time.Before(time.Now()) {
 		_ = s.repo.Delete(ctx, hashToken(token))
-		return nil, apperror.NewUnauthorized("refresh token expired")
+		return 0, apperror.NewUnauthorized("refresh token expired")
 	}
 
-	return rt, nil
+	return rt.UserID, nil
 }
 
 func (s *refreshTokenService) Revoke(ctx context.Context, token string) error {

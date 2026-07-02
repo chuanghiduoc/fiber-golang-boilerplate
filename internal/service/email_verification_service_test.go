@@ -83,11 +83,12 @@ func TestVerify(t *testing.T) {
 			UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		}
 
-		// Create a valid token
-		vr.tokens["valid-token"] = &sqlc.EmailVerificationToken{
+		// Create a valid token — the repo stores only the hash, so the mock is
+		// keyed by hashToken(plaintext) just like the real service writes it.
+		vr.tokens[hashToken("valid-token")] = &sqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
-			Token:     "valid-token",
+			Token:     hashToken("valid-token"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
 		}
 
@@ -102,7 +103,7 @@ func TestVerify(t *testing.T) {
 		}
 
 		// Token should be deleted
-		if _, ok := vr.tokens["valid-token"]; ok {
+		if _, ok := vr.tokens[hashToken("valid-token")]; ok {
 			t.Error("token should be deleted after verification")
 		}
 	})
@@ -118,18 +119,18 @@ func TestVerify(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *apperror.AppError, got %T", err)
 		}
-		if appErr.Code != 400 {
-			t.Errorf("status = %d, want 400", appErr.Code)
+		if appErr.Status != 400 {
+			t.Errorf("status = %d, want 400", appErr.Status)
 		}
 	})
 
 	t.Run("expired token", func(t *testing.T) {
 		svc, _, vr, _, _ := newEmailVerifServiceForTest()
 
-		vr.tokens["expired"] = &sqlc.EmailVerificationToken{
+		vr.tokens[hashToken("expired")] = &sqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
-			Token:     "expired",
+			Token:     hashToken("expired"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-1 * time.Hour), Valid: true},
 		}
 
@@ -141,12 +142,12 @@ func TestVerify(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *apperror.AppError, got %T", err)
 		}
-		if appErr.Code != 400 {
-			t.Errorf("status = %d, want 400", appErr.Code)
+		if appErr.Status != 400 {
+			t.Errorf("status = %d, want 400", appErr.Status)
 		}
 
 		// Expired token should be deleted
-		if _, ok := vr.tokens["expired"]; ok {
+		if _, ok := vr.tokens[hashToken("expired")]; ok {
 			t.Error("expired token should be deleted")
 		}
 	})
@@ -190,8 +191,8 @@ func TestResendVerification(t *testing.T) {
 		if !ok {
 			t.Fatalf("expected *apperror.AppError, got %T", err)
 		}
-		if appErr.Code != 400 {
-			t.Errorf("status = %d, want 400", appErr.Code)
+		if appErr.Status != 400 {
+			t.Errorf("status = %d, want 400", appErr.Status)
 		}
 	})
 

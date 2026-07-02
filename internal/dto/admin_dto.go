@@ -5,12 +5,8 @@ type UpdateRoleRequest struct {
 }
 
 type AdminStatsResponse struct {
-	ActiveUsers   int64 `json:"active_users"`
-	DeletedUsers  int64 `json:"deleted_users"`
-	TotalFiles    int64 `json:"total_files"`
-	TotalFileSize int64 `json:"total_file_size"`
-}
-
-type AdminUserQuery struct {
-	PaginationQuery
+	ActiveUsers   int64 `json:"activeUsers"`
+	DeletedUsers  int64 `json:"deletedUsers"`
+	TotalFiles    int64 `json:"totalFiles"`
+	TotalFileSize int64 `json:"totalFileSize"`
 }

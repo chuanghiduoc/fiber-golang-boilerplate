@@ -14,15 +14,14 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 type UploadService interface {
 	Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*dto.FileResponse, error)
 	GetFileInfo(ctx context.Context, id, userID int64) (*dto.FileResponse, error)
-	Download(ctx context.Context, id, userID int64) (*sqlc.File, io.ReadCloser, error)
-	List(ctx context.Context, userID int64, page, perPage int) ([]dto.FileResponse, int64, error)
+	Download(ctx context.Context, id, userID int64) (*dto.FileResponse, io.ReadCloser, error)
+	List(ctx context.Context, userID int64, limit int, startingAfter string) ([]dto.FileResponse, bool, error)
 	Delete(ctx context.Context, id, userID int64) error
 }
 
@@ -80,7 +79,7 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 	return s.toFileResponse(file), nil
 }
 
-func (s *uploadService) Download(ctx context.Context, id, userID int64) (*sqlc.File, io.ReadCloser, error) {
+func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.FileResponse, io.ReadCloser, error) {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -98,29 +97,31 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*sqlc.F
 		return nil, nil, apperror.NewInternal("failed to read file from storage")
 	}
 
-	return file, reader, nil
+	return s.toFileResponse(file), reader, nil
 }
 
-func (s *uploadService) List(ctx context.Context, userID int64, page, perPage int) ([]dto.FileResponse, int64, error) {
-	limit, offset := pagination.LimitOffset(page, perPage)
-
-	// Note: List and Count are separate queries; minor pagination inconsistency is acceptable for read-only operations.
-	files, err := s.repo.ListByUserID(ctx, userID, limit, offset)
+func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string) ([]dto.FileResponse, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to list files")
+		return nil, false, err
 	}
 
-	total, err := s.repo.CountByUserID(ctx, userID)
+	files, err := s.repo.ListByUserCursor(ctx, userID, cur)
 	if err != nil {
-		return nil, 0, apperror.NewInternal("failed to count files")
+		return nil, false, apperror.NewInternal("failed to list files")
+	}
+
+	hasMore := len(files) > pageSize
+	if hasMore {
+		files = files[:pageSize]
 	}
 
 	responses := make([]dto.FileResponse, len(files))
-	for i, f := range files {
-		responses[i] = *s.toFileResponse(&f)
+	for i := range files {
+		responses[i] = *s.toFileResponse(&files[i])
 	}
 
-	return responses, total, nil
+	return responses, hasMore, nil
 }
 
 func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {

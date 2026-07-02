@@ -23,6 +23,14 @@ func NewLocalStorage(basePath string) (*LocalStorage, error) {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
+	// Canonicalize the base path (resolve symlinks / short names) so the prefix
+	// check in safePath compares like-for-like. Without this, a base dir that is
+	// itself a symlink (macOS /var, Windows 8.3 temp dirs) makes every safePath
+	// call falsely report path traversal.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+
 	return &LocalStorage{basePath: abs}, nil
 }
 

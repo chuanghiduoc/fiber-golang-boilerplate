@@ -257,15 +257,36 @@ func TestList(t *testing.T) {
 		repo.users[2] = &sqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
 		repo.nextID = 3
 
-		users, total, err := svc.List(context.Background(), 1, 10)
+		users, hasMore, err := svc.List(context.Background(), 10, "")
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		if total != 2 {
-			t.Errorf("expected total 2, got %d", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for a full page")
 		}
 		if len(users) != 2 {
 			t.Errorf("expected 2 users, got %d", len(users))
+		}
+	})
+
+	t.Run("hasMore when more rows exist", func(t *testing.T) {
+		repo := newMockUserRepo()
+		svc := newTestUserService(repo, false)
+
+		repo.users[1] = &sqlc.User{ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
+		repo.users[2] = &sqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
+		repo.nextID = 3
+
+		// Request a page smaller than the dataset.
+		users, hasMore, err := svc.List(context.Background(), 1, "")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if !hasMore {
+			t.Error("expected hasMore=true when more rows remain")
+		}
+		if len(users) != 1 {
+			t.Errorf("expected page trimmed to 1 user, got %d", len(users))
 		}
 	})
 }
@@ -323,8 +344,8 @@ func TestUpdate(t *testing.T) {
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Code != 404 {
-			t.Errorf("expected status 404, got %d", appErr.Code)
+		if appErr.Status != 404 {
+			t.Errorf("expected status 404, got %d", appErr.Status)
 		}
 	})
 }
@@ -495,11 +516,13 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		if user.ID != 1 {
 			t.Errorf("expected same user ID 1, got %d", user.ID)
 		}
-		if user.GoogleID.String != "google-456" {
-			t.Errorf("expected google ID linked, got %q", user.GoogleID.String)
+		// The service returns a DTO; verify the account was linked at the DB layer.
+		linked := repo.users[user.ID]
+		if linked.GoogleID.String != "google-456" {
+			t.Errorf("expected google ID linked, got %q", linked.GoogleID.String)
 		}
-		if user.AuthProvider != "google" {
-			t.Errorf("expected auth_provider 'google', got %q", user.AuthProvider)
+		if linked.AuthProvider != "google" {
+			t.Errorf("expected auth_provider 'google', got %q", linked.AuthProvider)
 		}
 	})
 
@@ -514,11 +537,12 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		if user.Email != "new@example.com" {
 			t.Errorf("expected email new@example.com, got %s", user.Email)
 		}
-		if user.GoogleID.String != "google-789" {
-			t.Errorf("expected google ID google-789, got %q", user.GoogleID.String)
+		created := repo.users[user.ID]
+		if created.GoogleID.String != "google-789" {
+			t.Errorf("expected google ID google-789, got %q", created.GoogleID.String)
 		}
-		if user.AuthProvider != "google" {
-			t.Errorf("expected auth_provider 'google', got %q", user.AuthProvider)
+		if created.AuthProvider != "google" {
+			t.Errorf("expected auth_provider 'google', got %q", created.AuthProvider)
 		}
 	})
 }

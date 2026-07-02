@@ -70,3 +70,16 @@ SELECT * FROM users ORDER BY id LIMIT $1 OFFSET $2;
 
 -- name: AdminCountUsers :one
 SELECT count(*) FROM users;
+
+-- name: ListUsersCursor :many
+SELECT * FROM users
+WHERE deleted_at IS NULL
+  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- name: AdminListUsersCursor :many
+SELECT * FROM users
+WHERE (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;

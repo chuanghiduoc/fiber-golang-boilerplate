@@ -27,3 +27,16 @@ SELECT * FROM files ORDER BY id DESC LIMIT $1 OFFSET $2;
 
 -- name: AdminCountFiles :one
 SELECT count(*) FROM files;
+
+-- name: ListFilesByUserCursor :many
+SELECT * FROM files
+WHERE user_id = @user_id::bigint AND deleted_at IS NULL
+  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- name: AdminListFilesCursor :many
+SELECT * FROM files
+WHERE (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;

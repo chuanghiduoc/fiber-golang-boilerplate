@@ -40,15 +40,12 @@ func TestSuccess(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
-	if result["success"] != true {
-		t.Error("success should be true")
+	// Success returns the resource directly, with no envelope.
+	if result["key"] != "value" {
+		t.Errorf("body.key = %v, want value", result["key"])
 	}
-	data, ok := result["data"].(map[string]any)
-	if !ok {
-		t.Fatal("data should be a map")
-	}
-	if data["key"] != "value" {
-		t.Errorf("data.key = %v, want value", data["key"])
+	if _, hasEnvelope := result["data"]; hasEnvelope {
+		t.Error("success response should not wrap data in an envelope")
 	}
 }
 
@@ -72,8 +69,8 @@ func TestCreated(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if result["success"] != true {
-		t.Error("success should be true")
+	if result["id"] != "1" {
+		t.Errorf("body.id = %v, want 1", result["id"])
 	}
 }
 
@@ -86,89 +83,41 @@ func TestNoContent(t *testing.T) {
 	}
 }
 
-func TestSuccessWithMeta(t *testing.T) {
+func TestList(t *testing.T) {
 	app := newTestApp(func(c fiber.Ctx) error {
-		meta := NewMeta(1, 10, 25)
-		return SuccessWithMeta(c, []string{"a", "b"}, meta)
+		return List(c, []string{"a", "b"}, true)
 	})
 
 	resp, result := doRequest(t, app)
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
 	}
-	if result["success"] != true {
-		t.Error("success should be true")
+	if result["object"] != "list" {
+		t.Errorf("object = %v, want list", result["object"])
 	}
-	meta, ok := result["meta"].(map[string]any)
-	if !ok {
-		t.Fatal("meta should be a map")
+	if result["url"] != "/test" {
+		t.Errorf("url = %v, want /test", result["url"])
 	}
-	if meta["page"] != float64(1) {
-		t.Errorf("meta.page = %v, want 1", meta["page"])
+	if result["hasMore"] != true {
+		t.Errorf("hasMore = %v, want true", result["hasMore"])
 	}
-	if meta["per_page"] != float64(10) {
-		t.Errorf("meta.per_page = %v, want 10", meta["per_page"])
-	}
-	if meta["total"] != float64(25) {
-		t.Errorf("meta.total = %v, want 25", meta["total"])
-	}
-	if meta["total_page"] != float64(3) {
-		t.Errorf("meta.total_page = %v, want 3", meta["total_page"])
+	data, ok := result["data"].([]any)
+	if !ok || len(data) != 2 {
+		t.Fatalf("data should be a 2-element array, got %v", result["data"])
 	}
 }
 
-func TestError(t *testing.T) {
+func TestList_EmptySerialisesAsArray(t *testing.T) {
 	app := newTestApp(func(c fiber.Ctx) error {
-		return Error(c, 400, "BAD_REQUEST", "invalid input")
+		return List(c, []string{}, false)
 	})
 
-	resp, result := doRequest(t, app)
-	if resp.StatusCode != 400 {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
-	}
-	if result["success"] != false {
-		t.Error("success should be false")
-	}
-	errObj, ok := result["error"].(map[string]any)
+	_, result := doRequest(t, app)
+	data, ok := result["data"].([]any)
 	if !ok {
-		t.Fatal("error should be a map")
+		t.Fatalf("empty data should serialise as [], got %T", result["data"])
 	}
-	if errObj["code"] != "BAD_REQUEST" {
-		t.Errorf("error.code = %v, want BAD_REQUEST", errObj["code"])
-	}
-	if errObj["message"] != "invalid input" {
-		t.Errorf("error.message = %v, want invalid input", errObj["message"])
-	}
-}
-
-func TestErrorWithDetails(t *testing.T) {
-	app := newTestApp(func(c fiber.Ctx) error {
-		return ErrorWithDetails(c, 422, "VALIDATION_ERROR", "validation failed",
-			map[string]string{"field": "required"})
-	})
-
-	resp, result := doRequest(t, app)
-	if resp.StatusCode != 422 {
-		t.Errorf("status = %d, want 422", resp.StatusCode)
-	}
-	errObj := result["error"].(map[string]any)
-	if errObj["details"] == nil {
-		t.Error("details should not be nil")
-	}
-}
-
-func TestNewMeta(t *testing.T) {
-	meta := NewMeta(2, 10, 25)
-	if meta.Page != 2 {
-		t.Errorf("Page = %d, want 2", meta.Page)
-	}
-	if meta.PerPage != 10 {
-		t.Errorf("PerPage = %d, want 10", meta.PerPage)
-	}
-	if meta.Total != 25 {
-		t.Errorf("Total = %d, want 25", meta.Total)
-	}
-	if meta.TotalPage != 3 {
-		t.Errorf("TotalPage = %d, want 3", meta.TotalPage)
+	if len(data) != 0 {
+		t.Errorf("expected empty array, got %v", data)
 	}
 }

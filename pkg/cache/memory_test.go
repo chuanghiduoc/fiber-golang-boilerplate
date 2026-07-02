@@ -118,6 +118,55 @@ func TestClose(t *testing.T) {
 	}
 }
 
+func TestCloseIsIdempotent(t *testing.T) {
+	mc := NewMemoryCache()
+	_ = mc.Close()
+	// A second Close must not panic on a closed channel.
+	if err := mc.Close(); err != nil {
+		t.Errorf("second Close returned error: %v", err)
+	}
+}
+
+func TestIncrement(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	for want := int64(1); want <= 3; want++ {
+		got, err := mc.Increment(ctx, "counter", time.Minute)
+		if err != nil {
+			t.Fatalf("Increment failed: %v", err)
+		}
+		if got != want {
+			t.Errorf("Increment = %d, want %d", got, want)
+		}
+	}
+
+	// The stored value should be readable as the latest count.
+	v, _ := mc.Get(ctx, "counter")
+	if string(v) != "3" {
+		t.Errorf("stored counter = %q, want %q", v, "3")
+	}
+}
+
+func TestIncrementExpiryNotExtended(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if _, err := mc.Increment(ctx, "c", 5*time.Millisecond); err != nil {
+		t.Fatalf("Increment failed: %v", err)
+	}
+	// A later increment must keep the original short expiry, not reset it.
+	if _, err := mc.Increment(ctx, "c", time.Hour); err != nil {
+		t.Fatalf("Increment failed: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got, _ := mc.Get(ctx, "c"); got != nil {
+		t.Errorf("counter should have expired on its original window, got %q", got)
+	}
+}
+
 func TestPing(t *testing.T) {
 	mc := NewMemoryCache()
 	defer mc.Close()

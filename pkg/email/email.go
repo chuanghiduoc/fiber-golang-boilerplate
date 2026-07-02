@@ -25,7 +25,7 @@ func NewSender(cfg config.EmailConfig) (Sender, error) {
 	case "console":
 		return NewConsoleSender(), nil
 	default:
-		return NewConsoleSender(), nil
+		return nil, fmt.Errorf("unknown email driver: %q (must be one of: console, smtp)", cfg.Driver)
 	}
 }
 

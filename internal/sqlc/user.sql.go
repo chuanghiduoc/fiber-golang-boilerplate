@@ -63,6 +63,57 @@ func (q *Queries) AdminListUsers(ctx context.Context, arg AdminListUsersParams) 
 	return items, nil
 }
 
+const adminListUsersCursor = `-- name: AdminListUsersCursor :many
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users
+WHERE (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT $4::int
+`
+
+type AdminListUsersCursorParams struct {
+	HasCursor       bool               `json:"has_cursor"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCursorParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, adminListUsersCursor,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []User{}
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.PasswordHash,
+			&i.Name,
+			&i.Role,
+			&i.GoogleID,
+			&i.AuthProvider,
+			&i.EmailVerifiedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countDeletedUsers = `-- name: CountDeletedUsers :one
 SELECT count(*) FROM users WHERE deleted_at IS NOT NULL
 `
@@ -329,6 +380,58 @@ type ListUsersParams struct {
 
 func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error) {
 	rows, err := q.db.Query(ctx, listUsers, arg.Limit, arg.Offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []User{}
+	for rows.Next() {
+		var i User
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.PasswordHash,
+			&i.Name,
+			&i.Role,
+			&i.GoogleID,
+			&i.AuthProvider,
+			&i.EmailVerifiedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUsersCursor = `-- name: ListUsersCursor :many
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users
+WHERE deleted_at IS NULL
+  AND (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
+ORDER BY created_at DESC, id DESC
+LIMIT $4::int
+`
+
+type ListUsersCursorParams struct {
+	HasCursor       bool               `json:"has_cursor"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams) ([]User, error) {
+	rows, err := q.db.Query(ctx, listUsersCursor,
+		arg.HasCursor,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -22,9 +22,9 @@ func NewAdminHandler(svc service.AdminService) *AdminHandler {
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
-// @Success 200 {object} response.Response{data=dto.AdminStatsResponse}
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
+// @Success 200 {object} dto.AdminStatsResponse
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/stats [get]
 func (h *AdminHandler) GetStats(c fiber.Ctx) error {
 	stats, err := h.service.GetStats(c.Context())
@@ -41,24 +41,24 @@ func (h *AdminHandler) GetStats(c fiber.Ctx) error {
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
-// @Param page query int false "Page number" default(1)
-// @Param per_page query int false "Items per page" default(10)
-// @Success 200 {object} response.Response{data=[]dto.UserResponse,meta=response.Meta}
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
+// @Param limit query int false "Max items to return" default(20)
+// @Param startingAfter query string false "Cursor from the last item of the previous page"
+// @Success 200 {object} response.ListResponse{data=[]dto.UserResponse}
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/users [get]
 func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
-	page, perPage, err := paginationQuery(c)
+	limit, startingAfter, err := cursorQuery(c)
 	if err != nil {
 		return err
 	}
 
-	users, total, err := h.service.ListUsers(c.Context(), page, perPage)
+	users, hasMore, err := h.service.ListUsers(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	return response.SuccessWithMeta(c, users, response.NewMeta(page, perPage, total))
+	return response.List(c, users, hasMore)
 }
 
 // UpdateRole godoc
@@ -70,11 +70,11 @@ func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
 // @Security BearerAuth
 // @Param id path int true "User ID"
 // @Param request body dto.UpdateRoleRequest true "Role update request"
-// @Success 200 {object} response.Response{data=dto.UserResponse}
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
-// @Failure 404 {object} response.Response
+// @Success 200 {object} dto.UserResponse
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/role [put]
 func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
@@ -103,10 +103,10 @@ func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 // @Security BearerAuth
 // @Param id path int true "User ID"
 // @Success 204
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
-// @Failure 404 {object} response.Response
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/ban [post]
 func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
@@ -128,11 +128,11 @@ func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param id path int true "User ID"
-// @Success 200 {object} response.Response{data=dto.UserResponse}
-// @Failure 400 {object} response.Response
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
-// @Failure 404 {object} response.Response
+// @Success 200 {object} dto.UserResponse
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/unban [post]
 func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
@@ -154,22 +154,22 @@ func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
-// @Param page query int false "Page number" default(1)
-// @Param per_page query int false "Items per page" default(10)
-// @Success 200 {object} response.Response{data=[]dto.FileResponse,meta=response.Meta}
-// @Failure 401 {object} response.Response
-// @Failure 403 {object} response.Response
+// @Param limit query int false "Max items to return" default(20)
+// @Param startingAfter query string false "Cursor from the last item of the previous page"
+// @Success 200 {object} response.ListResponse{data=[]dto.FileResponse}
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/files [get]
 func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
-	page, perPage, err := paginationQuery(c)
+	limit, startingAfter, err := cursorQuery(c)
 	if err != nil {
 		return err
 	}
 
-	files, total, err := h.service.ListFiles(c.Context(), page, perPage)
+	files, hasMore, err := h.service.ListFiles(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	return response.SuccessWithMeta(c, files, response.NewMeta(page, perPage, total))
+	return response.List(c, files, hasMore)
 }

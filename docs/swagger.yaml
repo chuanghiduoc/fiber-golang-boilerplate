@@ -1,35 +1,67 @@
 basePath: /api/v1
 definitions:
+  apperror.FieldError:
+    properties:
+      code:
+        type: string
+      message:
+        type: string
+      path:
+        type: string
+    type: object
+  apperror.ProblemDetails:
+    properties:
+      code:
+        type: string
+      detail:
+        type: string
+      errors:
+        items:
+          $ref: '#/definitions/apperror.FieldError'
+        type: array
+      instance:
+        type: string
+      requestId:
+        type: string
+      status:
+        type: integer
+      timestamp:
+        type: string
+      title:
+        type: string
+      type:
+        type: string
+    type: object
   dto.AdminStatsResponse:
     properties:
-      active_users:
+      activeUsers:
         type: integer
-      deleted_users:
+      deletedUsers:
         type: integer
-      total_file_size:
+      totalFileSize:
         type: integer
-      total_files:
+      totalFiles:
         type: integer
     type: object
   dto.ChangePasswordRequest:
     properties:
-      current_password:
+      currentPassword:
         type: string
-      new_password:
+      newPassword:
         type: string
     required:
-    - current_password
-    - new_password
+    - currentPassword
+    - newPassword
     type: object
   dto.FileResponse:
     properties:
-      created_at:
+      createdAt:
         type: string
       id:
         type: integer
-      mime_type:
+      mimeType:
         type: string
-      original_name:
+      originalName:
         type: string
       size:
         type: integer
@@ -55,19 +87,19 @@ definitions:
     type: object
   dto.LoginResponse:
     properties:
-      access_token:
+      accessToken:
         type: string
-      refresh_token:
+      refreshToken:
         type: string
       user:
         $ref: '#/definitions/dto.UserResponse'
     type: object
   dto.RefreshRequest:
     properties:
-      refresh_token:
+      refreshToken:
         type: string
     required:
-    - refresh_token
+    - refreshToken
     type: object
   dto.RegisterRequest:
     properties:
@@ -120,11 +152,11 @@ definitions:
     type: object
   dto.UserResponse:
     properties:
-      created_at:
+      createdAt:
         type: string
       email:
         type: string
-      email_verified:
+      emailVerified:
         type: boolean
       id:
         type: integer
@@ -132,7 +164,7 @@ definitions:
         type: string
       role:
         type: string
-      updated_at:
+      updatedAt:
         type: string
     type: object
   dto.VerifyEmailRequest:
@@ -142,34 +174,15 @@ definitions:
     required:
     - token
     type: object
-  response.ErrorInfo:
-    properties:
-      code:
-        type: string
-      details: {}
-      message:
-        type: string
-    type: object
-  response.Meta:
-    properties:
-      page:
-        type: integer
-      per_page:
-        type: integer
-      total:
-        type: integer
-      total_page:
-        type: integer
-    type: object
-  response.Response:
+  response.ListResponse:
     properties:
       data: {}
-      error:
-        $ref: '#/definitions/response.ErrorInfo'
-      meta:
-        $ref: '#/definitions/response.Meta'
-      success:
+      hasMore:
         type: boolean
+      object:
+        type: string
+      url:
+        type: string
     type: object
 info:
   contact: {}
@@ -181,16 +194,15 @@ paths:
     get:
       description: Get a paginated list of all files
       parameters:
-      - default: 1
-        description: Page number
+      - default: 20
+        description: Max items to return
         in: query
-        name: page
+        name: limit
         type: integer
-      - default: 10
-        description: Items per page
+      - description: Cursor from the last item of the previous page
         in: query
-        name: per_page
-        type: integer
+        name: startingAfter
+        type: string
       produces:
       - application/json
       responses:
@@ -198,23 +210,21 @@ paths:
           description: OK
           schema:
             allOf:
-            - $ref: '#/definitions/response.Response'
+            - $ref: '#/definitions/response.ListResponse'
             - properties:
                 data:
                   items:
                     $ref: '#/definitions/dto.FileResponse'
                   type: array
-                meta:
-                  $ref: '#/definitions/response.Meta'
               type: object
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: List all files (admin)
@@ -229,20 +239,15 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.AdminStatsResponse'
-              type: object
+            $ref: '#/definitions/dto.AdminStatsResponse'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Get system statistics
@@ -252,16 +257,15 @@ paths:
     get:
       description: Get a paginated list of all users including soft-deleted
       parameters:
-      - default: 1
-        description: Page number
+      - default: 20
+        description: Max items to return
         in: query
-        name: page
+        name: limit
         type: integer
-      - default: 10
-        description: Items per page
+      - description: Cursor from the last item of the previous page
         in: query
-        name: per_page
-        type: integer
+        name: startingAfter
+        type: string
       produces:
       - application/json
       responses:
@@ -269,23 +273,21 @@ paths:
           description: OK
           schema:
             allOf:
-            - $ref: '#/definitions/response.Response'
+            - $ref: '#/definitions/response.ListResponse'
             - properties:
                 data:
                   items:
                     $ref: '#/definitions/dto.UserResponse'
                   type: array
-                meta:
-                  $ref: '#/definitions/response.Meta'
               type: object
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: List all users (admin)
@@ -308,19 +310,19 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Ban a user
@@ -349,28 +351,23 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Update user role
@@ -391,28 +388,23 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Unban a user
@@ -436,19 +428,21 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/response.Response'
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Request password reset
       tags:
       - Auth
@@ -461,15 +455,15 @@ paths:
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Redirect to Google OAuth
       tags:
       - Auth
@@ -489,19 +483,19 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Google OAuth callback
       tags:
       - Auth
@@ -523,28 +517,23 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.LoginResponse'
-              type: object
+            $ref: '#/definitions/dto.LoginResponse'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Login
       tags:
       - Auth
@@ -568,11 +557,11 @@ paths:
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Logout
       tags:
       - Auth
@@ -594,28 +583,23 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.LoginResponse'
-              type: object
+            $ref: '#/definitions/dto.LoginResponse'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Refresh access token
       tags:
       - Auth
@@ -637,28 +621,23 @@ paths:
         "201":
           description: Created
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Register a new user
       tags:
       - Auth
@@ -680,19 +659,21 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/response.Response'
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Resend verification email
       tags:
       - Auth
@@ -714,19 +695,21 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/response.Response'
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Reset password
       tags:
       - Auth
@@ -748,19 +731,21 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/response.Response'
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "429":
           description: Too Many Requests
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       summary: Verify email address
       tags:
       - Auth
@@ -768,16 +753,15 @@ paths:
     get:
       description: Get a paginated list of the authenticated user's files
       parameters:
-      - default: 1
-        description: Page number
+      - default: 20
+        description: Max items to return
         in: query
-        name: page
+        name: limit
         type: integer
-      - default: 10
-        description: Items per page
+      - description: Cursor from the last item of the previous page
         in: query
-        name: per_page
-        type: integer
+        name: startingAfter
+        type: string
       produces:
       - application/json
       responses:
@@ -785,23 +769,21 @@ paths:
           description: OK
           schema:
             allOf:
-            - $ref: '#/definitions/response.Response'
+            - $ref: '#/definitions/response.ListResponse'
             - properties:
                 data:
                   items:
                     $ref: '#/definitions/dto.FileResponse'
                   type: array
-                meta:
-                  $ref: '#/definitions/response.Meta'
               type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: List user's files
@@ -822,19 +804,19 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Delete a file
@@ -854,24 +836,19 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.FileResponse'
-              type: object
+            $ref: '#/definitions/dto.FileResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Get file info
@@ -894,15 +871,15 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Download a file
@@ -925,24 +902,19 @@ paths:
         "201":
           description: Created
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.FileResponse'
-              type: object
+            $ref: '#/definitions/dto.FileResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Upload a file
@@ -952,16 +924,15 @@ paths:
     get:
       description: Get a paginated list of users
       parameters:
-      - default: 1
-        description: Page number
+      - default: 20
+        description: Max items to return
         in: query
-        name: page
+        name: limit
         type: integer
-      - default: 10
-        description: Items per page
+      - description: Cursor from the last item of the previous page
         in: query
-        name: per_page
-        type: integer
+        name: startingAfter
+        type: string
       produces:
       - application/json
       responses:
@@ -969,23 +940,21 @@ paths:
           description: OK
           schema:
             allOf:
-            - $ref: '#/definitions/response.Response'
+            - $ref: '#/definitions/response.ListResponse'
             - properties:
                 data:
                   items:
                     $ref: '#/definitions/dto.UserResponse'
                   type: array
-                meta:
-                  $ref: '#/definitions/response.Meta'
               type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: List users
@@ -1006,19 +975,19 @@ paths:
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Delete user
@@ -1038,24 +1007,19 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Get user by ID
@@ -1083,32 +1047,27 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "403":
           description: Forbidden
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Update user by ID
@@ -1123,16 +1082,11 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Get current user
@@ -1155,20 +1109,15 @@ paths:
         "200":
           description: OK
           schema:
-            allOf:
-            - $ref: '#/definitions/response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/dto.UserResponse'
-              type: object
+            $ref: '#/definitions/dto.UserResponse'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Update current user
@@ -1192,19 +1141,21 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/response.Response'
+            additionalProperties:
+              type: string
+            type: object
         "400":
           description: Bad Request
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
-            $ref: '#/definitions/response.Response'
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Change password

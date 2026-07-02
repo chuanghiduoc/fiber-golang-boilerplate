@@ -34,6 +34,22 @@ type AppConfig struct {
 	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"30"` // seconds
 	FrontendURL              string `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
 	RequireEmailVerification bool   `env:"REQUIRE_EMAIL_VERIFICATION" envDefault:"false"`
+	// TrustProxy enables reading the client IP from ProxyHeader only when the
+	// direct peer is in TrustedProxies. Required for correct rate limiting
+	// behind a reverse proxy; leaving it off prevents X-Forwarded-For spoofing.
+	TrustProxy     bool   `env:"APP_TRUST_PROXY" envDefault:"false"`
+	TrustedProxies string `env:"APP_TRUSTED_PROXIES"` // comma-separated IPs or CIDR ranges
+	// MetricsAuthToken, when set, requires a matching Bearer token to access
+	// the /metrics endpoint. Leave empty to keep /metrics open (local/dev only).
+	MetricsAuthToken string `env:"METRICS_AUTH_TOKEN"`
+	// ErrorDocsBaseURL is prepended to the RFC 9457 problem "type" URI, e.g.
+	// "https://docs.example.com" yields ".../errors/not-found". Empty = relative.
+	ErrorDocsBaseURL string `env:"ERROR_DOCS_BASE_URL"`
+}
+
+// TrustedProxiesList returns the parsed list of trusted proxy IPs/CIDRs.
+func (a AppConfig) TrustedProxiesList() []string {
+	return splitCSV(a.TrustedProxies)
 }
 
 type CORSConfig struct {
@@ -85,6 +101,10 @@ type EmailConfig struct {
 	SMTPPassword string `env:"SMTP_PASSWORD"`
 	FromAddress  string `env:"EMAIL_FROM_ADDRESS" envDefault:"noreply@localhost"`
 	FromName     string `env:"EMAIL_FROM_NAME" envDefault:"Fiber App"`
+	// SMTPRequireTLS fails the send when the server does not offer STARTTLS,
+	// preventing a downgrade that would send message content (reset/verification
+	// links) in cleartext. Leave false for local relays without TLS.
+	SMTPRequireTLS bool `env:"SMTP_REQUIRE_TLS" envDefault:"false"`
 }
 
 type StorageConfig struct {
@@ -100,16 +120,21 @@ type StorageConfig struct {
 	S3UseSSL         bool   `env:"STORAGE_S3_USE_SSL" envDefault:"false"`
 }
 
-// AllowedTypes returns the list of allowed MIME types for uploads.
-func (s StorageConfig) AllowedTypes() []string {
-	parts := strings.Split(s.AllowedMIMETypes, ",")
-	types := make([]string, 0, len(parts))
+// splitCSV splits a comma-separated string into trimmed, non-empty values.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
 	for _, p := range parts {
 		if t := strings.TrimSpace(p); t != "" {
-			types = append(types, t)
+			out = append(out, t)
 		}
 	}
-	return types
+	return out
+}
+
+// AllowedTypes returns the list of allowed MIME types for uploads.
+func (s StorageConfig) AllowedTypes() []string {
+	return splitCSV(s.AllowedMIMETypes)
 }
 
 type OAuthConfig struct {
@@ -121,38 +146,17 @@ type OAuthConfig struct {
 
 // Origins returns the list of allowed CORS origins.
 func (c CORSConfig) Origins() []string {
-	parts := strings.Split(c.AllowOrigins, ",")
-	origins := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			origins = append(origins, t)
-		}
-	}
-	return origins
+	return splitCSV(c.AllowOrigins)
 }
 
 // Methods returns the list of allowed CORS methods.
 func (c CORSConfig) Methods() []string {
-	parts := strings.Split(c.AllowMethods, ",")
-	methods := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			methods = append(methods, t)
-		}
-	}
-	return methods
+	return splitCSV(c.AllowMethods)
 }
 
 // Headers returns the list of allowed CORS headers.
 func (c CORSConfig) Headers() []string {
-	parts := strings.Split(c.AllowHeaders, ",")
-	headers := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			headers = append(headers, t)
-		}
-	}
-	return headers
+	return splitCSV(c.AllowHeaders)
 }
 
 func (db DBConfig) DSN() string {
@@ -204,19 +208,51 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("STORAGE_MAX_FILE_SIZE must be at least 1 byte")
 	}
 
-	// SMTP config validation
-	if cfg.Email.Driver == "smtp" {
+	// Database pool validation
+	if cfg.DB.MaxConns < 1 {
+		return fmt.Errorf("DB_MAX_CONNS must be at least 1")
+	}
+	if cfg.DB.MinConns < 0 {
+		return fmt.Errorf("DB_MIN_CONNS must not be negative")
+	}
+	if cfg.DB.MinConns > cfg.DB.MaxConns {
+		return fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", cfg.DB.MinConns, cfg.DB.MaxConns)
+	}
+
+	// Cache config validation
+	switch cfg.Cache.Driver {
+	case "memory":
+	case "redis":
+		if cfg.Cache.RedisURL == "" {
+			return fmt.Errorf("REDIS_URL is required when CACHE_DRIVER=redis")
+		}
+	default:
+		return fmt.Errorf("CACHE_DRIVER must be one of: memory, redis (got %q)", cfg.Cache.Driver)
+	}
+
+	// Email config validation
+	switch cfg.Email.Driver {
+	case "console":
+	case "smtp":
 		if cfg.Email.SMTPHost == "" {
 			return fmt.Errorf("SMTP_HOST is required when EMAIL_DRIVER=smtp")
 		}
 		if cfg.Email.SMTPPort < 1 || cfg.Email.SMTPPort > 65535 {
 			return fmt.Errorf("SMTP_PORT must be between 1 and 65535")
 		}
+	default:
+		return fmt.Errorf("EMAIL_DRIVER must be one of: console, smtp (got %q)", cfg.Email.Driver)
 	}
 
 	// CORS: AllowCredentials with wildcard origin is a spec violation
 	if cfg.CORS.AllowCredentials && cfg.CORS.AllowOrigins == "*" {
 		return fmt.Errorf("CORS_ALLOW_CREDENTIALS cannot be true when CORS_ALLOW_ORIGINS is '*'")
+	}
+
+	// Trusting proxies without an allowlist would let any client spoof
+	// X-Forwarded-For; require explicit proxy IPs/CIDRs.
+	if cfg.App.TrustProxy && len(cfg.App.TrustedProxiesList()) == 0 {
+		return fmt.Errorf("APP_TRUSTED_PROXIES must list at least one IP/CIDR when APP_TRUST_PROXY=true")
 	}
 
 	if cfg.OAuth.GoogleClientID != "" && cfg.OAuth.GoogleClientSecret == "" {

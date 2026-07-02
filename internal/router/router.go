@@ -1,6 +1,7 @@
 package router
 
 import (
+	"crypto/subtle"
 	"time"
 
 	"github.com/gofiber/contrib/v3/swagger"
@@ -49,16 +50,33 @@ func SetupRoutes(app *fiber.App, deps Deps) {
 	app.Get("/healthz", func(c fiber.Ctx) error {
 		return c.JSON(deps.Health.Liveness())
 	})
-	app.Get("/readyz", func(c fiber.Ctx) error {
-		return c.JSON(deps.Health.Readiness(c.Context()))
-	})
+	readiness := func(c fiber.Ctx) error {
+		st := deps.Health.Readiness(c.Context())
+		if st.Status != "up" {
+			// 503 lets load balancers drain traffic from a degraded instance.
+			return c.Status(fiber.StatusServiceUnavailable).JSON(st)
+		}
+		return c.JSON(st)
+	}
+	app.Get("/readyz", readiness)
 	// Keep /health as alias for readyz (backward compat)
-	app.Get("/health", func(c fiber.Ctx) error {
-		return c.JSON(deps.Health.Readiness(c.Context()))
-	})
+	app.Get("/health", readiness)
 
-	// Prometheus metrics endpoint
-	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+	// Prometheus metrics endpoint. When METRICS_AUTH_TOKEN is set, require a
+	// matching Bearer token so internal metrics are not publicly exposed.
+	metricsHandler := adaptor.HTTPHandler(promhttp.Handler())
+	if token := cfg.App.MetricsAuthToken; token != "" {
+		expected := []byte("Bearer " + token)
+		app.Get("/metrics", func(c fiber.Ctx) error {
+			got := []byte(c.Get(fiber.HeaderAuthorization))
+			if subtle.ConstantTimeCompare(got, expected) != 1 {
+				return fiber.NewError(fiber.StatusUnauthorized, "unauthorized")
+			}
+			return metricsHandler(c)
+		})
+	} else {
+		app.Get("/metrics", metricsHandler)
+	}
 
 	// API v1
 	RegisterV1Routes(app.Group("/api/v1"), deps)

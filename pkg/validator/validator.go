@@ -2,6 +2,8 @@ package validator
 
 import (
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"unicode"
 	"unicode/utf8"
@@ -20,6 +22,15 @@ func instance() *validator.Validate {
 	once.Do(func() {
 		validate = validator.New()
 		_ = validate.RegisterValidation("password", validatePassword)
+		// Report the JSON field name (camelCase) rather than the Go struct field
+		// name, so error paths match the request/response contract.
+		validate.RegisterTagNameFunc(func(fld reflect.StructField) string {
+			name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+			if name == "-" {
+				return ""
+			}
+			return name
+		})
 	})
 	return validate
 }
@@ -56,12 +67,36 @@ func ValidateStruct(s interface{}) error {
 		return apperror.NewBadRequest("invalid request")
 	}
 
-	details := make(map[string]string, len(validationErrors))
+	fields := make([]apperror.FieldError, 0, len(validationErrors))
 	for _, fe := range validationErrors {
-		details[fe.Field()] = formatError(fe)
+		fields = append(fields, apperror.FieldError{
+			Path:    fe.Field(),
+			Code:    codeForTag(fe.Tag()),
+			Message: formatError(fe),
+		})
 	}
 
-	return apperror.NewValidation("validation failed", details)
+	return apperror.NewValidation("One or more fields did not pass validation.", fields)
+}
+
+// codeForTag maps a validator tag to a stable snake_case error code (i18n key).
+func codeForTag(tag string) string {
+	switch tag {
+	case "required":
+		return "required"
+	case "email":
+		return "invalid_email"
+	case "min":
+		return "too_short"
+	case "max":
+		return "too_long"
+	case "password":
+		return "weak_password"
+	case "oneof":
+		return "invalid_value"
+	default:
+		return "invalid"
+	}
 }
 
 func formatError(fe validator.FieldError) string {

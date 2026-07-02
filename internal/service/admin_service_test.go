@@ -53,12 +53,12 @@ func TestAdminListUsers(t *testing.T) {
 		svc, ur, _, _, _ := newAdminServiceForTest()
 		seedUsers(ur, 3)
 
-		users, total, err := svc.ListUsers(context.Background(), 1, 10)
+		users, hasMore, err := svc.ListUsers(context.Background(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if total != 3 {
-			t.Errorf("total = %d, want 3", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for a full page")
 		}
 		if len(users) != 3 {
 			t.Errorf("len(users) = %d, want 3", len(users))
@@ -68,12 +68,12 @@ func TestAdminListUsers(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		svc, _, _, _, _ := newAdminServiceForTest()
 
-		users, total, err := svc.ListUsers(context.Background(), 1, 10)
+		users, hasMore, err := svc.ListUsers(context.Background(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if total != 0 {
-			t.Errorf("total = %d, want 0", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for an empty list")
 		}
 		if len(users) != 0 {
 			t.Errorf("len(users) = %d, want 0", len(users))
@@ -168,12 +168,12 @@ func TestAdminListFiles(t *testing.T) {
 		svc, _, fr, _, _ := newAdminServiceForTest()
 		seedFiles(fr, 2)
 
-		files, total, err := svc.ListFiles(context.Background(), 1, 10)
+		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if total != 2 {
-			t.Errorf("total = %d, want 2", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for a full page")
 		}
 		if len(files) != 2 {
 			t.Errorf("len(files) = %d, want 2", len(files))
@@ -189,12 +189,12 @@ func TestAdminListFiles(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		svc, _, _, _, _ := newAdminServiceForTest()
 
-		files, total, err := svc.ListFiles(context.Background(), 1, 10)
+		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if total != 0 {
-			t.Errorf("total = %d, want 0", total)
+		if hasMore {
+			t.Errorf("expected hasMore=false for an empty list")
 		}
 		if len(files) != 0 {
 			t.Errorf("len(files) = %d, want 0", len(files))

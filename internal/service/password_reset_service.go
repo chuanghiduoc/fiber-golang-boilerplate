@@ -84,10 +84,11 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	// Delete old tokens for this user
 	_ = s.resetRepo.DeleteByUserID(ctx, user.ID)
 
-	// Create new token with 1 hour expiry
+	// Create new token with 1 hour expiry. Store only the hash so a database
+	// leak cannot be used to reset passwords; the plaintext goes to the user.
 	_, err = s.resetRepo.Create(ctx, sqlc.CreatePasswordResetTokenParams{
 		UserID:    user.ID,
-		Token:     token,
+		Token:     hashToken(token),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(1 * time.Hour), Valid: true},
 	})
 	if err != nil {
@@ -120,9 +121,11 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		return apperror.NewInternal("failed to hash password")
 	}
 
+	tokenHash := hashToken(req.Token)
+
 	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository) error {
 		// Always use FOR UPDATE to prevent concurrent token reuse
-		rt, err := resetRepo.GetByTokenForUpdate(ctx, req.Token)
+		rt, err := resetRepo.GetByTokenForUpdate(ctx, tokenHash)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewBadRequest("invalid or expired reset token")
@@ -131,7 +134,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		}
 
 		if rt.ExpiresAt.Time.Before(time.Now()) {
-			if err := resetRepo.Delete(ctx, req.Token); err != nil {
+			if err := resetRepo.Delete(ctx, tokenHash); err != nil {
 				slog.Error("failed to delete expired reset token", slog.Any("error", err))
 			}
 			return apperror.NewBadRequest("reset token has expired")
@@ -144,7 +147,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		if err != nil {
 			return apperror.NewInternal("failed to update password")
 		}
-		if err := resetRepo.Delete(ctx, req.Token); err != nil {
+		if err := resetRepo.Delete(ctx, tokenHash); err != nil {
 			return apperror.NewInternal("failed to delete reset token")
 		}
 		if err := refreshRepo.DeleteByUserID(ctx, rt.UserID); err != nil {
