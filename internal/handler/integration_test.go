@@ -20,7 +20,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -31,12 +34,18 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, func()) {
 	pool, cleanup, err := testutil.SetupTestDB(ctx)
 	require.NoError(t, err)
 
+	refreshRepo := repository.NewRefreshTokenRepository(pool)
+	appCache := cache.NewMemoryCache()
+	txManager := database.NewTxManager(pool)
+
 	userRepo := repository.NewUserRepository(pool)
-	userSvc := service.NewUserService(userRepo, false)
+	userSvc := service.NewUserService(userRepo, refreshRepo, false, appCache, txManager)
 	userHandler := NewUserHandler(userSvc)
 
 	fileRepo := repository.NewFileRepository(pool)
-	adminSvc := service.NewAdminService(userRepo, fileRepo, nil)
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshRepo, store, txManager)
 	adminHandler := NewAdminHandler(adminSvc)
 
 	app := fiber.New(fiber.Config{
@@ -90,15 +99,10 @@ func TestIntegration_FullUserFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
 
-	var registerResp response.Response
+	// Register returns the created user resource directly (no envelope).
 	respBody, _ := io.ReadAll(resp.Body)
-	require.NoError(t, json.Unmarshal(respBody, &registerResp))
-	assert.True(t, registerResp.Success)
-
-	// Extract user ID from response
-	userData, _ := json.Marshal(registerResp.Data)
 	var userResp dto.UserResponse
-	require.NoError(t, json.Unmarshal(userData, &userResp))
+	require.NoError(t, json.Unmarshal(respBody, &userResp))
 	userID := userResp.ID
 
 	// 2. Get user (with JWT)
