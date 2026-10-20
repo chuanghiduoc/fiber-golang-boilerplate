@@ -10,7 +10,7 @@
 | [Feature Flags](feature-flags.md) | Compile-time catalog, precedence, environment force-off, database defaults and tenant/user targets, cache staleness, admin API, metrics |
 | [Webhooks](webhooks.md) | Outbound dispatch, HMAC signing and verification, SSRF-safe delivery, retries, replay, inbound sources, secrets, configuration |
 | [Tracing](tracing.md) | OpenTelemetry configuration, span privacy rules, collector, job trace links |
-| [Swagger](swagger.json) | Generated OpenAPI (served at `/swagger` outside production) |
+| [Swagger](swagger.json) | Generated OpenAPI, also as [YAML](swagger.yaml) (served at `/swagger` outside production) |
 
 Deployment and tooling:
 
