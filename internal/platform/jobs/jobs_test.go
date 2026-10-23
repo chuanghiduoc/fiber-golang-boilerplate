@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 func TestJobNormalize(t *testing.T) {
@@ -624,6 +627,18 @@ func TestWorkerOptions(t *testing.T) {
 	assert.Equal(t, 2*time.Minute, worker.jobTimeout)
 
 	assert.Equal(t, defaultJobTimeout, NewWorker(nil, "w").jobTimeout)
+	assert.Equal(t, defaultRetention, NewWorker(nil, "w").retention)
+	assert.Equal(t, defaultPurgeInterval, NewWorker(nil, "w").purgeInterval)
+
+	// Retention is enabled by default, disabled by a non-positive window, and
+	// the purge interval ignores non-positive values.
+	worker = NewWorker(nil, "w", WithRetention(0), WithPurgeInterval(0))
+	assert.Equal(t, time.Duration(0), worker.retention)
+	assert.Equal(t, defaultPurgeInterval, worker.purgeInterval)
+
+	worker = NewWorker(nil, "w", WithRetention(48*time.Hour), WithPurgeInterval(5*time.Minute))
+	assert.Equal(t, 48*time.Hour, worker.retention)
+	assert.Equal(t, 5*time.Minute, worker.purgeInterval)
 
 	// A heartbeat at or beyond the lease boundary would race expiry, so the
 	// interval is reduced to a quarter of the lease.
@@ -642,6 +657,257 @@ func TestWorkerOptions(t *testing.T) {
 	)
 	assert.Equal(t, 75*time.Second, worker.heartbeatInterval)
 	assert.Equal(t, 5*time.Minute, worker.leaseDuration)
+}
+
+// metricValue reads a Prometheus counter's current value.
+func metricValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	return testutil.ToFloat64(counter)
+}
+
+// TestWorkerMetrics checks that the job lifecycle counters move exactly once
+// per recorded outcome and only after the database write succeeds. It is not
+// parallel because the claim-error and purge counters are not labelled.
+func TestWorkerMetrics(t *testing.T) {
+	t.Run("claim error, claim, and success", func(t *testing.T) {
+		const kind = "metrics.claim.success"
+		fake := &fakeStore{
+			claimErrs: []error{errors.New("database unavailable")},
+			claimed: []claimedJob{{
+				ID:          100,
+				Kind:        kind,
+				Payload:     json.RawMessage(`{}`),
+				Attempts:    1,
+				MaxAttempts: 3,
+			}},
+		}
+		worker := NewWorker(nil, "metrics-worker", WithPollInterval(time.Millisecond))
+		worker.store = fake
+
+		handled := make(chan struct{})
+		worker.Register(kind, func(context.Context, json.RawMessage) error {
+			close(handled)
+			return nil
+		})
+
+		claimedBefore := metricValue(t, metrics.JobsClaimedTotal.WithLabelValues(kind))
+		succeededBefore := metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind))
+		claimErrorsBefore := metricValue(t, metrics.JobsClaimErrorsTotal)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() { errCh <- worker.Run(ctx) }()
+
+		select {
+		case <-handled:
+		case <-time.After(2 * time.Second):
+			cancel()
+			t.Fatal("worker did not process the job")
+		}
+		cancel()
+		select {
+		case err := <-errCh:
+			require.NoError(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker did not stop after context cancellation")
+		}
+
+		assert.Equal(t, claimedBefore+1,
+			metricValue(t, metrics.JobsClaimedTotal.WithLabelValues(kind)))
+		assert.Equal(t, succeededBefore+1,
+			metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind)))
+		assert.Equal(t, claimErrorsBefore+1, metricValue(t, metrics.JobsClaimErrorsTotal))
+	})
+
+	t.Run("retried", func(t *testing.T) {
+		const kind = "metrics.retried"
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "metrics-worker")
+		worker.store = fake
+		worker.retryBase = time.Millisecond
+		worker.retryMax = time.Millisecond
+		worker.Register(kind, func(context.Context, json.RawMessage) error {
+			return errors.New("temporary failure")
+		})
+
+		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
+		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          101,
+			Kind:        kind,
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+
+		assert.Equal(t, retriedBefore+1,
+			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+		assert.Equal(t, deadBefore,
+			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+	})
+
+	t.Run("dead", func(t *testing.T) {
+		const kind = "metrics.dead"
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "metrics-worker")
+		worker.store = fake
+		worker.Register(kind, func(context.Context, json.RawMessage) error {
+			return errors.New("permanent failure")
+		})
+
+		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
+		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          102,
+			Kind:        kind,
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    3,
+			MaxAttempts: 3,
+		}))
+
+		assert.Equal(t, retriedBefore,
+			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+		assert.Equal(t, deadBefore+1,
+			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+	})
+
+	t.Run("bookkeeping failure is not counted", func(t *testing.T) {
+		const kind = "metrics.bookkeeping.failure"
+		fake := &fakeStore{succeedErr: errors.New("database unavailable")}
+		worker := NewWorker(nil, "metrics-worker")
+		worker.store = fake
+		worker.Register(kind, func(context.Context, json.RawMessage) error { return nil })
+
+		succeededBefore := metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind))
+
+		err := worker.processJob(context.Background(), claimedJob{
+			ID:          103,
+			Kind:        kind,
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		})
+		require.Error(t, err)
+
+		assert.Equal(t, succeededBefore,
+			metricValue(t, metrics.JobsSucceededTotal.WithLabelValues(kind)),
+			"a failed success write must not count as a succeeded outcome")
+	})
+
+	t.Run("failed fail write is not counted", func(t *testing.T) {
+		const kind = "metrics.bookkeeping.fail"
+		fake := &fakeStore{failErr: errors.New("database unavailable")}
+		worker := NewWorker(nil, "metrics-worker")
+		worker.store = fake
+		worker.Register(kind, func(context.Context, json.RawMessage) error {
+			return errors.New("handler failure")
+		})
+
+		retriedBefore := metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind))
+		deadBefore := metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind))
+
+		err := worker.processJob(context.Background(), claimedJob{
+			ID:          104,
+			Kind:        kind,
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		})
+		require.Error(t, err)
+
+		assert.Equal(t, retriedBefore,
+			metricValue(t, metrics.JobsRetriedTotal.WithLabelValues(kind)))
+		assert.Equal(t, deadBefore,
+			metricValue(t, metrics.JobsDeadTotal.WithLabelValues(kind)))
+	})
+}
+
+func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
+	fake := &fakeStore{purgeRows: 3}
+	worker := NewWorker(nil, "purge-worker",
+		WithPollInterval(time.Millisecond),
+		WithRetention(time.Hour),
+		WithPurgeInterval(10*time.Millisecond),
+	)
+	worker.store = fake
+
+	before := metricValue(t, metrics.JobsPurgedTotal)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	calls := fake.purgeCallCount()
+	require.GreaterOrEqual(t, calls, 1, "the worker must run retention on the configured interval")
+	assert.Equal(t, time.Hour, fake.retentionSeen())
+	assert.Equal(t, before+float64(calls)*3, metricValue(t, metrics.JobsPurgedTotal))
+}
+
+func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
+	fake := &fakeStore{purgeErr: errors.New("purge unavailable")}
+	worker := NewWorker(nil, "purge-worker",
+		WithPollInterval(time.Millisecond),
+		WithRetention(time.Hour),
+		WithPurgeInterval(10*time.Millisecond),
+	)
+	worker.store = fake
+
+	before := metricValue(t, metrics.JobsPurgedTotal)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return fake.purgeCallCount() >= 2
+	}, 2*time.Second, 5*time.Millisecond, "a failed purge must not stop later attempts")
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	assert.Equal(t, before, metricValue(t, metrics.JobsPurgedTotal),
+		"a failed purge must not count as purged rows")
+}
+
+func TestWorkerRunRetentionDisabled(t *testing.T) {
+	fake := &fakeStore{purgeRows: 1}
+	worker := NewWorker(nil, "purge-worker",
+		WithPollInterval(time.Millisecond),
+		WithRetention(0),
+		WithPurgeInterval(time.Millisecond),
+	)
+	worker.store = fake
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	assert.Equal(t, 0, fake.purgeCallCount(), "a non-positive retention must disable purging")
 }
 
 func TestWorkerRunPassesLeaseDurationToClaim(t *testing.T) {
@@ -822,6 +1088,42 @@ func TestPGStoreHeartbeatRequiresPool(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoPool)
 }
 
+func TestPGStorePurgeTerminalValidation(t *testing.T) {
+	t.Parallel()
+
+	store := newPGStore(nil)
+
+	_, err := store.PurgeTerminal(context.Background(), 0)
+	require.ErrorIs(t, err, ErrInvalidRetention)
+
+	_, err = store.PurgeTerminal(context.Background(), -time.Hour)
+	require.ErrorIs(t, err, ErrInvalidRetention)
+
+	_, err = store.PurgeTerminal(context.Background(), time.Hour)
+	require.ErrorIs(t, err, ErrNoPool)
+
+	var nilStore *pgStore
+	_, err = nilStore.PurgeTerminal(context.Background(), time.Hour)
+	require.ErrorIs(t, err, ErrNoPool)
+}
+
+func TestQueuePurgeTerminalValidation(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewQueue(nil).PurgeTerminal(context.Background(), 30*24*time.Hour)
+	require.ErrorIs(t, err, ErrNoPool)
+
+	_, err = NewQueue(nil).PurgeTerminal(context.Background(), 0)
+	require.ErrorIs(t, err, ErrInvalidRetention)
+
+	_, err = NewQueue(nil).PurgeTerminal(context.Background(), -time.Second)
+	require.ErrorIs(t, err, ErrInvalidRetention)
+
+	var nilQueue *Queue
+	_, err = nilQueue.PurgeTerminal(context.Background(), time.Hour)
+	require.ErrorIs(t, err, ErrNoPool)
+}
+
 func TestQueueValidationBeforeDatabase(t *testing.T) {
 	t.Parallel()
 
@@ -913,9 +1215,15 @@ type fakeStore struct {
 	claimCalls     int
 	lastStaleAfter time.Duration
 	succeeded      []fakeSuccess
+	succeedErr     error
 	failures       []fakeFailure
+	failErr        error
 	heartbeats     []fakeHeartbeat
 	heartbeatErr   error
+	purgeCalls     int
+	purgeRows      int64
+	purgeErr       error
+	lastRetention  time.Duration
 }
 
 type fakeSuccess struct {
@@ -961,7 +1269,7 @@ func (f *fakeStore) Succeed(_ context.Context, id int64, workerID string, attemp
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.succeeded = append(f.succeeded, fakeSuccess{id: id, workerID: workerID, attempts: attempts})
-	return nil
+	return f.succeedErr
 }
 
 func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
@@ -974,7 +1282,7 @@ func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts 
 		reason:   reason,
 		retryAt:  retryAt,
 	})
-	return nil
+	return f.failErr
 }
 
 func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, attempts int) error {
@@ -982,6 +1290,26 @@ func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, atte
 	defer f.mu.Unlock()
 	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})
 	return f.heartbeatErr
+}
+
+func (f *fakeStore) PurgeTerminal(_ context.Context, olderThan time.Duration) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.purgeCalls++
+	f.lastRetention = olderThan
+	return f.purgeRows, f.purgeErr
+}
+
+func (f *fakeStore) purgeCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.purgeCalls
+}
+
+func (f *fakeStore) retentionSeen() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastRetention
 }
 
 func (f *fakeStore) succeededIDs() []int64 {

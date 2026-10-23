@@ -71,3 +71,18 @@ func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
 	}
 	return id, nil
 }
+
+// PurgeTerminal deletes succeeded and dead jobs whose last update is older than
+// olderThan and returns the number of deleted rows. Queue's normal worker also
+// runs this periodically; call it directly for operational cleanup. A
+// non-positive window returns ErrInvalidRetention and a nil pool returns
+// ErrNoPool. Queued and running jobs are never deleted.
+func (q *Queue) PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, ErrInvalidRetention
+	}
+	if q == nil || q.pool == nil {
+		return 0, ErrNoPool
+	}
+	return newPGStore(q.pool).PurgeTerminal(ctx, olderThan)
+}

@@ -283,6 +283,19 @@ transaction, so a crash cannot leave a usable link without a queued email.
   `last_error`; use them to inspect retries and dead letters. Successful and
   dead jobs have their `payload` cleared, so reset/verification links from email
   jobs are not retained after delivery.
+- A worker deletes terminal rows automatically: `succeeded` and `dead` jobs
+  whose `updated_at` is older than 30 days are purged, by default every hour.
+  Queued and running jobs are never deleted, regardless of age. Tune behavior
+  with `WithRetention` (default `30*24h`; a value less than or equal to zero
+  disables retention) and `WithPurgeInterval` (default `1h`; non-positive
+  values are ignored). Each purge uses a detached 10s context, and failures are
+  logged and retried on the next interval.
+- Prometheus counters expose job lifecycle and audit health:
+  `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
+  `jobs_retried_total{kind}`, `jobs_dead_total{kind}`,
+  `jobs_claim_errors_total`, `jobs_purged_total`, and
+  `audit_write_failures_total`. Outcome counters advance only after the
+  corresponding database write succeeds.
 - On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
   the app waits up to 10s for them to drain. Handlers must honor context
   cancellation: the worker cannot preempt a handler that ignores it, heartbeats

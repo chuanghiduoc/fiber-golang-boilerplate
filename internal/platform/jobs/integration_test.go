@@ -487,6 +487,55 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	assert.JSONEq(t, `{"ok":true}`, string(payload))
 }
 
+// TestPurgeTerminalIntegration covers the retention delete: only succeeded and
+// dead rows older than the window are removed; recent terminal rows and old
+// queued/running rows are retained.
+func TestPurgeTerminalIntegration(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	insertJob := func(kind, status string, age time.Duration) int64 {
+		t.Helper()
+		var id int64
+		err := pool.QueryRow(ctx, `
+			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+			VALUES ($1, '{}'::jsonb, $2, now(), 3,
+			        now() - make_interval(secs => $3::double precision),
+			        now() - make_interval(secs => $3::double precision))
+			RETURNING id`,
+			kind, status, age.Seconds(),
+		).Scan(&id)
+		require.NoError(t, err)
+		return id
+	}
+
+	oldSucceeded := insertJob("jobs.integration.retention.succeeded", "succeeded", 31*24*time.Hour)
+	oldDead := insertJob("jobs.integration.retention.dead", "dead", 31*24*time.Hour)
+	recentSucceeded := insertJob("jobs.integration.retention.recent", "succeeded", time.Hour)
+	oldQueued := insertJob("jobs.integration.retention.queued", "queued", 31*24*time.Hour)
+	oldRunning := insertJob("jobs.integration.retention.running", "running", 31*24*time.Hour)
+
+	purged, err := newPGStore(pool).PurgeTerminal(ctx, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), purged, "only old terminal rows must be deleted")
+
+	exists := func(id int64) bool {
+		t.Helper()
+		var found bool
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, id).Scan(&found))
+		return found
+	}
+
+	assert.False(t, exists(oldSucceeded), "an old succeeded job must be purged")
+	assert.False(t, exists(oldDead), "an old dead job must be purged")
+	assert.True(t, exists(recentSucceeded), "a recent terminal job must be retained")
+	assert.True(t, exists(oldQueued), "an old queued job must be retained")
+	assert.True(t, exists(oldRunning), "an old running job must be retained")
+}
+
 // setupIntegrationDB creates an isolated schema, applies the consolidated
 // init schema to it, and returns a pool whose connections use that schema.
 // TEST_DATABASE_URL must point at a PostgreSQL database where the user may

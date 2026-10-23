@@ -2,12 +2,16 @@ package audit
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type recordingRecorder struct {
@@ -59,4 +63,23 @@ func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {
 	_, _ = app.Test(req)
 
 	assert.Empty(t, recorder.events)
+}
+
+func TestMiddleware_CountsAuditWriteFailures(t *testing.T) {
+	before := testutil.ToFloat64(metrics.AuditWriteFailuresTotal)
+
+	recorder := &recordingRecorder{err: errors.New("database unavailable")}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Post("/admin/users/:id/ban", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	req, _ := http.NewRequest("POST", "/admin/users/7/ban", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+
+	assert.Equal(t, before+1, testutil.ToFloat64(metrics.AuditWriteFailuresTotal),
+		"a failed audit write must increment audit_write_failures_total")
 }
