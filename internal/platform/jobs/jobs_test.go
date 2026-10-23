@@ -301,28 +301,102 @@ func TestProcessJobUsesAttemptFence(t *testing.T) {
 func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeStore{}
-	worker := NewWorker(nil, "timeout-worker", WithJobTimeout(20*time.Millisecond))
-	worker.store = fake
-	worker.Register("blocking", func(ctx context.Context, _ json.RawMessage) error {
-		<-ctx.Done()
-		return ctx.Err()
+	t.Run("enabled timeout cancels a blocking handler", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "timeout-worker", WithJobTimeout(20*time.Millisecond))
+		worker.store = fake
+		worker.Register("blocking", func(ctx context.Context, _ json.RawMessage) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+
+		start := time.Now()
+		require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
+			ID:          32,
+			Kind:        "blocking",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+		assert.Less(t, time.Since(start), time.Second, "the handler must be canceled by the job timeout")
+
+		require.Len(t, fake.failures, 1)
+		assert.Contains(t, fake.failures[0].reason, "deadline exceeded")
+		assert.NotNil(t, fake.failures[0].retryAt, "a timed-out job with attempts left must retry")
+		assert.Empty(t, fake.succeededIDs())
 	})
 
-	start := time.Now()
-	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          32,
-		Kind:        "blocking",
-		Payload:     json.RawMessage(`{}`),
-		Attempts:    1,
-		MaxAttempts: 3,
-	}))
-	assert.Less(t, time.Since(start), time.Second, "the handler must be canceled by the job timeout")
+	t.Run("enabled timeout classifies a late nil return", func(t *testing.T) {
+		t.Parallel()
 
-	require.Len(t, fake.failures, 1)
-	assert.Contains(t, fake.failures[0].reason, "deadline exceeded")
-	assert.NotNil(t, fake.failures[0].retryAt, "a timed-out job with attempts left must retry")
-	assert.Empty(t, fake.succeededIDs())
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "timeout-worker", WithJobTimeout(20*time.Millisecond))
+		worker.store = fake
+		worker.Register("ignores-context", func(context.Context, json.RawMessage) error {
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		})
+
+		require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
+			ID:          33,
+			Kind:        "ignores-context",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+
+		require.Len(t, fake.failures, 1)
+		assert.Contains(t, fake.failures[0].reason, "job timeout")
+		assert.Empty(t, fake.succeededIDs(),
+			"a handler that returns nil after its deadline must not be marked succeeded")
+	})
+
+	t.Run("disabled timeout does not misclassify parent cancellation", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "timeout-worker", WithJobTimeout(0))
+		worker.store = fake
+		worker.Register("blocking", func(ctx context.Context, _ json.RawMessage) error {
+			<-ctx.Done()
+			return nil
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+
+		require.NoError(t, processJobWithWatchdog(t, worker, ctx, claimedJob{
+			ID:          34,
+			Kind:        "blocking",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+
+		assert.Equal(t, []int64{34}, fake.succeededIDs(),
+			"a disabled job timeout must not turn a successful handler into a timeout failure")
+		assert.Empty(t, fake.failures,
+			"a disabled timeout must not produce a handler exceeded the 0s job timeout failure")
+	})
+}
+
+// processJobWithWatchdog runs processJob in its own goroutine and fails the
+// test instead of hanging forever when a regression stops it from returning.
+func processJobWithWatchdog(t *testing.T, worker *Worker, ctx context.Context, job claimedJob) error {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() { done <- worker.processJob(ctx, job) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("processJob did not return within 2s")
+		return nil
+	}
 }
 
 func TestWorkerRunProcessesAndStops(t *testing.T) {

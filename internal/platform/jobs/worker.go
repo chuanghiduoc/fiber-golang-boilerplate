@@ -302,13 +302,17 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 
 		stopHeartbeat := w.startHeartbeat(ctx, job.ID, job.Attempts)
 		handlerErr = callHandler(handlerCtx, handler, job.Payload)
-		stopHeartbeat()
-		if handlerErr == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded) {
-			// The handler ignored cancellation and returned after its deadline.
-			handlerErr = fmt.Errorf("jobs: handler exceeded the %s job timeout", w.jobTimeout)
-		}
+		// Capture the deadline result immediately: stopHeartbeat can take time,
+		// and a disabled timeout must never classify a parent cancellation as a
+		// job timeout.
+		timedOut := w.jobTimeout > 0 && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
 		if cancel != nil {
 			cancel()
+		}
+		stopHeartbeat()
+		if handlerErr == nil && timedOut {
+			// The handler ignored cancellation and returned after its deadline.
+			handlerErr = fmt.Errorf("jobs: handler exceeded the %s job timeout", w.jobTimeout)
 		}
 	}
 
