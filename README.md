@@ -267,8 +267,9 @@ transaction, so a crash cannot leave a usable link without a queued email.
 - Each handler runs with a 10m timeout. Set it with `WithJobTimeout`; a value
   less than or equal to zero disables the deadline. A timed-out handler is
   canceled and recorded as a normal failure, so the job retries or is
-  dead-lettered. Heartbeats keep running while the handler unwinds, and the
-  final bookkeeping write uses a detached 5s context.
+  dead-lettered. Cancellation is cooperative: the worker cannot preempt a
+  handler that ignores its context, so heartbeats keep running until that
+  handler returns. The final bookkeeping write uses a detached 5s context.
 - Running jobs renew a lease with a 30s heartbeat (5m lease by default). A
   `running` job whose lease expires is requeued by the next claim, so a crashed
   worker does not block it forever. Reclamation happens inside the claim query,
@@ -283,8 +284,10 @@ transaction, so a crash cannot leave a usable link without a queued email.
   dead jobs have their `payload` cleared, so reset/verification links from email
   jobs are not retained after delivery.
 - On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
-  the app waits up to 10s for them to drain. Long handlers must honor context
-  cancellation.
+  the app waits up to 10s for them to drain. Handlers must honor context
+  cancellation: the worker cannot preempt a handler that ignores it, heartbeats
+  continue until that handler returns, and a non-cooperative handler can exceed
+  the shutdown drain window.
 
 ## Adding a New Module
 

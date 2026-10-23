@@ -202,10 +202,9 @@ func main() {
 	worker := jobs.NewWorker(pool, hostname, jobs.WithConcurrency(4))
 	worker.Register(jobs.EmailJobKind, jobs.EmailHandler(emailSender))
 	workerDone := make(chan struct{})
-	workerErrCh := make(chan error, 1)
 	go func() {
 		if err := worker.Run(workerCtx); err != nil {
-			workerErrCh <- err
+			slog.Error("job worker stopped", slog.Any("error", err))
 		}
 		close(workerDone)
 	}()
@@ -229,9 +228,6 @@ func main() {
 			slog.Error("server error", slog.Any("error", listenErr))
 			exitCode = 1
 		}
-	case workerErr := <-workerErrCh:
-		slog.Error("job worker stopped", slog.Any("error", workerErr))
-		exitCode = 1
 	case sig := <-sigChan:
 		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
 	}

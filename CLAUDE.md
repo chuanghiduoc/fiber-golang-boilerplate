@@ -104,7 +104,10 @@ Offset helpers are for small admin/export tables only.
   Claim errors are retried in-process with backoff capped at 30s. Handlers have
   a 10m default timeout (`WithJobTimeout`, non-positive disables it), and
   unknown kinds retry until `max_attempts` before dead-lettering. Heartbeats
-  renew a 5m lease every 30s; expired leases are reclaimed. Bookkeeping writes
+  renew a 5m lease every 30s; expired leases are reclaimed. Handlers must honor
+  context cancellation: the worker cannot preempt a handler that ignores it,
+  heartbeats continue until it returns, and a non-cooperative handler can
+  exceed the shutdown drain window (the app waits up to 10s). Bookkeeping writes
   are fenced by `attempts`, so a reclaimed worker cannot finish the job, though
   it may still be executing the old handler. Do not use `async.Go` for durable
   work.

@@ -380,6 +380,37 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 		assert.Empty(t, fake.failures,
 			"a disabled timeout must not produce a handler exceeded the 0s job timeout failure")
 	})
+
+	t.Run("expired parent deadline is not classified as job timeout", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "timeout-worker", WithJobTimeout(time.Minute))
+		worker.store = fake
+		worker.Register("ok", func(context.Context, json.RawMessage) error {
+			return nil
+		})
+
+		parent, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		require.ErrorIs(t, parent.Err(), context.DeadlineExceeded)
+
+		require.NoError(t, processJobWithWatchdog(t, worker, parent, claimedJob{
+			ID:          35,
+			Kind:        "ok",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+
+		assert.Equal(t, []int64{35}, fake.succeededIDs(),
+			"an already-expired parent deadline must not be mislabeled as a job timeout")
+		for _, failure := range fake.failures {
+			assert.NotContains(t, failure.reason, "job timeout")
+		}
+		assert.Empty(t, fake.failures,
+			"the handler's nil result must be recorded as success despite the expired parent")
+	})
 }
 
 // processJobWithWatchdog runs processJob in its own goroutine and fails the

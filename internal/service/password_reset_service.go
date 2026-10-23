@@ -124,6 +124,11 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 			// Enqueue on the same transaction: a crash between the token insert
 			// and the enqueue cannot leave a usable reset link without an email.
 			if err := txSender.SendTx(ctx, tx, msg); err != nil {
+				slog.Error("failed to enqueue password reset email",
+					slog.Int64("user_id", user.ID),
+					slog.String("email", user.Email),
+					slog.Any("error", err),
+				)
 				return apperror.NewInternal("failed to process request")
 			}
 			queuedInTx = true

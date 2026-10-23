@@ -304,8 +304,9 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 		handlerErr = callHandler(handlerCtx, handler, job.Payload)
 		// Capture the deadline result immediately: stopHeartbeat can take time,
 		// and a disabled timeout must never classify a parent cancellation as a
-		// job timeout.
-		timedOut := w.jobTimeout > 0 && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
+		// job timeout. Require the parent context to still be active so an
+		// already-expired parent deadline is not mislabeled as a job timeout.
+		timedOut := w.jobTimeout > 0 && ctx.Err() == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
 		if cancel != nil {
 			cancel()
 		}
