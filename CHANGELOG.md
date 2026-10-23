@@ -18,7 +18,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Add a `token_version` JWT claim plus a generation-keyed session cache: password changes/resets, bans, unbans, and role changes invalidate existing access tokens immediately without stale write-after-invalidate snapshots
 - Track `password_changed_at` and reject reset links issued before the last password or email change
 - Bind email-verification tokens to the address they were sent to and require the address to still match at verification time
-- Add `POST /auth/logout-all` to revoke every refresh token for the current user
+- Add `POST /auth/logout-all` to revoke every refresh token and bump the token version, invalidating access tokens immediately
 - Add admin file takedown (`DELETE /admin/files/:id`) and owner `includeDeleted=true` listing for trash/restore
 - Normalize emails (trim + lowercase), enforce case-insensitive uniqueness among active users, and allow email reuse after soft delete
 - Reset `email_verified_at` on email change, require the current password for self-service email changes, invalidate old verification tokens, and send a fresh link
@@ -48,6 +48,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - S3 downloads stat the object before responding and bound/cancel the stream; missing objects no longer surface after a 200
 - Integration tests can run without Docker via `TEST_DATABASE_URL` using an isolated schema
 - JSON bodies reject unknown fields and trailing values; duplicate emails return 409, oversized uploads 413, and unsupported media 415
+- Non-owned user/file IDs return 404 instead of 403 so sequential IDs cannot be used to confirm another tenant's resources exist
 - `TxManager.WithTx` now uses `errors.Join` on rollback failure so `errors.Is/As` still see the original business error
 - Fix cross-platform path-traversal false positive: canonicalize the local storage base path (symlink/8.3 resolution)
 - Readiness returns HTTP 503 when degraded; readiness checks now run truly in parallel

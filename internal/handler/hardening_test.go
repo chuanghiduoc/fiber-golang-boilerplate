@@ -31,7 +31,7 @@ func TestGetByID_OtherUserForbidden(t *testing.T) {
 
 	resp, err := app.Test(req)
 	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 }
 
 func TestUpdateMe_EmailChangeRequiresPassword(t *testing.T) {

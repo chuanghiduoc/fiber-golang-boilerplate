@@ -121,7 +121,8 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 	}
 
 	if file.UserID != userID {
-		return nil, apperror.NewForbidden("you can only access your own files")
+		// Do not reveal that another tenant's file ID exists.
+		return nil, apperror.NewNotFound("file not found")
 	}
 
 	return s.toFileResponse(file), nil
@@ -137,7 +138,7 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 	}
 
 	if file.UserID != userID {
-		return nil, nil, apperror.NewForbidden("you can only access your own files")
+		return nil, nil, apperror.NewNotFound("file not found")
 	}
 
 	// The response body is streamed after the handler returns, at which point
@@ -186,7 +187,7 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 	}
 
 	if file.UserID != userID {
-		return apperror.NewForbidden("you can only delete your own files")
+		return apperror.NewNotFound("file not found")
 	}
 
 	// Soft delete — do NOT remove from storage so the file can be restored.
@@ -214,7 +215,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 		return nil, apperror.NewInternal("failed to get file")
 	}
 	if file.UserID != userID {
-		return nil, apperror.NewForbidden("you can only restore your own files")
+		return nil, apperror.NewNotFound("file not found")
 	}
 	if !file.DeletedAt.Valid {
 		return nil, apperror.NewConflict("file is not deleted")

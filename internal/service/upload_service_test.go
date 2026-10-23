@@ -150,14 +150,14 @@ func TestGetFileInfo(t *testing.T) {
 
 		_, err := svc.GetFileInfo(context.Background(), 1, 99) // wrong user
 		if err == nil {
-			t.Fatal("expected forbidden error")
+			t.Fatal("expected not-found error")
 		}
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 403 {
-			t.Errorf("expected 403, got %d", appErr.Status)
+		if appErr.Status != 404 {
+			t.Errorf("expected 404, got %d", appErr.Status)
 		}
 	})
 }
@@ -214,14 +214,14 @@ func TestUploadDelete(t *testing.T) {
 
 		err := svc.Delete(context.Background(), 1, 99) // wrong user
 		if err == nil {
-			t.Fatal("expected forbidden error")
+			t.Fatal("expected not-found error")
 		}
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 403 {
-			t.Errorf("expected 403, got %d", appErr.Status)
+		if appErr.Status != 404 {
+			t.Errorf("expected 404, got %d", appErr.Status)
 		}
 	})
 }
@@ -285,14 +285,14 @@ func TestUploadDownload(t *testing.T) {
 
 		_, _, err := svc.Download(context.Background(), 1, 99)
 		if err == nil {
-			t.Fatal("expected forbidden error")
+			t.Fatal("expected not-found error")
 		}
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) {
 			t.Fatalf("expected AppError, got %T", err)
 		}
-		if appErr.Status != 403 {
-			t.Errorf("expected 403, got %d", appErr.Status)
+		if appErr.Status != 404 {
+			t.Errorf("expected 404, got %d", appErr.Status)
 		}
 	})
 

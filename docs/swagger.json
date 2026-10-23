@@ -1275,12 +1275,6 @@
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
-                    "403": {
-                        "description": "Forbidden",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
                     "404": {
                         "description": "Not Found",
                         "schema": {
@@ -1321,12 +1315,6 @@
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1380,12 +1368,6 @@
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
-                    "403": {
-                        "description": "Forbidden",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
                     "404": {
                         "description": "Not Found",
                         "schema": {
@@ -1434,12 +1416,6 @@
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1711,12 +1687,6 @@
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }

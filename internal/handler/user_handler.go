@@ -54,7 +54,6 @@ func (h *UserHandler) GetMe(c fiber.Ctx) error {
 // @Success 200 {object} dto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /users/{id} [get]
 func (h *UserHandler) GetByID(c fiber.Ctx) error {
@@ -71,7 +70,9 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 	// Only the account owner or an admin may read a profile (it contains PII
 	// such as the email address and role).
 	if id != authUserID(c) && authRole(c) != dto.RoleAdmin {
-		return apperror.NewForbidden("you can only view your own profile")
+		// 404 rather than 403 avoids confirming that an otherwise private
+		// account ID exists.
+		return apperror.NewNotFound("user not found")
 	}
 
 	return response.Success(c, user)

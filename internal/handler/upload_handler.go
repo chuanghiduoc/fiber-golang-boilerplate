@@ -98,7 +98,6 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 // @Success 200 {object} dto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /files/{id} [get]
 func (h *UploadHandler) GetInfo(c fiber.Ctx) error {
@@ -125,7 +124,6 @@ func (h *UploadHandler) GetInfo(c fiber.Ctx) error {
 // @Success 200
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /files/{id}/download [get]
 func (h *UploadHandler) Download(c fiber.Ctx) error {
@@ -188,7 +186,6 @@ func (h *UploadHandler) List(c fiber.Ctx) error {
 // @Success 204
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /files/{id} [delete]
 func (h *UploadHandler) Delete(c fiber.Ctx) error {
@@ -214,7 +211,6 @@ func (h *UploadHandler) Delete(c fiber.Ctx) error {
 // @Success 200 {object} dto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /files/{id}/restore [post]

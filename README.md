@@ -48,6 +48,7 @@ internal/
   dto/                              Request/Response structs + role constants
   sqlc/                             Generated code (DO NOT EDIT — use `make sqlc-generate`)
   middleware/                       JWT auth, rate limit, logger, recovery, security headers, metrics
+  session/                          Token-version/session validation with generation-keyed invalidation
   router/                           Route definitions, grouping, middleware wiring
   seed/                             Admin user seeder (idempotent)
 pkg/
@@ -94,7 +95,7 @@ cp .env.example .env
 make docker-run
 ```
 
-Services: API (:8080), PostgreSQL (:5432), Redis (:6379), MinIO (:9000/:9001)
+Services: API (:8080), PostgreSQL (:5432), Redis (:6379). Optional S3-compatible MinIO: `docker compose --profile s3 up` (:9000/:9001).
 
 **Without Docker** (requires Go 1.27.3+, PostgreSQL):
 
