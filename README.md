@@ -16,7 +16,7 @@
 
 </div>
 
-Production-ready REST API boilerplate built with Go Fiber v3, PostgreSQL, and sqlc.
+Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and sqlc.
 
 ## Tech Stack
 
