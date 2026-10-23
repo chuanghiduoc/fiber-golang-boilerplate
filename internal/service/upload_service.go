@@ -218,7 +218,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 		return nil, apperror.NewNotFound("file not found")
 	}
 	if !file.DeletedAt.Valid {
-		return nil, apperror.NewConflict("file is not deleted")
+		return nil, apperror.NewCode(apperror.CodeFileNotDeleted, "file is not deleted")
 	}
 
 	restored, err := s.repo.Restore(ctx, id)

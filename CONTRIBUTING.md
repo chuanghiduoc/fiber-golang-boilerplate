@@ -32,8 +32,29 @@ main (protected)
 1. Create branch from `main`
 2. Commit with conventional format
 3. Push and open PR
-4. CI must pass (Lint + Test)
+4. CI must pass (Lint + Build + Migrations + Test + Integration + Security + Docker)
 5. Squash merge into `main`
+
+## Local Checks
+
+```bash
+make check          # go vet + golangci-lint + unit tests
+go test -race ./... # required before merging
+make test-integration   # Docker/Testcontainers, or set TEST_DATABASE_URL
+go build ./cmd/migrate   # DDL entrypoint, also built by CI
+```
+
+Integration packages skip cleanly when `TEST_DATABASE_URL` is unset. Against a
+local server, point it at a disposable database:
+
+```bash
+TEST_DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@127.0.0.1:5432/apptest?sslmode=disable" \
+  go test -tags=integration -race -count=1 ./internal/handler ./internal/platform/jobs ./internal/platform/audit
+```
+
+CI's `Migrations` job applies the baseline up/down on a fresh PostgreSQL
+service, then runs `cmd/migrate` twice. Reproduce it locally against a
+disposable database (`make migrate-run`, then `make migrate-down`).
 
 ## Changelog
 
@@ -64,23 +85,65 @@ When releasing, move `[Unreleased]` entries under a version header:
 - ...
 ```
 
-## Adding a New Entity
+## Database & Migrations
 
-1. `make migrate-create name=create_xxx_table`
-2. Write SQL in `migrations/` (up + down)
-3. Write queries in `queries/xxx.sql`
-4. `make sqlc-generate`
-5. Create DTO, Repository, Service, Handler
-6. Register routes in `internal/router/v1.go`
-7. Wire DI in `cmd/api/main.go`
-8. `make swagger`
-9. Add tests in `internal/service/xxx_service_test.go`
-10. Update `CHANGELOG.md`
+- Schema changes are a one-shot step: `make migrate-run` runs `cmd/migrate`,
+  `make run` migrates before starting the API, `make seed` migrates before
+  seeding, and Compose runs the `migrate` service before `app`.
+- Only `cmd/migrate` applies DDL. `cmd/api` and `cmd/seed` assume the schema
+  already exists, so replicas never race on migrations. The migrate command
+  uses `config.LoadDatabase` and needs only `DB_*` environment variables; it
+  rejects `DB_SSLMODE=disable` in production and verifies required tables after
+  migrating.
+- Fresh installs start from one baseline schema file:
+  `migrations/000001_init_schema.up.sql` (and its `.down.sql`).
+- Once a database is deployed, never edit a shipped migration. Add the next
+  numbered migration instead (`make migrate-create name=...`).
+- One module owns each table. Cross-module access goes through a contract or
+  read model, not another module's repository.
+
+### Upgrading an existing database
+
+The consolidated `000001` is a fresh-install baseline (old `000001`–`000003`
+plus `jobs`/`audit_events`). Do not run it against a database that already
+applied the old migrations, and do not reset `schema_migrations` to force it.
+Keep the applied history, restore the old `000002`/`000003` files from git
+history (golang-migrate requires the recorded version to exist in the source),
+and add a migration with only the missing objects, numbered above the
+database's current version (a fully migrated old deployment is at 3, so
+`000004`+). `make migrate-create` derives the number from this repository, so
+set or rename it explicitly. A fresh schema created out-of-band that already
+matches `000001` can be baselined manually after verification (for example, the
+golang-migrate CLI's `force 1`) instead of re-running the file.
+
+## Adding a New Module
+
+1. Create `internal/modules/<name>/module.go` implementing `app.Module`
+   (`Name`, `RegisterRoutes`). Keep the module's handler/service/repository/DTO
+   inside that directory.
+2. Add permissions to `internal/platform/authz` and protect mutation routes
+   with `authz.Require(...)`.
+3. Add queries in `queries/<name>.sql` and run `make sqlc-generate`.
+4. For a deployed DB, add a numbered migration; for this boilerplate's fresh
+   installs, update the single init schema.
+5. Register the module once in `cmd/api/main.go`.
+6. Add unit tests plus an integration test; `test/arch` rejects cross-module
+   imports.
+7. Run `make swagger`, `make check`, and `go test -race ./...`.
+8. Update `CHANGELOG.md`.
+
+> The `identity`, `files`, and `admin` modules currently wrap the existing
+> handler/service/repository packages. Moving those internals into the modules
+> is the next strangler phase; new modules should start in the module layout.
 
 ## Code Style
 
-- Error handling: return `*apperror.AppError`, not raw errors
+- Error handling: return `*apperror.AppError` via the typed catalog
+  (`apperror.NewCode(...)`), not raw errors or magic strings
 - Responses: use `pkg/response` helpers, not `c.JSON()`
 - Roles: use `dto.RoleAdmin` / `dto.RoleUser`, not magic strings
+- Permissions: use `authz.Permission*`, not ad-hoc role checks
 - Int conversion: use `pagination.clampInt32()`, not direct `int32()` cast
-- Tests: stdlib `testing` only, no testify
+- Durable background work: enqueue in `internal/platform/jobs`; never use
+  `async.Go` for work that must survive a restart
+- Tests: stdlib `testing`; `testify` is allowed where it improves assertions

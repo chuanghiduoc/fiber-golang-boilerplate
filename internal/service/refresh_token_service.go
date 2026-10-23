@@ -70,14 +70,14 @@ func (s *refreshTokenService) Verify(ctx context.Context, token string) (int64, 
 	rt, err := s.repo.GetByToken(ctx, hashToken(token)) // Lookup by hash
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return 0, apperror.NewUnauthorized("invalid refresh token")
+			return 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
 		}
 		return 0, apperror.NewInternal("failed to verify refresh token")
 	}
 
 	if rt.ExpiresAt.Time.Before(time.Now()) {
 		_ = s.repo.Delete(ctx, hashToken(token))
-		return 0, apperror.NewUnauthorized("refresh token expired")
+		return 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "refresh token expired")
 	}
 
 	return rt.UserID, nil
@@ -89,12 +89,12 @@ func (s *refreshTokenService) Consume(ctx context.Context, token string) (userID
 	rt, err := s.repo.Consume(ctx, hashToken(token))
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return 0, 0, apperror.NewUnauthorized("invalid refresh token")
+			return 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
 		}
 		return 0, 0, apperror.NewInternal("failed to consume refresh token")
 	}
 	if rt.ExpiresAt.Time.Before(time.Now()) {
-		return 0, 0, apperror.NewUnauthorized("refresh token expired")
+		return 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "refresh token expired")
 	}
 	return rt.UserID, rt.TokenVersion, nil
 }

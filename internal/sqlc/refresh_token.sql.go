@@ -12,7 +12,7 @@ import (
 )
 
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
-DELETE FROM refresh_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at, token_version
+DELETE FROM refresh_tokens WHERE token = $1 RETURNING id, user_id, token, token_version, expires_at, created_at
 `
 
 func (q *Queries) ConsumeRefreshToken(ctx context.Context, token string) (RefreshToken, error) {
@@ -22,9 +22,9 @@ func (q *Queries) ConsumeRefreshToken(ctx context.Context, token string) (Refres
 		&i.ID,
 		&i.UserID,
 		&i.Token,
+		&i.TokenVersion,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.TokenVersion,
 	)
 	return i, err
 }
@@ -39,7 +39,7 @@ WHERE u.id = $1
   -- the bcrypt-length window where a password change could commit after the
   -- password check but before this INSERT.
   AND u.token_version = $4
-RETURNING id, user_id, token, expires_at, created_at, token_version
+RETURNING id, user_id, token, token_version, expires_at, created_at
 `
 
 type CreateRefreshTokenParams struct {
@@ -61,9 +61,9 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 		&i.ID,
 		&i.UserID,
 		&i.Token,
+		&i.TokenVersion,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.TokenVersion,
 	)
 	return i, err
 }
@@ -87,7 +87,7 @@ func (q *Queries) DeleteRefreshTokensByUserID(ctx context.Context, userID int64)
 }
 
 const getRefreshTokenByToken = `-- name: GetRefreshTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at, token_version FROM refresh_tokens WHERE token = $1
+SELECT id, user_id, token, token_version, expires_at, created_at FROM refresh_tokens WHERE token = $1
 `
 
 func (q *Queries) GetRefreshTokenByToken(ctx context.Context, token string) (RefreshToken, error) {
@@ -97,9 +97,9 @@ func (q *Queries) GetRefreshTokenByToken(ctx context.Context, token string) (Ref
 		&i.ID,
 		&i.UserID,
 		&i.Token,
+		&i.TokenVersion,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.TokenVersion,
 	)
 	return i, err
 }

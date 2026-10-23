@@ -6,6 +6,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/limiter"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 func NewLimiter(maxRequests, windowSecs int, prefix string, storages ...fiber.Storage) fiber.Handler {
@@ -22,7 +24,7 @@ func NewLimiter(maxRequests, windowSecs int, prefix string, storages ...fiber.St
 			return prefix + ":ip:" + c.IP()
 		},
 		LimitReached: func(c fiber.Ctx) error {
-			return fiber.NewError(fiber.StatusTooManyRequests, "too many requests, please try again later")
+			return apperror.NewCode(apperror.CodeRateLimitExceeded, "too many requests, please try again later")
 		},
 	}
 	if len(storages) > 0 && storages[0] != nil {

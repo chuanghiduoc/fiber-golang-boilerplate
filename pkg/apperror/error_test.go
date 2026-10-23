@@ -114,6 +114,21 @@ func TestFiberErrorHandler_AppError(t *testing.T) {
 	}
 }
 
+func TestFiberErrorHandler_TypedCodeUsesCatalogDocPath(t *testing.T) {
+	result, status, _ := decodeProblem(t, func(c fiber.Ctx) error {
+		return NewCode(CodeAuthInvalidCredentials, "invalid email or password")
+	})
+	if status != 401 {
+		t.Errorf("status = %d, want 401", status)
+	}
+	if result["type"] != "/errors/auth-invalid-credentials" {
+		t.Errorf("type = %v, want catalog DocPath /errors/auth-invalid-credentials", result["type"])
+	}
+	if result["code"] != string(CodeAuthInvalidCredentials) {
+		t.Errorf("code = %v, want %s", result["code"], CodeAuthInvalidCredentials)
+	}
+}
+
 func TestFiberErrorHandler_Validation(t *testing.T) {
 	result, status, _ := decodeProblem(t, func(c fiber.Ctx) error {
 		return NewValidation("bad fields", []FieldError{{Path: "name", Code: "required", Message: "name is required"}})

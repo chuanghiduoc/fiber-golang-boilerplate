@@ -15,7 +15,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -trimpath \
     -buildvcs=false \
-    -o server ./cmd/api
+    -o server ./cmd/api && \
+    CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -buildvcs=false \
+    -o migrate ./cmd/migrate
 
 # ---- Production stage ----
 FROM alpine:3.24 AS prod
@@ -27,6 +32,7 @@ RUN apk add --no-cache ca-certificates tzdata && \
 WORKDIR /app
 
 COPY --from=build /app/server ./server
+COPY --from=build /app/migrate ./migrate
 COPY --from=build /app/migrations ./migrations
 COPY --from=build /app/docs ./docs
 

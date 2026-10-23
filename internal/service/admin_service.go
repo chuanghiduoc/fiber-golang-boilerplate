@@ -103,7 +103,7 @@ func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*
 			return nil, apperror.NewInternal("failed to count admins")
 		}
 		if admins <= 1 {
-			return nil, apperror.NewConflict("cannot demote the last active admin")
+			return nil, apperror.NewCode(apperror.CodeUserLastAdmin, "cannot demote the last active admin")
 		}
 	}
 
@@ -142,7 +142,7 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 			return apperror.NewInternal("failed to count admins")
 		}
 		if admins <= 1 {
-			return apperror.NewConflict("cannot ban the last active admin")
+			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot ban the last active admin")
 		}
 	}
 
@@ -285,7 +285,7 @@ func (s *adminService) RestoreFile(ctx context.Context, id int64) (*dto.FileResp
 		return nil, apperror.NewInternal("failed to get file")
 	}
 	if !existing.DeletedAt.Valid {
-		return nil, apperror.NewConflict("file is not deleted")
+		return nil, apperror.NewCode(apperror.CodeFileNotDeleted, "file is not deleted")
 	}
 	file, err := s.fileRepo.Restore(ctx, id)
 	if err != nil {

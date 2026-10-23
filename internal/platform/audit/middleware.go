@@ -1,0 +1,59 @@
+package audit
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"github.com/gofiber/fiber/v3"
+)
+
+// Middleware records successful mutating requests (POST/PUT/PATCH/DELETE) with
+// the authenticated actor and route template. It is intentionally generic so
+// every module gets an audit trail without adding boilerplate to each handler.
+func Middleware(recorder Recorder) fiber.Handler {
+	if recorder == nil {
+		recorder = Noop{}
+	}
+
+	return func(c fiber.Ctx) error {
+		if err := c.Next(); err != nil {
+			return err
+		}
+		switch c.Method() {
+		case fiber.MethodPost, fiber.MethodPut, fiber.MethodPatch, fiber.MethodDelete:
+		default:
+			return nil
+		}
+		status := c.Response().StatusCode()
+		if status < 200 || status >= 300 || c.Route().Path == "" {
+			return nil
+		}
+
+		actorID := fiber.Locals[int64](c, "user_id")
+		event := Event{
+			ActorID:    actorID,
+			Action:     c.Method() + " " + c.Route().Path,
+			Resource:   c.Route().Path,
+			ResourceID: c.Params("id"),
+			Metadata: map[string]any{
+				"status": status,
+				"path":   c.Path(),
+			},
+			IP:        c.IP(),
+			UserAgent: c.Get("User-Agent"),
+			RequestID: fiber.Locals[string](c, "request_id"),
+			CreatedAt: time.Now().UTC(),
+		}
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 2*time.Second)
+		defer cancel()
+		if err := recorder.Record(ctx, event); err != nil {
+			slog.Warn("failed to record audit event",
+				slog.String("action", event.Action),
+				slog.Any("error", err),
+			)
+		}
+		return nil
+	}
+}

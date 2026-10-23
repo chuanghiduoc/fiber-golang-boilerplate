@@ -12,7 +12,7 @@ import (
 )
 
 const consumeEmailVerificationToken = `-- name: ConsumeEmailVerificationToken :one
-DELETE FROM email_verification_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at, email
+DELETE FROM email_verification_tokens WHERE token = $1 RETURNING id, user_id, email, token, expires_at, created_at
 `
 
 func (q *Queries) ConsumeEmailVerificationToken(ctx context.Context, token string) (EmailVerificationToken, error) {
@@ -21,10 +21,10 @@ func (q *Queries) ConsumeEmailVerificationToken(ctx context.Context, token strin
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
+		&i.Email,
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.Email,
 	)
 	return i, err
 }
@@ -37,7 +37,7 @@ SET email = EXCLUDED.email,
     token = EXCLUDED.token,
     expires_at = EXCLUDED.expires_at,
     created_at = NOW()
-RETURNING id, user_id, token, expires_at, created_at, email
+RETURNING id, user_id, email, token, expires_at, created_at
 `
 
 type CreateEmailVerificationTokenParams struct {
@@ -58,10 +58,10 @@ func (q *Queries) CreateEmailVerificationToken(ctx context.Context, arg CreateEm
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
+		&i.Email,
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.Email,
 	)
 	return i, err
 }
@@ -85,7 +85,7 @@ func (q *Queries) DeleteEmailVerificationTokensByUserID(ctx context.Context, use
 }
 
 const getEmailVerificationTokenByToken = `-- name: GetEmailVerificationTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at, email FROM email_verification_tokens WHERE token = $1
+SELECT id, user_id, email, token, expires_at, created_at FROM email_verification_tokens WHERE token = $1
 `
 
 func (q *Queries) GetEmailVerificationTokenByToken(ctx context.Context, token string) (EmailVerificationToken, error) {
@@ -94,10 +94,10 @@ func (q *Queries) GetEmailVerificationTokenByToken(ctx context.Context, token st
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
+		&i.Email,
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.Email,
 	)
 	return i, err
 }

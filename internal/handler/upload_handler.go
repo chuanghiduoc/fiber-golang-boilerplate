@@ -52,7 +52,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 	}
 
 	if fileHeader.Size > h.maxFileSize {
-		return apperror.NewPayloadTooLarge(fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
+		return apperror.NewCode(apperror.CodeFileTooLarge, fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
 	}
 
 	file, err := fileHeader.Open()
@@ -71,7 +71,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 
 	if len(h.allowedMIME) > 0 {
 		if _, ok := h.allowedMIME[contentType]; !ok {
-			return apperror.NewUnsupportedMediaType(fmt.Sprintf("file type %q is not allowed", contentType))
+			return apperror.NewCode(apperror.CodeFileUnsupportedType, fmt.Sprintf("file type %q is not allowed", contentType))
 		}
 	}
 

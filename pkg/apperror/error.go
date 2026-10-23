@@ -131,8 +131,12 @@ func FiberErrorHandler(c fiber.Ctx, err error) error {
 }
 
 func writeProblem(c fiber.Ctx, e *AppError) error {
+	docPath := "/errors/" + strings.ReplaceAll(e.Code, "_", "-")
+	if spec, ok := SpecFor(Code(e.Code)); ok {
+		docPath = spec.DocPath
+	}
 	doc := ProblemDetails{
-		Type:      DocsBaseURL + "/errors/" + strings.ReplaceAll(e.Code, "_", "-"),
+		Type:      DocsBaseURL + docPath,
 		Title:     e.Title,
 		Status:    e.Status,
 		Code:      e.Code,
