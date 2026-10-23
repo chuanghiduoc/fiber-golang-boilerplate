@@ -71,6 +71,42 @@ func TestForgotPassword(t *testing.T) {
 		}
 	})
 
+	t.Run("transactional sender falls back to Send without a tx manager", func(t *testing.T) {
+		userRepo := newMockUserRepo()
+		resetRepo := newMockPasswordResetRepo()
+		refreshRepo := newMockRefreshTokenRepo()
+		emailSender := newMockTransactionalEmailSender()
+		cache := newMockCache()
+		svc := NewPasswordResetService(
+			userRepo, resetRepo, refreshRepo,
+			emailSender, cache,
+			"http://localhost:3000",
+			nil, // no txManager: the sender must not be used transactionally
+		)
+
+		userRepo.users[1] = &sqlc.User{ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
+
+		err := svc.ForgotPassword(context.Background(), dto.ForgotPasswordRequest{
+			Email: "test@example.com",
+		})
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if len(resetRepo.tokens) != 1 {
+			t.Errorf("expected 1 reset token, got %d", len(resetRepo.tokens))
+		}
+		if !emailSender.WaitFor(1, time.Second) {
+			t.Fatalf("expected 1 email sent, got %d", emailSender.Sent())
+		}
+		if emailSender.Sent() != 1 {
+			t.Errorf("expected exactly 1 email, got %d", emailSender.Sent())
+		}
+		if emailSender.SendTxCalls() != 0 {
+			t.Errorf("expected no transactional sends without a tx manager, got %d", emailSender.SendTxCalls())
+		}
+	})
+
 	t.Run("rate limited", func(t *testing.T) {
 		userRepo := newMockUserRepo()
 		resetRepo := newMockPasswordResetRepo()

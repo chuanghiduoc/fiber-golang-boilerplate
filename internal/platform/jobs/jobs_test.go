@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
 func TestJobNormalize(t *testing.T) {
@@ -528,6 +530,26 @@ func TestQueueValidationBeforeDatabase(t *testing.T) {
 
 	_, err = queue.EnqueueTx(context.Background(), nil, Job{Kind: "ok"})
 	require.ErrorIs(t, err, ErrNoTx)
+}
+
+func TestQueuedSenderSendTxRequiresTransaction(t *testing.T) {
+	t.Parallel()
+
+	sender := NewQueuedSender(NewQueue(nil))
+	var err error
+	require.NotPanics(t, func() {
+		err = sender.SendTx(context.Background(), nil, email.Message{
+			To:      []string{"user@example.com"},
+			Subject: "Verify Your Email Address",
+		})
+	})
+	require.ErrorIs(t, err, ErrNoTx)
+
+	// A nil sender or queue must fail cleanly instead of panicking.
+	require.NotPanics(t, func() {
+		err = (*QueuedSender)(nil).SendTx(context.Background(), nil, email.Message{})
+	})
+	require.Error(t, err)
 }
 
 // streamingStore serves jobs in claim-sized batches so a test can process more

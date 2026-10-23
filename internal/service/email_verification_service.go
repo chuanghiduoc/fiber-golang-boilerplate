@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
@@ -16,8 +17,16 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
+
+// transactionalEmailSender can enqueue an email on the caller's database
+// transaction. jobs.QueuedSender implements it; plain senders only implement
+// email.Sender and are sent after the token transaction commits.
+type transactionalEmailSender interface {
+	SendTx(ctx context.Context, tx pgx.Tx, msg email.Message) error
+}
 
 type EmailVerificationService interface {
 	SendVerification(ctx context.Context, userID int64, userEmail string) error
@@ -34,6 +43,7 @@ type emailVerificationService struct {
 	sender    email.Sender
 	cache     cache.Cache
 	frontURL  string
+	txManager *database.TxManager
 }
 
 func NewEmailVerificationService(
@@ -42,6 +52,7 @@ func NewEmailVerificationService(
 	sender email.Sender,
 	appCache cache.Cache,
 	frontendURL string,
+	txManager *database.TxManager,
 ) EmailVerificationService {
 	return &emailVerificationService{
 		userRepo:  userRepo,
@@ -49,6 +60,7 @@ func NewEmailVerificationService(
 		sender:    sender,
 		cache:     appCache,
 		frontURL:  frontendURL,
+		txManager: txManager,
 	}
 }
 
@@ -62,29 +74,63 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 	}
 	token := hex.EncodeToString(b)
 
-	// Delete old tokens
-	_ = s.verifRepo.DeleteByUserID(ctx, userID)
-
-	// Create with 24 hour expiry. Store only the hash; the plaintext token is
-	// delivered to the user via email so a DB leak cannot be replayed.
-	_, err := s.verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
-		UserID:    userID,
-		Email:     userEmail,
-		Token:     hashToken(token),
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-	})
-	if err != nil {
-		return fmt.Errorf("create verification token: %w", err)
-	}
-
-	// Send email — return error so callers (e.g. ResendVerification) can propagate it.
-	// Fire-and-forget callers like the auth handler already ignore the return value.
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", s.frontURL, token)
-	if err := s.sender.Send(ctx, email.Message{
+	msg := email.Message{
 		To:      []string{userEmail},
 		Subject: "Verify Your Email Address",
 		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to verify your email address. This link expires in 24 hours.</p>", verifyURL),
-	}); err != nil {
+	}
+	txSender, transactional := s.sender.(transactionalEmailSender)
+
+	queuedInTx := false
+	createToken := func(verifRepo repository.EmailVerificationRepository, tx pgx.Tx) error {
+		// Delete old tokens first so a user has at most one live link.
+		if err := verifRepo.DeleteByUserID(ctx, userID); err != nil {
+			return fmt.Errorf("delete old verification tokens: %w", err)
+		}
+
+		// Create with 24 hour expiry. Store only the hash; the plaintext token
+		// is delivered to the user via email so a DB leak cannot be replayed.
+		_, err := verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+			UserID:    userID,
+			Email:     userEmail,
+			Token:     hashToken(token),
+			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		})
+		if err != nil {
+			return fmt.Errorf("create verification token: %w", err)
+		}
+
+		if tx != nil && transactional {
+			// Enqueue on the same transaction: a crash between the token insert
+			// and the enqueue cannot leave a usable verification link without
+			// an email.
+			if err := txSender.SendTx(ctx, tx, msg); err != nil {
+				return fmt.Errorf("send verification email: %w", err)
+			}
+			queuedInTx = true
+		}
+		return nil
+	}
+
+	if s.txManager != nil {
+		if err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			return createToken(repository.NewEmailVerificationRepository(tx), tx)
+		}); err != nil {
+			return err
+		}
+	} else if err := createToken(s.verifRepo, nil); err != nil {
+		return err
+	}
+
+	if queuedInTx {
+		return nil
+	}
+
+	// Send email — return error so callers (e.g. ResendVerification) can
+	// propagate it. Fire-and-forget callers like the auth handler already
+	// ignore the return value.
+	if err := s.sender.Send(ctx, msg); err != nil {
 		slog.Error("failed to send verification email",
 			slog.Int64("user_id", userID),
 			slog.String("email", userEmail),

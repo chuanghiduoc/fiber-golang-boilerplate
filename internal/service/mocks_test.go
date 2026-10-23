@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
@@ -719,6 +720,33 @@ func (m *mockEmailSender) WaitFor(n int, timeout time.Duration) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return m.Sent() >= n
+}
+
+// mockTransactionalEmailSender is both an email.Sender and a
+// transactionalEmailSender. Tests use it to prove that services only call
+// SendTx when they actually have a transaction; otherwise they must fall back
+// to exactly one Send.
+type mockTransactionalEmailSender struct {
+	*mockEmailSender
+	mu          sync.Mutex
+	sendTxCalls int
+}
+
+func newMockTransactionalEmailSender() *mockTransactionalEmailSender {
+	return &mockTransactionalEmailSender{mockEmailSender: newMockEmailSender()}
+}
+
+func (m *mockTransactionalEmailSender) SendTx(ctx context.Context, _ pgx.Tx, msg email.Message) error {
+	m.mu.Lock()
+	m.sendTxCalls++
+	m.mu.Unlock()
+	return m.Send(ctx, msg)
+}
+
+func (m *mockTransactionalEmailSender) SendTxCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sendTxCalls
 }
 
 // ---------------------------------------------------------------------------

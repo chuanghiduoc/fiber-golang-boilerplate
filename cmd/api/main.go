@@ -161,7 +161,7 @@ func main() {
 	// Email verification
 	emailVerifRepo := repository.NewEmailVerificationRepository(pool)
 	emailVerifSvc := service.NewEmailVerificationService(
-		userRepo, emailVerifRepo, queuedEmail, appCache, cfg.App.FrontendURL,
+		userRepo, emailVerifRepo, queuedEmail, appCache, cfg.App.FrontendURL, txManager,
 	)
 
 	authHandler := handler.NewAuthHandler(
