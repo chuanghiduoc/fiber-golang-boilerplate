@@ -843,7 +843,9 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	go func() { errCh <- worker.Run(ctx) }()
 
 	require.Eventually(t, func() bool {
-		return fake.purgeCallCount() >= 1
+		// One immediate startup pass plus at least one interval pass proves
+		// recurrence, not just the startup purge.
+		return fake.purgeCallCount() >= 2
 	}, 2*time.Second, time.Millisecond, "the worker must run retention on the configured interval")
 
 	cancel()
@@ -855,7 +857,7 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	}
 
 	calls := fake.purgeCallCount()
-	require.GreaterOrEqual(t, calls, 1)
+	require.GreaterOrEqual(t, calls, 2)
 	assert.Equal(t, time.Hour, fake.retentionSeen())
 	assert.Equal(t, before+float64(calls)*3, metricValue(t, metrics.JobsPurgedTotal))
 }
