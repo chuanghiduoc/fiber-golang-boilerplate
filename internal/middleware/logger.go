@@ -41,7 +41,7 @@ func Logger() fiber.Handler {
 		err := c.Next()
 
 		latency := time.Since(start)
-		status := c.Response().StatusCode()
+		status := effectiveStatus(c, err)
 
 		var userID int64
 		if v := fiber.Locals[int64](c, "user_id"); v != 0 {

@@ -20,6 +20,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Bind email-verification tokens to the address they were sent to and require the address to still match at verification time
 - Add `POST /auth/logout-all` to revoke every refresh token and bump the token version, invalidating access tokens immediately
 - Add admin file takedown (`DELETE /admin/files/:id`) and owner `includeDeleted=true` listing for trash/restore
+- Distinguish admin bans from self-deletion (`banned_at`): banned emails cannot be reused through registration or Google login
+- Share rate-limit counters through the application cache (Redis in production); log/metric error responses with their real status instead of 200
+- Mark the seeded admin email verified so `REQUIRE_EMAIL_VERIFICATION=true` does not lock out a fresh deployment; disable Swagger UI in production and give docs a compatible CSP
 - Normalize emails (trim + lowercase), enforce case-insensitive uniqueness among active users, and allow email reuse after soft delete
 - Reset `email_verified_at` on email change, require the current password for self-service email changes, invalidate old verification tokens, and send a fresh link
 - Revoke every refresh token and bump the token version on password change

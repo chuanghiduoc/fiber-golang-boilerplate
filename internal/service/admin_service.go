@@ -143,7 +143,7 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 	}
 
 	doBan := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		_, err := userRepo.Delete(ctx, id)
+		_, err := userRepo.Ban(ctx, id)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("user not found or already banned")

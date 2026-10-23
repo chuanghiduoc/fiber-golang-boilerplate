@@ -2083,6 +2083,9 @@ const docTemplate = `{
         "dto.UserResponse": {
             "type": "object",
             "properties": {
+                "bannedAt": {
+                    "type": "string"
+                },
                 "createdAt": {
                     "type": "string"
                 },

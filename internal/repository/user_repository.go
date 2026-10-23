@@ -12,6 +12,7 @@ type UserRepository interface {
 	GetByID(ctx context.Context, id int64) (*sqlc.User, error)
 	GetByEmail(ctx context.Context, email string) (*sqlc.User, error)
 	GetByGoogleID(ctx context.Context, googleID string) (*sqlc.User, error)
+	GetBannedByEmail(ctx context.Context, email string) (*sqlc.User, error)
 	List(ctx context.Context, limit, offset int32) ([]sqlc.User, error)
 	ListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error)
 	Count(ctx context.Context) (int64, error)
@@ -24,6 +25,7 @@ type UserRepository interface {
 	VerifyEmail(ctx context.Context, id int64, email string) (*sqlc.User, error)
 	LinkGoogleAccount(ctx context.Context, params sqlc.LinkGoogleAccountParams) (*sqlc.User, error)
 	Delete(ctx context.Context, id int64) (*sqlc.User, error)
+	Ban(ctx context.Context, id int64) (*sqlc.User, error)
 	Restore(ctx context.Context, id int64) (*sqlc.User, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.User, error)
 	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error)
@@ -60,6 +62,14 @@ func (r *userRepository) GetByEmail(ctx context.Context, email string) (*sqlc.Us
 
 func (r *userRepository) GetByGoogleID(ctx context.Context, googleID string) (*sqlc.User, error) {
 	user, err := r.q.GetUserByGoogleID(ctx, pgtype.Text{String: googleID, Valid: true})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &user, nil
+}
+
+func (r *userRepository) GetBannedByEmail(ctx context.Context, email string) (*sqlc.User, error) {
+	user, err := r.q.GetBannedUserByEmail(ctx, email)
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -155,6 +165,14 @@ func (r *userRepository) VerifyEmail(ctx context.Context, id int64, email string
 
 func (r *userRepository) Delete(ctx context.Context, id int64) (*sqlc.User, error) {
 	user, err := r.q.DeleteUser(ctx, id)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &user, nil
+}
+
+func (r *userRepository) Ban(ctx context.Context, id int64) (*sqlc.User, error) {
+	user, err := r.q.BanUser(ctx, id)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

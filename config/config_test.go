@@ -331,6 +331,7 @@ func productionValidConfig() Config {
 	cfg.CORS.AllowOrigins = "https://app.example.com"
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
+	cfg.DB.SSLMode = "require"
 	return cfg
 }
 
@@ -361,6 +362,7 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"known default JWT secret", func(c *Config) {
 			c.JWT.Secret = "your-super-secret-key-change-in-production"
 		}},
+		{"db ssl disabled", func(c *Config) { c.DB.SSLMode = "disable" }},
 	}
 
 	for _, tt := range tests {
@@ -371,5 +373,20 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 				t.Error("Validate() should reject this production config")
 			}
 		})
+	}
+}
+
+func TestValidate_StagingRejectsKnownDefaults(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.App.Env = "staging"
+	cfg.JWT.Secret = "your-super-secret-key-change-in-production"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("staging must reject the published sample JWT secret")
+	}
+
+	cfg.JWT.Secret = strings.Repeat("b", 32)
+	cfg.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("staging must reject the default admin password")
 	}
 }

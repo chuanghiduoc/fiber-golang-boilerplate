@@ -4,6 +4,9 @@ SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL;
 -- name: GetUserByEmail :one
 SELECT * FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL;
 
+-- name: GetBannedUserByEmail :one
+SELECT * FROM users WHERE lower(email) = lower($1) AND banned_at IS NOT NULL LIMIT 1;
+
 -- name: ListUsers :many
 SELECT * FROM users WHERE deleted_at IS NULL ORDER BY id LIMIT $1 OFFSET $2;
 
@@ -45,10 +48,17 @@ SET deleted_at = NOW(), updated_at = NOW(), token_version = token_version + 1,
 WHERE id = $1 AND deleted_at IS NULL
 RETURNING *;
 
+-- name: BanUser :one
+UPDATE users
+SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),
+    token_version = token_version + 1, password_changed_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+RETURNING *;
+
 -- name: RestoreUser :one
 UPDATE users
-SET deleted_at = NULL, updated_at = NOW(), token_version = token_version + 1,
-    password_changed_at = NOW()
+SET deleted_at = NULL, banned_at = NULL, updated_at = NOW(),
+    token_version = token_version + 1, password_changed_at = NOW()
 WHERE id = $1 AND deleted_at IS NOT NULL
 RETURNING *;
 

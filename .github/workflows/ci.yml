@@ -79,6 +79,16 @@ jobs:
       - name: Run govulncheck
         run: govulncheck ./...
 
+  docker:
+    name: Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build production image
+        run: docker build -t fiber-golang-boilerplate:ci .
+
   test:
     name: Test
     runs-on: ubuntu-latest

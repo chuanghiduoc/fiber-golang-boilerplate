@@ -16,7 +16,7 @@ func Metrics() fiber.Handler {
 		err := c.Next()
 
 		duration := time.Since(start).Seconds()
-		status := strconv.Itoa(c.Response().StatusCode())
+		status := strconv.Itoa(effectiveStatus(c, err))
 		method := c.Method()
 		path := c.Route().Path
 

@@ -164,7 +164,7 @@ The app auto-runs migrations and seeds an admin user on startup.
 | GET | `/healthz` | Liveness probe |
 | GET | `/readyz` | Readiness probe (DB + cache) |
 | GET | `/metrics` | Prometheus metrics (requires `METRICS_AUTH_TOKEN` in production) |
-| GET | `/swagger` | Swagger UI |
+| GET | `/swagger` | Swagger UI (non-production only) |
 
 ## Makefile Commands
 
@@ -209,8 +209,9 @@ Key settings:
 - `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
-- `CACHE_DRIVER` — `memory` | `redis` (use Redis when running multiple replicas)
+- `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, and session invalidation across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
+- `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on startup (password must be 12+ chars in production)
 
@@ -244,6 +245,10 @@ TEST_DATABASE_URL='postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable'
   sessions, and send a fresh verification link.
 - Uploaded files are never served from a public directory; downloads require
   authentication and ownership (or admin role).
-- Production startup rejects the sample JWT secret, console email, wildcard
-  CORS, insecure frontend/OAuth URLs, missing metrics auth, and a body limit
-  smaller than the configured upload size.
+- Banned emails cannot be reused through registration or Google login;
+  self-deleted accounts can still be re-registered.
+- `POST /auth/logout` revokes one refresh token; use `/auth/logout-all` to bump
+  the token version and invalidate access tokens immediately.
+- Production startup rejects the sample JWT secret/default admin password,
+  console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics
+  auth, `DB_SSLMODE=disable`, and a body limit smaller than the upload size.

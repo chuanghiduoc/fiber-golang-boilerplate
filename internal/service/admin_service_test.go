@@ -119,8 +119,8 @@ func TestAdminBanUser(t *testing.T) {
 		}
 
 		// User should be soft-deleted, not removed from the table.
-		if u, ok := ur.users[1]; !ok || !u.DeletedAt.Valid {
-			t.Error("user should be soft-deleted")
+		if u, ok := ur.users[1]; !ok || !u.DeletedAt.Valid || !u.BannedAt.Valid {
+			t.Error("user should be soft-deleted and marked banned")
 		}
 
 		// Refresh tokens should be revoked
@@ -152,8 +152,8 @@ func TestAdminUnbanUser(t *testing.T) {
 		if user == nil {
 			t.Fatal("user should not be nil")
 		}
-		if ur.users[1].DeletedAt.Valid {
-			t.Error("user should be restored")
+		if ur.users[1].DeletedAt.Valid || ur.users[1].BannedAt.Valid {
+			t.Error("user should be restored and unbanned")
 		}
 	})
 

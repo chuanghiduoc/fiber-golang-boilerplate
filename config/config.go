@@ -210,13 +210,24 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	// JWT validation
+	// JWT/admin validation for every non-local environment, including staging
+	// and development. The sample secret is public and must never sign tokens
+	// outside local/test.
 	if cfg.App.Env != "local" && cfg.App.Env != "test" {
-		if cfg.JWT.Secret == "" || cfg.JWT.Secret == "secret" {
+		if cfg.JWT.Secret == "" || cfg.JWT.Secret == "secret" ||
+			cfg.JWT.Secret == "your-super-secret-key-change-in-production" {
 			return fmt.Errorf("JWT_SECRET must be set to a secure value in %s environment", cfg.App.Env)
 		}
 		if len(cfg.JWT.Secret) < 32 {
 			return fmt.Errorf("JWT_SECRET must be at least 32 characters for security")
+		}
+		if cfg.Admin.Email != "" || cfg.Admin.Password != "" {
+			if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
+				return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set together")
+			}
+			if len(cfg.Admin.Password) < 12 || cfg.Admin.Password == "Admin123!" {
+				return fmt.Errorf("ADMIN_PASSWORD is too weak for %s environment", cfg.App.Env)
+			}
 		}
 	}
 	if cfg.JWT.ExpireHour < 1 {
@@ -337,8 +348,8 @@ func (cfg *Config) Validate() error {
 		if u, err := url.Parse(cfg.App.FrontendURL); err != nil || u.Scheme != "https" {
 			return fmt.Errorf("APP_FRONTEND_URL must use https in production")
 		}
-		if cfg.JWT.Secret == "your-super-secret-key-change-in-production" {
-			return fmt.Errorf("JWT_SECRET is a known default; generate one with `openssl rand -hex 32`")
+		if cfg.DB.SSLMode == "disable" {
+			return fmt.Errorf("DB_SSLMODE must not be disable in production")
 		}
 		if cfg.OAuth.GoogleClientID != "" {
 			if u, err := url.Parse(cfg.OAuth.FrontendURL); err != nil || u.Scheme != "https" {
@@ -353,14 +364,6 @@ func (cfg *Config) Validate() error {
 		}
 		if len(cfg.App.MetricsAuthToken) < 16 {
 			return fmt.Errorf("METRICS_AUTH_TOKEN must be at least 16 characters")
-		}
-		if cfg.Admin.Email != "" || cfg.Admin.Password != "" {
-			if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
-				return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set together")
-			}
-			if len(cfg.Admin.Password) < 12 || cfg.Admin.Password == "Admin123!" {
-				return fmt.Errorf("ADMIN_PASSWORD is too weak for production")
-			}
 		}
 	}
 	return nil

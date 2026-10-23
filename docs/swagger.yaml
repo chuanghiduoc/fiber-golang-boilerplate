@@ -169,6 +169,8 @@ definitions:
     type: object
   dto.UserResponse:
     properties:
+      bannedAt:
+        type: string
       createdAt:
         type: string
       deletedAt:

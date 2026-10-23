@@ -56,6 +56,7 @@ type UserResponse struct {
 	CreatedAt     time.Time  `json:"createdAt"`
 	UpdatedAt     time.Time  `json:"updatedAt"`
 	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
+	BannedAt      *time.Time `json:"bannedAt,omitempty"`
 	// TokenVersion is internal and must never be serialized to clients.
 	TokenVersion int32 `json:"-"`
 }

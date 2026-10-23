@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
@@ -161,7 +162,18 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 		return nil
 	}
 
-	return s.SendVerification(ctx, user.ID, user.Email)
+	// Send asynchronously so response timing does not reveal whether the
+	// address exists or whether a message was actually delivered.
+	async.Go(func() {
+		if err := s.SendVerification(context.Background(), user.ID, user.Email); err != nil {
+			slog.Error("failed to resend verification email",
+				slog.Int64("user_id", user.ID),
+				slog.String("email", user.Email),
+				slog.Any("error", err),
+			)
+		}
+	})
+	return nil
 }
 
 func (s *emailVerificationService) Invalidate(ctx context.Context, userID int64) error {

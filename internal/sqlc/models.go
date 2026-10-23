@@ -59,4 +59,5 @@ type User struct {
 	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
 	TokenVersion      int32              `json:"token_version"`
 	PasswordChangedAt pgtype.Timestamptz `json:"password_changed_at"`
+	BannedAt          pgtype.Timestamptz `json:"banned_at"`
 }

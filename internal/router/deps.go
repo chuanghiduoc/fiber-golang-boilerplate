@@ -6,6 +6,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 )
 
@@ -18,4 +19,5 @@ type Deps struct {
 	Pool          *pgxpool.Pool
 	Health        *health.Checker
 	Sessions      session.Store
+	Cache         cache.Cache
 }
