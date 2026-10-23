@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -29,7 +28,14 @@ func (s *QueuedSender) Send(ctx context.Context, msg email.Message) error {
 	if s == nil || s.queue == nil {
 		return fmt.Errorf("jobs: email queue is nil")
 	}
-	return s.enqueue(ctx, s.queue.pool, msg)
+	job, err := emailJob(msg)
+	if err != nil {
+		return err
+	}
+	if _, err := s.queue.Enqueue(ctx, job); err != nil {
+		return fmt.Errorf("jobs: enqueue email: %w", err)
+	}
+	return nil
 }
 
 // SendTx enqueues msg using tx, so the email job commits atomically with the
@@ -41,31 +47,29 @@ func (s *QueuedSender) SendTx(ctx context.Context, tx pgx.Tx, msg email.Message)
 	if tx == nil {
 		return ErrNoTx
 	}
-	return s.enqueue(ctx, tx, msg)
-}
-
-// enqueue marshals one email into a job and inserts it through db, which is
-// either the queue's pool or a caller-owned transaction.
-func (s *QueuedSender) enqueue(ctx context.Context, db queryRower, msg email.Message) error {
-	payload, err := json.Marshal(msg)
+	job, err := emailJob(msg)
 	if err != nil {
-		return fmt.Errorf("jobs: encode email: %w", err)
+		return err
 	}
-	job, err := Job{
-		Kind:        EmailJobKind,
-		Payload:     payload,
-		MaxAttempts: 10,
-	}.normalize(time.Now())
-	if err != nil {
-		return fmt.Errorf("jobs: prepare email job: %w", err)
-	}
-	if db == nil {
-		return ErrNoPool
-	}
-	if _, err := insertJob(ctx, db, job); err != nil {
+	if _, err := s.queue.EnqueueTx(ctx, tx, job); err != nil {
 		return fmt.Errorf("jobs: enqueue email: %w", err)
 	}
 	return nil
+}
+
+// emailJob marshals one email message into the job payload. Queue.Enqueue and
+// Queue.EnqueueTx apply the defaults and validate the job so both paths stay
+// identical.
+func emailJob(msg email.Message) (Job, error) {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		return Job{}, fmt.Errorf("jobs: encode email: %w", err)
+	}
+	return Job{
+		Kind:        EmailJobKind,
+		Payload:     payload,
+		MaxAttempts: 10,
+	}, nil
 }
 
 // EmailHandler adapts a concrete email.Sender to a jobs.Handler.

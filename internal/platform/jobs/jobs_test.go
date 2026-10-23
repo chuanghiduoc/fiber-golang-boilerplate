@@ -532,6 +532,26 @@ func TestQueueValidationBeforeDatabase(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoTx)
 }
 
+func TestQueuedSenderSendRequiresPool(t *testing.T) {
+	t.Parallel()
+
+	sender := NewQueuedSender(NewQueue(nil))
+	var err error
+	require.NotPanics(t, func() {
+		err = sender.Send(context.Background(), email.Message{
+			To:      []string{"user@example.com"},
+			Subject: "Verify Your Email Address",
+		})
+	})
+	require.ErrorIs(t, err, ErrNoPool)
+
+	// A nil sender or queue must fail cleanly instead of panicking.
+	require.NotPanics(t, func() {
+		err = (*QueuedSender)(nil).Send(context.Background(), email.Message{})
+	})
+	require.Error(t, err)
+}
+
 func TestQueuedSenderSendTxRequiresTransaction(t *testing.T) {
 	t.Parallel()
 

@@ -165,3 +165,59 @@ func TestEmailVerificationIntegrationEnqueuesEmailInTokenTransaction(t *testing.
 	).Scan(&jobCount))
 	require.Equal(t, 1, jobCount, "verification email must be queued in the same transaction")
 }
+
+// TestEmailVerificationIntegrationRollsBackTokenWhenEnqueueFails drops the
+// outbox table so the enqueue fails after the old token delete and the new
+// token insert. All three steps must roll back together, leaving the old token
+// intact and surfacing the error.
+func TestEmailVerificationIntegrationRollsBackTokenWhenEnqueueFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, cleanup, err := testutil.SetupTestDB(ctx)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+
+	userRepo := repository.NewUserRepository(pool)
+	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+		Email: "verify-rollback@example.com",
+		Name:  "Verify Rollback",
+	})
+	require.NoError(t, err)
+
+	verifRepo := repository.NewEmailVerificationRepository(pool)
+	const oldToken = "old-token-hash"
+	_, err = verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+		UserID:    user.ID,
+		Email:     user.Email,
+		Token:     oldToken,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	})
+	require.NoError(t, err)
+
+	// The service must not be able to write the outbox row.
+	_, err = pool.Exec(ctx, `DROP TABLE jobs`)
+	require.NoError(t, err)
+
+	svc := NewEmailVerificationService(
+		userRepo,
+		verifRepo,
+		jobs.NewQueuedSender(jobs.NewQueue(pool)),
+		cache.NewMemoryCache(),
+		"http://localhost:3000",
+		database.NewTxManager(pool),
+	)
+
+	err = svc.SendVerification(ctx, user.ID, user.Email)
+	require.Error(t, err, "enqueue failure must surface instead of committing a token")
+
+	var (
+		tokenCount int
+		token      string
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*), min(token) FROM email_verification_tokens WHERE user_id = $1`, user.ID,
+	).Scan(&tokenCount, &token))
+	require.Equal(t, 1, tokenCount, "delete and create must roll back together")
+	require.Equal(t, oldToken, token, "the pre-existing token must remain after rollback")
+}

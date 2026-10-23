@@ -106,6 +106,11 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 			// and the enqueue cannot leave a usable verification link without
 			// an email.
 			if err := txSender.SendTx(ctx, tx, msg); err != nil {
+				slog.Error("failed to enqueue verification email",
+					slog.Int64("user_id", userID),
+					slog.String("email", userEmail),
+					slog.Any("error", err),
+				)
 				return fmt.Errorf("send verification email: %w", err)
 			}
 			queuedInTx = true
