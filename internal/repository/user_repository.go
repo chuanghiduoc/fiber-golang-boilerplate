@@ -20,6 +20,7 @@ type UserRepository interface {
 	Update(ctx context.Context, params sqlc.UpdateUserParams) (*sqlc.User, error)
 	UpdatePassword(ctx context.Context, params sqlc.UpdateUserPasswordParams) (*sqlc.User, error)
 	UpdateRole(ctx context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error)
+	RevokeSessions(ctx context.Context, id int64) (*sqlc.User, error)
 	VerifyEmail(ctx context.Context, id int64, email string) (*sqlc.User, error)
 	LinkGoogleAccount(ctx context.Context, params sqlc.LinkGoogleAccountParams) (*sqlc.User, error)
 	Delete(ctx context.Context, id int64) (*sqlc.User, error)
@@ -127,6 +128,14 @@ func (r *userRepository) UpdatePassword(ctx context.Context, params sqlc.UpdateU
 
 func (r *userRepository) UpdateRole(ctx context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error) {
 	user, err := r.q.UpdateUserRole(ctx, params)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &user, nil
+}
+
+func (r *userRepository) RevokeSessions(ctx context.Context, id int64) (*sqlc.User, error) {
+	user, err := r.q.RevokeUserSessions(ctx, id)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

@@ -143,11 +143,6 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 }
 
 func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error {
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
-	if err != nil {
-		return apperror.NewInternal("failed to hash password")
-	}
-
 	tokenHash := hashToken(req.Token)
 	var resetUserID int64
 
@@ -183,6 +178,13 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		}
 		resetUserID = rt.UserID
 
+		// Hash only after the token has been validated, so invalid-token
+		// requests cannot consume bcrypt CPU.
+		hash, hashErr := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+		if hashErr != nil {
+			return apperror.NewInternal("failed to hash password")
+		}
+
 		_, err = userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			ID:           rt.UserID,
@@ -202,6 +204,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		return nil
 	}
 
+	var err error
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			return doReset(

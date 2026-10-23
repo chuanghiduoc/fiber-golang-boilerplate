@@ -92,6 +92,24 @@ func TestChangePassword_RevokesSessionsAndBumpsVersion(t *testing.T) {
 	}
 }
 
+func TestRevokeSessions_InvalidatesAccessAndRefreshTokens(t *testing.T) {
+	repo := newMockUserRepo()
+	refreshRepo := newMockRefreshTokenRepo()
+	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil)
+	repo.users[1] = &sqlc.User{ID: 1, Email: "user@example.com", Name: "User", Role: "user"}
+	refreshRepo.tokens["hash"] = &sqlc.RefreshToken{UserID: 1, Token: "hash"}
+
+	if err := svc.RevokeSessions(context.Background(), 1); err != nil {
+		t.Fatalf("revoke sessions: %v", err)
+	}
+	if len(refreshRepo.tokens) != 0 {
+		t.Error("refresh tokens must be revoked")
+	}
+	if repo.users[1].TokenVersion == 0 {
+		t.Error("token version must be bumped to invalidate access tokens")
+	}
+}
+
 func TestDelete_CannotDeleteLastAdmin(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)

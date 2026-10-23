@@ -221,8 +221,8 @@ func (h *AuthHandler) Logout(c fiber.Ctx) error {
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/logout-all [post]
 func (h *AuthHandler) LogoutAll(c fiber.Ctx) error {
-	if err := h.refreshSvc.RevokeAllByUserID(c.Context(), authUserID(c)); err != nil {
-		return apperror.NewInternal("failed to revoke sessions")
+	if err := h.userSvc.RevokeSessions(c.Context(), authUserID(c)); err != nil {
+		return err
 	}
 	return response.NoContent(c)
 }

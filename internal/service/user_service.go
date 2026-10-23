@@ -39,6 +39,7 @@ type UserService interface {
 	VerifyPassword(ctx context.Context, userID int64, password string) error
 	Delete(ctx context.Context, id int64) error
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
+	RevokeSessions(ctx context.Context, userID int64) error
 }
 
 type userService struct {
@@ -475,6 +476,39 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, id)
+	}
+	return nil
+}
+
+// RevokeSessions invalidates every access and refresh token for a user, used
+// by the "logout all devices" endpoint.
+func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
+	doRevoke := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		if _, err := userRepo.RevokeSessions(ctx, userID); err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found")
+			}
+			return apperror.NewInternal("failed to revoke sessions")
+		}
+		if err := refreshRepo.DeleteByUserID(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to revoke refresh tokens")
+		}
+		return nil
+	}
+
+	var err error
+	if s.txManager != nil {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			return doRevoke(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+		})
+	} else {
+		err = doRevoke(s.repo, s.refreshTokenRepo)
+	}
+	if err != nil {
+		return err
+	}
+	if s.sessions != nil {
+		_ = s.sessions.Invalidate(ctx, userID)
 	}
 	return nil
 }

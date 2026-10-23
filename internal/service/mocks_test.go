@@ -200,6 +200,15 @@ func (m *mockUserRepo) UpdatePassword(_ context.Context, params sqlc.UpdateUserP
 	return u, nil
 }
 
+func (m *mockUserRepo) RevokeSessions(_ context.Context, id int64) (*sqlc.User, error) {
+	u, ok := m.users[id]
+	if !ok || u.DeletedAt.Valid {
+		return nil, apperror.ErrNotFound
+	}
+	u.TokenVersion++
+	return u, nil
+}
+
 func (m *mockUserRepo) UpdateRole(_ context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error) {
 	u, ok := m.users[params.ID]
 	if !ok || u.DeletedAt.Valid {

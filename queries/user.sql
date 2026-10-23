@@ -85,6 +85,12 @@ UPDATE users SET email_verified_at = NOW(), updated_at = NOW()
 WHERE id = $1 AND deleted_at IS NULL AND email = $2
 RETURNING *;
 
+-- name: RevokeUserSessions :one
+UPDATE users
+SET token_version = token_version + 1, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+RETURNING *;
+
 -- name: UpdateUserRole :one
 UPDATE users
 SET role = $1, updated_at = NOW(), token_version = token_version + 1
