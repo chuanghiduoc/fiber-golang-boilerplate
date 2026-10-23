@@ -304,6 +304,63 @@ func TestLoad_DefaultValues(t *testing.T) {
 	}
 }
 
+func TestLoadDatabase_IgnoresApplicationSecrets(t *testing.T) {
+	// A production migration job must not need JWT/admin/CORS/SMTP secrets.
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("ADMIN_EMAIL", "")
+	t.Setenv("ADMIN_PASSWORD", "")
+	t.Setenv("DB_HOST", "db.internal")
+	t.Setenv("DB_PORT", "5433")
+	t.Setenv("DB_DATABASE", "app")
+	t.Setenv("DB_USERNAME", "migrator")
+	t.Setenv("DB_PASSWORD", "secret")
+	t.Setenv("DB_SSLMODE", "require")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+
+	db, err := LoadDatabase()
+	if err != nil {
+		t.Fatalf("LoadDatabase() returned error: %v", err)
+	}
+	if db.Host != "db.internal" || db.Database != "app" || db.SSLMode != "require" {
+		t.Fatalf("unexpected database config: %+v", db)
+	}
+}
+
+func TestLoadDatabase_RejectsInvalidPoolSettings(t *testing.T) {
+	t.Setenv("DB_MAX_CONNS", "0")
+	if _, err := LoadDatabase(); err == nil {
+		t.Fatal("LoadDatabase() should reject DB_MAX_CONNS=0")
+	}
+}
+
+func TestLoadDatabase_RejectsPlaintextProductionTransport(t *testing.T) {
+	for _, mode := range []string{"disable", "allow", "prefer"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("APP_ENV", "Production")
+			t.Setenv("DB_SSLMODE", mode)
+			t.Setenv("DB_CONNECT_TIMEOUT", "10")
+			t.Setenv("DB_MAX_CONNS", "5")
+			t.Setenv("DB_MIN_CONNS", "1")
+			if _, err := LoadDatabase(); err == nil {
+				t.Fatalf("LoadDatabase() should reject DB_SSLMODE=%s in production", mode)
+			}
+		})
+	}
+}
+
+func TestLoadDatabase_RejectsUnknownEnvironment(t *testing.T) {
+	t.Setenv("APP_ENV", "prod")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	if _, err := LoadDatabase(); err == nil {
+		t.Fatal("LoadDatabase() should reject an unknown APP_ENV")
+	}
+}
+
 func TestDBConfig_DSN_EscapesSpecialCharacters(t *testing.T) {
 	db := DBConfig{
 		Host:     "localhost",

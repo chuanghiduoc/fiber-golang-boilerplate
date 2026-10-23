@@ -1,0 +1,190 @@
+package jobs
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// claimJobsSQL atomically requeues jobs whose worker lease expired and claims
+// due work. The expired CTE releases stale leases before the due CTE selects
+// candidates. A concurrently committed Heartbeat moves locked_at forward, and
+// PostgreSQL rechecks the row after waiting on the heartbeat's row lock, so a
+// live job is not reclaimed. Requeued rows become visible to the next claim,
+// which is why a call may reclaim a job without returning it.
+//
+// Reclaiming intentionally leaves attempts unchanged and records the lease
+// expiry in last_error; the subsequent claim increments attempts once. A worker
+// that dies on its final allowed attempt is dead-lettered instead of being
+// requeued forever, which prevents poison jobs from crash-looping. The due CTE
+// locks candidate rows with SKIP LOCKED so concurrent workers never claim the
+// same job, and the UPDATE increments attempts at claim time.
+const claimJobsSQL = `
+WITH expired AS (
+    UPDATE jobs
+    SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+        payload = CASE WHEN attempts >= max_attempts THEN '{}'::jsonb ELSE payload END,
+        run_at = CASE WHEN attempts >= max_attempts THEN run_at ELSE now() END,
+        locked_at = NULL,
+        locked_by = NULL,
+        last_error = CASE WHEN attempts >= max_attempts
+            THEN 'jobs: worker lease expired after max attempts'
+            ELSE 'jobs: worker lease expired'
+        END,
+        updated_at = now()
+    WHERE status = 'running'
+      AND locked_at < now() - make_interval(secs => $3::double precision)
+    RETURNING id
+),
+due AS (
+    SELECT id
+    FROM jobs
+    WHERE status = 'queued'
+      AND run_at <= now()
+    ORDER BY run_at, id
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+)
+UPDATE jobs AS j
+SET status = 'running',
+    attempts = j.attempts + 1,
+    locked_at = now(),
+    locked_by = $2,
+    updated_at = now()
+FROM due
+WHERE j.id = due.id
+RETURNING j.id, j.kind, j.payload, j.attempts, j.max_attempts`
+
+// heartbeatJobSQL renews the lease for a job that is still running under the
+// supplied worker. It changes only locked_at: a heartbeat is not a state
+// transition, so updated_at is deliberately left alone.
+const heartbeatJobSQL = `
+UPDATE jobs
+SET locked_at = now()
+WHERE id = $1
+  AND locked_by = $2
+  AND status = 'running'`
+
+// Completed jobs drop their payload: email jobs can contain password-reset or
+// verification links, and a terminal row must not retain usable secrets.
+const succeedJobSQL = `
+UPDATE jobs
+SET status = 'succeeded',
+    payload = '{}'::jsonb,
+    locked_at = NULL,
+    locked_by = NULL,
+    last_error = NULL,
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2
+  AND status = 'running'`
+
+// failJobSQL requeues the job when retryAt is set and marks it dead when it is
+// NULL. locked_by guards against a worker finishing a job it no longer owns.
+// Dead jobs drop their payload for the same secret-retention reason as success.
+const failJobSQL = `
+UPDATE jobs
+SET status = CASE WHEN $4::timestamptz IS NULL THEN 'dead' ELSE 'queued' END,
+    payload = CASE WHEN $4::timestamptz IS NULL THEN '{}'::jsonb ELSE payload END,
+    run_at = COALESCE($4::timestamptz, run_at),
+    last_error = $3,
+    locked_at = NULL,
+    locked_by = NULL,
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2
+  AND status = 'running'`
+
+// pgStore is the PostgreSQL implementation of store.
+type pgStore struct {
+	pool *pgxpool.Pool
+}
+
+var _ store = (*pgStore)(nil)
+
+func newPGStore(pool *pgxpool.Pool) *pgStore {
+	return &pgStore{pool: pool}
+}
+
+func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAfter time.Duration) ([]claimedJob, error) {
+	if s == nil || s.pool == nil {
+		return nil, ErrNoPool
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	if staleAfter <= 0 {
+		staleAfter = defaultLeaseDuration
+	}
+
+	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, staleAfter.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("jobs: claim: %w", err)
+	}
+	defer rows.Close()
+
+	var claimed []claimedJob
+	for rows.Next() {
+		var (
+			job     claimedJob
+			payload string
+		)
+		if err := rows.Scan(&job.ID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts); err != nil {
+			return nil, fmt.Errorf("jobs: scan claimed job: %w", err)
+		}
+		job.Payload = json.RawMessage(payload)
+		claimed = append(claimed, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("jobs: claim rows: %w", err)
+	}
+	return claimed, nil
+}
+
+func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string) error {
+	if s == nil || s.pool == nil {
+		return ErrNoPool
+	}
+	tag, err := s.pool.Exec(ctx, succeedJobSQL, id, workerID)
+	if err != nil {
+		return fmt.Errorf("jobs: mark %d succeeded: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+	}
+	return nil
+}
+
+func (s *pgStore) Fail(ctx context.Context, id int64, workerID, reason string, retryAt *time.Time) error {
+	if s == nil || s.pool == nil {
+		return ErrNoPool
+	}
+	tag, err := s.pool.Exec(ctx, failJobSQL, id, workerID, reason, retryAt)
+	if err != nil {
+		return fmt.Errorf("jobs: mark %d failed: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+	}
+	return nil
+}
+
+// Heartbeat renews the lease of a running job owned by workerID. A job that was
+// already reclaimed, finished, or claimed by another worker is reported as
+// ErrLeaseLost; the caller logs it but leaves the handler running.
+func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string) error {
+	if s == nil || s.pool == nil {
+		return ErrNoPool
+	}
+	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID)
+	if err != nil {
+		return fmt.Errorf("jobs: heartbeat %d: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+	}
+	return nil
+}

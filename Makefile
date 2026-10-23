@@ -7,10 +7,15 @@ all: build test
 build:
 	@echo "Building..."
 	@go build -o main.exe ./cmd/api
+	@go build -o migrate.exe ./cmd/migrate
 
-# Run the application
-run:
+# Run the application (schema first, then API)
+run: migrate-run
 	@go run ./cmd/api
+
+# Apply the single init schema through the project migration command
+migrate-run:
+	@go run ./cmd/migrate
 
 # Create DB container
 docker-run:
@@ -20,12 +25,18 @@ docker-run:
 docker-down:
 	@docker compose down
 
+# Verify the application (fast local gate)
+check: vet lint test
+
+vet:
+	@go vet ./...
+
 # Test the application
 test:
 	@echo "Testing..."
 	@go test ./... -v
 
-# Integration tests (requires Docker)
+# Integration tests (Docker/Testcontainers, or set TEST_DATABASE_URL)
 test-integration:
 	@echo "Running integration tests..."
 	@go test ./... -v -tags=integration -count=1 -timeout=10m
@@ -33,7 +44,7 @@ test-integration:
 # Clean the binary
 clean:
 	@echo "Cleaning..."
-	@rm -f main.exe
+	@rm -f main.exe migrate.exe
 
 # Live Reload
 watch:
@@ -61,8 +72,8 @@ sqlc-generate:
 lint:
 	@golangci-lint run ./...
 
-# Seed database
-seed:
+# Seed database (schema must already exist; migrate-run is a dependency)
+seed: migrate-run
 	@echo "Seeding database..."
 	@go run ./cmd/seed
 
@@ -74,4 +85,4 @@ swagger:
 rename-module:
 	@bash scripts/rename-module.sh $(mod)
 
-.PHONY: all build run test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed rename-module
+.PHONY: all build run migrate-run check vet test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed rename-module

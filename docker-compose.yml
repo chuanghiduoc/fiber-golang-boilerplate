@@ -17,6 +17,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
       EMAIL_DRIVER: ${EMAIL_DRIVER:-console}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-noreply@localhost}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Fiber App}
+      SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-false}
       METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
       JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-30}
@@ -57,9 +64,34 @@ services:
           memory: 512M
           cpus: "1.0"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    restart: "no"
+    command: ["./migrate"]
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-boilerplate}
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-password}
+      DB_SCHEMA: ${DB_SCHEMA:-public}
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+    depends_on:
+      postgres:
         condition: service_healthy
     networks:
       - app-network

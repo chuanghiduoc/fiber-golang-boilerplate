@@ -165,6 +165,23 @@ func (c CORSConfig) Headers() []string {
 	return splitCSV(c.AllowHeaders)
 }
 
+// Validate checks the database connection and pool settings.
+func (db DBConfig) Validate() error {
+	if db.ConnectTimeout < 1 {
+		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1 second")
+	}
+	if db.MaxConns < 1 {
+		return fmt.Errorf("DB_MAX_CONNS must be at least 1")
+	}
+	if db.MinConns < 0 {
+		return fmt.Errorf("DB_MIN_CONNS must not be negative")
+	}
+	if db.MinConns > db.MaxConns {
+		return fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", db.MinConns, db.MaxConns)
+	}
+	return nil
+}
+
 func (db DBConfig) DSN() string {
 	q := url.Values{}
 	q.Set("sslmode", db.SSLMode)
@@ -189,6 +206,41 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	return cfg, nil
+}
+
+// LoadDatabase loads and validates only the database settings. Schema tooling
+// (cmd/migrate) must be able to run without application secrets such as JWT
+// keys, metrics tokens, or SMTP credentials, so it deliberately skips the
+// application-wide validation performed by Load.
+func LoadDatabase() (DBConfig, error) {
+	var parsed struct {
+		App struct {
+			Env string `env:"APP_ENV" envDefault:"local"`
+		}
+		DB DBConfig
+	}
+	if err := env.Parse(&parsed); err != nil {
+		return DBConfig{}, fmt.Errorf("failed to parse database config: %w", err)
+	}
+	if err := parsed.DB.Validate(); err != nil {
+		return DBConfig{}, fmt.Errorf("invalid database config: %w", err)
+	}
+	appEnv := strings.ToLower(strings.TrimSpace(parsed.App.Env))
+	switch appEnv {
+	case "local", "test", "development", "staging", "production":
+	default:
+		return DBConfig{}, fmt.Errorf("APP_ENV must be one of: local, test, development, staging, production (got %q)", parsed.App.Env)
+	}
+	// Migration jobs skip the full application validation, but must not
+	// silently downgrade transport security relative to the API. allow/prefer
+	// permit a plaintext fallback, so they are not acceptable in production.
+	if appEnv == "production" {
+		switch strings.ToLower(parsed.DB.SSLMode) {
+		case "disable", "allow", "prefer":
+			return DBConfig{}, fmt.Errorf("DB_SSLMODE=%s permits plaintext in production; use require or verify-full", parsed.DB.SSLMode)
+		}
+	}
+	return parsed.DB, nil
 }
 
 func (cfg *Config) Validate() error {
@@ -251,17 +303,8 @@ func (cfg *Config) Validate() error {
 	}
 
 	// Database pool validation
-	if cfg.DB.ConnectTimeout < 1 {
-		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1 second")
-	}
-	if cfg.DB.MaxConns < 1 {
-		return fmt.Errorf("DB_MAX_CONNS must be at least 1")
-	}
-	if cfg.DB.MinConns < 0 {
-		return fmt.Errorf("DB_MIN_CONNS must not be negative")
-	}
-	if cfg.DB.MinConns > cfg.DB.MaxConns {
-		return fmt.Errorf("DB_MIN_CONNS (%d) must not exceed DB_MAX_CONNS (%d)", cfg.DB.MinConns, cfg.DB.MaxConns)
+	if err := cfg.DB.Validate(); err != nil {
+		return err
 	}
 
 	// Cache config validation

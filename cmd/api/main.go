@@ -19,12 +19,15 @@ import (
 
 	_ "github.com/joho/godotenv/autoload"
 
-	"github.com/gofiber/fiber/v3"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/router"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
@@ -86,12 +89,9 @@ func main() {
 
 	slog.Info("connected to database")
 
-	// Run migrations
-	if err := database.RunMigrations(cfg.DB.DSN(), "migrations"); err != nil {
-		pool.Close()
-		fail("failed to run migrations", err)
-	}
-	slog.Info("migrations completed")
+	// Schema management is owned by cmd/migrate only. The API never applies
+	// DDL, so replicas can start safely without a migration lock convoy.
+	slog.Info("database schema assumed up to date (run cmd/migrate)")
 
 	// Initialize storage
 	store, err := storage.NewStorage(cfg.Storage)
@@ -147,17 +147,21 @@ func main() {
 
 	refreshSvc := service.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
+	// Durable email delivery: services enqueue; the worker sends and retries.
+	jobQueue := jobs.NewQueue(pool)
+	queuedEmail := jobs.NewQueuedSender(jobQueue)
+
 	// Password reset
 	passwordResetRepo := repository.NewPasswordResetRepository(pool)
 	passwordResetSvc := service.NewPasswordResetService(
 		userRepo, passwordResetRepo, refreshTokenRepo,
-		emailSender, appCache, cfg.App.FrontendURL, txManager, sessionStore,
+		queuedEmail, appCache, cfg.App.FrontendURL, txManager, sessionStore,
 	)
 
 	// Email verification
 	emailVerifRepo := repository.NewEmailVerificationRepository(pool)
 	emailVerifSvc := service.NewEmailVerificationService(
-		userRepo, emailVerifRepo, emailSender, appCache, cfg.App.FrontendURL,
+		userRepo, emailVerifRepo, queuedEmail, appCache, cfg.App.FrontendURL,
 	)
 
 	authHandler := handler.NewAuthHandler(
@@ -177,36 +181,34 @@ func main() {
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)
 
-	// Create Fiber app
-	fiberCfg := fiber.Config{
-		AppName:      "fiber-golang-boilerplate",
-		ErrorHandler: apperror.FiberErrorHandler,
-		BodyLimit:    cfg.App.BodyLimit,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-	// Behind a reverse proxy, only trust X-Forwarded-* from configured proxies
-	// so c.IP() (used for rate limiting) cannot be spoofed by clients.
-	if cfg.App.TrustProxy {
-		fiberCfg.TrustProxy = true
-		fiberCfg.ProxyHeader = fiber.HeaderXForwardedFor
-		fiberCfg.TrustProxyConfig = fiber.TrustProxyConfig{Proxies: cfg.App.TrustedProxiesList()}
-	}
-	app := fiber.New(fiberCfg)
-
-	// Setup routes
-	router.SetupRoutes(app, router.Deps{
-		AuthHandler:   authHandler,
-		UserHandler:   userHandler,
-		UploadHandler: uploadHandler,
-		AdminHandler:  adminHandler,
-		Config:        cfg,
-		Pool:          pool,
-		Health:        healthChecker,
-		Sessions:      sessionStore,
-		Cache:         appCache,
+	// Composition root. Modules own their route tables; app owns global
+	// middleware, infrastructure routes, and lifecycle.
+	application := app.New(cfg, app.Deps{
+		Cache:    appCache,
+		Sessions: sessionStore,
+		Health:   healthChecker,
+		Audit:    audit.NewPostgresRecorder(pool),
 	})
+	application.Register(
+		identity.New(authHandler, userHandler),
+		files.New(uploadHandler),
+		admin.New(adminHandler),
+	)
+
+	// Durable email worker. It shares the pool but runs outside the request
+	// path, so SMTP outages retry instead of failing a registration request.
+	hostname, _ := os.Hostname()
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	worker := jobs.NewWorker(pool, hostname, jobs.WithConcurrency(4))
+	worker.Register(jobs.EmailJobKind, jobs.EmailHandler(emailSender))
+	workerDone := make(chan struct{})
+	workerErrCh := make(chan error, 1)
+	go func() {
+		if err := worker.Run(workerCtx); err != nil {
+			workerErrCh <- err
+		}
+		close(workerDone)
+	}()
 
 	// Graceful shutdown
 	serverErr := make(chan error, 1)
@@ -214,7 +216,7 @@ func main() {
 	go func() {
 		addr := fmt.Sprintf(":%d", cfg.App.Port)
 		slog.Info("server starting", slog.String("addr", addr), slog.String("env", cfg.App.Env))
-		serverErr <- app.Listen(addr)
+		serverErr <- application.Listen(addr)
 	}()
 
 	sigChan := make(chan os.Signal, 1)
@@ -227,18 +229,29 @@ func main() {
 			slog.Error("server error", slog.Any("error", listenErr))
 			exitCode = 1
 		}
+	case workerErr := <-workerErrCh:
+		slog.Error("job worker stopped", slog.Any("error", workerErr))
+		exitCode = 1
 	case sig := <-sigChan:
 		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
-
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		shutdownErr := app.ShutdownWithContext(shutdownCtx)
-		cancel()
-		if shutdownErr != nil {
-			slog.Error("server forced to shutdown", slog.Any("error", shutdownErr))
-			exitCode = 1
-		}
 	}
 	signal.Stop(sigChan)
+
+	// Stop claiming new jobs, let running handlers drain, then stop HTTP.
+	workerCancel()
+	select {
+	case <-workerDone:
+	case <-time.After(10 * time.Second):
+		slog.Warn("job worker did not drain within 10s")
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownErr := application.ShutdownWithContext(shutdownCtx)
+	cancel()
+	if shutdownErr != nil {
+		slog.Error("server forced to shutdown", slog.Any("error", shutdownErr))
+		exitCode = 1
+	}
 
 	// Cleanup all resources
 	if err := appCache.Close(); err != nil {

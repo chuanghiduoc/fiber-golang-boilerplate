@@ -168,7 +168,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
 	if h.requireEmailVerification && !user.EmailVerified {
-		return apperror.NewEmailNotVerified("email not verified")
+		return apperror.NewCode(apperror.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)

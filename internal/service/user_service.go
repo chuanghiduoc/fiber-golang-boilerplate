@@ -89,7 +89,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to check existing user")
 	}
 	if existing != nil {
-		return nil, apperror.NewConflict("email already registered")
+		return nil, apperror.NewCode(apperror.CodeUserEmailTaken, "email already registered")
 	}
 	if err := ensureEmailNotBanned(ctx, s.repo, email); err != nil {
 		return nil, err
@@ -107,7 +107,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	})
 	if err != nil {
 		if repository.IsUniqueViolation(err) {
-			return nil, apperror.NewConflict("email already registered")
+			return nil, apperror.NewCode(apperror.CodeUserEmailTaken, "email already registered")
 		}
 		return nil, apperror.NewInternal("failed to create user")
 	}
@@ -131,7 +131,7 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 			// timing cannot be used for account enumeration.
 			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
 			// Never create a lockout key for a nonexistent account.
-			return nil, apperror.NewUnauthorized("invalid email or password")
+			return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
 		}
 		return nil, apperror.NewInternal("failed to get user")
 	}
@@ -148,15 +148,15 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 
 	if !user.PasswordHash.Valid {
 		s.incrementLoginAttempts(ctx, cacheKey)
-		return nil, apperror.NewUnauthorized("invalid email or password")
+		return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.Password)); err != nil {
 		s.incrementLoginAttempts(ctx, cacheKey)
-		return nil, apperror.NewUnauthorized("invalid email or password")
+		return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 
 	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
-		return nil, apperror.NewEmailNotVerified("email not verified")
+		return nil, apperror.NewCode(apperror.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	// Clear attempts on success
@@ -474,7 +474,7 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 			return apperror.NewInternal("failed to count admins")
 		}
 		if admins <= 1 {
-			return apperror.NewConflict("cannot delete the last active admin")
+			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot delete the last active admin")
 		}
 	}
 

@@ -25,6 +25,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l . | grep -v '^docs/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -59,8 +68,102 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Vet
+        run: go vet ./...
+
       - name: Build binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o server ./cmd/api
+
+      - name: Build migrate binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o migrate ./cmd/migrate
+
+  migrations:
+    name: Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: boilerplate
+          POSTGRES_USER: postgres
+          # Ephemeral CI-only database; no password is used or stored.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d boilerplate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      APP_ENV: local
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_DATABASE: boilerplate
+      DB_USERNAME: postgres
+      DB_SSLMODE: disable
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Apply initial schema up and down with psql
+        run: |
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
+            -f migrations/000001_init_schema.up.sql
+
+          expected_tables="users refresh_tokens password_reset_tokens email_verification_tokens files jobs audit_events"
+          existing_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+          for table in $expected_tables; do
+            if ! grep -qx "$table" <<< "$existing_tables"; then
+              echo "::error::missing table after up migration: $table"
+              exit 1
+            fi
+          done
+
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
+            -f migrations/000001_init_schema.down.sql
+
+          remaining_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
+          if [ "$remaining_tables" -ne 0 ]; then
+            echo "::error::down migration left $remaining_tables table(s) behind"
+            exit 1
+          fi
+
+      - name: Run cmd/migrate twice against a clean database
+        run: |
+          go run ./cmd/migrate
+          go run ./cmd/migrate
+
+          migrated_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'files', 'jobs', 'audit_events')")
+          if [ "$migrated_tables" -ne 7 ]; then
+            echo "::error::expected 7 tables after cmd/migrate, found $migrated_tables"
+            exit 1
+          fi
+
+      - name: Reject a legacy version-1 schema with an actionable error
+        run: |
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d postgres -v ON_ERROR_STOP=1 \
+            -c "CREATE DATABASE legacy"
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d legacy -v ON_ERROR_STOP=1 \
+            -c "CREATE TABLE users (id BIGSERIAL PRIMARY KEY); \
+                CREATE TABLE schema_migrations (version BIGINT NOT NULL, dirty BOOLEAN NOT NULL); \
+                INSERT INTO schema_migrations VALUES (1, false);"
+          if DB_DATABASE=legacy go run ./cmd/migrate > /tmp/legacy-migrate.log 2>&1; then
+            echo "::error::legacy schema unexpectedly passed migration verification"
+            exit 1
+          fi
+          grep -q "schema is incomplete" /tmp/legacy-migrate.log || {
+            echo "::error::legacy schema failed without the expected actionable error"
+            cat /tmp/legacy-migrate.log
+            exit 1
+          }
 
   security:
     name: Security
@@ -119,6 +222,23 @@ jobs:
     name: Integration
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: apptest
+          POSTGRES_USER: postgres
+          # Ephemeral CI-only database; no password is used or stored.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d apptest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/apptest?sslmode=disable
     steps:
       - uses: actions/checkout@v7
 
@@ -126,5 +246,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run integration tests (Testcontainers/PostgreSQL)
+      # The audit integration tests query the public schema directly; the
+      # handler/jobs tests create their own isolated schemas from the same file.
+      - name: Apply schema to integration database
+        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/000001_init_schema.up.sql
+
+      - name: Run integration tests (PostgreSQL service)
         run: go test -tags=integration -race -count=1 -timeout=10m ./...

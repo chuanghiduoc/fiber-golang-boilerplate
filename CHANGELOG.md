@@ -6,8 +6,49 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- Modular-monolith composition root (`internal/app`) with module-owned route tables (`internal/modules/identity`, `files`, `admin`); platform packages for cross-cutting mechanics
+- Durable PostgreSQL job queue (`internal/platform/jobs`): transactional enqueue, `FOR UPDATE SKIP LOCKED` claiming, lease heartbeats with stale-lock reclamation, exponential backoff, dead-lettering, graceful drain; email delivery now runs through queued jobs. Delivery is at-least-once, so handlers must be idempotent.
+- Permission-based authorization (`internal/platform/authz`) with a role→permission matrix and `Require`/`RequireAny` middleware
+- Generic audit trail (`internal/platform/audit`) for successful mutating requests plus explicit domain events
+- Typed error catalog (`pkg/apperror/catalog.go`) mapping stable codes to HTTP status/title
+- One-shot database entrypoint `cmd/migrate`; Docker Compose runs it before the API
+- Architecture test (`test/arch`) that rejects cross-module and platform→module imports
+- `make check` and `make migrate-run`
+
+### Changed (architecture)
+- API and seed no longer auto-run migrations; only `cmd/migrate` applies DDL, preventing replica migration races
+- Consolidated all schema into a single `migrations/000001_init_schema.up.sql` / `.down.sql` (replaces the old shipped migrations `000001`–`000003`); `jobs` and `audit_events` live in that file
+- Dockerfile builds both `server` and `migrate`; Compose adds a one-shot `migrate` service and app dependency
+- `make run` migrates before starting; `make seed` depends on migration
+- CI builds both binaries, runs `go vet`/`gofmt`, and includes a fresh-PostgreSQL migration job (baseline up/down + `cmd/migrate` twice)
+- README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
+
+### Fixed
+- Job bookkeeping now reports lost leases (`RowsAffected` check) and logs outcome-write failures instead of silently leaving a job `running`
+- Heartbeats are clamped to at least four renewals per lease, and terminal jobs clear their payload so queued email secrets are not retained
+- `cmd/migrate` verifies required tables after migrating and fails with an actionable message for legacy version-1 schemas
+- Migration jobs enforce the same production TLS rule as the API (`DB_SSLMODE=disable` is rejected)
+- Compose forwards SMTP/email-from settings so a production SMTP deployment can start without editing the file
+- The baseline schema drops/recreates triggers idempotently; the down migration guards against a missing `users` table
+
+### Upgrade notes
+
+- **Upgrading an existing database:** the consolidated `000001_init_schema` is
+  a fresh-install baseline, not a drop-in replacement for a database that
+  applied the old migrations. Keep its `schema_migrations` history, restore the
+  old `000002`/`000003` source files from git history (golang-migrate requires
+  the recorded version to exist), and add a new numbered migration (a fully
+  migrated old deployment is at version 3, so `000004` or later) with any
+  missing tables/indexes, such as `jobs` and `audit_events`. Do not point an
+  existing database at the new `000001` or reset `schema_migrations`, and never
+  edit a shipped migration after deployment. `cmd/migrate` now prints this
+  guidance for legacy history and verifies required tables, columns, and unique
+  indexes after migrating. See
+  "Upgrading an existing database" in the README.
+
 ### Changed (API contract — breaking)
-- Errors now follow RFC 9457 Problem Details (`application/problem+json`): `type`, `title`, `status`, `code` (snake_case i18n key), `detail`, `instance`, `requestId`, `timestamp`, and a flat `errors[]` for validation. Configurable docs base via `ERROR_DOCS_BASE_URL`.
+- Errors now follow RFC 9457 Problem Details (`application/problem+json`): `type`, `title`, `status`, `code` (stable dotted domain code), `detail`, `instance`, `requestId`, `timestamp`, and a flat `errors[]` for validation. Configurable docs base via `ERROR_DOCS_BASE_URL`; typed codes use their catalog `DocPath` for `type`.
 - Successful responses return the resource directly (no `{data,meta}` envelope). List endpoints use the Stripe-style `{object:"list", url, data, hasMore, nextCursor}` envelope.
 - List endpoints switched to forward-only cursor pagination (`limit` + `startingAfter`), backed by `(created_at, id)` indexes; the opaque cursor is `base64url(created_at:id)`. Offset helpers remain for small tables.
 - JSON keys are camelCase; correlation header standardised to `X-Request-Id`.
@@ -47,14 +88,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - `APP_BODY_LIMIT` default now exceeds `STORAGE_MAX_FILE_SIZE`, so advertised 10 MB uploads are reachable
 - DSN construction escapes credentials/database names; migrations resolve paths and schemes robustly
 - Server exits non-zero when `Listen` fails; startup is bounded by a timeout; HTTP read/write/idle timeouts are configured
-- Migration 000002 preserves email reuse after soft delete, creates real unique token-per-user indexes, and adds a DB trigger that makes last-admin removal safe under concurrency
-- Migration 000003 adds `banned_at` for installations that already applied 000002; migrations are no longer edited after shipping
+- The consolidated schema preserves email reuse after soft delete, creates real unique token-per-user indexes, and adds a DB trigger that makes last-admin removal safe under concurrency
+- The consolidated schema includes `banned_at`; migrations are no longer edited after shipping
 - Rate-limit tiers use separate keyspaces, and cache-backed limiter reads/writes fail open instead of turning a Redis blip into API-wide 500s
 - Console email logs HTML-only messages (reset/verification links), and seeded admins are marked verified
 - S3 downloads stat the object before responding and bound/cancel the stream; missing objects no longer surface after a 200
 - Integration tests can run without Docker via `TEST_DATABASE_URL` using an isolated schema
 - JSON bodies reject unknown fields and trailing values; duplicate emails return 409, oversized uploads 413, and unsupported media 415
-- Non-owned user/file IDs return 404 instead of 403 so sequential IDs cannot be used to confirm another tenant's resources exist
+- Non-owned user/file IDs return 404 instead of 403 so sequential IDs cannot be used to confirm another user's resources exist
 - `TxManager.WithTx` now uses `errors.Join` on rollback failure so `errors.Is/As` still see the original business error
 - Fix cross-platform path-traversal false positive: canonicalize the local storage base path (symlink/8.3 resolution)
 - Readiness returns HTTP 503 when degraded; readiness checks now run truly in parallel
@@ -96,7 +137,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Admin: stats, user management (ban/unban/role), file listing
 - JWT with iss/aud claims, refresh token rotation
 - Pluggable drivers: storage (local/s3/minio), cache (memory/redis), email (console/smtp)
-- Auto-migrations on startup, admin user seeding
+- Initial schema setup and admin seeding at startup (superseded by the one-shot `cmd/migrate` and `cmd/seed` commands)
 - Swagger/OpenAPI docs
 - Prometheus metrics, structured slog logging, health checks
 - Tiered rate limiting (strict/normal/relaxed)

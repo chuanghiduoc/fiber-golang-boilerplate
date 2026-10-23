@@ -23,7 +23,7 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 - **Framework**: [Fiber v3](https://docs.gofiber.io/) (Go 1.27.3+)
 - **Database**: PostgreSQL 17 with [pgxpool](https://github.com/jackc/pgx)
 - **Query**: [sqlc](https://sqlc.dev/) (type-safe SQL code generation)
-- **Migration**: [golang-migrate](https://github.com/golang-migrate/migrate) (auto-run on startup)
+- **Migration**: [golang-migrate](https://github.com/golang-migrate/migrate) via one `cmd/migrate` entrypoint (single init schema)
 - **Auth**: JWT ([golang-jwt](https://github.com/golang-jwt/jwt)) + Google OAuth 2.0
 - **Validation**: [go-playground/validator](https://github.com/go-playground/validator)
 - **Logging**: slog (stdlib structured logging)
@@ -37,41 +37,45 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 
 ## Architecture
 
+The project is a **modular monolith**: one deployable, module-owned route tables, and
+platform packages for cross-cutting mechanics.
+
 ```
-cmd/api/main.go                     Entry point, DI, graceful shutdown
-cmd/seed/main.go                    Standalone DB seeder
-config/config.go                    Struct-based config from env vars (caarlos0/env)
-internal/
-  handler/                          HTTP handlers (parse request → call service → return response)
-  service/                          Business logic (interfaces for testability)
-  repository/                       Data access layer (wraps sqlc, error translation)
-  dto/                              Request/Response structs + role constants
-  sqlc/                             Generated code (DO NOT EDIT — use `make sqlc-generate`)
-  middleware/                       JWT auth, rate limit, logger, recovery, security headers, metrics
-  session/                          Token-version/session validation with generation-keyed invalidation
-  router/                           Route definitions, grouping, middleware wiring
-  seed/                             Admin user seeder (idempotent)
+cmd/api/main.go                     Bootstrap, module registration, graceful shutdown
+cmd/migrate/main.go                 The only DB initializer/migrator (single init schema)
+cmd/seed/main.go                    Standalone admin seeder (schema must exist)
+internal/app/                       Composition root: Fiber, global middleware, module registry
+internal/modules/
+  identity/                         Auth, users, sessions, tokens (route table)
+  files/                            Upload, download, soft delete, restore
+  admin/                            Back-office facade
+internal/platform/
+  authz/                            Permission catalog + Fiber middleware
+  audit/                            Audit event recorder + mutating-request middleware
+  jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
+internal/handler/                   Current handler internals (being moved into modules)
+internal/service/                   Current service internals
+internal/repository/                Current repository internals
+internal/dto/                       Current DTOs
+internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
+internal/middleware/                JWT, rate limit, logger, recovery, security headers, metrics
+internal/session/                   Token-version/session validation
 pkg/
-  apperror/                         AppError type + Fiber error handler + ErrNotFound sentinel
-  response/                         Standardized JSON responses (Success, Created, NoContent, Error)
-  database/                         PostgreSQL pool, auto-migration, TxManager
-  validator/                        Struct validation (password: 8-72 chars, upper+lower+digit+special)
-  token/                            JWT generation/parsing (iss/aud claims)
-  cache/                            Cache interface (memory | redis)
-  storage/                          Storage interface (local | s3 | minio)
-  email/                            Email interface (console | smtp)
-  pagination/                       Normalize, LimitOffset, TotalPages
-  logger/                           slog setup (JSON in prod, text in dev)
-  health/                           Liveness + readiness checks
-  oauth/                            Google OAuth 2.0
-  metrics/                          Prometheus HTTP metrics
-  async/                            Fire-and-forget goroutine with panic recovery
-migrations/                         SQL migration files (baseline schema + identity/session hardening)
-queries/                            SQL query files for sqlc
+  apperror/                         RFC 9457 errors + typed error catalog
+  response/                         JSON response helpers
+  database/                         Pool, TxManager, migration runner
+  validator/ token/ cache/ storage/ email/ pagination/ logger/ health/ oauth/ metrics/ async/
+migrations/000001_init_schema.*     Single consolidated init schema (up/down)
+queries/                            sqlc query files
 docs/                               Generated Swagger docs
 ```
 
-Request flow: `Client → Middleware → Handler → Service → Repository → sqlc → PostgreSQL`
+Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
+
+**Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
+assume the schema exists, so replicas never race on migrations. Fresh installs
+run the single `000001_init_schema.up.sql`; add new numbered migrations only
+after a database is deployed.
 
 ## Quick Start
 
@@ -105,7 +109,58 @@ cp .env.example .env
 make run
 ```
 
-The app auto-runs migrations and seeds an admin user on startup.
+`make run` applies the schema through `cmd/migrate` before starting the API.
+Docker Compose runs a one-shot `migrate` service before the app; the API seeds
+the admin user on startup.
+
+## Database & Migrations
+
+Schema changes are a separate one-shot step owned by `cmd/migrate`:
+
+```bash
+make migrate-run   # apply pending migrations (the only DDL entrypoint)
+make run           # apply migrations, then start the API
+make seed          # apply migrations, then seed the admin user
+```
+
+Docker Compose runs the one-shot `migrate` service before the `app` service
+(`service_completed_successfully`). `cmd/api` and `cmd/seed` never apply DDL;
+they assume the schema exists, so API replicas never race on migrations.
+
+`cmd/migrate` loads only database configuration (`config.LoadDatabase`), so a
+production migration job needs `DB_*` variables (host, port, database, user,
+password, schema, SSL mode) and no JWT, admin, SMTP, or other application
+secrets. `DB_SSLMODE=disable` is rejected when `APP_ENV=production`. After
+migrating, the command verifies that every required table exists and fails with
+an actionable error if it finds a legacy partial schema.
+
+### Upgrading an existing database
+
+`000001_init_schema` is a **fresh-install baseline**. It replaces the old
+shipped migrations `000001`–`000003` and also creates the `jobs` and
+`audit_events` tables.
+
+A database that already applied the old migrations has a different
+`schema_migrations` history (normally version 3 if all old migrations were
+applied). Do not point it at the new `000001`, and never reset
+`schema_migrations` to force the baseline through. Keep the applied history and
+add a numbered migration containing only the missing tables/indexes. The new
+version must be higher than the version already recorded, so a fully migrated
+old deployment needs `000004` or later.
+
+Because this refactor removed the old `000002`/`000003` source files, restore
+them from git history first (do not edit them): golang-migrate requires the
+recorded version to exist in the source before it will advance. Add `000004`
+(or later) for `jobs`, `audit_events`, and any other missing objects, then run
+`cmd/migrate`. `cmd/migrate` prints this guidance when it detects a legacy
+version whose source files are missing. Alternatively, apply the missing DDL
+manually with `psql` and baseline the version; do not run the new `000001` over
+the old schema.
+
+If a fresh schema was created out-of-band and already matches `000001`,
+baseline it manually after verifying the objects (for example, set version 1
+with the golang-migrate CLI's `force 1`) instead of running the file over
+populated tables. Never edit a shipped migration after deployment.
 
 ## API Endpoints
 
@@ -169,35 +224,76 @@ The app auto-runs migrations and seeds an admin user on startup.
 ## Makefile Commands
 
 ```bash
-make build                        # Build binary
-make run                          # Run locally
+make build                        # Build server + migrate binaries
+make run                          # Apply schema, then run locally
+make migrate-run                  # Apply pending migrations via cmd/migrate
 make test                         # Run unit tests
 make test-integration             # Run integration tests (Docker/testcontainers, or set TEST_DATABASE_URL)
 make lint                         # Run golangci-lint
-make docker-run                   # Start with Docker Compose
+make docker-run                   # Start with Docker Compose (includes migrate service)
 make docker-down                  # Stop Docker Compose
-make migrate-up                   # Run migrations manually
+make migrate-up                   # Run migrations with the golang-migrate CLI
 make migrate-down                 # Rollback migrations
-make migrate-create name=xxx      # Create new migration
+make migrate-create name=xxx      # Create a new migration after deployment
 make sqlc-generate                # Regenerate sqlc code
 make swagger                      # Regenerate Swagger docs
-make seed                         # Seed database (admin user)
+make seed                         # Apply schema, then seed the admin user
 make watch                        # Live reload with Air
 ```
 
-## Adding a New Entity
+`make migrate-run`, `make run`, and `make seed` use `cmd/migrate`.
+`make migrate-up` and `make migrate-down` are the golang-migrate CLI equivalents.
 
-1. Create migration: `make migrate-create name=create_xxx_table`
-2. Write SQL in `migrations/` (up + down)
-3. Write queries in `queries/xxx.sql` (with sqlc annotations)
-4. Run `make sqlc-generate`
-5. Create `internal/dto/xxx_dto.go` (request/response structs)
-6. Create `internal/repository/xxx_repository.go` (interface + impl wrapping sqlc)
-7. Create `internal/service/xxx_service.go` (interface + impl with business logic)
-8. Create `internal/handler/xxx_handler.go` (HTTP handler with Swagger annotations)
-9. Register routes in `internal/router/v1.go`
-10. Wire DI in `cmd/api/main.go`
-11. Run `make swagger` to update docs
+## Background Jobs
+
+`internal/platform/jobs` is a PostgreSQL-backed durable queue; email delivery
+runs through it. Delivery is **at-least-once**, not exactly-once: a handler can
+run again after a retry, panic, or lease expiry, so handlers must be idempotent
+and safe to retry. Use `Queue.EnqueueTx` when a job must commit atomically with
+the business transaction that produced it.
+
+- Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
+  Failures retry with exponential backoff (1s doubling up to 1h) until
+  `max_attempts` (default 10), then move to `dead`. An unregistered job kind is
+  dead-lettered immediately.
+- Running jobs renew a lease with a 30s heartbeat (5m lease by default). A
+  `running` job whose lease expires is requeued by the next claim, so a crashed
+  worker does not block it forever. Reclamation happens inside the claim query,
+  so another worker must be polling to recover a dead worker's jobs; a
+  reclaimed job consumes an attempt when claimed again. A worker that loses its
+  lease can still be executing the old handler, so duplicate concurrent
+  execution is possible. Tune the lease with `WithHeartbeatInterval` and
+  `WithLeaseDuration`.
+- `jobs` stores `run_at`, `locked_at`, `locked_by`, `attempts`, and
+  `last_error`; use them to inspect retries and dead letters. Successful and
+  dead jobs have their `payload` cleared, so reset/verification links from email
+  jobs are not retained after delivery.
+- On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
+  the app waits up to 10s for them to drain. Long handlers must honor context
+  cancellation.
+
+## Adding a New Module
+
+1. Create `internal/modules/<name>/module.go` implementing `app.Module`
+   (`Name`, `RegisterRoutes`).
+2. Keep the module's handler/service/repository/DTO inside its directory.
+   Do not import another module's internals; use `internal/contracts` or a
+   narrow exported interface.
+3. Add permissions to `internal/platform/authz` and protect mutation routes
+   with `authz.Require(...)`.
+4. Write queries in a module-scoped `queries/<name>.sql` file and run
+   `make sqlc-generate`.
+5. For a deployed database, add a numbered migration. For this boilerplate's
+   fresh installs, update the single `000001_init_schema` file.
+6. Register the module once in `cmd/api/main.go`.
+7. Add module unit tests and an integration test; the architecture test in
+   `test/arch` rejects cross-module imports.
+8. Run `make swagger` and `make check` before opening a PR.
+
+> The current `identity`, `files`, and `admin` modules wrap the existing
+> handler/service/repository packages. Moving those internals into the module
+> directories is the next strangler phase; new modules should start directly
+> in the module layout.
 
 ## Environment Variables
 
@@ -213,7 +309,7 @@ Key settings:
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
 - `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
-- `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on startup (password must be 12+ chars in production)
+- `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on API startup (also available via `make seed`; password must be 12+ chars in production)
 
 ## Pagination
 
@@ -235,6 +331,20 @@ Testcontainers pulls the Docker client as a test-only dependency. `govulncheck`
 reports no called vulnerabilities, but GitHub may show open advisories for that
 client until upstream ships a patched module; it is not linked into the API
 binary.
+
+## Scope and Remaining Work
+
+This is a boilerplate, not a finished multi-tenant SaaS platform. The modular
+monolith, durable jobs, audit trail, permission-based authorization, and single
+migration entrypoint exist. Remaining work:
+
+- Tenant isolation: tenant-scoped data, query enforcement/row-level security,
+  and per-tenant limits.
+- Per-module sqlc generation: `internal/sqlc` is still one shared package.
+- Tracing and CD: metrics exist, but distributed tracing and deployment
+  pipelines do not.
+- Moving `internal/handler|service|repository|dto` internals into the module
+  directories (the strangler phase noted above).
 
 ## Security notes
 

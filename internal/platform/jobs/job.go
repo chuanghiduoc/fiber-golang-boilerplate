@@ -1,0 +1,112 @@
+// Package jobs provides a small PostgreSQL-backed durable job queue and
+// worker. Jobs are stored in the jobs table, claimed with FOR UPDATE SKIP
+// LOCKED, and retried with exponential backoff until they succeed or exhaust
+// their attempt budget. A running worker renews its job lease with heartbeats;
+// leases that expire (for example after a crashed process) are requeued
+// automatically.
+package jobs
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+const (
+	// DefaultMaxAttempts is used when Job.MaxAttempts is zero.
+	DefaultMaxAttempts = 10
+
+	defaultBackoffBase = time.Second
+	defaultBackoffMax  = time.Hour
+)
+
+var (
+	// ErrEmptyKind is returned when a job has no kind.
+	ErrEmptyKind = errors.New("jobs: kind is required")
+	// ErrInvalidPayload is returned when a job payload is not valid JSON.
+	ErrInvalidPayload = errors.New("jobs: payload must be valid JSON")
+	// ErrInvalidMaxAttempts is returned when Job.MaxAttempts is negative.
+	ErrInvalidMaxAttempts = errors.New("jobs: max attempts must not be negative")
+	// ErrNoHandler is returned internally when a claimed job kind has no
+	// registered handler. Such jobs are moved to the dead state.
+	ErrNoHandler = errors.New("jobs: no handler registered")
+	// ErrNoPool is returned when a queue or worker has no database pool.
+	ErrNoPool = errors.New("jobs: database pool is nil")
+	// ErrNoTx is returned when EnqueueTx is called with a nil transaction.
+	ErrNoTx = errors.New("jobs: transaction is nil")
+	// ErrLeaseLost is returned by Heartbeat when the job is no longer running
+	// under the supplied worker, usually because its lease expired and another
+	// worker reclaimed it.
+	ErrLeaseLost = errors.New("jobs: worker lease lost")
+)
+
+// Job describes a unit of work to enqueue.
+type Job struct {
+	// Kind selects the registered handler that processes the job.
+	Kind string
+	// Payload is passed verbatim to the handler. Nil or empty payloads are
+	// stored as an empty JSON object.
+	Payload json.RawMessage
+	// RunAt is the earliest time the job may be claimed. Zero means now.
+	RunAt time.Time
+	// MaxAttempts caps how many times the job may be claimed. Zero means
+	// DefaultMaxAttempts.
+	MaxAttempts int
+}
+
+// normalize applies documented defaults and validates the job. now is passed
+// in so callers can keep a consistent clock.
+func (j Job) normalize(now time.Time) (Job, error) {
+	if strings.TrimSpace(j.Kind) == "" {
+		return Job{}, ErrEmptyKind
+	}
+
+	if len(j.Payload) == 0 {
+		j.Payload = json.RawMessage(`{}`)
+	}
+	if !json.Valid(j.Payload) {
+		return Job{}, fmt.Errorf("%w: kind %q", ErrInvalidPayload, j.Kind)
+	}
+
+	if j.MaxAttempts < 0 {
+		return Job{}, fmt.Errorf("%w: got %d", ErrInvalidMaxAttempts, j.MaxAttempts)
+	}
+	if j.MaxAttempts == 0 {
+		j.MaxAttempts = DefaultMaxAttempts
+	}
+
+	if j.RunAt.IsZero() {
+		j.RunAt = now.UTC()
+	}
+
+	return j, nil
+}
+
+// backoffDelay returns the delay before the next attempt. attempt is the
+// number of attempts already made (1 after the first claim), so the delay is
+// base, 2*base, 4*base, ... capped at max.
+func backoffDelay(attempt int) time.Duration {
+	return scaledBackoff(attempt, defaultBackoffBase, defaultBackoffMax)
+}
+
+// scaledBackoff is backoffDelay with explicit bounds, which keeps it easy to
+// test and reuse.
+func scaledBackoff(attempt int, base, maxDelay time.Duration) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+
+	delay := base
+	for i := 1; i < attempt; i++ {
+		if delay >= maxDelay || delay > maxDelay/2 {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}

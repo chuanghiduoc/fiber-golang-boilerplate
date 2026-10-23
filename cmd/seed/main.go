@@ -40,10 +40,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	if err := database.RunMigrations(cfg.DB.DSN(), "migrations"); err != nil {
-		return fmt.Errorf("run migrations: %w", err)
-	}
-
+	// Schema management is owned by cmd/migrate; fail fast if it has not run.
 	userRepo := repository.NewUserRepository(pool)
 
 	if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
