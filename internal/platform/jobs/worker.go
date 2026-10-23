@@ -19,7 +19,9 @@ const (
 	defaultConcurrency       = 1
 	defaultHeartbeatInterval = 30 * time.Second
 	defaultLeaseDuration     = 5 * time.Minute
+	defaultJobTimeout        = 10 * time.Minute
 	bookkeepingTimeout       = 5 * time.Second
+	maxClaimBackoff          = 30 * time.Second
 )
 
 // Handler processes a claimed job. Returning an error schedules a retry (or
@@ -31,9 +33,9 @@ type Handler func(context.Context, json.RawMessage) error
 // PostgreSQL server.
 type store interface {
 	Claim(ctx context.Context, workerID string, limit int, staleAfter time.Duration) ([]claimedJob, error)
-	Succeed(ctx context.Context, id int64, workerID string) error
-	Fail(ctx context.Context, id int64, workerID, reason string, retryAt *time.Time) error
-	Heartbeat(ctx context.Context, id int64, workerID string) error
+	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
+	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
+	Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error
 }
 
 type claimedJob struct {
@@ -90,6 +92,20 @@ func WithLeaseDuration(d time.Duration) Option {
 	}
 }
 
+// WithJobTimeout limits how long a handler may run before its context is
+// canceled. The worker then records a normal failure, so the job retries or is
+// dead-lettered by the usual attempt budget. Values less than or equal to zero
+// disable the timeout.
+func WithJobTimeout(d time.Duration) Option {
+	return func(w *Worker) {
+		if d > 0 {
+			w.jobTimeout = d
+			return
+		}
+		w.jobTimeout = 0
+	}
+}
+
 // Worker claims due jobs and dispatches them to registered handlers.
 type Worker struct {
 	pool              *pgxpool.Pool
@@ -100,6 +116,7 @@ type Worker struct {
 	retryMax          time.Duration
 	heartbeatInterval time.Duration
 	leaseDuration     time.Duration
+	jobTimeout        time.Duration
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
@@ -123,6 +140,7 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		retryMax:          defaultBackoffMax,
 		heartbeatInterval: defaultHeartbeatInterval,
 		leaseDuration:     defaultLeaseDuration,
+		jobTimeout:        defaultJobTimeout,
 		handlers:          make(map[string]Handler),
 		store:             newPGStore(pool),
 	}
@@ -169,8 +187,11 @@ func (w *Worker) Register(kind string, handler Handler) {
 // claims; handlers already running receive the canceled context and Run waits
 // for them before returning nil.
 //
-// A claim failure is returned to the caller so a supervisor can restart the
-// worker. Bookkeeping failures while finishing a job are not fatal.
+// Claim failures are transient by nature (for example a database restart), so
+// they are logged and retried with exponential backoff starting at the poll
+// interval and capped at 30s. Run therefore returns nil once ctx is canceled,
+// never because a claim failed. Bookkeeping failures while finishing a job are
+// not fatal either.
 func (w *Worker) Run(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return nil
@@ -178,6 +199,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	slots := make(chan struct{}, w.concurrency)
 	finished := make(chan struct{}, w.concurrency)
+	claimBackoff := cappedClaimBackoff(w.pollInterval)
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -202,8 +224,18 @@ func (w *Worker) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("jobs: worker %q: claim: %w", w.id, err)
+			slog.Warn("jobs: claim failed; retrying",
+				"worker_id", w.id,
+				"retry_in", claimBackoff,
+				"error", err,
+			)
+			if !waitFor(ctx, claimBackoff) {
+				return nil
+			}
+			claimBackoff = cappedClaimBackoff(claimBackoff * 2)
+			continue
 		}
+		claimBackoff = cappedClaimBackoff(w.pollInterval)
 
 		if len(claimed) == 0 {
 			if !waitFor(ctx, w.pollInterval) {
@@ -248,17 +280,36 @@ func (w *Worker) Run(ctx context.Context) error {
 // processJob runs one claimed job and records its outcome. The handler is
 // always isolated behind callHandler so a panic is treated as a normal
 // failure. While the handler runs a background heartbeat keeps the job's lease
-// alive; it is stopped and joined before the final success/failure write so no
-// heartbeat can race that write.
+// alive; it uses the worker context and is stopped and joined before the final
+// success/failure write so no heartbeat can race that write. The handler gets a
+// child context bounded by the job timeout, which does not affect the
+// heartbeat.
+//
+// Every store write carries job.Attempts as a fence: if the lease expired and
+// another worker reclaimed the job, attempts has advanced and the stale owner's
+// write affects no row, returning ErrLeaseLost.
 func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	handler, ok := w.handler(job.Kind)
 	var handlerErr error
 	if !ok {
 		handlerErr = fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	} else {
-		stopHeartbeat := w.startHeartbeat(ctx, job.ID)
-		handlerErr = callHandler(ctx, handler, job.Payload)
+		handlerCtx := ctx
+		var cancel context.CancelFunc
+		if w.jobTimeout > 0 {
+			handlerCtx, cancel = context.WithTimeout(ctx, w.jobTimeout)
+		}
+
+		stopHeartbeat := w.startHeartbeat(ctx, job.ID, job.Attempts)
+		handlerErr = callHandler(handlerCtx, handler, job.Payload)
 		stopHeartbeat()
+		if handlerErr == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded) {
+			// The handler ignored cancellation and returned after its deadline.
+			handlerErr = fmt.Errorf("jobs: handler exceeded the %s job timeout", w.jobTimeout)
+		}
+		if cancel != nil {
+			cancel()
+		}
 	}
 
 	// The job has already been claimed in the database, so bookkeeping must
@@ -267,7 +318,7 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	defer cancel()
 
 	if handlerErr == nil {
-		if err := w.store.Succeed(writeCtx, job.ID, w.id); err != nil {
+		if err := w.store.Succeed(writeCtx, job.ID, w.id, job.Attempts); err != nil {
 			return fmt.Errorf("jobs: mark job %d succeeded: %w", job.ID, err)
 		}
 		return nil
@@ -275,14 +326,15 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 
 	reason := handlerErr.Error()
 	var retryAt *time.Time
-	// An unregistered kind is a configuration error: retrying cannot fix it,
-	// so move the job straight to dead instead of burning its attempt budget.
-	if !errors.Is(handlerErr, ErrNoHandler) && job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
+	// Every failure retries while attempts remain, including an unregistered
+	// kind. A rollout may register the missing handler before the budget runs
+	// out, and the attempt cap still dead-letters genuinely unknown work.
+	if job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
 		next := time.Now().Add(scaledBackoff(job.Attempts, w.retryBase, w.retryMax))
 		retryAt = &next
 	}
 
-	if err := w.store.Fail(writeCtx, job.ID, w.id, reason, retryAt); err != nil {
+	if err := w.store.Fail(writeCtx, job.ID, w.id, job.Attempts, reason, retryAt); err != nil {
 		return fmt.Errorf("jobs: mark job %d failed: %w", job.ID, err)
 	}
 	return nil
@@ -292,8 +344,9 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 // called. Heartbeats use a context detached from cancellation so a handler
 // that is still unwinding during shutdown keeps ownership until it finishes.
 // stop waits for the goroutine, which guarantees no heartbeat runs after the
-// worker writes the final outcome.
-func (w *Worker) startHeartbeat(ctx context.Context, id int64) func() {
+// worker writes the final outcome. attempts is the worker's claim fence: a job
+// reclaimed at a higher attempt no longer matches and reports ErrLeaseLost.
+func (w *Worker) startHeartbeat(ctx context.Context, id int64, attempts int) func() {
 	if w.store == nil || w.heartbeatInterval <= 0 {
 		return func() {}
 	}
@@ -316,7 +369,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, id int64) func() {
 					timeout = bookkeepingTimeout
 				}
 				callCtx, callCancel := context.WithTimeout(hbCtx, timeout)
-				err := w.store.Heartbeat(callCtx, id, w.id)
+				err := w.store.Heartbeat(callCtx, id, w.id, attempts)
 				callCancel()
 				if err != nil {
 					// A missed heartbeat is not fatal here: either the lease is
@@ -367,4 +420,17 @@ func waitFor(ctx context.Context, d time.Duration) bool {
 	case <-timer.C:
 		return true
 	}
+}
+
+// cappedClaimBackoff bounds a claim retry delay to the 30s ceiling. A
+// non-positive duration falls back to the default poll interval so the worker
+// never spins on a misconfigured zero delay.
+func cappedClaimBackoff(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultPollInterval
+	}
+	if d > maxClaimBackoff {
+		return maxClaimBackoff
+	}
+	return d
 }

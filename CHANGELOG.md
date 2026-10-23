@@ -25,6 +25,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
 
 ### Fixed
+- Worker claim errors are retried with exponential backoff capped at 30s instead of terminating the worker (and the API process that hosts it)
+- Job heartbeat, success, and failure writes are fenced by `attempts`, so a worker whose lease was reclaimed cannot finish the job under its new owner
+- Handlers get a 10m default timeout (`WithJobTimeout`, non-positive disables it), and unknown job kinds now retry with normal backoff until `max_attempts` before dead-lettering
 - Job bookkeeping now reports lost leases (`RowsAffected` check) and logs outcome-write failures instead of silently leaving a job `running`
 - Heartbeats are clamped to at least four renewals per lease, and terminal jobs clear their payload so queued email secrets are not retained
 - `cmd/migrate` verifies required tables after migrating and fails with an actionable message for legacy version-1 schemas

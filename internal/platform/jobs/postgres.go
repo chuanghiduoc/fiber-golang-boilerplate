@@ -59,17 +59,21 @@ WHERE j.id = due.id
 RETURNING j.id, j.kind, j.payload, j.attempts, j.max_attempts`
 
 // heartbeatJobSQL renews the lease for a job that is still running under the
-// supplied worker. It changes only locked_at: a heartbeat is not a state
-// transition, so updated_at is deliberately left alone.
+// supplied worker and attempt. Matching attempts fences out a stale owner whose
+// job was reclaimed at a higher attempt. It changes only locked_at: a heartbeat
+// is not a state transition, so updated_at is deliberately left alone.
 const heartbeatJobSQL = `
 UPDATE jobs
 SET locked_at = now()
 WHERE id = $1
   AND locked_by = $2
+  AND attempts = $3
   AND status = 'running'`
 
 // Completed jobs drop their payload: email jobs can contain password-reset or
-// verification links, and a terminal row must not retain usable secrets.
+// verification links, and a terminal row must not retain usable secrets. The
+// attempt fence prevents a worker whose lease was reclaimed from completing the
+// job under its new owner.
 const succeedJobSQL = `
 UPDATE jobs
 SET status = 'succeeded',
@@ -80,11 +84,13 @@ SET status = 'succeeded',
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2
+  AND attempts = $3
   AND status = 'running'`
 
 // failJobSQL requeues the job when retryAt is set and marks it dead when it is
-// NULL. locked_by guards against a worker finishing a job it no longer owns.
-// Dead jobs drop their payload for the same secret-retention reason as success.
+// NULL. locked_by and attempts guard against a worker finishing a job it no
+// longer owns; a reclaimed job always carries a higher attempt. Dead jobs drop
+// their payload for the same secret-retention reason as success.
 const failJobSQL = `
 UPDATE jobs
 SET status = CASE WHEN $4::timestamptz IS NULL THEN 'dead' ELSE 'queued' END,
@@ -96,6 +102,7 @@ SET status = CASE WHEN $4::timestamptz IS NULL THEN 'dead' ELSE 'queued' END,
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2
+  AND attempts = $5
   AND status = 'running'`
 
 // pgStore is the PostgreSQL implementation of store.
@@ -144,47 +151,47 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAf
 	return claimed, nil
 }
 
-func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string) error {
+func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string, attempts int) error {
 	if s == nil || s.pool == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, succeedJobSQL, id, workerID)
+	tag, err := s.pool.Exec(ctx, succeedJobSQL, id, workerID, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: mark %d succeeded: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }
 
-func (s *pgStore) Fail(ctx context.Context, id int64, workerID, reason string, retryAt *time.Time) error {
+func (s *pgStore) Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
 	if s == nil || s.pool == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, failJobSQL, id, workerID, reason, retryAt)
+	tag, err := s.pool.Exec(ctx, failJobSQL, id, workerID, reason, retryAt, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: mark %d failed: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }
 
-// Heartbeat renews the lease of a running job owned by workerID. A job that was
-// already reclaimed, finished, or claimed by another worker is reported as
-// ErrLeaseLost; the caller logs it but leaves the handler running.
-func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string) error {
+// Heartbeat renews the lease of a running job owned by workerID at attempts. A
+// job that was already reclaimed, finished, or claimed by another worker is
+// reported as ErrLeaseLost; the caller logs it but leaves the handler running.
+func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error {
 	if s == nil || s.pool == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID)
+	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: heartbeat %d: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: job %d worker %q", ErrLeaseLost, id, workerID)
+		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
 }

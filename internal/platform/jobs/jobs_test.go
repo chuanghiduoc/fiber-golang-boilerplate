@@ -149,6 +149,7 @@ func TestProcessJobRetriesWithBackoff(t *testing.T) {
 	failure := fake.failures[0]
 	assert.Equal(t, int64(8), failure.id)
 	assert.Equal(t, "test-worker", failure.workerID)
+	assert.Equal(t, 2, failure.attempts, "the claim attempt must be passed as the fence")
 	assert.Contains(t, failure.reason, "temporary failure")
 	require.NotNil(t, failure.retryAt)
 	// Second attempt backs off 2 * retryBase.
@@ -175,6 +176,7 @@ func TestProcessJobMarksDeadAfterMaxAttempts(t *testing.T) {
 
 	require.Len(t, fake.failures, 1)
 	assert.Nil(t, fake.failures[0].retryAt, "exhausted job must be marked dead")
+	assert.Equal(t, 3, fake.failures[0].attempts, "the claim attempt must be passed as the fence")
 	assert.Contains(t, fake.failures[0].reason, "permanent failure")
 }
 
@@ -202,24 +204,125 @@ func TestProcessJobRecoversPanic(t *testing.T) {
 	assert.NotNil(t, fake.failures[0].retryAt, "a panic before the limit should be retried")
 }
 
-func TestProcessJobUnknownKindIsDead(t *testing.T) {
+func TestProcessJobUnknownKindRetriesUntilExhausted(t *testing.T) {
+	t.Parallel()
+
+	t.Run("retries below the attempt limit", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "test-worker")
+		worker.store = fake
+		worker.retryBase = 10 * time.Millisecond
+		worker.retryMax = time.Second
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          11,
+			Kind:        "missing",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}))
+
+		require.Len(t, fake.failures, 1)
+		assert.Contains(t, fake.failures[0].reason, ErrNoHandler.Error())
+		require.NotNil(t, fake.failures[0].retryAt,
+			"an unregistered kind must retry while attempts remain")
+	})
+
+	t.Run("dead-letters when exhausted", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "test-worker")
+		worker.store = fake
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          11,
+			Kind:        "missing",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    3,
+			MaxAttempts: 3,
+		}))
+
+		require.Len(t, fake.failures, 1)
+		assert.Contains(t, fake.failures[0].reason, ErrNoHandler.Error())
+		assert.Nil(t, fake.failures[0].retryAt,
+			"an unregistered kind must be dead-lettered only after max attempts")
+	})
+}
+
+func TestProcessJobUsesAttemptFence(t *testing.T) {
+	t.Parallel()
+
+	t.Run("success", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "fence-worker")
+		worker.store = fake
+		worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          30,
+			Kind:        "ok",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    3,
+			MaxAttempts: 5,
+		}))
+
+		require.Len(t, fake.succeeded, 1)
+		assert.Equal(t, 3, fake.succeeded[0].attempts)
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		t.Parallel()
+
+		fake := &fakeStore{}
+		worker := NewWorker(nil, "fence-worker")
+		worker.store = fake
+		worker.Register("boom", func(context.Context, json.RawMessage) error {
+			return errors.New("boom")
+		})
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID:          31,
+			Kind:        "boom",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    3,
+			MaxAttempts: 5,
+		}))
+
+		require.Len(t, fake.failures, 1)
+		assert.Equal(t, 3, fake.failures[0].attempts)
+	})
+}
+
+func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 	t.Parallel()
 
 	fake := &fakeStore{}
-	worker := NewWorker(nil, "test-worker")
+	worker := NewWorker(nil, "timeout-worker", WithJobTimeout(20*time.Millisecond))
 	worker.store = fake
+	worker.Register("blocking", func(ctx context.Context, _ json.RawMessage) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
 
+	start := time.Now()
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          11,
-		Kind:        "missing",
+		ID:          32,
+		Kind:        "blocking",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
-		MaxAttempts: 5,
+		MaxAttempts: 3,
 	}))
+	assert.Less(t, time.Since(start), time.Second, "the handler must be canceled by the job timeout")
 
 	require.Len(t, fake.failures, 1)
-	assert.Contains(t, fake.failures[0].reason, ErrNoHandler.Error())
-	assert.Nil(t, fake.failures[0].retryAt, "an unregistered kind cannot succeed on retry")
+	assert.Contains(t, fake.failures[0].reason, "deadline exceeded")
+	assert.NotNil(t, fake.failures[0].retryAt, "a timed-out job with attempts left must retry")
+	assert.Empty(t, fake.succeededIDs())
 }
 
 func TestWorkerRunProcessesAndStops(t *testing.T) {
@@ -280,16 +383,109 @@ func TestWorkerRunReturnsImmediatelyWhenCanceled(t *testing.T) {
 	assert.Equal(t, 0, fake.claimCalls)
 }
 
-func TestWorkerRunReturnsClaimError(t *testing.T) {
+func TestWorkerRunRetriesClaimError(t *testing.T) {
 	t.Parallel()
 
-	fake := &fakeStore{claimErr: errors.New("database unavailable")}
-	worker := NewWorker(nil, "test-worker")
+	fake := &fakeStore{
+		claimErrs: []error{errors.New("database unavailable")},
+		claimed: []claimedJob{{
+			ID:          16,
+			Kind:        "ok",
+			Payload:     json.RawMessage(`{}`),
+			Attempts:    1,
+			MaxAttempts: 3,
+		}},
+	}
+	worker := NewWorker(nil, "test-worker", WithPollInterval(time.Millisecond))
 	worker.store = fake
 
-	err := worker.Run(context.Background())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "database unavailable")
+	handled := make(chan struct{})
+	worker.Register("ok", func(context.Context, json.RawMessage) error {
+		close(handled)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not retry the claim and process the job")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err, "a transient claim error must not terminate the worker")
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	assert.GreaterOrEqual(t, fake.claimCalls, 2, "the failed claim must be retried")
+	assert.Equal(t, []int64{16}, fake.succeededIDs())
+}
+
+func TestWorkerRunPassesAttemptFence(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeStore{claimed: []claimedJob{{
+		ID:          17,
+		Kind:        "slow",
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    3,
+		MaxAttempts: 5,
+	}}}
+	worker := NewWorker(nil, "fence-worker",
+		WithPollInterval(time.Millisecond),
+		WithHeartbeatInterval(5*time.Millisecond),
+		WithLeaseDuration(250*time.Millisecond),
+	)
+	worker.store = fake
+
+	handled := make(chan struct{})
+	worker.Register("slow", func(ctx context.Context, _ json.RawMessage) error {
+		deadline := time.Now().Add(time.Second)
+		for fake.heartbeatCount() == 0 {
+			if time.Now().After(deadline) {
+				return errors.New("heartbeat was not sent")
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		}
+		close(handled)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	select {
+	case <-handled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not process the job")
+	}
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	require.Len(t, fake.succeeded, 1)
+	assert.Equal(t, 3, fake.succeeded[0].attempts)
+	heartbeats := fake.lastHeartbeats()
+	require.NotEmpty(t, heartbeats)
+	for _, hb := range heartbeats {
+		assert.Equal(t, 3, hb.attempts, "heartbeats must carry the claim attempt fence")
+	}
 }
 
 func TestWorkerOptions(t *testing.T) {
@@ -300,11 +496,13 @@ func TestWorkerOptions(t *testing.T) {
 		WithConcurrency(0),
 		WithHeartbeatInterval(0),
 		WithLeaseDuration(-time.Second),
+		WithJobTimeout(0),
 	)
 	assert.Equal(t, defaultPollInterval, worker.pollInterval)
 	assert.Equal(t, defaultConcurrency, worker.concurrency)
 	assert.Equal(t, defaultHeartbeatInterval, worker.heartbeatInterval)
 	assert.Equal(t, defaultLeaseDuration, worker.leaseDuration)
+	assert.Equal(t, time.Duration(0), worker.jobTimeout, "a non-positive timeout disables the deadline")
 	assert.Equal(t, "worker", worker.id)
 
 	worker = NewWorker(nil, "w",
@@ -312,11 +510,15 @@ func TestWorkerOptions(t *testing.T) {
 		WithConcurrency(4),
 		WithHeartbeatInterval(2*time.Second),
 		WithLeaseDuration(20*time.Second),
+		WithJobTimeout(2*time.Minute),
 	)
 	assert.Equal(t, 25*time.Millisecond, worker.pollInterval)
 	assert.Equal(t, 4, worker.concurrency)
 	assert.Equal(t, 2*time.Second, worker.heartbeatInterval)
 	assert.Equal(t, 20*time.Second, worker.leaseDuration)
+	assert.Equal(t, 2*time.Minute, worker.jobTimeout)
+
+	assert.Equal(t, defaultJobTimeout, NewWorker(nil, "w").jobTimeout)
 
 	// A heartbeat at or beyond the lease boundary would race expiry, so the
 	// interval is reduced to a quarter of the lease.
@@ -465,6 +667,7 @@ func TestProcessJobHeartbeatsWhileHandlerRuns(t *testing.T) {
 	for _, hb := range heartbeats {
 		assert.Equal(t, int64(14), hb.id)
 		assert.Equal(t, "heartbeat-worker", hb.workerID)
+		assert.Equal(t, 1, hb.attempts)
 	}
 
 	before := fake.heartbeatCount()
@@ -507,7 +710,7 @@ func TestPGStoreHeartbeatRequiresPool(t *testing.T) {
 	t.Parallel()
 
 	store := newPGStore(nil)
-	err := store.Heartbeat(context.Background(), 1, "worker")
+	err := store.Heartbeat(context.Background(), 1, "worker", 1)
 	require.ErrorIs(t, err, ErrNoPool)
 
 	_, err = store.Claim(context.Background(), "worker", 1, time.Second)
@@ -601,17 +804,25 @@ type fakeStore struct {
 	mu             sync.Mutex
 	claimed        []claimedJob
 	claimErr       error
+	claimErrs      []error
 	claimCalls     int
 	lastStaleAfter time.Duration
-	succeeded      []int64
+	succeeded      []fakeSuccess
 	failures       []fakeFailure
 	heartbeats     []fakeHeartbeat
 	heartbeatErr   error
 }
 
+type fakeSuccess struct {
+	id       int64
+	workerID string
+	attempts int
+}
+
 type fakeFailure struct {
 	id       int64
 	workerID string
+	attempts int
 	reason   string
 	retryAt  *time.Time
 }
@@ -619,6 +830,7 @@ type fakeFailure struct {
 type fakeHeartbeat struct {
 	id       int64
 	workerID string
+	attempts int
 }
 
 func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Duration) ([]claimedJob, error) {
@@ -627,6 +839,11 @@ func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Du
 
 	f.claimCalls++
 	f.lastStaleAfter = staleAfter
+	if len(f.claimErrs) > 0 {
+		err := f.claimErrs[0]
+		f.claimErrs = f.claimErrs[1:]
+		return nil, err
+	}
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
@@ -635,36 +852,41 @@ func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Du
 	return jobs, nil
 }
 
-func (f *fakeStore) Succeed(_ context.Context, id int64, _ string) error {
+func (f *fakeStore) Succeed(_ context.Context, id int64, workerID string, attempts int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.succeeded = append(f.succeeded, id)
+	f.succeeded = append(f.succeeded, fakeSuccess{id: id, workerID: workerID, attempts: attempts})
 	return nil
 }
 
-func (f *fakeStore) Fail(_ context.Context, id int64, workerID, reason string, retryAt *time.Time) error {
+func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failures = append(f.failures, fakeFailure{
 		id:       id,
 		workerID: workerID,
+		attempts: attempts,
 		reason:   reason,
 		retryAt:  retryAt,
 	})
 	return nil
 }
 
-func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string) error {
+func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, attempts int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID})
+	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})
 	return f.heartbeatErr
 }
 
 func (f *fakeStore) succeededIDs() []int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]int64(nil), f.succeeded...)
+	ids := make([]int64, len(f.succeeded))
+	for i, success := range f.succeeded {
+		ids[i] = success.id
+	}
+	return ids
 }
 
 func (f *fakeStore) heartbeatCount() int {

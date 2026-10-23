@@ -231,6 +231,67 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 	assert.Nil(t, lastError, "success clears the lease-expiry marker")
 }
 
+// TestSucceedIntegrationFencesStaleAttempt proves that attempts act as a
+// fencing token. A worker whose lease was reclaimed cannot finish the job:
+// the replacement claim owns a higher attempt, so the old worker's Succeed
+// affects no rows and must report ErrLeaseLost.
+func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const kind = "jobs.integration.fence"
+	id, err := NewQueue(pool).Enqueue(ctx, Job{
+		Kind:        kind,
+		Payload:     json.RawMessage(`{"secret":"must-survive"}`),
+		MaxAttempts: 5,
+	})
+	require.NoError(t, err)
+
+	store := newPGStore(pool)
+
+	first, err := store.Claim(ctx, "w1", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.Equal(t, id, first[0].ID)
+	require.Equal(t, 1, first[0].Attempts)
+
+	// Simulate the expired lease being requeued and reclaimed by w2. The
+	// replacement claim increments attempts, which invalidates w1's fence.
+	_, err = pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'queued',
+		    locked_by = NULL,
+		    locked_at = NULL,
+		    run_at = now()
+		WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	second, err := store.Claim(ctx, "w2", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	require.Equal(t, id, second[0].ID)
+	require.Equal(t, 2, second[0].Attempts)
+
+	err = store.Succeed(ctx, id, "w1", first[0].Attempts)
+	require.ErrorIs(t, err, ErrLeaseLost,
+		"the stale attempt must not be allowed to complete a reclaimed job")
+
+	var (
+		status   string
+		attempts int
+		lockedBy *string
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, attempts, locked_by FROM jobs WHERE id = $1`, id,
+	).Scan(&status, &attempts, &lockedBy))
+	assert.Equal(t, "running", status)
+	assert.Equal(t, 2, attempts)
+	require.NotNil(t, lockedBy)
+	assert.Equal(t, "w2", *lockedBy)
+}
+
 // TestClaimIntegrationDoesNotReclaimHeartbeatedJob holds a row lock the same
 // way Heartbeat does while Claim tries to reclaim the row. Claim must wait for
 // the heartbeat to commit and then recheck locked_at, leaving the live job
