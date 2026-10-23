@@ -486,7 +486,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 
 		repo.users[1] = &sqlc.User{
 			ID: 1, Email: "google@example.com", Name: "Google User",
-			GoogleID: pgtype.Text{String: "google-123", Valid: true},
+			GoogleID:     pgtype.Text{String: "google-123", Valid: true},
 			AuthProvider: "google", Role: "user",
 		}
 		repo.nextID = 2

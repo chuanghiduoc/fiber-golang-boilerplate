@@ -1282,12 +1282,6 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
-                    "403": {
-                        "description": "Forbidden",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
                     "404": {
                         "description": "Not Found",
                         "schema": {
@@ -1328,12 +1322,6 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1387,12 +1375,6 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
-                    "403": {
-                        "description": "Forbidden",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
                     "404": {
                         "description": "Not Found",
                         "schema": {
@@ -1441,12 +1423,6 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1718,12 +1694,6 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
-                        "schema": {
-                            "$ref": "#/definitions/apperror.ProblemDetails"
-                        }
-                    },
-                    "403": {
-                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -2113,6 +2083,9 @@ const docTemplate = `{
         "dto.UserResponse": {
             "type": "object",
             "properties": {
+                "bannedAt": {
+                    "type": "string"
+                },
                 "createdAt": {
                     "type": "string"
                 },

@@ -31,8 +31,21 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		name = "Admin"
 	}
 
+	verify := func(user *sqlc.User) error {
+		if user.EmailVerifiedAt.Valid {
+			return nil
+		}
+		if _, err := userRepo.VerifyEmail(ctx, user.ID, email); err != nil {
+			return fmt.Errorf("mark seeded admin email verified: %w", err)
+		}
+		return nil
+	}
+
 	promote := func(existing *sqlc.User) error {
 		if existing.Role == dto.RoleAdmin {
+			if err := verify(existing); err != nil {
+				return err
+			}
 			slog.Debug("admin user already exists, skipping seed", slog.String("email", email))
 			return nil
 		}
@@ -42,11 +55,15 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 			bcrypt.CompareHashAndPassword([]byte(existing.PasswordHash.String), []byte(cfg.Password)) != nil {
 			return fmt.Errorf("ADMIN_EMAIL %q already belongs to a non-admin account with a different password", email)
 		}
-		if _, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
+		promoted, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
 			ID:   existing.ID,
 			Role: dto.RoleAdmin,
-		}); err != nil {
+		})
+		if err != nil {
 			return fmt.Errorf("promote existing admin user: %w", err)
+		}
+		if err := verify(promoted); err != nil {
+			return err
 		}
 		slog.Info("existing user promoted to admin", slog.String("email", email))
 		return nil
@@ -81,11 +98,15 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		return fmt.Errorf("create admin user: %w", err)
 	}
 
-	if _, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
+	adminUser, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
 		ID:   user.ID,
 		Role: dto.RoleAdmin,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("set admin role: %w", err)
+	}
+	if err := verify(adminUser); err != nil {
+		return err
 	}
 
 	slog.Info("admin user created", slog.String("email", email))

@@ -169,6 +169,8 @@ definitions:
     type: object
   dto.UserResponse:
     properties:
+      bannedAt:
+        type: string
       createdAt:
         type: string
       deletedAt:
@@ -973,10 +975,6 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
-        "403":
-          description: Forbidden
-          schema:
-            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
@@ -1007,10 +1005,6 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
-          schema:
-            $ref: '#/definitions/apperror.ProblemDetails'
-        "403":
-          description: Forbidden
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":
@@ -1044,10 +1038,6 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
-        "403":
-          description: Forbidden
-          schema:
-            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
@@ -1079,10 +1069,6 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
-          schema:
-            $ref: '#/definitions/apperror.ProblemDetails'
-        "403":
-          description: Forbidden
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":
@@ -1239,10 +1225,6 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
-          schema:
-            $ref: '#/definitions/apperror.ProblemDetails'
-        "403":
-          description: Forbidden
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":

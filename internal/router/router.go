@@ -35,14 +35,23 @@ func SetupRoutes(app *fiber.App, deps Deps) {
 	app.Use(middleware.Recovery(cfg.App.Env))
 	app.Use(middleware.Timeout(time.Duration(cfg.App.RequestTimeout) * time.Second))
 
-	// Swagger
-	swaggerHandler := swagger.New(swagger.Config{
-		BasePath: "/",
-		FilePath: "./docs/swagger.json",
-		Path:     "swagger",
-	})
-	app.Get("/swagger*", swaggerHandler)
-	app.Get("/docs/*", swaggerHandler)
+	// Swagger is a development aid; do not expose API docs in production.
+	if cfg.App.Env != "production" {
+		swaggerHandler := swagger.New(swagger.Config{
+			BasePath: "/",
+			FilePath: "./docs/swagger.json",
+			Path:     "swagger",
+		})
+		// The contrib UI loads its bundle/styles from unpkg and uses inline
+		// initialization, so the strict global CSP must be relaxed for docs.
+		swaggerCSP := func(c fiber.Ctx) error {
+			c.Set("Content-Security-Policy",
+				"default-src 'self'; script-src 'self' https://unpkg.com 'unsafe-inline'; style-src 'self' https://unpkg.com 'unsafe-inline'; img-src 'self' data:; font-src 'self' https://unpkg.com; frame-ancestors 'none'")
+			return c.Next()
+		}
+		app.Get("/swagger*", swaggerCSP, swaggerHandler)
+		app.Get("/docs/*", swaggerCSP, swaggerHandler)
+	}
 
 	// Health check
 	app.Get("/healthz", func(c fiber.Ctx) error {

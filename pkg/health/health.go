@@ -2,9 +2,10 @@ package health
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -56,8 +57,11 @@ func (h *Checker) Readiness(ctx context.Context) Status {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := h.pool.Ping(ctx); err != nil {
-			set("database", fmt.Sprintf("down: %v", err), false)
+		dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := h.pool.Ping(dbCtx); err != nil {
+			slog.Error("readiness: database ping failed", slog.Any("error", err))
+			set("database", "down", false)
 			return
 		}
 		stats := h.pool.Stat()
@@ -72,8 +76,11 @@ func (h *Checker) Readiness(ctx context.Context) Status {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := h.cache.Ping(ctx); err != nil {
-			set("cache", fmt.Sprintf("down: %v", err), false)
+		cacheCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := h.cache.Ping(cacheCtx); err != nil {
+			slog.Error("readiness: cache ping failed", slog.Any("error", err))
+			set("cache", "down", false)
 			return
 		}
 		set("cache", "up", true)

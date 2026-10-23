@@ -66,6 +66,15 @@ func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*sqlc.
 	return nil, apperror.ErrNotFound
 }
 
+func (m *mockUserRepo) GetBannedByEmail(_ context.Context, addr string) (*sqlc.User, error) {
+	for _, u := range m.users {
+		if u.BannedAt.Valid && strings.EqualFold(u.Email, addr) {
+			return u, nil
+		}
+	}
+	return nil, apperror.ErrNotFound
+}
+
 func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User, error) {
 	all := make([]sqlc.User, 0, len(m.users))
 	for _, u := range m.users {
@@ -249,12 +258,26 @@ func (m *mockUserRepo) Delete(_ context.Context, id int64) (*sqlc.User, error) {
 	return u, nil
 }
 
+func (m *mockUserRepo) Ban(_ context.Context, id int64) (*sqlc.User, error) {
+	u, ok := m.users[id]
+	if !ok || u.DeletedAt.Valid {
+		return nil, apperror.ErrNotFound
+	}
+	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	u.DeletedAt = now
+	u.BannedAt = now
+	u.TokenVersion++
+	u.PasswordChangedAt = now
+	return u, nil
+}
+
 func (m *mockUserRepo) Restore(_ context.Context, id int64) (*sqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || !u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	u.DeletedAt = pgtype.Timestamptz{}
+	u.BannedAt = pgtype.Timestamptz{}
 	u.TokenVersion++
 	u.PasswordChangedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return u, nil

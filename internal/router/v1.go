@@ -12,9 +12,10 @@ func RegisterV1Routes(v1 fiber.Router, deps Deps) {
 
 	// Rate limiters (tiered)
 	rl := cfg.RateLimit
-	strictLimiter := middleware.NewLimiter(rl.StrictMax, rl.StrictWindow)
-	normalLimiter := middleware.NewLimiter(rl.NormalMax, rl.NormalWindow)
-	relaxedLimiter := middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow)
+	limiterStorage := middleware.NewLimiterStorage(deps.Cache)
+	strictLimiter := middleware.NewLimiter(rl.StrictMax, rl.StrictWindow, limiterStorage)
+	normalLimiter := middleware.NewLimiter(rl.NormalMax, rl.NormalWindow, limiterStorage)
+	relaxedLimiter := middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow, limiterStorage)
 
 	// Auth routes (public)
 	auth := v1.Group("/auth")

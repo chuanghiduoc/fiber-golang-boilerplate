@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	cacheTTL      = 30 * time.Second
+	cacheTTL      = 5 * time.Second
 	generationTTL = 24 * time.Hour
 )
 

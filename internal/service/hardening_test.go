@@ -43,6 +43,23 @@ func TestRegister_NormalizesAndDeduplicatesEmail(t *testing.T) {
 	}
 }
 
+func TestRegister_BannedEmailRejected(t *testing.T) {
+	repo := newMockUserRepo()
+	svc := newTestUserService(repo, false)
+	repo.users[1] = &sqlc.User{
+		ID: 1, Email: "banned@example.com", Name: "Banned", Role: "user",
+		DeletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		BannedAt:  pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}
+
+	_, err := svc.Register(context.Background(), dto.RegisterRequest{
+		Email: "banned@example.com", Password: "Password1!", Name: "New",
+	})
+	if err == nil {
+		t.Fatal("a banned email must not be reusable")
+	}
+}
+
 func TestUpdate_EmailChangeResetsVerification(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)

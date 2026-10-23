@@ -29,6 +29,13 @@ const (
 	loginAttemptPrefix = "login_attempts:"
 )
 
+// dummyPasswordHash equalizes the bcrypt work for unknown-email logins so the
+// response time does not reveal whether an account exists.
+var dummyPasswordHash = func() []byte {
+	hash, _ := bcrypt.GenerateFromPassword([]byte("timing-only-dummy-password"), bcryptCost)
+	return hash
+}()
+
 type UserService interface {
 	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
 	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
@@ -84,6 +91,9 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	if existing != nil {
 		return nil, apperror.NewConflict("email already registered")
 	}
+	if err := ensureEmailNotBanned(ctx, s.repo, email); err != nil {
+		return nil, err
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
 	if err != nil {
@@ -117,6 +127,9 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	user, err := s.repo.GetByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
+			// Spend the same bcrypt time as an existing account so login
+			// timing cannot be used for account enumeration.
+			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
 			// Never create a lockout key for a nonexistent account.
 			return nil, apperror.NewUnauthorized("invalid email or password")
 		}
@@ -220,6 +233,9 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		}
 		if !errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewInternal("failed to find user by email")
+		}
+		if err := ensureEmailNotBanned(ctx, repo, email); err != nil {
+			return nil, err
 		}
 
 		newUser, err := repo.CreateOAuthUser(ctx, sqlc.CreateOAuthUserParams{
@@ -351,6 +367,9 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 			if dup != nil {
 				return nil, apperror.NewConflict("email already in use")
 			}
+			if err := ensureEmailNotBanned(ctx, s.repo, requested); err != nil {
+				return nil, err
+			}
 			email = requested
 		}
 	}
@@ -401,6 +420,18 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 
 // VerifyPassword checks a plaintext password against the stored hash. It is
 // used to require re-authentication for sensitive profile changes.
+func ensureEmailNotBanned(ctx context.Context, repo repository.UserRepository, email string) error {
+	_, err := repo.GetBannedByEmail(ctx, email)
+	switch {
+	case err == nil:
+		return apperror.NewConflict("email is not available")
+	case errors.Is(err, apperror.ErrNotFound):
+		return nil
+	default:
+		return apperror.NewInternal("failed to check email availability")
+	}
+}
+
 func (s *userService) VerifyPassword(ctx context.Context, userID int64, password string) error {
 	user, err := s.repo.GetByID(ctx, userID)
 	if err != nil {
@@ -586,6 +617,10 @@ func ToUserResponse(user *sqlc.User) *dto.UserResponse {
 	if user.DeletedAt.Valid {
 		deletedAt := user.DeletedAt.Time
 		resp.DeletedAt = &deletedAt
+	}
+	if user.BannedAt.Valid {
+		bannedAt := user.BannedAt.Time
+		resp.BannedAt = &bannedAt
 	}
 	return resp
 }

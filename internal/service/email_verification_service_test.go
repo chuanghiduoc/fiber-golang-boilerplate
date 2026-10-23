@@ -171,7 +171,7 @@ func TestResendVerification(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if es.Sent() != 1 {
+		if !es.WaitFor(1, time.Second) {
 			t.Errorf("expected 1 email sent, got %d", es.Sent())
 		}
 		if len(vr.tokens) != 1 {
