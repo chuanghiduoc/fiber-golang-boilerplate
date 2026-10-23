@@ -3,7 +3,9 @@ package handler
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -20,13 +22,14 @@ import (
 const oauthStateCookieName = "oauth_state"
 
 type AuthHandler struct {
-	userSvc       service.UserService
-	refreshSvc    service.RefreshTokenService
-	resetSvc      service.PasswordResetService
-	emailVerifSvc service.EmailVerificationService
-	jwtSecret     string
-	jwtExpireHour int
-	googleOAuth   *oauth.GoogleOAuth
+	userSvc                  service.UserService
+	refreshSvc               service.RefreshTokenService
+	resetSvc                 service.PasswordResetService
+	emailVerifSvc            service.EmailVerificationService
+	jwtSecret                string
+	jwtExpireHour            int
+	requireEmailVerification bool
+	googleOAuth              *oauth.GoogleOAuth
 }
 
 func NewAuthHandler(
@@ -36,16 +39,18 @@ func NewAuthHandler(
 	emailVerifSvc service.EmailVerificationService,
 	jwtSecret string,
 	jwtExpireHour int,
+	requireEmailVerification bool,
 	googleOAuth *oauth.GoogleOAuth,
 ) *AuthHandler {
 	return &AuthHandler{
-		userSvc:       userSvc,
-		refreshSvc:    refreshSvc,
-		resetSvc:      resetSvc,
-		emailVerifSvc: emailVerifSvc,
-		jwtSecret:     jwtSecret,
-		jwtExpireHour: jwtExpireHour,
-		googleOAuth:   googleOAuth,
+		userSvc:                  userSvc,
+		refreshSvc:               refreshSvc,
+		resetSvc:                 resetSvc,
+		emailVerifSvc:            emailVerifSvc,
+		jwtSecret:                jwtSecret,
+		jwtExpireHour:            jwtExpireHour,
+		requireEmailVerification: requireEmailVerification,
+		googleOAuth:              googleOAuth,
 	}
 }
 
@@ -107,12 +112,12 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 		return err
 	}
 
-	accessToken, err := token.Generate(user.ID, user.Email, user.Role, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate access token")
 	}
 
-	refreshToken, err := h.refreshSvc.Create(c.Context(), user.ID)
+	refreshToken, err := h.refreshSvc.Create(c.Context(), user.ID, user.TokenVersion)
 	if err != nil {
 		return err
 	}
@@ -143,27 +148,35 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return err
 	}
 
-	userID, err := h.refreshSvc.Verify(c.Context(), req.RefreshToken)
+	// Consume atomically: a replayed or concurrent refresh token can only be
+	// used once, even if two requests arrive at the same time.
+	userID, tokenVersion, err := h.refreshSvc.Consume(c.Context(), req.RefreshToken)
 	if err != nil {
 		return err
-	}
-
-	// Revoke old refresh token — if this fails, do NOT issue new tokens to prevent token reuse attacks
-	if err := h.refreshSvc.Revoke(c.Context(), req.RefreshToken); err != nil {
-		return apperror.NewInternal("failed to revoke refresh token")
 	}
 
 	user, err := h.userSvc.GetByID(c.Context(), userID)
 	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewUnauthorized("account is not active")
+		}
 		return err
 	}
+	// A token issued before a password change/reset, ban, or role change must
+	// not be allowed to mint a new session.
+	if user.TokenVersion != tokenVersion {
+		return apperror.NewUnauthorized("refresh token is no longer valid")
+	}
+	if h.requireEmailVerification && !user.EmailVerified {
+		return apperror.NewEmailNotVerified("email not verified")
+	}
 
-	accessToken, err := token.Generate(user.ID, user.Email, user.Role, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate access token")
 	}
 
-	newRefreshToken, err := h.refreshSvc.Create(c.Context(), userID)
+	newRefreshToken, err := h.refreshSvc.Create(c.Context(), userID, tokenVersion)
 	if err != nil {
 		return err
 	}
@@ -192,7 +205,25 @@ func (h *AuthHandler) Logout(c fiber.Ctx) error {
 		return err
 	}
 
-	_ = h.refreshSvc.Revoke(c.Context(), req.RefreshToken)
+	if err := h.refreshSvc.Revoke(c.Context(), req.RefreshToken); err != nil {
+		return apperror.NewInternal("failed to revoke refresh token")
+	}
+	return response.NoContent(c)
+}
+
+// LogoutAll godoc
+// @Summary Revoke all refresh tokens
+// @Description Revoke every refresh token for the authenticated user
+// @Tags Auth
+// @Security BearerAuth
+// @Success 204
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
+// @Router /auth/logout-all [post]
+func (h *AuthHandler) LogoutAll(c fiber.Ctx) error {
+	if err := h.refreshSvc.RevokeAllByUserID(c.Context(), authUserID(c)); err != nil {
+		return apperror.NewInternal("failed to revoke sessions")
+	}
 	return response.NoContent(c)
 }
 
@@ -348,7 +379,8 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	// Verify CSRF state
 	state := c.Query("state")
 	cookieState := c.Cookies(oauthStateCookieName)
-	if state == "" || cookieState == "" || state != cookieState {
+	if state == "" || cookieState == "" ||
+		subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
 		return apperror.NewBadRequest("invalid oauth state")
 	}
 
@@ -379,12 +411,12 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return err
 	}
 
-	accessToken, err := token.Generate(user.ID, user.Email, user.Role, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate token")
 	}
 
-	refreshToken, err := h.refreshSvc.Create(c.Context(), user.ID)
+	refreshToken, err := h.refreshSvc.Create(c.Context(), user.ID, user.TokenVersion)
 	if err != nil {
 		return apperror.NewInternal("failed to generate refresh token")
 	}

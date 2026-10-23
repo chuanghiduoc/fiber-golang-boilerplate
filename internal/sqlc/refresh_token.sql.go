@@ -11,20 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createRefreshToken = `-- name: CreateRefreshToken :one
-INSERT INTO refresh_tokens (user_id, token, expires_at)
-VALUES ($1, $2, $3)
-RETURNING id, user_id, token, expires_at, created_at
+const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
+DELETE FROM refresh_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at, token_version
 `
 
-type CreateRefreshTokenParams struct {
-	UserID    int64              `json:"user_id"`
-	Token     string             `json:"token"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-}
-
-func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, createRefreshToken, arg.UserID, arg.Token, arg.ExpiresAt)
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, token string) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, consumeRefreshToken, token)
 	var i RefreshToken
 	err := row.Scan(
 		&i.ID,
@@ -32,6 +24,46 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.TokenVersion,
+	)
+	return i, err
+}
+
+const createRefreshToken = `-- name: CreateRefreshToken :one
+INSERT INTO refresh_tokens (user_id, token, expires_at, token_version)
+SELECT $1, $2, $3, u.token_version
+FROM users u
+WHERE u.id = $1
+  AND u.deleted_at IS NULL
+  -- Compare with the version the caller authenticated/consumed. This closes
+  -- the bcrypt-length window where a password change could commit after the
+  -- password check but before this INSERT.
+  AND u.token_version = $4
+RETURNING id, user_id, token, expires_at, created_at, token_version
+`
+
+type CreateRefreshTokenParams struct {
+	UserID       int64              `json:"user_id"`
+	Token        string             `json:"token"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	TokenVersion int32              `json:"token_version"`
+}
+
+func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, createRefreshToken,
+		arg.UserID,
+		arg.Token,
+		arg.ExpiresAt,
+		arg.TokenVersion,
+	)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Token,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.TokenVersion,
 	)
 	return i, err
 }
@@ -55,7 +87,7 @@ func (q *Queries) DeleteRefreshTokensByUserID(ctx context.Context, userID int64)
 }
 
 const getRefreshTokenByToken = `-- name: GetRefreshTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at FROM refresh_tokens WHERE token = $1
+SELECT id, user_id, token, expires_at, created_at, token_version FROM refresh_tokens WHERE token = $1
 `
 
 func (q *Queries) GetRefreshTokenByToken(ctx context.Context, token string) (RefreshToken, error) {
@@ -67,6 +99,7 @@ func (q *Queries) GetRefreshTokenByToken(ctx context.Context, token string) (Ref
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.TokenVersion,
 	)
 	return i, err
 }

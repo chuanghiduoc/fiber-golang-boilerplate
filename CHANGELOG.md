@@ -8,11 +8,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed (API contract — breaking)
 - Errors now follow RFC 9457 Problem Details (`application/problem+json`): `type`, `title`, `status`, `code` (snake_case i18n key), `detail`, `instance`, `requestId`, `timestamp`, and a flat `errors[]` for validation. Configurable docs base via `ERROR_DOCS_BASE_URL`.
-- Successful responses return the resource directly (no `{data,meta}` envelope). List endpoints use the Stripe-style `{object:"list", url, data, hasMore}` envelope.
+- Successful responses return the resource directly (no `{data,meta}` envelope). List endpoints use the Stripe-style `{object:"list", url, data, hasMore, nextCursor}` envelope.
 - List endpoints switched to forward-only cursor pagination (`limit` + `startingAfter`), backed by `(created_at, id)` indexes; the opaque cursor is `base64url(created_at:id)`. Offset helpers remain for small tables.
 - JSON keys are camelCase; correlation header standardised to `X-Request-Id`.
 
 ### Security
+- Consume refresh tokens atomically (`DELETE … RETURNING`) so a replayed/concurrent refresh cannot mint two sessions
+- Bind refresh tokens to the authenticated token version and require a matching version at creation/consumption, closing the bcrypt/rotation race with password changes
+- Add a `token_version` JWT claim plus a generation-keyed session cache: password changes/resets, bans, unbans, and role changes invalidate existing access tokens immediately without stale write-after-invalidate snapshots
+- Track `password_changed_at` and reject reset links issued before the last password or email change
+- Bind email-verification tokens to the address they were sent to and require the address to still match at verification time
+- Add `POST /auth/logout-all` to revoke every refresh token for the current user
+- Add admin file takedown (`DELETE /admin/files/:id`) and owner `includeDeleted=true` listing for trash/restore
+- Normalize emails (trim + lowercase), enforce case-insensitive uniqueness among active users, and allow email reuse after soft delete
+- Reset `email_verified_at` on email change, require the current password for self-service email changes, invalidate old verification tokens, and send a fresh link
+- Revoke every refresh token and bump the token version on password change
+- Remove the public `/uploads*` static route; files are only served through authenticated download endpoints, with a MIME-derived storage extension
+- Require `verified_email=true` from Google and refuse to auto-link Google to an unverified local account
+- Redact OAuth/token query parameters from request logs; validate client-supplied `X-Request-Id`
+- Pin JWT parsing to HS256, require `exp`/`iat`, and add clock-skew leeway
+- Reject self-demotion/self-ban and last-admin removal; bump token versions on role changes
+- Protect the final admin and repair partially-seeded admins on startup
 - Hash password-reset and email-verification tokens (SHA-256) before storing, matching refresh tokens — a DB leak can no longer be replayed
 - Upgrade SMTP connections via STARTTLS when advertised; add `SMTP_REQUIRE_TLS` to fail-close when the server offers no TLS
 - Protect `/metrics` behind an optional `METRICS_AUTH_TOKEN` bearer (constant-time compare); drop the `Server` response header
@@ -21,6 +37,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Harden `Content-Disposition` to RFC 6266/5987 (strip control/path chars, encode Unicode via `filename*`)
 
 ### Fixed
+- `TxManager.WithTx` now always rolls back (including on panic), preventing pooled-connection leaks
+- Password-reset requests are rate-limited before lookup and always return the same response, removing the account-enumeration oracle
+- Email-verification tokens are single-use and email-bound; sibling password-reset tokens are invalidated after a successful reset
+- Local uploads are written to a temporary file, size-checked, and atomically renamed; DB-failure cleanup uses a non-canceled context
+- `APP_BODY_LIMIT` default now exceeds `STORAGE_MAX_FILE_SIZE`, so advertised 10 MB uploads are reachable
+- DSN construction escapes credentials/database names; migrations resolve paths and schemes robustly
+- Server exits non-zero when `Listen` fails; startup is bounded by a timeout; HTTP read/write/idle timeouts are configured
+- Migration 000002 preserves email reuse after soft delete, creates real unique token-per-user indexes, and adds a DB trigger that makes last-admin removal safe under concurrency
+- S3 downloads stat the object before responding and bound/cancel the stream; missing objects no longer surface after a 200
+- Integration tests can run without Docker via `TEST_DATABASE_URL` using an isolated schema
+- JSON bodies reject unknown fields and trailing values; duplicate emails return 409, oversized uploads 413, and unsupported media 415
 - `TxManager.WithTx` now uses `errors.Join` on rollback failure so `errors.Is/As` still see the original business error
 - Fix cross-platform path-traversal false positive: canonicalize the local storage base path (symlink/8.3 resolution)
 - Readiness returns HTTP 503 when degraded; readiness checks now run truly in parallel

@@ -38,8 +38,14 @@ func Normalize(page, perPage int) (normalizedPage, normalizedPerPage int) {
 // LimitOffset returns safe int32 limit and offset for SQL queries.
 func LimitOffset(page, perPage int) (limit, offset int32) {
 	page, perPage = Normalize(page, perPage)
-	off := (page - 1) * perPage
-	return clampInt32(perPage), clampInt32(off)
+	if page > math.MaxInt32 {
+		page = math.MaxInt32
+	}
+	off := int64(page-1) * int64(perPage)
+	if off > math.MaxInt32 {
+		off = math.MaxInt32
+	}
+	return clampInt32(perPage), clampInt32(int(off))
 }
 
 // TotalPages calculates total number of pages.

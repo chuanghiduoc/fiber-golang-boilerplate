@@ -38,6 +38,8 @@ func NewUploadHandler(svc service.UploadService, maxFileSize int64, allowedTypes
 // @Success 201 {object} dto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 413 {object} apperror.ProblemDetails
+// @Failure 415 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /files/upload [post]
 func (h *UploadHandler) Upload(c fiber.Ctx) error {
@@ -45,9 +47,12 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 	if err != nil {
 		return apperror.NewBadRequest("file is required")
 	}
+	if len([]rune(fileHeader.Filename)) > 255 {
+		return apperror.NewBadRequest("file name is too long")
+	}
 
 	if fileHeader.Size > h.maxFileSize {
-		return apperror.NewBadRequest(fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
+		return apperror.NewPayloadTooLarge(fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
 	}
 
 	file, err := fileHeader.Open()
@@ -66,7 +71,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 
 	if len(h.allowedMIME) > 0 {
 		if _, ok := h.allowedMIME[contentType]; !ok {
-			return apperror.NewBadRequest(fmt.Sprintf("file type %q is not allowed", contentType))
+			return apperror.NewUnsupportedMediaType(fmt.Sprintf("file type %q is not allowed", contentType))
 		}
 	}
 
@@ -93,6 +98,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 // @Success 200 {object} dto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /files/{id} [get]
 func (h *UploadHandler) GetInfo(c fiber.Ctx) error {
@@ -119,6 +125,7 @@ func (h *UploadHandler) GetInfo(c fiber.Ctx) error {
 // @Success 200
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /files/{id}/download [get]
 func (h *UploadHandler) Download(c fiber.Ctx) error {
@@ -152,6 +159,7 @@ func (h *UploadHandler) Download(c fiber.Ctx) error {
 // @Security BearerAuth
 // @Param limit query int false "Max items to return" default(20)
 // @Param startingAfter query string false "Cursor from the last item of the previous page"
+// @Param includeDeleted query bool false "Include soft-deleted files (trash)"
 // @Success 200 {object} response.ListResponse{data=[]dto.FileResponse}
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
@@ -162,12 +170,13 @@ func (h *UploadHandler) List(c fiber.Ctx) error {
 		return err
 	}
 
-	files, hasMore, err := h.service.List(c.Context(), authUserID(c), limit, startingAfter)
+	includeDeleted, _ := strconv.ParseBool(c.Query("includeDeleted"))
+	files, hasMore, err := h.service.List(c.Context(), authUserID(c), limit, startingAfter, includeDeleted)
 	if err != nil {
 		return err
 	}
 
-	return response.List(c, files, hasMore)
+	return response.List(c, files, hasMore, nextFileCursor(files))
 }
 
 // Delete godoc
@@ -193,4 +202,32 @@ func (h *UploadHandler) Delete(c fiber.Ctx) error {
 	}
 
 	return response.NoContent(c)
+}
+
+// Restore godoc
+// @Summary Restore a soft-deleted file
+// @Description Restore a file owned by the authenticated user
+// @Tags Files
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "File ID"
+// @Success 200 {object} dto.FileResponse
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
+// @Router /files/{id}/restore [post]
+func (h *UploadHandler) Restore(c fiber.Ctx) error {
+	id, err := paramID(c, "id")
+	if err != nil {
+		return err
+	}
+
+	file, err := h.service.Restore(c.Context(), id, authUserID(c))
+	if err != nil {
+		return err
+	}
+
+	return response.Success(c, file)
 }

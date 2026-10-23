@@ -329,7 +329,7 @@ func TestUploadList(t *testing.T) {
 		repo.files[3] = &sqlc.File{ID: 3, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
-		files, hasMore, err := svc.List(context.Background(), 10, 10, "")
+		files, hasMore, err := svc.List(context.Background(), 10, 10, "", false)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}

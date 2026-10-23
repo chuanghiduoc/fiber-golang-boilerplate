@@ -1,5 +1,5 @@
 # ---- Build stage ----
-FROM golang:1.26-alpine AS build
+FROM golang:1.27.3-alpine AS build
 
 RUN apk add --no-cache git
 
@@ -10,18 +10,17 @@ RUN go mod download && go mod verify
 
 COPY . .
 
-RUN go install github.com/swaggo/swag/cmd/swag@latest && \
-    swag init -g cmd/api/main.go -o docs
-
+# docs/ is committed and checked for drift in CI; do not regenerate it here.
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -trimpath \
+    -buildvcs=false \
     -o server ./cmd/api
 
 # ---- Production stage ----
 FROM alpine:3.24 AS prod
 
-RUN apk add --no-cache ca-certificates tzdata curl && \
+RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S appgroup && \
     adduser -S appuser -G appgroup
 
@@ -37,7 +36,7 @@ USER appuser
 
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD wget -qO- "http://127.0.0.1:${APP_PORT:-8080}/readyz" >/dev/null || exit 1
 
 CMD ["./server"]

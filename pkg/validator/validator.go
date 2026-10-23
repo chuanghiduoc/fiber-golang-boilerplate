@@ -22,6 +22,9 @@ func instance() *validator.Validate {
 	once.Do(func() {
 		validate = validator.New()
 		_ = validate.RegisterValidation("password", validatePassword)
+		_ = validate.RegisterValidation("notblank", func(fl validator.FieldLevel) bool {
+			return strings.TrimSpace(fl.Field().String()) != ""
+		})
 		// Report the JSON field name (camelCase) rather than the Go struct field
 		// name, so error paths match the request/response contract.
 		validate.RegisterTagNameFunc(func(fld reflect.StructField) string {
@@ -94,6 +97,8 @@ func codeForTag(tag string) string {
 		return "weak_password"
 	case "oneof":
 		return "invalid_value"
+	case "notblank":
+		return "required"
 	default:
 		return "invalid"
 	}
@@ -111,6 +116,8 @@ func formatError(fe validator.FieldError) string {
 		return fmt.Sprintf("%s must be at most %s characters", fe.Field(), fe.Param())
 	case "password":
 		return fmt.Sprintf("%s must be 8-72 characters with uppercase, lowercase, digit, and special character", fe.Field())
+	case "notblank":
+		return fmt.Sprintf("%s must not be blank", fe.Field())
 	default:
 		return fmt.Sprintf("%s is invalid", fe.Field())
 	}

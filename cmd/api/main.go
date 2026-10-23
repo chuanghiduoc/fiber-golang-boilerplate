@@ -27,6 +27,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/router"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -53,12 +54,25 @@ func main() {
 	// Base URL for RFC 9457 problem "type" links in error responses.
 	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
 
-	// Create database pool
-	ctx := context.Background()
-	pool, err := database.NewPool(ctx, cfg.DB)
-	if err != nil {
-		slog.Error("failed to connect to database", slog.Any("error", err))
+	if cfg.App.Env != "production" && cfg.App.BodyLimit < int(cfg.Storage.MaxFileSize) {
+		slog.Warn("APP_BODY_LIMIT is smaller than STORAGE_MAX_FILE_SIZE; large uploads will be rejected",
+			slog.Int("body_limit", cfg.App.BodyLimit),
+			slog.Int64("max_file_size", cfg.Storage.MaxFileSize),
+		)
+	}
+
+	// Bound startup so an unreachable database cannot hang the process forever.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 60*time.Second)
+	fail := func(msg string, err error) {
+		cancelStartup()
+		slog.Error(msg, slog.Any("error", err))
 		os.Exit(1)
+	}
+
+	// Create database pool
+	pool, err := database.NewPool(startupCtx, cfg.DB)
+	if err != nil {
+		fail("failed to connect to database", err)
 	}
 
 	slog.Info("connected to database")
@@ -66,8 +80,7 @@ func main() {
 	// Run migrations
 	if err := database.RunMigrations(cfg.DB.DSN(), "migrations"); err != nil {
 		pool.Close()
-		slog.Error("failed to run migrations", slog.Any("error", err))
-		os.Exit(1)
+		fail("failed to run migrations", err)
 	}
 	slog.Info("migrations completed")
 
@@ -75,8 +88,7 @@ func main() {
 	store, err := storage.NewStorage(cfg.Storage)
 	if err != nil {
 		pool.Close()
-		slog.Error("failed to initialize storage", slog.Any("error", err))
-		os.Exit(1)
+		fail("failed to initialize storage", err)
 	}
 	slog.Info("storage initialized", slog.String("driver", cfg.Storage.Driver))
 
@@ -84,8 +96,7 @@ func main() {
 	appCache, err := cache.NewCache(cfg.Cache)
 	if err != nil {
 		pool.Close()
-		slog.Error("failed to initialize cache", slog.Any("error", err))
-		os.Exit(1)
+		fail("failed to initialize cache", err)
 	}
 	slog.Info("cache initialized", slog.String("driver", cfg.Cache.Driver))
 
@@ -93,8 +104,7 @@ func main() {
 	emailSender, err := email.NewSender(cfg.Email)
 	if err != nil {
 		pool.Close()
-		slog.Error("failed to initialize email sender", slog.Any("error", err))
-		os.Exit(1)
+		fail("failed to initialize email sender", err)
 	}
 	slog.Info("email sender initialized", slog.String("driver", cfg.Email.Driver))
 
@@ -103,9 +113,8 @@ func main() {
 	if cfg.OAuth.GoogleClientID != "" {
 		googleOAuth = oauth.NewGoogleOAuth(cfg.OAuth)
 		if err := googleOAuth.ValidateFrontendURL(); err != nil {
-			slog.Error("invalid OAuth frontend URL", slog.Any("error", err))
 			pool.Close()
-			os.Exit(1)
+			fail("invalid OAuth frontend URL", err)
 		}
 		slog.Info("Google OAuth enabled")
 	}
@@ -115,16 +124,17 @@ func main() {
 
 	// Dependency injection
 	userRepo := repository.NewUserRepository(pool)
+	sessionStore := session.NewStore(userRepo, appCache)
 
 	// Auto-seed admin user (idempotent)
-	if err := seed.Admin(ctx, cfg.Admin, userRepo); err != nil {
-		slog.Error("failed to seed admin user", slog.Any("error", err))
+	if err := seed.Admin(startupCtx, cfg.Admin, userRepo); err != nil {
 		pool.Close()
-		os.Exit(1)
+		fail("failed to seed admin user", err)
 	}
+	cancelStartup()
 
 	refreshTokenRepo := repository.NewRefreshTokenRepository(pool)
-	userSvc := service.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager)
+	userSvc := service.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager, sessionStore)
 
 	refreshSvc := service.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
@@ -132,7 +142,7 @@ func main() {
 	passwordResetRepo := repository.NewPasswordResetRepository(pool)
 	passwordResetSvc := service.NewPasswordResetService(
 		userRepo, passwordResetRepo, refreshTokenRepo,
-		emailSender, appCache, cfg.App.FrontendURL, txManager,
+		emailSender, appCache, cfg.App.FrontendURL, txManager, sessionStore,
 	)
 
 	// Email verification
@@ -143,16 +153,16 @@ func main() {
 
 	authHandler := handler.NewAuthHandler(
 		userSvc, refreshSvc, passwordResetSvc, emailVerifSvc,
-		cfg.JWT.Secret, cfg.JWT.ExpireHour, googleOAuth,
+		cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.App.RequireEmailVerification, googleOAuth,
 	)
-	userHandler := handler.NewUserHandler(userSvc)
+	userHandler := handler.NewUserHandler(userSvc, emailVerifSvc)
 
 	fileRepo := repository.NewFileRepository(pool)
 	uploadSvc := service.NewUploadService(fileRepo, store)
 	uploadHandler := handler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
 
 	// Admin
-	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager)
+	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager, sessionStore)
 	adminHandler := handler.NewAdminHandler(adminSvc)
 
 	// Health checker
@@ -163,6 +173,9 @@ func main() {
 		AppName:      "fiber-golang-boilerplate",
 		ErrorHandler: apperror.FiberErrorHandler,
 		BodyLimit:    cfg.App.BodyLimit,
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
 	}
 	// Behind a reverse proxy, only trust X-Forwarded-* from configured proxies
 	// so c.IP() (used for rate limiting) cannot be spoofed by clients.
@@ -182,6 +195,7 @@ func main() {
 		Config:        cfg,
 		Pool:          pool,
 		Health:        healthChecker,
+		Sessions:      sessionStore,
 	})
 
 	// Graceful shutdown
@@ -196,19 +210,25 @@ func main() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	exitCode := 0
 	select {
-	case err := <-serverErr:
-		slog.Error("server error", slog.Any("error", err))
+	case listenErr := <-serverErr:
+		if listenErr != nil {
+			slog.Error("server error", slog.Any("error", listenErr))
+			exitCode = 1
+		}
 	case sig := <-sigChan:
 		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
 
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
-			slog.Error("server forced to shutdown", slog.Any("error", err))
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownErr := app.ShutdownWithContext(shutdownCtx)
+		cancel()
+		if shutdownErr != nil {
+			slog.Error("server forced to shutdown", slog.Any("error", shutdownErr))
+			exitCode = 1
 		}
 	}
+	signal.Stop(sigChan)
 
 	// Cleanup all resources
 	if err := appCache.Close(); err != nil {
@@ -217,4 +237,7 @@ func main() {
 	pool.Close()
 
 	slog.Info("server exited")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
 }

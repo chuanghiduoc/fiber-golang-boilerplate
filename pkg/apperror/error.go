@@ -1,6 +1,7 @@
 package apperror
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -69,6 +70,22 @@ func NewInternal(detail string) *AppError {
 	return newError(fiber.StatusInternalServerError, "internal_error", "Internal Server Error", detail)
 }
 
+func NewPayloadTooLarge(detail string) *AppError {
+	return newError(fiber.StatusRequestEntityTooLarge, "payload_too_large", "Payload Too Large", detail)
+}
+
+func NewUnsupportedMediaType(detail string) *AppError {
+	return newError(fiber.StatusUnsupportedMediaType, "unsupported_media_type", "Unsupported Media Type", detail)
+}
+
+func NewTooManyRequests(detail string) *AppError {
+	return newError(fiber.StatusTooManyRequests, "too_many_requests", "Too Many Requests", detail)
+}
+
+func NewEmailNotVerified(detail string) *AppError {
+	return newError(fiber.StatusForbidden, "email_not_verified", "Email not verified", detail)
+}
+
 // NewValidation builds a 422 with a flat list of field errors.
 func NewValidation(detail string, fields []FieldError) *AppError {
 	e := newError(fiber.StatusUnprocessableEntity, "validation_failed", "Validation failed", detail)
@@ -94,6 +111,10 @@ func FiberErrorHandler(c fiber.Ctx, err error) error {
 	var appErr *AppError
 	if errors.As(err, &appErr) {
 		return writeProblem(c, appErr)
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return writeProblem(c, newError(fiber.StatusGatewayTimeout, "gateway_timeout", "Gateway Timeout", "request timed out"))
 	}
 
 	var fiberErr *fiber.Error

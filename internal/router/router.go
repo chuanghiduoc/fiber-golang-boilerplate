@@ -8,7 +8,6 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/gofiber/fiber/v3/middleware/cors"
-	"github.com/gofiber/fiber/v3/middleware/static"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/docs"
@@ -18,10 +17,9 @@ import (
 func SetupRoutes(app *fiber.App, deps Deps) {
 	cfg := deps.Config
 
-	// Serve local uploads as static files
-	if cfg.Storage.Driver == "local" {
-		app.Get("/uploads*", static.New(cfg.Storage.LocalPath))
-	}
+	// Uploaded files are served only through the authenticated download
+	// endpoints. Do not expose the storage directory as a public static tree:
+	// that bypasses ownership checks, security headers, logging, and timeout.
 
 	// Global middleware
 	app.Use(cors.New(cors.Config{

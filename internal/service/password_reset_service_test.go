@@ -60,9 +60,9 @@ func TestForgotPassword(t *testing.T) {
 			t.Errorf("expected 1 reset token, got %d", len(resetRepo.tokens))
 		}
 
-		// Verify email was sent
-		if emailSender.sent != 1 {
-			t.Errorf("expected 1 email sent, got %d", emailSender.sent)
+		// Email is sent asynchronously.
+		if !emailSender.WaitFor(1, time.Second) {
+			t.Errorf("expected 1 email sent, got %d", emailSender.Sent())
 		}
 
 		// Verify rate limit was set
@@ -85,11 +85,11 @@ func TestForgotPassword(t *testing.T) {
 		err := svc.ForgotPassword(context.Background(), dto.ForgotPasswordRequest{
 			Email: "test@example.com",
 		})
-		if err == nil {
-			t.Fatal("expected rate limit error")
+		if err != nil {
+			t.Fatalf("rate limiting must be silent, got %v", err)
 		}
-		if !strings.Contains(err.Error(), "please wait") {
-			t.Errorf("expected rate limit message, got %q", err.Error())
+		if len(resetRepo.tokens) != 0 {
+			t.Error("rate-limited request must not create a token")
 		}
 	})
 
@@ -114,8 +114,8 @@ func TestForgotPassword(t *testing.T) {
 		}
 
 		// No email should be sent
-		if emailSender.sent != 0 {
-			t.Errorf("expected 0 emails, got %d", emailSender.sent)
+		if emailSender.Sent() != 0 {
+			t.Errorf("expected 0 emails, got %d", emailSender.Sent())
 		}
 	})
 }

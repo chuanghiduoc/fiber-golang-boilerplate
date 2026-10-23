@@ -30,18 +30,30 @@ func NewTxManager(pool *pgxpool.Pool) *TxManager {
 //	    // ... transactional operations ...
 //	    return nil
 //	})
-func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
+func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) (err error) {
 	tx, err := tm.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 
-	if err := fn(tx); err != nil {
-		if rbErr := tx.Rollback(ctx); rbErr != nil {
+	// Always roll back if the function panics or returns early. A panic used to
+	// skip both Commit and Rollback and leak a pooled connection.
+	defer func() {
+		// The rollback must still run if the request context was canceled.
+		rbErr := tx.Rollback(context.WithoutCancel(ctx))
+		if rbErr == nil || errors.Is(rbErr, pgx.ErrTxClosed) {
+			return
+		}
+		if err != nil {
 			// Join so callers can still errors.Is/As the original business error
 			// (e.g. apperror.ErrNotFound) while retaining the rollback failure.
-			return errors.Join(err, fmt.Errorf("rollback failed: %w", rbErr))
+			err = errors.Join(err, fmt.Errorf("rollback failed: %w", rbErr))
+			return
 		}
+		err = fmt.Errorf("rollback failed: %w", rbErr)
+	}()
+
+	if err := fn(tx); err != nil {
 		return err
 	}
 

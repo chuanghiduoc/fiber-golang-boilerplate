@@ -9,6 +9,9 @@ import (
 type RefreshTokenRepository interface {
 	Create(ctx context.Context, params sqlc.CreateRefreshTokenParams) (*sqlc.RefreshToken, error)
 	GetByToken(ctx context.Context, token string) (*sqlc.RefreshToken, error)
+	// Consume atomically deletes and returns a token. Exactly one concurrent
+	// caller can win, which prevents refresh-token replay/rotation races.
+	Consume(ctx context.Context, token string) (*sqlc.RefreshToken, error)
 	Delete(ctx context.Context, token string) error
 	DeleteByUserID(ctx context.Context, userID int64) error
 }
@@ -31,6 +34,14 @@ func (r *refreshTokenRepository) Create(ctx context.Context, params sqlc.CreateR
 
 func (r *refreshTokenRepository) GetByToken(ctx context.Context, token string) (*sqlc.RefreshToken, error) {
 	rt, err := r.q.GetRefreshTokenByToken(ctx, token)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &rt, nil
+}
+
+func (r *refreshTokenRepository) Consume(ctx context.Context, token string) (*sqlc.RefreshToken, error) {
+	rt, err := r.q.ConsumeRefreshToken(ctx, token)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

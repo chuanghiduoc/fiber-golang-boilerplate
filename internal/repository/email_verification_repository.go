@@ -9,6 +9,9 @@ import (
 type EmailVerificationRepository interface {
 	Create(ctx context.Context, params sqlc.CreateEmailVerificationTokenParams) (*sqlc.EmailVerificationToken, error)
 	GetByToken(ctx context.Context, token string) (*sqlc.EmailVerificationToken, error)
+	// Consume atomically deletes and returns a token so a verification link
+	// cannot be replayed by two concurrent requests.
+	Consume(ctx context.Context, token string) (*sqlc.EmailVerificationToken, error)
 	Delete(ctx context.Context, token string) error
 	DeleteByUserID(ctx context.Context, userID int64) error
 }
@@ -35,6 +38,14 @@ func (r *emailVerificationRepository) GetByToken(ctx context.Context, token stri
 		return nil, wrapErr(err)
 	}
 	return &rt, nil
+}
+
+func (r *emailVerificationRepository) Consume(ctx context.Context, token string) (*sqlc.EmailVerificationToken, error) {
+	vt, err := r.q.ConsumeEmailVerificationToken(ctx, token)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &vt, nil
 }
 
 func (r *emailVerificationRepository) Delete(ctx context.Context, token string) error {

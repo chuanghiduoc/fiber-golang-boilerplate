@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -25,6 +27,9 @@ func NewPool(ctx context.Context, dbCfg config.DBConfig) (*pgxpool.Pool, error) 
 	poolCfg.MinConns = dbCfg.MinConns
 	poolCfg.MaxConnLifetime = time.Duration(dbCfg.MaxConnLifetime) * time.Second
 	poolCfg.MaxConnIdleTime = time.Duration(dbCfg.MaxConnIdleTime) * time.Second
+	if dbCfg.ConnectTimeout > 0 {
+		poolCfg.ConnConfig.ConnectTimeout = time.Duration(dbCfg.ConnectTimeout) * time.Second
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
@@ -40,14 +45,26 @@ func NewPool(ctx context.Context, dbCfg config.DBConfig) (*pgxpool.Pool, error) 
 }
 
 func RunMigrations(dsn, migrationsPath string) error {
-	m, err := migrate.New(
-		fmt.Sprintf("file://%s", migrationsPath),
-		fmt.Sprintf("pgx5://%s", dsn[len("postgres://"):]),
-	)
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return fmt.Errorf("invalid database DSN: %w", err)
+	}
+	if u.Scheme != "postgres" && u.Scheme != "postgresql" {
+		return fmt.Errorf("unsupported database scheme %q", u.Scheme)
+	}
+	u.Scheme = "pgx5"
+
+	absPath, err := filepath.Abs(migrationsPath)
+	if err != nil {
+		return fmt.Errorf("resolve migrations path: %w", err)
+	}
+	sourceURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}).String()
+
+	m, err := migrate.New(sourceURL, u.String())
 	if err != nil {
 		return fmt.Errorf("failed to create migrate instance: %w", err)
 	}
-	defer func() { srcErr, dbErr := m.Close(); _, _ = srcErr, dbErr }()
+	defer func() { _, _ = m.Close() }()
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("failed to run migrations: %w", err)

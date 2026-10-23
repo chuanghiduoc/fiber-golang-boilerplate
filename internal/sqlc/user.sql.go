@@ -23,7 +23,7 @@ func (q *Queries) AdminCountUsers(ctx context.Context) (int64, error) {
 }
 
 const adminListUsers = `-- name: AdminListUsers :many
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users ORDER BY id LIMIT $1 OFFSET $2
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users ORDER BY id LIMIT $1 OFFSET $2
 `
 
 type AdminListUsersParams struct {
@@ -52,6 +52,8 @@ func (q *Queries) AdminListUsers(ctx context.Context, arg AdminListUsersParams) 
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
+			&i.TokenVersion,
+			&i.PasswordChangedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -64,7 +66,7 @@ func (q *Queries) AdminListUsers(ctx context.Context, arg AdminListUsersParams) 
 }
 
 const adminListUsersCursor = `-- name: AdminListUsersCursor :many
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users
 WHERE (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
 ORDER BY created_at DESC, id DESC
 LIMIT $4::int
@@ -103,6 +105,8 @@ func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCu
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
+			&i.TokenVersion,
+			&i.PasswordChangedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -112,6 +116,17 @@ func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCu
 		return nil, err
 	}
 	return items, nil
+}
+
+const countActiveAdmins = `-- name: CountActiveAdmins :one
+SELECT count(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL
+`
+
+func (q *Queries) CountActiveAdmins(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAdmins)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
 const countDeletedUsers = `-- name: CountDeletedUsers :one
@@ -139,7 +154,7 @@ func (q *Queries) CountUsers(ctx context.Context) (int64, error) {
 const createOAuthUser = `-- name: CreateOAuthUser :one
 INSERT INTO users (email, name, google_id, auth_provider, email_verified_at)
 VALUES ($1, $2, $3, $4, NOW())
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type CreateOAuthUserParams struct {
@@ -169,6 +184,8 @@ func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
@@ -176,7 +193,7 @@ func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams
 const createUser = `-- name: CreateUser :one
 INSERT INTO users (email, password_hash, name)
 VALUES ($1, $2, $3)
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type CreateUserParams struct {
@@ -200,14 +217,18 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const deleteUser = `-- name: DeleteUser :one
-UPDATE users SET deleted_at = NOW(), updated_at = NOW()
+UPDATE users
+SET deleted_at = NOW(), updated_at = NOW(), token_version = token_version + 1,
+    password_changed_at = NOW()
 WHERE id = $1 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 func (q *Queries) DeleteUser(ctx context.Context, id int64) (User, error) {
@@ -225,16 +246,18 @@ func (q *Queries) DeleteUser(ctx context.Context, id int64) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users WHERE email = $1 AND deleted_at IS NULL
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users WHERE lower(email) = lower($1) AND deleted_at IS NULL
 `
 
-func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByEmail, email)
+func (q *Queries) GetUserByEmail(ctx context.Context, lower string) (User, error) {
+	row := q.db.QueryRow(ctx, getUserByEmail, lower)
 	var i User
 	err := row.Scan(
 		&i.ID,
@@ -248,12 +271,14 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const getUserByGoogleID = `-- name: GetUserByGoogleID :one
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users WHERE google_id = $1 AND deleted_at IS NULL
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users WHERE google_id = $1 AND deleted_at IS NULL
 `
 
 func (q *Queries) GetUserByGoogleID(ctx context.Context, googleID pgtype.Text) (User, error) {
@@ -271,12 +296,14 @@ func (q *Queries) GetUserByGoogleID(ctx context.Context, googleID pgtype.Text) (
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users WHERE id = $1 AND deleted_at IS NULL
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users WHERE id = $1 AND deleted_at IS NULL
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
@@ -294,6 +321,8 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
@@ -301,7 +330,7 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 const linkGoogleAccount = `-- name: LinkGoogleAccount :one
 UPDATE users SET google_id = $1, auth_provider = 'google', updated_at = NOW()
 WHERE id = $2 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type LinkGoogleAccountParams struct {
@@ -324,12 +353,14 @@ func (q *Queries) LinkGoogleAccount(ctx context.Context, arg LinkGoogleAccountPa
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const listDeletedUsers = `-- name: ListDeletedUsers :many
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT $1 OFFSET $2
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT $1 OFFSET $2
 `
 
 type ListDeletedUsersParams struct {
@@ -358,6 +389,8 @@ func (q *Queries) ListDeletedUsers(ctx context.Context, arg ListDeletedUsersPara
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
+			&i.TokenVersion,
+			&i.PasswordChangedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -370,7 +403,7 @@ func (q *Queries) ListDeletedUsers(ctx context.Context, arg ListDeletedUsersPara
 }
 
 const listUsers = `-- name: ListUsers :many
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users WHERE deleted_at IS NULL ORDER BY id LIMIT $1 OFFSET $2
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users WHERE deleted_at IS NULL ORDER BY id LIMIT $1 OFFSET $2
 `
 
 type ListUsersParams struct {
@@ -399,6 +432,8 @@ func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, e
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
+			&i.TokenVersion,
+			&i.PasswordChangedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -411,7 +446,7 @@ func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, e
 }
 
 const listUsersCursor = `-- name: ListUsersCursor :many
-SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at FROM users
+SELECT id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at FROM users
 WHERE deleted_at IS NULL
   AND (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
 ORDER BY created_at DESC, id DESC
@@ -451,6 +486,8 @@ func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
+			&i.TokenVersion,
+			&i.PasswordChangedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -463,9 +500,11 @@ func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams
 }
 
 const restoreUser = `-- name: RestoreUser :one
-UPDATE users SET deleted_at = NULL, updated_at = NOW()
+UPDATE users
+SET deleted_at = NULL, updated_at = NOW(), token_version = token_version + 1,
+    password_changed_at = NOW()
 WHERE id = $1 AND deleted_at IS NOT NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 func (q *Queries) RestoreUser(ctx context.Context, id int64) (User, error) {
@@ -483,25 +522,50 @@ func (q *Queries) RestoreUser(ctx context.Context, id int64) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const updateUser = `-- name: UpdateUser :one
 UPDATE users
-SET name = $1, email = $2, updated_at = NOW()
+SET name = $1,
+    -- Omit email when the caller did not supply one, so a name-only update
+    -- cannot clobber a concurrent email change.
+    email = CASE WHEN $4::boolean THEN $2 ELSE email END,
+    -- Changing the address invalidates any prior verification of the old one,
+    -- pending reset links, and every access/refresh token for the old identity.
+    email_verified_at = CASE
+        WHEN $4::boolean AND email IS DISTINCT FROM $2 THEN NULL
+        ELSE email_verified_at
+    END,
+    token_version = token_version + CASE
+        WHEN $4::boolean AND email IS DISTINCT FROM $2 THEN 1 ELSE 0
+    END,
+    password_changed_at = CASE
+        WHEN $4::boolean AND email IS DISTINCT FROM $2 THEN NOW()
+        ELSE password_changed_at
+    END,
+    updated_at = NOW()
 WHERE id = $3 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type UpdateUserParams struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
-	ID    int64  `json:"id"`
+	Name        string `json:"name"`
+	Email       string `json:"email"`
+	ID          int64  `json:"id"`
+	UpdateEmail bool   `json:"update_email"`
 }
 
 func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUser, arg.Name, arg.Email, arg.ID)
+	row := q.db.QueryRow(ctx, updateUser,
+		arg.Name,
+		arg.Email,
+		arg.ID,
+		arg.UpdateEmail,
+	)
 	var i User
 	err := row.Scan(
 		&i.ID,
@@ -515,14 +579,20 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const updateUserPassword = `-- name: UpdateUserPassword :one
-UPDATE users SET password_hash = $1, updated_at = NOW()
+UPDATE users
+SET password_hash = $1,
+    updated_at = NOW(),
+    token_version = token_version + 1,
+    password_changed_at = NOW()
 WHERE id = $2 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type UpdateUserPasswordParams struct {
@@ -545,14 +615,17 @@ func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPassword
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const updateUserRole = `-- name: UpdateUserRole :one
-UPDATE users SET role = $1, updated_at = NOW()
+UPDATE users
+SET role = $1, updated_at = NOW(), token_version = token_version + 1
 WHERE id = $2 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
 type UpdateUserRoleParams struct {
@@ -575,18 +648,25 @@ func (q *Queries) UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) 
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }
 
 const verifyUserEmail = `-- name: VerifyUserEmail :one
 UPDATE users SET email_verified_at = NOW(), updated_at = NOW()
-WHERE id = $1 AND deleted_at IS NULL
-RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at
+WHERE id = $1 AND deleted_at IS NULL AND email = $2
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
 `
 
-func (q *Queries) VerifyUserEmail(ctx context.Context, id int64) (User, error) {
-	row := q.db.QueryRow(ctx, verifyUserEmail, id)
+type VerifyUserEmailParams struct {
+	ID    int64  `json:"id"`
+	Email string `json:"email"`
+}
+
+func (q *Queries) VerifyUserEmail(ctx context.Context, arg VerifyUserEmailParams) (User, error) {
+	row := q.db.QueryRow(ctx, verifyUserEmail, arg.ID, arg.Email)
 	var i User
 	err := row.Scan(
 		&i.ID,
@@ -600,6 +680,8 @@ func (q *Queries) VerifyUserEmail(ctx context.Context, id int64) (User, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
 	)
 	return i, err
 }

@@ -9,8 +9,9 @@ import (
 type FileRepository interface {
 	Create(ctx context.Context, params sqlc.CreateFileParams) (*sqlc.File, error)
 	GetByID(ctx context.Context, id int64) (*sqlc.File, error)
+	GetByIDIncludingDeleted(ctx context.Context, id int64) (*sqlc.File, error)
 	ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]sqlc.File, error)
-	ListByUserCursor(ctx context.Context, userID int64, cur Cursor) ([]sqlc.File, error)
+	ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error)
 	CountByUserID(ctx context.Context, userID int64) (int64, error)
 	Delete(ctx context.Context, id int64) (*sqlc.File, error)
 	Restore(ctx context.Context, id int64) (*sqlc.File, error)
@@ -45,6 +46,14 @@ func (r *fileRepository) GetByID(ctx context.Context, id int64) (*sqlc.File, err
 	return &file, nil
 }
 
+func (r *fileRepository) GetByIDIncludingDeleted(ctx context.Context, id int64) (*sqlc.File, error) {
+	file, err := r.q.GetFileByIDIncludingDeleted(ctx, id)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &file, nil
+}
+
 func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]sqlc.File, error) {
 	return r.q.ListFilesByUserID(ctx, sqlc.ListFilesByUserIDParams{
 		UserID: userID,
@@ -53,13 +62,14 @@ func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, 
 	})
 }
 
-func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor) ([]sqlc.File, error) {
+func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error) {
 	return r.q.ListFilesByUserCursor(ctx, sqlc.ListFilesByUserCursorParams{
-		UserID:          userID,
-		HasCursor:       cur.HasCursor,
+		UserID:         userID,
+		IncludeDeleted: includeDeleted,
+		HasCursor:      cur.HasCursor,
 		CursorCreatedAt: cur.createdAt(),
-		CursorID:        cur.ID,
-		RowLimit:        cur.Limit,
+		CursorID:       cur.ID,
+		RowLimit:       cur.Limit,
 	})
 }
 

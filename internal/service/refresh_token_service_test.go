@@ -20,7 +20,7 @@ func newRefreshTokenServiceForTest() (*refreshTokenService, *mockRefreshTokenRep
 func TestRefreshTokenCreate(t *testing.T) {
 	svc, repo := newRefreshTokenServiceForTest()
 
-	plainToken, err := svc.Create(context.Background(), 1)
+	plainToken, err := svc.Create(context.Background(), 1, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

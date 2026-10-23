@@ -22,6 +22,9 @@ type EmailVerificationService interface {
 	SendVerification(ctx context.Context, userID int64, userEmail string) error
 	Verify(ctx context.Context, token string) error
 	ResendVerification(ctx context.Context, emailAddr string) error
+	// Invalidate removes pending verification tokens, e.g. after an email
+	// address change so a link sent to the old address cannot verify the new one.
+	Invalidate(ctx context.Context, userID int64) error
 }
 
 type emailVerificationService struct {
@@ -49,6 +52,8 @@ func NewEmailVerificationService(
 }
 
 func (s *emailVerificationService) SendVerification(ctx context.Context, userID int64, userEmail string) error {
+	userEmail = normalizeEmail(userEmail)
+
 	// Generate token
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -63,6 +68,7 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 	// delivered to the user via email so a DB leak cannot be replayed.
 	_, err := s.verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
 		UserID:    userID,
+		Email:     userEmail,
 		Token:     hashToken(token),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
 	})
@@ -92,7 +98,9 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 func (s *emailVerificationService) Verify(ctx context.Context, token string) error {
 	tokenHash := hashToken(token)
 
-	vt, err := s.verifRepo.GetByToken(ctx, tokenHash)
+	// Consume atomically so a verification link cannot be replayed by two
+	// concurrent requests (or reused after a successful verification).
+	vt, err := s.verifRepo.Consume(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewBadRequest("invalid or expired verification token")
@@ -101,30 +109,44 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 	}
 
 	if vt.ExpiresAt.Time.Before(time.Now()) {
-		_ = s.verifRepo.Delete(ctx, tokenHash)
 		return apperror.NewBadRequest("verification token has expired")
 	}
 
-	// Mark email as verified
-	_, err = s.userRepo.VerifyEmail(ctx, vt.UserID)
+	// The link proves ownership of the address it was sent to, not merely of
+	// the account. Reject it if the account has since changed address.
+	user, err := s.userRepo.GetByID(ctx, vt.UserID)
 	if err != nil {
-		return apperror.NewInternal("failed to verify email")
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewBadRequest("invalid or expired verification token")
+		}
+		return apperror.NewInternal("failed to load user")
+	}
+	if normalizeEmail(user.Email) != normalizeEmail(vt.Email) {
+		return apperror.NewBadRequest("verification token does not match the current email")
 	}
 
-	// Delete token
-	_ = s.verifRepo.Delete(ctx, tokenHash)
+	// Mark email as verified
+	if _, err := s.userRepo.VerifyEmail(ctx, vt.UserID, vt.Email); err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewBadRequest("verification token does not match the current email")
+		}
+		return apperror.NewInternal("failed to verify email")
+	}
 
 	return nil
 }
 
 func (s *emailVerificationService) ResendVerification(ctx context.Context, emailAddr string) error {
-	// Rate limit — apply BEFORE user lookup to prevent enumeration via timing
+	emailAddr = normalizeEmail(emailAddr)
+
+	// Rate limit before user lookup so the response cannot reveal whether the
+	// address exists. Increment is atomic and sets the TTL on first use.
 	cacheKey := "email_verification:" + emailAddr
-	exists, _ := s.cache.Exists(ctx, cacheKey)
-	if exists {
-		return apperror.NewBadRequest("please wait before requesting another verification email")
+	if s.cache != nil {
+		if n, err := s.cache.Increment(ctx, cacheKey, 1*time.Minute); err == nil && n > 1 {
+			return nil
+		}
 	}
-	_ = s.cache.Set(ctx, cacheKey, []byte("1"), 1*time.Minute)
 
 	user, err := s.userRepo.GetByEmail(ctx, emailAddr)
 	if err != nil {
@@ -140,4 +162,8 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 	}
 
 	return s.SendVerification(ctx, user.ID, user.Email)
+}
+
+func (s *emailVerificationService) Invalidate(ctx context.Context, userID int64) error {
+	return s.verifRepo.DeleteByUserID(ctx, userID)
 }

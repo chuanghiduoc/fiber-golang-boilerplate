@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	_ "github.com/joho/godotenv/autoload"
 
@@ -30,7 +31,9 @@ func run() error {
 
 	logger.Setup(cfg.App.Env, cfg.App.LogLevel)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
 	pool, err := database.NewPool(ctx, cfg.DB)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)

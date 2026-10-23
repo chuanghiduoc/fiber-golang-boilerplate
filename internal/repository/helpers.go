@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -29,6 +30,11 @@ func (c Cursor) createdAt() pgtype.Timestamptz {
 func wrapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return apperror.ErrNotFound
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "P0001" &&
+		strings.Contains(pgErr.Message, "last active admin") {
+		return apperror.NewConflict("cannot remove the last active admin")
 	}
 	return err
 }

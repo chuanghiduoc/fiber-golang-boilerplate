@@ -8,7 +8,16 @@ updates:
       prefix: "chore(deps):"
     labels:
       - "dependencies"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 15
+    groups:
+      golang-x:
+        patterns:
+          - "golang.org/x/*"
+      testcontainers:
+        patterns:
+          - "github.com/testcontainers/*"
+          - "github.com/moby/*"
+          - "go.opentelemetry.io/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"

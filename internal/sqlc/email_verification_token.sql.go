@@ -11,20 +11,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const createEmailVerificationToken = `-- name: CreateEmailVerificationToken :one
-INSERT INTO email_verification_tokens (user_id, token, expires_at)
-VALUES ($1, $2, $3)
-RETURNING id, user_id, token, expires_at, created_at
+const consumeEmailVerificationToken = `-- name: ConsumeEmailVerificationToken :one
+DELETE FROM email_verification_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at, email
 `
 
-type CreateEmailVerificationTokenParams struct {
-	UserID    int64              `json:"user_id"`
-	Token     string             `json:"token"`
-	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-}
-
-func (q *Queries) CreateEmailVerificationToken(ctx context.Context, arg CreateEmailVerificationTokenParams) (EmailVerificationToken, error) {
-	row := q.db.QueryRow(ctx, createEmailVerificationToken, arg.UserID, arg.Token, arg.ExpiresAt)
+func (q *Queries) ConsumeEmailVerificationToken(ctx context.Context, token string) (EmailVerificationToken, error) {
+	row := q.db.QueryRow(ctx, consumeEmailVerificationToken, token)
 	var i EmailVerificationToken
 	err := row.Scan(
 		&i.ID,
@@ -32,6 +24,44 @@ func (q *Queries) CreateEmailVerificationToken(ctx context.Context, arg CreateEm
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.Email,
+	)
+	return i, err
+}
+
+const createEmailVerificationToken = `-- name: CreateEmailVerificationToken :one
+INSERT INTO email_verification_tokens (user_id, email, token, expires_at)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (user_id) DO UPDATE
+SET email = EXCLUDED.email,
+    token = EXCLUDED.token,
+    expires_at = EXCLUDED.expires_at,
+    created_at = NOW()
+RETURNING id, user_id, token, expires_at, created_at, email
+`
+
+type CreateEmailVerificationTokenParams struct {
+	UserID    int64              `json:"user_id"`
+	Email     string             `json:"email"`
+	Token     string             `json:"token"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) CreateEmailVerificationToken(ctx context.Context, arg CreateEmailVerificationTokenParams) (EmailVerificationToken, error) {
+	row := q.db.QueryRow(ctx, createEmailVerificationToken,
+		arg.UserID,
+		arg.Email,
+		arg.Token,
+		arg.ExpiresAt,
+	)
+	var i EmailVerificationToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Token,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.Email,
 	)
 	return i, err
 }
@@ -55,7 +85,7 @@ func (q *Queries) DeleteEmailVerificationTokensByUserID(ctx context.Context, use
 }
 
 const getEmailVerificationTokenByToken = `-- name: GetEmailVerificationTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at FROM email_verification_tokens WHERE token = $1
+SELECT id, user_id, token, expires_at, created_at, email FROM email_verification_tokens WHERE token = $1
 `
 
 func (q *Queries) GetEmailVerificationTokenByToken(ctx context.Context, token string) (EmailVerificationToken, error) {
@@ -67,6 +97,7 @@ func (q *Queries) GetEmailVerificationTokenByToken(ctx context.Context, token st
 		&i.Token,
 		&i.ExpiresAt,
 		&i.CreatedAt,
+		&i.Email,
 	)
 	return i, err
 }

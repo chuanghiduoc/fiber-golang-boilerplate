@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -34,6 +36,7 @@ type UserService interface {
 	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
 	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
 	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
+	VerifyPassword(ctx context.Context, userID int64, password string) error
 	Delete(ctx context.Context, id int64) error
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
 }
@@ -44,6 +47,7 @@ type userService struct {
 	requireEmailVerification bool
 	cache                    cache.Cache
 	txManager                *database.TxManager
+	sessions                 session.Store
 }
 
 func NewUserService(
@@ -52,23 +56,32 @@ func NewUserService(
 	requireEmailVerification bool,
 	appCache cache.Cache,
 	txManager *database.TxManager,
+	sessions ...session.Store,
 ) UserService {
+	var sessionStore session.Store
+	if len(sessions) > 0 {
+		sessionStore = sessions[0]
+	}
 	return &userService{
 		repo:                     repo,
 		refreshTokenRepo:         refreshTokenRepo,
 		requireEmailVerification: requireEmailVerification,
 		cache:                    appCache,
 		txManager:                txManager,
+		sessions:                 sessionStore,
 	}
 }
 
 func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	existing, err := s.repo.GetByEmail(ctx, req.Email)
+	email := normalizeEmail(req.Email)
+	name := strings.TrimSpace(req.Name)
+
+	existing, err := s.repo.GetByEmail(ctx, email)
 	if err != nil && !errors.Is(err, apperror.ErrNotFound) {
 		return nil, apperror.NewInternal("failed to check existing user")
 	}
 	if existing != nil {
-		return nil, apperror.NewBadRequest("email already registered")
+		return nil, apperror.NewConflict("email already registered")
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
@@ -77,35 +90,46 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	user, err := s.repo.Create(ctx, sqlc.CreateUserParams{
-		Email:        req.Email,
+		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-		Name:         req.Name,
+		Name:         name,
 	})
 	if err != nil {
+		if repository.IsUniqueViolation(err) {
+			return nil, apperror.NewConflict("email already registered")
+		}
 		return nil, apperror.NewInternal("failed to create user")
 	}
+
+	// A previous failed-login lockout must not survive registration.
+	_ = s.cache.Delete(ctx, loginAttemptPrefix+email)
 
 	return ToUserResponse(user), nil
 }
 
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
+	email := normalizeEmail(req.Email)
+
+	// Look up the account before applying a per-email lockout. Otherwise an
+	// attacker can pre-lock an address that does not exist yet, and the real
+	// owner is locked out immediately after registering.
+	user, err := s.repo.GetByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			// Never create a lockout key for a nonexistent account.
+			return nil, apperror.NewUnauthorized("invalid email or password")
+		}
+		return nil, apperror.NewInternal("failed to get user")
+	}
+
 	// Check lockout (fail-closed: deny login if cache is unavailable)
-	cacheKey := loginAttemptPrefix + req.Email
+	cacheKey := loginAttemptPrefix + email
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
 		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
 	}
 	if locked {
-		return nil, apperror.NewBadRequest(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
-	}
-
-	user, err := s.repo.GetByEmail(ctx, req.Email)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			s.incrementLoginAttempts(ctx, cacheKey)
-			return nil, apperror.NewUnauthorized("invalid email or password")
-		}
-		return nil, apperror.NewInternal("failed to get user")
+		return nil, apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
 	}
 
 	if !user.PasswordHash.Valid {
@@ -118,7 +142,7 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	}
 
 	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
-		return nil, apperror.NewForbidden("email not verified")
+		return nil, apperror.NewEmailNotVerified("email not verified")
 	}
 
 	// Clear attempts on success
@@ -162,6 +186,8 @@ func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email,
 }
 
 func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
+	email = normalizeEmail(email)
+
 	findOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
 		user, err := repo.GetByGoogleID(ctx, googleID)
 		if err == nil {
@@ -173,11 +199,20 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 
 		existing, err := repo.GetByEmail(ctx, email)
 		if err == nil {
+			// Never silently attach a Google identity to an unverified local
+			// account. An attacker could otherwise pre-register a victim's
+			// address and take over the account when the victim uses Google.
+			if !existing.EmailVerifiedAt.Valid {
+				return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
+			}
 			linked, linkErr := repo.LinkGoogleAccount(ctx, sqlc.LinkGoogleAccountParams{
 				GoogleID: pgtype.Text{String: googleID, Valid: true},
 				ID:       existing.ID,
 			})
 			if linkErr != nil {
+				if repository.IsUniqueViolation(linkErr) {
+					return nil, apperror.NewConflict("this Google account is already linked to another user")
+				}
 				return nil, apperror.NewInternal("failed to link google account")
 			}
 			return linked, nil
@@ -207,9 +242,14 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			return err
 		})
 		if txErr != nil {
-			if repository.IsUniqueViolation(txErr) {
-				if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
+			if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, txErr); retryErr == nil {
+				if user != nil {
 					return user, nil
+				}
+			} else {
+				var appErr *apperror.AppError
+				if errors.As(retryErr, &appErr) {
+					return nil, retryErr
 				}
 			}
 			return nil, apperror.NewInternal("failed to create oauth user")
@@ -219,14 +259,34 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 
 	result, err := findOrCreate(s.repo)
 	if err != nil {
-		if repository.IsUniqueViolation(err) {
-			if user, retryErr := s.repo.GetByGoogleID(ctx, googleID); retryErr == nil {
+		if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, err); retryErr == nil {
+			if user != nil {
 				return user, nil
+			}
+		} else {
+			var appErr *apperror.AppError
+			if errors.As(retryErr, &appErr) {
+				return nil, retryErr
 			}
 		}
 		return nil, apperror.NewInternal("failed to create oauth user")
 	}
 	return result, nil
+}
+
+// retryOAuthLookup handles the concurrent-create race. It returns a user when
+// another request won, or nil to let the caller surface the original error.
+func (s *userService) retryOAuthLookup(ctx context.Context, googleID, email string, cause error) (*sqlc.User, error) {
+	if !repository.IsUniqueViolation(cause) {
+		return nil, cause
+	}
+	if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
+		return user, nil
+	}
+	if _, err := s.repo.GetByEmail(ctx, email); err == nil {
+		return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
+	}
+	return nil, cause
 }
 
 func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
@@ -278,32 +338,114 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 	email := existing.Email
 
 	if req.Name != nil {
-		name = *req.Name
+		name = strings.TrimSpace(*req.Name)
 	}
-	if req.Email != nil && *req.Email != existing.Email {
-		dup, err := s.repo.GetByEmail(ctx, *req.Email)
-		if err != nil && !errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewInternal("failed to check email availability")
+	if req.Email != nil {
+		requested := normalizeEmail(*req.Email)
+		if requested != normalizeEmail(existing.Email) {
+			dup, err := s.repo.GetByEmail(ctx, requested)
+			if err != nil && !errors.Is(err, apperror.ErrNotFound) {
+				return nil, apperror.NewInternal("failed to check email availability")
+			}
+			if dup != nil {
+				return nil, apperror.NewConflict("email already in use")
+			}
+			email = requested
 		}
-		if dup != nil {
-			return nil, apperror.NewBadRequest("email already in use")
-		}
-		email = *req.Email
 	}
 
-	user, err := s.repo.Update(ctx, sqlc.UpdateUserParams{
-		ID:    id,
-		Name:  name,
-		Email: email,
-	})
+	emailChanged := normalizeEmail(existing.Email) != normalizeEmail(email)
+
+	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*sqlc.User, error) {
+		user, err := userRepo.Update(ctx, sqlc.UpdateUserParams{
+			ID:          id,
+			Name:        name,
+			Email:       email,
+			UpdateEmail: req.Email != nil,
+		})
+		if err != nil {
+			if repository.IsUniqueViolation(err) {
+				return nil, apperror.NewConflict("email already in use")
+			}
+			return nil, apperror.NewInternal("failed to update user")
+		}
+		if emailChanged {
+			// Changing the identity address must end every existing session.
+			if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
+				return nil, apperror.NewInternal("failed to revoke sessions")
+			}
+		}
+		return user, nil
+	}
+
+	var user *sqlc.User
+	if s.txManager != nil {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			var updateErr error
+			user, updateErr = doUpdate(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			return updateErr
+		})
+	} else {
+		user, err = doUpdate(s.repo, s.refreshTokenRepo)
+	}
 	if err != nil {
-		return nil, apperror.NewInternal("failed to update user")
+		return nil, err
+	}
+	if emailChanged && s.sessions != nil {
+		_ = s.sessions.Invalidate(ctx, id)
 	}
 
 	return ToUserResponse(user), nil
 }
 
+// VerifyPassword checks a plaintext password against the stored hash. It is
+// used to require re-authentication for sensitive profile changes.
+func (s *userService) VerifyPassword(ctx context.Context, userID int64, password string) error {
+	user, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to get user")
+	}
+	if !user.PasswordHash.Valid {
+		return apperror.NewBadRequest("current password is incorrect")
+	}
+
+	cacheKey := loginAttemptPrefix + normalizeEmail(user.Email)
+	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
+	if cacheErr != nil {
+		return apperror.NewInternal("unable to verify login attempts, please try again later")
+	}
+	if locked {
+		return apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(password)) != nil {
+		s.incrementLoginAttempts(ctx, cacheKey)
+		return apperror.NewBadRequest("current password is incorrect")
+	}
+	_ = s.cache.Delete(ctx, cacheKey)
+	return nil
+}
+
 func (s *userService) Delete(ctx context.Context, id int64) error {
+	target, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to get user")
+	}
+	if target.Role == dto.RoleAdmin {
+		admins, err := s.repo.CountActiveAdmins(ctx)
+		if err != nil {
+			return apperror.NewInternal("failed to count admins")
+		}
+		if admins <= 1 {
+			return apperror.NewConflict("cannot delete the last active admin")
+		}
+	}
+
 	doDelete := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
 		_, err := userRepo.Delete(ctx, id)
 		if err != nil {
@@ -321,12 +463,20 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 	}
 
 	if s.txManager != nil {
-		return s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			return doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
 		})
+	} else {
+		err = doDelete(s.repo, s.refreshTokenRepo)
+	}
+	if err != nil {
+		return err
 	}
 
-	return doDelete(s.repo, s.refreshTokenRepo)
+	if s.sessions != nil {
+		_ = s.sessions.Invalidate(ctx, id)
+	}
+	return nil
 }
 
 func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error {
@@ -345,31 +495,63 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.CurrentPassword)); err != nil {
 		return apperror.NewBadRequest("current password is incorrect")
 	}
+	if req.CurrentPassword == req.NewPassword {
+		return apperror.NewBadRequest("new password must be different from the current password")
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcryptCost)
 	if err != nil {
 		return apperror.NewInternal("failed to hash password")
 	}
 
-	_, err = s.repo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
-		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-		ID:           userID,
-	})
-	if err != nil {
-		return apperror.NewInternal("failed to update password")
+	doChange := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		if _, err := userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
+			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
+			ID:           userID,
+		}); err != nil {
+			return apperror.NewInternal("failed to update password")
+		}
+		// A password change must invalidate every existing session.
+		if err := refreshRepo.DeleteByUserID(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to revoke sessions")
+		}
+		return nil
 	}
+
+	if s.txManager != nil {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			return doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+		})
+	} else {
+		err = doChange(s.repo, s.refreshTokenRepo)
+	}
+	if err != nil {
+		return err
+	}
+
+	if s.sessions != nil {
+		_ = s.sessions.Invalidate(ctx, userID)
+	}
+	_ = s.cache.Delete(ctx, loginAttemptPrefix+normalizeEmail(user.Email))
 
 	return nil
 }
 
 func ToUserResponse(user *sqlc.User) *dto.UserResponse {
-	return &dto.UserResponse{
+	resp := &dto.UserResponse{
 		ID:            user.ID,
 		Email:         user.Email,
 		Name:          user.Name,
 		Role:          user.Role,
 		EmailVerified: user.EmailVerifiedAt.Valid,
+		HasPassword:   user.PasswordHash.Valid,
 		CreatedAt:     user.CreatedAt.Time,
 		UpdatedAt:     user.UpdatedAt.Time,
+		TokenVersion:  user.TokenVersion,
 	}
+	if user.DeletedAt.Valid {
+		deletedAt := user.DeletedAt.Time
+		resp.DeletedAt = &deletedAt
+	}
+	return resp
 }

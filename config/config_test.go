@@ -82,7 +82,7 @@ func TestDBConfig_DSN(t *testing.T) {
 	}
 
 	dsn := db.DSN()
-	expected := "postgres://user:pass@localhost:5432/testdb?sslmode=disable&search_path=public"
+	expected := "postgres://user:pass@localhost:5432/testdb?search_path=public&sslmode=disable"
 	if dsn != expected {
 		t.Errorf("DSN() = %q, want %q", dsn, expected)
 	}
@@ -92,9 +92,12 @@ func TestDBConfig_DSN(t *testing.T) {
 // this baseline and mutates exactly one field so failures isolate one rule.
 func baseValidConfig() Config {
 	return Config{
-		App:       AppConfig{Port: 8080, Env: "local", BodyLimit: 4194304},
-		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24},
-		DB:        DBConfig{MaxConns: 25, MinConns: 5},
+		App: AppConfig{
+			Port: 8080, Env: "local", BodyLimit: 12582912,
+			RequestTimeout: 30, FrontendURL: "http://localhost:3000",
+		},
+		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30},
+		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
 		Cache:     CacheConfig{Driver: "memory"},
@@ -297,5 +300,76 @@ func TestLoad_DefaultValues(t *testing.T) {
 	}
 	if cfg.App.Port != 8080 {
 		t.Errorf("default port = %d, want 8080", cfg.App.Port)
+	}
+}
+
+func TestDBConfig_DSN_EscapesSpecialCharacters(t *testing.T) {
+	db := DBConfig{
+		Host:     "localhost",
+		Port:     5432,
+		Database: "test db",
+		Username: "user@example.com",
+		Password: "p@ss:word/with?chars",
+		SSLMode:  "disable",
+		Schema:   "public",
+	}
+
+	dsn := db.DSN()
+	for _, want := range []string{"user%40example.com", "p%40ss%3Aword%2Fwith%3Fchars", "test%20db"} {
+		if !strings.Contains(dsn, want) {
+			t.Errorf("DSN() = %q, want it to contain %q", dsn, want)
+		}
+	}
+}
+
+func productionValidConfig() Config {
+	cfg := baseValidConfig()
+	cfg.App.Env = "production"
+	cfg.App.FrontendURL = "https://app.example.com"
+	cfg.JWT.Secret = strings.Repeat("a", 32)
+	cfg.Storage.AllowedMIMETypes = "image/png,application/pdf"
+	cfg.CORS.AllowOrigins = "https://app.example.com"
+	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
+	cfg.App.MetricsAuthToken = "metrics-token-123456"
+	return cfg
+}
+
+func TestValidate_ProductionSafetyRails(t *testing.T) {
+	t.Run("valid production config", func(t *testing.T) {
+		cfg := productionValidConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("production config should be valid: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"body limit below file limit", func(c *Config) { c.App.BodyLimit = 1024 }},
+		{"empty MIME allowlist", func(c *Config) { c.Storage.AllowedMIMETypes = "" }},
+		{"console email", func(c *Config) { c.Email = EmailConfig{Driver: "console"} }},
+		{"smtp without TLS", func(c *Config) { c.Email.SMTPRequireTLS = false }},
+		{"wildcard CORS", func(c *Config) { c.CORS.AllowOrigins = "*" }},
+		{"http frontend", func(c *Config) { c.App.FrontendURL = "http://app.example.com" }},
+		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshExpireDays = 0 }},
+		{"invalid env", func(c *Config) { c.App.Env = "prod" }},
+		{"missing metrics token", func(c *Config) { c.App.MetricsAuthToken = "" }},
+		{"weak admin password", func(c *Config) {
+			c.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
+		}},
+		{"known default JWT secret", func(c *Config) {
+			c.JWT.Secret = "your-super-secret-key-change-in-production"
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := productionValidConfig()
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Validate() should reject this production config")
+			}
+		})
 	}
 }

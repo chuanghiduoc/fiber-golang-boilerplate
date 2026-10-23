@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -28,8 +29,11 @@ func NewS3Storage(cfg config.StorageConfig) (*S3Storage, error) {
 		return nil, fmt.Errorf("failed to create S3 client: %w", err)
 	}
 
-	// Ensure bucket exists
-	ctx := context.Background()
+	// Ensure bucket exists. Bound startup so an unreachable endpoint cannot
+	// hang the process indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	exists, err := client.BucketExists(ctx, cfg.S3Bucket)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check bucket: %w", err)
@@ -62,12 +66,35 @@ func (s *S3Storage) Put(ctx context.Context, path string, reader io.Reader, size
 }
 
 func (s *S3Storage) Get(ctx context.Context, path string) (io.ReadCloser, error) {
-	obj, err := s.client.GetObject(ctx, s.bucket, path, minio.GetObjectOptions{})
+	// GetObject is lazy; a missing object would otherwise fail after the HTTP
+	// handler has already sent its 200 response. Stat first so failures are
+	// reported as an error.
+	if _, err := s.client.StatObject(ctx, s.bucket, path, minio.StatObjectOptions{}); err != nil {
+		return nil, fmt.Errorf("failed to stat S3 object: %w", err)
+	}
+
+	// The response body is streamed after the handler returns, so the request
+	// deadline is no longer suitable. Bound the stream independently and cancel
+	// it when the caller closes the body.
+	streamCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	obj, err := s.client.GetObject(streamCtx, s.bucket, path, minio.GetObjectOptions{})
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to get from S3: %w", err)
 	}
 
-	return obj, nil
+	return &cancelReadCloser{ReadCloser: obj, cancel: cancel}, nil
+}
+
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 func (s *S3Storage) Delete(ctx context.Context, path string) error {
