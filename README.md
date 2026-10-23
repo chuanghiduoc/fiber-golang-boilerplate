@@ -231,6 +231,11 @@ TEST_DATABASE_URL='postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable'
   go test -tags=integration -race -count=1 ./...
 ```
 
+Testcontainers pulls the Docker client as a test-only dependency. `govulncheck`
+reports no called vulnerabilities, but GitHub may show open advisories for that
+client until upstream ships a patched module; it is not linked into the API
+binary.
+
 ## Security notes
 
 - Refresh tokens are hashed, atomic/single-use, bound to the user's token
