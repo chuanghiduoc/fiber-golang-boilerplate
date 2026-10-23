@@ -528,6 +528,34 @@ func (q *Queries) RestoreUser(ctx context.Context, id int64) (User, error) {
 	return i, err
 }
 
+const revokeUserSessions = `-- name: RevokeUserSessions :one
+UPDATE users
+SET token_version = token_version + 1, updated_at = NOW()
+WHERE id = $1 AND deleted_at IS NULL
+RETURNING id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, created_at, updated_at, deleted_at, token_version, password_changed_at
+`
+
+func (q *Queries) RevokeUserSessions(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRow(ctx, revokeUserSessions, id)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.PasswordHash,
+		&i.Name,
+		&i.Role,
+		&i.GoogleID,
+		&i.AuthProvider,
+		&i.EmailVerifiedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.TokenVersion,
+		&i.PasswordChangedAt,
+	)
+	return i, err
+}
+
 const updateUser = `-- name: UpdateUser :one
 UPDATE users
 SET name = $1,

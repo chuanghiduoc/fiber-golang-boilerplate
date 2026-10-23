@@ -54,6 +54,18 @@ func main() {
 	// Base URL for RFC 9457 problem "type" links in error responses.
 	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
 
+	if cfg.App.Env == "production" {
+		if cfg.Cache.Driver == "memory" {
+			slog.Warn("CACHE_DRIVER=memory in production: rate limits and session invalidation are not shared across replicas")
+		}
+		if cfg.DB.SSLMode == "disable" {
+			slog.Warn("DB_SSLMODE=disable in production: database traffic is not encrypted")
+		}
+		if (cfg.Storage.Driver == "s3" || cfg.Storage.Driver == "minio") && !cfg.Storage.S3UseSSL {
+			slog.Warn("STORAGE_S3_USE_SSL=false in production: object storage traffic is not encrypted")
+		}
+	}
+
 	if cfg.App.Env != "production" && cfg.App.BodyLimit < int(cfg.Storage.MaxFileSize) {
 		slog.Warn("APP_BODY_LIMIT is smaller than STORAGE_MAX_FILE_SIZE; large uploads will be rejected",
 			slog.Int("body_limit", cfg.App.BodyLimit),

@@ -87,6 +87,10 @@ func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.Chang
 	return nil
 }
 
+func (m *mockUserService) RevokeSessions(_ context.Context, _ int64) error {
+	return nil
+}
+
 func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password string) error {
 	if password == "Password1!" {
 		return nil
