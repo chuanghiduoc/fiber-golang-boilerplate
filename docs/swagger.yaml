@@ -356,6 +356,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Restore a soft-deleted file (admin)

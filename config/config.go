@@ -289,9 +289,23 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("EMAIL_DRIVER must be one of: console, smtp (got %q)", cfg.Email.Driver)
 	}
 
-	// CORS: AllowCredentials with wildcard origin is a spec violation
-	if cfg.CORS.AllowCredentials && cfg.CORS.AllowOrigins == "*" {
-		return fmt.Errorf("CORS_ALLOW_CREDENTIALS cannot be true when CORS_ALLOW_ORIGINS is '*'")
+	// CORS validation. Fiber treats an empty origin list as allow-all and can
+	// panic on malformed origins, so validate explicitly.
+	origins := cfg.CORS.Origins()
+	if len(origins) == 0 {
+		return fmt.Errorf("CORS_ALLOW_ORIGINS must not be empty")
+	}
+	for _, origin := range origins {
+		if origin == "*" {
+			if cfg.CORS.AllowCredentials {
+				return fmt.Errorf("CORS_ALLOW_CREDENTIALS cannot be true when CORS_ALLOW_ORIGINS contains '*'")
+			}
+			continue
+		}
+		u, err := url.Parse(origin)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("CORS_ALLOW_ORIGINS contains invalid origin %q", origin)
+		}
 	}
 
 	// Trusting proxies without an allowlist would let any client spoof
@@ -328,8 +342,8 @@ func (cfg *Config) Validate() error {
 	// Production-only safety rails. These would break local development
 	// defaults, so they are enforced only for the production environment.
 	if cfg.App.Env == "production" {
-		if cfg.App.BodyLimit < int(cfg.Storage.MaxFileSize) {
-			return fmt.Errorf("APP_BODY_LIMIT (%d) must be >= STORAGE_MAX_FILE_SIZE (%d)", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
+		if cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
+			return fmt.Errorf("APP_BODY_LIMIT (%d) must be greater than STORAGE_MAX_FILE_SIZE (%d) to allow multipart framing", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
 		}
 		if len(cfg.Storage.AllowedTypes()) == 0 {
 			return fmt.Errorf("STORAGE_ALLOWED_MIME_TYPES must not be empty in production")
@@ -340,7 +354,7 @@ func (cfg *Config) Validate() error {
 		if cfg.Email.Driver == "smtp" && !cfg.Email.SMTPRequireTLS {
 			return fmt.Errorf("SMTP_REQUIRE_TLS must be true when EMAIL_DRIVER=smtp in production")
 		}
-		for _, origin := range cfg.CORS.Origins() {
+		for _, origin := range origins {
 			if origin == "*" {
 				return fmt.Errorf("CORS_ALLOW_ORIGINS must not contain '*' in production")
 			}

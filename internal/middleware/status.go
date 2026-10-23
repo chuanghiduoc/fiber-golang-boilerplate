@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"errors"
 
 	"github.com/gofiber/fiber/v3"
@@ -15,6 +16,10 @@ import (
 func effectiveStatus(c fiber.Ctx, err error) int {
 	if err == nil {
 		return c.Response().StatusCode()
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fiber.StatusGatewayTimeout
 	}
 
 	var appErr *apperror.AppError

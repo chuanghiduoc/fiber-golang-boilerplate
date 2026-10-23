@@ -63,7 +63,7 @@ func main() {
 		}
 	}
 
-	if cfg.App.Env != "production" && cfg.App.BodyLimit < int(cfg.Storage.MaxFileSize) {
+	if cfg.App.Env != "production" && cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
 		slog.Warn("APP_BODY_LIMIT is smaller than STORAGE_MAX_FILE_SIZE; large uploads will be rejected",
 			slog.Int("body_limit", cfg.App.BodyLimit),
 			slog.Int64("max_file_size", cfg.Storage.MaxFileSize),

@@ -522,7 +522,7 @@ func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]dto.
 func (m *mockAdminService) Download(_ context.Context, id int64) (*dto.FileResponse, io.ReadCloser, error) {
 	for i := range m.files {
 		if m.files[i].ID == id {
-			return &m.files[i], io.NopCloser(bytes.NewReader([]byte("file content"))), nil
+			return &m.files[i], io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(m.files[i].Size)))), nil
 		}
 	}
 	return nil, nil, apperror.NewNotFound("file not found")
@@ -791,7 +791,7 @@ func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*dto.FileR
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
 	return &dto.FileResponse{ID: id, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
-		io.NopCloser(bytes.NewReader([]byte("file content"))), nil
+		io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), 1024))), nil
 }
 
 func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string, _ bool) ([]dto.FileResponse, bool, error) {

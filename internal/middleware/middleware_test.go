@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -443,7 +444,7 @@ func TestMetrics_Passthrough(t *testing.T) {
 
 func TestNewLimiter(t *testing.T) {
 	app := newTestApp()
-	app.Get("/test", NewLimiter(2, 60), func(c fiber.Ctx) error {
+	app.Get("/test", NewLimiter(2, 60, "test"), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -504,7 +505,10 @@ func TestEffectiveStatus(t *testing.T) {
 	if got := effectiveStatus(nil, fiber.NewError(fiber.StatusTeapot, "teapot")); got != fiber.StatusTeapot {
 		t.Errorf("fiber.Error status = %d, want 418", got)
 	}
-	if got := effectiveStatus(nil, context.DeadlineExceeded); got != fiber.StatusInternalServerError {
+	if got := effectiveStatus(nil, context.DeadlineExceeded); got != fiber.StatusGatewayTimeout {
+		t.Errorf("deadline status = %d, want 504", got)
+	}
+	if got := effectiveStatus(nil, errors.New("generic")); got != fiber.StatusInternalServerError {
 		t.Errorf("generic error status = %d, want 500", got)
 	}
 }

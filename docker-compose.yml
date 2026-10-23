@@ -26,7 +26,7 @@ services:
       DB_USERNAME: ${DB_USERNAME:-postgres}
       DB_PASSWORD: ${DB_PASSWORD:-password}
       DB_SCHEMA: ${DB_SCHEMA:-public}
-      DB_SSLMODE: disable
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
       JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-24}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}

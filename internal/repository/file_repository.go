@@ -64,12 +64,12 @@ func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, 
 
 func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error) {
 	return r.q.ListFilesByUserCursor(ctx, sqlc.ListFilesByUserCursorParams{
-		UserID:         userID,
-		IncludeDeleted: includeDeleted,
-		HasCursor:      cur.HasCursor,
+		UserID:          userID,
+		IncludeDeleted:  includeDeleted,
+		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.createdAt(),
-		CursorID:       cur.ID,
-		RowLimit:       cur.Limit,
+		CursorID:        cur.ID,
+		RowLimit:        cur.Limit,
 	})
 }
 

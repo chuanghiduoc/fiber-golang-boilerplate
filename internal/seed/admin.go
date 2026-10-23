@@ -76,6 +76,11 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 	if !errors.Is(err, apperror.ErrNotFound) {
 		return fmt.Errorf("look up admin user: %w", err)
 	}
+	if _, err := userRepo.GetBannedByEmail(ctx, email); err == nil {
+		return fmt.Errorf("ADMIN_EMAIL %q belongs to a banned account", email)
+	} else if !errors.Is(err, apperror.ErrNotFound) {
+		return fmt.Errorf("check banned admin email: %w", err)
+	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(cfg.Password), 12)
 	if err != nil {

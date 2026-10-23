@@ -48,6 +48,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - DSN construction escapes credentials/database names; migrations resolve paths and schemes robustly
 - Server exits non-zero when `Listen` fails; startup is bounded by a timeout; HTTP read/write/idle timeouts are configured
 - Migration 000002 preserves email reuse after soft delete, creates real unique token-per-user indexes, and adds a DB trigger that makes last-admin removal safe under concurrency
+- Migration 000003 adds `banned_at` for installations that already applied 000002; migrations are no longer edited after shipping
+- Rate-limit tiers use separate keyspaces, and cache-backed limiter reads/writes fail open instead of turning a Redis blip into API-wide 500s
+- Console email logs HTML-only messages (reset/verification links), and seeded admins are marked verified
 - S3 downloads stat the object before responding and bound/cancel the stream; missing objects no longer surface after a 200
 - Integration tests can run without Docker via `TEST_DATABASE_URL` using an isolated schema
 - JSON bodies reject unknown fields and trailing values; duplicate emails return 409, oversized uploads 413, and unsupported media 415

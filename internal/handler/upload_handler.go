@@ -144,9 +144,8 @@ func (h *UploadHandler) Download(c fiber.Ctx) error {
 
 	c.Set("Content-Type", file.MimeType)
 	c.Set("Content-Disposition", contentDispositionAttachment(file.OriginalName))
-	c.Set("Content-Length", strconv.FormatInt(file.Size, 10))
 
-	return c.SendStream(reader)
+	return c.SendStream(reader, int(file.Size))
 }
 
 // List godoc

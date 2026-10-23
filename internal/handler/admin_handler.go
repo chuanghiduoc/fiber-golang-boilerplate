@@ -1,8 +1,6 @@
 package handler
 
 import (
-	"strconv"
-
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
@@ -212,8 +210,7 @@ func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
 
 	c.Set("Content-Type", file.MimeType)
 	c.Set("Content-Disposition", contentDispositionAttachment(file.OriginalName))
-	c.Set("Content-Length", strconv.FormatInt(file.Size, 10))
-	return c.SendStream(reader)
+	return c.SendStream(reader, int(file.Size))
 }
 
 // DeleteFile godoc
@@ -251,6 +248,7 @@ func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/files/{id}/restore [post]
 func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
 	id, err := paramID(c, "id")

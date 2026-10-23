@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -25,28 +26,42 @@ func NewLimiterStorage(appCache cache.Cache) fiber.Storage {
 	return &cacheLimiterStorage{cache: appCache}
 }
 
+// Cache failures fail open (skip the limit) rather than turning a cache blip
+// into a 500 for every API request. Login lockout still fails closed in the
+// user service.
 func (s *cacheLimiterStorage) GetWithContext(ctx context.Context, key string) ([]byte, error) {
-	return s.cache.Get(ctx, key)
+	value, err := s.cache.Get(ctx, key)
+	if err != nil {
+		slog.Warn("rate-limit cache read failed; allowing request", slog.Any("error", err))
+		return nil, nil
+	}
+	return value, nil
 }
 
 func (s *cacheLimiterStorage) Get(key string) ([]byte, error) {
-	return s.cache.Get(context.Background(), key)
+	return s.GetWithContext(context.Background(), key)
 }
 
 func (s *cacheLimiterStorage) SetWithContext(ctx context.Context, key string, val []byte, exp time.Duration) error {
-	return s.cache.Set(ctx, key, val, exp)
+	if err := s.cache.Set(ctx, key, val, exp); err != nil {
+		slog.Warn("rate-limit cache write failed; allowing request", slog.Any("error", err))
+	}
+	return nil
 }
 
 func (s *cacheLimiterStorage) Set(key string, val []byte, exp time.Duration) error {
-	return s.cache.Set(context.Background(), key, val, exp)
+	return s.SetWithContext(context.Background(), key, val, exp)
 }
 
 func (s *cacheLimiterStorage) DeleteWithContext(ctx context.Context, key string) error {
-	return s.cache.Delete(ctx, key)
+	if err := s.cache.Delete(ctx, key); err != nil {
+		slog.Warn("rate-limit cache delete failed", slog.Any("error", err))
+	}
+	return nil
 }
 
 func (s *cacheLimiterStorage) Delete(key string) error {
-	return s.cache.Delete(context.Background(), key)
+	return s.DeleteWithContext(context.Background(), key)
 }
 
 // Reset/Close are not used by the limiter at runtime. Scanning and deleting

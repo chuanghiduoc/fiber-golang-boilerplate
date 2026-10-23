@@ -243,6 +243,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
                     }
                 }
             }

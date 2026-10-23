@@ -484,6 +484,10 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("user not found")
 			}
+			var appErr *apperror.AppError
+			if errors.As(err, &appErr) {
+				return err
+			}
 			return apperror.NewInternal("failed to delete user")
 		}
 		// Revoke all refresh tokens so a deleted user's sessions cannot outlive
@@ -557,8 +561,8 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 		return apperror.NewBadRequest("cannot change password for OAuth accounts")
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.CurrentPassword)); err != nil {
-		return apperror.NewBadRequest("current password is incorrect")
+	if err := s.VerifyPassword(ctx, userID, req.CurrentPassword); err != nil {
+		return err
 	}
 	if req.CurrentPassword == req.NewPassword {
 		return apperror.NewBadRequest("new password must be different from the current password")

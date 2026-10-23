@@ -20,11 +20,6 @@ ALTER TABLE users
     ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP WITH TIME ZONE;
 UPDATE users SET password_changed_at = NOW() WHERE password_changed_at IS NULL;
 
--- Distinguish an administrator ban from a self-service account deletion.
--- Banned emails must not be reusable via registration or Google login.
-ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS banned_at TIMESTAMP WITH TIME ZONE;
-
 -- Backfill timestamps before tightening NOT NULL constraints.
 UPDATE users SET created_at = NOW() WHERE created_at IS NULL;
 UPDATE users SET updated_at = NOW() WHERE updated_at IS NULL;

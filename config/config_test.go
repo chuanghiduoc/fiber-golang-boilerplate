@@ -100,6 +100,7 @@ func baseValidConfig() Config {
 		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		CORS:      CORSConfig{AllowOrigins: "*"},
 		Cache:     CacheConfig{Driver: "memory"},
 		Email:     EmailConfig{Driver: "console"},
 	}
@@ -363,6 +364,8 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 			c.JWT.Secret = "your-super-secret-key-change-in-production"
 		}},
 		{"db ssl disabled", func(c *Config) { c.DB.SSLMode = "disable" }},
+		{"empty cors origins", func(c *Config) { c.CORS.AllowOrigins = "" }},
+		{"malformed cors origin", func(c *Config) { c.CORS.AllowOrigins = "not-a-url" }},
 	}
 
 	for _, tt := range tests {

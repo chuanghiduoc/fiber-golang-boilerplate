@@ -115,6 +115,10 @@ func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("user not found")
 		}
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) {
+			return nil, err
+		}
 		return nil, apperror.NewInternal("failed to update user role")
 	}
 
@@ -147,6 +151,10 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("user not found or already banned")
+			}
+			var appErr *apperror.AppError
+			if errors.As(err, &appErr) {
+				return err
 			}
 			return apperror.NewInternal("failed to ban user")
 		}
