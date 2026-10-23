@@ -97,7 +97,10 @@ Offset helpers are for small admin/export tables only.
   version-bound. `pkg/token` pins HS256 and requires `exp`.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
-  work; a worker retries with backoff and dead-letters after `max_attempts`.
+  work; password-reset and verification tokens are committed with their
+  `email.send` job in one transaction (`QueuedSender.SendTx`), so an enqueue
+  failure rolls the token back. A worker retries with backoff and dead-letters
+  after `max_attempts`.
   Claim errors are retried in-process with backoff capped at 30s. Handlers have
   a 10m default timeout (`WithJobTimeout`, non-positive disables it), and
   unknown kinds retry until `max_attempts` before dead-lettering. Heartbeats

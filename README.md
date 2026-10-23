@@ -250,7 +250,9 @@ make watch                        # Live reload with Air
 runs through it. Delivery is **at-least-once**, not exactly-once: a handler can
 run again after a retry, panic, or lease expiry, so handlers must be idempotent
 and safe to retry. Use `Queue.EnqueueTx` when a job must commit atomically with
-the business transaction that produced it.
+the business transaction that produced it. Password-reset and email-verification
+services already do this: the token row and the `email.send` job share one
+transaction, so a crash cannot leave a usable link without a queued email.
 
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
