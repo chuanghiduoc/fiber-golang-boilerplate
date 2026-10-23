@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -659,10 +659,13 @@ func TestWorkerOptions(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, worker.leaseDuration)
 }
 
-// metricValue reads a Prometheus counter's current value.
+// metricValue reads a Prometheus counter's current value without pulling in
+// prometheus/testutil (and its test-only dependencies).
 func metricValue(t *testing.T, counter prometheus.Counter) float64 {
 	t.Helper()
-	return testutil.ToFloat64(counter)
+	var m dto.Metric
+	require.NoError(t, counter.Write(&m))
+	return m.GetCounter().GetValue()
 }
 
 // TestWorkerMetrics checks that the job lifecycle counters move exactly once

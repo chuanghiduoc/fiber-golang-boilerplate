@@ -7,7 +7,8 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -65,8 +66,15 @@ func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {
 	assert.Empty(t, recorder.events)
 }
 
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, counter.Write(&m))
+	return m.GetCounter().GetValue()
+}
+
 func TestMiddleware_CountsAuditWriteFailures(t *testing.T) {
-	before := testutil.ToFloat64(metrics.AuditWriteFailuresTotal)
+	before := counterValue(t, metrics.AuditWriteFailuresTotal)
 
 	recorder := &recordingRecorder{err: errors.New("database unavailable")}
 	app := fiber.New()
@@ -80,6 +88,6 @@ func TestMiddleware_CountsAuditWriteFailures(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 
-	assert.Equal(t, before+1, testutil.ToFloat64(metrics.AuditWriteFailuresTotal),
+	assert.Equal(t, before+1, counterValue(t, metrics.AuditWriteFailuresTotal),
 		"a failed audit write must increment audit_write_failures_total")
 }
