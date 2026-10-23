@@ -1,20 +1,29 @@
 package handler
 
 import (
+	"context"
+	"strings"
+
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
 type UserHandler struct {
-	service service.UserService
+	service       service.UserService
+	emailVerifSvc service.EmailVerificationService
 }
 
-func NewUserHandler(svc service.UserService) *UserHandler {
-	return &UserHandler{service: svc}
+func NewUserHandler(svc service.UserService, emailVerif ...service.EmailVerificationService) *UserHandler {
+	h := &UserHandler{service: svc}
+	if len(emailVerif) > 0 {
+		h.emailVerifSvc = emailVerif[0]
+	}
+	return h
 }
 
 // GetMe godoc
@@ -45,6 +54,7 @@ func (h *UserHandler) GetMe(c fiber.Ctx) error {
 // @Success 200 {object} dto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /users/{id} [get]
 func (h *UserHandler) GetByID(c fiber.Ctx) error {
@@ -56,6 +66,12 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 	user, err := h.service.GetByID(c.Context(), id)
 	if err != nil {
 		return err
+	}
+
+	// Only the account owner or an admin may read a profile (it contains PII
+	// such as the email address and role).
+	if id != authUserID(c) && authRole(c) != dto.RoleAdmin {
+		return apperror.NewForbidden("you can only view your own profile")
 	}
 
 	return response.Success(c, user)
@@ -72,6 +88,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 // @Success 200 {object} response.ListResponse{data=[]dto.UserResponse}
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
 // @Router /users [get]
 func (h *UserHandler) List(c fiber.Ctx) error {
 	limit, startingAfter, err := cursorQuery(c)
@@ -84,7 +101,7 @@ func (h *UserHandler) List(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore)
+	return response.List(c, users, hasMore, nextUserCursor(users))
 }
 
 // UpdateMe godoc
@@ -105,10 +122,15 @@ func (h *UserHandler) UpdateMe(c fiber.Ctx) error {
 		return err
 	}
 
+	if err := h.requirePasswordForEmailChange(c, authUserID(c), req); err != nil {
+		return err
+	}
+
 	user, err := h.service.Update(c.Context(), authUserID(c), req)
 	if err != nil {
 		return err
 	}
+	h.sendVerificationAfterEmailChange(c.Context(), user, req)
 
 	return response.Success(c, user)
 }
@@ -144,12 +166,59 @@ func (h *UserHandler) Update(c fiber.Ctx) error {
 		return err
 	}
 
+	if id == authUserID(c) {
+		if err := h.requirePasswordForEmailChange(c, id, req); err != nil {
+			return err
+		}
+	}
+
 	user, err := h.service.Update(c.Context(), id, req)
 	if err != nil {
 		return err
 	}
+	h.sendVerificationAfterEmailChange(c.Context(), user, req)
 
 	return response.Success(c, user)
+}
+
+// requirePasswordForEmailChange forces a re-authentication step before a user
+// can move their account to a different address. Without it, a stolen access
+// token is enough to redirect a password-reset email to the attacker.
+func (h *UserHandler) requirePasswordForEmailChange(c fiber.Ctx, userID int64, req dto.UpdateUserRequest) error {
+	if req.Email == nil {
+		return nil
+	}
+
+	current, err := h.service.GetByID(c.Context(), userID)
+	if err != nil {
+		return err
+	}
+	// A full-resource PUT often echoes the existing email; that is not an
+	// identity change and must not demand re-authentication.
+	if strings.EqualFold(strings.TrimSpace(*req.Email), current.Email) {
+		return nil
+	}
+	if !current.HasPassword {
+		return apperror.NewBadRequest("email changes are not available for passwordless accounts")
+	}
+	if req.CurrentPassword == nil || *req.CurrentPassword == "" {
+		return apperror.NewBadRequest("currentPassword is required to change email")
+	}
+	return h.service.VerifyPassword(c.Context(), userID, *req.CurrentPassword)
+}
+
+// sendVerificationAfterEmailChange invalidates tokens sent to the old address
+// and sends a fresh verification link to the new one.
+func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, user *dto.UserResponse, req dto.UpdateUserRequest) {
+	if req.Email == nil || user.EmailVerified || h.emailVerifSvc == nil {
+		return
+	}
+	if err := h.emailVerifSvc.Invalidate(ctx, user.ID); err != nil {
+		return
+	}
+	async.Go(func() {
+		_ = h.emailVerifSvc.SendVerification(context.Background(), user.ID, user.Email)
+	})
 }
 
 // ChangePassword godoc

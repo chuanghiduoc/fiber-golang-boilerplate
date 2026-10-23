@@ -22,6 +22,7 @@ func RegisterV1Routes(v1 fiber.Router, deps Deps) {
 	auth.Post("/login", strictLimiter, deps.AuthHandler.Login)
 	auth.Post("/refresh", normalLimiter, deps.AuthHandler.Refresh)
 	auth.Post("/logout", normalLimiter, deps.AuthHandler.Logout)
+	auth.Post("/logout-all", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions), normalLimiter, deps.AuthHandler.LogoutAll)
 	auth.Post("/forgot-password", strictLimiter, deps.AuthHandler.ForgotPassword)
 	auth.Post("/reset-password", strictLimiter, deps.AuthHandler.ResetPassword)
 	auth.Post("/verify-email", normalLimiter, deps.AuthHandler.VerifyEmail)
@@ -30,7 +31,7 @@ func RegisterV1Routes(v1 fiber.Router, deps Deps) {
 	auth.Get("/google/callback", normalLimiter, deps.AuthHandler.GoogleCallback)
 
 	// User routes (protected)
-	users := v1.Group("/users", middleware.JWTAuth(cfg.JWT.Secret))
+	users := v1.Group("/users", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
 	users.Get("/me", relaxedLimiter, deps.UserHandler.GetMe)
 	users.Put("/me", normalLimiter, deps.UserHandler.UpdateMe)
 	users.Put("/me/password", normalLimiter, deps.UserHandler.ChangePassword)
@@ -40,16 +41,17 @@ func RegisterV1Routes(v1 fiber.Router, deps Deps) {
 	users.Delete("/:id", normalLimiter, deps.UserHandler.Delete)
 
 	// File routes (protected)
-	files := v1.Group("/files", middleware.JWTAuth(cfg.JWT.Secret))
+	files := v1.Group("/files", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
 	files.Post("/upload", normalLimiter, deps.UploadHandler.Upload)
 	files.Get("/", relaxedLimiter, deps.UploadHandler.List)
-	files.Get("/:id", relaxedLimiter, deps.UploadHandler.GetInfo)
 	files.Get("/:id/download", relaxedLimiter, deps.UploadHandler.Download)
+	files.Get("/:id", relaxedLimiter, deps.UploadHandler.GetInfo)
 	files.Delete("/:id", normalLimiter, deps.UploadHandler.Delete)
+	files.Post("/:id/restore", normalLimiter, deps.UploadHandler.Restore)
 
 	// Admin routes (protected, admin-only)
 	admin := v1.Group("/admin",
-		middleware.JWTAuth(cfg.JWT.Secret),
+		middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions),
 		middleware.RequireRole(dto.RoleAdmin),
 		normalLimiter,
 	)
@@ -59,4 +61,7 @@ func RegisterV1Routes(v1 fiber.Router, deps Deps) {
 	admin.Post("/users/:id/ban", deps.AdminHandler.BanUser)
 	admin.Post("/users/:id/unban", deps.AdminHandler.UnbanUser)
 	admin.Get("/files", deps.AdminHandler.ListFiles)
+	admin.Get("/files/:id/download", deps.AdminHandler.DownloadFile)
+	admin.Delete("/files/:id", deps.AdminHandler.DeleteFile)
+	admin.Post("/files/:id/restore", deps.AdminHandler.RestoreFile)
 }

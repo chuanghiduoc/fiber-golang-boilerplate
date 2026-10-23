@@ -82,6 +82,171 @@ const docTemplate = `{
                 }
             }
         },
+        "/admin/files/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Soft-delete a file by ID regardless of owner",
+                "tags": [
+                    "Admin"
+                ],
+                "summary": "Soft-delete any file (admin)",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "File ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/files/{id}/download": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Download an active file by ID",
+                "produces": [
+                    "application/octet-stream"
+                ],
+                "tags": [
+                    "Admin"
+                ],
+                "summary": "Download any file (admin)",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "File ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/files/{id}/restore": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Restore any file by ID",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin"
+                ],
+                "summary": "Restore a soft-deleted file (admin)",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "File ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.FileResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/stats": {
             "get": {
                 "security": [
@@ -237,6 +402,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
                     }
                 }
             }
@@ -307,6 +478,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
                     }
                 }
             }
@@ -362,6 +539,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -597,6 +780,37 @@ const docTemplate = `{
                     },
                     "429": {
                         "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/logout-all": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Revoke every refresh token for the authenticated user",
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Revoke all refresh tokens",
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -913,6 +1127,12 @@ const docTemplate = `{
                         "description": "Cursor from the last item of the previous page",
                         "name": "startingAfter",
                         "in": "query"
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Include soft-deleted files (trash)",
+                        "name": "includeDeleted",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -998,6 +1218,18 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "415": {
+                        "description": "Unsupported Media Type",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
                         "schema": {
@@ -1046,6 +1278,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1149,8 +1387,78 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/files/{id}/restore": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Restore a file owned by the authenticated user",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Files"
+                ],
+                "summary": "Restore a soft-deleted file",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "File ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.FileResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1218,6 +1526,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1404,6 +1718,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1630,6 +1950,9 @@ const docTemplate = `{
                 "createdAt": {
                     "type": "string"
                 },
+                "deletedAt": {
+                    "type": "string"
+                },
                 "id": {
                     "type": "integer"
                 },
@@ -1644,6 +1967,9 @@ const docTemplate = `{
                 },
                 "url": {
                     "type": "string"
+                },
+                "userId": {
+                    "type": "integer"
                 }
             }
         },
@@ -1654,7 +1980,8 @@ const docTemplate = `{
             ],
             "properties": {
                 "email": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 255
                 }
             }
         },
@@ -1666,7 +1993,8 @@ const docTemplate = `{
             ],
             "properties": {
                 "email": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 255
                 },
                 "password": {
                     "type": "string"
@@ -1694,7 +2022,8 @@ const docTemplate = `{
             ],
             "properties": {
                 "refreshToken": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 256
                 }
             }
         },
@@ -1707,10 +2036,12 @@ const docTemplate = `{
             ],
             "properties": {
                 "email": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 255
                 },
                 "name": {
                     "type": "string",
+                    "maxLength": 255,
                     "minLength": 2
                 },
                 "password": {
@@ -1725,7 +2056,8 @@ const docTemplate = `{
             ],
             "properties": {
                 "email": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 255
                 }
             }
         },
@@ -1740,7 +2072,8 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "token": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 256
                 }
             }
         },
@@ -1762,11 +2095,17 @@ const docTemplate = `{
         "dto.UpdateUserRequest": {
             "type": "object",
             "properties": {
-                "email": {
+                "currentPassword": {
+                    "description": "CurrentPassword is required when a non-admin changes their own email.",
                     "type": "string"
+                },
+                "email": {
+                    "type": "string",
+                    "maxLength": 255
                 },
                 "name": {
                     "type": "string",
+                    "maxLength": 255,
                     "minLength": 2
                 }
             }
@@ -1777,10 +2116,16 @@ const docTemplate = `{
                 "createdAt": {
                     "type": "string"
                 },
+                "deletedAt": {
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
                 "emailVerified": {
+                    "type": "boolean"
+                },
+                "hasPassword": {
                     "type": "boolean"
                 },
                 "id": {
@@ -1804,7 +2149,8 @@ const docTemplate = `{
             ],
             "properties": {
                 "token": {
-                    "type": "string"
+                    "type": "string",
+                    "maxLength": 256
                 }
             }
         },
@@ -1814,6 +2160,9 @@ const docTemplate = `{
                 "data": {},
                 "hasMore": {
                     "type": "boolean"
+                },
+                "nextCursor": {
+                    "type": "string"
                 },
                 "object": {
                     "type": "string"

@@ -2,6 +2,9 @@ package config
 
 import (
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/caarlos0/env/v11"
@@ -27,9 +30,11 @@ type AdminConfig struct {
 }
 
 type AppConfig struct {
-	Port                     int    `env:"APP_PORT" envDefault:"8080"`
-	Env                      string `env:"APP_ENV" envDefault:"local"`
-	BodyLimit                int    `env:"APP_BODY_LIMIT" envDefault:"4194304"` // 4MB
+	Port int    `env:"APP_PORT" envDefault:"8080"`
+	Env  string `env:"APP_ENV" envDefault:"local"`
+	// BodyLimit must be larger than STORAGE_MAX_FILE_SIZE because multipart
+	// framing adds overhead before the upload handler sees the file.
+	BodyLimit                int    `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
 	LogLevel                 string `env:"LOG_LEVEL" envDefault:"info"`
 	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"30"` // seconds
 	FrontendURL              string `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
@@ -71,14 +76,15 @@ type RateLimitConfig struct {
 type DBConfig struct {
 	Host            string `env:"DB_HOST" envDefault:"localhost"`
 	Port            int    `env:"DB_PORT" envDefault:"5432"`
-	Database        string `env:"DB_DATABASE" envDefault:"fiber_app"`
+	Database        string `env:"DB_DATABASE" envDefault:"boilerplate"`
 	Username        string `env:"DB_USERNAME" envDefault:"postgres"`
 	Password        string `env:"DB_PASSWORD" envDefault:"postgres"`
 	Schema          string `env:"DB_SCHEMA" envDefault:"public"`
 	SSLMode         string `env:"DB_SSLMODE" envDefault:"disable"`
+	ConnectTimeout  int    `env:"DB_CONNECT_TIMEOUT" envDefault:"10"` // seconds
 	MaxConns        int32  `env:"DB_MAX_CONNS" envDefault:"25"`
 	MinConns        int32  `env:"DB_MIN_CONNS" envDefault:"5"`
-	MaxConnLifetime int    `env:"DB_MAX_CONN_LIFETIME" envDefault:"3600"`   // seconds
+	MaxConnLifetime int    `env:"DB_MAX_CONN_LIFETIME" envDefault:"3600"` // seconds
 	MaxConnIdleTime int    `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"300"` // seconds
 }
 
@@ -160,10 +166,18 @@ func (c CORSConfig) Headers() []string {
 }
 
 func (db DBConfig) DSN() string {
-	return fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?sslmode=%s&search_path=%s",
-		db.Username, db.Password, db.Host, db.Port, db.Database, db.SSLMode, db.Schema,
-	)
+	q := url.Values{}
+	q.Set("sslmode", db.SSLMode)
+	q.Set("search_path", db.Schema)
+
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(db.Username, db.Password),
+		Host:     net.JoinHostPort(db.Host, strconv.Itoa(db.Port)),
+		Path:     "/" + db.Database,
+		RawQuery: q.Encode(),
+	}
+	return u.String()
 }
 
 func Load() (*Config, error) {
@@ -181,6 +195,20 @@ func (cfg *Config) Validate() error {
 	if cfg.App.Port < 1 || cfg.App.Port > 65535 {
 		return fmt.Errorf("APP_PORT must be between 1 and 65535")
 	}
+	switch cfg.App.Env {
+	case "local", "test", "development", "staging", "production":
+	default:
+		return fmt.Errorf("APP_ENV must be one of: local, test, development, staging, production (got %q)", cfg.App.Env)
+	}
+	if cfg.App.RequestTimeout < 1 {
+		return fmt.Errorf("APP_REQUEST_TIMEOUT must be at least 1 second")
+	}
+	if cfg.App.FrontendURL != "" {
+		u, err := url.Parse(cfg.App.FrontendURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("APP_FRONTEND_URL must be an absolute http(s) URL")
+		}
+	}
 
 	// JWT validation
 	if cfg.App.Env != "local" && cfg.App.Env != "test" {
@@ -193,6 +221,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.JWT.ExpireHour < 1 {
 		return fmt.Errorf("JWT_EXPIRE_HOUR must be at least 1")
+	}
+	if cfg.JWT.RefreshExpireDays < 1 {
+		return fmt.Errorf("JWT_REFRESH_EXPIRE_DAYS must be at least 1")
 	}
 
 	if cfg.App.BodyLimit < 1 {
@@ -209,6 +240,9 @@ func (cfg *Config) Validate() error {
 	}
 
 	// Database pool validation
+	if cfg.DB.ConnectTimeout < 1 {
+		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1 second")
+	}
 	if cfg.DB.MaxConns < 1 {
 		return fmt.Errorf("DB_MAX_CONNS must be at least 1")
 	}
@@ -278,6 +312,56 @@ func (cfg *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("STORAGE_DRIVER must be one of: local, s3, minio (got %q)", cfg.Storage.Driver)
+	}
+
+	// Production-only safety rails. These would break local development
+	// defaults, so they are enforced only for the production environment.
+	if cfg.App.Env == "production" {
+		if cfg.App.BodyLimit < int(cfg.Storage.MaxFileSize) {
+			return fmt.Errorf("APP_BODY_LIMIT (%d) must be >= STORAGE_MAX_FILE_SIZE (%d)", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
+		}
+		if len(cfg.Storage.AllowedTypes()) == 0 {
+			return fmt.Errorf("STORAGE_ALLOWED_MIME_TYPES must not be empty in production")
+		}
+		if cfg.Email.Driver == "console" {
+			return fmt.Errorf("EMAIL_DRIVER=console must not be used in production")
+		}
+		if cfg.Email.Driver == "smtp" && !cfg.Email.SMTPRequireTLS {
+			return fmt.Errorf("SMTP_REQUIRE_TLS must be true when EMAIL_DRIVER=smtp in production")
+		}
+		for _, origin := range cfg.CORS.Origins() {
+			if origin == "*" {
+				return fmt.Errorf("CORS_ALLOW_ORIGINS must not contain '*' in production")
+			}
+		}
+		if u, err := url.Parse(cfg.App.FrontendURL); err != nil || u.Scheme != "https" {
+			return fmt.Errorf("APP_FRONTEND_URL must use https in production")
+		}
+		if cfg.JWT.Secret == "your-super-secret-key-change-in-production" {
+			return fmt.Errorf("JWT_SECRET is a known default; generate one with `openssl rand -hex 32`")
+		}
+		if cfg.OAuth.GoogleClientID != "" {
+			if u, err := url.Parse(cfg.OAuth.FrontendURL); err != nil || u.Scheme != "https" {
+				return fmt.Errorf("OAUTH_FRONTEND_URL must use https in production")
+			}
+			if u, err := url.Parse(cfg.OAuth.GoogleRedirectURL); err != nil || u.Scheme != "https" {
+				return fmt.Errorf("GOOGLE_REDIRECT_URL must use https in production")
+			}
+		}
+		if cfg.App.MetricsAuthToken == "" {
+			return fmt.Errorf("METRICS_AUTH_TOKEN must be set in production")
+		}
+		if len(cfg.App.MetricsAuthToken) < 16 {
+			return fmt.Errorf("METRICS_AUTH_TOKEN must be at least 16 characters")
+		}
+		if cfg.Admin.Email != "" || cfg.Admin.Password != "" {
+			if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
+				return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set together")
+			}
+			if len(cfg.Admin.Password) < 12 || cfg.Admin.Password == "Admin123!" {
+				return fmt.Errorf("ADMIN_PASSWORD is too weak for production")
+			}
+		}
 	}
 	return nil
 }

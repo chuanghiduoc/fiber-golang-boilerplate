@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
@@ -365,8 +366,8 @@ func TestDelete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		if len(repo.users) != 0 {
-			t.Error("expected user to be removed from repo")
+		if _, ok := repo.users[1]; !ok || !repo.users[1].DeletedAt.Valid {
+			t.Error("expected user to be soft-deleted")
 		}
 	})
 
@@ -506,6 +507,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo.users[1] = &sqlc.User{
 			ID: 1, Email: "existing@example.com", Name: "Existing",
 			AuthProvider: "local", Role: "user",
+			EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		}
 		repo.nextID = 2
 

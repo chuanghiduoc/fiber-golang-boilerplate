@@ -80,7 +80,7 @@ func resolveExistingPrefix(fullPath string) (string, error) {
 	}
 }
 
-func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, _ int64, _ string) error {
+func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, size int64, _ string) error {
 	fullPath, err := s.safePath(path)
 	if err != nil {
 		return err
@@ -91,14 +91,39 @@ func (s *LocalStorage) Put(_ context.Context, path string, reader io.Reader, _ i
 		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	f, err := os.Create(fullPath)
+	// Write to a temporary file and rename only after the full content has
+	// been flushed. A failed/truncated upload must never leave a partial blob
+	// at the final path.
+	f, err := os.CreateTemp(dir, ".upload-*")
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		return fmt.Errorf("failed to create temporary file: %w", err)
 	}
-	defer func() { _ = f.Close() }()
+	tmpName := f.Name()
+	cleanup := func() {
+		_ = f.Close()
+		_ = os.Remove(tmpName)
+	}
 
-	if _, err := io.Copy(f, reader); err != nil {
+	written, err := io.Copy(f, reader)
+	if err != nil {
+		cleanup()
 		return fmt.Errorf("failed to write file: %w", err)
+	}
+	if size >= 0 && written != size {
+		cleanup()
+		return fmt.Errorf("file size mismatch: expected %d bytes, wrote %d", size, written)
+	}
+	if err := f.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("failed to flush file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+	if err := os.Rename(tmpName, fullPath); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("failed to commit file: %w", err)
 	}
 
 	return nil

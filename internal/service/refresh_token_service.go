@@ -16,9 +16,13 @@ import (
 )
 
 type RefreshTokenService interface {
-	Create(ctx context.Context, userID int64) (string, error)
+	Create(ctx context.Context, userID int64, tokenVersion int32) (string, error)
 	// Verify validates the token and returns the associated user ID.
 	Verify(ctx context.Context, token string) (int64, error)
+	// Consume atomically validates and deletes a refresh token. Exactly one
+	// concurrent caller can succeed, which prevents replay/rotation races. The
+	// returned token version must match the user's current version.
+	Consume(ctx context.Context, token string) (userID int64, tokenVersion int32, err error)
 	Revoke(ctx context.Context, token string) error
 	RevokeAllByUserID(ctx context.Context, userID int64) error
 }
@@ -37,7 +41,7 @@ func hashToken(token string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (s *refreshTokenService) Create(ctx context.Context, userID int64) (string, error) {
+func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVersion int32) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", apperror.NewInternal("failed to generate refresh token")
@@ -47,11 +51,15 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64) (string,
 	expiresAt := time.Now().Add(time.Duration(s.expireDays) * 24 * time.Hour)
 
 	_, err := s.repo.Create(ctx, sqlc.CreateRefreshTokenParams{
-		UserID:    userID,
-		Token:     hashToken(plainToken), // Store hash, not plaintext
-		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		UserID:       userID,
+		Token:        hashToken(plainToken), // Store hash, not plaintext
+		ExpiresAt:    pgtype.Timestamptz{Time: expiresAt, Valid: true},
+		TokenVersion: tokenVersion,
 	})
 	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return "", apperror.NewUnauthorized("account is not active")
+		}
 		return "", apperror.NewInternal("failed to store refresh token")
 	}
 
@@ -73,6 +81,22 @@ func (s *refreshTokenService) Verify(ctx context.Context, token string) (int64, 
 	}
 
 	return rt.UserID, nil
+}
+
+// Consume removes the token in the same statement that reads it. A replay
+// attempt sees ErrNotFound and is rejected, even if two requests race.
+func (s *refreshTokenService) Consume(ctx context.Context, token string) (userID int64, tokenVersion int32, err error) {
+	rt, err := s.repo.Consume(ctx, hashToken(token))
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return 0, 0, apperror.NewUnauthorized("invalid refresh token")
+		}
+		return 0, 0, apperror.NewInternal("failed to consume refresh token")
+	}
+	if rt.ExpiresAt.Time.Before(time.Now()) {
+		return 0, 0, apperror.NewUnauthorized("refresh token expired")
+	}
+	return rt.UserID, rt.TokenVersion, nil
 }
 
 func (s *refreshTokenService) Revoke(ctx context.Context, token string) error {

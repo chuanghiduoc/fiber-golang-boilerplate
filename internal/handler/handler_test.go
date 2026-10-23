@@ -21,13 +21,14 @@ import (
 
 // mockUserService is a manual mock for testing handlers.
 type mockUserService struct {
-	users map[int64]*dto.UserResponse
+	users   map[int64]*dto.UserResponse
+	hasMore bool
 }
 
 func newMockService() *mockUserService {
 	return &mockUserService{
 		users: map[int64]*dto.UserResponse{
-			1: {ID: 1, Email: "test@example.com", Name: "Test User", Role: "user"},
+			1: {ID: 1, Email: "test@example.com", Name: "Test User", Role: "user", HasPassword: true},
 		},
 	}
 }
@@ -56,7 +57,7 @@ func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]dto.UserRe
 	for _, u := range m.users {
 		users = append(users, *u)
 	}
-	return users, false, nil
+	return users, m.hasMore, nil
 }
 
 func (m *mockUserService) Update(_ context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
@@ -86,10 +87,17 @@ func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.Chang
 	return nil
 }
 
+func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password string) error {
+	if password == "Password1!" {
+		return nil
+	}
+	return apperror.NewBadRequest("current password is incorrect")
+}
+
 // mockRefreshTokenService is a manual mock for testing handlers.
 type mockRefreshTokenService struct{}
 
-func (m *mockRefreshTokenService) Create(_ context.Context, _ int64) (string, error) {
+func (m *mockRefreshTokenService) Create(_ context.Context, _ int64, _ int32) (string, error) {
 	return "mock-refresh-token", nil
 }
 
@@ -98,6 +106,11 @@ func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (in
 		return 1, nil
 	}
 	return 0, apperror.NewUnauthorized("invalid refresh token")
+}
+
+func (m *mockRefreshTokenService) Consume(_ context.Context, tokenStr string) (userID int64, tokenVersion int32, err error) {
+	userID, err = m.Verify(context.Background(), tokenStr)
+	return userID, 0, err
 }
 
 func (m *mockRefreshTokenService) Revoke(_ context.Context, _ string) error {
@@ -134,6 +147,10 @@ func (m *mockEmailVerificationService) ResendVerification(_ context.Context, _ s
 	return nil
 }
 
+func (m *mockEmailVerificationService) Invalidate(_ context.Context, _ int64) error {
+	return nil
+}
+
 func setupApp(svc *mockUserService) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: apperror.FiberErrorHandler,
@@ -142,13 +159,14 @@ func setupApp(svc *mockUserService) *fiber.App {
 	refreshSvc := &mockRefreshTokenService{}
 	resetSvc := &mockPasswordResetService{}
 	emailVerifSvc := &mockEmailVerificationService{}
-	authHandler := NewAuthHandler(svc, refreshSvc, resetSvc, emailVerifSvc, "test-secret", 24, nil)
+	authHandler := NewAuthHandler(svc, refreshSvc, resetSvc, emailVerifSvc, "test-secret", 24, false, nil)
 	userHandler := NewUserHandler(svc)
 
 	app.Post("/auth/register", authHandler.Register)
 	app.Post("/auth/login", authHandler.Login)
 	app.Post("/auth/refresh", authHandler.Refresh)
 	app.Post("/auth/logout", authHandler.Logout)
+	app.Post("/auth/logout-all", middleware.JWTAuth("test-secret"), authHandler.LogoutAll)
 	app.Post("/auth/forgot-password", authHandler.ForgotPassword)
 	app.Post("/auth/reset-password", authHandler.ResetPassword)
 	app.Post("/auth/verify-email", authHandler.VerifyEmail)
@@ -497,6 +515,33 @@ func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]dto.
 	return m.files, false, nil
 }
 
+func (m *mockAdminService) Download(_ context.Context, id int64) (*dto.FileResponse, io.ReadCloser, error) {
+	for i := range m.files {
+		if m.files[i].ID == id {
+			return &m.files[i], io.NopCloser(bytes.NewReader([]byte("file content"))), nil
+		}
+	}
+	return nil, nil, apperror.NewNotFound("file not found")
+}
+
+func (m *mockAdminService) DeleteFile(_ context.Context, id int64) error {
+	for i := range m.files {
+		if m.files[i].ID == id {
+			return nil
+		}
+	}
+	return apperror.NewNotFound("file not found")
+}
+
+func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (*dto.FileResponse, error) {
+	for i := range m.files {
+		if m.files[i].ID == id {
+			return &m.files[i], nil
+		}
+	}
+	return nil, apperror.NewNotFound("file not found or not deleted")
+}
+
 func (m *mockAdminService) GetStats(_ context.Context) (*dto.AdminStatsResponse, error) {
 	return m.stats, nil
 }
@@ -516,12 +561,17 @@ func setupAdminApp() *fiber.App {
 	admin.Post("/users/:id/ban", adminHandler.BanUser)
 	admin.Post("/users/:id/unban", adminHandler.UnbanUser)
 	admin.Get("/files", adminHandler.ListFiles)
+	admin.Get("/files/:id/download", adminHandler.DownloadFile)
+	admin.Delete("/files/:id", adminHandler.DeleteFile)
+	admin.Post("/files/:id/restore", adminHandler.RestoreFile)
 
 	return app
 }
 
 func adminToken() string {
-	t, _ := token.Generate(1, "admin@example.com", "admin", "test-secret", 24)
+	// Use an ID distinct from the users under test so self-protection guards
+	// do not turn legitimate admin actions into 400s.
+	t, _ := token.Generate(99, "admin@example.com", "admin", "test-secret", 24)
 	return t
 }
 
@@ -740,7 +790,7 @@ func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*dto.FileR
 		io.NopCloser(bytes.NewReader([]byte("file content"))), nil
 }
 
-func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string) ([]dto.FileResponse, bool, error) {
+func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string, _ bool) ([]dto.FileResponse, bool, error) {
 	files := make([]dto.FileResponse, 0, len(m.files))
 	for _, f := range m.files {
 		files = append(files, *f)
@@ -756,6 +806,14 @@ func (m *mockUploadService) Delete(_ context.Context, id, _ int64) error {
 	return nil
 }
 
+func (m *mockUploadService) Restore(_ context.Context, id, _ int64) (*dto.FileResponse, error) {
+	f, ok := m.files[id]
+	if !ok {
+		return nil, apperror.NewNotFound("file not found")
+	}
+	return f, nil
+}
+
 func setupUploadApp() *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: apperror.FiberErrorHandler,
@@ -769,6 +827,7 @@ func setupUploadApp() *fiber.App {
 	files.Get("/:id", uploadHandler.GetInfo)
 	files.Get("/:id/download", uploadHandler.Download)
 	files.Delete("/:id", uploadHandler.Delete)
+	files.Post("/:id/restore", uploadHandler.Restore)
 
 	return app
 }
@@ -1088,7 +1147,7 @@ func TestUploadHandler_Upload_DisallowedMIME(t *testing.T) {
 
 	resp, err := app.Test(req)
 	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, fiber.StatusUnsupportedMediaType, resp.StatusCode)
 }
 
 // ---------------------------------------------------------------------------

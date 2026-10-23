@@ -11,10 +11,29 @@ type contextKey string
 
 const RequestIDKey contextKey = "request_id"
 
+// validRequestID accepts a bounded, log-safe correlation ID from an upstream
+// proxy. Arbitrary client headers are never echoed into logs/responses.
+func validRequestID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func RequestID() fiber.Handler {
 	return func(c fiber.Ctx) error {
 		requestID := c.Get("X-Request-Id")
-		if requestID == "" {
+		if !validRequestID(requestID) {
 			requestID = uuid.New().String()
 		}
 

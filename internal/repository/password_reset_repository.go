@@ -10,6 +10,7 @@ type PasswordResetRepository interface {
 	Create(ctx context.Context, params sqlc.CreatePasswordResetTokenParams) (*sqlc.PasswordResetToken, error)
 	GetByToken(ctx context.Context, token string) (*sqlc.PasswordResetToken, error)
 	GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error)
+	Consume(ctx context.Context, token string) (*sqlc.PasswordResetToken, error)
 	Delete(ctx context.Context, token string) error
 	DeleteByUserID(ctx context.Context, userID int64) error
 }
@@ -40,6 +41,14 @@ func (r *passwordResetRepository) GetByToken(ctx context.Context, token string) 
 
 func (r *passwordResetRepository) GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
 	rt, err := r.q.GetPasswordResetTokenByTokenForUpdate(ctx, token)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &rt, nil
+}
+
+func (r *passwordResetRepository) Consume(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
+	rt, err := r.q.ConsumePasswordResetToken(ctx, token)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

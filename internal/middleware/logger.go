@@ -2,10 +2,37 @@ package middleware
 
 import (
 	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 )
+
+// sensitiveQueryKeys are redacted before a request URL is written to logs.
+// OAuth callbacks and future token-in-query flows must not leak credentials
+// into centralized logging.
+func sensitiveQueryKey(key string) bool {
+	k := strings.ToLower(key)
+	return k == "code" || k == "state" || k == "password" ||
+		strings.Contains(k, "token") || strings.Contains(k, "secret")
+}
+
+func redactQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "[unparseable]"
+	}
+	for key := range values {
+		if sensitiveQueryKey(key) {
+			values.Set(key, "[REDACTED]")
+		}
+	}
+	return values.Encode()
+}
 
 func Logger() fiber.Handler {
 	return func(c fiber.Ctx) error {
@@ -31,7 +58,7 @@ func Logger() fiber.Handler {
 			slog.Int64("user_id", userID),
 			slog.Int("content_length", c.Request().Header.ContentLength()),
 			slog.String("user_agent", c.Get("User-Agent")),
-			slog.String("query", string(c.Request().URI().QueryString())),
+			slog.String("query", redactQuery(string(c.Request().URI().QueryString()))),
 		}
 
 		switch {

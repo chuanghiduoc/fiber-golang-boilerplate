@@ -72,6 +72,21 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 	if err != nil {
 		return fmt.Errorf("connect to SMTP server: %w", err)
 	}
+	// smtp.Client has no context-aware methods. A deadline plus a watcher keeps
+	// a stalled server from leaking the connection/goroutine forever.
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("set SMTP deadline: %w", err)
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
 
 	client, err := smtp.NewClient(conn, s.host)
 	if err != nil {

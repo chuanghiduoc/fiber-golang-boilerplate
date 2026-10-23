@@ -109,3 +109,38 @@ func TestParse_WrongAudience(t *testing.T) {
 		t.Fatal("expected error for wrong audience")
 	}
 }
+
+func TestParse_RequiresExpiration(t *testing.T) {
+	claims := Claims{
+		UserID: 1,
+		Email:  "a@b.com",
+		Role:   "user",
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt: jwt.NewNumericDate(time.Now()),
+			Issuer:   jwtIssuer,
+			Audience: jwt.ClaimStrings{jwtAudience},
+		},
+	}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(testSecret))
+	if _, err := Parse(tok, testSecret); err == nil {
+		t.Fatal("token without exp must be rejected")
+	}
+}
+
+func TestParse_RejectsNonHS256Algorithms(t *testing.T) {
+	claims := Claims{
+		UserID: 1,
+		Email:  "a@b.com",
+		Role:   "user",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    jwtIssuer,
+			Audience:  jwt.ClaimStrings{jwtAudience},
+		},
+	}
+	tok, _ := jwt.NewWithClaims(jwt.SigningMethodHS384, claims).SignedString([]byte(testSecret))
+	if _, err := Parse(tok, testSecret); err == nil {
+		t.Fatal("HS384 token must be rejected when HS256 is expected")
+	}
+}

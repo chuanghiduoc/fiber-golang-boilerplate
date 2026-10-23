@@ -6,6 +6,8 @@ import (
 	"io"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -40,7 +42,7 @@ func newMockUserRepo() *mockUserRepo {
 
 func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*sqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok {
+	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	return u, nil
@@ -48,7 +50,7 @@ func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*sqlc.User, error) 
 
 func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*sqlc.User, error) {
 	for _, u := range m.users {
-		if u.Email == addr {
+		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, addr) {
 			return u, nil
 		}
 	}
@@ -57,7 +59,7 @@ func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*sqlc.User, e
 
 func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*sqlc.User, error) {
 	for _, u := range m.users {
-		if u.GoogleID.Valid && u.GoogleID.String == googleID {
+		if !u.DeletedAt.Valid && u.GoogleID.Valid && u.GoogleID.String == googleID {
 			return u, nil
 		}
 	}
@@ -67,6 +69,9 @@ func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*sqlc.
 func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User, error) {
 	all := make([]sqlc.User, 0, len(m.users))
 	for _, u := range m.users {
+		if u.DeletedAt.Valid {
+			continue
+		}
 		all = append(all, *u)
 	}
 	start := int(offset)
@@ -81,16 +86,19 @@ func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User
 }
 
 func (m *mockUserRepo) ListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
-	return m.listCursor(cur), nil
+	return m.listCursor(cur, false), nil
 }
 
 func (m *mockUserRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
-	return m.listCursor(cur), nil
+	return m.listCursor(cur, true), nil
 }
 
-func (m *mockUserRepo) listCursor(cur repository.Cursor) []sqlc.User {
+func (m *mockUserRepo) listCursor(cur repository.Cursor, includeDeleted bool) []sqlc.User {
 	all := make([]sqlc.User, 0, len(m.users))
 	for _, u := range m.users {
+		if u.DeletedAt.Valid && !includeDeleted {
+			continue
+		}
 		all = append(all, *u)
 	}
 	// (created_at DESC, id DESC)
@@ -111,14 +119,20 @@ func (m *mockUserRepo) listCursor(cur repository.Cursor) []sqlc.User {
 }
 
 func (m *mockUserRepo) Count(_ context.Context) (int64, error) {
-	return int64(len(m.users)), nil
+	var count int64
+	for _, u := range m.users {
+		if !u.DeletedAt.Valid {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (*sqlc.User, error) {
-	// Enforce email uniqueness like a real database
+	// Enforce active, case-insensitive email uniqueness like the real schema.
 	for _, u := range m.users {
-		if u.Email == params.Email {
-			return nil, fmt.Errorf("duplicate key value violates unique constraint \"users_email_key\"")
+		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
 		}
 	}
 	u := &sqlc.User{
@@ -137,10 +151,10 @@ func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (
 }
 
 func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params sqlc.CreateOAuthUserParams) (*sqlc.User, error) {
-	// Enforce email uniqueness like a real database
+	// Enforce active, case-insensitive email uniqueness like the real schema.
 	for _, u := range m.users {
-		if u.Email == params.Email {
-			return nil, fmt.Errorf("duplicate key value violates unique constraint \"users_email_key\"")
+		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
 		}
 	}
 	u := &sqlc.User{
@@ -160,35 +174,45 @@ func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params sqlc.CreateOAut
 
 func (m *mockUserRepo) Update(_ context.Context, params sqlc.UpdateUserParams) (*sqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok {
+	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	u.Name = params.Name
-	u.Email = params.Email
+	if params.UpdateEmail {
+		if !strings.EqualFold(u.Email, params.Email) {
+			u.EmailVerifiedAt = pgtype.Timestamptz{}
+			u.TokenVersion++
+			u.PasswordChangedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		}
+		u.Email = params.Email
+	}
 	return u, nil
 }
 
 func (m *mockUserRepo) UpdatePassword(_ context.Context, params sqlc.UpdateUserPasswordParams) (*sqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok {
+	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	u.PasswordHash = params.PasswordHash
+	u.TokenVersion++
+	u.PasswordChangedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return u, nil
 }
 
 func (m *mockUserRepo) UpdateRole(_ context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok {
+	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	u.Role = params.Role
+	u.TokenVersion++
 	return u, nil
 }
 
-func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64, addr string) (*sqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok {
+	if !ok || !strings.EqualFold(u.Email, addr) {
 		return nil, apperror.ErrNotFound
 	}
 	u.EmailVerifiedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
@@ -207,19 +231,23 @@ func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params sqlc.LinkGoog
 
 func (m *mockUserRepo) Delete(_ context.Context, id int64) (*sqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok {
+	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
-	delete(m.users, id)
+	u.DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	u.TokenVersion++
+	u.PasswordChangedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return u, nil
 }
 
 func (m *mockUserRepo) Restore(_ context.Context, id int64) (*sqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok {
+	if !ok || !u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
 	}
 	u.DeletedAt = pgtype.Timestamptz{}
+	u.TokenVersion++
+	u.PasswordChangedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return u, nil
 }
 
@@ -229,6 +257,16 @@ func (m *mockUserRepo) AdminList(ctx context.Context, limit, offset int32) ([]sq
 
 func (m *mockUserRepo) AdminCount(_ context.Context) (int64, error) {
 	return int64(len(m.users)), nil
+}
+
+func (m *mockUserRepo) CountActiveAdmins(_ context.Context) (int64, error) {
+	var count int64
+	for _, u := range m.users {
+		if !u.DeletedAt.Valid && u.Role == "admin" {
+			count++
+		}
+	}
+	return count, nil
 }
 
 func (m *mockUserRepo) GetSystemStats(_ context.Context) (sqlc.GetSystemStatsRow, error) {
@@ -250,9 +288,10 @@ func newMockRefreshTokenRepo() *mockRefreshTokenRepo {
 
 func (m *mockRefreshTokenRepo) Create(_ context.Context, params sqlc.CreateRefreshTokenParams) (*sqlc.RefreshToken, error) {
 	rt := &sqlc.RefreshToken{
-		UserID:    params.UserID,
-		Token:     params.Token,
-		ExpiresAt: params.ExpiresAt,
+		UserID:       params.UserID,
+		Token:        params.Token,
+		ExpiresAt:    params.ExpiresAt,
+		TokenVersion: params.TokenVersion,
 	}
 	m.tokens[params.Token] = rt
 	return rt, nil
@@ -263,6 +302,15 @@ func (m *mockRefreshTokenRepo) GetByToken(_ context.Context, token string) (*sql
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
+	return rt, nil
+}
+
+func (m *mockRefreshTokenRepo) Consume(_ context.Context, token string) (*sqlc.RefreshToken, error) {
+	rt, ok := m.tokens[token]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	delete(m.tokens, token)
 	return rt, nil
 }
 
@@ -317,6 +365,14 @@ func (m *mockFileRepo) GetByID(_ context.Context, id int64) (*sqlc.File, error) 
 	return f, nil
 }
 
+func (m *mockFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*sqlc.File, error) {
+	f, ok := m.files[id]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	return f, nil
+}
+
 func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offset int32) ([]sqlc.File, error) {
 	var result []sqlc.File
 	for _, f := range m.files {
@@ -335,18 +391,21 @@ func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offs
 	return result[start:end], nil
 }
 
-func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur repository.Cursor) ([]sqlc.File, error) {
-	return m.listCursor(&userID, cur), nil
+func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur repository.Cursor, includeDeleted bool) ([]sqlc.File, error) {
+	return m.listCursor(&userID, cur, includeDeleted), nil
 }
 
 func (m *mockFileRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.File, error) {
-	return m.listCursor(nil, cur), nil
+	return m.listCursor(nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(userID *int64, cur repository.Cursor) []sqlc.File {
+func (m *mockFileRepo) listCursor(userID *int64, cur repository.Cursor, includeDeleted bool) []sqlc.File {
 	all := make([]sqlc.File, 0, len(m.files))
 	for _, f := range m.files {
 		if userID != nil && f.UserID != *userID {
+			continue
+		}
+		if !includeDeleted && f.DeletedAt.Valid {
 			continue
 		}
 		all = append(all, *f)
@@ -432,6 +491,7 @@ func (m *mockEmailVerificationRepo) Create(_ context.Context, params sqlc.Create
 	t := &sqlc.EmailVerificationToken{
 		ID:        m.nextID,
 		UserID:    params.UserID,
+		Email:     params.Email,
 		Token:     params.Token,
 		ExpiresAt: params.ExpiresAt,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -446,6 +506,15 @@ func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) 
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
+	return t, nil
+}
+
+func (m *mockEmailVerificationRepo) Consume(_ context.Context, token string) (*sqlc.EmailVerificationToken, error) {
+	t, ok := m.tokens[token]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	delete(m.tokens, token)
 	return t, nil
 }
 
@@ -499,6 +568,15 @@ func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*sq
 
 func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
 	return m.GetByToken(ctx, token)
+}
+
+func (m *mockPasswordResetRepo) Consume(_ context.Context, token string) (*sqlc.PasswordResetToken, error) {
+	t, ok := m.tokens[token]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	delete(m.tokens, token)
+	return t, nil
 }
 
 func (m *mockPasswordResetRepo) Delete(_ context.Context, token string) error {
@@ -571,6 +649,7 @@ func (m *mockCache) Ping(_ context.Context) error { return nil }
 // ---------------------------------------------------------------------------
 
 type mockEmailSender struct {
+	mu       sync.Mutex
 	sendErr  error
 	sent     int
 	messages []email.Message
@@ -584,9 +663,30 @@ func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 	if m.sendErr != nil {
 		return m.sendErr
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.sent++
 	m.messages = append(m.messages, msg)
 	return nil
+}
+
+func (m *mockEmailSender) Sent() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sent
+}
+
+// WaitFor waits for asynchronously sent mail to arrive without sleeping in the
+// happy path. Used by tests that exercise fire-and-forget email delivery.
+func (m *mockEmailSender) WaitFor(n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if m.Sent() >= n {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return m.Sent() >= n
 }
 
 // ---------------------------------------------------------------------------

@@ -6,6 +6,9 @@ RETURNING *;
 -- name: GetFileByID :one
 SELECT * FROM files WHERE id = $1 AND deleted_at IS NULL;
 
+-- name: GetFileByIDIncludingDeleted :one
+SELECT * FROM files WHERE id = $1;
+
 -- name: ListFilesByUserID :many
 SELECT * FROM files WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2 OFFSET $3;
 
@@ -30,7 +33,8 @@ SELECT count(*) FROM files;
 
 -- name: ListFilesByUserCursor :many
 SELECT * FROM files
-WHERE user_id = @user_id::bigint AND deleted_at IS NULL
+WHERE user_id = @user_id::bigint
+  AND (deleted_at IS NULL OR @include_deleted::boolean)
   AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;

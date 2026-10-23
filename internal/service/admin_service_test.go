@@ -118,9 +118,9 @@ func TestAdminBanUser(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// User should be deleted
-		if _, ok := ur.users[1]; ok {
-			t.Error("user should be deleted from repo")
+		// User should be soft-deleted, not removed from the table.
+		if u, ok := ur.users[1]; !ok || !u.DeletedAt.Valid {
+			t.Error("user should be soft-deleted")
 		}
 
 		// Refresh tokens should be revoked
@@ -143,6 +143,7 @@ func TestAdminUnbanUser(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		svc, ur, _, _, _ := newAdminServiceForTest()
 		seedUsers(ur, 1)
+		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
 		user, err := svc.UnbanUser(context.Background(), 1)
 		if err != nil {
@@ -150,6 +151,18 @@ func TestAdminUnbanUser(t *testing.T) {
 		}
 		if user == nil {
 			t.Fatal("user should not be nil")
+		}
+		if ur.users[1].DeletedAt.Valid {
+			t.Error("user should be restored")
+		}
+	})
+
+	t.Run("active user is not banned", func(t *testing.T) {
+		svc, ur, _, _, _ := newAdminServiceForTest()
+		seedUsers(ur, 1)
+
+		if _, err := svc.UnbanUser(context.Background(), 1); err == nil {
+			t.Fatal("expected not-found for an active user")
 		}
 	})
 

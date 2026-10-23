@@ -1,4 +1,5 @@
 # Simple Makefile for a Go project
+-include .env
 
 # Build the application
 all: build test
@@ -27,7 +28,7 @@ test:
 # Integration tests (requires Docker)
 test-integration:
 	@echo "Running integration tests..."
-	@go test ./... -v -tags=integration -count=1 -timeout=120s
+	@go test ./... -v -tags=integration -count=1 -timeout=10m
 
 # Clean the binary
 clean:

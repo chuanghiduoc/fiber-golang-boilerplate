@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,9 +260,9 @@ func TestSecurityHeaders_Production(t *testing.T) {
 		"X-Content-Type-Options":    "nosniff",
 		"X-Frame-Options":           "DENY",
 		"X-XSS-Protection":          "1; mode=block",
-		"Referrer-Policy":            "strict-origin-when-cross-origin",
-		"Permissions-Policy":         "camera=(), microphone=(), geolocation=()",
-		"Strict-Transport-Security":  "max-age=31536000; includeSubDomains",
+		"Referrer-Policy":           "strict-origin-when-cross-origin",
+		"Permissions-Policy":        "camera=(), microphone=(), geolocation=()",
+		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 	}
 
 	for header, want := range expected {
@@ -491,5 +492,32 @@ func TestTimeout_SetsContext(t *testing.T) {
 	}
 	if resp.StatusCode != 200 {
 		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestRedactQuery(t *testing.T) {
+	got := redactQuery("code=abc&state=xyz&access_token=secret&page=2")
+	for _, leaked := range []string{"abc", "xyz", "secret"} {
+		if strings.Contains(got, leaked) {
+			t.Errorf("redactQuery() leaked %q in %q", leaked, got)
+		}
+	}
+	if !strings.Contains(got, "page=2") {
+		t.Errorf("redactQuery() dropped a safe parameter: %q", got)
+	}
+}
+
+func TestValidRequestID(t *testing.T) {
+	valid := []string{"abc-123", "req_1.2:3", "A"}
+	for _, v := range valid {
+		if !validRequestID(v) {
+			t.Errorf("validRequestID(%q) = false, want true", v)
+		}
+	}
+	invalid := []string{"", "has space", "line\nbreak", strings.Repeat("a", 129), "<script>"}
+	for _, v := range invalid {
+		if validRequestID(v) {
+			t.Errorf("validRequestID(%q) = true, want false", v)
+		}
 	}
 }

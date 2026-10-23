@@ -17,9 +17,10 @@ import (
 const googleUserInfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 type GoogleUserInfo struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
+	ID            string `json:"id"`
+	Email         string `json:"email"`
+	Name          string `json:"name"`
+	VerifiedEmail bool   `json:"verified_email"`
 }
 
 type GoogleOAuth struct {
@@ -65,7 +66,13 @@ func (g *GoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string 
 	params := url.Values{}
 	params.Set("access_token", accessToken)
 	params.Set("refresh_token", refreshToken)
-	return g.frontendURL + "#" + params.Encode()
+
+	u, err := url.Parse(g.frontendURL)
+	if err != nil {
+		return g.frontendURL
+	}
+	u.Fragment = params.Encode()
+	return u.String()
 }
 
 func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInfo, error) {
@@ -82,7 +89,7 @@ func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInf
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("google userinfo returned status %d: %s", resp.StatusCode, body)
 	}
 
@@ -93,6 +100,9 @@ func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInf
 
 	if info.ID == "" || info.Email == "" {
 		return nil, fmt.Errorf("incomplete user info from Google")
+	}
+	if !info.VerifiedEmail {
+		return nil, fmt.Errorf("google email address is not verified")
 	}
 
 	return &info, nil

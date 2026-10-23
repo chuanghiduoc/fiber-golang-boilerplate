@@ -20,13 +20,14 @@ type UserRepository interface {
 	Update(ctx context.Context, params sqlc.UpdateUserParams) (*sqlc.User, error)
 	UpdatePassword(ctx context.Context, params sqlc.UpdateUserPasswordParams) (*sqlc.User, error)
 	UpdateRole(ctx context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error)
-	VerifyEmail(ctx context.Context, id int64) (*sqlc.User, error)
+	VerifyEmail(ctx context.Context, id int64, email string) (*sqlc.User, error)
 	LinkGoogleAccount(ctx context.Context, params sqlc.LinkGoogleAccountParams) (*sqlc.User, error)
 	Delete(ctx context.Context, id int64) (*sqlc.User, error)
 	Restore(ctx context.Context, id int64) (*sqlc.User, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.User, error)
 	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error)
 	AdminCount(ctx context.Context) (int64, error)
+	CountActiveAdmins(ctx context.Context) (int64, error)
 	GetSystemStats(ctx context.Context) (sqlc.GetSystemStatsRow, error)
 }
 
@@ -132,8 +133,11 @@ func (r *userRepository) UpdateRole(ctx context.Context, params sqlc.UpdateUserR
 	return &user, nil
 }
 
-func (r *userRepository) VerifyEmail(ctx context.Context, id int64) (*sqlc.User, error) {
-	user, err := r.q.VerifyUserEmail(ctx, id)
+func (r *userRepository) VerifyEmail(ctx context.Context, id int64, email string) (*sqlc.User, error) {
+	user, err := r.q.VerifyUserEmail(ctx, sqlc.VerifyUserEmailParams{
+		ID:    id,
+		Email: email,
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -174,6 +178,10 @@ func (r *userRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sql
 
 func (r *userRepository) AdminCount(ctx context.Context) (int64, error) {
 	return r.q.AdminCountUsers(ctx)
+}
+
+func (r *userRepository) CountActiveAdmins(ctx context.Context) (int64, error) {
+	return r.q.CountActiveAdmins(ctx)
 }
 
 func (r *userRepository) GetSystemStats(ctx context.Context) (sqlc.GetSystemStatsRow, error) {

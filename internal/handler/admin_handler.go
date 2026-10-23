@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"strconv"
+
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
@@ -58,7 +61,7 @@ func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore)
+	return response.List(c, users, hasMore, nextUserCursor(users))
 }
 
 // UpdateRole godoc
@@ -75,11 +78,15 @@ func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/role [put]
 func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
 	if err != nil {
 		return err
+	}
+	if id == authUserID(c) {
+		return apperror.NewBadRequest("you cannot change your own role")
 	}
 
 	var req dto.UpdateRoleRequest
@@ -107,11 +114,15 @@ func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/ban [post]
 func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
 	if err != nil {
 		return err
+	}
+	if id == authUserID(c) {
+		return apperror.NewBadRequest("you cannot ban your own account")
 	}
 
 	if err := h.service.BanUser(c.Context(), id); err != nil {
@@ -133,6 +144,7 @@ func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/unban [post]
 func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
 	id, err := paramID(c, "id")
@@ -171,5 +183,84 @@ func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, files, hasMore)
+	return response.List(c, files, hasMore, nextFileCursor(files))
+}
+
+// DownloadFile godoc
+// @Summary Download any file (admin)
+// @Description Download an active file by ID
+// @Tags Admin
+// @Produce octet-stream
+// @Security BearerAuth
+// @Param id path int true "File ID"
+// @Success 200
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Router /admin/files/{id}/download [get]
+func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
+	id, err := paramID(c, "id")
+	if err != nil {
+		return err
+	}
+
+	file, reader, err := h.service.Download(c.Context(), id)
+	if err != nil {
+		return err
+	}
+
+	c.Set("Content-Type", file.MimeType)
+	c.Set("Content-Disposition", contentDispositionAttachment(file.OriginalName))
+	c.Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	return c.SendStream(reader)
+}
+
+// DeleteFile godoc
+// @Summary Soft-delete any file (admin)
+// @Description Soft-delete a file by ID regardless of owner
+// @Tags Admin
+// @Security BearerAuth
+// @Param id path int true "File ID"
+// @Success 204
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Router /admin/files/{id} [delete]
+func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
+	id, err := paramID(c, "id")
+	if err != nil {
+		return err
+	}
+	if err := h.service.DeleteFile(c.Context(), id); err != nil {
+		return err
+	}
+	return response.NoContent(c)
+}
+
+// RestoreFile godoc
+// @Summary Restore a soft-deleted file (admin)
+// @Description Restore any file by ID
+// @Tags Admin
+// @Produce json
+// @Security BearerAuth
+// @Param id path int true "File ID"
+// @Success 200 {object} dto.FileResponse
+// @Failure 400 {object} apperror.ProblemDetails
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Router /admin/files/{id}/restore [post]
+func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
+	id, err := paramID(c, "id")
+	if err != nil {
+		return err
+	}
+
+	file, err := h.service.RestoreFile(c.Context(), id)
+	if err != nil {
+		return err
+	}
+	return response.Success(c, file)
 }

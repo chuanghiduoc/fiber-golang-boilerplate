@@ -43,6 +43,10 @@ func EncodeCursor(createdAt time.Time, id int64) string {
 // DecodeCursor reverses EncodeCursor. The timestamp itself contains colons, so
 // the id is taken from after the final colon.
 func DecodeCursor(cursor string) (time.Time, int64, error) {
+	// Bound attacker-controlled input before allocating the decoded buffer.
+	if cursor == "" || len(cursor) > 512 {
+		return time.Time{}, 0, fmt.Errorf("invalid cursor length")
+	}
 	b, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
 		return time.Time{}, 0, fmt.Errorf("invalid cursor encoding")

@@ -41,8 +41,8 @@ func TestSendVerification(t *testing.T) {
 		}
 
 		// Email should be sent
-		if es.sent != 1 {
-			t.Errorf("expected 1 email sent, got %d", es.sent)
+		if es.Sent() != 1 {
+			t.Errorf("expected 1 email sent, got %d", es.Sent())
 		}
 	})
 
@@ -88,6 +88,7 @@ func TestVerify(t *testing.T) {
 		vr.tokens[hashToken("valid-token")] = &sqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
+			Email:     "user@example.com",
 			Token:     hashToken("valid-token"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
 		}
@@ -130,6 +131,7 @@ func TestVerify(t *testing.T) {
 		vr.tokens[hashToken("expired")] = &sqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
+			Email:     "user@example.com",
 			Token:     hashToken("expired"),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-1 * time.Hour), Valid: true},
 		}
@@ -169,8 +171,8 @@ func TestResendVerification(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if es.sent != 1 {
-			t.Errorf("expected 1 email sent, got %d", es.sent)
+		if es.Sent() != 1 {
+			t.Errorf("expected 1 email sent, got %d", es.Sent())
 		}
 		if len(vr.tokens) != 1 {
 			t.Errorf("expected 1 token, got %d", len(vr.tokens))
@@ -178,21 +180,17 @@ func TestResendVerification(t *testing.T) {
 	})
 
 	t.Run("rate limited", func(t *testing.T) {
-		svc, _, _, _, mc := newEmailVerifServiceForTest()
+		svc, _, _, es, mc := newEmailVerifServiceForTest()
 
 		// Pre-set rate limit cache key
 		mc.items["email_verification:user@example.com"] = []byte("1")
 
 		err := svc.ResendVerification(context.Background(), "user@example.com")
-		if err == nil {
-			t.Fatal("expected error, got nil")
+		if err != nil {
+			t.Fatalf("rate limiting must be silent, got %v", err)
 		}
-		appErr, ok := err.(*apperror.AppError)
-		if !ok {
-			t.Fatalf("expected *apperror.AppError, got %T", err)
-		}
-		if appErr.Status != 400 {
-			t.Errorf("status = %d, want 400", appErr.Status)
+		if es.Sent() != 0 {
+			t.Error("rate-limited request must not send email")
 		}
 	})
 
@@ -220,8 +218,8 @@ func TestResendVerification(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected nil for already verified, got: %v", err)
 		}
-		if es.sent != 0 {
-			t.Errorf("should not send email for already verified user, got %d", es.sent)
+		if es.Sent() != 0 {
+			t.Errorf("should not send email for already verified user, got %d", es.Sent())
 		}
 	})
 }

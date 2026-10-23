@@ -20,7 +20,7 @@ Production-ready REST API boilerplate built with Go Fiber v3, PostgreSQL, and sq
 
 ## Tech Stack
 
-- **Framework**: [Fiber v3](https://docs.gofiber.io/) (Go 1.25+)
+- **Framework**: [Fiber v3](https://docs.gofiber.io/) (Go 1.27.3+)
 - **Database**: PostgreSQL 17 with [pgxpool](https://github.com/jackc/pgx)
 - **Query**: [sqlc](https://sqlc.dev/) (type-safe SQL code generation)
 - **Migration**: [golang-migrate](https://github.com/golang-migrate/migrate) (auto-run on startup)
@@ -65,7 +65,7 @@ pkg/
   oauth/                            Google OAuth 2.0
   metrics/                          Prometheus HTTP metrics
   async/                            Fire-and-forget goroutine with panic recovery
-migrations/                         SQL migration files (3 migrations: users, files, tokens)
+migrations/                         SQL migration files (baseline schema + identity/session hardening)
 queries/                            SQL query files for sqlc
 docs/                               Generated Swagger docs
 ```
@@ -96,7 +96,7 @@ make docker-run
 
 Services: API (:8080), PostgreSQL (:5432), Redis (:6379), MinIO (:9000/:9001)
 
-**Without Docker** (requires Go 1.25+, PostgreSQL):
+**Without Docker** (requires Go 1.27.3+, PostgreSQL):
 
 ```bash
 cp .env.example .env
@@ -114,7 +114,8 @@ The app auto-runs migrations and seeds an admin user on startup.
 | POST | `/api/v1/auth/register` | Register new user |
 | POST | `/api/v1/auth/login` | Login, returns JWT + refresh token |
 | POST | `/api/v1/auth/refresh` | Refresh access token |
-| POST | `/api/v1/auth/logout` | Revoke refresh token |
+| POST | `/api/v1/auth/logout` | Revoke one refresh token |
+| POST | `/api/v1/auth/logout-all` | Revoke every refresh token for the current user |
 | POST | `/api/v1/auth/forgot-password` | Request password reset email |
 | POST | `/api/v1/auth/reset-password` | Reset password with token |
 | POST | `/api/v1/auth/verify-email` | Verify email with token |
@@ -128,7 +129,7 @@ The app auto-runs migrations and seeds an admin user on startup.
 | GET | `/api/v1/users/me` | Get current user |
 | PUT | `/api/v1/users/me` | Update own profile |
 | PUT | `/api/v1/users/me/password` | Change password |
-| GET | `/api/v1/users/:id` | Get user by ID |
+| GET | `/api/v1/users/:id` | Get user by ID (self or admin) |
 | GET | `/api/v1/users/` | List users (admin only) |
 | PUT | `/api/v1/users/:id` | Update user (admin or self) |
 | DELETE | `/api/v1/users/:id` | Delete user (admin or self) |
@@ -137,10 +138,11 @@ The app auto-runs migrations and seeds an admin user on startup.
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/v1/files/upload` | Upload file |
-| GET | `/api/v1/files/` | List own files (paginated) |
+| GET | `/api/v1/files/` | List own files (paginated; `includeDeleted=true` shows trash) |
 | GET | `/api/v1/files/:id` | Get file info |
-| GET | `/api/v1/files/:id/download` | Download file |
+| GET | `/api/v1/files/:id/download` | Download file (authenticated; storage is not publicly served) |
 | DELETE | `/api/v1/files/:id` | Delete file (soft) |
+| POST | `/api/v1/files/:id/restore` | Restore own soft-deleted file |
 
 ### Admin (protected — admin role required)
 | Method | Path | Description |
@@ -150,14 +152,17 @@ The app auto-runs migrations and seeds an admin user on startup.
 | PUT | `/api/v1/admin/users/:id/role` | Update user role |
 | POST | `/api/v1/admin/users/:id/ban` | Ban user (soft delete) |
 | POST | `/api/v1/admin/users/:id/unban` | Unban user (restore) |
-| GET | `/api/v1/admin/files` | List all files |
+| GET | `/api/v1/admin/files` | List all files (including soft-deleted) |
+| GET | `/api/v1/admin/files/:id/download` | Download any active file |
+| DELETE | `/api/v1/admin/files/:id` | Soft-delete any file (takedown) |
+| POST | `/api/v1/admin/files/:id/restore` | Restore any soft-deleted file |
 
 ### Infrastructure
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/healthz` | Liveness probe |
 | GET | `/readyz` | Readiness probe (DB + cache) |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/metrics` | Prometheus metrics (requires `METRICS_AUTH_TOKEN` in production) |
 | GET | `/swagger` | Swagger UI |
 
 ## Makefile Commands
@@ -166,7 +171,7 @@ The app auto-runs migrations and seeds an admin user on startup.
 make build                        # Build binary
 make run                          # Run locally
 make test                         # Run unit tests
-make test-integration             # Run integration tests (requires Docker)
+make test-integration             # Run integration tests (Docker/testcontainers, or set TEST_DATABASE_URL)
 make lint                         # Run golangci-lint
 make docker-run                   # Start with Docker Compose
 make docker-down                  # Stop Docker Compose
@@ -198,9 +203,46 @@ make watch                        # Live reload with Air
 See [.env.example](.env.example) for all available configuration options with defaults.
 
 Key settings:
-- `APP_ENV` — `local` | `staging` | `production` (affects logging format, JWT secret validation)
-- `REQUIRE_EMAIL_VERIFICATION` — Enable email verification requirement for login
+- `APP_ENV` — `local` | `test` | `development` | `staging` | `production` (affects logging format and production-only safety checks)
+- `APP_BODY_LIMIT` — must be greater than `STORAGE_MAX_FILE_SIZE` (multipart overhead)
+- `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
+- `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
-- `CACHE_DRIVER` — `memory` | `redis`
-- `EMAIL_DRIVER` — `console` | `smtp`
-- `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on startup
+- `CACHE_DRIVER` — `memory` | `redis` (use Redis when running multiple replicas)
+- `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
+- `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
+- `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on startup (password must be 12+ chars in production)
+
+## Pagination
+
+List endpoints return `{object, url, data, hasMore, nextCursor}`. When
+`hasMore` is true, pass `nextCursor` as the `startingAfter` query parameter on
+the next request. `limit` is clamped to 100.
+
+## Testing
+
+```bash
+make test                 # unit tests
+make test-integration     # testcontainers (Docker)
+# or, without Docker, against a disposable schema on an existing PostgreSQL:
+TEST_DATABASE_URL='postgres://user:pass@127.0.0.1:5432/postgres?sslmode=disable' \
+  go test -tags=integration -race -count=1 ./...
+```
+
+## Security notes
+
+- Refresh tokens are hashed, atomic/single-use, bound to the user's token
+  version, and rotated on every refresh.
+- Access tokens carry `token_version`; password changes/resets, bans,
+  unbans, and role changes invalidate them immediately.
+- Access tokens are validated against the current user record through a
+  generation-keyed session cache. Use Redis in production so invalidation is
+  shared across replicas.
+- Emails are normalized and unique case-insensitively among active accounts;
+  email changes require the current password, reset verification, revoke
+  sessions, and send a fresh verification link.
+- Uploaded files are never served from a public directory; downloads require
+  authentication and ownership (or admin role).
+- Production startup rejects the sample JWT secret, console email, wildcard
+  CORS, insecure frontend/OAuth URLs, missing metrics auth, and a body limit
+  smaller than the configured upload size.

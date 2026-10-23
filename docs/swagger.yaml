@@ -57,6 +57,8 @@ definitions:
     properties:
       createdAt:
         type: string
+      deletedAt:
+        type: string
       id:
         type: integer
       mimeType:
@@ -67,10 +69,13 @@ definitions:
         type: integer
       url:
         type: string
+      userId:
+        type: integer
     type: object
   dto.ForgotPasswordRequest:
     properties:
       email:
+        maxLength: 255
         type: string
     required:
     - email
@@ -78,6 +83,7 @@ definitions:
   dto.LoginRequest:
     properties:
       email:
+        maxLength: 255
         type: string
       password:
         type: string
@@ -97,6 +103,7 @@ definitions:
   dto.RefreshRequest:
     properties:
       refreshToken:
+        maxLength: 256
         type: string
     required:
     - refreshToken
@@ -104,8 +111,10 @@ definitions:
   dto.RegisterRequest:
     properties:
       email:
+        maxLength: 255
         type: string
       name:
+        maxLength: 255
         minLength: 2
         type: string
       password:
@@ -118,6 +127,7 @@ definitions:
   dto.ResendVerificationRequest:
     properties:
       email:
+        maxLength: 255
         type: string
     required:
     - email
@@ -127,6 +137,7 @@ definitions:
       password:
         type: string
       token:
+        maxLength: 256
         type: string
     required:
     - password
@@ -144,9 +155,15 @@ definitions:
     type: object
   dto.UpdateUserRequest:
     properties:
+      currentPassword:
+        description: CurrentPassword is required when a non-admin changes their own
+          email.
+        type: string
       email:
+        maxLength: 255
         type: string
       name:
+        maxLength: 255
         minLength: 2
         type: string
     type: object
@@ -154,9 +171,13 @@ definitions:
     properties:
       createdAt:
         type: string
+      deletedAt:
+        type: string
       email:
         type: string
       emailVerified:
+        type: boolean
+      hasPassword:
         type: boolean
       id:
         type: integer
@@ -170,6 +191,7 @@ definitions:
   dto.VerifyEmailRequest:
     properties:
       token:
+        maxLength: 256
         type: string
     required:
     - token
@@ -179,6 +201,8 @@ definitions:
       data: {}
       hasMore:
         type: boolean
+      nextCursor:
+        type: string
       object:
         type: string
       url:
@@ -228,6 +252,111 @@ paths:
       security:
       - BearerAuth: []
       summary: List all files (admin)
+      tags:
+      - Admin
+  /admin/files/{id}:
+    delete:
+      description: Soft-delete a file by ID regardless of owner
+      parameters:
+      - description: File ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Soft-delete any file (admin)
+      tags:
+      - Admin
+  /admin/files/{id}/download:
+    get:
+      description: Download an active file by ID
+      parameters:
+      - description: File ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/octet-stream
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Download any file (admin)
+      tags:
+      - Admin
+  /admin/files/{id}/restore:
+    post:
+      description: Restore any file by ID
+      parameters:
+      - description: File ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.FileResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Restore a soft-deleted file (admin)
       tags:
       - Admin
   /admin/stats:
@@ -323,6 +452,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Ban a user
@@ -368,6 +501,10 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
       summary: Update user role
@@ -403,6 +540,10 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
@@ -563,6 +704,25 @@ paths:
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       summary: Logout
+      tags:
+      - Auth
+  /auth/logout-all:
+    post:
+      description: Revoke every refresh token for the authenticated user
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Revoke all refresh tokens
       tags:
       - Auth
   /auth/refresh:
@@ -762,6 +922,10 @@ paths:
         in: query
         name: startingAfter
         type: string
+      - description: Include soft-deleted files (trash)
+        in: query
+        name: includeDeleted
+        type: boolean
       produces:
       - application/json
       responses:
@@ -845,6 +1009,10 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
@@ -876,6 +1044,10 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
           schema:
@@ -883,6 +1055,47 @@ paths:
       security:
       - BearerAuth: []
       summary: Download a file
+      tags:
+      - Files
+  /files/{id}/restore:
+    post:
+      description: Restore a file owned by the authenticated user
+      parameters:
+      - description: File ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.FileResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Restore a soft-deleted file
       tags:
       - Files
   /files/upload:
@@ -909,6 +1122,14 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "413":
+          description: Request Entity Too Large
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "415":
+          description: Unsupported Media Type
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "500":
@@ -953,6 +1174,10 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
@@ -1014,6 +1239,10 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":

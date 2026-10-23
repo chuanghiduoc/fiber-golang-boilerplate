@@ -197,16 +197,38 @@ func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
 	return i, err
 }
 
+const getFileByIDIncludingDeleted = `-- name: GetFileByIDIncludingDeleted :one
+SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1
+`
+
+func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (File, error) {
+	row := q.db.QueryRow(ctx, getFileByIDIncludingDeleted, id)
+	var i File
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.OriginalName,
+		&i.StoragePath,
+		&i.MimeType,
+		&i.Size,
+		&i.CreatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
 SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
-WHERE user_id = $1::bigint AND deleted_at IS NULL
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+WHERE user_id = $1::bigint
+  AND (deleted_at IS NULL OR $2::boolean)
+  AND (NOT $3::boolean OR (created_at, id) < ($4::timestamptz, $5::bigint))
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $6::int
 `
 
 type ListFilesByUserCursorParams struct {
 	UserID          int64              `json:"user_id"`
+	IncludeDeleted  bool               `json:"include_deleted"`
 	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
@@ -216,6 +238,7 @@ type ListFilesByUserCursorParams struct {
 func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUserCursorParams) ([]File, error) {
 	rows, err := q.db.Query(ctx, listFilesByUserCursor,
 		arg.UserID,
+		arg.IncludeDeleted,
 		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
