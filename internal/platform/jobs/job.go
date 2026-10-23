@@ -41,6 +41,8 @@ var (
 	// no longer running under the supplied worker and attempt, usually because
 	// its lease expired and another worker reclaimed it.
 	ErrLeaseLost = errors.New("jobs: worker lease lost")
+	// ErrInvalidRetention is returned when a retention window is not positive.
+	ErrInvalidRetention = errors.New("jobs: retention must be positive")
 )
 
 // Job describes a unit of work to enqueue.

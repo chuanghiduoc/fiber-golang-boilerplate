@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // Middleware records successful mutating requests (POST/PUT/PATCH/DELETE) with
@@ -49,6 +51,7 @@ func Middleware(recorder Recorder) fiber.Handler {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 2*time.Second)
 		defer cancel()
 		if err := recorder.Record(ctx, event); err != nil {
+			metrics.AuditWriteFailuresTotal.Inc()
 			slog.Warn("failed to record audit event",
 				slog.String("action", event.Action),
 				slog.Any("error", err),

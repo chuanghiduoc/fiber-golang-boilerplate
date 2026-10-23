@@ -7,6 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // insertJobSQL inserts one queued job and returns its id. The cast makes the
@@ -70,4 +72,25 @@ func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
 		return 0, fmt.Errorf("jobs: enqueue %q: %w", job.Kind, err)
 	}
 	return id, nil
+}
+
+// PurgeTerminal deletes succeeded and dead jobs whose last update is older than
+// olderThan and returns the number of deleted rows. Workers run retention
+// automatically, so this is for manual operational cleanup; it records the
+// deleted rows in JobsPurgedTotal just like the worker does. A non-positive
+// window returns ErrInvalidRetention and a nil pool returns ErrNoPool. If a
+// later batch fails, the rows deleted before the error are counted and returned
+// with the error. Queued and running jobs are never deleted.
+func (q *Queue) PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, ErrInvalidRetention
+	}
+	if q == nil || q.pool == nil {
+		return 0, ErrNoPool
+	}
+	purged, err := newPGStore(q.pool).PurgeTerminal(ctx, olderThan)
+	if purged > 0 {
+		metrics.JobsPurgedTotal.Add(float64(purged))
+	}
+	return purged, err
 }

@@ -105,6 +105,31 @@ WHERE id = $1
   AND attempts = $5
   AND status = 'running'`
 
+// purgeTerminalJobsSQL deletes one batch of terminal rows older than the
+// retention window. Only succeeded and dead jobs are eligible: queued and
+// running jobs are live work and must never be removed by retention. The CTE
+// limits every statement to purgeBatchSize rows ordered by age, and SKIP LOCKED
+// avoids waiting on rows another purge already selected. The window is passed
+// in seconds and applied with make_interval so the caller controls it
+// precisely.
+const purgeTerminalJobsSQL = `
+WITH batch AS (
+    SELECT id
+    FROM jobs
+    WHERE status IN ('succeeded', 'dead')
+      AND updated_at < now() - make_interval(secs => $1::double precision)
+    ORDER BY updated_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM jobs AS j
+USING batch
+WHERE j.id = batch.id`
+
+// purgeBatchSize bounds one retention DELETE so a large backlog cannot hold a
+// single transaction open past the worker's purge timeout.
+const purgeBatchSize = 1000
+
 // pgStore is the PostgreSQL implementation of store.
 type pgStore struct {
 	pool *pgxpool.Pool
@@ -194,4 +219,34 @@ func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, atte
 		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
 	}
 	return nil
+}
+
+// PurgeTerminal deletes succeeded and dead jobs whose last update is older than
+// olderThan and returns the number of deleted rows. Deletion happens in bounded
+// batches until a batch is short (the backlog is drained) or the context ends.
+// If a later batch fails, the successfully deleted total is returned alongside
+// the error. Queued and running jobs are never eligible, regardless of age.
+func (s *pgStore) PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, ErrInvalidRetention
+	}
+	if s == nil || s.pool == nil {
+		return 0, ErrNoPool
+	}
+
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("jobs: purge terminal jobs: %w", err)
+		}
+		tag, err := s.pool.Exec(ctx, purgeTerminalJobsSQL, olderThan.Seconds(), purgeBatchSize)
+		if err != nil {
+			return total, fmt.Errorf("jobs: purge terminal jobs: %w", err)
+		}
+		deleted := tag.RowsAffected()
+		total += deleted
+		if deleted < purgeBatchSize {
+			return total, nil
+		}
+	}
 }

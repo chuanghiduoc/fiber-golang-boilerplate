@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // TestWorkerIntegrationProcessesJob exercises Enqueue and Worker against a real
@@ -485,6 +487,105 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	assert.Equal(t, "queued", status)
 	assert.Equal(t, DefaultMaxAttempts, maxAttempts)
 	assert.JSONEq(t, `{"ok":true}`, string(payload))
+}
+
+// TestPurgeTerminalIntegration covers the retention delete: only succeeded and
+// dead rows older than the window are removed; recent terminal rows and old
+// queued/running rows are retained.
+func TestPurgeTerminalIntegration(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	insertJob := func(kind, status string, age time.Duration) int64 {
+		t.Helper()
+		var id int64
+		err := pool.QueryRow(ctx, `
+			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+			VALUES ($1, '{}'::jsonb, $2, now(), 3,
+			        now() - make_interval(secs => $3::double precision),
+			        now() - make_interval(secs => $3::double precision))
+			RETURNING id`,
+			kind, status, age.Seconds(),
+		).Scan(&id)
+		require.NoError(t, err)
+		return id
+	}
+
+	oldSucceeded := insertJob("jobs.integration.retention.succeeded", "succeeded", 31*24*time.Hour)
+	oldDead := insertJob("jobs.integration.retention.dead", "dead", 31*24*time.Hour)
+	recentSucceeded := insertJob("jobs.integration.retention.recent", "succeeded", time.Hour)
+	oldQueued := insertJob("jobs.integration.retention.queued", "queued", 31*24*time.Hour)
+	oldRunning := insertJob("jobs.integration.retention.running", "running", 31*24*time.Hour)
+
+	purged, err := newPGStore(pool).PurgeTerminal(ctx, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), purged, "only old terminal rows must be deleted")
+
+	exists := func(id int64) bool {
+		t.Helper()
+		var found bool
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, id).Scan(&found))
+		return found
+	}
+
+	assert.False(t, exists(oldSucceeded), "an old succeeded job must be purged")
+	assert.False(t, exists(oldDead), "an old dead job must be purged")
+	assert.True(t, exists(recentSucceeded), "a recent terminal job must be retained")
+	assert.True(t, exists(oldQueued), "an old queued job must be retained")
+	assert.True(t, exists(oldRunning), "an old running job must be retained")
+
+	// The manual Queue path must count deleted rows too.
+	before := metricValue(t, metrics.JobsPurgedTotal)
+	manual := insertJob("jobs.integration.retention.manual", "succeeded", 31*24*time.Hour)
+	purged, err = NewQueue(pool).PurgeTerminal(ctx, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), purged)
+	assert.False(t, exists(manual))
+	assert.Equal(t, before+1, metricValue(t, metrics.JobsPurgedTotal))
+}
+
+// TestPurgeTerminalIntegrationBatches proves the purge drains more than one
+// batch and stops with a short final batch.
+func TestPurgeTerminalIntegrationBatches(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const batchKind = "jobs.integration.retention.batch"
+	oldRows := purgeBatchSize + 1
+	_, err := pool.Exec(ctx, `
+		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+		SELECT $1, '{}'::jsonb, 'dead', now(), 3,
+		       now() - interval '31 days', now() - interval '31 days'
+		FROM generate_series(1, $2::int)`,
+		batchKind, oldRows,
+	)
+	require.NoError(t, err)
+
+	var recentID int64
+	require.NoError(t, pool.QueryRow(ctx, `
+		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+		VALUES ($1, '{}'::jsonb, 'succeeded', now(), 3, now(), now())
+		RETURNING id`, batchKind,
+	).Scan(&recentID))
+
+	purged, err := newPGStore(pool).PurgeTerminal(ctx, 30*24*time.Hour)
+	require.NoError(t, err)
+	assert.Equal(t, int64(oldRows), purged)
+
+	var remaining int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = $1`, batchKind).Scan(&remaining))
+	assert.Equal(t, int64(1), remaining, "only the recent row must remain")
+
+	var recentExists bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, recentID).Scan(&recentExists))
+	assert.True(t, recentExists)
 }
 
 // setupIntegrationDB creates an isolated schema, applies the consolidated

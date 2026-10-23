@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 const (
@@ -20,7 +22,10 @@ const (
 	defaultHeartbeatInterval = 30 * time.Second
 	defaultLeaseDuration     = 5 * time.Minute
 	defaultJobTimeout        = 10 * time.Minute
+	defaultRetention         = 30 * 24 * time.Hour
+	defaultPurgeInterval     = time.Hour
 	bookkeepingTimeout       = 5 * time.Second
+	purgeTimeout             = 5 * time.Second
 	maxClaimBackoff          = 30 * time.Second
 )
 
@@ -36,6 +41,7 @@ type store interface {
 	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
 	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
 	Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error
+	PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
 type claimedJob struct {
@@ -106,6 +112,29 @@ func WithJobTimeout(d time.Duration) Option {
 	}
 }
 
+// WithRetention sets how long terminal (succeeded or dead) job rows are kept.
+// The default is 30 days. Values less than or equal to zero disable automatic
+// retention, so terminal rows are never purged by the worker.
+func WithRetention(d time.Duration) Option {
+	return func(w *Worker) {
+		if d <= 0 {
+			w.retention = 0
+			return
+		}
+		w.retention = d
+	}
+}
+
+// WithPurgeInterval sets how often the worker runs terminal-job retention.
+// The default is one hour. Values less than or equal to zero are ignored.
+func WithPurgeInterval(d time.Duration) Option {
+	return func(w *Worker) {
+		if d > 0 {
+			w.purgeInterval = d
+		}
+	}
+}
+
 // Worker claims due jobs and dispatches them to registered handlers.
 type Worker struct {
 	pool              *pgxpool.Pool
@@ -117,6 +146,8 @@ type Worker struct {
 	heartbeatInterval time.Duration
 	leaseDuration     time.Duration
 	jobTimeout        time.Duration
+	retention         time.Duration
+	purgeInterval     time.Duration
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
@@ -141,6 +172,8 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		heartbeatInterval: defaultHeartbeatInterval,
 		leaseDuration:     defaultLeaseDuration,
 		jobTimeout:        defaultJobTimeout,
+		retention:         defaultRetention,
+		purgeInterval:     defaultPurgeInterval,
 		handlers:          make(map[string]Handler),
 		store:             newPGStore(pool),
 	}
@@ -204,9 +237,20 @@ func (w *Worker) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
+	// Subtract one interval so a fresh worker is immediately due: a process
+	// restarted more often than the interval still performs retention.
+	lastPurge := time.Now().Add(-w.purgeInterval)
+
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		if w.retention > 0 && time.Since(lastPurge) >= w.purgeInterval {
+			w.purgeTerminal(ctx)
+			// Reset even after a failure so a broken purge cannot hammer the
+			// database on every claim-loop iteration.
+			lastPurge = time.Now()
 		}
 
 		free := w.concurrency - len(slots)
@@ -224,6 +268,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			metrics.JobsClaimErrorsTotal.Inc()
 			slog.Warn("jobs: claim failed; retrying",
 				"worker_id", w.id,
 				"retry_in", claimBackoff,
@@ -245,6 +290,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 
 		for _, job := range claimed {
+			metrics.JobsClaimedTotal.WithLabelValues(job.Kind).Inc()
 			// Claims never exceed the free slot count, so this send does not
 			// block and the concurrency limit is respected.
 			slots <- struct{}{}
@@ -326,6 +372,7 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 		if err := w.store.Succeed(writeCtx, job.ID, w.id, job.Attempts); err != nil {
 			return fmt.Errorf("jobs: mark job %d succeeded: %w", job.ID, err)
 		}
+		metrics.JobsSucceededTotal.WithLabelValues(job.Kind).Inc()
 		return nil
 	}
 
@@ -342,7 +389,39 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	if err := w.store.Fail(writeCtx, job.ID, w.id, job.Attempts, reason, retryAt); err != nil {
 		return fmt.Errorf("jobs: mark job %d failed: %w", job.ID, err)
 	}
+	if retryAt != nil {
+		metrics.JobsRetriedTotal.WithLabelValues(job.Kind).Inc()
+	} else {
+		metrics.JobsDeadTotal.WithLabelValues(job.Kind).Inc()
+	}
 	return nil
+}
+
+// purgeTerminal runs one retention pass. It uses a detached context bounded by
+// purgeTimeout so a slow DELETE cannot hold shutdown open indefinitely or be
+// aborted mid-flight when the worker context is canceled. Every successfully
+// deleted row counts toward JobsPurgedTotal, including a partial total returned
+// with an error; failures are logged and retried on the next interval.
+func (w *Worker) purgeTerminal(ctx context.Context) {
+	if w == nil || w.retention <= 0 || w.store == nil {
+		return
+	}
+
+	purgeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), purgeTimeout)
+	defer cancel()
+
+	purged, err := w.store.PurgeTerminal(purgeCtx, w.retention)
+	if purged > 0 {
+		metrics.JobsPurgedTotal.Add(float64(purged))
+	}
+	if err != nil {
+		slog.Warn("jobs: purge terminal jobs failed",
+			"worker_id", w.id,
+			"retention", w.retention,
+			"purged", purged,
+			"error", err,
+		)
+	}
 }
 
 // startHeartbeat renews the job's lease until the returned stop function is
