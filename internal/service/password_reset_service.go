@@ -95,7 +95,18 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	}
 	token := hex.EncodeToString(b)
 
-	createToken := func(resetRepo repository.PasswordResetRepository) error {
+	resetURL := fmt.Sprintf("%s/reset-password?token=%s", s.frontendURL, token)
+	msg := email.Message{
+		To:      []string{user.Email},
+		Subject: "Password Reset Request",
+		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to reset your password. This link expires in 1 hour.</p>", resetURL),
+	}
+	txSender, transactional := s.emailSender.(transactionalEmailSender)
+
+	// queuedInTx records that the email was enqueued on the token transaction,
+	// so the fallback send below must not run as well.
+	queuedInTx := false
+	createToken := func(resetRepo repository.PasswordResetRepository, tx pgx.Tx) error {
 		// Delete old tokens and create the new one in a single transaction so
 		// two concurrent requests cannot leave two live reset links behind.
 		if err := resetRepo.DeleteByUserID(ctx, user.ID); err != nil {
@@ -109,35 +120,46 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 		if err != nil {
 			return apperror.NewInternal("failed to create reset token")
 		}
+		if tx != nil && transactional {
+			// Enqueue on the same transaction: a crash between the token insert
+			// and the enqueue cannot leave a usable reset link without an email.
+			if err := txSender.SendTx(ctx, tx, msg); err != nil {
+				slog.Error("failed to enqueue password reset email",
+					slog.Int64("user_id", user.ID),
+					slog.String("email", user.Email),
+					slog.Any("error", err),
+				)
+				return apperror.NewInternal("failed to process request")
+			}
+			queuedInTx = true
+		}
 		return nil
 	}
 
 	if s.txManager != nil {
 		if err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return createToken(repository.NewPasswordResetRepository(tx))
+			return createToken(repository.NewPasswordResetRepository(tx), tx)
 		}); err != nil {
 			return err
 		}
-	} else if err := createToken(s.resetRepo); err != nil {
+	} else if err := createToken(s.resetRepo, nil); err != nil {
 		return err
 	}
 
-	// Send email asynchronously: SMTP latency must not create a timing oracle
-	// and must not block the request. Failures are logged, never returned.
-	resetURL := fmt.Sprintf("%s/reset-password?token=%s", s.frontendURL, token)
-	async.Go(func() {
-		if err := s.emailSender.Send(context.Background(), email.Message{
-			To:      []string{user.Email},
-			Subject: "Password Reset Request",
-			HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to reset your password. This link expires in 1 hour.</p>", resetURL),
-		}); err != nil {
-			slog.Warn("failed to send password reset email",
-				slog.Int64("user_id", user.ID),
-				slog.String("email", user.Email),
-				slog.Any("error", err),
-			)
-		}
-	})
+	if !queuedInTx {
+		// Send email asynchronously: SMTP latency must not create a timing
+		// oracle and must not block the request. Failures are logged, never
+		// returned.
+		async.Go(func() {
+			if err := s.emailSender.Send(context.Background(), msg); err != nil {
+				slog.Warn("failed to send password reset email",
+					slog.Int64("user_id", user.ID),
+					slog.String("email", user.Email),
+					slog.Any("error", err),
+				)
+			}
+		})
+	}
 
 	return nil
 }

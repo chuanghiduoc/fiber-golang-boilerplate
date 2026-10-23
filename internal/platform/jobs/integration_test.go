@@ -113,6 +113,63 @@ func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
 	assert.JSONEq(t, `{}`, string(payload), "dead jobs must not retain payload secrets")
 }
 
+// TestWorkerIntegrationUnknownKindRetriesThenDeadLetters verifies that an
+// unregistered kind is not dead-lettered immediately: it retries with its
+// payload intact, then is dead-lettered with the payload cleared once the
+// attempt budget is exhausted.
+func TestWorkerIntegrationUnknownKindRetriesThenDeadLetters(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const kind = "jobs.integration.unregistered"
+	payload := json.RawMessage(`{"secret":"must-retry-then-clear"}`)
+	id, err := NewQueue(pool).Enqueue(ctx, Job{
+		Kind:        kind,
+		Payload:     payload,
+		MaxAttempts: 2,
+	})
+	require.NoError(t, err)
+
+	worker := NewWorker(pool, "unknown-kind-worker", WithPollInterval(10*time.Millisecond))
+	// A long retry delay gives the test a stable window to observe the queued
+	// retry before the second claim.
+	worker.retryBase = time.Second
+	worker.retryMax = time.Second
+	// Deliberately register no handler for kind.
+	runIntegrationWorker(t, worker)
+
+	var (
+		status     string
+		attempts   int
+		lastError  *string
+		gotPayload []byte
+	)
+	require.Eventually(t, func() bool {
+		err := pool.QueryRow(ctx,
+			`SELECT status, attempts, last_error, payload FROM jobs WHERE id = $1`, id,
+		).Scan(&status, &attempts, &lastError, &gotPayload)
+		return err == nil && status == "queued" && attempts == 1
+	}, 5*time.Second, 10*time.Millisecond)
+
+	assert.JSONEq(t, string(payload), string(gotPayload),
+		"an unknown kind must retain its payload while retrying")
+	require.NotNil(t, lastError)
+	assert.Contains(t, *lastError, ErrNoHandler.Error())
+
+	require.Eventually(t, func() bool {
+		err := pool.QueryRow(ctx,
+			`SELECT status, attempts, last_error, payload FROM jobs WHERE id = $1`, id,
+		).Scan(&status, &attempts, &lastError, &gotPayload)
+		return err == nil && status == "dead"
+	}, 5*time.Second, 10*time.Millisecond)
+
+	assert.Equal(t, 2, attempts)
+	assert.JSONEq(t, `{}`, string(gotPayload),
+		"an unknown kind must be dead-lettered with its payload cleared")
+}
+
 // TestClaimIntegrationDeadLettersExpiredFinalAttempt covers a worker that
 // crashes after consuming its last allowed attempt. Reclaiming it as queued
 // would let a poison job crash-loop forever, so it must become dead.
@@ -229,6 +286,94 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 
 	assert.Equal(t, 2, attempts)
 	assert.Nil(t, lastError, "success clears the lease-expiry marker")
+}
+
+// TestSucceedIntegrationFencesStaleAttempt proves that attempts act as a
+// fencing token independently of locked_by. The same worker ID reclaims the
+// job, so only the attempt predicate can reject its stale writes. It also
+// covers Heartbeat and Fail, plus the current owner's ability to finish.
+func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const (
+		kind     = "jobs.integration.fence"
+		workerID = "fence-worker"
+	)
+	payload := json.RawMessage(`{"secret":"must-survive"}`)
+	id, err := NewQueue(pool).Enqueue(ctx, Job{
+		Kind:        kind,
+		Payload:     payload,
+		MaxAttempts: 5,
+	})
+	require.NoError(t, err)
+
+	store := newPGStore(pool)
+
+	first, err := store.Claim(ctx, workerID, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, first, 1)
+	require.Equal(t, id, first[0].ID)
+	require.Equal(t, 1, first[0].Attempts)
+
+	// Simulate the expired lease being requeued and reclaimed by the same
+	// worker ID. The replacement claim increments attempts, which invalidates
+	// the old attempt even though locked_by still matches.
+	_, err = pool.Exec(ctx, `
+		UPDATE jobs
+		SET status = 'queued',
+		    locked_by = NULL,
+		    locked_at = NULL,
+		    run_at = now()
+		WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	second, err := store.Claim(ctx, workerID, 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, second, 1)
+	require.Equal(t, id, second[0].ID)
+	require.Equal(t, 2, second[0].Attempts)
+
+	currentAttempt := second[0].Attempts
+	staleAttempt := first[0].Attempts
+
+	// The current owner can heartbeat with its attempt. This also exercises
+	// heartbeatJobSQL's $3 parameter order against the database.
+	require.NoError(t, store.Heartbeat(ctx, id, workerID, currentAttempt))
+
+	// Every stale bookkeeping write must be rejected by the attempt fence,
+	// even though the worker ID still matches.
+	require.ErrorIs(t, store.Heartbeat(ctx, id, workerID, staleAttempt), ErrLeaseLost)
+	require.ErrorIs(t, store.Fail(ctx, id, workerID, staleAttempt, "stale failure", nil), ErrLeaseLost)
+	require.ErrorIs(t, store.Succeed(ctx, id, workerID, staleAttempt), ErrLeaseLost)
+
+	var (
+		status     string
+		attempts   int
+		lockedBy   *string
+		lastError  *string
+		gotPayload []byte
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, attempts, locked_by, last_error, payload FROM jobs WHERE id = $1`, id,
+	).Scan(&status, &attempts, &lockedBy, &lastError, &gotPayload))
+	assert.Equal(t, "running", status)
+	assert.Equal(t, currentAttempt, attempts)
+	require.NotNil(t, lockedBy)
+	assert.Equal(t, workerID, *lockedBy)
+	assert.Nil(t, lastError, "a fenced stale fail must not write last_error")
+	assert.JSONEq(t, string(payload), string(gotPayload),
+		"a fenced stale fail must not dead-letter the job or clear its payload")
+
+	// Cleanup: the current owner can still complete the job.
+	require.NoError(t, store.Succeed(ctx, id, workerID, currentAttempt))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, payload FROM jobs WHERE id = $1`, id,
+	).Scan(&status, &gotPayload))
+	assert.Equal(t, "succeeded", status)
+	assert.JSONEq(t, `{}`, string(gotPayload), "success still clears the payload")
 }
 
 // TestClaimIntegrationDoesNotReclaimHeartbeatedJob holds a row lock the same

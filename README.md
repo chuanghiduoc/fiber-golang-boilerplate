@@ -250,27 +250,44 @@ make watch                        # Live reload with Air
 runs through it. Delivery is **at-least-once**, not exactly-once: a handler can
 run again after a retry, panic, or lease expiry, so handlers must be idempotent
 and safe to retry. Use `Queue.EnqueueTx` when a job must commit atomically with
-the business transaction that produced it.
+the business transaction that produced it. Password-reset and email-verification
+services already do this: the token row and the `email.send` job share one
+transaction, so a crash cannot leave a usable link without a queued email.
 
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
   `max_attempts` (default 10), then move to `dead`. An unregistered job kind is
-  dead-lettered immediately.
+  not special-cased: it retries with the same backoff and is dead-lettered only
+  when its attempt budget is exhausted, so a rollout can register a handler
+  before pending work dies.
+- Claim failures are retried in-process with exponential backoff, starting at
+  the poll interval and capped at 30s, so a transient database outage does not
+  stop the worker (or the API that hosts it). `Run` returns only when its
+  context is canceled.
+- Each handler runs with a 10m timeout. Set it with `WithJobTimeout`; a value
+  less than or equal to zero disables the deadline. A timed-out handler is
+  canceled and recorded as a normal failure, so the job retries or is
+  dead-lettered. Cancellation is cooperative: the worker cannot preempt a
+  handler that ignores its context, so heartbeats keep running until that
+  handler returns. The final bookkeeping write uses a detached 5s context.
 - Running jobs renew a lease with a 30s heartbeat (5m lease by default). A
   `running` job whose lease expires is requeued by the next claim, so a crashed
   worker does not block it forever. Reclamation happens inside the claim query,
   so another worker must be polling to recover a dead worker's jobs; a
-  reclaimed job consumes an attempt when claimed again. A worker that loses its
-  lease can still be executing the old handler, so duplicate concurrent
-  execution is possible. Tune the lease with `WithHeartbeatInterval` and
-  `WithLeaseDuration`.
+  reclaimed job consumes an attempt when claimed again. Heartbeat, success, and
+  failure writes are fenced by `locked_by` and `attempts`, so the previous owner
+  of a reclaimed job cannot renew or finish it. That owner can still be
+  executing the old handler, so duplicate concurrent execution is possible.
+  Tune the lease with `WithHeartbeatInterval` and `WithLeaseDuration`.
 - `jobs` stores `run_at`, `locked_at`, `locked_by`, `attempts`, and
   `last_error`; use them to inspect retries and dead letters. Successful and
   dead jobs have their `payload` cleared, so reset/verification links from email
   jobs are not retained after delivery.
 - On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
-  the app waits up to 10s for them to drain. Long handlers must honor context
-  cancellation.
+  the app waits up to 10s for them to drain. Handlers must honor context
+  cancellation: the worker cannot preempt a handler that ignores it, heartbeats
+  continue until that handler returns, and a non-cooperative handler can exceed
+  the shutdown drain window.
 
 ## Adding a New Module
 

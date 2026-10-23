@@ -30,15 +30,16 @@ var (
 	// ErrInvalidMaxAttempts is returned when Job.MaxAttempts is negative.
 	ErrInvalidMaxAttempts = errors.New("jobs: max attempts must not be negative")
 	// ErrNoHandler is returned internally when a claimed job kind has no
-	// registered handler. Such jobs are moved to the dead state.
+	// registered handler. Such jobs follow the normal retry path and are
+	// dead-lettered once their attempt budget is exhausted.
 	ErrNoHandler = errors.New("jobs: no handler registered")
 	// ErrNoPool is returned when a queue or worker has no database pool.
 	ErrNoPool = errors.New("jobs: database pool is nil")
 	// ErrNoTx is returned when EnqueueTx is called with a nil transaction.
 	ErrNoTx = errors.New("jobs: transaction is nil")
-	// ErrLeaseLost is returned by Heartbeat when the job is no longer running
-	// under the supplied worker, usually because its lease expired and another
-	// worker reclaimed it.
+	// ErrLeaseLost is returned by Heartbeat, Succeed, or Fail when the job is
+	// no longer running under the supplied worker and attempt, usually because
+	// its lease expired and another worker reclaimed it.
 	ErrLeaseLost = errors.New("jobs: worker lease lost")
 )
 

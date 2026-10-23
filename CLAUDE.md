@@ -97,10 +97,20 @@ Offset helpers are for small admin/export tables only.
   version-bound. `pkg/token` pins HS256 and requires `exp`.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
-  work; a worker retries with backoff and dead-letters after `max_attempts`.
-  Heartbeats renew a 5m lease every 30s; expired leases are reclaimed, so a
-  worker that lost its lease may still be executing the old handler. Do not use
-  `async.Go` for durable work.
+  work; password-reset and verification tokens are committed with their
+  `email.send` job in one transaction (`QueuedSender.SendTx`), so an enqueue
+  failure rolls the token back. A worker retries with backoff and dead-letters
+  after `max_attempts`.
+  Claim errors are retried in-process with backoff capped at 30s. Handlers have
+  a 10m default timeout (`WithJobTimeout`, non-positive disables it), and
+  unknown kinds retry until `max_attempts` before dead-lettering. Heartbeats
+  renew a 5m lease every 30s; expired leases are reclaimed. Handlers must honor
+  context cancellation: the worker cannot preempt a handler that ignores it,
+  heartbeats continue until it returns, and a non-cooperative handler can
+  exceed the shutdown drain window (the app waits up to 10s). Bookkeeping writes
+  are fenced by `attempts`, so a reclaimed worker cannot finish the job, though
+  it may still be executing the old handler. Do not use `async.Go` for durable
+  work.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.

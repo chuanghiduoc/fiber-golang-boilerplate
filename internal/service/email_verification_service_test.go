@@ -22,7 +22,7 @@ func newEmailVerifServiceForTest() (
 	vr := newMockEmailVerificationRepo()
 	es := newMockEmailSender()
 	mc := newMockCache()
-	svc := NewEmailVerificationService(ur, vr, es, mc, "http://localhost:3000").(*emailVerificationService)
+	svc := NewEmailVerificationService(ur, vr, es, mc, "http://localhost:3000", nil).(*emailVerificationService)
 	return svc, ur, vr, es, mc
 }
 
@@ -43,6 +43,28 @@ func TestSendVerification(t *testing.T) {
 		// Email should be sent
 		if es.Sent() != 1 {
 			t.Errorf("expected 1 email sent, got %d", es.Sent())
+		}
+	})
+
+	t.Run("transactional sender falls back to Send without a tx manager", func(t *testing.T) {
+		ur := newMockUserRepo()
+		vr := newMockEmailVerificationRepo()
+		es := newMockTransactionalEmailSender()
+		svc := NewEmailVerificationService(ur, vr, es, newMockCache(), "http://localhost:3000", nil)
+
+		err := svc.SendVerification(context.Background(), 1, "user@example.com")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(vr.tokens) != 1 {
+			t.Errorf("expected 1 token, got %d", len(vr.tokens))
+		}
+		if es.Sent() != 1 {
+			t.Errorf("expected exactly 1 email sent, got %d", es.Sent())
+		}
+		if es.SendTxCalls() != 0 {
+			t.Errorf("expected no transactional sends without a tx manager, got %d", es.SendTxCalls())
 		}
 	})
 

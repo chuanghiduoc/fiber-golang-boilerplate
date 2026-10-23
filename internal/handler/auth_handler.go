@@ -85,6 +85,10 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		})
 	}
 
+	// Attribute the audit event to the newly registered user. The key matches
+	// middleware.JWTAuth and is read by audit.Middleware after the response.
+	fiber.Locals(c, "user_id", user.ID)
+
 	return response.Created(c, user)
 }
 
@@ -121,6 +125,9 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+
+	// Attribute the audit event to the authenticated user.
+	fiber.Locals(c, "user_id", user.ID)
 
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  accessToken,
@@ -180,6 +187,9 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+
+	// Attribute the audit event to the authenticated user.
+	fiber.Locals(c, "user_id", user.ID)
 
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  accessToken,

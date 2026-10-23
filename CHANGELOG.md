@@ -8,7 +8,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 - Modular-monolith composition root (`internal/app`) with module-owned route tables (`internal/modules/identity`, `files`, `admin`); platform packages for cross-cutting mechanics
-- Durable PostgreSQL job queue (`internal/platform/jobs`): transactional enqueue, `FOR UPDATE SKIP LOCKED` claiming, lease heartbeats with stale-lock reclamation, exponential backoff, dead-lettering, graceful drain; email delivery now runs through queued jobs. Delivery is at-least-once, so handlers must be idempotent.
+- Durable PostgreSQL job queue (`internal/platform/jobs`): transactional enqueue, `FOR UPDATE SKIP LOCKED` claiming, lease heartbeats with stale-lock reclamation, exponential backoff, dead-lettering, graceful drain; email delivery now runs through queued jobs. Password-reset and verification tokens are committed together with their `email.send` job via `QueuedSender.SendTx`, so an enqueue failure rolls the token back. Delivery is at-least-once, so handlers must be idempotent.
 - Permission-based authorization (`internal/platform/authz`) with a role→permission matrix and `Require`/`RequireAny` middleware
 - Generic audit trail (`internal/platform/audit`) for successful mutating requests plus explicit domain events
 - Typed error catalog (`pkg/apperror/catalog.go`) mapping stable codes to HTTP status/title
@@ -25,6 +25,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
 
 ### Fixed
+- Worker claim errors are retried with exponential backoff capped at 30s instead of terminating the worker (and the API process that hosts it)
+- Job heartbeat, success, and failure writes are fenced by `attempts`, so a worker whose lease was reclaimed cannot finish the job under its new owner
+- Login, register, and refresh audit events now carry the authenticated user ID instead of an anonymous actor
+- Handlers get a 10m default timeout (`WithJobTimeout`, non-positive disables it), and unknown job kinds now retry with normal backoff until `max_attempts` before dead-lettering
 - Job bookkeeping now reports lost leases (`RowsAffected` check) and logs outcome-write failures instead of silently leaving a job `running`
 - Heartbeats are clamped to at least four renewals per lease, and terminal jobs clear their payload so queued email secrets are not retained
 - `cmd/migrate` verifies required tables after migrating and fails with an actionable message for legacy version-1 schemas
