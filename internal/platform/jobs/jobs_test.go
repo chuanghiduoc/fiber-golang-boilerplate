@@ -842,7 +842,10 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- worker.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return fake.purgeCallCount() >= 1
+	}, 2*time.Second, time.Millisecond, "the worker must run retention on the configured interval")
+
 	cancel()
 	select {
 	case err := <-errCh:
@@ -852,13 +855,50 @@ func TestWorkerRunPurgesTerminalJobsOnInterval(t *testing.T) {
 	}
 
 	calls := fake.purgeCallCount()
-	require.GreaterOrEqual(t, calls, 1, "the worker must run retention on the configured interval")
+	require.GreaterOrEqual(t, calls, 1)
 	assert.Equal(t, time.Hour, fake.retentionSeen())
 	assert.Equal(t, before+float64(calls)*3, metricValue(t, metrics.JobsPurgedTotal))
 }
 
+func TestWorkerRunPurgesImmediatelyOnStartup(t *testing.T) {
+	fake := &fakeStore{purgeRows: 2}
+	worker := NewWorker(nil, "purge-worker",
+		WithPollInterval(time.Hour),
+		WithRetention(30*24*time.Hour),
+		WithPurgeInterval(time.Hour),
+	)
+	worker.store = fake
+
+	before := metricValue(t, metrics.JobsPurgedTotal)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- worker.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return fake.purgeCallCount() >= 1
+	}, 2*time.Second, time.Millisecond,
+		"a fresh worker must run retention without waiting a full interval")
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+
+	calls := fake.purgeCallCount()
+	require.GreaterOrEqual(t, calls, 1)
+	assert.Equal(t, 30*24*time.Hour, fake.retentionSeen())
+	assert.Equal(t, before+float64(calls)*2, metricValue(t, metrics.JobsPurgedTotal))
+}
+
 func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
-	fake := &fakeStore{purgeErr: errors.New("purge unavailable")}
+	fake := &fakeStore{
+		purgeRows: 2,
+		purgeErr:  errors.New("purge unavailable"),
+	}
 	worker := NewWorker(nil, "purge-worker",
 		WithPollInterval(time.Millisecond),
 		WithRetention(time.Hour),
@@ -884,8 +924,9 @@ func TestWorkerRunPurgeFailureIsLoggedAndRetried(t *testing.T) {
 		t.Fatal("worker did not stop after context cancellation")
 	}
 
-	assert.Equal(t, before, metricValue(t, metrics.JobsPurgedTotal),
-		"a failed purge must not count as purged rows")
+	calls := fake.purgeCallCount()
+	assert.Equal(t, before+float64(calls)*2, metricValue(t, metrics.JobsPurgedTotal),
+		"rows deleted before a batch failure must still be counted")
 }
 
 func TestWorkerRunRetentionDisabled(t *testing.T) {
@@ -901,7 +942,10 @@ func TestWorkerRunRetentionDisabled(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- worker.Run(ctx) }()
 
-	time.Sleep(50 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return fake.claimCallCount() >= 1
+	}, 2*time.Second, time.Millisecond, "worker must enter its claim loop")
+
 	cancel()
 	select {
 	case err := <-errCh:
@@ -1307,6 +1351,12 @@ func (f *fakeStore) purgeCallCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.purgeCalls
+}
+
+func (f *fakeStore) claimCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claimCalls
 }
 
 func (f *fakeStore) retentionSeen() time.Duration {

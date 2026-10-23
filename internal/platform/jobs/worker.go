@@ -25,7 +25,7 @@ const (
 	defaultRetention         = 30 * 24 * time.Hour
 	defaultPurgeInterval     = time.Hour
 	bookkeepingTimeout       = 5 * time.Second
-	purgeTimeout             = 10 * time.Second
+	purgeTimeout             = 5 * time.Second
 	maxClaimBackoff          = 30 * time.Second
 )
 
@@ -237,7 +237,9 @@ func (w *Worker) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	lastPurge := time.Now()
+	// Subtract one interval so a fresh worker is immediately due: a process
+	// restarted more often than the interval still performs retention.
+	lastPurge := time.Now().Add(-w.purgeInterval)
 
 	for {
 		if ctx.Err() != nil {
@@ -397,8 +399,9 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 
 // purgeTerminal runs one retention pass. It uses a detached context bounded by
 // purgeTimeout so a slow DELETE cannot hold shutdown open indefinitely or be
-// aborted mid-flight when the worker context is canceled. Success is counted in
-// JobsPurgedTotal; failures are logged and retried on the next interval.
+// aborted mid-flight when the worker context is canceled. Every successfully
+// deleted row counts toward JobsPurgedTotal, including a partial total returned
+// with an error; failures are logged and retried on the next interval.
 func (w *Worker) purgeTerminal(ctx context.Context) {
 	if w == nil || w.retention <= 0 || w.store == nil {
 		return
@@ -408,15 +411,17 @@ func (w *Worker) purgeTerminal(ctx context.Context) {
 	defer cancel()
 
 	purged, err := w.store.PurgeTerminal(purgeCtx, w.retention)
+	if purged > 0 {
+		metrics.JobsPurgedTotal.Add(float64(purged))
+	}
 	if err != nil {
 		slog.Warn("jobs: purge terminal jobs failed",
 			"worker_id", w.id,
 			"retention", w.retention,
+			"purged", purged,
 			"error", err,
 		)
-		return
 	}
-	metrics.JobsPurgedTotal.Add(float64(purged))
 }
 
 // startHeartbeat renews the job's lease until the returned stop function is

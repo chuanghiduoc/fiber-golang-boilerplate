@@ -112,12 +112,14 @@ Offset helpers are for small admin/export tables only.
   it may still be executing the old handler. Do not use `async.Go` for durable
   work. Terminal rows (`succeeded`/`dead`) are purged hourly once older than
   30 days (`WithRetention`; non-positive disables) at `WithPurgeInterval`
-  (non-positive values are ignored); only terminal rows are eligible, and each
-  purge is bounded to 10s. Prometheus counters cover job lifecycle
+  (non-positive values are ignored), starting immediately when a worker boots.
+  Only terminal rows are eligible; each pass is bounded to 5s and deletes in
+  batches of at most 1,000 rows. Prometheus counters cover job lifecycle
   (`jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
   `jobs_retried_total{kind}`, `jobs_dead_total{kind}`), claim failures
   (`jobs_claim_errors_total`), purges (`jobs_purged_total`), and audit write
-  failures (`audit_write_failures_total`).
+  failures (`audit_write_failures_total`). `jobs_dead_total` covers handler
+  failures that exhaust attempts, not lease-expiry dead letters.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
