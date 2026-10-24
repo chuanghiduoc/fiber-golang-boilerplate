@@ -24,6 +24,8 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
+	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
+	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -183,8 +185,8 @@ func main() {
 	userHandler := handler.NewUserHandler(userSvc, emailVerifSvc)
 
 	fileRepo := repository.NewFileRepository(pool)
-	uploadSvc := service.NewUploadService(fileRepo, store)
-	uploadHandler := handler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
+	uploadSvc := filesvc.NewUploadService(fileRepo, store)
+	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
 
 	// Admin
 	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager, sessionStore)

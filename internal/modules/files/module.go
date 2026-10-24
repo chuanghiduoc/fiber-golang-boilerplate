@@ -4,16 +4,16 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module owns file upload, metadata, download, soft delete, and restore.
 type Module struct {
-	upload *handler.UploadHandler
+	upload *fileshandler.UploadHandler
 }
 
-func New(upload *handler.UploadHandler) *Module {
+func New(upload *fileshandler.UploadHandler) *Module {
 	return &Module{upload: upload}
 }
 

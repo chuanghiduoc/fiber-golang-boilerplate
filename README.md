@@ -48,14 +48,15 @@ internal/app/                       Composition root: Fiber, global middleware, 
 internal/modules/
   identity/                         Auth, users, sessions, tokens (route table + admin seed)
   files/                            Upload, download, soft delete, restore
+                                    (service + handler now live here)
   admin/                            Back-office facade
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
-internal/handler/                   Current handler internals (being moved into modules)
-internal/service/                   Current service internals
+internal/handler/                   Legacy handler internals + files compatibility wrappers
+internal/service/                   Legacy service internals + files compatibility wrappers
 internal/repository/                Current repository internals
 internal/dto/                       Current DTOs
 internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
@@ -465,7 +466,8 @@ migration entrypoint exist. Remaining work:
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
 - Moving `internal/handler|service|repository|dto` internals into the module
-  directories (the strangler phase noted above).
+  directories (the strangler phase noted above). The files service and handler
+  have moved; the files repository and DTOs are still legacy.
 
 ## Security notes
 
