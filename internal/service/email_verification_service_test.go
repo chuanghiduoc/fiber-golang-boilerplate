@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 func newEmailVerifServiceForTest() (
@@ -109,6 +111,61 @@ func TestSendVerificationTxRequiresTransaction(t *testing.T) {
 	if es.SendTxCalls() != 0 || es.Sent() != 0 {
 		t.Errorf("no email may be queued without a transaction, got SendTx=%d Send=%d", es.SendTxCalls(), es.Sent())
 	}
+}
+
+func TestSendVerificationTxRejectsNonTransactionalSender(t *testing.T) {
+	ur := newMockUserRepo()
+	vr := newMockEmailVerificationRepo()
+	es := newMockEmailSender()
+	svc := NewEmailVerificationService(ur, vr, es, newMockCache(), "http://localhost:3000", nil)
+
+	// The sender is checked before the transaction, so a nil tx still proves
+	// the capability gate rejects a non-transactional sender.
+	err := svc.SendVerificationTx(context.Background(), nil, 1, "user@example.com")
+	if err == nil {
+		t.Fatal("expected error for a non-transactional sender")
+	}
+	if !strings.Contains(err.Error(), "transactional") {
+		t.Errorf("expected a transactional-sender error, got %q", err.Error())
+	}
+	if len(vr.tokens) != 0 {
+		t.Errorf("no token may be created for a non-transactional sender, got %d", len(vr.tokens))
+	}
+	if es.Sent() != 0 {
+		t.Errorf("no email may be sent for a non-transactional sender, got %d", es.Sent())
+	}
+}
+
+func TestSupportsTransactionalEnqueue(t *testing.T) {
+	t.Run("false without a tx manager", func(t *testing.T) {
+		svc := NewEmailVerificationService(
+			newMockUserRepo(), newMockEmailVerificationRepo(), newMockTransactionalEmailSender(),
+			newMockCache(), "http://localhost:3000", nil,
+		)
+		if svc.SupportsTransactionalEnqueue() {
+			t.Error("a service without a tx manager must not claim transactional enqueue support")
+		}
+	})
+
+	t.Run("false with a non-transactional sender", func(t *testing.T) {
+		svc := NewEmailVerificationService(
+			newMockUserRepo(), newMockEmailVerificationRepo(), newMockEmailSender(),
+			newMockCache(), "http://localhost:3000", database.NewTxManager(nil),
+		)
+		if svc.SupportsTransactionalEnqueue() {
+			t.Error("a plain sender must not claim transactional enqueue support")
+		}
+	})
+
+	t.Run("true with a tx manager and transactional sender", func(t *testing.T) {
+		svc := NewEmailVerificationService(
+			newMockUserRepo(), newMockEmailVerificationRepo(), newMockTransactionalEmailSender(),
+			newMockCache(), "http://localhost:3000", database.NewTxManager(nil),
+		)
+		if !svc.SupportsTransactionalEnqueue() {
+			t.Error("a tx manager and transactional sender must support transactional enqueue")
+		}
+	})
 }
 
 func TestVerify(t *testing.T) {

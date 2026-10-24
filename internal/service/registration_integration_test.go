@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -118,6 +119,9 @@ func TestRegisterIntegrationRollsBackUserWhenEnqueueFails(t *testing.T) {
 		Name:     "Atomic Rollback",
 	})
 	require.Error(t, err, "a failed outbox write must fail registration")
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr, "provisioning failures must use the stable internal error contract")
+	require.Equal(t, 500, appErr.Status, "registration provisioning failures must surface as internal errors")
 
 	var userCount int
 	require.NoError(t, pool.QueryRow(ctx,

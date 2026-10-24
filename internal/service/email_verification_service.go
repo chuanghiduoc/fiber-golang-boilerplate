@@ -33,11 +33,15 @@ type transactionalEmailSender interface {
 // the user, token, and email job commit together.
 type VerificationProvisioner interface {
 	SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error
+	// SupportsTransactionalEnqueue reports whether SendVerificationTx can
+	// enqueue the email on the caller's transaction.
+	SupportsTransactionalEnqueue() bool
 }
 
 type EmailVerificationService interface {
 	SendVerification(ctx context.Context, userID int64, userEmail string) error
 	SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error
+	SupportsTransactionalEnqueue() bool
 	Verify(ctx context.Context, token string) error
 	ResendVerification(ctx context.Context, emailAddr string) error
 	// Invalidate removes pending verification tokens, e.g. after an email
@@ -70,6 +74,16 @@ func NewEmailVerificationService(
 		frontURL:  frontendURL,
 		txManager: txManager,
 	}
+}
+
+// SupportsTransactionalEnqueue reports whether this service can write the
+// token and enqueue its email on a caller-owned transaction.
+func (s *emailVerificationService) SupportsTransactionalEnqueue() bool {
+	if s.txManager == nil {
+		return false
+	}
+	_, transactional := s.sender.(transactionalEmailSender)
+	return transactional
 }
 
 func (s *emailVerificationService) SendVerification(ctx context.Context, userID int64, userEmail string) error {
@@ -117,12 +131,14 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 // It fails closed: a nil transaction or a non-transactional sender is an error
 // rather than a silent post-commit send.
 func (s *emailVerificationService) SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error {
-	if tx == nil {
-		return errors.New("send verification: transaction is required")
-	}
+	// Check sender capability first: a non-transactional sender can never honor
+	// this method, regardless of whether the transaction is present.
 	txSender, transactional := s.sender.(transactionalEmailSender)
 	if !transactional {
 		return errors.New("send verification: sender does not support transactional enqueue")
+	}
+	if tx == nil {
+		return errors.New("send verification: transaction is required")
 	}
 
 	userEmail = normalizeEmail(userEmail)

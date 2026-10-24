@@ -161,6 +161,10 @@ func (m *mockEmailVerificationService) SendVerificationTx(_ context.Context, _ p
 	return nil
 }
 
+func (m *mockEmailVerificationService) SupportsTransactionalEnqueue() bool {
+	return false
+}
+
 func (m *mockEmailVerificationService) SendVerificationCallCount() int {
 	return int(m.sendVerificationCalls.Load())
 }

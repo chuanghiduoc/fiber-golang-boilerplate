@@ -104,13 +104,22 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, err
 	}
 
+	// Hash before opening a transaction: bcrypt is intentionally expensive and
+	// must not hold a pooled database connection for hundreds of milliseconds.
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	if err != nil {
+		return nil, apperror.NewInternal("failed to hash password")
+	}
+
 	var user *sqlc.User
-	if s.verificationProvisioner != nil && s.txManager != nil {
+	if s.verificationProvisioner != nil &&
+		s.txManager != nil &&
+		s.verificationProvisioner.SupportsTransactionalEnqueue() {
 		// Create the user, verification token, and email job in one transaction.
 		// A provisioning failure rolls the user back: registration fails closed
 		// rather than committing an account that cannot receive its link.
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, req.Password)
+			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, hash)
 			if createErr != nil {
 				return createErr
 			}
@@ -120,7 +129,9 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 					slog.String("email", created.Email),
 					slog.Any("error", provErr),
 				)
-				return provErr
+				// Provisioning details (including context deadlines) are for the
+				// logs only. Keep the public registration contract at 500.
+				return apperror.NewInternal("failed to create user")
 			}
 			user = created
 			return nil
@@ -129,7 +140,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 			return nil, err
 		}
 	} else {
-		user, err = s.createUser(ctx, s.repo, email, name, req.Password)
+		user, err = s.createUser(ctx, s.repo, email, name, hash)
 		if err != nil {
 			return nil, err
 		}
@@ -141,18 +152,14 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	return ToUserResponse(user), nil
 }
 
-// createUser creates a local account through repo, which may be backed by the
-// pool or by a caller-owned transaction.
+// createUser creates a local account with a precomputed password hash through
+// repo, which may be backed by the pool or by a caller-owned transaction.
 func (s *userService) createUser(
 	ctx context.Context,
 	repo repository.UserRepository,
-	email, name, password string,
+	email, name string,
+	hash []byte,
 ) (*sqlc.User, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to hash password")
-	}
-
 	user, err := repo.Create(ctx, sqlc.CreateUserParams{
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
@@ -172,7 +179,9 @@ func (s *userService) SetVerificationProvisioner(p VerificationProvisioner) {
 }
 
 func (s *userService) RegistrationEmailsTransactional() bool {
-	return s.verificationProvisioner != nil && s.txManager != nil
+	return s.verificationProvisioner != nil &&
+		s.txManager != nil &&
+		s.verificationProvisioner.SupportsTransactionalEnqueue()
 }
 
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {

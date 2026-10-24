@@ -253,11 +253,13 @@ and safe to retry. Use `Queue.EnqueueTx` when a job must commit atomically with
 the business transaction that produced it. Password-reset and email-verification
 services already do this: the token row and the `email.send` job share one
 transaction, so a crash cannot leave a usable link without a queued email.
-Registration is atomic as well: the user row, its verification token, and the
+When transactional email provisioning is wired (as in `cmd/api/main.go`),
+registration is atomic as well: the user row, its verification token, and the
 `email.send` job commit together, and an outbox write failure rolls the account
-back (fail-closed). Resend-verification and email-change flows still create
-their token and email in a separate transaction after the account already
-exists.
+back (fail-closed). Without that wiring, the handler falls back to a
+post-commit verification email. Resend-verification and email-change flows
+still create their token and email in a separate transaction after the account
+already exists.
 
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
