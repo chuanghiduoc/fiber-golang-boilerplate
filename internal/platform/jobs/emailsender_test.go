@@ -1,0 +1,148 @@
+package jobs
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+)
+
+type recordingEmailSender struct {
+	messages []email.Message
+	err      error
+}
+
+func (s *recordingEmailSender) Send(_ context.Context, msg email.Message) error {
+	s.messages = append(s.messages, msg)
+	return s.err
+}
+
+func testEmailMessage() email.Message {
+	return email.Message{
+		To:      []string{"user@example.com"},
+		Subject: "Reset your password",
+		Body:    "Reset your password: https://app.example/reset?token=secret-token",
+		HTML:    `<a href="https://app.example/reset?token=secret-token">Reset</a>`,
+	}
+}
+
+func TestEmailJobWithoutCodecKeepsPlaintext(t *testing.T) {
+	t.Parallel()
+
+	msg := testEmailMessage()
+	job, err := emailJob(msg, nil)
+	require.NoError(t, err)
+	require.Equal(t, EmailJobKind, job.Kind)
+	assert.Contains(t, string(job.Payload), "secret-token")
+
+	var decoded email.Message
+	require.NoError(t, json.Unmarshal(job.Payload, &decoded))
+	assert.Equal(t, msg, decoded)
+}
+
+func TestEmailJobWithCodecSealsPayload(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+
+	msg := testEmailMessage()
+	job, err := emailJob(msg, codec)
+	require.NoError(t, err)
+	require.Equal(t, EmailJobKind, job.Kind)
+
+	encoded := string(job.Payload)
+	assert.NotContains(t, encoded, "secret-token")
+	assert.NotContains(t, encoded, "user@example.com")
+
+	opened, err := codec.Open(job.Payload)
+	require.NoError(t, err)
+	var decoded email.Message
+	require.NoError(t, json.Unmarshal(opened, &decoded))
+	assert.Equal(t, msg, decoded)
+}
+
+func TestEmailHandlerWithCodecDecodesEncryptedPayload(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	msg := testEmailMessage()
+	job, err := emailJob(msg, codec)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	handler := EmailHandler(sender, WithEmailPayloadCodec(codec))
+	require.NoError(t, handler(context.Background(), job.Payload))
+	require.Len(t, sender.messages, 1)
+	assert.Equal(t, msg, sender.messages[0])
+}
+
+func TestEmailHandlerWithCodecAcceptsLegacyPlaintext(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	msg := testEmailMessage()
+	payload, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	handler := EmailHandler(sender, WithEmailPayloadCodec(codec))
+	require.NoError(t, handler(context.Background(), payload))
+	require.Len(t, sender.messages, 1)
+	assert.Equal(t, msg, sender.messages[0])
+}
+
+func TestEmailHandlerWithoutCodecDecodesPlaintext(t *testing.T) {
+	t.Parallel()
+
+	msg := testEmailMessage()
+	payload, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	require.NoError(t, EmailHandler(sender)(context.Background(), payload))
+	require.Len(t, sender.messages, 1)
+	assert.Equal(t, msg, sender.messages[0])
+}
+
+func TestEmailHandlerWithCodecReturnsErrorForTamperedPayload(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	msg := testEmailMessage()
+	job, err := emailJob(msg, codec)
+	require.NoError(t, err)
+
+	// Break the ciphertext while keeping the envelope structurally valid.
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(job.Payload, &envelope))
+	envelope.Data = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	tampered, err := json.Marshal(envelope)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	handler := EmailHandler(sender, WithEmailPayloadCodec(codec))
+	err = handler(context.Background(), tampered)
+	require.ErrorIs(t, err, ErrPayloadDecryption)
+	assert.Empty(t, sender.messages, "a tampered payload must not reach the sender")
+}
+
+func TestEmailHandlerPropagatesSenderError(t *testing.T) {
+	t.Parallel()
+
+	msg := testEmailMessage()
+	payload, err := json.Marshal(msg)
+	require.NoError(t, err)
+
+	sendErr := errors.New("smtp unavailable")
+	sender := &recordingEmailSender{err: sendErr}
+	require.ErrorIs(t, EmailHandler(sender)(context.Background(), payload), sendErr)
+}
