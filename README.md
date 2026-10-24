@@ -21,7 +21,7 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 ## Tech Stack
 
 - **Framework**: [Fiber v3](https://docs.gofiber.io/) (Go 1.27.3+)
-- **Database**: PostgreSQL 17 with [pgxpool](https://github.com/jackc/pgx)
+- **Database**: PostgreSQL 18 with [pgxpool](https://github.com/jackc/pgx)
 - **Query**: [sqlc](https://sqlc.dev/) (type-safe SQL code generation)
 - **Migration**: [golang-migrate](https://github.com/golang-migrate/migrate) via one `cmd/migrate` entrypoint (single init schema)
 - **Auth**: JWT ([golang-jwt](https://github.com/golang-jwt/jwt)) + Google OAuth 2.0

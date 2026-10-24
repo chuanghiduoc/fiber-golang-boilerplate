@@ -28,7 +28,7 @@ rendered Secret.
 - Kubernetes 1.29+ and `kubectl` (with built-in kustomize).
 - `kustomize` v5.8.1+ for `kustomize edit set image` in the manual flow;
   `kubectl kustomize` can render but has no `edit` subcommand.
-- A managed PostgreSQL 17 instance reachable over TLS. `DB_SSLMODE=require`
+- A managed PostgreSQL 18 instance reachable over TLS. `DB_SSLMODE=require`
   (or `verify-full`) is mandatory because `APP_ENV=production`.
 - A managed Redis instance. Redis is required for correct session invalidation
   when more than one API replica is running.

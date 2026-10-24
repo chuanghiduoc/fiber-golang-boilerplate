@@ -178,7 +178,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:17
+        image: postgres:18
         env:
           POSTGRES_DB: boilerplate
           POSTGRES_USER: postgres
@@ -319,7 +319,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: postgres:17
+        image: postgres:18
         env:
           POSTGRES_DB: apptest
           POSTGRES_USER: postgres

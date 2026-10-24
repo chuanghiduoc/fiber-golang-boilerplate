@@ -8,12 +8,12 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Repository is the feature-flag admin persistence contract.
@@ -65,8 +65,7 @@ func (r *featureRepository) UpsertFlag(ctx context.Context, params featuressqlc.
 // delete. The conflict deliberately does not say which tenants own targets.
 func (r *featureRepository) DeleteFlag(ctx context.Context, key string) error {
 	if _, err := r.q.DeleteFeatureFlag(ctx, key); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == flagKeyFK {
+		if constraint, ok := database.ForeignKeyViolation(err); ok && constraint == flagKeyFK {
 			return apperror.NewConflict("feature flag has targets; delete them before deleting the flag")
 		}
 		return wrapErr(err)
@@ -128,18 +127,15 @@ func wrapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return apperror.ErrNotFound
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "23503": // foreign_key_violation
-			if pgErr.ConstraintName == flagKeyFK {
-				// A target upsert lost a race with a concurrent flag delete.
-				return apperror.NewConflict("feature flag was modified concurrently; retry the request")
-			}
-			return apperror.NewBadRequest("target references a user or tenant outside the current scope")
-		case "23505": // unique_violation
-			return apperror.NewConflict("feature flag target already exists")
+	if constraint, ok := database.ForeignKeyViolation(err); ok {
+		if constraint == flagKeyFK {
+			// A target upsert lost a race with a concurrent flag delete.
+			return apperror.NewConflict("feature flag was modified concurrently; retry the request")
 		}
+		return apperror.NewBadRequest("target references a user or tenant outside the current scope")
+	}
+	if database.IsUniqueViolation(err) {
+		return apperror.NewConflict("feature flag target already exists")
 	}
 	return err
 }

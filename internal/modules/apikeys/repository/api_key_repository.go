@@ -11,13 +11,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	apikeyssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -248,11 +248,8 @@ func wrapErr(err error) error {
 	}
 	// fk_api_keys_tenant_user: the owner does not exist in the key's tenant.
 	// Surface it like any other missing owner instead of a 500.
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == sqlStateForeignKeyViolation {
+	if _, ok := database.ForeignKeyViolation(err); ok {
 		return apperror.ErrNotFound
 	}
 	return err
 }
-
-const sqlStateForeignKeyViolation = "23503"
