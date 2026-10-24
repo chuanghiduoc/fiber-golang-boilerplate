@@ -3,13 +3,13 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// HTTP helpers shared with the legacy handler package live in platform/httpx.
-// These unexported wrappers keep the module's call sites stable.
+// HTTP helpers shared across handlers live in platform/httpx. These
+// unexported wrappers keep the module's call sites stable.
 
 func paramID(c fiber.Ctx, name string) (int64, error) {
 	return httpx.ParamID(c, name)

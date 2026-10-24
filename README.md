@@ -49,17 +49,15 @@ internal/modules/
   identity/                         Auth, users, sessions, tokens
                                     (dto + repository + service + handler + admin seed)
   files/                            Upload, download, soft delete, restore
-                                    (service + handler now live here)
+                                    (dto + repository + service + handler + adapter)
   admin/                            Back-office facade
+                                    (dto + service + handler, contracts-only)
+internal/contracts/                 Narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
-internal/handler/                   Legacy admin handler + files compatibility wrapper
-internal/service/                   Legacy admin service + files compatibility wrapper
-internal/repository/                Legacy files repository
-internal/dto/                       Legacy admin/files DTOs
 internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
@@ -422,12 +420,11 @@ checklist.
    `test/arch` rejects cross-module imports.
 8. Run `make swagger` and `make check` before opening a PR.
 
-> `identity` owns its DTOs, repositories, services, and handlers under
-> `internal/modules/identity`. `files` owns its upload handler, service, and
-> repository inside the module, while still using the legacy DTO layer.
-> `admin` still wraps the global handler/service packages. Moving the remaining
-> internals is the next strangler phase; new modules should start directly in
-> the module layout.
+> `identity`, `files`, and `admin` own all of their DTOs, repositories,
+> services, and handlers under `internal/modules/<name>`. `admin` reaches
+> identity/files only through the stdlib-only `internal/contracts` interfaces
+> implemented by the owner modules' adapters. `internal/sqlc` is the only
+> shared generated package; there are no legacy handler/service/DTO packages.
 
 ## Environment Variables
 
@@ -478,10 +475,10 @@ migration entrypoint exist. Remaining work:
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
-- Moving `internal/handler|service|repository|dto` internals into the module
-  directories (the strangler phase noted above). `identity` and the files
-  service/handler/repository have moved; `admin` handler/service and the files
-  DTO still live in the legacy layer.
+
+All bounded-context internals are module-owned under `internal/modules`; the
+only shared generated package is `internal/sqlc`, and `admin` composes through
+`internal/contracts`. No legacy handler/service/DTO/repository packages remain.
 
 ## Security notes
 

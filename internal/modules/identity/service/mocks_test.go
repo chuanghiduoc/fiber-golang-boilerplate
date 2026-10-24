@@ -301,8 +301,16 @@ func (m *mockUserRepo) CountActiveAdmins(_ context.Context) (int64, error) {
 	return count, nil
 }
 
-func (m *mockUserRepo) GetSystemStats(_ context.Context) (sqlc.GetSystemStatsRow, error) {
-	return sqlc.GetSystemStatsRow{ActiveUsers: int64(len(m.users))}, nil
+func (m *mockUserRepo) AdminUserStats(_ context.Context) (sqlc.AdminUserStatsRow, error) {
+	var active, deleted int64
+	for _, u := range m.users {
+		if u.DeletedAt.Valid {
+			deleted++
+		} else {
+			active++
+		}
+	}
+	return sqlc.AdminUserStatsRow{ActiveUsers: active, DeletedUsers: deleted}, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -13,16 +13,17 @@ cmd/seed       standalone admin seeder (schema must already exist)
 
 internal/app   composition root: Fiber, middleware, infra routes, module registry
 internal/modules
-  identity     auth, users, sessions, tokens, admin seed (dto/repository/service/handler)
-  files        upload, metadata, download, soft delete, restore (handler/service)
-  admin        back-office facade
+  identity     auth, users, sessions, tokens, admin seed (dto/repository/service/handler + adapter)
+  files        upload, metadata, download, soft delete, restore (dto/repository/service/handler + adapter)
+  admin        back-office facade (dto/service/handler, contracts-only)
+internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-internal/handler|service|dto|sqlc   remaining legacy strangler layer
+internal/sqlc  shared generated SQL (the only shared generated package)
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
 
@@ -39,12 +40,18 @@ client
 ## Dependency rules
 
 - A module must not import another module's internals. Use an exported
-  contract in `internal/contracts` or a narrow interface.
+  contract in `internal/contracts` or a narrow interface. Contracts are
+  stdlib-only and never import modules, repositories, DTOs, sqlc, storage,
+  database, or session packages.
 - `internal/platform/*` and `pkg/*` must not import business modules.
 - One module owns each table. Cross-module reads go through a read model or
   contract, never another module's repository.
-- Generated sqlc code is shared infrastructure while the strangler migration
-  is in progress; new modules should keep their queries and DTOs local.
+- Module DTOs, repositories, services, and handlers stay inside the owning
+  module. `internal/sqlc` is the only shared generated package; per-module sqlc
+  generation remains future work.
+- Modules must not import the deleted shared legacy handler/service/DTO/
+  repository packages; the architecture test enforces this so the layer cannot
+  return.
 - Enforced by `test/arch/imports_test.go` (`make arch`).
 
 ## Data and transactions
@@ -82,19 +89,19 @@ client
 
 ## Strangler status
 
-The module wrappers own route tables. The `identity` module owns its DTOs,
-repositories, services, and HTTP handlers under `internal/modules/identity`;
-legacy identity code has been deleted rather than aliased. The `files` module
-owns its upload service, HTTP handler, and repository under
-`internal/modules/files/{service,handler,repository}`; `internal/service` and
-`internal/handler` keep thin deprecated aliases and constructors so legacy
-call sites continue to compile. The files DTOs still live in the legacy
-`internal/dto` package. `admin` still keeps its handler/service in the legacy
-layer while consuming the identity/files module packages.
+The migration is complete. `identity`, `files`, and `admin` own their DTOs,
+repositories, services, and HTTP handlers under `internal/modules/<name>`;
+there are no shared legacy handler/service/DTO/repository packages or
+compatibility aliases.
 
-`admin` still keeps its handler/service in the legacy layer while using the
-identity module's repository/DTO/service contracts. Moving the remaining
-internals one module at a time remains the next phase; new code should start in
+The `admin` module depends on `internal/contracts.IdentityAdmin` and
+`internal/contracts.FilesAdmin`; identity and files implement those contracts
+with adapters in their own `adapter` packages. Admin never imports another
+module, its repository, generated SQL, storage, database transactions, or
+session store. Identity and files each own their half of the dashboard stats
+(`AdminUserStats` / `AdminFileStats`), so no cross-module SQL remains.
+
+`internal/sqlc` is the only shared generated package. New code should start in
 `internal/modules/<name>/` and use contracts for cross-module reads.
 
 ## Extension checklist

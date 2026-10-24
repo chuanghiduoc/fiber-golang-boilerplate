@@ -7,16 +7,17 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 )
 
-func seedUsers(repo *mockUserRepo, n int) {
+func seedAdminUsers(repo *mockUserRepo, n int) {
 	for i := 0; i < n; i++ {
 		repo.users[repo.nextID] = &sqlc.User{
 			ID:        repo.nextID,
 			Email:     "user@example.com",
 			Name:      "User",
-			Role:      "user",
+			Role:      dto.RoleUser,
 			CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 			UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		}
@@ -24,34 +25,17 @@ func seedUsers(repo *mockUserRepo, n int) {
 	}
 }
 
-func seedFiles(repo *mockFileRepo, n int) {
-	for i := 0; i < n; i++ {
-		repo.files[repo.nextID] = &sqlc.File{
-			ID:           repo.nextID,
-			UserID:       1,
-			OriginalName: "file.txt",
-			StoragePath:  "uploads/file.txt",
-			MimeType:     "text/plain",
-			Size:         1024,
-			CreatedAt:    pgtype.Timestamptz{Time: time.Now(), Valid: true},
-		}
-		repo.nextID++
-	}
-}
-
-func newAdminServiceForTest() (*adminService, *mockUserRepo, *mockFileRepo, *mockRefreshTokenRepo, *mockStorage) {
+func newAdminUserServiceForTest() (*adminUserService, *mockUserRepo, *mockRefreshTokenRepo) {
 	ur := newMockUserRepo()
-	fr := newMockFileRepo()
 	rtr := newMockRefreshTokenRepo()
-	st := newMockStorage()
-	svc := NewAdminService(ur, fr, rtr, st, nil).(*adminService)
-	return svc, ur, fr, rtr, st
+	svc := NewAdminUserService(ur, rtr, nil).(*adminUserService)
+	return svc, ur, rtr
 }
 
 func TestAdminListUsers(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		svc, ur, _, _, _ := newAdminServiceForTest()
-		seedUsers(ur, 3)
+		svc, ur, _ := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 3)
 
 		users, hasMore, err := svc.ListUsers(context.Background(), 10, "")
 		if err != nil {
@@ -66,7 +50,7 @@ func TestAdminListUsers(t *testing.T) {
 	})
 
 	t.Run("empty list", func(t *testing.T) {
-		svc, _, _, _, _ := newAdminServiceForTest()
+		svc, _, _ := newAdminUserServiceForTest()
 
 		users, hasMore, err := svc.ListUsers(context.Background(), 10, "")
 		if err != nil {
@@ -79,26 +63,44 @@ func TestAdminListUsers(t *testing.T) {
 			t.Errorf("len(users) = %d, want 0", len(users))
 		}
 	})
+
+	t.Run("invalid cursor", func(t *testing.T) {
+		svc, _, _ := newAdminUserServiceForTest()
+
+		_, _, err := svc.ListUsers(context.Background(), 10, "not-a-cursor")
+		if err == nil {
+			t.Fatal("expected invalid cursor error")
+		}
+	})
 }
 
 func TestAdminUpdateRole(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		svc, ur, _, _, _ := newAdminServiceForTest()
-		seedUsers(ur, 1)
+		svc, ur, _ := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 1)
 
-		user, err := svc.UpdateRole(context.Background(), 1, "admin")
+		user, err := svc.UpdateRole(context.Background(), 1, dto.RoleAdmin)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if user.Role != "admin" {
+		if user.Role != dto.RoleAdmin {
 			t.Errorf("role = %q, want admin", user.Role)
 		}
 	})
 
-	t.Run("user not found", func(t *testing.T) {
-		svc, _, _, _, _ := newAdminServiceForTest()
+	t.Run("invalid role", func(t *testing.T) {
+		svc, _, _ := newAdminUserServiceForTest()
 
-		_, err := svc.UpdateRole(context.Background(), 999, "admin")
+		_, err := svc.UpdateRole(context.Background(), 1, "superuser")
+		if err == nil {
+			t.Fatal("expected invalid role error")
+		}
+	})
+
+	t.Run("user not found", func(t *testing.T) {
+		svc, _, _ := newAdminUserServiceForTest()
+
+		_, err := svc.UpdateRole(context.Background(), 999, dto.RoleAdmin)
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -107,10 +109,10 @@ func TestAdminUpdateRole(t *testing.T) {
 
 func TestAdminBanUser(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		svc, ur, _, rtr, _ := newAdminServiceForTest()
-		seedUsers(ur, 1)
+		svc, ur, rtr := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 1)
 
-		// Create a refresh token for the user
+		// Create a refresh token for the user.
 		rtr.tokens["hash1"] = &sqlc.RefreshToken{UserID: 1, Token: "hash1"}
 
 		err := svc.BanUser(context.Background(), 1)
@@ -123,14 +125,14 @@ func TestAdminBanUser(t *testing.T) {
 			t.Error("user should be soft-deleted and marked banned")
 		}
 
-		// Refresh tokens should be revoked
+		// Refresh tokens should be revoked.
 		if len(rtr.deletedUserIDs) == 0 || rtr.deletedUserIDs[0] != 1 {
 			t.Error("refresh tokens should be revoked for banned user")
 		}
 	})
 
 	t.Run("user not found", func(t *testing.T) {
-		svc, _, _, _, _ := newAdminServiceForTest()
+		svc, _, _ := newAdminUserServiceForTest()
 
 		err := svc.BanUser(context.Background(), 999)
 		if err == nil {
@@ -141,9 +143,10 @@ func TestAdminBanUser(t *testing.T) {
 
 func TestAdminUnbanUser(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		svc, ur, _, _, _ := newAdminServiceForTest()
-		seedUsers(ur, 1)
+		svc, ur, rtr := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 1)
 		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		rtr.tokens["hash1"] = &sqlc.RefreshToken{UserID: 1, Token: "hash1"}
 
 		user, err := svc.UnbanUser(context.Background(), 1)
 		if err != nil {
@@ -155,11 +158,14 @@ func TestAdminUnbanUser(t *testing.T) {
 		if ur.users[1].DeletedAt.Valid || ur.users[1].BannedAt.Valid {
 			t.Error("user should be restored and unbanned")
 		}
+		if len(rtr.deletedUserIDs) == 0 || rtr.deletedUserIDs[0] != 1 {
+			t.Error("refresh tokens should be cleared for unbanned user")
+		}
 	})
 
 	t.Run("active user is not banned", func(t *testing.T) {
-		svc, ur, _, _, _ := newAdminServiceForTest()
-		seedUsers(ur, 1)
+		svc, ur, _ := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 1)
 
 		if _, err := svc.UnbanUser(context.Background(), 1); err == nil {
 			t.Fatal("expected not-found for an active user")
@@ -167,7 +173,7 @@ func TestAdminUnbanUser(t *testing.T) {
 	})
 
 	t.Run("user not found", func(t *testing.T) {
-		svc, _, _, _, _ := newAdminServiceForTest()
+		svc, _, _ := newAdminUserServiceForTest()
 
 		_, err := svc.UnbanUser(context.Background(), 999)
 		if err == nil {
@@ -176,54 +182,35 @@ func TestAdminUnbanUser(t *testing.T) {
 	})
 }
 
-func TestAdminListFiles(t *testing.T) {
-	t.Run("success", func(t *testing.T) {
-		svc, _, fr, _, _ := newAdminServiceForTest()
-		seedFiles(fr, 2)
+func TestAdmin_CannotRemoveLastAdmin(t *testing.T) {
+	svc, repo, _ := newAdminUserServiceForTest()
+	repo.users[1] = &sqlc.User{
+		ID: 1, Email: "admin@example.com", Name: "Admin", Role: dto.RoleAdmin,
+		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}
 
-		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if hasMore {
-			t.Errorf("expected hasMore=false for a full page")
-		}
-		if len(files) != 2 {
-			t.Errorf("len(files) = %d, want 2", len(files))
-		}
-		// Check that URL is constructed via storage
-		for _, f := range files {
-			if f.URL == "" {
-				t.Error("file URL should not be empty")
-			}
-		}
-	})
-
-	t.Run("empty list", func(t *testing.T) {
-		svc, _, _, _, _ := newAdminServiceForTest()
-
-		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if hasMore {
-			t.Errorf("expected hasMore=false for an empty list")
-		}
-		if len(files) != 0 {
-			t.Errorf("len(files) = %d, want 0", len(files))
-		}
-	})
+	if _, err := svc.UpdateRole(context.Background(), 1, dto.RoleUser); err == nil {
+		t.Fatal("expected last-admin demotion to be rejected")
+	}
+	if err := svc.BanUser(context.Background(), 1); err == nil {
+		t.Fatal("expected last-admin ban to be rejected")
+	}
 }
 
-func TestAdminGetStats(t *testing.T) {
-	svc, ur, _, _, _ := newAdminServiceForTest()
-	seedUsers(ur, 5)
+func TestAdminGetUserStats(t *testing.T) {
+	svc, ur, _ := newAdminUserServiceForTest()
+	seedAdminUsers(ur, 5)
+	ur.users[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
-	stats, err := svc.GetStats(context.Background())
+	stats, err := svc.GetUserStats(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if stats.ActiveUsers != 5 {
-		t.Errorf("ActiveUsers = %d, want 5", stats.ActiveUsers)
+	if stats.ActiveUsers != 4 {
+		t.Errorf("ActiveUsers = %d, want 4", stats.ActiveUsers)
+	}
+	if stats.DeletedUsers != 1 {
+		t.Errorf("DeletedUsers = %d, want 1", stats.DeletedUsers)
 	}
 }
