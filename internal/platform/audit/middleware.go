@@ -48,10 +48,24 @@ func Middleware(recorder Recorder) fiber.Handler {
 	}
 
 	return func(c fiber.Ctx) error {
+		// Install the request's RequestInfo up front so JWT auth enriches it
+		// (WithActor/WithRequestMeta reuse an existing pointer) and a Tier 1
+		// service's RecordInTx can mark it as already audited.
+		info := RequestInfoFromContext(c.Context())
+		if info == nil {
+			info = &RequestInfo{RequestID: fiber.Locals[string](c, "request_id")}
+			c.SetContext(WithRequestInfo(c.Context(), info))
+		}
+
 		if err := c.Next(); err != nil {
 			return err
 		}
 		if fiber.Locals[bool](c, auditGuardedLocal) {
+			return nil
+		}
+		// A Tier 1 service already wrote this mutation's audit row inside its
+		// transaction; a second generic row would duplicate the trail.
+		if info.ServiceRecorded > 0 {
 			return nil
 		}
 		switch c.Method() {

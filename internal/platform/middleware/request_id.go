@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"strings"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
@@ -28,7 +30,10 @@ func validRequestID(value string) bool {
 
 func RequestID() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		requestID := c.Get("X-Request-Id")
+		// Clone: Fiber header strings are zero-copy views into a pooled buffer
+		// (Immutable=false), but the ID outlives the request in contexts,
+		// async goroutines, and asynchronously exported span attributes.
+		requestID := strings.Clone(c.Get("X-Request-Id"))
 		if !validRequestID(requestID) {
 			requestID = uuid.New().String()
 		}

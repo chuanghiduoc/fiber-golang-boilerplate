@@ -23,6 +23,11 @@ var DocsBaseURL = ""
 // problemContentType is the RFC 9457 media type for error responses.
 const problemContentType = "application/problem+json"
 
+// StatusClientClosedRequest is the de-facto (nginx) status for a request whose
+// client disconnected before the response. It is a client outcome, so it is
+// logged at Info and never counted as a server error.
+const StatusClientClosedRequest = 499
+
 // FieldError is one entry in the flat errors[] list (validation / business rule).
 // Params carries interpolation values (for example min/max) for localizers; it
 // is intentionally excluded from the wire contract.
@@ -155,6 +160,12 @@ func handleError(c fiber.Ctx, err error, localizer Localizer) error {
 
 	if errors.Is(err, context.DeadlineExceeded) {
 		return writeProblem(c, newError(fiber.StatusGatewayTimeout, "gateway_timeout", "Gateway Timeout", "request timed out"), localizer)
+	}
+
+	if errors.Is(err, context.Canceled) {
+		// The client went away; the body is most likely never delivered.
+		slog.Info("request canceled by client", slog.String("path", c.Path()))
+		return writeProblem(c, newError(StatusClientClosedRequest, "client_closed_request", "Client Closed Request", "request canceled by client"), localizer)
 	}
 
 	var fiberErr *fiber.Error

@@ -538,6 +538,40 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 	})
 }
 
+// TestProcessJobShutdownReleasesWithoutConsumingAttempt proves a handler that
+// fails because the worker is stopping is requeued, not dead-lettered, even on
+// its final attempt.
+func TestProcessJobShutdownReleasesWithoutConsumingAttempt(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeStore{}
+	worker := NewWorker(nil, "shutdown-worker")
+	worker.store = fake
+	worker.Register("blocking", func(ctx context.Context, _ json.RawMessage) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	defer cancel()
+
+	require.NoError(t, processJobWithWatchdog(t, worker, ctx, claimedJob{
+		ID:          36,
+		Kind:        "blocking",
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    3,
+		MaxAttempts: 3,
+	}))
+
+	assert.Empty(t, fake.failures, "a shutdown interruption must not dead-letter the job")
+	assert.Empty(t, fake.succeededIDs())
+	require.Len(t, fake.releases, 1)
+	assert.Equal(t, int64(36), fake.releases[0].id)
+	assert.Equal(t, 3, fake.releases[0].attempts, "the release is fenced by the claimed attempt")
+	assert.Contains(t, fake.releases[0].reason, "interrupted by worker shutdown")
+}
+
 // processJobWithWatchdog runs processJob in its own goroutine and fails the
 // test instead of hanging forever when a regression stops it from returning.
 func processJobWithWatchdog(t *testing.T, worker *Worker, ctx context.Context, job claimedJob) error {
@@ -1398,6 +1432,7 @@ type fakeStore struct {
 	succeedErr     error
 	failures       []fakeFailure
 	failErr        error
+	releases       []fakeFailure
 	heartbeats     []fakeHeartbeat
 	heartbeatErr   error
 	purgeCalls     int
@@ -1470,6 +1505,13 @@ func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, atte
 	defer f.mu.Unlock()
 	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})
 	return f.heartbeatErr
+}
+
+func (f *fakeStore) Release(_ context.Context, id int64, workerID string, attempts int, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releases = append(f.releases, fakeFailure{id: id, workerID: workerID, attempts: attempts, reason: reason})
+	return nil
 }
 
 func (f *fakeStore) PurgeTerminal(_ context.Context, olderThan time.Duration) (int64, error) {

@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
@@ -63,7 +66,7 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 			},
 		},
 	}
-	dispatcher := NewDispatcher(store)
+	dispatcher := NewDispatcher(store, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	dispatcher.now = func() time.Time { return now }
@@ -116,7 +119,7 @@ func TestDispatcher_AssignsIDAndResolvesTenant(t *testing.T) {
 			42: {activeEndpoint(9, 42, "*")},
 		},
 	}
-	dispatcher := NewDispatcher(store)
+	dispatcher := NewDispatcher(store, nil)
 	dispatcher.now = func() time.Time { return time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC) }
 	ctx := tenant.WithID(context.Background(), 42)
 
@@ -143,7 +146,7 @@ func TestDispatcher_AssignsIDAndResolvesTenant(t *testing.T) {
 }
 
 func TestDispatcher_NoEndpointsAndValidation(t *testing.T) {
-	dispatcher := NewDispatcher(&fakeDispatchStore{})
+	dispatcher := NewDispatcher(&fakeDispatchStore{}, nil)
 	if created, err := dispatcher.Dispatch(context.Background()); err != nil || created != 0 {
 		t.Fatalf("empty Dispatch = (%d, %v)", created, err)
 	}
@@ -153,9 +156,78 @@ func TestDispatcher_NoEndpointsAndValidation(t *testing.T) {
 	}
 
 	store := &fakeDispatchStore{callErr: errors.New("boom")}
-	dispatcher = NewDispatcher(store)
+	dispatcher = NewDispatcher(store, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	if _, err := dispatcher.Dispatch(ctx, webhookcontracts.Event{Type: "file.uploaded"}); err == nil {
 		t.Fatal("Dispatch() should surface endpoint load failures")
+	}
+}
+
+type fakeTxQueue struct {
+	jobs []jobs.Job
+}
+
+func (f *fakeTxQueue) EnqueueOnceTx(_ context.Context, _ pgx.Tx, job jobs.Job) (id int64, created bool, err error) {
+	f.jobs = append(f.jobs, job)
+	return int64(len(f.jobs)), true, nil
+}
+
+// fakeTx is a non-nil pgx.Tx; the fake queue never calls it.
+type fakeTx struct{ pgx.Tx }
+
+// TestDispatcher_DispatchTxEnqueuesStableFanoutJob proves the transactional
+// path enqueues one idempotent job carrying a fixed event ID, and that running
+// the job (twice, as at-least-once delivery may) creates each delivery once.
+func TestDispatcher_DispatchTxEnqueuesStableFanoutJob(t *testing.T) {
+	store := &fakeDispatchStore{
+		endpoints: map[int64][]repository.ActiveEndpoint{
+			7: {activeEndpoint(1, 7, "file.*"), activeEndpoint(2, 7, "user.*")},
+		},
+	}
+	queue := &fakeTxQueue{}
+	dispatcher := NewDispatcher(store, queue)
+	ctx := tenant.WithID(context.Background(), 7)
+
+	if err := dispatcher.DispatchTx(ctx, nil, webhookcontracts.Event{Type: "file.uploaded"}); !errors.Is(err, jobs.ErrNoTx) {
+		t.Fatalf("nil tx error = %v, want jobs.ErrNoTx", err)
+	}
+	if err := dispatcher.DispatchTx(ctx, fakeTx{}, webhookcontracts.Event{
+		Type: "file.uploaded",
+		Data: json.RawMessage(`{"fileId":3}`),
+	}); err != nil {
+		t.Fatalf("DispatchTx: %v", err)
+	}
+	if len(queue.jobs) != 1 {
+		t.Fatalf("enqueued jobs = %d, want 1", len(queue.jobs))
+	}
+	job := queue.jobs[0]
+	if job.Kind != DispatchJobKind || job.TenantID != 7 {
+		t.Fatalf("job = %+v", job)
+	}
+	var payload dispatchJobPayload
+	if err := json.Unmarshal(job.Payload, &payload); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	if payload.ID == "" || job.IdempotencyKey != DispatchJobKind+":"+payload.ID {
+		t.Fatalf("event id %q / key %q must be stable and linked", payload.ID, job.IdempotencyKey)
+	}
+	if len(store.deliveries) != 0 {
+		t.Fatal("DispatchTx must not create deliveries before the producer commits")
+	}
+
+	for range 2 {
+		if err := dispatcher.HandleDispatchJob(context.Background(), job.Payload); err != nil {
+			t.Fatalf("HandleDispatchJob: %v", err)
+		}
+	}
+	if len(store.deliveries) != 1 {
+		t.Fatalf("deliveries = %d, want 1 (only the file.* endpoint, once)", len(store.deliveries))
+	}
+	if _, ok := store.deliveries[fmt.Sprintf("7/1/%s", payload.ID)]; !ok {
+		t.Fatalf("delivery must use the enqueued event id; got %v", store.deliveries)
+	}
+
+	if err := dispatcher.HandleDispatchJob(context.Background(), json.RawMessage(`{"type":"file.uploaded"}`)); err == nil {
+		t.Fatal("a dispatch job without id/tenant must fail")
 	}
 }

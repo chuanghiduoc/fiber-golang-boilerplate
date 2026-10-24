@@ -18,6 +18,12 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
 
+// maxSequentialVersion is the largest pre-timestamp (6-digit -seq) version.
+// New migrations use UTC timestamp versions (make migrate-create), so only a
+// database recorded at 2..999999 is a legacy sequential history whose source
+// files were consolidated away.
+const maxSequentialVersion = 999999
+
 // requiredTables lists the schema objects the application assumes exist. The
 // check catches a legacy database that reports migration version 1 but predates
 // the consolidated baseline, which golang-migrate alone would treat as current.
@@ -53,14 +59,14 @@ var requiredColumns = map[string][]string{
 	"refresh_tokens":            {"tenant_id", "token_version"},
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
-	"files":                     {"tenant_id"},
+	"files":                     {"tenant_id", "updated_at"},
 	"api_keys": {
 		"tenant_id", "user_id", "key_hash", "scopes", "expires_at",
 		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",
 	},
 	"feature_flags":            {"flag_key", "enabled", "kill_switch", "description"},
 	"feature_flag_targets":     {"flag_key", "tenant_id", "user_id", "enabled"},
-	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at"},
+	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at", "updated_at"},
 	"notification_preferences": {"tenant_id", "user_id", "type", "channel", "enabled"},
 	"jobs":                     {"tenant_id", "trace_parent", "idempotency_key"},
 	"scheduler_leases":         {"name", "holder", "expires_at", "heartbeat_at"},
@@ -116,7 +122,6 @@ var requiredTenantLeadingIndexes = map[string][]string{
 		"idx_email_verification_tokens_tenant_user_id",
 	},
 	"files": {
-		"idx_files_tenant_user_id_deleted_at",
 		"idx_files_tenant_user_created",
 		"idx_files_tenant_created_at_id",
 	},
@@ -205,7 +210,7 @@ func run() error {
 		return fmt.Errorf("database migration state is dirty at version %d; repair it manually before retrying", version)
 	}
 	if err := database.RunMigrations(dbCfg.DSN(), "migrations"); err != nil {
-		if hasHistory && version > 1 {
+		if hasHistory && version > 1 && version <= maxSequentialVersion {
 			return fmt.Errorf(
 				"run migrations from legacy version %d: %w; restore the historical migration files "+
 					"(they must remain source versions for the recorded history) and add an upgrade "+

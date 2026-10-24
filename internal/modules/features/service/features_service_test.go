@@ -10,6 +10,7 @@ import (
 
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -151,14 +152,14 @@ func tenantCtx(id int64) context.Context {
 
 func TestListFlagsMergesCatalogAndDatabaseState(t *testing.T) {
 	repo := newFakeRepository()
-	repo.flags[string(features.KeyUserRegistration)] = featuressqlc.FeatureFlag{
-		FlagKey:     string(features.KeyUserRegistration),
-		Enabled:     false,
+	repo.flags[string(testKeyUserRegistration)] = featuressqlc.FeatureFlag{
+		FlagKey:     string(testKeyUserRegistration),
+		Enabled:     pgtype.Bool{Bool: false, Valid: true},
 		KillSwitch:  true,
 		Description: "custom",
 	}
 	evaluator := &fakeEvaluator{result: features.Result{Enabled: true, Source: features.SourceUserTarget}}
-	svc := New(repo, evaluator)
+	svc := New(repo, evaluator, nil)
 
 	flags, err := svc.ListFlags(tenantCtx(2), features.Subject{TenantID: 2, UserID: 7})
 	if err != nil {
@@ -168,7 +169,7 @@ func TestListFlagsMergesCatalogAndDatabaseState(t *testing.T) {
 		t.Fatalf("ListFlags returned %d flags, want %d", len(flags), len(features.Catalog()))
 	}
 	for _, flag := range flags {
-		if flag.Key != string(features.KeyUserRegistration) {
+		if flag.Key != string(testKeyUserRegistration) {
 			if flag.Configured {
 				t.Errorf("flag %q unexpectedly configured", flag.Key)
 			}
@@ -186,16 +187,16 @@ func TestListFlagsMergesCatalogAndDatabaseState(t *testing.T) {
 func TestGetFlagIncludesTargetsForTenant(t *testing.T) {
 	repo := newFakeRepository()
 	repo.targets = []featuressqlc.FeatureFlagTarget{
-		{ID: 1, FlagKey: string(features.KeyFileUploads), TenantID: 1, Enabled: false},
-		{ID: 2, FlagKey: string(features.KeyFileUploads), TenantID: 2, Enabled: true},
+		{ID: 1, FlagKey: string(testKeyFileUploads), TenantID: 1, Enabled: false},
+		{ID: 2, FlagKey: string(testKeyFileUploads), TenantID: 2, Enabled: true},
 	}
-	svc := New(repo, &fakeEvaluator{})
+	svc := New(repo, &fakeEvaluator{}, nil)
 
-	detail, err := svc.GetFlag(tenantCtx(2), string(features.KeyFileUploads), features.Subject{TenantID: 2})
+	detail, err := svc.GetFlag(tenantCtx(2), string(testKeyFileUploads), features.Subject{TenantID: 2})
 	if err != nil {
 		t.Fatalf("GetFlag: %v", err)
 	}
-	if detail.Flag.Key != string(features.KeyFileUploads) || detail.Flag.Configured {
+	if detail.Flag.Key != string(testKeyFileUploads) || detail.Flag.Configured {
 		t.Fatalf("flag = %+v, want compiled file_uploads", detail.Flag)
 	}
 	if len(detail.Targets) != 1 || detail.Targets[0].ID != 2 || detail.Targets[0].TenantID != 2 {
@@ -205,16 +206,16 @@ func TestGetFlagIncludesTargetsForTenant(t *testing.T) {
 
 func TestUpsertFlagPreservesExistingDescriptionAndInvalidates(t *testing.T) {
 	repo := newFakeRepository()
-	repo.flags[string(features.KeyFileUploads)] = featuressqlc.FeatureFlag{
-		FlagKey:     string(features.KeyFileUploads),
-		Enabled:     true,
+	repo.flags[string(testKeyFileUploads)] = featuressqlc.FeatureFlag{
+		FlagKey:     string(testKeyFileUploads),
+		Enabled:     pgtype.Bool{Bool: true, Valid: true},
 		Description: "custom upload policy",
 	}
 	evaluator := &fakeEvaluator{result: features.Result{Enabled: false, Source: features.SourceKillSwitch}}
-	svc := New(repo, evaluator)
+	svc := New(repo, evaluator, nil)
 	enabled, kill := false, true
 
-	flag, err := svc.UpsertFlag(tenantCtx(1), string(features.KeyFileUploads), featuresdto.UpsertFlagRequest{
+	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyFileUploads), featuresdto.UpsertFlagRequest{
 		Enabled:    &enabled,
 		KillSwitch: &kill,
 	}, features.Subject{TenantID: 1})
@@ -234,17 +235,17 @@ func TestUpsertFlagPreservesExistingDescriptionAndInvalidates(t *testing.T) {
 
 func TestUpsertFlagUsesCatalogDescriptionForNewRow(t *testing.T) {
 	repo := newFakeRepository()
-	svc := New(repo, &fakeEvaluator{})
+	svc := New(repo, &fakeEvaluator{}, nil)
 	enabled, kill := true, false
 
-	flag, err := svc.UpsertFlag(tenantCtx(1), string(features.KeyGoogleOAuth), featuresdto.UpsertFlagRequest{
+	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyGoogleOAuth), featuresdto.UpsertFlagRequest{
 		Enabled:    &enabled,
 		KillSwitch: &kill,
 	}, features.Subject{TenantID: 1})
 	if err != nil {
 		t.Fatalf("UpsertFlag: %v", err)
 	}
-	def, _ := features.Lookup(string(features.KeyGoogleOAuth))
+	def, _ := features.Lookup(string(testKeyGoogleOAuth))
 	if flag.Description != def.Description {
 		t.Fatalf("description = %q, want catalog description %q", flag.Description, def.Description)
 	}
@@ -252,11 +253,11 @@ func TestUpsertFlagUsesCatalogDescriptionForNewRow(t *testing.T) {
 
 func TestUpsertTargetUsesRequestTenant(t *testing.T) {
 	repo := newFakeRepository()
-	svc := New(repo, &fakeEvaluator{})
+	svc := New(repo, &fakeEvaluator{}, nil)
 	userID := int64(42)
 	enabled := true
 
-	target, err := svc.UpsertTarget(tenantCtx(3), string(features.KeyFileUploads), featuresdto.UpsertTargetRequest{
+	target, err := svc.UpsertTarget(tenantCtx(3), string(testKeyFileUploads), featuresdto.UpsertTargetRequest{
 		UserID:  &userID,
 		Enabled: &enabled,
 	})
@@ -274,9 +275,9 @@ func TestUpsertTargetUsesRequestTenant(t *testing.T) {
 func TestDeleteFlagIsIdempotent(t *testing.T) {
 	repo := newFakeRepository()
 	evaluator := &fakeEvaluator{}
-	svc := New(repo, evaluator)
+	svc := New(repo, evaluator, nil)
 
-	if err := svc.DeleteFlag(tenantCtx(1), string(features.KeyFileUploads)); err != nil {
+	if err := svc.DeleteFlag(tenantCtx(1), string(testKeyFileUploads)); err != nil {
 		t.Fatalf("DeleteFlag missing row: %v", err)
 	}
 	if evaluator.invalidations != 1 {
@@ -287,9 +288,9 @@ func TestDeleteFlagIsIdempotent(t *testing.T) {
 func TestDeleteTargetNotFoundIs404(t *testing.T) {
 	repo := newFakeRepository()
 	evaluator := &fakeEvaluator{}
-	svc := New(repo, evaluator)
+	svc := New(repo, evaluator, nil)
 
-	err := svc.DeleteTarget(tenantCtx(1), string(features.KeyFileUploads), 99)
+	err := svc.DeleteTarget(tenantCtx(1), string(testKeyFileUploads), 99)
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 404 {
 		t.Fatalf("DeleteTarget error = %v, want 404", err)
@@ -300,7 +301,7 @@ func TestDeleteTargetNotFoundIs404(t *testing.T) {
 }
 
 func TestUnknownFlagKeyIs404(t *testing.T) {
-	svc := New(newFakeRepository(), &fakeEvaluator{})
+	svc := New(newFakeRepository(), &fakeEvaluator{}, nil)
 	ctx := tenantCtx(1)
 
 	if _, err := svc.GetFlag(ctx, "typo", features.Subject{}); !isNotFound(err) {
@@ -326,4 +327,126 @@ func TestUnknownFlagKeyIs404(t *testing.T) {
 func isNotFound(err error) bool {
 	var appErr *apperror.AppError
 	return errors.As(err, &appErr) && appErr.Status == 404
+}
+
+type recordingAudit struct {
+	events []audit.Event
+}
+
+func (r *recordingAudit) Record(_ context.Context, event audit.Event) error {
+	r.events = append(r.events, event)
+	return nil
+}
+
+func isPermissionDenied(err error) bool {
+	var appErr *apperror.AppError
+	return errors.As(err, &appErr) && appErr.Status == 403 && appErr.Code == string(apperror.CodePermissionDenied)
+}
+
+func TestGlobalFlagWritesRequirePlatformTenant(t *testing.T) {
+	repo := newFakeRepository()
+	evaluator := &fakeEvaluator{}
+	svc := New(repo, evaluator, nil)
+	enabled, kill := true, true
+	req := featuresdto.UpsertFlagRequest{Enabled: &enabled, KillSwitch: &kill}
+	key := string(testKeyFileUploads)
+
+	// A tenant 2 admin, and a context with no resolved tenant (no EffectiveID
+	// fallback), must not change process-wide state.
+	for _, ctx := range []context.Context{tenantCtx(2), context.Background()} {
+		if _, err := svc.UpsertFlag(ctx, key, req, features.Subject{}); !isPermissionDenied(err) {
+			t.Fatalf("UpsertFlag error = %v, want 403 permission.denied", err)
+		}
+		if err := svc.DeleteFlag(ctx, key); !isPermissionDenied(err) {
+			t.Fatalf("DeleteFlag error = %v, want 403 permission.denied", err)
+		}
+	}
+	if len(repo.flags) != 0 || len(repo.deletedKeys) != 0 || evaluator.invalidations != 0 {
+		t.Fatalf("denied writes reached the repository: flags=%v deleted=%v invalidations=%d",
+			repo.flags, repo.deletedKeys, evaluator.invalidations)
+	}
+
+	// Tenant-scoped target management stays available to other tenants.
+	if _, err := svc.UpsertTarget(tenantCtx(2), key, featuresdto.UpsertTargetRequest{Enabled: &enabled}); err != nil {
+		t.Fatalf("UpsertTarget for tenant 2: %v", err)
+	}
+}
+
+func TestUpsertFlagWithoutEnabledClearsDatabaseDefault(t *testing.T) {
+	repo := newFakeRepository()
+	svc := New(repo, &fakeEvaluator{}, nil)
+	kill := true
+
+	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyGoogleOAuth), featuresdto.UpsertFlagRequest{
+		KillSwitch: &kill,
+	}, features.Subject{TenantID: 1})
+	if err != nil {
+		t.Fatalf("UpsertFlag: %v", err)
+	}
+	if repo.flags[string(testKeyGoogleOAuth)].Enabled.Valid {
+		t.Fatal("omitted enabled must store NULL")
+	}
+	def, _ := features.Lookup(string(testKeyGoogleOAuth))
+	if flag.Configured || flag.Enabled != def.Default || !flag.KillSwitch {
+		t.Fatalf("flag = %+v, want unconfigured default with kill switch", flag)
+	}
+}
+
+func TestDeleteFlagPropagatesTargetConflict(t *testing.T) {
+	svc := New(&conflictRepository{fakeRepository: newFakeRepository()}, &fakeEvaluator{}, nil)
+
+	err := svc.DeleteFlag(tenantCtx(1), string(testKeyFileUploads))
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 409 {
+		t.Fatalf("DeleteFlag error = %v, want 409", err)
+	}
+}
+
+type conflictRepository struct {
+	*fakeRepository
+}
+
+func (r *conflictRepository) DeleteFlag(context.Context, string) error {
+	return apperror.NewConflict("feature flag has targets; delete them before deleting the flag")
+}
+
+func TestMutationsRecordDomainEventsWithMetadata(t *testing.T) {
+	repo := newFakeRepository()
+	recorder := &recordingAudit{}
+	svc := New(repo, &fakeEvaluator{result: features.Result{Source: features.SourceKillSwitch}}, recorder)
+	ctx := tenantCtx(1)
+	enabled, kill := false, true
+	key := string(testKeyFileUploads)
+	userID := int64(42)
+
+	if _, err := svc.UpsertFlag(ctx, key, featuresdto.UpsertFlagRequest{Enabled: &enabled, KillSwitch: &kill}, features.Subject{TenantID: 1}); err != nil {
+		t.Fatalf("UpsertFlag: %v", err)
+	}
+	target, err := svc.UpsertTarget(ctx, key, featuresdto.UpsertTargetRequest{UserID: &userID, Enabled: &enabled})
+	if err != nil {
+		t.Fatalf("UpsertTarget: %v", err)
+	}
+	if err := svc.DeleteTarget(ctx, key, target.ID); err != nil {
+		t.Fatalf("DeleteTarget: %v", err)
+	}
+	if err := svc.DeleteFlag(ctx, key); err != nil {
+		t.Fatalf("DeleteFlag: %v", err)
+	}
+
+	if len(recorder.events) != 4 {
+		t.Fatalf("events = %d, want 4", len(recorder.events))
+	}
+	flagEvent := recorder.events[0]
+	if flagEvent.Action != "admin.feature_flag.updated" || flagEvent.ResourceID != key ||
+		flagEvent.Metadata["feature"] != key || flagEvent.Metadata["enabled"] != false ||
+		flagEvent.Metadata["killSwitch"] != true || flagEvent.Metadata["source"] != "kill_switch" {
+		t.Fatalf("flag event = %+v", flagEvent)
+	}
+	targetEvent := recorder.events[1]
+	if targetEvent.Action != "admin.feature_flag_target.updated" || targetEvent.Metadata["userId"] != int64(42) {
+		t.Fatalf("target event = %+v", targetEvent)
+	}
+	if recorder.events[2].Action != "admin.feature_flag_target.deleted" || recorder.events[3].Action != "admin.feature_flag.deleted" {
+		t.Fatalf("delete events = %q, %q", recorder.events[2].Action, recorder.events[3].Action)
+	}
 }

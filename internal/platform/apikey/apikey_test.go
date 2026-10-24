@@ -12,8 +12,10 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -45,11 +47,11 @@ func (s *fakeStore) TouchLastUsed(_ context.Context, id int64, at time.Time) err
 }
 
 type fakePrincipals struct {
-	principal contracts.Principal
+	principal identitycontracts.Principal
 	err       error
 }
 
-func (p fakePrincipals) GetPrincipal(context.Context, int64, int64) (contracts.Principal, error) {
+func (p fakePrincipals) GetPrincipal(context.Context, int64, int64) (identitycontracts.Principal, error) {
 	return p.principal, p.err
 }
 
@@ -66,7 +68,7 @@ func newTestKey(t *testing.T) (Credentials, Key) {
 		Name:      "ci",
 		Prefix:    credentials.Prefix,
 		Hash:      credentials.Hash,
-		Scopes:    []authz.Permission{authz.PermissionFilesRead},
+		Scopes:    []authz.Permission{testScopeRead},
 		CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
 		UpdatedAt: time.Unix(1_700_000_000, 0).UTC(),
 	}
@@ -138,7 +140,7 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	credentials, key := newTestKey(t)
 	store := &fakeStore{key: key}
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := contracts.Principal{ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleUser}
+	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive}
 	verifier := NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now))
 
 	verified, err := verifier.Verify(context.Background(), credentials.Key, 1)
@@ -148,8 +150,8 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	if verified.Key.ID != key.ID || verified.Principal.ID != 42 {
 		t.Fatalf("verified = %+v, want key 7/principal 42", verified)
 	}
-	if len(verified.Key.Scopes) != 1 || verified.Key.Scopes[0] != authz.PermissionFilesRead {
-		t.Fatalf("scopes = %v, want files:read", verified.Key.Scopes)
+	if len(verified.Key.Scopes) != 1 || verified.Key.Scopes[0] != testScopeRead {
+		t.Fatalf("scopes = %v, want apikeytest:read", verified.Key.Scopes)
 	}
 	if len(store.touched) != 1 || !store.touched[0].Equal(now) {
 		t.Fatalf("touched = %v, want one write at %v", store.touched, now)
@@ -172,7 +174,7 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 func TestVerifier_RejectsInvalidStates(t *testing.T) {
 	credentials, baseKey := newTestKey(t)
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := contracts.Principal{ID: 42, TenantID: 1, Role: authz.RoleUser}
+	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive}
 
 	past := now.Add(-time.Minute)
 	future := now.Add(time.Hour)
@@ -270,7 +272,7 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 		name       string
 		raw        string
 		store      *fakeStore
-		principals contracts.PrincipalReader
+		principals identitycontracts.PrincipalReader
 	}{
 		{
 			name:  "unknown hash",
@@ -292,8 +294,8 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 			name:  "owner tenant mismatch",
 			raw:   credentials.Key,
 			store: &fakeStore{key: key},
-			principals: fakePrincipals{principal: contracts.Principal{
-				ID: 42, TenantID: 2, Role: authz.RoleUser,
+			principals: fakePrincipals{principal: identitycontracts.Principal{
+				ID: 42, TenantID: 2, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive,
 			}},
 		},
 	}
@@ -313,11 +315,11 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 func TestEffectiveScopes_CurrentRoleBoundsKey(t *testing.T) {
 	scopes := []authz.Permission{
 		authz.PermissionAdminUsersRead,
-		authz.PermissionFilesRead,
+		testScopeRead,
 	}
 	got := effectiveScopes(authz.RoleUser, scopes)
-	if len(got) != 1 || got[0] != authz.PermissionFilesRead {
-		t.Fatalf("effective scopes = %v, want only files:read after demotion", got)
+	if len(got) != 1 || got[0] != testScopeRead {
+		t.Fatalf("effective scopes = %v, want only apikeytest:read after demotion", got)
 	}
 
 	got = effectiveScopes(authz.RoleAdmin, scopes)
@@ -334,8 +336,8 @@ func TestAuthenticate_DelegatesJWTsAndSetsAPIKeyLocals(t *testing.T) {
 	credentials, key := newTestKey(t)
 	now := time.Unix(1_700_000_100, 0).UTC()
 	store := &fakeStore{key: key}
-	verifier := NewVerifier(store, fakePrincipals{principal: contracts.Principal{
-		ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleAdmin,
+	verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
+		ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
 	}}, fixedClock(now))
 
 	jwtCalled := false
@@ -431,5 +433,81 @@ func TestAuthenticate_NilVerifierRejectsApiKey(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != fiber.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestVerifier_RejectsSuspendedTenant(t *testing.T) {
+	credentials, key := newTestKey(t)
+	store := &fakeStore{key: key}
+	verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
+		ID: 42, TenantID: 1, Role: authz.RoleUser, TenantStatus: "suspended",
+	}})
+
+	_, err := verifier.Verify(context.Background(), credentials.Key, 0)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != fiber.StatusUnauthorized {
+		t.Fatalf("err = %v, want 401 for a suspended tenant", err)
+	}
+	if len(store.touched) != 0 {
+		t.Fatal("a rejected key must not update last_used_at")
+	}
+}
+
+func TestAuthenticate_InstallsActorContextAndClearsOverriddenSlug(t *testing.T) {
+	credentials, key := newTestKey(t)
+	key.TenantID = 3
+	store := &fakeStore{key: key}
+	verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
+		ID: 42, TenantID: 3, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
+	}})
+
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Use(func(c fiber.Ctx) error {
+		// Simulate the tenant middleware resolving a header-less request to
+		// the default tenant.
+		fiber.Locals[string](c, "request_id", "req-1")
+		fiber.Locals[int64](c, "tenant_id", 1)
+		fiber.Locals[string](c, "tenant_slug", "default")
+		c.SetContext(tenant.WithIdentity(c.Context(), 1, "default"))
+		return c.Next()
+	})
+	app.Get("/me", Authenticate(nil, verifier), func(c fiber.Ctx) error {
+		ctx := c.Context()
+		info := audit.RequestInfoFromContext(ctx)
+		if info == nil {
+			return c.Status(fiber.StatusInternalServerError).SendString("no audit info")
+		}
+		return c.JSON(fiber.Map{
+			"actor":      requestctx.ActorID(ctx),
+			"auditActor": info.ActorID,
+			"auditRole":  info.ActorRole,
+			"requestID":  info.RequestID,
+			"localSlug":  tenant.Slug(c),
+			"ctxSlug":    tenant.SlugFromContext(ctx),
+			"ctxTenant":  tenant.IDFromContext(ctx),
+		})
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, "/me", http.NoBody)
+	req.Header.Set(fiber.HeaderAuthorization, APIKeyScheme+" "+credentials.Key)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d (body=%s)", resp.StatusCode, body)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if payload["actor"].(float64) != 42 || payload["auditActor"].(float64) != 42 ||
+		payload["auditRole"] != authz.RoleAdmin || payload["requestID"] != "req-1" {
+		t.Fatalf("actor context = %+v, want actor 42/admin with request id", payload)
+	}
+	if payload["localSlug"] != "" || payload["ctxSlug"] != "" || payload["ctxTenant"].(float64) != 3 {
+		t.Fatalf("tenant = %+v, want key tenant 3 with cleared slug", payload)
 	}
 }

@@ -27,9 +27,22 @@ func wrapErr(err error) error {
 		return apperror.ErrNotFound
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "P0001" &&
-		strings.Contains(pgErr.Message, "last active admin") {
-		return apperror.NewConflict("cannot remove the last active admin")
+	if errors.As(err, &pgErr) {
+		switch {
+		case pgErr.Code == sqlStateRaiseException && strings.Contains(pgErr.Message, "last active admin"):
+			// protect_last_admin trigger: the database-level last-admin guard.
+			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot remove the last active admin")
+		case pgErr.Code == sqlStateDeadlockDetected:
+			// PostgreSQL aborted one side of a lock cycle (for example a
+			// concurrent admin change made outside the service lock). The
+			// other side committed; the caller can retry.
+			return apperror.NewConflict("the account was modified concurrently, please retry")
+		}
 	}
 	return err
 }
+
+const (
+	sqlStateRaiseException   = "P0001"
+	sqlStateDeadlockDetected = "40P01"
+)

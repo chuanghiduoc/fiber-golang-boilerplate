@@ -91,6 +91,14 @@ func (s *stressStore) Heartbeat(_ context.Context, _ int64, _ string, _ int) err
 	return nil
 }
 
+// Release is counted as a recorded outcome alongside failures.
+func (s *stressStore) Release(_ context.Context, id int64, _ string, _ int, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failed[id]++
+	return nil
+}
+
 func (s *stressStore) PurgeTerminal(_ context.Context, _ time.Duration) (int64, error) {
 	return 0, nil
 }

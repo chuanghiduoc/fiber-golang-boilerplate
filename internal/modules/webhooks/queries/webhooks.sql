@@ -57,6 +57,14 @@ SELECT * FROM webhook_endpoint_secrets
 WHERE tenant_id = @tenant_id AND endpoint_id = @endpoint_id AND active
 LIMIT 1;
 
+-- name: LockWebhookEndpoint :one
+-- Serializes concurrent secret rotations: the row lock is held until the
+-- rotation transaction commits, so NextWebhookEndpointSecretVersion cannot
+-- hand two rotations the same version.
+SELECT * FROM webhook_endpoints
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+FOR UPDATE;
+
 -- name: NextWebhookEndpointSecretVersion :one
 SELECT (COALESCE(MAX(version), 0) + 1)::integer AS version
 FROM webhook_endpoint_secrets
@@ -91,13 +99,13 @@ ORDER BY e.id;
 -- name: CreateWebhookDelivery :one
 INSERT INTO webhook_deliveries (
     tenant_id, endpoint_id, event_id, event_type, event_created_at,
-    url, payload, secret_ciphertext, status, max_attempts, next_attempt_at,
-    replayed_from_id
+    url, payload, secret_ciphertext, status, max_attempts, timeout_ms,
+    next_attempt_at, replayed_from_id
 )
 VALUES (
     @tenant_id, @endpoint_id, @event_id, @event_type, @event_created_at,
-    @url, @payload::jsonb, @secret_ciphertext, 'pending', @max_attempts, NOW(),
-    @replayed_from_id
+    @url, @payload::jsonb, @secret_ciphertext, 'pending', @max_attempts, @timeout_ms,
+    NOW(), @replayed_from_id
 )
 ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
 RETURNING id;
@@ -116,15 +124,51 @@ ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
 -- name: ClaimWebhookDelivery :one
+-- A disabled or deleted endpoint is never claimed, so it stops receiving
+-- retries; ExpireUnclaimableWebhookDelivery then dead-letters the delivery.
 UPDATE webhook_deliveries
 SET attempts = attempts + 1,
     next_attempt_at = NOW() + make_interval(secs => @lease_seconds::double precision)
-WHERE id = @id
-  AND tenant_id = @tenant_id
+WHERE webhook_deliveries.id = @id
+  AND webhook_deliveries.tenant_id = @tenant_id
   AND status = 'pending'
   AND attempts < max_attempts
   AND next_attempt_at <= NOW()
+  AND EXISTS (
+      SELECT 1 FROM webhook_endpoints e
+      WHERE e.id = webhook_deliveries.endpoint_id
+        AND e.tenant_id = webhook_deliveries.tenant_id
+        AND e.status = 'active'
+        AND e.deleted_at IS NULL
+  )
 RETURNING *;
+
+-- name: ExpireUnclaimableWebhookDelivery :execrows
+-- Dead-letters a pending delivery that can never be claimed again: its
+-- endpoint is disabled/deleted, or every attempt was consumed but the final
+-- bookkeeping write was lost. A live claim lease (next_attempt_at in the
+-- future) is left alone so an in-flight attempt can finish.
+UPDATE webhook_deliveries
+SET status = 'dead',
+    next_attempt_at = NOW(),
+    last_error = CASE
+        WHEN attempts >= max_attempts THEN 'delivery attempts exhausted'
+        ELSE 'endpoint is disabled or deleted'
+    END
+WHERE webhook_deliveries.id = @id
+  AND webhook_deliveries.tenant_id = @tenant_id
+  AND status = 'pending'
+  AND next_attempt_at <= NOW()
+  AND (
+      attempts >= max_attempts
+      OR NOT EXISTS (
+          SELECT 1 FROM webhook_endpoints e
+          WHERE e.id = webhook_deliveries.endpoint_id
+            AND e.tenant_id = webhook_deliveries.tenant_id
+            AND e.status = 'active'
+            AND e.deleted_at IS NULL
+      )
+  );
 
 -- name: MarkWebhookDeliverySucceeded :exec
 UPDATE webhook_deliveries
@@ -176,9 +220,20 @@ FROM webhook_deliveries
 WHERE tenant_id = @tenant_id;
 
 -- name: PurgeWebhookDeliveries :execrows
-DELETE FROM webhook_deliveries
-WHERE status IN ('succeeded', 'dead')
-  AND updated_at < NOW() - make_interval(days => @retention_days::integer);
+-- One bounded retention batch, served by idx_webhook_deliveries_terminal_updated_at.
+-- The caller loops until a batch is short.
+WITH batch AS (
+    SELECT id
+    FROM webhook_deliveries
+    WHERE status IN ('succeeded', 'dead')
+      AND updated_at < NOW() - make_interval(days => @retention_days::integer)
+    ORDER BY updated_at
+    LIMIT @batch_size::integer
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_deliveries AS d
+USING batch
+WHERE d.id = batch.id;
 
 -- Inbound sources and events ------------------------------------------------
 
@@ -249,5 +304,16 @@ ORDER BY received_at DESC, id DESC
 LIMIT @row_limit::int;
 
 -- name: PurgeWebhookInboundEvents :execrows
-DELETE FROM webhook_inbound_events
-WHERE received_at < NOW() - make_interval(days => @retention_days::integer);
+-- One bounded retention batch, served by idx_webhook_inbound_events_received_at.
+-- The caller loops until a batch is short.
+WITH batch AS (
+    SELECT id
+    FROM webhook_inbound_events
+    WHERE received_at < NOW() - make_interval(days => @retention_days::integer)
+    ORDER BY received_at
+    LIMIT @batch_size::integer
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_inbound_events AS e
+USING batch
+WHERE e.id = batch.id;

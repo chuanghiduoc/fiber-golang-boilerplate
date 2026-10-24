@@ -37,6 +37,9 @@ spec:
       # The API does not call the Kubernetes API.
       automountServiceAccountToken: false
       enableServiceLinks: false
+      # 5s preStop + the API's 20s shared shutdown budget (HTTP drain, job
+      # worker/scheduler, async goroutines, span flush) + 5s margin. Raise this
+      # together with the budget in cmd/api/main.go.
       terminationGracePeriodSeconds: 30
       securityContext:
         # Match the Docker image user: appuser is UID 100 / GID 101. The

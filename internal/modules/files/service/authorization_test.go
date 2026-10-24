@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -133,7 +134,7 @@ func TestAdminFileService_ABACTenantPolicy(t *testing.T) {
 	store.data["uploads/file.txt"] = []byte("tenant-one")
 	store.data["2/20/two.pdf"] = []byte("tenant-two")
 
-	svc := NewAdminFileService(repo, nil, nil, store)
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, store)
 	ctx := abacCtx(1, authz.NewSubject(1, 1, authz.RoleAdmin))
 
 	files, _, err := svc.ListFiles(ctx, 10, "")

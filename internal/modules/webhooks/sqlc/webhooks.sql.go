@@ -15,12 +15,19 @@ const claimWebhookDelivery = `-- name: ClaimWebhookDelivery :one
 UPDATE webhook_deliveries
 SET attempts = attempts + 1,
     next_attempt_at = NOW() + make_interval(secs => $1::double precision)
-WHERE id = $2
-  AND tenant_id = $3
+WHERE webhook_deliveries.id = $2
+  AND webhook_deliveries.tenant_id = $3
   AND status = 'pending'
   AND attempts < max_attempts
   AND next_attempt_at <= NOW()
-RETURNING id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at
+  AND EXISTS (
+      SELECT 1 FROM webhook_endpoints e
+      WHERE e.id = webhook_deliveries.endpoint_id
+        AND e.tenant_id = webhook_deliveries.tenant_id
+        AND e.status = 'active'
+        AND e.deleted_at IS NULL
+  )
+RETURNING id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at
 `
 
 type ClaimWebhookDeliveryParams struct {
@@ -29,6 +36,8 @@ type ClaimWebhookDeliveryParams struct {
 	TenantID     int64   `json:"tenant_id"`
 }
 
+// A disabled or deleted endpoint is never claimed, so it stops receiving
+// retries; ExpireUnclaimableWebhookDelivery then dead-letters the delivery.
 func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeliveryParams) (WebhookDelivery, error) {
 	row := q.db.QueryRow(ctx, claimWebhookDelivery, arg.LeaseSeconds, arg.ID, arg.TenantID)
 	var i WebhookDelivery
@@ -45,6 +54,7 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 		&i.Status,
 		&i.Attempts,
 		&i.MaxAttempts,
+		&i.TimeoutMs,
 		&i.NextAttemptAt,
 		&i.LastStatusCode,
 		&i.LastError,
@@ -82,13 +92,13 @@ const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
 
 INSERT INTO webhook_deliveries (
     tenant_id, endpoint_id, event_id, event_type, event_created_at,
-    url, payload, secret_ciphertext, status, max_attempts, next_attempt_at,
-    replayed_from_id
+    url, payload, secret_ciphertext, status, max_attempts, timeout_ms,
+    next_attempt_at, replayed_from_id
 )
 VALUES (
     $1, $2, $3, $4, $5,
-    $6, $7::jsonb, $8, 'pending', $9, NOW(),
-    $10
+    $6, $7::jsonb, $8, 'pending', $9, $10,
+    NOW(), $11
 )
 ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
 RETURNING id
@@ -104,6 +114,7 @@ type CreateWebhookDeliveryParams struct {
 	Payload          []byte             `json:"payload"`
 	SecretCiphertext string             `json:"secret_ciphertext"`
 	MaxAttempts      int32              `json:"max_attempts"`
+	TimeoutMs        int32              `json:"timeout_ms"`
 	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
 }
 
@@ -119,6 +130,7 @@ func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDe
 		arg.Payload,
 		arg.SecretCiphertext,
 		arg.MaxAttempts,
+		arg.TimeoutMs,
 		arg.ReplayedFromID,
 	)
 	var id int64
@@ -398,6 +410,47 @@ func (q *Queries) DeleteWebhookInboundSource(ctx context.Context, arg DeleteWebh
 	return i, err
 }
 
+const expireUnclaimableWebhookDelivery = `-- name: ExpireUnclaimableWebhookDelivery :execrows
+UPDATE webhook_deliveries
+SET status = 'dead',
+    next_attempt_at = NOW(),
+    last_error = CASE
+        WHEN attempts >= max_attempts THEN 'delivery attempts exhausted'
+        ELSE 'endpoint is disabled or deleted'
+    END
+WHERE webhook_deliveries.id = $1
+  AND webhook_deliveries.tenant_id = $2
+  AND status = 'pending'
+  AND next_attempt_at <= NOW()
+  AND (
+      attempts >= max_attempts
+      OR NOT EXISTS (
+          SELECT 1 FROM webhook_endpoints e
+          WHERE e.id = webhook_deliveries.endpoint_id
+            AND e.tenant_id = webhook_deliveries.tenant_id
+            AND e.status = 'active'
+            AND e.deleted_at IS NULL
+      )
+  )
+`
+
+type ExpireUnclaimableWebhookDeliveryParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+// Dead-letters a pending delivery that can never be claimed again: its
+// endpoint is disabled/deleted, or every attempt was consumed but the final
+// bookkeeping write was lost. A live claim lease (next_attempt_at in the
+// future) is left alone so an in-flight attempt can finish.
+func (q *Queries) ExpireUnclaimableWebhookDelivery(ctx context.Context, arg ExpireUnclaimableWebhookDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, expireUnclaimableWebhookDelivery, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getActiveWebhookEndpointSecret = `-- name: GetActiveWebhookEndpointSecret :one
 SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, created_at FROM webhook_endpoint_secrets
 WHERE tenant_id = $1 AND endpoint_id = $2 AND active
@@ -425,7 +478,7 @@ func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetAct
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
+SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -450,6 +503,7 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDelivery
 		&i.Status,
 		&i.Attempts,
 		&i.MaxAttempts,
+		&i.TimeoutMs,
 		&i.NextAttemptAt,
 		&i.LastStatusCode,
 		&i.LastError,
@@ -646,7 +700,7 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 }
 
 const listWebhookDeliveries = `-- name: ListWebhookDeliveries :many
-SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
+SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
 WHERE tenant_id = $1
   AND ($2::bigint = 0 OR endpoint_id = $2)
   AND ($3::text = '' OR status = $3)
@@ -695,6 +749,7 @@ func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeli
 			&i.Status,
 			&i.Attempts,
 			&i.MaxAttempts,
+			&i.TimeoutMs,
 			&i.NextAttemptAt,
 			&i.LastStatusCode,
 			&i.LastError,
@@ -914,6 +969,39 @@ func (q *Queries) ListWebhookInboundSources(ctx context.Context, arg ListWebhook
 	return items, nil
 }
 
+const lockWebhookEndpoint = `-- name: LockWebhookEndpoint :one
+SELECT id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at FROM webhook_endpoints
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+FOR UPDATE
+`
+
+type LockWebhookEndpointParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+// Serializes concurrent secret rotations: the row lock is held until the
+// rotation transaction commits, so NextWebhookEndpointSecretVersion cannot
+// hand two rotations the same version.
+func (q *Queries) LockWebhookEndpoint(ctx context.Context, arg LockWebhookEndpointParams) (WebhookEndpoint, error) {
+	row := q.db.QueryRow(ctx, lockWebhookEndpoint, arg.ID, arg.TenantID)
+	var i WebhookEndpoint
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Url,
+		&i.Description,
+		&i.EventTypes,
+		&i.Status,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const markWebhookDeliveryDead = `-- name: MarkWebhookDeliveryDead :exec
 UPDATE webhook_deliveries
 SET status = 'dead',
@@ -975,13 +1063,29 @@ func (q *Queries) NextWebhookEndpointSecretVersion(ctx context.Context, endpoint
 }
 
 const purgeWebhookDeliveries = `-- name: PurgeWebhookDeliveries :execrows
-DELETE FROM webhook_deliveries
-WHERE status IN ('succeeded', 'dead')
-  AND updated_at < NOW() - make_interval(days => $1::integer)
+WITH batch AS (
+    SELECT id
+    FROM webhook_deliveries
+    WHERE status IN ('succeeded', 'dead')
+      AND updated_at < NOW() - make_interval(days => $1::integer)
+    ORDER BY updated_at
+    LIMIT $2::integer
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_deliveries AS d
+USING batch
+WHERE d.id = batch.id
 `
 
-func (q *Queries) PurgeWebhookDeliveries(ctx context.Context, retentionDays int32) (int64, error) {
-	result, err := q.db.Exec(ctx, purgeWebhookDeliveries, retentionDays)
+type PurgeWebhookDeliveriesParams struct {
+	RetentionDays int32 `json:"retention_days"`
+	BatchSize     int32 `json:"batch_size"`
+}
+
+// One bounded retention batch, served by idx_webhook_deliveries_terminal_updated_at.
+// The caller loops until a batch is short.
+func (q *Queries) PurgeWebhookDeliveries(ctx context.Context, arg PurgeWebhookDeliveriesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeWebhookDeliveries, arg.RetentionDays, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}
@@ -989,12 +1093,28 @@ func (q *Queries) PurgeWebhookDeliveries(ctx context.Context, retentionDays int3
 }
 
 const purgeWebhookInboundEvents = `-- name: PurgeWebhookInboundEvents :execrows
-DELETE FROM webhook_inbound_events
-WHERE received_at < NOW() - make_interval(days => $1::integer)
+WITH batch AS (
+    SELECT id
+    FROM webhook_inbound_events
+    WHERE received_at < NOW() - make_interval(days => $1::integer)
+    ORDER BY received_at
+    LIMIT $2::integer
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_inbound_events AS e
+USING batch
+WHERE e.id = batch.id
 `
 
-func (q *Queries) PurgeWebhookInboundEvents(ctx context.Context, retentionDays int32) (int64, error) {
-	result, err := q.db.Exec(ctx, purgeWebhookInboundEvents, retentionDays)
+type PurgeWebhookInboundEventsParams struct {
+	RetentionDays int32 `json:"retention_days"`
+	BatchSize     int32 `json:"batch_size"`
+}
+
+// One bounded retention batch, served by idx_webhook_inbound_events_received_at.
+// The caller loops until a batch is short.
+func (q *Queries) PurgeWebhookInboundEvents(ctx context.Context, arg PurgeWebhookInboundEventsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeWebhookInboundEvents, arg.RetentionDays, arg.BatchSize)
 	if err != nil {
 		return 0, err
 	}

@@ -260,14 +260,16 @@ func statusErrorCode(status int) string {
 }
 
 func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *RequestInfo {
+	// IP and User-Agent are cloned: Fiber strings are zero-copy views into
+	// pooled buffers, while RequestInfo lives in the context beyond the handler.
 	info := &RequestInfo{
 		EventID:            eventID,
 		TenantID:           tenant.ID(c),
 		Action:             action,
 		Resource:           resource,
 		RequestID:          fiber.Locals[string](c, "request_id"),
-		IP:                 c.IP(),
-		UserAgent:          c.Get("User-Agent"),
+		IP:                 strings.Clone(c.IP()),
+		UserAgent:          strings.Clone(c.Get("User-Agent")),
 		IdempotencyKeyHash: HashIdempotencyKey(c.Get("Idempotency-Key")),
 	}
 	if info.TenantID == 0 {

@@ -253,16 +253,22 @@ func Backoff(attempt int, base, maxDelay time.Duration) time.Duration {
 }
 
 // RetryDelay selects the delay before the next delivery attempt. A valid
-// Retry-After wins over exponential backoff but is capped at maxDelay; the
-// boolean reports whether Retry-After was used.
+// Retry-After can only lengthen the exponential backoff, never shorten it, so
+// "Retry-After: 0" or a past date cannot make a receiver hammer itself with
+// immediate retries. It is capped at maxDelay; the boolean reports whether
+// Retry-After was used.
 func RetryDelay(attempt int, base, maxDelay time.Duration, retryAfter string, now time.Time) (time.Duration, bool) {
+	backoff := Backoff(attempt, base, maxDelay)
 	if delay, ok := ParseRetryAfter(retryAfter, now); ok {
 		if maxDelay > 0 && delay > maxDelay {
 			delay = maxDelay
 		}
+		if delay < backoff {
+			delay = backoff
+		}
 		return delay, true
 	}
-	return Backoff(attempt, base, maxDelay), false
+	return backoff, false
 }
 
 // TransportError is a non-HTTP failure. Blocked and invalid targets are

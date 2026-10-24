@@ -46,14 +46,19 @@ func (s *PostgresStore) LoadSnapshot(ctx context.Context) (Snapshot, error) {
 	for flagRows.Next() {
 		var (
 			key        string
-			enabled    bool
+			enabled    pgtype.Bool
 			killSwitch bool
 		)
 		if err := flagRows.Scan(&key, &enabled, &killSwitch); err != nil {
 			flagRows.Close()
 			return Snapshot{}, fmt.Errorf("load feature flags: scan row: %w", err)
 		}
-		snapshot.Flags[Key(key)] = FlagState{Enabled: enabled, KillSwitch: killSwitch}
+		state := FlagState{KillSwitch: killSwitch}
+		if enabled.Valid {
+			value := enabled.Bool
+			state.Enabled = &value
+		}
+		snapshot.Flags[Key(key)] = state
 	}
 	if err := flagRows.Err(); err != nil {
 		flagRows.Close()

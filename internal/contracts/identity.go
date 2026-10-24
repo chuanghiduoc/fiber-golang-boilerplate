@@ -44,7 +44,14 @@ type Principal struct {
 	Email    string
 	Name     string
 	Role     string
+	// TenantStatus is the owning tenant's current status ("active" or
+	// "suspended"). API-key authentication rejects anything but
+	// TenantStatusActive.
+	TenantStatus string
 }
+
+// TenantStatusActive is the only tenant status that may authenticate.
+const TenantStatusActive = "active"
 
 // PrincipalReader loads the current principal for a tenant/user pair. It is
 // used by API-key authentication so bans, deletions, and role changes take

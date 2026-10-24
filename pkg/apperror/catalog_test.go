@@ -5,20 +5,13 @@ import (
 	"testing"
 )
 
-// requiredCodes pins the public catalog contract. Removing or renaming any
-// of these breaks clients that branch on the code, so the test fails loudly.
+// requiredCodes pins the platform-wide catalog contract. Removing or renaming
+// any of these breaks clients that branch on the code, so the test fails
+// loudly. Module-owned codes are pinned by each module's catalog test.
 var requiredCodes = []Code{
-	CodeAuthInvalidCredentials,
-	CodeAuthEmailNotVerified,
-	CodeAuthRefreshInvalid,
-	CodeUserEmailTaken,
-	CodeUserNotFound,
 	CodeUserLastAdmin,
-	CodeFileNotFound,
-	CodeFileTooLarge,
-	CodeFileUnsupportedType,
-	CodeFileNotDeleted,
 	CodePermissionDenied,
+	CodeFeatureDisabled,
 	CodeRateLimitExceeded,
 	CodeAPIVersionUnsupported,
 	CodeSystemInternal,
@@ -72,8 +65,8 @@ func TestCatalogCodesUnique(t *testing.T) {
 	}
 
 	all := AllCodes()
-	if len(all) != len(catalog) {
-		t.Fatalf("AllCodes() returned %d codes, catalog has %d", len(all), len(catalog))
+	if len(all) != len(state.Load().specs) {
+		t.Fatalf("AllCodes() returned %d codes, catalog has %d", len(all), len(state.Load().specs))
 	}
 	for i := 1; i < len(all); i++ {
 		if all[i-1] >= all[i] {
@@ -132,5 +125,49 @@ func TestNewCodeUnknownFallback(t *testing.T) {
 	}
 	if err.Detail != "safe detail" {
 		t.Errorf("Detail = %q, want %q", err.Detail, "safe detail")
+	}
+}
+
+func TestRegisterModuleCodes(t *testing.T) {
+	spec := Spec{Status: 409, Title: "Widget locked", DocPath: "/errors/widget-locked"}
+	if err := Register("widgets", map[Code]Spec{"widget.locked": spec}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if got := NewCode("widget.locked", "busy"); got.Status != 409 || got.Code != "widget.locked" {
+		t.Fatalf("NewCode = %+v, want registered spec", got)
+	}
+	if owner, _ := OwnerOf("widget.locked"); owner != "widgets" {
+		t.Fatalf("OwnerOf = %q, want widgets", owner)
+	}
+	if err := Register("widgets", map[Code]Spec{"widget.locked": spec}); err != nil {
+		t.Fatalf("identical re-registration must be a no-op: %v", err)
+	}
+}
+
+func TestRegisterRejectsConflicts(t *testing.T) {
+	valid := Spec{Status: 400, Title: "Bad", DocPath: "/errors/x"}
+	cases := map[string]struct {
+		owner string
+		specs map[Code]Spec
+		want  string
+	}{
+		"platform code": {"intruder", map[Code]Spec{CodePermissionDenied: platformSpecs[CodePermissionDenied]}, "already owned"},
+		"changed spec":  {platformOwner, map[Code]Spec{CodePermissionDenied: valid}, "different spec"},
+		"bad code":      {"x", map[Code]Spec{"NoDots": valid}, "invalid code"},
+		"bad status":    {"x", map[Code]Spec{"x.bad_status": {Status: 200, Title: "t", DocPath: "/errors/x"}}, "status"},
+		"empty title":   {"x", map[Code]Spec{"x.empty_title": {Status: 400, DocPath: "/errors/x"}}, "title"},
+		"bad doc path":  {"x", map[Code]Spec{"x.bad_doc": {Status: 400, Title: "t", DocPath: "x"}}, "DocPath"},
+		"missing owner": {"", map[Code]Spec{"x.no_owner": valid}, "owner is required"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := Register(tc.owner, tc.specs)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Register error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+	if _, ok := SpecFor("x.no_owner"); ok {
+		t.Fatal("a rejected registration must not be applied")
 	}
 }

@@ -17,5 +17,6 @@ type File struct {
 	MimeType     string             `json:"mime_type"`
 	Size         int64              `json:"size"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
 	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
 }

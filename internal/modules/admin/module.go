@@ -5,9 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module owns the back-office surface. Its services compose narrow
@@ -23,19 +21,20 @@ func New(admin *adminhandler.Handler) *Module {
 func (m *Module) Name() string { return "admin" }
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	cfg := deps.Config
-	auth := apikey.Authenticate(middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions), deps.APIKeyVerifier)
-	adminGroup := v1.Group("/admin",
-		auth,
-		deps.Limiters.Normal,
-	)
-	adminGroup.Get("/stats", authz.Require(authz.PermissionAdminStatsRead), m.admin.GetStats)
-	adminGroup.Get("/users", authz.Require(authz.PermissionAdminUsersRead), m.admin.ListUsers)
-	adminGroup.Put("/users/:id/role", authz.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.admin.UpdateRole)
-	adminGroup.Post("/users/:id/ban", authz.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.BanUser)
-	adminGroup.Post("/users/:id/unban", authz.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.UnbanUser)
-	adminGroup.Get("/files", authz.Require(authz.PermissionAdminFilesRead), m.admin.ListFiles)
-	adminGroup.Get("/files/:id/download", authz.Require(authz.PermissionAdminFilesRead), m.admin.DownloadFile)
-	adminGroup.Delete("/files/:id", authz.Require(authz.PermissionAdminFilesDelete), deps.Idempotency, m.admin.DeleteFile)
-	adminGroup.Post("/files/:id/restore", authz.Require(authz.PermissionAdminFilesRestore), deps.Idempotency, m.admin.RestoreFile)
+	auth := deps.Authenticate()
+	limit := deps.Limiters.Normal
+	// The group carries no middleware on purpose: Fiber registers group
+	// middleware as Use("/admin"), which would also run on /admin/features/*
+	// and /admin/api-keys/* owned by other modules (double auth, double
+	// rate-limit counting). Auth and the limiter are attached per route.
+	adminGroup := v1.Group("/admin")
+	adminGroup.Get("/stats", auth, limit, authz.Require(authz.PermissionAdminStatsRead), m.admin.GetStats)
+	adminGroup.Get("/users", auth, limit, authz.Require(authz.PermissionAdminUsersRead), m.admin.ListUsers)
+	adminGroup.Put("/users/:id/role", auth, limit, authz.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.admin.UpdateRole)
+	adminGroup.Post("/users/:id/ban", auth, limit, authz.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.BanUser)
+	adminGroup.Post("/users/:id/unban", auth, limit, authz.Require(authz.PermissionAdminUsersBan), deps.Idempotency, m.admin.UnbanUser)
+	adminGroup.Get("/files", auth, limit, authz.Require(authz.PermissionAdminFilesRead), m.admin.ListFiles)
+	adminGroup.Get("/files/:id/download", auth, limit, authz.Require(authz.PermissionAdminFilesRead), m.admin.DownloadFile)
+	adminGroup.Delete("/files/:id", auth, limit, authz.Require(authz.PermissionAdminFilesDelete), deps.Idempotency, m.admin.DeleteFile)
+	adminGroup.Post("/files/:id/restore", auth, limit, authz.Require(authz.PermissionAdminFilesRestore), deps.Idempotency, m.admin.RestoreFile)
 }

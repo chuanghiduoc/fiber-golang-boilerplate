@@ -15,7 +15,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
@@ -65,8 +66,8 @@ type CreateResult struct {
 
 // NotificationService is the notifications module's business surface.
 type NotificationService interface {
-	Create(ctx context.Context, input contracts.CreateNotificationInput) (CreateResult, error)
-	Notify(ctx context.Context, input contracts.CreateNotificationInput) error
+	Create(ctx context.Context, input notificationcontracts.CreateNotificationInput) (CreateResult, error)
+	Notify(ctx context.Context, input notificationcontracts.CreateNotificationInput) error
 	Get(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error)
 	List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]dto.NotificationResponse, bool, error)
 	MarkRead(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error)
@@ -78,26 +79,26 @@ type NotificationService interface {
 
 type notificationService struct {
 	repo       repository.NotificationRepository
-	recipients contracts.NotificationRecipientLookup
+	recipients identitycontracts.NotificationRecipientLookup
 	sender     email.Sender
 	txManager  TransactionManager
 }
 
-// Notify implements contracts.Notifier for other modules. A notification
+// Notify implements notificationcontracts.Notifier for other modules. A notification
 // suppressed by the user's channel preferences is a successful no-op.
-func (s *notificationService) Notify(ctx context.Context, input contracts.CreateNotificationInput) error {
+func (s *notificationService) Notify(ctx context.Context, input notificationcontracts.CreateNotificationInput) error {
 	_, err := s.Create(ctx, input)
 	return err
 }
 
 var (
-	_ NotificationService = (*notificationService)(nil)
-	_ contracts.Notifier  = (*notificationService)(nil)
+	_ NotificationService            = (*notificationService)(nil)
+	_ notificationcontracts.Notifier = (*notificationService)(nil)
 )
 
 func NewNotificationService(
 	repo repository.NotificationRepository,
-	recipients contracts.NotificationRecipientLookup,
+	recipients identitycontracts.NotificationRecipientLookup,
 	sender email.Sender,
 	txManager TransactionManager,
 ) NotificationService {
@@ -113,7 +114,7 @@ func NewNotificationService(
 // stores the in-app row, and enqueues the email channel. When a transaction
 // manager and a transactional sender are wired, the row and job commit
 // together: an enqueue failure rolls the row back.
-func (s *notificationService) Create(ctx context.Context, input contracts.CreateNotificationInput) (CreateResult, error) {
+func (s *notificationService) Create(ctx context.Context, input notificationcontracts.CreateNotificationInput) (CreateResult, error) {
 	scopedCtx, err := resolveTenantContext(ctx, input.TenantID)
 	if err != nil {
 		return CreateResult{}, err
@@ -194,7 +195,7 @@ func (s *notificationService) Create(ctx context.Context, input contracts.Create
 
 // createError preserves domain errors and hides persistence/queue internals
 // behind a public 500 detail while logging the cause.
-func (s *notificationService) createError(ctx context.Context, err error, input contracts.CreateNotificationInput) error {
+func (s *notificationService) createError(ctx context.Context, err error, input notificationcontracts.CreateNotificationInput) error {
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
 		return err
@@ -211,7 +212,7 @@ func (s *notificationService) createError(ctx context.Context, err error, input 
 	return apperror.NewInternal("failed to create notification")
 }
 
-func (s *notificationService) buildEmailMessage(ctx context.Context, input contracts.CreateNotificationInput) (email.Message, error) {
+func (s *notificationService) buildEmailMessage(ctx context.Context, input notificationcontracts.CreateNotificationInput) (email.Message, error) {
 	if s.recipients == nil {
 		return email.Message{}, apperror.NewInternal("notification recipient lookup is not configured")
 	}
@@ -368,27 +369,27 @@ func resolveTenantContext(ctx context.Context, explicit int64) (context.Context,
 	return ctx, nil
 }
 
-func normalizeInput(input contracts.CreateNotificationInput) (contracts.CreateNotificationInput, error) {
+func normalizeInput(input notificationcontracts.CreateNotificationInput) (notificationcontracts.CreateNotificationInput, error) {
 	input.Type = strings.TrimSpace(input.Type)
 	input.Title = strings.TrimSpace(input.Title)
 	input.Body = strings.TrimSpace(input.Body)
 	if input.UserID <= 0 {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest("userId is required")
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("userId is required")
 	}
 	if err := validateType(input.Type); err != nil {
-		return contracts.CreateNotificationInput{}, err
+		return notificationcontracts.CreateNotificationInput{}, err
 	}
 	if input.Title == "" {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidTitle)
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidTitle)
 	}
 	if len([]rune(input.Title)) > maxTitleLen {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest("title is too long")
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("title is too long")
 	}
 	if input.Body == "" {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidBody)
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidBody)
 	}
 	if len([]rune(input.Body)) > maxBodyLen {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest("body is too long")
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("body is too long")
 	}
 
 	data := bytes.TrimSpace(input.Data)
@@ -396,11 +397,11 @@ func normalizeInput(input contracts.CreateNotificationInput) (contracts.CreateNo
 		data = []byte("{}")
 	}
 	if len(data) > maxDataBytes {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest("data is too large")
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("data is too large")
 	}
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(data, &object); err != nil || object == nil {
-		return contracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidData)
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidData)
 	}
 	input.Data = json.RawMessage(data)
 	return input, nil

@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 )
 
 func TestStorageConfig_AllowedTypes(t *testing.T) {
@@ -281,7 +283,7 @@ func TestDBConfig_DSN(t *testing.T) {
 func baseValidConfig() Config {
 	return Config{
 		App: AppConfig{
-			Port: 8080, Env: "local", BodyLimit: 12582912,
+			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
 			RequestTimeout: 30, FrontendURL: "http://localhost:3000",
 		},
 		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30},
@@ -700,7 +702,35 @@ func productionValidConfig() Config {
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "require"
 	cfg.Tenant.RequireHeader = true
+	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0"}
 	return cfg
+}
+
+func TestValidate_MemoryCacheInProduction(t *testing.T) {
+	cfg := productionValidConfig()
+	cfg.Cache = CacheConfig{Driver: "memory"}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("production must reject CACHE_DRIVER=memory without the single-replica opt-in")
+	}
+	cfg.Cache.AllowMemoryInProduction = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("CACHE_ALLOW_MEMORY_IN_PRODUCTION=true should allow memory cache: %v", err)
+	}
+}
+
+func TestValidate_JSONBodyLimit(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.App.JSONBodyLimit = 0
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should fail for APP_JSON_BODY_LIMIT < 1")
+	}
+	cfg.App.JSONBodyLimit = cfg.App.BodyLimit + 1
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should fail when APP_JSON_BODY_LIMIT exceeds APP_BODY_LIMIT")
+	}
+	if got := (AppConfig{}).EffectiveJSONBodyLimit(); got != DefaultJSONBodyLimit {
+		t.Errorf("EffectiveJSONBodyLimit() for zero value = %d, want %d", got, DefaultJSONBodyLimit)
+	}
 }
 
 func TestValidate_ProductionSafetyRails(t *testing.T) {
@@ -787,6 +817,38 @@ func TestFeatureFlagsConfigParsedValues(t *testing.T) {
 	}
 }
 
+// TestFeatureFlagsValidateKnownKeys covers the post-registration check. Load
+// cannot know module-owned keys, so unknown keys pass Validate and are
+// rejected here once the catalog is complete.
+func TestFeatureFlagsValidateKnownKeys(t *testing.T) {
+	if err := features.Register("configtest", features.Definition{
+		Key: "configtest_flag", Description: "config test flag", Default: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	valid := FeatureFlagsConfig{Flags: "configtest_flag=false", ForceOff: "configtest_flag"}
+	if err := valid.ValidateKnownKeys(); err != nil {
+		t.Fatalf("registered keys rejected: %v", err)
+	}
+	for name, cfg := range map[string]FeatureFlagsConfig{
+		"unknown flag":      {Flags: "typo=true"},
+		"unknown force-off": {ForceOff: "typo"},
+		"malformed flag":    {Flags: "configtest_flag="},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := cfg.ValidateKnownKeys(); err == nil {
+				t.Error("ValidateKnownKeys() should reject this config")
+			}
+		})
+	}
+
+	syntaxOnly := baseValidConfig()
+	syntaxOnly.FeatureFlags.Flags = "typo=true"
+	if err := syntaxOnly.Validate(); err != nil {
+		t.Fatalf("Validate must only check syntax (keys are registered later): %v", err)
+	}
+}
+
 func TestValidate_FeatureFlags(t *testing.T) {
 	t.Run("valid flags", func(t *testing.T) {
 		cfg := baseValidConfig()
@@ -812,10 +874,8 @@ func TestValidate_FeatureFlags(t *testing.T) {
 		name   string
 		mutate func(*Config)
 	}{
-		{"unknown flag", func(c *Config) { c.FeatureFlags.Flags = "typo=true" }},
 		{"malformed flag", func(c *Config) { c.FeatureFlags.Flags = "user_registration=" }},
 		{"duplicate flag", func(c *Config) { c.FeatureFlags.Flags = "file_uploads=true,file_uploads=false" }},
-		{"unknown force-off", func(c *Config) { c.FeatureFlags.ForceOff = "typo" }},
 		{"negative TTL", func(c *Config) { c.FeatureFlags.CacheTTLSeconds = -1 }},
 		{"negative staleness", func(c *Config) { c.FeatureFlags.MaxStalenessSeconds = -1 }},
 		{"staleness below TTL", func(c *Config) {

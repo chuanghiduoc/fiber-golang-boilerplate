@@ -3,15 +3,18 @@ package handler
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
@@ -71,7 +74,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 
 	// Only the account owner or an admin may read a profile (it contains PII
 	// such as the email address and role).
-	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && !httpx.Can(c, authz.PermissionAdminUsersRead) {
 		// 404 rather than 403 avoids confirming that an otherwise private
 		// account ID exists.
 		return apperror.NewNotFound("user not found")
@@ -104,7 +107,7 @@ func (h *UserHandler) List(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore, nextUserCursor(users))
+	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u dto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
 }
 
 // UpdateMe godoc
@@ -160,7 +163,7 @@ func (h *UserHandler) Update(c fiber.Ctx) error {
 		return err
 	}
 
-	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && !httpx.Can(c, authz.PermissionAdminUsersWrite) {
 		return apperror.NewForbidden("you can only update your own profile")
 	}
 
@@ -270,7 +273,7 @@ func (h *UserHandler) Delete(c fiber.Ctx) error {
 		return err
 	}
 
-	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && !httpx.Can(c, authz.PermissionAdminUsersDelete) {
 		return apperror.NewForbidden("you can only delete your own profile")
 	}
 

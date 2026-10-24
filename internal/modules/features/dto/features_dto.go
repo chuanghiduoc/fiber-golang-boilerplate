@@ -4,9 +4,11 @@ package featuresdto
 import "time"
 
 // UpsertFlagRequest replaces the database default and kill switch for a
-// compile-time flag. The key comes from the path, never the body.
+// compile-time flag. The key comes from the path, never the body. Omitting
+// enabled (or sending null) clears the database default so environment and
+// compiled defaults apply again.
 type UpsertFlagRequest struct {
-	Enabled     *bool   `json:"enabled" validate:"required"`
+	Enabled     *bool   `json:"enabled"`
 	KillSwitch  *bool   `json:"killSwitch" validate:"required"`
 	Description *string `json:"description" validate:"omitempty,max=500"`
 }
@@ -21,7 +23,8 @@ type UpsertTargetRequest struct {
 
 // FlagResponse is the admin view of one compile-time flag. Enabled is the
 // configured database default (or the compiled default when Configured is
-// false); Effective is the value the requesting admin would observe after the
+// false, including a row that exists only for a kill switch or targets);
+// Effective is the value the requesting admin would observe after the
 // full precedence chain.
 type FlagResponse struct {
 	Key         string     `json:"key"`

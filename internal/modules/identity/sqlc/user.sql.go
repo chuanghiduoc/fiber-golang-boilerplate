@@ -474,6 +474,43 @@ func (q *Queries) GetUserByID(ctx context.Context, arg GetUserByIDParams) (User,
 	return i, err
 }
 
+const getUserPrincipal = `-- name: GetUserPrincipal :one
+SELECT u.id, u.tenant_id, u.email, u.name, u.role, t.status AS tenant_status
+FROM users u
+JOIN tenants t ON t.id = u.tenant_id
+WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+`
+
+type GetUserPrincipalParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+type GetUserPrincipalRow struct {
+	ID           int64  `json:"id"`
+	TenantID     int64  `json:"tenant_id"`
+	Email        string `json:"email"`
+	Name         string `json:"name"`
+	Role         string `json:"role"`
+	TenantStatus string `json:"tenant_status"`
+}
+
+// API-key authentication needs the owner's current role and the owning
+// tenant's status in one lookup, so a suspended tenant's keys stop working.
+func (q *Queries) GetUserPrincipal(ctx context.Context, arg GetUserPrincipalParams) (GetUserPrincipalRow, error) {
+	row := q.db.QueryRow(ctx, getUserPrincipal, arg.ID, arg.TenantID)
+	var i GetUserPrincipalRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Email,
+		&i.Name,
+		&i.Role,
+		&i.TenantStatus,
+	)
+	return i, err
+}
+
 const getUserSessionState = `-- name: GetUserSessionState :one
 SELECT u.role, u.token_version, u.tenant_id, t.status
 FROM users u
@@ -693,11 +730,25 @@ func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams
 	return items, nil
 }
 
+const lockTenantAdminChanges = `-- name: LockTenantAdminChanges :exec
+SELECT pg_advisory_xact_lock(hashtextextended('identity.last_admin', $1::bigint))
+`
+
+// Serializes admin demotion/ban/delete per tenant for the rest of the
+// transaction. It must run before the target row is updated: the
+// protect_last_admin trigger locks the other admins' rows, and without this
+// lock two concurrent demotions each hold their own row and wait on the
+// other's (deadlock).
+func (q *Queries) LockTenantAdminChanges(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, lockTenantAdminChanges, tenantID)
+	return err
+}
+
 const restoreUser = `-- name: RestoreUser :one
 UPDATE users
 SET deleted_at = NULL, banned_at = NULL, updated_at = NOW(),
     token_version = token_version + 1, password_changed_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL AND banned_at IS NOT NULL
 RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, created_at, updated_at, deleted_at
 `
 
@@ -706,6 +757,8 @@ type RestoreUserParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
+// Unban only reverses a ban. A self-deleted account (deleted_at set,
+// banned_at NULL) is not restorable through this path.
 func (q *Queries) RestoreUser(ctx context.Context, arg RestoreUserParams) (User, error) {
 	row := q.db.QueryRow(ctx, restoreUser, arg.ID, arg.TenantID)
 	var i User

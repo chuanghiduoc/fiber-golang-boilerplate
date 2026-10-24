@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
@@ -107,7 +108,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to check existing user")
 	}
 	if existing != nil {
-		return nil, apperror.NewCode(apperror.CodeUserEmailTaken, "email already registered")
+		return nil, apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
 	}
 	if err := ensureEmailNotBanned(ctx, s.repo, email); err != nil {
 		return nil, err
@@ -120,7 +121,10 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 
-	var user *identitysqlc.User
+	var (
+		user          *identitysqlc.User
+		webhookQueued bool
+	)
 	if s.txManager != nil {
 		// Create the user, optional verification provisioning, and the audit
 		// row in one transaction. Any failure rolls the account back: a
@@ -134,7 +138,6 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 				if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
 					slog.Error("failed to provision registration verification email",
 						slog.Int64("user_id", created.ID),
-						slog.String("email", created.Email),
 						slog.Any("error", provErr),
 					)
 					// Provisioning details (including context deadlines) are for
@@ -151,6 +154,18 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 			}
 			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
 				return auditWriteError(auditErr)
+			}
+			if txDispatcher, ok := s.webhooks.(WebhookTxDispatcher); ok {
+				// The webhook outbox job commits with the account, so a
+				// registration never exists without its event (or vice versa).
+				if hookErr := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventUserRegistered, created.TenantID, ToUserResponse(created)); hookErr != nil {
+					slog.Error("failed to enqueue registration webhook",
+						slog.Int64("user_id", created.ID),
+						slog.Any("error", hookErr),
+					)
+					return apperror.NewInternal("failed to create user")
+				}
+				webhookQueued = true
 			}
 			user = created
 			return nil
@@ -179,8 +194,30 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, email))
 
 	response := ToUserResponse(user)
-	s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
+	if !webhookQueued {
+		s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
+	}
 	return response, nil
+}
+
+// WebhookTxDispatcher is the optional transactional side of the webhooks
+// dispatcher. It cannot live in the stdlib-only contracts package because it
+// takes the producer's pgx.Tx.
+type WebhookTxDispatcher interface {
+	DispatchTx(ctx context.Context, tx pgx.Tx, events ...webhookcontracts.Event) error
+}
+
+// dispatchWebhookTx enqueues one domain event inside tx.
+func dispatchWebhookTx(ctx context.Context, dispatcher WebhookTxDispatcher, tx pgx.Tx, eventType string, tenantID int64, data any) error {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("marshal webhook payload: %w", err)
+	}
+	return dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
+		Type:     eventType,
+		TenantID: tenantID,
+		Data:     payload,
+	})
 }
 
 // SetWebhookDispatcher wires outbound domain events.
@@ -232,7 +269,7 @@ func (s *userService) createUser(
 	})
 	if err != nil {
 		if database.IsUniqueViolation(err) {
-			return nil, apperror.NewCode(apperror.CodeUserEmailTaken, "email already registered")
+			return nil, apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
 		}
 		return nil, apperror.NewInternal("failed to create user")
 	}
@@ -252,74 +289,67 @@ func (s *userService) RegistrationEmailsTransactional() bool {
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
 	email := normalizeEmail(req.Email)
 
-	// Look up the account before applying a per-email lockout. Otherwise an
-	// attacker can pre-lock an address that does not exist yet, and the real
-	// owner is locked out immediately after registering.
+	// Reserve an attempt before any lookup or password check. The counter is
+	// keyed by the normalized address whether or not an account exists, so a
+	// locked response cannot reveal existence, and the atomic increment means
+	// parallel guesses cannot all pass a stale "not locked yet" read.
+	// Registration clears the key, so pre-locking an unregistered address
+	// cannot lock out its future owner.
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, email)
+	if err := s.reserveLoginAttempt(ctx, cacheKey); err != nil {
+		return nil, err
+	}
+
 	user, err := s.repo.GetByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			// Spend the same bcrypt time as an existing account so login
 			// timing cannot be used for account enumeration.
 			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
-			// Never create a lockout key for a nonexistent account.
-			return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
+			return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 		}
 		return nil, apperror.NewInternal("failed to get user")
 	}
 
-	// Check lockout (fail-closed: deny login if cache is unavailable)
-	cacheKey := scopedKey(ctx, loginAttemptPrefix, email)
-	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
-	if cacheErr != nil {
-		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
-	}
-	if locked {
-		return nil, apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
-	}
-
 	if !user.PasswordHash.Valid {
-		s.incrementLoginAttempts(ctx, cacheKey)
-		return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
+		// OAuth-only account: equalize timing with a password check.
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
+		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.Password)); err != nil {
-		s.incrementLoginAttempts(ctx, cacheKey)
-		return nil, apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
+		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
+
+	// The password was correct: clear the counter even if the account still
+	// needs verification, so a correct password never accrues a lockout.
+	s.clearLoginAttempts(ctx, cacheKey)
 
 	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
-		return nil, apperror.NewCode(apperror.CodeAuthEmailNotVerified, "email not verified")
-	}
-
-	// Clear attempts on success
-	if err := s.cache.Delete(ctx, cacheKey); err != nil {
-		slog.Warn("cache error clearing login attempts", slog.String("key", cacheKey), slog.Any("error", err))
+		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 	return ToUserResponse(user), nil
 }
 
-func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
-	// Atomic increment so parallel failed logins cannot race the counter and
-	// slip past the lockout threshold.
-	if _, err := s.cache.Increment(ctx, key, lockoutDuration); err != nil {
-		slog.Error("cache error storing login attempts — brute force protection degraded", slog.String("key", key), slog.Any("error", err))
+// reserveLoginAttempt atomically counts one password attempt and rejects it
+// once more than maxLoginAttempts were made inside the lockout window. It
+// fails closed: when the cache is unavailable the attempt is denied rather
+// than allowed without brute-force protection.
+func (s *userService) reserveLoginAttempt(ctx context.Context, cacheKey string) error {
+	attempts, err := s.cache.Increment(ctx, cacheKey, lockoutDuration)
+	if err != nil {
+		slog.Error("cache unavailable for login lockout check — denying request for safety", slog.Any("error", err))
+		return apperror.NewInternal("unable to verify login attempts, please try again later")
 	}
+	if attempts > maxLoginAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
 }
 
-// checkLoginLockout verifies that the account is not locked out.
-// Returns an error if the cache read fails (fail-closed to protect against brute force when cache is down).
-func (s *userService) checkLoginLockout(ctx context.Context, cacheKey string) (bool, error) {
-	data, cacheErr := s.cache.Get(ctx, cacheKey)
-	if cacheErr != nil {
-		slog.Error("cache unavailable for login lockout check — denying request for safety", slog.String("key", cacheKey), slog.Any("error", cacheErr))
-		return false, cacheErr
+func (s *userService) clearLoginAttempts(ctx context.Context, cacheKey string) {
+	if err := s.cache.Delete(ctx, cacheKey); err != nil {
+		slog.Warn("cache error clearing login attempts", slog.Any("error", err))
 	}
-	if data != nil {
-		attempts, _ := strconv.Atoi(string(data))
-		if attempts >= maxLoginAttempts {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error) {
@@ -598,19 +628,16 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 		return apperror.NewBadRequest("current password is incorrect")
 	}
 
-	cacheKey := scopedKey(ctx, loginAttemptPrefix, user.Email)
-	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
-	if cacheErr != nil {
-		return apperror.NewInternal("unable to verify login attempts, please try again later")
-	}
-	if locked {
-		return apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+	// Shares the login counter so re-authentication cannot be used to guess
+	// the password in parallel either.
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email))
+	if err := s.reserveLoginAttempt(ctx, cacheKey); err != nil {
+		return err
 	}
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(password)) != nil {
-		s.incrementLoginAttempts(ctx, cacheKey)
 		return apperror.NewBadRequest("current password is incorrect")
 	}
-	_ = s.cache.Delete(ctx, cacheKey)
+	s.clearLoginAttempts(ctx, cacheKey)
 	return nil
 }
 
@@ -622,17 +649,14 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 		}
 		return apperror.NewInternal("failed to get user")
 	}
-	if target.Role == dto.RoleAdmin {
-		admins, err := s.repo.CountActiveAdmins(ctx)
-		if err != nil {
-			return apperror.NewInternal("failed to count admins")
-		}
-		if admins <= 1 {
-			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot delete the last active admin")
-		}
-	}
-
 	doDelete := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		// Checked on the transaction's repository, under the per-tenant
+		// admin-change lock, so it serializes with concurrent demotions/bans.
+		if target.Role == dto.RoleAdmin {
+			if err := ensureNotLastAdmin(ctx, userRepo, "cannot delete the last active admin"); err != nil {
+				return err
+			}
+		}
 		_, err := userRepo.Delete(ctx, id)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -789,7 +813,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, userID)
 	}
-	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, user.Email))
+	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email)))
 
 	return nil
 }

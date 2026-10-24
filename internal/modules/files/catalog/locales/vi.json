@@ -1,0 +1,6 @@
+{
+  "errors.file.not_found.title": "Không tìm thấy tệp",
+  "errors.file.too_large.title": "Tệp quá lớn",
+  "errors.file.unsupported_type.title": "Loại tệp không được hỗ trợ",
+  "errors.file.not_deleted.title": "Tệp chưa được xóa"
+}

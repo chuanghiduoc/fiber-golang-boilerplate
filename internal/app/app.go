@@ -6,6 +6,8 @@ package app
 import (
 	"context"
 	"crypto/subtle"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
@@ -68,6 +71,84 @@ type JobProvider interface {
 // composition root; a nil registry is skipped.
 type ScheduleProvider interface {
 	RegisterSchedules(registry *scheduler.Registry)
+}
+
+// PermissionProvider is an optional module capability declaring the
+// permissions the module owns and which built-in roles receive them (admins
+// receive every permission implicitly). Permissions checked by more than one
+// module stay in the shared authz catalog instead.
+type PermissionProvider interface {
+	Permissions() []authz.Grant
+}
+
+// ErrorProvider is an optional module capability declaring the module's
+// stable error codes. Platform-wide codes stay in pkg/apperror.
+type ErrorProvider interface {
+	ErrorCodes() map[apperror.Code]apperror.Spec
+}
+
+// LocaleProvider is an optional module capability supplying en.json/vi.json
+// (at the filesystem root) merged into the i18n bundle. Keys are namespaced
+// "<module>." or "errors.<code>.".
+type LocaleProvider interface {
+	Locales() fs.FS
+}
+
+// FlagProvider is an optional module capability declaring the module's
+// feature flags.
+type FlagProvider interface {
+	FeatureFlags() []features.Definition
+}
+
+// RegisterCatalogs registers every module's permissions, error codes, and
+// feature flags in the process-wide catalogs, owned by Module.Name(). It
+// fails on duplicate module names and on any key another owner already
+// registered. Call it once modules are constructed and before anything
+// validates against the catalogs: FEATURE_FLAGS key validation, the i18n
+// bundle (built from LocaleSources), and serving requests (API-key scope
+// validation, permission checks, error rendering). Re-registering the same
+// modules is a no-op, so Register can call it again safely.
+func RegisterCatalogs(modules ...Module) error {
+	seen := make(map[string]struct{}, len(modules))
+	for _, m := range modules {
+		owner := m.Name()
+		if owner == "" {
+			return fmt.Errorf("app: module %T has an empty name", m)
+		}
+		if _, dup := seen[owner]; dup {
+			return fmt.Errorf("app: module name %q is registered twice", owner)
+		}
+		seen[owner] = struct{}{}
+
+		if p, ok := m.(PermissionProvider); ok {
+			if err := authz.Register(owner, p.Permissions()...); err != nil {
+				return err
+			}
+		}
+		if p, ok := m.(ErrorProvider); ok {
+			if err := apperror.Register(owner, p.ErrorCodes()); err != nil {
+				return err
+			}
+		}
+		if p, ok := m.(FlagProvider); ok {
+			if err := features.Register(owner, p.FeatureFlags()...); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// LocaleSources returns the module catalogs to pass to i18n.New. Building
+// the bundle validates namespaces, collisions, and en/vi parity.
+func LocaleSources(modules ...Module) []i18n.Source {
+	var sources []i18n.Source
+	for _, m := range modules {
+		if p, ok := m.(LocaleProvider); ok {
+			sources = append(sources, i18n.Source{Owner: m.Name(), FS: p.Locales()})
+		}
+	}
+	return sources
 }
 
 // Limiters carries the tiered rate limiters so modules do not rebuild them.
@@ -120,6 +201,15 @@ type Deps struct {
 	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
 	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
 	APIKeyVerifier *apikey.Verifier
+}
+
+// Authenticate returns the standard authentication chain for protected module
+// routes: `Authorization: ApiKey` is verified by APIKeyVerifier and everything
+// else by the JWT/session middleware. A nil verifier keeps JWT behavior and
+// rejects API-key attempts with 401. Route permissions still come from
+// authz.Require, which sees an API key's scopes as the subject permissions.
+func (d Deps) Authenticate() fiber.Handler {
+	return apikey.Authenticate(middleware.JWTAuth(d.Config.JWT.Secret, d.Sessions), d.APIKeyVerifier)
 }
 
 type App struct {
@@ -175,16 +265,25 @@ func New(cfg *config.Config, deps Deps) *App {
 }
 
 func buildLimiters(cfg *config.Config, appCache cache.Cache) Limiters {
-	storage := middleware.NewLimiterStorage(appCache)
 	rl := cfg.RateLimit
+	if appCache == nil {
+		// Tests and minimal deployments: one process-local counter store shared
+		// by all tiers (keys are tier-namespaced).
+		appCache = cache.NewMemoryCache()
+	}
 	return Limiters{
-		Strict:  middleware.NewLimiter(rl.StrictMax, rl.StrictWindow, "strict", storage),
-		Normal:  middleware.NewLimiter(rl.NormalMax, rl.NormalWindow, "normal", storage),
-		Relaxed: middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow, "relaxed", storage),
+		Strict:  middleware.NewLimiter(rl.StrictMax, rl.StrictWindow, "strict", appCache),
+		Normal:  middleware.NewLimiter(rl.NormalMax, rl.NormalWindow, "normal", appCache),
+		Relaxed: middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow, "relaxed", appCache),
 	}
 }
 
 func (a *App) setupGlobalMiddleware() {
+	// Outermost safety net: a panic in CORS, request ID, i18n, tracing,
+	// metrics, or logging would otherwise crash the process. The inner
+	// Recovery below stays where it is so handler panics still flow through
+	// Logger/Metrics/Tracing as a 500 with the request ID attached.
+	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
 	a.fiber.Use(cors.New(cors.Config{
 		AllowOrigins:     a.cfg.CORS.Origins(),
 		AllowMethods:     a.cfg.CORS.Methods(),
@@ -195,10 +294,13 @@ func (a *App) setupGlobalMiddleware() {
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(middleware.RequestID())
 	a.fiber.Use(i18n.Middleware(a.deps.I18n))
-	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths()))
+	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths(), a.cfg.Tracing.TrustIncoming))
 	a.fiber.Use(middleware.Metrics())
 	a.fiber.Use(middleware.Logger())
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
+	// Fiber's BodyLimit is the multipart upload ceiling; every other body is
+	// capped here before auth, rate limiting, or decoding run.
+	a.fiber.Use(middleware.BodyLimit(a.cfg.App.EffectiveJSONBodyLimit()))
 	a.fiber.Use(audit.Middleware(a.deps.Audit))
 	a.fiber.Use(middleware.Timeout(time.Duration(a.cfg.App.RequestTimeout) * time.Second))
 }
@@ -209,7 +311,9 @@ func (a *App) setupInfrastructureRoutes() {
 	})
 	readiness := func(c fiber.Ctx) error {
 		st := a.deps.Health.Readiness(c.Context())
-		if st.Status != "up" {
+		// Degraded (cache down, DB pool saturated) stays 200 so a shared
+		// dependency blip does not pull every replica out of rotation at once.
+		if st.Status == health.StatusDown {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(st)
 		}
 		return c.JSON(st)
@@ -251,7 +355,16 @@ func (a *App) setupInfrastructureRoutes() {
 // are also mounted under /api/v2; the v2 group is created only when at least
 // one module opts in. Callers must register before Listen; duplicate paths are
 // a programming error caught by Fiber's router.
+//
+// Register first (re-)registers the module catalogs. The composition root
+// calls RegisterCatalogs earlier to fail with an error and to validate config
+// against the complete catalog; this call is then a no-op. A catalog conflict
+// reaching this point is a programming error and panics, like a duplicate
+// route.
 func (a *App) Register(modules ...Module) {
+	if err := RegisterCatalogs(modules...); err != nil {
+		panic(fmt.Sprintf("app: register module catalogs: %v", err))
+	}
 	supported := []versioning.Version{versioning.V1}
 	hasV2 := false
 	for _, m := range modules {

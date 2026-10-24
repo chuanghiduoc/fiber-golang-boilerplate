@@ -24,6 +24,7 @@ import (
 	featuresrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/repository"
 	featuressvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
@@ -35,14 +36,24 @@ import (
 
 const featureSecret = "feature-flags-integration-secret"
 
+// featureAudit records domain events and implements the intent/completion
+// contracts required by the routes' required-mode audit.Guard.
 type featureAudit struct {
-	events []audit.Event
+	events  []audit.Event
+	intents []audit.Event
 }
 
 func (r *featureAudit) Record(_ context.Context, event audit.Event) error {
 	r.events = append(r.events, event)
 	return nil
 }
+
+func (r *featureAudit) RecordID(_ context.Context, event audit.Event) (int64, error) {
+	r.intents = append(r.intents, event)
+	return int64(len(r.intents)), nil
+}
+
+func (r *featureAudit) Complete(context.Context, int64, audit.Completion) error { return nil }
 
 type featureHarness struct {
 	app     *fiber.App
@@ -94,8 +105,8 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 		MaxStaleness: time.Minute,
 	})
 	repo := featuresrepo.New(pool)
-	handler := featureshandler.NewHandler(featuressvc.New(repo, flags))
 	recorder := &featureAudit{}
+	handler := featureshandler.NewHandler(featuressvc.New(repo, flags, recorder))
 
 	cfg := &config.Config{
 		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
@@ -126,7 +137,7 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	}
 }
 
-func (h *featureHarness) request(t *testing.T, method, path, bearer, slug string, body []byte) (*http.Response, []byte) {
+func (h *featureHarness) request(t *testing.T, method, path, bearer, slug string, body []byte) (res *http.Response, payload []byte) {
 	t.Helper()
 	req, err := http.NewRequest(method, path, bytes.NewReader(body))
 	require.NoError(t, err)
@@ -172,9 +183,9 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	assert.True(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.True(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantA}))
-	assert.True(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.True(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB}))
 
 	// Tenant B target disables only tenant B.
@@ -197,9 +208,9 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	assert.True(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.True(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantA}))
-	assert.False(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.False(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB}))
 
 	// User target wins over the tenant target.
@@ -214,7 +225,7 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	assert.True(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.True(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB, UserID: h.userB}))
 
 	// Kill switch wins over the user target.
@@ -224,7 +235,7 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	result := h.flags.Evaluate(context.Background(), featureflags.KeyUserRegistration,
+	result := h.flags.Evaluate(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB, UserID: h.userB})
 	assert.False(t, result.Enabled)
 	assert.Equal(t, featureflags.SourceKillSwitch, result.Source)
@@ -250,23 +261,40 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	assert.False(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.False(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB, UserID: h.userB}))
 
-	// Deleting the flag removes all targets and reverts to compiled/env.
+	// A tenant B admin cannot change or delete process-wide flag state.
+	resp, body = h.request(t, http.MethodPut, "/api/v1/admin/features/flags/user_registration", h.tokenB, "flags-acme",
+		[]byte(`{"enabled":true,"killSwitch":false}`))
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "permission.denied")
+	resp, _ = h.request(t, http.MethodDelete, "/api/v1/admin/features/flags/user_registration", h.tokenB, "flags-acme", nil)
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
+	// The platform admin cannot delete the flag while tenant B still has a
+	// target: RESTRICT blocks it with 409 and does not name the tenant.
+	resp, body = h.request(t, http.MethodDelete, "/api/v1/admin/features/flags/user_registration", h.tokenA, "default", nil)
+	assert.Equal(t, fiber.StatusConflict, resp.StatusCode)
+	assert.NotContains(t, string(body), "flags-acme")
+	var remainingTargets int
+	require.NoError(t, h.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM feature_flag_targets WHERE flag_key = 'user_registration'`,
+	).Scan(&remainingTargets))
+	assert.Equal(t, 1, remainingTargets, "a blocked flag delete must keep other tenants' targets")
+
+	// Once tenant B removes its own target, the flag delete succeeds and the
+	// flag reverts to compiled/env defaults.
+	resp, _ = h.request(t, http.MethodDelete,
+		"/api/v1/admin/features/flags/user_registration/targets/"+jsonInt(tenantTarget.ID), h.tokenB, "flags-acme", nil)
+	require.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	resp, _ = h.request(t, http.MethodDelete, "/api/v1/admin/features/flags/user_registration", h.tokenA, "default", nil)
 	require.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	if err := h.flags.Invalidate(context.Background()); err != nil {
 		t.Fatalf("invalidate: %v", err)
 	}
-	assert.True(t, h.flags.Enabled(context.Background(), featureflags.KeyUserRegistration,
+	assert.True(t, h.flags.Enabled(context.Background(), identitycatalog.KeyUserRegistration,
 		featureflags.Subject{TenantID: h.tenantB, UserID: h.userB}))
-
-	var remainingTargets int
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM feature_flag_targets WHERE flag_key = 'user_registration'`,
-	).Scan(&remainingTargets))
-	assert.Zero(t, remainingTargets, "deleting a flag must cascade its targets")
 
 	// Unknown keys and non-admin callers are rejected.
 	resp, _ = h.request(t, http.MethodGet, "/api/v1/admin/features/flags/typo", h.tokenA, "default", nil)
@@ -287,6 +315,62 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "audit events must include feature metadata")
+
+	// Every mutation wrote a required intent row before running.
+	actions := make(map[string]bool, len(h.audit.intents))
+	for _, intent := range h.audit.intents {
+		actions[intent.Action] = true
+	}
+	for _, action := range []string{
+		"admin.feature_flag.updated", "admin.feature_flag.deleted",
+		"admin.feature_flag_target.updated", "admin.feature_flag_target.deleted",
+	} {
+		assert.True(t, actions[action], "missing audit intent %q", action)
+	}
+}
+
+func TestIntegration_FeatureFlagTargetWithoutDatabaseDefault(t *testing.T) {
+	h := setupFeatureHarness(t)
+	ctx := context.Background()
+
+	// Tenant B targets a flag no platform admin has configured. The parent row
+	// is created with a NULL database default instead of failing the FK.
+	resp, _ := h.request(t, http.MethodPut, "/api/v1/admin/features/flags/email_verification/targets", h.tokenB, "flags-acme",
+		[]byte(`{"enabled":true}`))
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	var enabledIsNull bool
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT enabled IS NULL FROM feature_flags WHERE flag_key = 'email_verification'`,
+	).Scan(&enabledIsNull))
+	assert.True(t, enabledIsNull, "a target must not force a database default")
+
+	if err := h.flags.Invalidate(ctx); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	resultB := h.flags.Evaluate(ctx, identitycatalog.KeyEmailVerification, featureflags.Subject{TenantID: h.tenantB})
+	assert.True(t, resultB.Enabled)
+	assert.Equal(t, featureflags.SourceTenantTarget, resultB.Source)
+	resultA := h.flags.Evaluate(ctx, identitycatalog.KeyEmailVerification, featureflags.Subject{TenantID: h.tenantA})
+	assert.False(t, resultA.Enabled)
+	assert.Equal(t, featureflags.SourceCompiledDefault, resultA.Source, "other tenants keep env/compiled defaults")
+
+	// The admin view reports the anchor row as not configured.
+	resp, body := h.request(t, http.MethodGet, "/api/v1/admin/features/flags/email_verification", h.tokenA, "default", nil)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	var detail featuresdto.FlagDetailResponse
+	require.NoError(t, json.Unmarshal(body, &detail))
+	assert.False(t, detail.Flag.Configured)
+
+	// A platform admin can set a kill switch while leaving the default unset.
+	resp, _ = h.request(t, http.MethodPut, "/api/v1/admin/features/flags/email_verification", h.tokenA, "default",
+		[]byte(`{"killSwitch":true}`))
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	if err := h.flags.Invalidate(ctx); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	resultB = h.flags.Evaluate(ctx, identitycatalog.KeyEmailVerification, featureflags.Subject{TenantID: h.tenantB})
+	assert.Equal(t, featureflags.SourceKillSwitch, resultB.Source)
 }
 
 func jsonInt(value int64) string {

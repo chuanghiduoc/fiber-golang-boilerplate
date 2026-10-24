@@ -44,7 +44,7 @@ func TestModuleBoundaries(t *testing.T) {
 		t.Fatalf("walk modules: %v", err)
 	}
 
-	for _, dir := range []string{"internal/platform", "internal/shared", "pkg"} {
+	for _, dir := range []string{"internal/platform", "pkg"} {
 		checkNoBusinessImports(t, filepath.Join(root, dir))
 	}
 
@@ -99,6 +99,16 @@ func TestModuleBoundaries(t *testing.T) {
 			forbidden = append(forbidden, "internal/"+pkg)
 		}
 		checkForbiddenImports(t, modulesDir, forbidden)
+	})
+
+	t.Run("only the composition root imports bootstrap", func(t *testing.T) {
+		// internal/bootstrap imports every module, so anything below it
+		// (app, platform, pkg, contracts, modules) importing it would create
+		// a cycle or a hidden cross-module dependency.
+		for _, dir := range []string{"internal/app", "internal/platform", "internal/contracts", "internal/modules", "pkg"} {
+			checkForbiddenImports(t, filepath.Join(root, dir), []string{"internal/bootstrap"})
+		}
+		checkForbiddenImports(t, filepath.Join(root, "internal", "app"), []string{"internal/modules/"})
 	})
 
 	t.Run("contracts stay stdlib-only", func(t *testing.T) {

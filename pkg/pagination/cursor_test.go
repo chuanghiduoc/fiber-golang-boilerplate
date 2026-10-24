@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+func TestNextCursor(t *testing.T) {
+	type row struct {
+		at time.Time
+		id int64
+	}
+	key := func(r row) (time.Time, int64) { return r.at, r.id }
+
+	if got := NextCursor([]row(nil), key); got != "" {
+		t.Fatalf("empty page cursor = %q, want empty", got)
+	}
+	last := time.Date(2026, 4, 30, 22, 28, 27, 356_000_000, time.UTC)
+	rows := []row{{at: last.Add(time.Hour), id: 9}, {at: last, id: 7}}
+	if got, want := NextCursor(rows, key), EncodeCursor(last, 7); got != want {
+		t.Fatalf("cursor = %q, want last row's %q", got, want)
+	}
+}
+
 // encodeRaw base64url-encodes a raw payload to build malformed cursors for tests.
 func encodeRaw(s string) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(s))

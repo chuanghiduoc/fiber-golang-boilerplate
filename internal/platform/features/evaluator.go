@@ -2,6 +2,7 @@ package features
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -18,6 +19,11 @@ const (
 	DefaultCacheTTL     = 30 * time.Second
 	DefaultMaxStaleness = 5 * time.Minute
 )
+
+// snapshotLoadTimeout bounds one database load. Loads are detached from the
+// request context (a canceled request must not count as a database failure
+// or throttle reloads for everyone), so this is the only deadline.
+const snapshotLoadTimeout = 5 * time.Second
 
 // Source identifies which precedence rule produced an evaluation result.
 type Source string
@@ -52,9 +58,12 @@ func SubjectFromContext(ctx context.Context, userID int64) Subject {
 	return Subject{TenantID: tenant.EffectiveID(ctx), UserID: userID}
 }
 
-// FlagState is the database-level state for one flag.
+// FlagState is the database-level state for one flag. A nil Enabled means the
+// row has no database default (it exists only for a kill switch or as the
+// parent of targets), so evaluation falls through to environment/compiled
+// defaults.
 type FlagState struct {
-	Enabled    bool
+	Enabled    *bool
 	KillSwitch bool
 }
 
@@ -93,8 +102,10 @@ type Evaluator interface {
 	Enabled(ctx context.Context, key Key, subject Subject) bool
 	// Evaluate returns the value and the precedence rule that produced it.
 	Evaluate(ctx context.Context, key Key, subject Subject) Result
-	// Invalidate drops the cached snapshot. The next evaluation reloads from
-	// the store. Other replicas converge when their cache TTL expires.
+	// Invalidate marks the cached snapshot stale. The next evaluation reloads
+	// from the store; if that reload fails, the previous snapshot is still
+	// served within MaxStaleness. Other replicas converge when their cache TTL
+	// expires.
 	Invalidate(ctx context.Context) error
 }
 
@@ -126,6 +137,9 @@ type CachedEvaluator struct {
 	loadedAt    time.Time
 	lastAttempt time.Time
 	generation  uint64
+	// invalidated marks snapshot stale after Invalidate: it is never served
+	// as fresh, but remains the fallback while a reload fails.
+	invalidated bool
 	refreshMu   sync.Mutex
 }
 
@@ -201,23 +215,24 @@ func normalizeSubject(ctx context.Context, subject Subject) Subject {
 
 func (e *CachedEvaluator) resolve(key Key, subject Subject, snapshot *Snapshot) (bool, Source) {
 	if snapshot != nil {
-		if flag, ok := snapshot.Flags[key]; ok {
-			if flag.KillSwitch {
-				return false, SourceKillSwitch
-			}
-			if subject.UserID != 0 {
-				if targets := snapshot.UserTargets[key]; targets != nil {
-					if enabled, ok := targets[UserTargetKey(subject)]; ok {
-						return enabled, SourceUserTarget
-					}
+		flag, hasRow := snapshot.Flags[key]
+		if hasRow && flag.KillSwitch {
+			return false, SourceKillSwitch
+		}
+		if subject.UserID != 0 {
+			if targets := snapshot.UserTargets[key]; targets != nil {
+				if enabled, ok := targets[UserTargetKey(subject)]; ok {
+					return enabled, SourceUserTarget
 				}
 			}
-			if targets := snapshot.TenantTargets[key]; targets != nil {
-				if enabled, ok := targets[subject.TenantID]; ok {
-					return enabled, SourceTenantTarget
-				}
+		}
+		if targets := snapshot.TenantTargets[key]; targets != nil {
+			if enabled, ok := targets[subject.TenantID]; ok {
+				return enabled, SourceTenantTarget
 			}
-			return flag.Enabled, SourceDatabaseDefault
+		}
+		if hasRow && flag.Enabled != nil {
+			return *flag.Enabled, SourceDatabaseDefault
 		}
 	}
 
@@ -269,8 +284,15 @@ func (e *CachedEvaluator) snapshotFor(ctx context.Context) *Snapshot {
 			return e.usableStale(staleSnapshot, staleAt, now)
 		}
 
-		snapshot, err := e.store.LoadSnapshot(ctx)
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotLoadTimeout)
+		snapshot, err := e.store.LoadSnapshot(loadCtx)
+		cancel()
 		attemptAt := e.now()
+		if errors.Is(err, context.Canceled) {
+			// Not a database failure: do not throttle the next reload.
+			slog.Debug("feature flag snapshot load canceled; using fallback")
+			return e.usableStale(staleSnapshot, staleAt, now)
+		}
 		if err != nil {
 			metrics.FeatureFlagSnapshotLoadsTotal.WithLabelValues("error").Inc()
 			slog.Warn("feature flag snapshot load failed; using fallback",
@@ -292,6 +314,7 @@ func (e *CachedEvaluator) snapshotFor(ctx context.Context) *Snapshot {
 			e.snapshot = &snapshot
 			e.loadedAt = attemptAt
 			e.lastAttempt = attemptAt
+			e.invalidated = false
 			metrics.FeatureFlagSnapshotAgeSeconds.Set(0)
 			e.mu.Unlock()
 			return &snapshot
@@ -304,7 +327,7 @@ func (e *CachedEvaluator) snapshotFor(ctx context.Context) *Snapshot {
 func (e *CachedEvaluator) freshSnapshot(now time.Time) (*Snapshot, time.Duration, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.snapshot == nil || e.loadedAt.IsZero() {
+	if e.snapshot == nil || e.loadedAt.IsZero() || e.invalidated {
 		return nil, 0, false
 	}
 	age := now.Sub(e.loadedAt)
@@ -329,11 +352,12 @@ func (e *CachedEvaluator) usableStale(snapshot *Snapshot, loadedAt, now time.Tim
 	return snapshot
 }
 
-// Invalidate implements Evaluator.
+// Invalidate implements Evaluator. The previous snapshot is kept as a stale
+// fallback instead of being dropped: dropping it would make a reload failure
+// fall back to environment/compiled defaults and silently lift kill switches.
 func (e *CachedEvaluator) Invalidate(context.Context) error {
 	e.mu.Lock()
-	e.snapshot = nil
-	e.loadedAt = time.Time{}
+	e.invalidated = true
 	e.lastAttempt = time.Time{}
 	e.generation++
 	e.mu.Unlock()

@@ -6,6 +6,7 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -77,7 +78,7 @@ func (h *Handler) ListEndpoints(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, nextEndpointCursor(items))
+	return response.List(c, items, hasMore, pagination.NextCursor(items, func(e dto.EndpointResponse) (time.Time, int64) { return e.CreatedAt, e.ID }))
 }
 
 // GetEndpoint godoc
@@ -216,7 +217,7 @@ func (h *Handler) ListDeliveries(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, nextDeliveryCursor(items))
+	return response.List(c, items, hasMore, pagination.NextCursor(items, func(d dto.DeliveryResponse) (time.Time, int64) { return d.CreatedAt, d.ID }))
 }
 
 // GetDelivery godoc
@@ -344,7 +345,7 @@ func (h *Handler) ListInboundSources(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, nextInboundSourceCursor(items))
+	return response.List(c, items, hasMore, pagination.NextCursor(items, func(s dto.InboundSourceResponse) (time.Time, int64) { return s.CreatedAt, s.ID }))
 }
 
 // GetInboundSource godoc
@@ -481,7 +482,7 @@ func (h *Handler) ListInboundEvents(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, nextInboundEventCursor(items))
+	return response.List(c, items, hasMore, pagination.NextCursor(items, func(e dto.InboundEventResponse) (time.Time, int64) { return e.ReceivedAt, e.ID }))
 }
 
 // ReceiveInbound godoc
@@ -528,36 +529,4 @@ func (h *Handler) ReceiveInbound(c fiber.Ctx) error {
 		status = fiber.StatusOK
 	}
 	return c.Status(status).JSON(receipt)
-}
-
-func nextEndpointCursor(items []dto.EndpointResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
-}
-
-func nextDeliveryCursor(items []dto.DeliveryResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
-}
-
-func nextInboundSourceCursor(items []dto.InboundSourceResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
-}
-
-func nextInboundEventCursor(items []dto.InboundEventResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.ReceivedAt, last.ID)
 }

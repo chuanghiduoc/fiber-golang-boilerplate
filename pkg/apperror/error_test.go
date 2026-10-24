@@ -1,6 +1,7 @@
 package apperror
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,6 +156,18 @@ func TestFiberErrorHandler_FiberError(t *testing.T) {
 	}
 	if result["code"] != "not_found" {
 		t.Errorf("code = %v, want not_found", result["code"])
+	}
+}
+
+func TestFiberErrorHandler_ClientCanceled(t *testing.T) {
+	result, status, _ := decodeProblem(t, func(c fiber.Ctx) error {
+		return fmt.Errorf("list users: %w", context.Canceled)
+	})
+	if status != StatusClientClosedRequest {
+		t.Errorf("status = %d, want 499", status)
+	}
+	if result["code"] != "client_closed_request" {
+		t.Errorf("code = %v, want client_closed_request", result["code"])
 	}
 }
 

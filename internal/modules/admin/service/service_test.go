@@ -8,23 +8,24 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 type fakeIdentityAdmin struct {
-	users    contracts.UserPage
-	roleUser contracts.User
-	stats    contracts.UserStats
+	users    identitycontracts.UserPage
+	roleUser identitycontracts.User
+	stats    identitycontracts.UserStats
 	err      error
 }
 
-func (f *fakeIdentityAdmin) ListUsers(context.Context, int, string) (contracts.UserPage, error) {
+func (f *fakeIdentityAdmin) ListUsers(context.Context, int, string) (identitycontracts.UserPage, error) {
 	return f.users, f.err
 }
 
-func (f *fakeIdentityAdmin) UpdateRole(_ context.Context, _ int64, role string) (contracts.User, error) {
+func (f *fakeIdentityAdmin) UpdateRole(_ context.Context, _ int64, role string) (identitycontracts.User, error) {
 	user := f.roleUser
 	user.Role = role
 	return user, f.err
@@ -32,37 +33,37 @@ func (f *fakeIdentityAdmin) UpdateRole(_ context.Context, _ int64, role string) 
 
 func (f *fakeIdentityAdmin) BanUser(context.Context, int64) error { return f.err }
 
-func (f *fakeIdentityAdmin) UnbanUser(context.Context, int64) (contracts.User, error) {
+func (f *fakeIdentityAdmin) UnbanUser(context.Context, int64) (identitycontracts.User, error) {
 	return f.roleUser, f.err
 }
 
-func (f *fakeIdentityAdmin) GetUserStats(context.Context) (contracts.UserStats, error) {
+func (f *fakeIdentityAdmin) GetUserStats(context.Context) (identitycontracts.UserStats, error) {
 	return f.stats, f.err
 }
 
 type fakeFilesAdmin struct {
-	files    contracts.FilePage
-	download contracts.FileDownload
-	restored contracts.File
-	stats    contracts.FileStats
+	files    filescontracts.FilePage
+	download filescontracts.FileDownload
+	restored filescontracts.File
+	stats    filescontracts.FileStats
 	err      error
 }
 
-func (f *fakeFilesAdmin) ListFiles(context.Context, int, string) (contracts.FilePage, error) {
+func (f *fakeFilesAdmin) ListFiles(context.Context, int, string) (filescontracts.FilePage, error) {
 	return f.files, f.err
 }
 
-func (f *fakeFilesAdmin) OpenFile(context.Context, int64) (contracts.FileDownload, error) {
+func (f *fakeFilesAdmin) OpenFile(context.Context, int64) (filescontracts.FileDownload, error) {
 	return f.download, f.err
 }
 
 func (f *fakeFilesAdmin) DeleteFile(context.Context, int64) error { return f.err }
 
-func (f *fakeFilesAdmin) RestoreFile(context.Context, int64) (contracts.File, error) {
+func (f *fakeFilesAdmin) RestoreFile(context.Context, int64) (filescontracts.File, error) {
 	return f.restored, f.err
 }
 
-func (f *fakeFilesAdmin) GetFileStats(context.Context) (contracts.FileStats, error) {
+func (f *fakeFilesAdmin) GetFileStats(context.Context) (filescontracts.FileStats, error) {
 	return f.stats, f.err
 }
 
@@ -73,8 +74,8 @@ func newTestService(identity *fakeIdentityAdmin, files *fakeFilesAdmin) Service 
 func TestListUsers(t *testing.T) {
 	now := time.Now()
 	deleted := now.Add(-time.Hour)
-	svc := newTestService(&fakeIdentityAdmin{users: contracts.UserPage{
-		Items: []contracts.User{{
+	svc := newTestService(&fakeIdentityAdmin{users: identitycontracts.UserPage{
+		Items: []identitycontracts.User{{
 			ID: 7, Email: "u@example.com", Name: "U", Role: admindto.RoleUser,
 			EmailVerified: true, HasPassword: true, CreatedAt: now, UpdatedAt: now, DeletedAt: &deleted,
 		}},
@@ -105,7 +106,7 @@ func TestUpdateRoleRejectsUnknownRole(t *testing.T) {
 
 func TestUpdateRoleMapsUser(t *testing.T) {
 	now := time.Now()
-	svc := newTestService(&fakeIdentityAdmin{roleUser: contracts.User{
+	svc := newTestService(&fakeIdentityAdmin{roleUser: identitycontracts.User{
 		ID: 1, Email: "u@example.com", Name: "U", Role: admindto.RoleUser, CreatedAt: now, UpdatedAt: now,
 	}}, &fakeFilesAdmin{})
 
@@ -121,8 +122,8 @@ func TestUpdateRoleMapsUser(t *testing.T) {
 func TestListFilesMapsAdminURL(t *testing.T) {
 	now := time.Now()
 	deleted := now.Add(-time.Hour)
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{files: contracts.FilePage{
-		Items: []contracts.File{
+	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{files: filescontracts.FilePage{
+		Items: []filescontracts.File{
 			{ID: 1, OriginalName: "active.txt", CreatedAt: now},
 			{ID: 2, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: &deleted},
 		},
@@ -141,8 +142,8 @@ func TestListFilesMapsAdminURL(t *testing.T) {
 }
 
 func TestDownloadReturnsReader(t *testing.T) {
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{download: contracts.FileDownload{
-		File:   contracts.File{ID: 3, OriginalName: "f.bin", MimeType: "application/octet-stream", Size: 3},
+	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{download: filescontracts.FileDownload{
+		File:   filescontracts.File{ID: 3, OriginalName: "f.bin", MimeType: "application/octet-stream", Size: 3},
 		Reader: io.NopCloser(bytes.NewReader([]byte("abc"))),
 	}})
 
@@ -162,7 +163,7 @@ func TestDownloadReturnsReader(t *testing.T) {
 
 func TestRestoreFileMapsResponse(t *testing.T) {
 	now := time.Now()
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{restored: contracts.File{
+	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{restored: filescontracts.File{
 		ID: 4, OriginalName: "r.txt", CreatedAt: now,
 	}})
 
@@ -177,8 +178,8 @@ func TestRestoreFileMapsResponse(t *testing.T) {
 
 func TestGetStatsComposesOwnerQueries(t *testing.T) {
 	svc := newTestService(
-		&fakeIdentityAdmin{stats: contracts.UserStats{ActiveUsers: 10, DeletedUsers: 2}},
-		&fakeFilesAdmin{stats: contracts.FileStats{TotalFiles: 5, TotalFileSize: 50000}},
+		&fakeIdentityAdmin{stats: identitycontracts.UserStats{ActiveUsers: 10, DeletedUsers: 2}},
+		&fakeFilesAdmin{stats: filescontracts.FileStats{TotalFiles: 5, TotalFileSize: 50000}},
 	)
 
 	stats, err := svc.GetStats(context.Background())

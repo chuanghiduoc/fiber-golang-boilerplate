@@ -64,11 +64,22 @@ func Locale(c fiber.Ctx) string {
 	return fiber.Locals[string](c, LocaleLocalKey)
 }
 
-// New loads every embedded catalog, validates key/placeholder parity, and
-// returns a bundle. An empty defaultLocale means DefaultLocale. An explicit
-// unsupported default locale is an error so configuration typos fail at
-// startup instead of silently serving English.
-func New(defaultLocale string) (*Bundle, error) {
+// Source is a module-owned set of catalogs merged into the platform catalogs.
+// FS holds one flat <locale>.json per platform locale at its root (en.json,
+// vi.json). Keys must be namespaced "<Owner>." or "errors." (error titles and
+// details for the module's own codes) and must not collide with any other
+// catalog.
+type Source struct {
+	Owner string
+	FS    fs.FS
+}
+
+// New loads every embedded catalog, merges module sources, validates
+// key/placeholder parity over the merged result, and returns a bundle. An
+// empty defaultLocale means DefaultLocale. An explicit unsupported default
+// locale is an error so configuration typos fail at startup instead of
+// silently serving English.
+func New(defaultLocale string, sources ...Source) (*Bundle, error) {
 	files, err := fs.Glob(catalogsFS, messagesDir+"/*.json")
 	if err != nil {
 		return nil, fmt.Errorf("i18n: list embedded catalogs: %w", err)
@@ -102,6 +113,12 @@ func New(defaultLocale string) (*Bundle, error) {
 		locales = append(locales, locale)
 	}
 	sort.Strings(locales)
+
+	for _, source := range sources {
+		if err := mergeSource(catalogs, locales, source); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := validateParity(catalogs, locales); err != nil {
 		return nil, err
@@ -346,6 +363,56 @@ func interpolate(message string, params map[string]any) string {
 		i = end + 1
 	}
 	return out.String()
+}
+
+// mergeSource adds one module's catalogs. The module must ship exactly the
+// platform locales, namespace every key, and never redefine an existing key;
+// cross-locale key/placeholder parity is checked afterwards on the merge.
+func mergeSource(catalogs map[string]localeCatalog, locales []string, source Source) error {
+	if source.Owner == "" || source.FS == nil {
+		return fmt.Errorf("i18n: module source needs an owner and a filesystem")
+	}
+	files, err := fs.Glob(source.FS, "*.json")
+	if err != nil {
+		return fmt.Errorf("i18n: %s: list catalogs: %w", source.Owner, err)
+	}
+	provided := make(map[string]string, len(files))
+	for _, file := range files {
+		provided[normalizeLocale(strings.TrimSuffix(file, path.Ext(file)))] = file
+	}
+	for locale := range provided {
+		if _, ok := catalogs[locale]; !ok {
+			return fmt.Errorf("i18n: %s: catalog for unsupported locale %q (platform locales: %s)",
+				source.Owner, locale, strings.Join(locales, ", "))
+		}
+	}
+	ownerPrefix := source.Owner + "."
+	for _, locale := range locales {
+		file, ok := provided[locale]
+		if !ok {
+			return fmt.Errorf("i18n: %s: missing %s.json", source.Owner, locale)
+		}
+		raw, err := fs.ReadFile(source.FS, file)
+		if err != nil {
+			return fmt.Errorf("i18n: %s: read %s: %w", source.Owner, file, err)
+		}
+		var messages localeCatalog
+		if err := json.Unmarshal(raw, &messages); err != nil {
+			return fmt.Errorf("i18n: %s: decode %s: %w", source.Owner, file, err)
+		}
+		for key, message := range messages {
+			if !strings.HasPrefix(key, ownerPrefix) && !strings.HasPrefix(key, "errors.") {
+				return fmt.Errorf("i18n: %s: key %q in %s must start with %q or %q",
+					source.Owner, key, file, ownerPrefix, "errors.")
+			}
+			if _, exists := catalogs[locale][key]; exists {
+				return fmt.Errorf("i18n: %s: key %q in %s is already defined by another catalog",
+					source.Owner, key, file)
+			}
+			catalogs[locale][key] = message
+		}
+	}
+	return nil
 }
 
 func validateParity(catalogs map[string]localeCatalog, locales []string) error {

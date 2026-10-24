@@ -11,6 +11,14 @@ FROM users u
 JOIN tenants t ON t.id = u.tenant_id
 WHERE u.id = $1 AND u.deleted_at IS NULL;
 
+-- name: GetUserPrincipal :one
+-- API-key authentication needs the owner's current role and the owning
+-- tenant's status in one lookup, so a suspended tenant's keys stop working.
+SELECT u.id, u.tenant_id, u.email, u.name, u.role, t.status AS tenant_status
+FROM users u
+JOIN tenants t ON t.id = u.tenant_id
+WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL;
+
 -- name: GetUserByEmail :one
 SELECT * FROM users
 WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NULL;
@@ -72,10 +80,12 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 RETURNING *;
 
 -- name: RestoreUser :one
+-- Unban only reverses a ban. A self-deleted account (deleted_at set,
+-- banned_at NULL) is not restorable through this path.
 UPDATE users
 SET deleted_at = NULL, banned_at = NULL, updated_at = NOW(),
     token_version = token_version + 1, password_changed_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL AND banned_at IS NOT NULL
 RETURNING *;
 
 -- name: ListDeletedUsers :many
@@ -130,6 +140,14 @@ RETURNING *;
 -- name: CountActiveAdmins :one
 SELECT count(*) FROM users
 WHERE tenant_id = $1 AND role = 'admin' AND deleted_at IS NULL;
+
+-- name: LockTenantAdminChanges :exec
+-- Serializes admin demotion/ban/delete per tenant for the rest of the
+-- transaction. It must run before the target row is updated: the
+-- protect_last_admin trigger locks the other admins' rows, and without this
+-- lock two concurrent demotions each hold their own row and wait on the
+-- other's (deadlock).
+SELECT pg_advisory_xact_lock(hashtextextended('identity.last_admin', @tenant_id::bigint));
 
 -- name: AdminUserStats :one
 SELECT

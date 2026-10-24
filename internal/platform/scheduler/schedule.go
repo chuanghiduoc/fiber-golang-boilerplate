@@ -2,6 +2,11 @@
 // leader, using PostgreSQL for the leader lease and a unique run ledger. Every
 // due slot is enqueued as a durable jobs job; no schedule survives only in
 // memory.
+//
+// Cron day matching: when both day-of-month and day-of-week are restricted, a
+// day matches if either field matches (classic cron OR rule). Only a literal
+// "*" counts as unrestricted; a stepped wildcard such as "*/2" is a
+// restriction, so "0 0 */2 * 1" runs on odd days of the month OR on Mondays.
 package scheduler
 
 import (

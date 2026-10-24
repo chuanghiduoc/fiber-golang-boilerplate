@@ -128,7 +128,6 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 			if err := txSender.SendTx(ctx, tx, msg); err != nil {
 				slog.Error("failed to enqueue password reset email",
 					slog.Int64("user_id", user.ID),
-					slog.String("email", user.Email),
 					slog.Any("error", err),
 				)
 				return apperror.NewInternal("failed to process request")
@@ -163,7 +162,6 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 			if err := s.emailSender.Send(sendCtx, msg); err != nil {
 				slog.Warn("failed to send password reset email",
 					slog.Int64("user_id", user.ID),
-					slog.String("email", user.Email),
 					slog.Any("error", err),
 				)
 			}
@@ -177,9 +175,38 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 	tokenHash := hashToken(req.Token)
 	var resetUserID int64
 
+	// Validate the token with a cheap read before spending bcrypt CPU, and
+	// hash outside the transaction so the cost-12 hash never holds a pooled
+	// connection. The read is only a pre-check: single use is still enforced
+	// by the atomic Consume inside the transaction below.
+	pending, err := s.resetRepo.GetByToken(ctx, tokenHash)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewBadRequest("invalid or expired reset token")
+		}
+		return apperror.NewInternal("failed to verify reset token")
+	}
+	if pending.TenantID != tenant.EffectiveID(ctx) {
+		return apperror.NewBadRequest("invalid or expired reset token")
+	}
+	if pending.ExpiresAt.Time.Before(time.Now()) {
+		// Delete outside any transaction so the cleanup actually persists
+		// (there is no TTL purge for reset tokens).
+		if err := s.resetRepo.Delete(ctx, tokenHash); err != nil {
+			slog.Error("failed to delete expired reset token", slog.Any("error", err))
+		}
+		return apperror.NewBadRequest("reset token has expired")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	if err != nil {
+		return apperror.NewInternal("failed to hash password")
+	}
+
 	doReset := func(userRepo repository.UserRepository, resetRepo repository.PasswordResetRepository, refreshRepo repository.RefreshTokenRepository) error {
 		// Consume atomically. This avoids the token->user lock-order deadlock
-		// that FOR UPDATE could create when two resets run concurrently.
+		// that FOR UPDATE could create when two resets run concurrently, and a
+		// concurrent reset that consumed the token first makes this one fail.
 		rt, err := resetRepo.Consume(ctx, tokenHash)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -190,11 +217,9 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		if rt.TenantID != tenant.EffectiveID(ctx) {
 			return apperror.NewBadRequest("invalid or expired reset token")
 		}
-
+		// Re-check: the token may have expired since the pre-check. The
+		// rollback keeps it; the next attempt's pre-check deletes it.
 		if rt.ExpiresAt.Time.Before(time.Now()) {
-			if err := resetRepo.Delete(ctx, tokenHash); err != nil {
-				slog.Error("failed to delete expired reset token", slog.Any("error", err))
-			}
 			return apperror.NewBadRequest("reset token has expired")
 		}
 
@@ -211,13 +236,6 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 			return apperror.NewBadRequest("reset token has been invalidated by a later account change")
 		}
 		resetUserID = rt.UserID
-
-		// Hash only after the token has been validated, so invalid-token
-		// requests cannot consume bcrypt CPU.
-		hash, hashErr := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
-		if hashErr != nil {
-			return apperror.NewInternal("failed to hash password")
-		}
 
 		_, err = userRepo.UpdatePassword(ctx, identitysqlc.UpdateUserPasswordParams{
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
@@ -238,7 +256,6 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		return nil
 	}
 
-	var err error
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			return doReset(
@@ -259,7 +276,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		// can actually sign in with the new password.
 		if s.cache != nil {
 			if user, err := s.userRepo.GetByID(ctx, resetUserID); err == nil {
-				_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, user.Email))
+				_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email)))
 			}
 		}
 		if s.sessions != nil {

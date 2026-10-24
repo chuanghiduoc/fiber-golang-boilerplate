@@ -38,6 +38,14 @@ type UserRepository interface {
 	AdminCount(ctx context.Context) (int64, error)
 	CountActiveAdmins(ctx context.Context) (int64, error)
 	AdminUserStats(ctx context.Context) (identitysqlc.AdminUserStatsRow, error)
+	// GetPrincipal returns the active user's authorization view plus the
+	// owning tenant's status, for API-key authentication.
+	GetPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error)
+	// LockAdminChanges takes a transaction-scoped per-tenant lock that
+	// serializes admin demotion/ban/delete. It is only meaningful on a
+	// transaction-backed repository and must run before the target row is
+	// updated.
+	LockAdminChanges(ctx context.Context) error
 }
 
 type userRepository struct {
@@ -262,4 +270,22 @@ func (r *userRepository) CountActiveAdmins(ctx context.Context) (int64, error) {
 
 func (r *userRepository) AdminUserStats(ctx context.Context) (identitysqlc.AdminUserStatsRow, error) {
 	return r.q.AdminUserStats(ctx, tenantID(ctx))
+}
+
+func (r *userRepository) GetPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error) {
+	row, err := r.q.GetUserPrincipal(ctx, identitysqlc.GetUserPrincipalParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &row, nil
+}
+
+func (r *userRepository) LockAdminChanges(ctx context.Context) error {
+	if err := r.q.LockTenantAdminChanges(ctx, tenantID(ctx)); err != nil {
+		return wrapErr(err)
+	}
+	return nil
 }

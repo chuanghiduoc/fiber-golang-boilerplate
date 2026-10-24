@@ -2,6 +2,7 @@ package handler
 
 import (
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -82,7 +83,7 @@ func (h *Handler) List(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, keys, hasMore, nextCursor(keys))
+	return response.List(c, keys, hasMore, pagination.NextCursor(keys, func(k apikeydto.APIKeyResponse) (time.Time, int64) { return k.CreatedAt, k.ID }))
 }
 
 // Get godoc
@@ -229,12 +230,4 @@ func (h *Handler) Rotate(c fiber.Ctx) error {
 
 func setAuditMetadata(c fiber.Ctx, metadata map[string]any) {
 	fiber.Locals[map[string]any](c, audit.MetadataLocalKey, metadata)
-}
-
-func nextCursor(items []apikeydto.APIKeyResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }

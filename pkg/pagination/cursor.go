@@ -59,6 +59,17 @@ func EncodeCursor(createdAt time.Time, id int64) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
+// NextCursor returns the opaque startingAfter cursor for the page following
+// items, built from the last item's sort key and id, or "" for an empty page.
+// key extracts (created_at, id), or the list's equivalent sort timestamp.
+func NextCursor[T any](items []T, key func(T) (time.Time, int64)) string {
+	if len(items) == 0 {
+		return ""
+	}
+	sortedAt, id := key(items[len(items)-1])
+	return EncodeCursor(sortedAt, id)
+}
+
 // DecodeCursor reverses EncodeCursor. The timestamp itself contains colons, so
 // the id is taken from after the final colon.
 func DecodeCursor(cursor string) (time.Time, int64, error) {

@@ -19,7 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
@@ -59,22 +59,22 @@ type tenantFilesHarness struct {
 // the dashboard; identity is covered by its own tenant integration test.
 type zeroIdentityAdmin struct{}
 
-func (zeroIdentityAdmin) ListUsers(context.Context, int, string) (contracts.UserPage, error) {
-	return contracts.UserPage{}, nil
+func (zeroIdentityAdmin) ListUsers(context.Context, int, string) (identitycontracts.UserPage, error) {
+	return identitycontracts.UserPage{}, nil
 }
 
-func (zeroIdentityAdmin) UpdateRole(context.Context, int64, string) (contracts.User, error) {
-	return contracts.User{}, nil
+func (zeroIdentityAdmin) UpdateRole(context.Context, int64, string) (identitycontracts.User, error) {
+	return identitycontracts.User{}, nil
 }
 
 func (zeroIdentityAdmin) BanUser(context.Context, int64) error { return nil }
 
-func (zeroIdentityAdmin) UnbanUser(context.Context, int64) (contracts.User, error) {
-	return contracts.User{}, nil
+func (zeroIdentityAdmin) UnbanUser(context.Context, int64) (identitycontracts.User, error) {
+	return identitycontracts.User{}, nil
 }
 
-func (zeroIdentityAdmin) GetUserStats(context.Context) (contracts.UserStats, error) {
-	return contracts.UserStats{}, nil
+func (zeroIdentityAdmin) GetUserStats(context.Context) (identitycontracts.UserStats, error) {
+	return identitycontracts.UserStats{}, nil
 }
 
 func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {

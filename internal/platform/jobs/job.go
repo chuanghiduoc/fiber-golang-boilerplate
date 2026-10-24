@@ -37,7 +37,7 @@ var (
 	ErrNoPool = errors.New("jobs: database pool is nil")
 	// ErrNoTx is returned when EnqueueTx is called with a nil transaction.
 	ErrNoTx = errors.New("jobs: transaction is nil")
-	// ErrLeaseLost is returned by Heartbeat, Succeed, or Fail when the job is
+	// ErrLeaseLost is returned by Heartbeat, Succeed, Fail, or Release when the job is
 	// no longer running under the supplied worker and attempt, usually because
 	// its lease expired and another worker reclaimed it.
 	ErrLeaseLost = errors.New("jobs: worker lease lost")

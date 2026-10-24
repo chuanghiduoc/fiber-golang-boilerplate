@@ -11,9 +11,14 @@ scripts/new-module.sh widgets
 scripts/new-module.sh --dry-run widgets   # print paths, write nothing
 ```
 
-The scaffold creates a compile-safe vertical slice and runs
-`go build ./internal/modules/<name>/...` before reporting success. It
-deliberately registers no routes; add them once the handler methods exist.
+The scaffold creates a compile-safe vertical slice with its own catalog
+(permissions, error codes, en/vi strings), a `Build(app.Infra)` constructor,
+one JWT + `authz.Require` protected sample route, a module test, a
+`queries/<name>.sql` placeholder, and the module's `sqlc.yaml` block. It runs
+`go build`, `go vet`, and `go test` on `./internal/modules/<name>/...` before
+reporting success, and removes everything (including the `sqlc.yaml` block)
+if any step fails. The only remaining central edit is one line in
+`internal/bootstrap/modules.go`; the script prints the exact steps.
 `<name>` must be lower_snake_case; the script rejects Go keywords, reserved
 package names, and Go-reserved directories such as `vendor` and `testdata`. Do
 not commit a probe module created only to test the script.
@@ -22,8 +27,15 @@ not commit a probe module created only to test the script.
 
 ```text
 internal/modules/<name>/
-├── module.go              package <name>: implements app.Module, owns the route table
+├── module.go              package <name>: app.Module, Build(app.Infra), catalog providers, route table
+├── module_test.go         catalog registration/localization + a route test through app.New
 ├── README.md              ownership, routes, permissions, tables, jobs, contracts
+├── catalog/               leaf package: public identifiers owned by the module
+│   ├── catalog.go         Owner (== Module.Name()), Register(), Locales() (embed)
+│   ├── permissions.go     authz.Permission constants + Permissions() []authz.Grant
+│   ├── errors.go          apperror.Code constants + ErrorCodes() map[Code]Spec
+│   ├── flags.go           optional: features.Key constants + FeatureFlags()
+│   └── locales/{en,vi}.json  keys "<name>.*" or "errors.<code>.*"
 ├── dto/
 │   └── dto.go             request/response transport types; no HTTP or SQL
 ├── handler/
@@ -48,7 +60,8 @@ Responsibilities and import direction:
 
 | Package | Owns | May import | Must not import |
 | --- | --- | --- | --- |
-| `module.go` | module identity and route table | `internal/app`, own subpackages, `platform`, `pkg` | another module |
+| `module.go` | module identity, `Build`, catalog providers, route table | `internal/app`, own subpackages, `internal/contracts/*`, `platform`, `pkg` | another module |
+| `catalog` | permissions, error codes, flags, en/vi strings (public identifiers) | `platform/authz`, `platform/features`, `pkg/apperror`, stdlib | anything else (it is a leaf so every subpackage may import it) |
 | `handler` | HTTP binding, validation, status/response shape | own `dto`, own `service`, `platform/httpx`, `pkg` | own `repository`, SQL |
 | `service` | business rules, authorization decisions, transactions, jobs | own `dto`, own `repository` interface, `platform`, `pkg` | Fiber handlers |
 | `repository` | SQL, sqlc rows, persistence errors | own `dto`/domain types, own `sqlc`, `pkg/database` | own `handler`, Fiber, another module's `sqlc` |
@@ -66,38 +79,63 @@ with real use cases; keep the package boundaries.
 `internal/modules/widgets/module.go`:
 
 ```go
-// Package widgets owns the widgets business capability.
-//
-// It implements app.Module and owns this module's route table. Keep business
-// rules in service, persistence in repository, and HTTP in handler.
 package widgets
-
-import (
-	"github.com/gofiber/fiber/v3"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	widgetshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/widgets/handler"
-)
 
 // Module wires the widgets HTTP surface into the application.
 type Module struct {
 	handler *widgetshandler.Handler
 }
 
-// New builds the module from its handler. Construct the handler, service, and
-// repository in cmd/api/main.go.
+// New builds the module from its handler (tests). Production uses Build.
 func New(handler *widgetshandler.Handler) *Module {
 	return &Module{handler: handler}
 }
 
-// Name identifies the module in the registry.
-func (m *Module) Name() string { return "widgets" }
+// Build constructs the repository, service, and handler from the shared
+// infrastructure. No I/O. Another module's capability arrives only as an
+// internal/contracts interface parameter, wired in internal/bootstrap.
+func Build(infra app.Infra) *Module {
+	repo := widgetsrepository.New(infra.Pool)
+	return New(widgetshandler.New(widgetsservice.New(repo)))
+}
 
-// RegisterRoutes mounts routes below /api/v1. The scaffold is intentionally
-// empty; copy the patterns below when the handlers are ready.
+func (m *Module) Name() string { return widgetscatalog.Owner }
+
+// Catalog providers: registered by app.RegisterCatalogs at startup.
+func (m *Module) Permissions() []authz.Grant { return widgetscatalog.Permissions() }
+func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return widgetscatalog.ErrorCodes() }
+func (m *Module) Locales() fs.FS { return widgetscatalog.Locales() }
+
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
+	group := v1.Group("/widgets", deps.Authenticate())
+	group.Get("/health", deps.Limiters.Relaxed, authz.Require(widgetscatalog.PermissionRead), m.handler.Health)
 }
 ```
+
+`internal/modules/widgets/catalog/permissions.go` (errors.go and the en/vi
+locales follow the same shape):
+
+```go
+package catalog
+
+const (
+	PermissionRead  authz.Permission = "widgets:read"
+	PermissionWrite authz.Permission = "widgets:write"
+)
+
+// Admins receive every permission implicitly; grant other roles deliberately.
+func Permissions() []authz.Grant {
+	return []authz.Grant{
+		{Permission: PermissionRead, Roles: []string{authz.RoleUser}},
+		{Permission: PermissionWrite},
+	}
+}
+```
+
+Why a `catalog` subpackage instead of constants in `module.go`: the module
+root imports its handler and service, so a handler or service referencing a
+root constant would be an import cycle. The leaf package can be imported by
+every layer of the module (and by the module's own tests).
 
 `internal/modules/widgets/handler/handler.go`:
 
@@ -223,13 +261,26 @@ global middleware or another module's routes.
 Recommended order for a protected route:
 
 ```text
-JWT auth (group) -> rate limit (tier) -> authz.Require -> idempotency -> handler
+deps.Authenticate() (group) -> rate limit (tier) -> authz.Require -> idempotency -> audit.Guard -> handler
 ```
 
-- `JWTAuth` belongs on the module group (or per route for mixed public/private
-  groups), not on the root app.
-- Use `deps.Config` for secrets and `deps.Sessions` for session validation;
-  never capture a second config copy.
+- `deps.Authenticate()` is the one authentication chain for protected routes:
+  `Authorization: ApiKey` is verified by `deps.APIKeyVerifier` (nil means
+  API-key attempts get 401) and everything else by JWT + session validation.
+  API-key scopes become the subject's permissions, so `authz.Require` gates
+  both credential types. Use plain `middleware.JWTAuth` only with a commented
+  security reason (today only `POST /auth/logout-all`, which revokes login
+  sessions an API key does not have).
+- Authentication belongs on the module group (or per route for mixed
+  public/private groups), not on the root app.
+- Never capture a second config copy; `deps.Config`/`deps.Sessions` are
+  already wired into `deps.Authenticate()`.
+- Privileged mutations are Tier 1 (`audit.TxRecorder` in the service
+  transaction) or carry `audit.Guard` with `audit.ModeRequired` after
+  idempotency.
+- Never add `deps.Idempotency` to a route whose response carries a plaintext
+  secret or token (API-key create/rotate, webhook endpoint/source create and
+  `rotate-secret`): the replay cache would store it for 24h.
 - Use the tier that matches cost: `Strict` for credential/token endpoints,
   `Normal` for mutations and uploads, `Relaxed` for reads.
 - Protect every route with a permission, even reads. Public routes are an
@@ -246,42 +297,40 @@ Reference route table:
 
 ```go
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	group := v1.Group("/widgets",
-		middleware.JWTAuth(deps.Config.JWT.Secret, deps.Sessions),
-	)
+	group := v1.Group("/widgets", deps.Authenticate())
 
 	group.Get("/",
 		deps.Limiters.Relaxed,
-		authz.Require(authz.PermissionWidgetsRead),
+		authz.Require(widgetscatalog.PermissionRead),
 		m.handler.List,
 	)
 	group.Get("/:id",
 		deps.Limiters.Relaxed,
-		authz.Require(authz.PermissionWidgetsRead),
+		authz.Require(widgetscatalog.PermissionRead),
 		m.handler.Get,
 	)
 	group.Post("/",
 		deps.Limiters.Normal,
-		authz.Require(authz.PermissionWidgetsWrite),
+		authz.Require(widgetscatalog.PermissionWrite),
 		deps.Idempotency,
 		m.handler.Create,
 	)
 	group.Put("/:id",
 		deps.Limiters.Normal,
-		authz.Require(authz.PermissionWidgetsWrite),
+		authz.Require(widgetscatalog.PermissionWrite),
 		deps.Idempotency,
 		m.handler.Update,
 	)
 	group.Delete("/:id",
 		deps.Limiters.Normal,
-		authz.Require(authz.PermissionWidgetsDelete),
+		authz.Require(widgetscatalog.PermissionDelete),
 		deps.Idempotency,
 		m.handler.Delete,
 	)
 }
 ```
 
-For a public group, omit `JWTAuth` and use `Strict` where credentials are
+For a public group, omit `deps.Authenticate()` and use `Strict` where credentials are
 involved. For an admin-only sub-surface, mount it under the existing admin
 group only after the owner agrees; otherwise expose a dedicated permission and
 keep the module's routes together.
@@ -291,44 +340,88 @@ keep the module's routes together.
 The current tree predates the target rules. These are documented exceptions,
 not the convention for new modules:
 
-- **`files` authorization:** its routes use JWT and rate limits but do not call
-  `authz.Require`. Target: every route has a permission, including reads.
-- **`identity` user reads/updates:** `GET /users/:id` and some update paths use
-  owner/admin checks in the handler (`authRole`/`authUserID`) rather than route
-  permissions. Target: permission middleware, with ownership checks in the
-  service only for row-level access.
-- **`files.user_id`:** the existing foreign key uses `ON DELETE CASCADE` to
-  `users`, so a hard delete of a user removes file metadata across a module
-  boundary. Target: no cross-module foreign key or cascade; core identity
-  references require explicit owner approval. Keep the existing behavior until
-  a reviewed migration changes it.
+- **Public routes:** the `publicRoutes` allowlist in `test/arch/routes_test.go`
+  (anonymous/token-possession auth flows and the HMAC-authenticated webhook
+  receiver) is the complete list of `/api/v1` routes without `authz.Require`.
+  Every other route, including all `files` routes and
+  `POST /auth/logout-all` (`sessions:revoke`), requires a permission. Adding
+  to the list is a reviewed product decision.
+- **Fallback-audited mutations:** only the public webhook receiver and the
+  caller's own notification state (`read-all`, `:id/read`, preferences) are
+  neither Tier 1 nor `audit.Guard`ed; the best-effort global middleware
+  records them (`fallbackAudited` in `test/arch/audit_routes_test.go`).
+  Webhook administration and `POST /notifications/send` are guarded. Do not
+  extend the list with privileged mutations.
+- **`identity` user reads/updates:** `GET /users/:id`, `PUT /users/:id`, and
+  `DELETE /users/:id` require `profile:read`/`profile:write` and then allow
+  another user's id only when the caller also holds the matching
+  `admin:users:*` permission (`httpx.Can` in the handler). Target: keep the
+  route permission and move row-level ownership checks into the service.
+- **`users` references from other modules:** `files`, `notifications`,
+  `notification_preferences`, `api_keys`, and `feature_flag_targets` keep a
+  tenant-composite foreign key `(tenant_id, user_id) REFERENCES
+  users (tenant_id, id) ON DELETE RESTRICT`. Users are soft-deleted, so the
+  key only guarantees same-tenant ownership; it never cascades across the
+  module boundary. Target: no new cross-module foreign keys; core identity
+  references require explicit owner approval.
 
 ## 4. Permissions
 
-Permissions live in `internal/platform/authz/permissions.go`. One permission
-is one stable capability:
+A module owns its permissions in `internal/modules/<name>/catalog/permissions.go`
+and returns them from `Permissions() []authz.Grant` (`app.PermissionProvider`).
+One permission is one stable capability, named `<resource>:<verb>` (lower-case
+segments joined by `:`, validated at registration). The resource is usually the
+module name (`files:read`, `webhooks:write`) but may be a narrower concept
+(`profile:write`, `sessions:revoke` in identity); back-office capabilities use
+an `admin:` prefix (`admin:features:write`, `admin:api_keys:rotate`):
 
 ```go
 const (
-	PermissionWidgetsRead   Permission = "widgets:read"
-	PermissionWidgetsWrite  Permission = "widgets:write"
-	PermissionWidgetsDelete Permission = "widgets:delete"
+	PermissionRead   authz.Permission = "widgets:read"
+	PermissionWrite  authz.Permission = "widgets:write"
+	PermissionDelete authz.Permission = "widgets:delete"
 )
+
+func Permissions() []authz.Grant {
+	return []authz.Grant{
+		{Permission: PermissionRead, Roles: []string{authz.RoleUser}},
+		{Permission: PermissionWrite},  // admin-only
+		{Permission: PermissionDelete}, // admin-only
+	}
+}
 ```
 
-Add every constant to `allPermissions` (admins receive all entries by
-construction) and grant non-admin roles deliberately in `buildRolePermissions`.
-Do not reuse another module's permission, and do not authorize by role string
-in a handler. Unknown roles have no permissions.
+`app.RegisterCatalogs` registers every module's grants at startup, owned by
+`Module.Name()`. Admins receive every registered permission by construction;
+grant `user` deliberately. Registration fails startup on an invalid name, an
+unknown role, or a permission another module already owns, so two modules can
+never silently share one. Do not authorize by role string in a handler.
+Unknown roles have no permissions.
+
+**Shared permissions stay central.** A permission checked by more than one
+module cannot be owned by one of them without a cross-module import. Today
+that is only the back-office set in `internal/platform/authz/permissions.go`
+(`admin:users:*`, `admin:files:*`, `admin:stats:read`): the admin module's
+routes require them and the identity/files services re-check them. Prefer
+designs where the module that registers the route owns the permission.
 
 Permission checklist:
 
-1. Add constants and include them in `allPermissions`.
-2. Add the intended grants to `buildRolePermissions` (usually not to `user`).
+1. Add constants and `Grant`s in `catalog/permissions.go`.
+2. Grant `user` only when end users need the capability.
 3. Protect every route with `authz.Require` (or `RequireAny` for a documented
-   union).
-4. Add a table test for the role matrix.
+   union); `test/arch` fails on an unprotected route.
+4. Add a role-matrix assertion in `module_test.go` if grants are non-trivial.
 5. Mention the permission names in the module README.
+
+Error codes follow the same pattern in `catalog/errors.go`
+(`ErrorCodes() map[apperror.Code]apperror.Spec`, `app.ErrorProvider`), with an
+`errors.<code>.title` entry in both `catalog/locales/en.json` and `vi.json`
+(`app.LocaleProvider`; `i18n.New` fails on missing or mismatched keys).
+Feature flags go in `catalog/flags.go` (`app.FlagProvider`). Handler and
+service unit tests that do not build the app call `<name>catalog.Register()`
+in an `init` of a `_test.go` file; an unregistered code renders as
+500 `system.internal` and logs an error.
 
 ## 5. Audit
 
@@ -408,27 +501,37 @@ One module owns each table. Current owners:
 
 | Owner | Tables |
 | --- | --- |
-| `identity` | `users`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants`, `users`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
 | `files` | `files` |
-| `platform/jobs` | `jobs` |
-| `platform/audit` | `audit_events` |
+| `features` | `feature_flags`, `feature_flag_targets` |
+| `notifications` | `notifications`, `notification_preferences` |
+| `webhooks` | `webhook_*` |
+| `apikeys` | `api_keys` |
+| platform (`jobs`, `audit`, `scheduler`) | `jobs`, `audit_events`, `scheduler_leases`, `scheduler_runs` |
 
 New modules own tables named after the module or with a `<name>_` prefix (for
-example `widgets`, `widgets_events`).
+example `widgets`, `widgets_events`); `test/arch/table_ownership_test.go`
+derives ownership from that convention, so only differently named tables
+need an entry in its `tableOwners` map.
 Do not read or write another module's tables directly, even in a JOIN. Use a
-contract/read model or a job.
+contract/read model or a job. The same test parses every
+`internal/modules/*/queries/*.sql` (FROM/JOIN/INTO/UPDATE) and fails on a
+reference to another owner's table; reviewed exceptions go in
+`crossModuleReads` (there are none: tenants/users are read through
+`internal/contracts/identity`).
 
 ### Schema conventions
 
-- Primary keys are `BIGSERIAL` unless there is a strong reason otherwise.
+- Primary keys are `BIGINT GENERATED ALWAYS AS IDENTITY` unless there is a
+  strong reason otherwise (an explicit id needs `OVERRIDING SYSTEM VALUE`).
 - `created_at` and `updated_at` are `TIMESTAMP WITH TIME ZONE NOT NULL`; use
   the shared `update_updated_at()` trigger for mutable tables.
 - Soft delete uses `deleted_at` plus partial unique indexes for active rows.
 - Cursor pagination uses a `(created_at DESC, id DESC)` index.
 - Foreign keys inside the module are fine. Avoid cross-module foreign keys; if
   a core reference (for example `user_id`) is unavoidable, get the owner's
-  agreement, document it, and never cascade across the boundary. The existing
-  `files.user_id ... ON DELETE CASCADE` is a legacy exception, not a template.
+  agreement, document it, reference `(tenant_id, user_id)` against
+  `users (tenant_id, id)`, and use `ON DELETE RESTRICT`, never `CASCADE`.
 - Index every ownership and lookup path used by list/detail endpoints. Add
   indexes in the same migration as the table for a new module.
 
@@ -438,13 +541,20 @@ contract/read model or a job.
   exists.
 - **Upstream boilerplate before its first deployment:** extend the single
   `migrations/000001_init_schema.{up,down}.sql`.
-- **Any deployed database or downstream fork:** never edit `000001`. Add the
-  next numbered migration, for example
-  `000002_widgets_init.{up,down}.sql` (or `000004+` when upgrading a legacy
-  history). Never reuse or renumber a shipped migration.
+- **Any deployed database or downstream fork:** never edit `000001`. Create
+  the migration with `make migrate-create module=widgets name=init`, which
+  writes `<UTC YYYYMMDDHHMMSS>_widgets_init.{up,down}.sql`. Timestamp
+  versions do not collide when two branches each add a migration, and are
+  always above the legacy sequential versions. Never reuse or renumber a
+  shipped migration. golang-migrate only applies versions above the recorded
+  one, so before merging regenerate a branch migration whose timestamp is
+  older than the newest migration already on main.
+- `test/arch/migrations_test.go` fails on duplicate versions, a missing up or
+  down file, a non-timestamp version after the baseline, or a name that does
+  not start with a module (or `platform`) owner.
 - A database that applied the old `000001`–`000003` history keeps that history.
-  Restore those source files from git history if needed and add `000004+`; do
-  not point it at the consolidated baseline. See
+  Restore those source files from git history if needed and add a timestamped
+  migration; do not point it at the consolidated baseline. See
   [Upgrading an existing database](../README.md#upgrading-an-existing-database).
 - The down migration reverses only what its up migration created. Do not use
   down migrations as the production rollback plan; they are for local/test
@@ -463,7 +573,7 @@ Example table:
 
 ```sql
 CREATE TABLE IF NOT EXISTS widgets (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     -- identity user ID; intentionally no cross-module foreign key
     owner_id BIGINT NOT NULL,
     name VARCHAR(255) NOT NULL,
@@ -499,9 +609,10 @@ own generation block in `sqlc.yaml`; add one when you add the module:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
+        omit_unused_structs: true
 ```
 
-Then run `make sqlc-generate`. Generated code lands only in the module's own
+`scripts/new-module.sh` appends this block. Then run `make sqlc-generate`. Generated code lands only in the module's own
 `sqlc/` package; keep query names prefixed (`ListWidgetsByOwner`,
 `CreateWidget`) and never import another module's generated types. The
 architecture test enforces the boundary. SQLC generation is not a substitute
@@ -513,12 +624,17 @@ A module never imports another module's package, including its service or
 repository. When module B needs data or behavior from module A, define a
 contract package outside both modules:
 
+Contracts are grouped by the providing module, one package per provider:
+`internal/contracts/<provider>/` (today `identity`, `files`,
+`notifications`, `webhooks`). Consumers import them with an alias such as
+`identitycontracts`.
+
 ```text
-internal/contracts/identity.go
+internal/contracts/identity/identity.go
 ```
 
 ```go
-package contracts
+package identity
 
 import "context"
 
@@ -544,8 +660,9 @@ Rules:
   repositories, DTOs, storage, database, or session packages.
 - The provider implements the interface structurally; the consumer depends on
   the interface, not the implementation.
-- Wire the implementation in `cmd/api/main.go`. The composition root is the
-  only place that knows both sides.
+- The provider returns the implementation from its `Build` (a `Provides`
+  struct); `internal/bootstrap/modules.go` passes it to the consumer's
+  `Build`. The composition root is the only place that knows both sides.
 - A contract exposes identifiers and stable values, not repositories, database
   rows, or DTOs from the provider's HTTP layer.
 - Errors are part of the contract. Map them to `apperror` at the transport
@@ -570,7 +687,8 @@ owner. Never reach into another module's repository.
 | A module handler | its own repository, another module, Fiber global setup |
 | A module service | Fiber context/handlers, another module |
 | `internal/contracts/*` | any module implementation, repository, DTO, sqlc, storage, database, session, or Fiber |
-| `cmd/api` | module internals other than exported constructors |
+| `cmd/api`, `internal/bootstrap` | module internals other than `Build`/`Provides` |
+| anything but `cmd/*`/`test/*` | `internal/bootstrap` |
 
 `test/arch/imports_test.go` fails the build on cross-module and
 platform/pkg-to-module imports. Run `make arch` after adding a module. Do not
@@ -620,40 +738,48 @@ make swagger   # if route annotations changed
 
 ## 11. Register in the composition root
 
-Construct dependencies in `cmd/api/main.go`, then register the module once:
+`internal/bootstrap/modules.go` holds the single ordered module list. Add the
+module there, passing only contracts from modules built earlier:
 
 ```go
-widgetRepo := widgetsrepository.New()
-widgetService := widgetsservice.New(widgetRepo)
-widgetHandler := widgetshandler.New(widgetService)
+widgetsModule := widgets.Build(infra)                        // no contracts needed
+ordersModule := orders.Build(infra, identityProvides.Principals) // consumes a contract
 
-application := app.New(cfg, app.Deps{
-	Cache:    appCache,
-	Sessions: sessionStore,
-	Health:   healthChecker,
-	Audit:    audit.NewPostgresRecorder(pool),
-})
-application.Register(
-	identity.New(authHandler, userHandler),
-	files.New(uploadHandler),
-	admin.New(adminHandler),
-	widgets.New(widgetHandler),
-)
+return &Modules{
+	List: []app.Module{
+		identityModule,
+		// ...
+		widgetsModule,
+		ordersModule,
+	},
+	// ...
+}, nil
 ```
+
+`cmd/api/main.go` builds `app.Infra` (pool, tx manager, cache, audit
+recorder, job queue, queued email sender, storage, flag evaluator), calls
+`bootstrap.Build`, `app.RegisterCatalogs`, validates `FEATURE_FLAGS` against
+the now-complete catalog, builds the i18n bundle from `app.LocaleSources`,
+runs `Modules.Startup`, and only then calls `app.New` and
+`application.Register(modules.List...)`. `test/arch` builds the same list, so
+the route, permission, audit, overlap, and SQL ownership checks cover the new
+module without further edits.
 
 Rules:
 
-- The scaffold's generated `repository.New()` takes no arguments. When you
-  replace its empty struct with the pgx pool, change it to `New(pool)` and
-  update this call; keep construction in the composition root.
-- Keep module-specific dependencies in the module constructor; do not grow
+- `Build` must not perform I/O; startup checks that need the database go in a
+  method the bootstrap exposes as `Modules.Startup` (see identity).
+- Keep module-specific dependencies in `Build`; do not grow `app.Infra` or
   `app.Deps` for one module.
-- Register before `Listen`. Duplicate paths are a startup/programming error.
-- If the module owns durable work, register its job handler before
-  `worker.Run`, for example `worker.Register("widgets.reindex", widgetWorker)`.
-  Job kinds use a `<module>.<action>` prefix.
-- Startup order matters: database -> migrations (separate command) -> storage ->
-  cache -> email -> repositories -> services -> handlers -> app -> worker.
+- Register before `Listen`. Duplicate paths are a startup/programming error;
+  a catalog conflict fails `app.RegisterCatalogs` (and panics in `Register`).
+- If the module owns durable work, implement `RegisterJobs(jobs.Registrar)`
+  (`app.JobProvider`), as the webhooks module does for `webhook.delivery` and
+  `webhook.dispatch`. Job kinds use a `<module>.<action>` prefix. Slow kinds
+  can be moved to a dedicated worker with `jobs.WithKinds`/`WithExcludeKinds`.
+- Startup order: database -> migrations (separate command) -> storage -> cache
+  -> email -> app.Infra -> bootstrap.Build -> RegisterCatalogs -> FEATURE_FLAGS
+  check -> i18n -> Startup -> app.New/Register -> worker.
 - Do not enqueue work during `RegisterRoutes`; request handling must be the
   trigger, or an explicit startup backfill job.
 
@@ -661,16 +787,16 @@ Rules:
 
 1. `scripts/new-module.sh <name>` (or create the same layout by hand). Keep the
    generated README and fill in ownership.
-2. Add permissions to `internal/platform/authz` and a role-matrix test.
-3. Add the migration (baseline only for an undeployed upstream; otherwise the
-   next numbered migration), module `queries/`, `sqlc.yaml` block, and
-   `make sqlc-generate`.
+2. Adjust permissions, error codes, flags, and en/vi strings in `catalog/`.
+3. Add the migration (baseline only for an undeployed upstream; otherwise
+   `make migrate-create module=<name> name=<purpose>`), replace
+   `queries/<name>.sql`, and `make sqlc-generate`.
 4. Implement repository -> service -> handler. Keep transport, rules, and SQL
    in their packages.
 5. Add routes to `module.go`: JWT, rate limit, permission, idempotency where
    appropriate, then handler.
-6. Wire dependencies and register the module in `cmd/api/main.go`; register
-   job handlers if any.
+6. Add the module to `internal/bootstrap/modules.go`; implement
+   `RegisterJobs`/`RegisterEvents`/`RegisterSchedules` for durable work.
 7. Add unit, handler, and integration tests; run `make arch`.
 8. Update the module README, `docs/architecture.md` if the module map changes,
    and Swagger annotations if routes were added.
@@ -680,10 +806,13 @@ Rules:
 
 ## 13. Conventions for many modules
 
-- **Names:** lower_snake_case directories; `<name>_` tables; `<name>:read` /
-  `<name>:write` permissions; `<name>.<action>` job kinds;
-  `<name>.<resource>.<verb>` audit actions. Prefixes make ownership obvious at
-  scale.
+- **Names:** lower_snake_case directories; `<name>_` tables;
+  `<resource>:<verb>` permissions (`admin:<resource>:<verb>` for back-office
+  routes); `<name>.<action>` job kinds; audit actions are
+  `[admin.]<resource>[.<sub-resource>].<past-tense verb>` as used today
+  (`file.uploaded`, `webhook.endpoint.secret_rotated`,
+  `admin.feature_flag.updated`, `api_key.rotated`, `notification.sent`).
+  Prefixes make ownership obvious at scale.
 - **One reason to change:** avoid shared "common" or "utils" domain packages.
   Shared mechanics belong in `platform`/`pkg`; shared business concepts belong
   in contracts.

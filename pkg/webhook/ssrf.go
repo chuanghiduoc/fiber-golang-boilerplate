@@ -237,12 +237,58 @@ func isBlockedIP(ip net.IP) bool {
 	}
 
 	if v6 := ip.To16(); v6 != nil {
-		// 2001:db8::/32 documentation range.
-		if v6[0] == 0x20 && v6[1] == 0x01 && v6[2] == 0x0d && v6[3] == 0xb8 {
+		return isBlockedIPv6(v6)
+	}
+	return false
+}
+
+// blockedIPv6Ranges are non-public IPv6 ranges with no usable embedded IPv4
+// destination. Teredo is blocked whole: its client address is obfuscated and
+// the relay path is not something a webhook target legitimately needs.
+var blockedIPv6Ranges = mustCIDRs(
+	"2001:db8::/32",  // documentation
+	"2001::/32",      // Teredo
+	"fec0::/10",      // deprecated site-local
+	"64:ff9b:1::/48", // local-use NAT64 (RFC 8215)
+)
+
+// embeddedIPv4Ranges translate or tunnel to the IPv4 address at the given
+// byte offset, so the target is only as public as that IPv4 address. A dial
+// to e.g. 64:ff9b::7f00:1 through a NAT64 gateway reaches 127.0.0.1.
+var embeddedIPv4Ranges = []struct {
+	network *net.IPNet
+	offset  int
+}{
+	{mustCIDRs("64:ff9b::/96")[0], 12},    // well-known NAT64 (RFC 6052)
+	{mustCIDRs("2002::/16")[0], 2},        // 6to4 (RFC 3056)
+	{mustCIDRs("::/96")[0], 12},           // deprecated IPv4-compatible
+	{mustCIDRs("::ffff:0:0:0/96")[0], 12}, // SIIT IPv4-translated (RFC 2765)
+}
+
+func isBlockedIPv6(v6 net.IP) bool {
+	for _, network := range blockedIPv6Ranges {
+		if network.Contains(v6) {
 			return true
 		}
 	}
+	for _, r := range embeddedIPv4Ranges {
+		if r.network.Contains(v6) {
+			return isBlockedIP(net.IP(v6[r.offset : r.offset+net.IPv4len]))
+		}
+	}
 	return false
+}
+
+func mustCIDRs(cidrs ...string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			panic(fmt.Sprintf("webhook: invalid built-in CIDR %q: %v", cidr, err))
+		}
+		out = append(out, network)
+	}
+	return out
 }
 
 // IsBlocked reports whether err (or an error it wraps) is a blocked-target

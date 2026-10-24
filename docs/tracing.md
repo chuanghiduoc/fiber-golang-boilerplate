@@ -57,6 +57,7 @@ All settings are optional and read at startup through `config.Load`.
 | `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Ratio in `[0,1]` for the ratio samplers. |
 | `OTEL_TRACING_EXCLUDE_PATHS` | `/healthz,/readyz,/health,/metrics` | Exact request paths that never create spans. |
 | `OTEL_INSTRUMENT_DB` | `true` | Emit sanitized pgx client spans under a recording parent. |
+| `OTEL_TRUST_INCOMING_TRACE` | `false` | Honor an inbound W3C `traceparent`. With `APP_TRUST_PROXY=true` it is honored only from a peer in `APP_TRUSTED_PROXIES`. Off by default so a client cannot force sampling. |
 | `OTEL_BATCH_TIMEOUT_SECS` | `5` | Maximum delay before a batch is exported. |
 | `OTEL_EXPORT_TIMEOUT_SECS` | `30` | Per-export timeout. |
 | `OTEL_SHUTDOWN_TIMEOUT_SECS` | `10` | Bounded flush on process shutdown. |
@@ -83,7 +84,11 @@ and before `Metrics`/`Logger`/`Recovery`:
 - `app.error_code` for `apperror.AppError` values (for example
   `internal_error`, `not_found`)
 - 5xx: status `Error` and a bounded `error.type`; 4xx stays `Unset`
-- inbound W3C `traceparent` is extracted automatically
+- inbound W3C `traceparent` is extracted only when
+  `OTEL_TRUST_INCOMING_TRACE=true` (and, behind `APP_TRUST_PROXY`, only from a
+  trusted proxy). Otherwise it is ignored and every request starts a new root
+  trace sampled by the local ratio: with a parent-based sampler an untrusted
+  client's sampled flag would otherwise force 100% sampling and export cost.
 
 ### PostgreSQL client span
 
@@ -106,7 +111,7 @@ client span:
 the tenant context before running the handler:
 
 - `job.id`, `job.kind`, `job.tenant_id`, `job.attempt`, `job.max_attempts`
-- `job.outcome` (`succeeded`, `retried`, `dead`), `job.dead_letter`,
+- `job.outcome` (`succeeded`, `retried`, `dead`, `released` on shutdown), `job.dead_letter`,
   `job.retry_at` when retried
 - failures: status `Error` and a bounded `error.type`
 
@@ -166,9 +171,10 @@ span without a link.
   The API stays ready. Check the collector endpoint and network policy; do not
   restart the API expecting spans to recover.
 - Missing traces: verify `OTEL_ENABLED=true`, the endpoint, the sampler ratio,
-  and that the route is not excluded. Inbound sampling follows the parent; a
-  client sending `traceparent` with the sampled flag off keeps the trace
-  unsampled.
+  and that the route is not excluded. With `OTEL_TRUST_INCOMING_TRACE=true`,
+  inbound sampling follows the trusted parent; a `traceparent` with the sampled
+  flag off keeps the trace unsampled. Upstream traces not joining is expected
+  while the flag is off.
 - Shutdown: the provider flushes last, after HTTP and the job worker stop. A
   failed flush logs a warning but never changes the process exit code.
 - Logs: request records include `trace_id` and `span_id` when a recording span

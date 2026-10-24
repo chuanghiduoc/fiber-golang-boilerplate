@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -267,17 +267,17 @@ func (m *mockEmailSender) SendTx(_ context.Context, _ pgx.Tx, msg email.Message)
 }
 
 type mockRecipientLookup struct {
-	recipients map[int64]contracts.NotificationRecipient
+	recipients map[int64]identitycontracts.NotificationRecipient
 	err        error
 }
 
-func (m *mockRecipientLookup) NotificationRecipient(_ context.Context, userID int64) (contracts.NotificationRecipient, error) {
+func (m *mockRecipientLookup) NotificationRecipient(_ context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
 	if m.err != nil {
-		return contracts.NotificationRecipient{}, m.err
+		return identitycontracts.NotificationRecipient{}, m.err
 	}
 	recipient, ok := m.recipients[userID]
 	if !ok {
-		return contracts.NotificationRecipient{}, apperror.ErrNotFound
+		return identitycontracts.NotificationRecipient{}, apperror.ErrNotFound
 	}
 	return recipient, nil
 }

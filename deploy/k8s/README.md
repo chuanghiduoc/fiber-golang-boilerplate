@@ -280,7 +280,9 @@ curl -fsS https://api.staging.example.com/readyz
 ```
 
 `/healthz` is a process liveness check. `/readyz` also checks dependencies
-such as PostgreSQL and Redis. The startup probe deliberately uses `/healthz`
+such as PostgreSQL and Redis; only PostgreSQL being down returns `503`, while a
+Redis outage or a saturated DB pool reports `status:"degraded"` with `200`
+(see `docs/operations.md`). The startup probe deliberately uses `/healthz`
 (not `/readyz`), but it only covers slow-but-reachable startup: the API exits
 during startup if PostgreSQL, storage (including the S3 bucket check), or cache
 initialization fails. The startup probe cannot mask that dependency outage; the

@@ -5,11 +5,15 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
+	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
@@ -38,6 +42,7 @@ func NewUploadHandler(svc filesvc.UploadService, maxFileSize int64, allowedTypes
 // @Success 201 {object} dto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails "feature.disabled when file_uploads is off"
 // @Failure 413 {object} apperror.ProblemDetails
 // @Failure 415 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
@@ -52,7 +57,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 	}
 
 	if fileHeader.Size > h.maxFileSize {
-		return apperror.NewCode(apperror.CodeFileTooLarge, fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
+		return apperror.NewCode(filescatalog.CodeFileTooLarge, fmt.Sprintf("file size exceeds %dMB limit", h.maxFileSize/(1<<20)))
 	}
 
 	file, err := fileHeader.Open()
@@ -71,7 +76,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 
 	if len(h.allowedMIME) > 0 {
 		if _, ok := h.allowedMIME[contentType]; !ok {
-			return apperror.NewCode(apperror.CodeFileUnsupportedType, fmt.Sprintf("file type %q is not allowed", contentType))
+			return apperror.NewCode(filescatalog.CodeFileUnsupportedType, fmt.Sprintf("file type %q is not allowed", contentType))
 		}
 	}
 
@@ -173,7 +178,7 @@ func (h *UploadHandler) List(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, files, hasMore, nextFileCursor(files))
+	return response.List(c, files, hasMore, pagination.NextCursor(files, func(f dto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
 // Delete godoc
