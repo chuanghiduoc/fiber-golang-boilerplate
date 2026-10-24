@@ -128,11 +128,12 @@ Offset helpers are for small admin/export tables only.
   payloads are sealed with AES-256-GCM using an HKDF-SHA256 key derived from
   `JWT_SECRET` (`jobs.PayloadCodec`); `EmailHandler` also accepts legacy
   plaintext JSON, which remains readable at rest until delivered or cleared.
-  External tools see the envelope in `jobs.payload`. Drain the queue and stop
-  old workers before enabling encryption: pre-codec binaries cannot decrypt
-  new jobs, and unknown-kind retry does not help because `email.send` is
-  registered. Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain
-  the queue first.
+  External tools see the envelope in `jobs.payload`. Encrypted jobs use the
+  distinct kind `email.send.encrypted`; new workers register both kinds. During
+  a rolling deploy old workers leave encrypted jobs queued (unknown-kind retry)
+  instead of misreading them, so deploy the new worker to drain the queue.
+  Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
+  first.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.

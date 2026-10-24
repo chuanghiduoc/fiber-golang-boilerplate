@@ -212,7 +212,11 @@ func main() {
 	hostname, _ := os.Hostname()
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	worker := jobs.NewWorker(pool, hostname, jobs.WithConcurrency(4))
-	worker.Register(jobs.EmailJobKind, jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec)))
+	emailHandler := jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec))
+	// New workers consume both legacy plaintext jobs and encrypted jobs so a
+	// rolling deployment can drain the old queue without losing messages.
+	worker.Register(jobs.EmailJobKind, emailHandler)
+	worker.Register(jobs.EncryptedEmailJobKind, emailHandler)
 	workerDone := make(chan struct{})
 	go func() {
 		if err := worker.Run(workerCtx); err != nil {

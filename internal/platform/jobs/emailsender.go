@@ -11,8 +11,14 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
-// EmailJobKind is the job kind registered for durable email delivery.
-const EmailJobKind = "email.send"
+// EmailJobKind is the job kind for plaintext email jobs (legacy/backward
+// compatible). Encrypted jobs use EncryptedEmailJobKind so an old worker that
+// has not yet been upgraded leaves them queued (unknown kind retry) instead of
+// misreading the envelope as an empty message.
+const (
+	EmailJobKind          = "email.send"
+	EncryptedEmailJobKind = "email.send.encrypted"
+)
 
 // ErrEmailNoRecipients is returned when a queued email has no recipients. The
 // guard prevents a malformed or undecodable payload from being sent as an empty
@@ -89,14 +95,18 @@ func emailJob(msg email.Message, codec *PayloadCodec) (Job, error) {
 	if err != nil {
 		return Job{}, fmt.Errorf("jobs: encode email: %w", err)
 	}
+	kind := EmailJobKind
 	if codec != nil {
 		payload, err = codec.Seal(payload)
 		if err != nil {
 			return Job{}, fmt.Errorf("jobs: encrypt email payload: %w", err)
 		}
+		// A distinct kind makes rolling deploys safe: old workers retry an
+		// unknown kind instead of misreading the envelope as an empty email.
+		kind = EncryptedEmailJobKind
 	}
 	return Job{
-		Kind:        EmailJobKind,
+		Kind:        kind,
 		Payload:     payload,
 		MaxAttempts: 10,
 	}, nil

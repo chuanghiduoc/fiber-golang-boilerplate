@@ -54,7 +54,7 @@ func TestEmailJobWithCodecSealsPayload(t *testing.T) {
 	msg := testEmailMessage()
 	job, err := emailJob(msg, codec)
 	require.NoError(t, err)
-	require.Equal(t, EmailJobKind, job.Kind)
+	require.Equal(t, EncryptedEmailJobKind, job.Kind)
 
 	encoded := string(job.Payload)
 	assert.NotContains(t, encoded, "secret-token")
