@@ -19,7 +19,7 @@ func NewStorage(cfg config.StorageConfig) (Storage, error) {
 	switch cfg.Driver {
 	case "local":
 		return NewLocalStorage(cfg.LocalPath)
-	case "s3", "minio":
+	case DriverS3, DriverSeaweedFS:
 		return NewS3Storage(cfg)
 	default:
 		return nil, fmt.Errorf("unsupported storage driver: %s", cfg.Driver)

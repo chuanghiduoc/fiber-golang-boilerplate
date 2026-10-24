@@ -929,8 +929,17 @@ Other caveats:
   credentials, and `EMAIL_FROM_ADDRESS`; production requires
   `SMTP_REQUIRE_TLS=true`, and `EMAIL_DRIVER=console` is rejected. A relay that
   does not advertise STARTTLS will fail sends.
-- **S3/MinIO:** set `STORAGE_DRIVER=s3` (or `minio`), endpoint, region, bucket,
-  access key, and secret key; enable `STORAGE_S3_USE_SSL` in production. Every
+- **S3 / SeaweedFS:** set `STORAGE_DRIVER=s3` (AWS S3) or `seaweedfs` (the
+  SeaweedFS S3 gateway, default port 8333), endpoint (`host:port`, no scheme),
+  region, bucket, access key, and secret key; enable `STORAGE_S3_USE_SSL` in
+  production. The client is aws-sdk-go-v2: `*.amazonaws.com` endpoints use
+  virtual-hosted addressing and the SDK's default checksums; every other
+  endpoint (SeaweedFS, other S3-compatible servers) uses path-style
+  addressing and checksums only when required. `minio` is no longer an
+  accepted driver name; a deployment still setting it fails startup. SeaweedFS
+  credentials come from `-s3.config` identities or, with no config, from its
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` admin identity (what
+  `docker-compose.yml` uses). Every
   replica checks bucket existence at startup and may try to create a missing
   bucket, so pre-create it to avoid races; an unreachable endpoint or bad
   credentials prevents startup. After startup, object reads/writes/deletes fail

@@ -30,7 +30,7 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 - **Docs**: Swagger/OpenAPI via [swaggo](https://github.com/swaggo/swag)
 - **Linter**: [golangci-lint v2](https://golangci-lint.run/)
 - **Cache**: In-memory or Redis
-- **Storage**: Local filesystem or S3/MinIO
+- **Storage**: Local filesystem, AWS S3, or SeaweedFS (S3 gateway)
 - **Email**: SMTP or console (dev)
 - **Metrics**: Prometheus
 - **Tracing**: OpenTelemetry (OTLP/gRPC, disabled by default; see [docs/tracing.md](docs/tracing.md))
@@ -235,7 +235,7 @@ cp .env.example .env
 make docker-run
 ```
 
-Services: API (:8080), PostgreSQL (:5432), Redis (:6379). Optional S3-compatible MinIO: `docker compose --profile s3 up` (:9000/:9001).
+Services: API (:8080), PostgreSQL (:5432), Redis (:6379). Optional SeaweedFS S3 gateway: `STORAGE_DRIVER=seaweedfs docker compose --profile s3 up` (:8333).
 
 **Without Docker** (requires Go 1.27.3+, PostgreSQL):
 
@@ -818,7 +818,7 @@ Key settings:
 - `SCHEDULER_LEASE_TTL_SECS` / `SCHEDULER_HEARTBEAT_SECS` / `SCHEDULER_POLL_SECS` — leader lease, renewal, and evaluation timings (defaults 30/10/15)
 - `SCHEDULER_CATCHUP` — `none` | `latest` | `all` (default `latest`); `SCHEDULER_CATCHUP_LIMIT` bounds `all` per pass
 - `SCHEDULER_RETENTION_DAYS` — `scheduler_runs` retention (default 30)
-- `STORAGE_DRIVER` — `local` | `s3` | `minio`
+- `STORAGE_DRIVER` — `local` | `s3` | `seaweedfs`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
 - `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`

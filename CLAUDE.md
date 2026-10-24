@@ -360,7 +360,7 @@ full replace (webhooks); new modules use `PATCH` for partial updates (see
   snapshot after writes. See `docs/feature-flags.md`.
 - **Transactions:** `database.TxManager.WithTx` scopes a transaction to one
   module/aggregate. Do not span modules; use jobs/events.
-- **Drivers:** storage (`local|s3|minio`), cache (`memory|redis`), email
+- **Drivers:** storage (`local|s3|seaweedfs`, S3 via aws-sdk-go-v2), cache (`memory|redis`), email
   (`console|smtp`) are selected by config factories.
 - **Rate limits:** tiered, cache-backed in `internal/app`; authenticated
   requests are keyed per user, unauthenticated per IP.

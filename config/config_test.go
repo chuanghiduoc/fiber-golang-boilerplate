@@ -592,6 +592,28 @@ func TestValidate_S3Driver_Success(t *testing.T) {
 	}
 }
 
+func TestValidate_SeaweedFSDriver(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Storage = StorageConfig{Driver: "seaweedfs", S3Endpoint: "seaweedfs:8333", S3AccessKey: "key", S3SecretKey: "secret", S3Bucket: "bucket", MaxFileSize: 10485760}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate() should pass for valid seaweedfs config, got: %v", err)
+	}
+	cfg.Storage.S3Endpoint = ""
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should fail for seaweedfs driver without endpoint")
+	}
+}
+
+// TestValidate_MinIODriverRemoved pins the breaking rename: STORAGE_DRIVER=minio
+// fails startup instead of silently selecting another backend.
+func TestValidate_MinIODriverRemoved(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Storage = StorageConfig{Driver: "minio", S3Endpoint: "minio:9000", S3AccessKey: "key", S3SecretKey: "secret", S3Bucket: "bucket", MaxFileSize: 10485760}
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate() should reject the removed minio driver")
+	}
+}
+
 func TestValidate_UnknownStorageDriver(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.Storage = StorageConfig{Driver: "gcs", MaxFileSize: 10485760}
