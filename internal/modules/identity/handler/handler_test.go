@@ -28,6 +28,8 @@ type mockUserService struct {
 	users                           map[int64]*dto.UserResponse
 	hasMore                         bool
 	registrationEmailsTransactional bool
+	// googleAllowSignUp records the allowSignUp argument of each Google call.
+	googleAllowSignUp []bool
 }
 
 func newMockService() *mockUserService {
@@ -84,7 +86,8 @@ func (m *mockUserService) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string) (*dto.UserResponse, error) {
+func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string, allowSignUp bool) (*dto.UserResponse, error) {
+	m.googleAllowSignUp = append(m.googleAllowSignUp, allowSignUp)
 	return &dto.UserResponse{ID: 1, TenantID: 1, Email: email, Name: name, Role: "user"}, nil
 }
 

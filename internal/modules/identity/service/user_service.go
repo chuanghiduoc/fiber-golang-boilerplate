@@ -44,7 +44,10 @@ var dummyPasswordHash = func() []byte {
 type UserService interface {
 	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
 	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
-	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error)
+	// FindOrCreateByGoogle signs in an existing or linkable account. It creates a
+	// new account only when allowSignUp is true (the user_registration flag);
+	// otherwise a sign-up attempt fails with feature.disabled.
+	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string, allowSignUp bool) (*dto.UserResponse, error)
 	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
 	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
 	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
@@ -352,15 +355,15 @@ func (s *userService) clearLoginAttempts(ctx context.Context, cacheKey string) {
 	}
 }
 
-func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error) {
-	user, err := s.findOrCreateByGoogleUser(ctx, googleID, email, name)
+func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string, allowSignUp bool) (*dto.UserResponse, error) {
+	user, err := s.findOrCreateByGoogleUser(ctx, googleID, email, name, allowSignUp)
 	if err != nil {
 		return nil, err
 	}
 	return ToUserResponse(user), nil
 }
 
-func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*identitysqlc.User, error) {
+func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string, allowSignUp bool) (*identitysqlc.User, error) {
 	email = normalizeEmail(email)
 
 	findOrCreate := func(repo repository.UserRepository) (*identitysqlc.User, error) {
@@ -394,6 +397,9 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		}
 		if !errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewInternal("failed to find user by email")
+		}
+		if !allowSignUp {
+			return nil, apperror.NewCode(apperror.CodeFeatureDisabled, "feature user_registration is disabled")
 		}
 		if err := ensureEmailNotBanned(ctx, repo, email); err != nil {
 			return nil, err

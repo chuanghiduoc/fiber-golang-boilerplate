@@ -74,14 +74,13 @@ func (q *Queries) AdminListUsers(ctx context.Context, arg AdminListUsersParams) 
 const adminListUsersCursor = `-- name: AdminListUsersCursor :many
 SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, created_at, updated_at, deleted_at FROM users
 WHERE tenant_id = $1::bigint
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type AdminListUsersCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -90,7 +89,6 @@ type AdminListUsersCursorParams struct {
 func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCursorParams) ([]User, error) {
 	rows, err := q.db.Query(ctx, adminListUsersCursor,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,
@@ -675,14 +673,13 @@ const listUsersCursor = `-- name: ListUsersCursor :many
 SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, created_at, updated_at, deleted_at FROM users
 WHERE tenant_id = $1::bigint
   AND deleted_at IS NULL
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type ListUsersCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -691,7 +688,6 @@ type ListUsersCursorParams struct {
 func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams) ([]User, error) {
 	rows, err := q.db.Query(ctx, listUsersCursor,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

@@ -77,9 +77,8 @@ func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesPara
 		TenantID:        tenantID(ctx),
 		EndpointID:      params.EndpointID,
 		Status:          params.Status,
-		HasCursor:       params.Cursor.HasCursor,
 		CursorCreatedAt: params.Cursor.CreatedAtParam(),
-		CursorID:        params.Cursor.ID,
+		CursorID:        params.Cursor.IDParam(),
 		RowLimit:        params.Cursor.Limit,
 	})
 }

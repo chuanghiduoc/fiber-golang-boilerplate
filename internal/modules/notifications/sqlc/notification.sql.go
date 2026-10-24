@@ -183,16 +183,15 @@ SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, upd
 WHERE tenant_id = $1::bigint
   AND user_id = $2::bigint
   AND (NOT $3::boolean OR read_at IS NULL)
-  AND (NOT $4::boolean OR (created_at, id) < ($5::timestamptz, $6::bigint))
+  AND (created_at, id) < ($4::timestamptz, $5::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $7::int
+LIMIT $6::int
 `
 
 type ListNotificationsCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
 	UserID          int64              `json:"user_id"`
 	UnreadOnly      bool               `json:"unread_only"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -203,7 +202,6 @@ func (q *Queries) ListNotificationsCursor(ctx context.Context, arg ListNotificat
 		arg.TenantID,
 		arg.UserID,
 		arg.UnreadOnly,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

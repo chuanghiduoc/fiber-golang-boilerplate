@@ -51,6 +51,14 @@ Cursors are opaque base64url `(created_at:id)`. Handlers build `nextCursor`
 with `pagination.NextCursor` from the last item's sort key. Offset helpers are
 for small admin/export tables only.
 
+Cursor SQL always uses the plain row comparison
+`(created_at, id) < (@cursor_created_at, @cursor_id)`; repositories bind
+`DBCursor.CreatedAtParam()`/`IDParam()`, which return `('infinity',
+MaxInt64)` on the first page. Never write `NOT @has_cursor OR ...`: under a
+generic (prepared) plan the OR form can only filter, so a deep page scans every
+newer row (measured on 200k rows: 2,742 buffers vs 5 with the row comparison
+as an index condition).
+
 ## Update semantics
 
 Existing `PUT` routes keep their current, documented behavior:

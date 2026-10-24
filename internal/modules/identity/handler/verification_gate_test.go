@@ -10,7 +10,9 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/require"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
@@ -78,4 +80,31 @@ func TestGoogleCallback_RequiresVerifiedEmailWhenConfigured(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+}
+
+// TestGoogleCallback_UserRegistrationGatesSignUp proves the callback passes
+// the tenant's user_registration flag to the service, which only refuses
+// creating new accounts (existing users keep signing in).
+func TestGoogleCallback_UserRegistrationGatesSignUp(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		provider := &stubGoogleOAuth{info: &oauth.GoogleUserInfo{ID: "g-1", Email: "g@example.com", Name: "G", VerifiedEmail: true}}
+		tenants := &fakeTenantRepository{tenant: identitysqlc.Tenant{ID: 1, Slug: "default", Status: "active"}}
+		svc := newMockService()
+		h := NewAuthHandler(svc, &mockRefreshTokenService{}, &mockPasswordResetService{},
+			&mockEmailVerificationService{}, "test-secret", 24, false, provider, tenants)
+		h.SetFeatureFlags(features.NewEvaluator(features.Options{
+			Env: map[features.Key]bool{identitycatalog.KeyUserRegistration: enabled},
+		}))
+		app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+		app.Get("/auth/google/callback", h.GoogleCallback)
+
+		state := encodeOAuthState(oauthStateKey("test-secret"), "nonce", 1)
+		req, err := http.NewRequest(http.MethodGet,
+			"/auth/google/callback?code=c&state="+url.QueryEscape(state), http.NoBody)
+		require.NoError(t, err)
+		req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})
+		_, err = app.Test(req)
+		require.NoError(t, err)
+		require.Equal(t, []bool{enabled}, svc.googleAllowSignUp)
+	}
 }

@@ -2,8 +2,11 @@ package pagination
 
 import (
 	"encoding/base64"
+	"math"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestNextCursor(t *testing.T) {
@@ -92,5 +95,24 @@ func TestNormalizeLimit(t *testing.T) {
 func TestRowLimit(t *testing.T) {
 	if got := RowLimit(21); got != 21 {
 		t.Errorf("RowLimit(21) = %d, want 21", got)
+	}
+}
+
+func TestDBCursorParams(t *testing.T) {
+	first := DBCursor{Limit: 21}
+	if at := first.CreatedAtParam(); !at.Valid || at.InfinityModifier != pgtype.Infinity {
+		t.Fatalf("first page CreatedAtParam = %+v, want valid +infinity", at)
+	}
+	if id := first.IDParam(); id != math.MaxInt64 {
+		t.Fatalf("first page IDParam = %d, want MaxInt64", id)
+	}
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 6, time.UTC)
+	next := DBCursor{HasCursor: true, CreatedAt: at, ID: 42}
+	if got := next.CreatedAtParam(); !got.Valid || got.InfinityModifier != pgtype.Finite || !got.Time.Equal(at) {
+		t.Fatalf("cursor CreatedAtParam = %+v, want %v", got, at)
+	}
+	if id := next.IDParam(); id != 42 {
+		t.Fatalf("cursor IDParam = %d, want 42", id)
 	}
 }

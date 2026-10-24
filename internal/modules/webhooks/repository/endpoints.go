@@ -65,9 +65,8 @@ func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) (
 	}
 	return r.q.ListWebhookEndpoints(ctx, webhooksqlc.ListWebhookEndpointsParams{
 		TenantID:        tenantID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }

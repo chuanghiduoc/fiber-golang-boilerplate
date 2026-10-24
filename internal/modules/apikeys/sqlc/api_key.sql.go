@@ -122,14 +122,13 @@ func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (A
 const listAPIKeysCursor = `-- name: ListAPIKeysCursor :many
 SELECT id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at FROM api_keys
 WHERE tenant_id = $1::bigint
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type ListAPIKeysCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -138,7 +137,6 @@ type ListAPIKeysCursorParams struct {
 func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorParams) ([]ApiKey, error) {
 	rows, err := q.db.Query(ctx, listAPIKeysCursor,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

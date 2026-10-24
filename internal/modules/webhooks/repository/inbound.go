@@ -63,9 +63,8 @@ func (r *Postgres) ListInboundSources(ctx context.Context, cur pagination.DBCurs
 	}
 	return r.q.ListWebhookInboundSources(ctx, webhooksqlc.ListWebhookInboundSourcesParams{
 		TenantID:        tenantID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }
@@ -162,9 +161,8 @@ func (r *Postgres) ListInboundEvents(ctx context.Context, sourceID int64, cur pa
 	return r.q.ListWebhookInboundEvents(ctx, webhooksqlc.ListWebhookInboundEventsParams{
 		TenantID:         tenantID(ctx),
 		SourceID:         sourceID,
-		HasCursor:        cur.HasCursor,
 		CursorReceivedAt: cur.CreatedAtParam(),
-		CursorID:         cur.ID,
+		CursorID:         cur.IDParam(),
 		RowLimit:         cur.Limit,
 	})
 }

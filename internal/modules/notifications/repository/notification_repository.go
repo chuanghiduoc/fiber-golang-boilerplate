@@ -79,9 +79,8 @@ func (r *notificationRepository) ListCursor(ctx context.Context, userID int64, c
 		TenantID:        tenantID(ctx),
 		UserID:          userID,
 		UnreadOnly:      unreadOnly,
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }

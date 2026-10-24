@@ -644,7 +644,10 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return apperror.NewBadRequest("failed to exchange authorization code")
 	}
 
-	user, err := h.userSvc.FindOrCreateByGoogle(ctx, info.ID, info.Email, info.Name)
+	// An existing or linkable account may always sign in; only creating a new
+	// account is a registration, so it honors user_registration.
+	allowSignUp := features.Require(ctx, h.flags, identitycatalog.KeyUserRegistration, features.Subject{TenantID: tenantID}) == nil
+	user, err := h.userSvc.FindOrCreateByGoogle(ctx, info.ID, info.Email, info.Name, allowSignUp)
 	if err != nil {
 		return err
 	}
