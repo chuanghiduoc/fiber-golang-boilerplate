@@ -412,8 +412,8 @@ type AppConfig struct {
 	BodyLimit int `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
 	// JSONBodyLimit caps every non-multipart request body (JSON, form, raw).
 	// Only multipart/form-data uploads may use the larger APP_BODY_LIMIT.
-	JSONBodyLimit            int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
-	LogLevel                 string `env:"LOG_LEVEL" envDefault:"info"`
+	JSONBodyLimit int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
+	LogLevel      string `env:"LOG_LEVEL" envDefault:"info"`
 	// RequestTimeout must fit the shutdown drain window
 	// (ShutdownBudget - ShutdownReserve) so an in-flight request can finish
 	// before the process stops waiting for it.
