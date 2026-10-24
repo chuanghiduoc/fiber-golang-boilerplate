@@ -59,9 +59,11 @@ internal/contracts/                 Narrow cross-module identity/files admin int
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
+  i18n/                             Embedded en/vi catalogs, Accept-Language negotiation, localization
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
   tenant/                           Tenant resolution (X-Tenant-Slug + auth query fallback)
+  versioning/                       V1/V2 policy, Accept-Version assertions, deprecation headers
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
   apperror/                         RFC 9457 errors + typed error catalog
@@ -81,7 +83,7 @@ layout and scaffold, and [docs/operations.md](docs/operations.md) for the
 operations runbook. Tracing configuration, privacy rules, and the local
 collector live in [docs/tracing.md](docs/tracing.md).
 
-Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
+Request flow: `Client → app middleware (request ID, locale) → /api/vN version guard → tenant middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
@@ -98,10 +100,10 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
   compatibility mode. `TENANT_REQUIRE_HEADER=true` rejects header-less
   requests instead, and **production requires it** so a write can never
   silently fall back to tenant 1. Staging should set it too.
-- `X-Tenant-Slug` selects the request tenant on `/api/v1` routes. Invalid,
-  unknown, or suspended slugs return `404` `tenant not found`. Startup checks
-  tenant *existence* separately: a suspended configured/default tenant does
-  not crash `cmd/api` or `cmd/seed`; its requests return `404` until it is
+- `X-Tenant-Slug` selects the request tenant on `/api/v1` and `/api/v2` routes.
+  Invalid, unknown, or suspended slugs return `404` `tenant not found`. Startup
+  checks tenant *existence* separately: a suspended configured/default tenant
+  does not crash `cmd/api` or `cmd/seed`; its requests return `404` until it is
   reactivated.
 - Public auth calls operate on the resolved tenant: registration, login,
   forgot/reset password, resend/verify email, and refresh. A client that
@@ -158,6 +160,26 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
   callers, and tests without request context. HTTP writes must resolve a
   tenant through middleware (production enforces the header).
 - **Remaining:** row-level security and per-tenant limits/quotas.
+
+## Internationalization and API Versioning
+
+**Locales.** `internal/platform/i18n` embeds English (`en`) and Vietnamese
+(`vi`) JSON catalogs. Global middleware negotiates `Accept-Language` using
+q-values, case-insensitive matching, region truncation (`vi-VN` → `vi`), and
+wildcards, then falls back to `I18N_DEFAULT_LOCALE` (default `en`). Responses
+carry `Content-Language` and `Vary: Accept-Language`. RFC 9457 error titles and
+validation messages are localized; `AppError.DetailKey` opts a detail into
+translation. Error `code`, `type`, `status`, and `instance` never change.
+
+**API versions.** `/api/v1` is always mounted. A module can implement
+`app.V2Module` (in addition to `app.Module`) to mount `/api/v2`; the v2 group is
+created only when at least one module opts in (otherwise `/api/v2` returns
+406). Clients may send `Accept-Version: 1|v1|2|v2`; it must match the path
+version or the request fails with `406 api.version_unsupported`. Every
+versioned response carries
+`API-Version` and `Vary: Accept-Version`; a deprecated version additionally
+emits `Deprecation`, `Sunset`, and `Link` headers from `versioning.Config`.
+Any other `/api/vN` path returns 406 rather than a generic 404.
 
 ## Quick Start
 
@@ -386,9 +408,10 @@ characters; only `[A-Za-z0-9._:-]`). When present:
   user, or tenant does not collide or replay a cross-tenant `201`
 
 Browser clients must be allowed to send `Idempotency-Key`. The default
-`CORS_ALLOW_HEADERS` includes it, and the default `CORS_EXPOSE_HEADERS` exposes
-`Location`, `ETag`, and `Idempotent-Replayed`. If you override those settings,
-keep the relevant values.
+`CORS_ALLOW_HEADERS` includes it along with `Accept-Language` and
+`Accept-Version`; the default `CORS_EXPOSE_HEADERS` exposes `Location`, `ETag`,
+`Idempotent-Replayed`, `Content-Language`, `API-Version`, `Deprecation`,
+`Sunset`, and `Link`. If you override those settings, keep the relevant values.
 
 This is opt-in and applied to registration, profile/password updates, user
 updates/deletes, file upload/delete/restore, and admin role/ban/unban/file
@@ -539,7 +562,8 @@ permissions, audit, idempotency, tables, contracts, tests, and the full
 checklist.
 
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`
-   (`Name`, `RegisterRoutes`).
+   (`Name`, `RegisterRoutes`). Implement `app.V2Module` (`RegisterV2Routes`)
+   only when the module has a breaking v2 surface.
 2. Keep the module's handler/service/repository/DTO inside its directory.
    Do not import another module's internals; use `internal/contracts` or a
    narrow exported interface.
@@ -574,7 +598,8 @@ Key settings:
 - `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `TENANT_DEFAULT_SLUG` — tenant for header-less requests in compatibility mode (default `default`)
-- `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`; **must be `true` in production**, recommended in staging)
+- `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1`/`/api/v2` requests (default `false`; **must be `true` in production**, recommended in staging)
+- `I18N_DEFAULT_LOCALE` — fallback locale for `Accept-Language` (`en` or `vi`, default `en`; unsupported values fail startup)
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)

@@ -36,6 +36,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
@@ -64,6 +65,14 @@ func main() {
 
 	// Base URL for RFC 9457 problem "type" links in error responses.
 	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
+
+	// Embedded catalogs are validated at startup so catalog drift or an
+	// unsupported I18N_DEFAULT_LOCALE fails fast instead of serving raw keys.
+	i18nBundle, err := i18n.New(cfg.I18N.Locale())
+	if err != nil {
+		slog.Error("failed to initialize i18n", slog.Any("error", err))
+		os.Exit(1)
+	}
 
 	if cfg.App.Env == "production" {
 		if cfg.Cache.Driver == "memory" {
@@ -259,6 +268,7 @@ func main() {
 		Audit:          auditRecorder,
 		TenantResolver: tenantResolver,
 		Tracing:        traceProvider,
+		I18n:           i18nBundle,
 	})
 	application.Register(
 		identity.New(authHandler, userHandler),

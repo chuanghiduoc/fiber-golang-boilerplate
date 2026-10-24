@@ -20,6 +20,7 @@ var requiredCodes = []Code{
 	CodeFileNotDeleted,
 	CodePermissionDenied,
 	CodeRateLimitExceeded,
+	CodeAPIVersionUnsupported,
 	CodeSystemInternal,
 	CodeSystemTimeout,
 	CodeSystemUnavailable,

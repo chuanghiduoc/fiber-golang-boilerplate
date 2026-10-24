@@ -22,9 +22,11 @@ internal/contracts  narrow cross-module identity/files admin interfaces (stdlib 
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
+  i18n         embedded en/vi catalogs, Accept-Language negotiation, localization
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
   tenant       request tenant resolver + locals helpers (X-Tenant-Slug)
+  versioning   V1/V2 policy, Accept-Version assertions, deprecation headers
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
@@ -33,26 +35,34 @@ Request flow:
 
 ```
 client
-  -> app global middleware (CORS, security, request ID, metrics, logger,
-     recovery, audit, timeout, idempotency where wired)
-  -> /api/v1 tenant middleware (X-Tenant-Slug, browser auth query, or default)
+  -> app global middleware (CORS, security, request ID, i18n, tracing, metrics,
+     logger, recovery, audit, timeout, idempotency where wired)
+  -> /api version guard (unknown /api/vN -> 406)
+  -> /api/vN version middleware (Accept-Version, API-Version, deprecation)
+  -> tenant middleware (X-Tenant-Slug, browser auth query, or default)
   -> module route (JWT -> rate limit -> authz -> idempotency)
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
 
-`tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
-validates `[a-z0-9-]{1,63}`, resolves the slug (header; validated `?tenant=`
-fallback on `/auth/google`, `/auth/reset-password`, and `/auth/verify-email`;
-otherwise `TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber
-locals and the request context. The Google OAuth callback is exempt so
-`TENANT_REQUIRE_HEADER=true` cannot reject it before the handler validates the
-signed `state`; the handler installs the state tenant itself. `JWTAuth` treats
-the JWT `tenant_id` claim as authoritative, rejects a non-positive claim, and
-rejects an explicit header that resolves to a different tenant with 403. It
-clears `tenant_slug` when a claim overrides a header-less default resolution
-rather than leaving a misleading slug. Infrastructure probes (`/healthz`,
-`/readyz`, `/metrics`) stay outside tenant resolution so they never depend on
-the `tenants` table.
+`i18n.Middleware` runs immediately after request ID so every response,
+including errors, carries the negotiated locale. `pkg/apperror` uses the
+request locale for catalog titles and validation messages. `versioning.Guard`
+runs on `/api` before the version groups; `versioning.Middleware` is mounted on
+each group. The v2 group exists only when a module implements `app.V2Module`.
+
+`tenant.Middleware` runs on the `/api/v1` and `/api/v2` groups, before module
+JWTs. It validates `[a-z0-9-]{1,63}`, resolves the slug (header; validated
+`?tenant=` fallback on `/auth/google`, `/auth/reset-password`, and
+`/auth/verify-email`; otherwise `TENANT_DEFAULT_SLUG`), and stores
+`tenant_id`/`tenant_slug` in Fiber locals and the request context. The Google
+OAuth callback is exempt so `TENANT_REQUIRE_HEADER=true` cannot reject it
+before the handler validates the signed `state`; the handler installs the
+state tenant itself. `JWTAuth` treats the JWT `tenant_id` claim as
+authoritative, rejects a non-positive claim, and rejects an explicit header
+that resolves to a different tenant with 403. It clears `tenant_slug` when a
+claim overrides a header-less default resolution rather than leaving a
+misleading slug. Infrastructure probes (`/healthz`, `/readyz`, `/metrics`)
+stay outside tenant resolution so they never depend on the `tenants` table.
 
 ## Multi-tenant model
 
@@ -165,7 +175,19 @@ the `tenants` table.
   `audit.NewServiceEvent` enriches explicit domain events from the request
   context; a zero `Event.TenantID` is resolved from the recording context.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
-  HTTP renders RFC 9457 `application/problem+json`.
+  HTTP renders RFC 9457 `application/problem+json`. With a localizer installed
+  (`Deps.I18n`), titles and validation messages follow `Accept-Language`;
+  `DetailKey` opts a detail into translation without changing code/type/status.
+  A nil localizer keeps the literal English output.
+- **i18n:** embedded `en`/`vi` catalogs must keep identical keys and
+  `{placeholders}`; `i18n.New` fails otherwise. Locale tags are truncated to the
+  supported base (for example `vi-VN` → `vi`) and unsupported languages fall
+  back to `I18N_DEFAULT_LOCALE`.
+- **API versions:** path routing under `/api/v1`, with opt-in `/api/v2` through
+  `app.V2Module`. Optional `Accept-Version` must match the path (406
+  `api.version_unsupported` otherwise). Version middleware adds `API-Version`,
+  `Vary: Accept-Version`, and configured deprecation metadata; the guard
+  rejects unknown `/api/vN` before routing. Swagger stays on v1.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,
   24h replay, body-bound for non-multipart requests.
 - **Observability:** request IDs, structured `slog`, Prometheus HTTP/job/audit

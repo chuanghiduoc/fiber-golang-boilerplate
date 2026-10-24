@@ -76,10 +76,45 @@ func TestCORSConfig_DefaultsIncludeIdempotencyHeaders(t *testing.T) {
 	if !contains(c.Headers(), "Idempotency-Key") {
 		t.Errorf("default CORS allowed headers = %v, want Idempotency-Key", c.Headers())
 	}
-	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed"} {
+	for _, header := range []string{"Accept-Language", "Accept-Version"} {
+		if !contains(c.Headers(), header) {
+			t.Errorf("default CORS allowed headers = %v, want %s", c.Headers(), header)
+		}
+	}
+	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed", "Content-Language", "API-Version", "Deprecation", "Sunset", "Link"} {
 		if !contains(c.ExposedHeaders(), header) {
 			t.Errorf("default CORS exposed headers = %v, want %s", c.ExposedHeaders(), header)
 		}
+	}
+}
+
+func TestLoad_I18NDefaultLocale(t *testing.T) {
+	t.Setenv("I18N_DEFAULT_LOCALE", "vi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.I18N.DefaultLocale != "vi" {
+		t.Errorf("I18N_DEFAULT_LOCALE = %q, want vi", cfg.I18N.DefaultLocale)
+	}
+}
+
+func TestI18NConfigDefaultLocale(t *testing.T) {
+	t.Setenv("I18N_DEFAULT_LOCALE", "")
+	var cfg I18NConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("parse I18N defaults: %v", err)
+	}
+	if cfg.DefaultLocale != "en" {
+		t.Errorf("I18N_DEFAULT_LOCALE = %q, want en", cfg.DefaultLocale)
+	}
+
+	cfg.DefaultLocale = " VI "
+	if got := cfg.Locale(); got != "vi" {
+		t.Errorf("Locale() = %q, want vi", got)
+	}
+	if got := (I18NConfig{}).Locale(); got != "en" {
+		t.Errorf("zero Locale() = %q, want en", got)
 	}
 }
 
