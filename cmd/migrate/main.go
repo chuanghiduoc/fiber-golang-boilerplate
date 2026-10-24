@@ -136,6 +136,36 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	"notification_preferences": {
 		"idx_notification_preferences_unique",
 	},
+	"api_keys": {
+		"idx_api_keys_tenant_user",
+		"idx_api_keys_tenant_created_at_id",
+	},
+	"feature_flag_targets": {
+		"idx_feature_flag_targets_tenant_flag_user",
+	},
+	"webhook_endpoints": {
+		"idx_webhook_endpoints_tenant_created_at_id",
+		"idx_webhook_endpoints_tenant_status",
+	},
+	"webhook_endpoint_secrets": {
+		"idx_webhook_endpoint_secrets_tenant_endpoint",
+	},
+	"webhook_deliveries": {
+		"idx_webhook_deliveries_tenant_created_at_id",
+		"idx_webhook_deliveries_tenant_endpoint_created",
+		"idx_webhook_deliveries_tenant_status_next",
+	},
+	"webhook_delivery_attempts": {
+		"idx_webhook_delivery_attempts_tenant_delivery",
+		"idx_webhook_delivery_attempts_tenant_created",
+	},
+	"webhook_inbound_sources": {
+		"idx_webhook_inbound_sources_tenant_created",
+	},
+	"webhook_inbound_events": {
+		"idx_webhook_inbound_events_tenant_source_received",
+		"idx_webhook_inbound_events_tenant_received",
+	},
 }
 
 func main() {
