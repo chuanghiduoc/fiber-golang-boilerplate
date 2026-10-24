@@ -25,6 +25,35 @@ const (
 	localTenantSlug = "tenant_slug"
 )
 
+type contextKey struct{}
+
+// DefaultID is the tenant used by pre-multi-tenant rows and tests that do not
+// install tenant middleware. Production requests always carry an explicit ID.
+const DefaultID int64 = 1
+
+// WithID stores the tenant ID in a context so services and repositories can
+// scope queries without threading a parameter through every signature.
+func WithID(ctx context.Context, id int64) context.Context {
+	return context.WithValue(ctx, contextKey{}, id)
+}
+
+// IDFromContext returns the tenant ID stored by WithID, or 0.
+func IDFromContext(ctx context.Context) int64 {
+	if id, ok := ctx.Value(contextKey{}).(int64); ok {
+		return id
+	}
+	return 0
+}
+
+// EffectiveID returns the context tenant, falling back to DefaultID for
+// backward compatibility with tests and pre-tenant call sites.
+func EffectiveID(ctx context.Context) int64 {
+	if id := IDFromContext(ctx); id != 0 {
+		return id
+	}
+	return DefaultID
+}
+
 var slugPattern = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
 
 // Tenant is the minimal tenant identity needed by request handling.
@@ -69,6 +98,7 @@ func Middleware(r Resolver, defaultSlug string) fiber.Handler {
 
 		fiber.Locals[int64](c, localTenantID, resolved.ID)
 		fiber.Locals[string](c, localTenantSlug, resolved.Slug)
+		c.SetContext(WithID(c.Context(), resolved.ID))
 		return c.Next()
 	}
 }

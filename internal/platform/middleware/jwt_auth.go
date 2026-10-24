@@ -55,6 +55,7 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 				return apperror.NewCode(apperror.CodePermissionDenied, "tenant mismatch")
 			}
 			fiber.Locals[int64](c, "tenant_id", claims.TenantID)
+			c.SetContext(tenant.WithID(c.Context(), claims.TenantID))
 		}
 
 		if store != nil {
