@@ -132,9 +132,10 @@ golang-migrate CLI's `force 1`) instead of re-running the file.
 7. Run `make swagger`, `make check`, and `go test -race ./...`.
 8. Update `CHANGELOG.md`.
 
-> The `identity`, `files`, and `admin` modules currently wrap the existing
-> handler/service/repository packages. Moving those internals into the modules
-> is the next strangler phase; new modules should start in the module layout.
+> `files` owns its upload handler/service in the module but still uses the
+> legacy repository/DTO layer. `identity` and `admin` still wrap the global
+> handler/service/repository packages. Moving the remaining internals is the
+> next strangler phase; new modules should start in the module layout.
 
 ## Code Style
 

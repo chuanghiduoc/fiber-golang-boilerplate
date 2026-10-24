@@ -411,10 +411,11 @@ already exists.
    `test/arch` rejects cross-module imports.
 8. Run `make swagger` and `make check` before opening a PR.
 
-> The current `identity`, `files`, and `admin` modules wrap the existing
-> handler/service/repository packages. Moving those internals into the module
-> directories is the next strangler phase; new modules should start directly
-> in the module layout.
+> `files` owns its upload handler and service inside the module, while still
+> using the legacy repository/DTO layer. `identity` and `admin` still wrap the
+> global handler/service/repository packages. Moving the remaining internals is
+> the next strangler phase; new modules should start directly in the module
+> layout.
 
 ## Environment Variables
 

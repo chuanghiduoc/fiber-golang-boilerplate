@@ -40,7 +40,7 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (+ admin seed), files, admin (route tables)
+internal/modules/           identity (+ admin seed), files (handler/service), admin
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
 internal/handler|service|repository|dto|sqlc   current internals (strangler phase)
 pkg/                        apperror, response, database, cache, storage, email, ...
@@ -74,10 +74,12 @@ idempotency, compatibility). Keep both current when routes/contracts change.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
 Tenant isolation, per-module sqlc generation, distributed tracing, environment
-promotion/rollout automation, and moving the current handler/service/repository
-internals into modules remain future work. Kubernetes manifests and a GHCR
-release workflow exist under `deploy/k8s/` and `.github/workflows/release.yml`;
-they are a production foundation, not a complete CD platform.
+promotion/rollout automation, and moving the remaining legacy
+handler/service/repository/DTO internals into modules remain future work.
+`files` already owns its upload handler/service; `identity` and `admin` still
+wrap the global layers. Kubernetes manifests and a GHCR release workflow exist
+under `deploy/k8s/` and `.github/workflows/release.yml`; they are a production
+foundation, not a complete CD platform.
 
 ## Error Handling
 
