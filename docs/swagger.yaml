@@ -245,6 +245,76 @@ definitions:
     required:
     - token
     type: object
+  featuresdto.FlagDetailResponse:
+    properties:
+      flag:
+        $ref: '#/definitions/featuresdto.FlagResponse'
+      targets:
+        items:
+          $ref: '#/definitions/featuresdto.TargetResponse'
+        type: array
+    type: object
+  featuresdto.FlagResponse:
+    properties:
+      configured:
+        type: boolean
+      createdAt:
+        type: string
+      description:
+        type: string
+      effective:
+        type: boolean
+      enabled:
+        type: boolean
+      key:
+        type: string
+      killSwitch:
+        type: boolean
+      source:
+        type: string
+      updatedAt:
+        type: string
+    type: object
+  featuresdto.TargetResponse:
+    properties:
+      createdAt:
+        type: string
+      enabled:
+        type: boolean
+      flagKey:
+        type: string
+      id:
+        type: integer
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
+  featuresdto.UpsertFlagRequest:
+    properties:
+      description:
+        maxLength: 500
+        type: string
+      enabled:
+        type: boolean
+      killSwitch:
+        type: boolean
+    required:
+    - enabled
+    - killSwitch
+    type: object
+  featuresdto.UpsertTargetRequest:
+    properties:
+      enabled:
+        type: boolean
+      userId:
+        minimum: 1
+        type: integer
+    required:
+    - enabled
+    type: object
   response.ListResponse:
     properties:
       data: {}
@@ -263,6 +333,280 @@ info:
   title: Fiber Golang Boilerplate API
   version: "1.0"
 paths:
+  /admin/features/flags:
+    get:
+      description: List every compile-time feature flag with its database default,
+        kill switch, and effective value for the caller
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/featuresdto.FlagResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List feature flags (admin)
+      tags:
+      - Admin
+  /admin/features/flags/{key}:
+    delete:
+      description: Delete the database default and all targets, reverting the flag
+        to environment and compiled defaults
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete a feature flag override (admin)
+      tags:
+      - Admin
+    get:
+      description: Get one flag with its database state and every target in the current
+        tenant
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/featuresdto.FlagDetailResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a feature flag (admin)
+      tags:
+      - Admin
+    put:
+      consumes:
+      - application/json
+      description: Replace the database default, kill switch, and description for
+        a compile-time flag
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      - description: Flag state
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/featuresdto.UpsertFlagRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/featuresdto.FlagResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create or update a feature flag (admin)
+      tags:
+      - Admin
+  /admin/features/flags/{key}/targets:
+    get:
+      description: List tenant-wide and user targets for a flag in the current tenant
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/featuresdto.TargetResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List feature flag targets (admin)
+      tags:
+      - Admin
+    put:
+      consumes:
+      - application/json
+      description: Set a tenant-wide target (omit userId) or a user target in the
+        current tenant
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      - description: Target state
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/featuresdto.UpsertTargetRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/featuresdto.TargetResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create or update a feature flag target (admin)
+      tags:
+      - Admin
+  /admin/features/flags/{key}/targets/{id}:
+    delete:
+      description: Delete a tenant-wide or user target by ID from the current tenant
+      parameters:
+      - description: Feature flag key
+        in: path
+        name: key
+        required: true
+        type: string
+      - description: Target ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete a feature flag target (admin)
+      tags:
+      - Admin
   /admin/files:
     get:
       description: Get a paginated list of files in the caller's tenant

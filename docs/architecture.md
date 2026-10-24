@@ -17,11 +17,14 @@ internal/modules
                (dto/repository/service/handler + adapter + queries + generated sqlc)
   files        upload, metadata, download, soft delete, restore
                (dto/repository/service/handler + adapter + queries + generated sqlc)
+  features     admin feature-flag catalogue surface
+               (dto/repository/service/handler + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
 internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
+  features     compile-time flag catalog, evaluator, snapshot cache, DB store
   i18n         embedded en/vi catalogs, Accept-Language negotiation, localization
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
@@ -105,6 +108,12 @@ stay outside tenant resolution so they never depend on the `tenants` table.
   even when the header is omitted.
 - New blobs use `<tenantID>/<userID>/<uuid>.<ext>`; existing rows keep their
   old `<userID>/<uuid>` path. RLS and per-tenant limits remain future work.
+- Feature-flag targets are tenant-owned (`feature_flag_targets.tenant_id` and
+  nullable `user_id`). The repository takes the tenant from
+  `tenant.EffectiveID(ctx)`; a composite foreign key prevents a target from
+  pointing at a user in another tenant. Flag definitions/defaults and kill
+  switches are process-wide; per-tenant rollout uses targets. See
+  [Feature Flags](feature-flags.md).
 
 
 ## Dependency rules
@@ -149,7 +158,9 @@ stay outside tenant resolution so they never depend on the `tenants` table.
 - Tenant-owned tables carry `tenant_id` with a default of 1 and a foreign key to
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
   `default` tenant as row 1, so existing rows and header-less requests remain on
-  the compatibility tenant.
+  the compatibility tenant. `feature_flags` is global configuration;
+  `feature_flag_targets` is tenant-owned and uses a `(tenant_id, user_id)`
+  composite foreign key to keep user targets inside the tenant.
 - File blobs are external to PostgreSQL but follow the row's tenant: new keys
   are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
   authoritative key for downloads. Moving a blob without updating that column
@@ -190,6 +201,10 @@ stay outside tenant resolution so they never depend on the `tenants` table.
   rejects unknown `/api/vN` before routing. Swagger stays on v1.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,
   24h replay, body-bound for non-multipart requests.
+- **Feature flags:** compile-time catalog in `platform/features`; precedence
+  force-off > kill switch > user > tenant > database default > environment >
+  compiled default. Admin writes go through the `features` module and invalidate
+  the local snapshot. See [Feature Flags](feature-flags.md).
 - **Observability:** request IDs, structured `slog`, Prometheus HTTP/job/audit
   metrics, readiness checks for DB/cache.
 

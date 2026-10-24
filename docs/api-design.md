@@ -222,6 +222,27 @@ Rules:
 - Terminal jobs clear payloads; success/dead rows are retained 30 days.
 - Email payloads are encrypted at rest.
 
+## Feature flags
+
+- Compile-time keys only; unknown keys return `404`. The evaluator precedence is
+  force-off > kill switch > user target > tenant target > database default >
+  environment > compiled default. See [Feature Flags](feature-flags.md).
+- `GET /admin/features/flags` lists the catalog with the database default,
+  kill switch, configured marker, and the caller's effective value/source.
+- `GET /admin/features/flags/{key}` returns the flag and current-tenant targets.
+- `PUT /admin/features/flags/{key}` replaces the database default, kill switch,
+  and description. `enabled` and `killSwitch` are required.
+- `DELETE /admin/features/flags/{key}` removes the database row and cascades
+  targets, reverting to environment/compiled defaults; it is idempotent for a
+  valid catalog key.
+- `GET`/`PUT /admin/features/flags/{key}/targets` list/upsert targets. Omit
+  `userId` for a tenant-wide target; the tenant always comes from the request
+  context. `DELETE .../targets/{id}` is scoped to the tenant and flag.
+- Reads require `admin:features:read`; mutations require
+  `admin:features:write` and accept `Idempotency-Key`. Flag definitions are
+  process-wide; targets are tenant-scoped. A user target from another tenant is
+  rejected with `400`.
+
 ## Compatibility checklist
 
 - New field: allowed.

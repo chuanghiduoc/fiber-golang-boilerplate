@@ -16,6 +16,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -71,6 +72,11 @@ type Deps struct {
 	// Versioning configures deprecation/sunset metadata for API groups. Nil is
 	// equivalent to v1, current, with no deprecation headers.
 	Versioning *versioning.Config
+	// Flags evaluates compile-time feature flags. It is optional for minimal
+	// deployments and tests; New replaces nil with an evaluator backed by
+	// FEATURE_FLAGS/FEATURE_FLAGS_FORCE_OFF and compiled defaults, so modules
+	// never need a nil check.
+	Flags features.Evaluator
 }
 
 type App struct {
@@ -84,6 +90,14 @@ type App struct {
 // through Register so the composition root can decide which modules are active.
 func New(cfg *config.Config, deps Deps) *App {
 	deps.Config = cfg
+	if deps.Flags == nil {
+		deps.Flags = features.NewEvaluator(features.Options{
+			Env:          cfg.FeatureFlags.EnvValues(),
+			ForceOff:     cfg.FeatureFlags.ForceOffValues(),
+			CacheTTL:     cfg.FeatureFlags.CacheTTL(),
+			MaxStaleness: cfg.FeatureFlags.MaxStaleness(),
+		})
+	}
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
 	deps.Idempotency = middleware.Idempotency(deps.Cache)
 

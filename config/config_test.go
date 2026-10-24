@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -573,5 +574,77 @@ func TestValidate_StagingRejectsKnownDefaults(t *testing.T) {
 	cfg.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("staging must reject the default admin password")
+	}
+}
+
+func TestFeatureFlagsConfigDefaults(t *testing.T) {
+	var c FeatureFlagsConfig
+	if err := env.Parse(&c); err != nil {
+		t.Fatalf("parse feature flag defaults: %v", err)
+	}
+	if c.CacheTTL() != time.Duration(c.CacheTTLSeconds)*time.Second {
+		t.Fatalf("CacheTTL() = %v, want %d seconds", c.CacheTTL(), c.CacheTTLSeconds)
+	}
+	if c.MaxStaleness() < c.CacheTTL() {
+		t.Fatalf("MaxStaleness() = %v, must be >= CacheTTL() %v", c.MaxStaleness(), c.CacheTTL())
+	}
+}
+
+func TestFeatureFlagsConfigParsedValues(t *testing.T) {
+	c := FeatureFlagsConfig{Flags: "user_registration=false,google_oauth=true", ForceOff: "file_uploads"}
+	values := c.EnvValues()
+	if values["user_registration"] || !values["google_oauth"] {
+		t.Fatalf("EnvValues() = %+v", values)
+	}
+	forceOff := c.ForceOffValues()
+	if _, ok := forceOff["file_uploads"]; !ok {
+		t.Fatalf("ForceOffValues() = %+v", forceOff)
+	}
+}
+
+func TestValidate_FeatureFlags(t *testing.T) {
+	t.Run("valid flags", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.FeatureFlags = FeatureFlagsConfig{
+			Flags:               "user_registration=false,email_verification=true",
+			ForceOff:            "google_oauth",
+			CacheTTLSeconds:     30,
+			MaxStalenessSeconds: 300,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid feature flags rejected: %v", err)
+		}
+	})
+
+	t.Run("zero timings use defaults", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("zero feature flag timings should be valid: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"unknown flag", func(c *Config) { c.FeatureFlags.Flags = "typo=true" }},
+		{"malformed flag", func(c *Config) { c.FeatureFlags.Flags = "user_registration=" }},
+		{"duplicate flag", func(c *Config) { c.FeatureFlags.Flags = "file_uploads=true,file_uploads=false" }},
+		{"unknown force-off", func(c *Config) { c.FeatureFlags.ForceOff = "typo" }},
+		{"negative TTL", func(c *Config) { c.FeatureFlags.CacheTTLSeconds = -1 }},
+		{"negative staleness", func(c *Config) { c.FeatureFlags.MaxStalenessSeconds = -1 }},
+		{"staleness below TTL", func(c *Config) {
+			c.FeatureFlags.CacheTTLSeconds = 60
+			c.FeatureFlags.MaxStalenessSeconds = 30
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Validate() should reject this feature flag config")
+			}
+		})
 	}
 }

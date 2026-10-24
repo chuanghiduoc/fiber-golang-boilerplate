@@ -28,6 +28,8 @@ var requiredTables = []string{
 	"password_reset_tokens",
 	"email_verification_tokens",
 	"files",
+	"feature_flags",
+	"feature_flag_targets",
 	"jobs",
 	"audit_events",
 }
@@ -41,6 +43,8 @@ var requiredColumns = map[string][]string{
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id"},
+	"feature_flags":             {"flag_key", "enabled", "kill_switch", "description"},
+	"feature_flag_targets":      {"flag_key", "tenant_id", "user_id", "enabled"},
 	"jobs":                      {"tenant_id", "trace_parent"},
 	"audit_events": {
 		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
@@ -55,8 +59,11 @@ var requiredUniqueIndexes = []string{
 	"tenants_slug_key",
 	"idx_users_tenant_email_lower_active",
 	"idx_users_tenant_google_id_active",
+	"idx_users_tenant_id_id",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+	"idx_feature_flag_targets_tenant_target",
+	"idx_feature_flag_targets_user_target",
 }
 
 // requiredTenantLeadingIndexes are the query indexes that must start with

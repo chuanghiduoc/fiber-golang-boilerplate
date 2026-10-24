@@ -7,24 +7,28 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 )
 
 type Config struct {
-	App       AppConfig
-	DB        DBConfig
-	JWT       JWTConfig
-	Storage   StorageConfig
-	OAuth     OAuthConfig
-	CORS      CORSConfig
-	RateLimit RateLimitConfig
-	Cache     CacheConfig
-	Email     EmailConfig
-	Admin     AdminConfig
-	Tenant    TenantConfig
-	Tracing   TracingConfig
-	I18N      I18NConfig
+	App          AppConfig
+	DB           DBConfig
+	JWT          JWTConfig
+	Storage      StorageConfig
+	OAuth        OAuthConfig
+	CORS         CORSConfig
+	RateLimit    RateLimitConfig
+	Cache        CacheConfig
+	Email        EmailConfig
+	Admin        AdminConfig
+	Tenant       TenantConfig
+	Tracing      TracingConfig
+	I18N         I18NConfig
+	FeatureFlags FeatureFlagsConfig
 }
 
 // I18NConfig controls request locale negotiation. Locale tags are matched
@@ -162,6 +166,64 @@ func validateOTLPEndpoint(endpoint string) error {
 		return fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must be host:port (got %q)", endpoint)
 	}
 	return nil
+}
+
+// FeatureFlagsConfig controls environment overrides, emergency force-off, and
+// the in-process snapshot cache used by internal/platform/features.
+type FeatureFlagsConfig struct {
+	// Flags is a comma-separated key=true|false list; a bare key means true,
+	// e.g. "user_registration,email_verification=false".
+	Flags string `env:"FEATURE_FLAGS"`
+	// ForceOff is a comma-separated list of keys that always evaluate false,
+	// even when a database default or user/tenant target enables them.
+	ForceOff string `env:"FEATURE_FLAGS_FORCE_OFF"`
+	// CacheTTLSeconds is how long a loaded snapshot is considered fresh.
+	CacheTTLSeconds int `env:"FEATURE_FLAGS_CACHE_TTL_SECONDS" envDefault:"30"`
+	// MaxStalenessSeconds bounds how long the last good snapshot may be used
+	// while the database is unavailable.
+	MaxStalenessSeconds int `env:"FEATURE_FLAGS_MAX_STALENESS_SECONDS" envDefault:"300"`
+}
+
+// CacheTTL returns the configured snapshot TTL, applying the package default
+// for zero values.
+func (f FeatureFlagsConfig) CacheTTL() time.Duration {
+	if f.CacheTTLSeconds <= 0 {
+		return features.DefaultCacheTTL
+	}
+	return time.Duration(f.CacheTTLSeconds) * time.Second
+}
+
+// MaxStaleness returns the configured stale-snapshot bound. It is never lower
+// than the cache TTL.
+func (f FeatureFlagsConfig) MaxStaleness() time.Duration {
+	maxStaleness := features.DefaultMaxStaleness
+	if f.MaxStalenessSeconds > 0 {
+		maxStaleness = time.Duration(f.MaxStalenessSeconds) * time.Second
+	}
+	if ttl := f.CacheTTL(); maxStaleness < ttl {
+		maxStaleness = ttl
+	}
+	return maxStaleness
+}
+
+// EnvValues parses FEATURE_FLAGS. Config validation has already rejected
+// malformed input in the normal Load path; invalid values here degrade to an
+// empty map so a partially built Config in tests cannot panic.
+func (f FeatureFlagsConfig) EnvValues() map[features.Key]bool {
+	values, err := features.ParseFlags(f.Flags)
+	if err != nil {
+		return map[features.Key]bool{}
+	}
+	return values
+}
+
+// ForceOffValues parses FEATURE_FLAGS_FORCE_OFF.
+func (f FeatureFlagsConfig) ForceOffValues() map[features.Key]struct{} {
+	values, err := features.ParseForceOff(f.ForceOff)
+	if err != nil {
+		return map[features.Key]struct{}{}
+	}
+	return values
 }
 
 // TenantConfig controls request-tenant resolution. The default slug preserves
@@ -450,6 +512,37 @@ func (cfg *Config) Validate() error {
 	// Tenant slugs are used as external identifiers and must stay DNS-safe.
 	if !tenantSlugPattern.MatchString(cfg.Tenant.DefaultSlug) {
 		return fmt.Errorf("TENANT_DEFAULT_SLUG must match [a-z0-9-]{1,63} (got %q)", cfg.Tenant.DefaultSlug)
+	}
+
+	// Feature flags: reject unknown/malformed keys so a typo cannot silently
+	// disable a feature. Zero cache values mean "use the package defaults";
+	// negative values are configuration errors.
+	parsedFlags, err := features.ParseFlags(cfg.FeatureFlags.Flags)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	if err := features.KnownKeysError(parsedFlags); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	forceOff, err := features.ParseForceOff(cfg.FeatureFlags.ForceOff)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	if err := features.KnownForceOffError(forceOff); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	if cfg.FeatureFlags.CacheTTLSeconds < 0 {
+		return fmt.Errorf("FEATURE_FLAGS_CACHE_TTL_SECONDS must not be negative")
+	}
+	if cfg.FeatureFlags.MaxStalenessSeconds < 0 {
+		return fmt.Errorf("FEATURE_FLAGS_MAX_STALENESS_SECONDS must not be negative")
+	}
+	if cfg.FeatureFlags.CacheTTLSeconds > 0 && cfg.FeatureFlags.MaxStalenessSeconds > 0 &&
+		cfg.FeatureFlags.MaxStalenessSeconds < cfg.FeatureFlags.CacheTTLSeconds {
+		return fmt.Errorf(
+			"FEATURE_FLAGS_MAX_STALENESS_SECONDS (%d) must be at least FEATURE_FLAGS_CACHE_TTL_SECONDS (%d)",
+			cfg.FeatureFlags.MaxStalenessSeconds, cfg.FeatureFlags.CacheTTLSeconds,
+		)
 	}
 
 	if cfg.App.BodyLimit < 1 {

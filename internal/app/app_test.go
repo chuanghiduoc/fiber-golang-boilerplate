@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -23,6 +25,20 @@ type pingModule struct{}
 func (pingModule) Name() string { return "ping" }
 func (pingModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
 	v1.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })
+}
+
+type flagModule struct {
+	enabled func(app.Deps) bool
+}
+
+func (m flagModule) Name() string { return "flag" }
+func (m flagModule) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
+	v1.Get("/flag", func(c fiber.Ctx) error {
+		if m.enabled(deps) {
+			return c.SendString("true")
+		}
+		return c.SendString("false")
+	})
 }
 
 type staticTenantResolver struct{}
@@ -50,6 +66,30 @@ func TestModuleRegistryMountsRoutes(t *testing.T) {
 	resp, err := application.Fiber().Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+func TestAppProvidesNilSafeFeatureEvaluator(t *testing.T) {
+	cfg := &config.Config{
+		App:          config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:         config.CORSConfig{AllowOrigins: "*"},
+		RateLimit:    config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:       config.TenantConfig{DefaultSlug: "default"},
+		FeatureFlags: config.FeatureFlagsConfig{Flags: "file_uploads=false"},
+	}
+	application := app.New(cfg, app.Deps{})
+	application.Register(flagModule{enabled: func(deps app.Deps) bool {
+		if deps.Flags == nil {
+			t.Fatal("app.New must install a default feature evaluator")
+		}
+		return deps.Flags.Enabled(context.Background(), features.KeyFileUploads, features.Subject{})
+	}})
+
+	req, _ := http.NewRequest("GET", "/api/v1/flag", http.NoBody)
+	resp, err := application.Fiber().Test(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "false", string(body), "FEATURE_FLAGS must apply when Deps.Flags is nil")
 }
 
 func TestTenantMiddlewareRejectsUnknownHeader(t *testing.T) {
