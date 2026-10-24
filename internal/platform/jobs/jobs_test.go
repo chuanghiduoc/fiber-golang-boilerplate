@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -79,6 +80,17 @@ func TestJobNormalize(t *testing.T) {
 
 		_, err := Job{Kind: "email.send", MaxAttempts: -1}.normalize(now)
 		require.ErrorIs(t, err, ErrInvalidMaxAttempts)
+	})
+
+	t.Run("normalizes idempotency key", func(t *testing.T) {
+		t.Parallel()
+
+		job, err := Job{Kind: "email.send", IdempotencyKey: "  event:1  "}.normalize(now)
+		require.NoError(t, err)
+		assert.Equal(t, "event:1", job.IdempotencyKey)
+
+		_, err = Job{Kind: "email.send", IdempotencyKey: strings.Repeat("x", 513)}.normalize(now)
+		require.ErrorIs(t, err, ErrInvalidIdempotencyKey)
 	})
 }
 
@@ -1298,6 +1310,15 @@ func TestQueueValidationBeforeDatabase(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoPool)
 
 	_, err = queue.EnqueueTx(context.Background(), nil, Job{Kind: "ok"})
+	require.ErrorIs(t, err, ErrNoTx)
+
+	_, _, err = queue.EnqueueOnce(context.Background(), Job{Kind: "ok"})
+	require.ErrorIs(t, err, ErrEmptyIdempotencyKey)
+
+	_, _, err = queue.EnqueueOnce(context.Background(), Job{Kind: "ok", IdempotencyKey: " k "})
+	require.ErrorIs(t, err, ErrNoPool)
+
+	_, _, err = queue.EnqueueOnceTx(context.Background(), nil, Job{Kind: "ok", IdempotencyKey: "k"})
 	require.ErrorIs(t, err, ErrNoTx)
 }
 

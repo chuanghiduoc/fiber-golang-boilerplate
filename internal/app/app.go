@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"crypto/subtle"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/contrib/v3/swagger"
@@ -16,9 +17,12 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
@@ -41,6 +45,27 @@ type Module interface {
 type V2Module interface {
 	Module
 	RegisterV2Routes(v2 fiber.Router, deps Deps)
+}
+
+// EventProvider is an optional module capability. RegisterEvents runs after
+// the module's routes are mounted and before the bus registers durable job
+// handlers, so modules may subscribe immediately or durably. A module without
+// events simply does not implement it.
+type EventProvider interface {
+	RegisterEvents(bus *events.Bus)
+}
+
+// JobProvider is an optional module capability for durable job handlers. The
+// scheduler and event bus use the same worker, so registration is additive.
+type JobProvider interface {
+	RegisterJobs(registrar jobs.Registrar)
+}
+
+// ScheduleProvider is an optional module capability for registering periodic
+// schedules. It is only invoked when the scheduler is enabled in the
+// composition root; a nil registry is skipped.
+type ScheduleProvider interface {
+	RegisterSchedules(registry *scheduler.Registry)
 }
 
 // Limiters carries the tiered rate limiters so modules do not rebuild them.
@@ -77,6 +102,15 @@ type Deps struct {
 	// FEATURE_FLAGS/FEATURE_FLAGS_FORCE_OFF and compiled defaults, so modules
 	// never need a nil check.
 	Flags features.Evaluator
+	// Events is the optional in-process/durable event bus. Nil disables
+	// EventProvider registration.
+	Events *events.Bus
+	// Jobs receives module job handlers when a module implements JobProvider.
+	// *jobs.Worker implements it; nil disables JobProvider registration.
+	Jobs jobs.Registrar
+	// Schedules receives module periodic schedules when the scheduler is
+	// enabled. Nil disables ScheduleProvider registration.
+	Schedules *scheduler.Registry
 }
 
 type App struct {
@@ -239,6 +273,27 @@ func (a *App) Register(modules ...Module) {
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		m.RegisterRoutes(v1, a.deps)
+
+		// Optional capabilities are type assertions: a module that only serves
+		// routes does not need any event/job/schedule plumbing. Nil deps make
+		// each hook a no-op for tests and minimal deployments.
+		if provider, ok := m.(ScheduleProvider); ok && a.deps.Schedules != nil {
+			provider.RegisterSchedules(a.deps.Schedules)
+		}
+		if provider, ok := m.(EventProvider); ok && a.deps.Events != nil {
+			provider.RegisterEvents(a.deps.Events)
+		}
+		if provider, ok := m.(JobProvider); ok && a.deps.Jobs != nil {
+			provider.RegisterJobs(a.deps.Jobs)
+		}
+	}
+
+	// Durable event subscriptions become worker handlers only after every
+	// module has had a chance to subscribe. RegisterJobs is idempotent.
+	if a.deps.Events != nil && a.deps.Jobs != nil {
+		if err := a.deps.Events.RegisterJobs(a.deps.Jobs); err != nil {
+			slog.Warn("failed to register durable event job handlers", slog.Any("error", err))
+		}
 	}
 
 	if !hasV2 {

@@ -42,7 +42,7 @@ cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
 internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, features, i18n, jobs, session, tenant, tracing, versioning, and shared mechanics
+internal/platform/          authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -87,6 +87,11 @@ routes/contracts change.
   New tenant-owned tables must do the same and lead their query indexes with
   `tenant_id`. `feature_flags` is process-wide configuration and is the
   deliberate exception.
+- `jobs.idempotency_key` is nullable with a partial unique
+  `(tenant_id, idempotency_key)` index; `EnqueueOnce`/`EnqueueOnceTx` use it.
+- `scheduler_leases` (one named leader row) and `scheduler_runs` (unique
+  `(schedule, scheduled_for)` ledger) are platform coordination tables. They
+  have no tenant column and no cross-module/jobs foreign keys; do not add them.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
   tenant; the `users` last-admin trigger is scoped per tenant.
 - Identity and files are tenant-isolated: identity queries scope users/admin
@@ -224,6 +229,27 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
+- **Events:** `internal/platform/events` is a typed in-process bus. `Event`
+  carries id/name/tenant/request/actor/timestamp/data; missing tenant, request,
+  and actor metadata is resolved from the context. `Subscribe` is synchronous
+  local delivery; `SubscribeDurable` enqueues one job per event and handler
+  with key `event:<id>:<handler>:<tenantId>`; `PublishTx` keeps the job and the
+  business transaction atomic. Panics are recovered per handler and errors are
+  combined with `errors.Join`. Durable handlers are at-least-once, so they must
+  be idempotent. `RegisterJobs` wires subscriptions into the worker.
+- **Scheduler:** `internal/platform/scheduler` is optional
+  (`SCHEDULER_ENABLED`, default false) and global, not tenant-scoped. One
+  process holds `scheduler_leases`; a unique `scheduler_runs` row plus the job
+  enqueue share a transaction. Interval schedules align to epoch boundaries;
+  cron is 5-field UTC with lists/ranges/steps and `@hourly`/`@daily`/etc.
+  `SCHEDULER_CATCHUP` is `none|latest|all` (bounded by
+  `SCHEDULER_CATCHUP_LIMIT`); a lost heartbeat cancels the current pass. Job
+  payloads include `schedule`/`scheduledFor`/`data` and keys are
+  `scheduler:<name>:<slot>`.
+- **Optional module hooks:** implement `app.EventProvider`,
+  `app.JobProvider`, or `app.ScheduleProvider` to register events, jobs, or
+  schedules. `app.Register` invokes them only when the corresponding dependency
+  is non-nil, then registers durable event job handlers.
 - **Audit:** privileged mutations are fail-closed. Tier 1 services call
   `audit.TxRecorder.RecordTx` in the mutation transaction (failure rolls back
   and returns `503 system.audit_unavailable`); Tier 2 routes use
@@ -277,7 +303,8 @@ Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
    sqlc block to `sqlc.yaml`, and run `make sqlc-generate`.
 5. Add a migration only for a deployed DB; otherwise update the single init
    schema.
-6. Register the module in `cmd/api/main.go`.
+6. Register the module in `cmd/api/main.go`; use the optional
+   `EventProvider`/`JobProvider`/`ScheduleProvider` hooks for durable work.
 7. Add unit + integration tests; `test/arch` must stay green.
 8. Run `make swagger` and `make check`.
 

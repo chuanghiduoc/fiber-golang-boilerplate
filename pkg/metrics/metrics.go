@@ -161,4 +161,58 @@ var (
 			Help: "Total number of local feature flag snapshot invalidations.",
 		},
 	)
+
+	EventsPublishedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "events_published_total",
+			Help: "Total number of events published, partitioned by event name and transport.",
+		},
+		[]string{"event", "mode"},
+	)
+
+	EventsHandledTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "events_handled_total",
+			Help: "Total number of event handler invocations, partitioned by event and outcome.",
+		},
+		[]string{"event", "outcome"},
+	)
+
+	EventsEnqueueErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "events_enqueue_errors_total",
+			Help: "Total number of durable event jobs that could not be enqueued.",
+		},
+		[]string{"event"},
+	)
+
+	SchedulerRunsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "scheduler_runs_total",
+			Help: "Total number of scheduler slots processed, partitioned by schedule and outcome.",
+		},
+		[]string{"schedule", "outcome"},
+	)
+
+	SchedulerEnqueueErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "scheduler_enqueue_errors_total",
+			Help: "Total number of scheduled jobs that could not be enqueued.",
+		},
+		[]string{"schedule"},
+	)
+
+	SchedulerLeader = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "scheduler_leader",
+			Help: "1 when this process holds the scheduler leader lease, otherwise 0.",
+		},
+	)
+
+	SchedulerRunsPurgedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "scheduler_runs_purged_total",
+			Help: "Total number of scheduler run-ledger rows deleted by retention.",
+		},
+	)
 )

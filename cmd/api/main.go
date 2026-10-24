@@ -40,9 +40,11 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -194,6 +196,22 @@ func main() {
 	txManager := database.NewTxManager(pool)
 	auditRecorder := audit.NewPostgresRecorder(pool)
 
+	// Durable infrastructure. The queue is shared by email, events, and the
+	// optional scheduler; one worker processes every registered kind.
+	jobQueue := jobs.NewQueue(pool)
+	hostname, _ := os.Hostname()
+	workerOpts := []jobs.Option{jobs.WithConcurrency(4)}
+	if traceProvider.Enabled() {
+		workerOpts = append(workerOpts, jobs.WithTracerProvider(traceProvider.TracerProvider()))
+	}
+	worker := jobs.NewWorker(pool, hostname, workerOpts...)
+	eventBus := events.New(jobQueue)
+
+	var scheduleRegistry *scheduler.Registry
+	if cfg.Scheduler.Enabled {
+		scheduleRegistry = scheduler.NewRegistry()
+	}
+
 	// Dependency injection
 	userRepo := identityrepository.NewUserRepository(pool)
 	tenantRepo := identityrepository.NewTenantRepository(pool)
@@ -233,7 +251,6 @@ func main() {
 	refreshSvc := identityservice.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
 	// Durable email delivery: services enqueue; the worker sends and retries.
-	jobQueue := jobs.NewQueue(pool)
 	queuedEmail := jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(payloadCodec))
 
 	// Password reset
@@ -293,7 +310,13 @@ func main() {
 		Tracing:        traceProvider,
 		I18n:           i18nBundle,
 		Flags:          flagEvaluator,
+		Events:         eventBus,
+		Jobs:           worker,
+		Schedules:      scheduleRegistry,
 	})
+	// Module providers register routes, event subscriptions, job handlers, and
+	// schedules. The bus turns durable subscriptions into worker handlers once
+	// every module has registered.
 	application.Register(
 		identity.New(authHandler, userHandler),
 		files.New(uploadHandler),
@@ -303,18 +326,46 @@ func main() {
 
 	// Durable email worker. It shares the pool but runs outside the request
 	// path, so SMTP outages retry instead of failing a registration request.
-	hostname, _ := os.Hostname()
-	workerCtx, workerCancel := context.WithCancel(context.Background())
-	workerOpts := []jobs.Option{jobs.WithConcurrency(4)}
-	if traceProvider.Enabled() {
-		workerOpts = append(workerOpts, jobs.WithTracerProvider(traceProvider.TracerProvider()))
-	}
-	worker := jobs.NewWorker(pool, hostname, workerOpts...)
 	emailHandler := jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec))
 	// New workers consume both legacy plaintext jobs and encrypted jobs so a
 	// rolling deployment can drain the old queue without losing messages.
 	worker.Register(jobs.EmailJobKind, emailHandler)
 	worker.Register(jobs.EncryptedEmailJobKind, emailHandler)
+
+	// Optional scheduler. It is global (not tenant-scoped); schedules choose a
+	// tenant in their job spec, and the worker restores it from jobs.tenant_id.
+	var (
+		schedulerCancel context.CancelFunc
+		schedulerDone   <-chan struct{}
+	)
+	if cfg.Scheduler.Enabled {
+		catchup, err := scheduler.ParseCatchup(cfg.Scheduler.Catchup)
+		if err != nil {
+			pool.Close()
+			fail("invalid scheduler catch-up policy", err)
+		}
+		sched := scheduler.New(pool, scheduleRegistry, jobQueue, hostname,
+			scheduler.WithLeaseTTL(cfg.Scheduler.LeaseTTL()),
+			scheduler.WithHeartbeatInterval(cfg.Scheduler.HeartbeatInterval()),
+			scheduler.WithPollInterval(cfg.Scheduler.PollInterval()),
+			scheduler.WithCatchup(catchup),
+			scheduler.WithCatchupLimit(cfg.Scheduler.CatchupLimit),
+			scheduler.WithRetention(cfg.Scheduler.Retention()),
+		)
+		schedulerCtx, cancel := context.WithCancel(context.Background())
+		schedulerCancel = cancel
+		done := make(chan struct{})
+		schedulerDone = done
+		go func() {
+			defer close(done)
+			if err := sched.Run(schedulerCtx); err != nil {
+				slog.Error("scheduler stopped", slog.Any("error", err))
+			}
+		}()
+		slog.Info("scheduler enabled", slog.Int("schedules", scheduleRegistry.Len()))
+	}
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})
 	go func() {
 		if err := worker.Run(workerCtx); err != nil {
@@ -347,7 +398,16 @@ func main() {
 	}
 	signal.Stop(sigChan)
 
-	// Stop claiming new jobs, let running handlers drain, then stop HTTP.
+	// Stop producing scheduled work first, then stop claiming new jobs and let
+	// running handlers drain, then stop HTTP.
+	if schedulerCancel != nil {
+		schedulerCancel()
+		select {
+		case <-schedulerDone:
+		case <-time.After(10 * time.Second):
+			slog.Warn("scheduler did not stop within 10s")
+		}
+	}
 	workerCancel()
 	select {
 	case <-workerDone:

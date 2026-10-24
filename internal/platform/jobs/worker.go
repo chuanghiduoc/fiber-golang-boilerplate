@@ -39,6 +39,15 @@ const (
 // marks the job dead once attempts are exhausted).
 type Handler func(context.Context, json.RawMessage) error
 
+// Registrar accepts job handlers. *Worker implements it, and the narrow
+// interface keeps modules and the event bus independent of the worker's
+// configuration surface.
+type Registrar interface {
+	Register(kind string, handler Handler)
+}
+
+var _ Registrar = (*Worker)(nil)
+
 // store is the persistence surface used by Worker. It is an interface so the
 // worker's retry, panic, and success paths can be unit tested without a
 // PostgreSQL server.

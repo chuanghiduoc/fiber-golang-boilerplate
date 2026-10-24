@@ -189,6 +189,72 @@ func TestValidate_ValidLocalConfig(t *testing.T) {
 	}
 }
 
+func TestSchedulerConfig_Defaults(t *testing.T) {
+	var cfg SchedulerConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("parse scheduler defaults: %v", err)
+	}
+	if cfg.Enabled {
+		t.Error("scheduler must default to disabled")
+	}
+	if cfg.LeaseTTL() != 30*time.Second {
+		t.Errorf("LeaseTTL() = %v, want 30s", cfg.LeaseTTL())
+	}
+	if cfg.HeartbeatInterval() != 10*time.Second {
+		t.Errorf("HeartbeatInterval() = %v, want 10s", cfg.HeartbeatInterval())
+	}
+	if cfg.PollInterval() != 15*time.Second {
+		t.Errorf("PollInterval() = %v, want 15s", cfg.PollInterval())
+	}
+	if cfg.Catchup != "latest" {
+		t.Errorf("Catchup = %q, want latest", cfg.Catchup)
+	}
+	if cfg.Retention() != 30*24*time.Hour {
+		t.Errorf("Retention() = %v, want 720h", cfg.Retention())
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("default scheduler config must validate: %v", err)
+	}
+}
+
+func TestSchedulerConfig_Validate(t *testing.T) {
+	valid := SchedulerConfig{
+		Enabled: true, LeaseTTLSecs: 30, HeartbeatSecs: 10, PollSecs: 15,
+		Catchup: "all", CatchupLimit: 10, RetentionDays: 7,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid scheduler config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		cfg  SchedulerConfig
+	}{
+		{"zero config", SchedulerConfig{}},
+		{"lease ttl", SchedulerConfig{LeaseTTLSecs: 0, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"heartbeat", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 10, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"poll", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 0, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"catchup", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "sometimes", CatchupLimit: 1, RetentionDays: 1}},
+		{"catchup limit", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 0, RetentionDays: 1}},
+		{"retention", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Zero config is valid by design (unset optional block), all other
+			// cases must fail their respective rule.
+			if tt.name == "zero config" {
+				if err := tt.cfg.Validate(); err != nil {
+					t.Fatalf("zero scheduler config must validate: %v", err)
+				}
+				return
+			}
+			if err := tt.cfg.Validate(); err == nil {
+				t.Error("Validate() should fail")
+			}
+		})
+	}
+}
+
 func TestValidate_InvalidPort(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.App.Port = 0

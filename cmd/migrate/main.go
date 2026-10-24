@@ -31,6 +31,8 @@ var requiredTables = []string{
 	"feature_flags",
 	"feature_flag_targets",
 	"jobs",
+	"scheduler_leases",
+	"scheduler_runs",
 	"audit_events",
 }
 
@@ -45,7 +47,9 @@ var requiredColumns = map[string][]string{
 	"files":                     {"tenant_id"},
 	"feature_flags":             {"flag_key", "enabled", "kill_switch", "description"},
 	"feature_flag_targets":      {"flag_key", "tenant_id", "user_id", "enabled"},
-	"jobs":                      {"tenant_id", "trace_parent"},
+	"jobs":                      {"tenant_id", "trace_parent", "idempotency_key"},
+	"scheduler_leases":          {"name", "holder", "expires_at", "heartbeat_at"},
+	"scheduler_runs":            {"schedule", "scheduled_for", "status", "job_id"},
 	"audit_events": {
 		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
 		"status_code", "error_code", "idempotency_key_hash", "completed_at",
@@ -64,6 +68,8 @@ var requiredUniqueIndexes = []string{
 	"idx_email_verification_tokens_user_id",
 	"idx_feature_flag_targets_tenant_target",
 	"idx_feature_flag_targets_user_target",
+	"idx_jobs_tenant_idempotency_key",
+	"idx_scheduler_runs_schedule_slot",
 }
 
 // requiredTenantLeadingIndexes are the query indexes that must start with

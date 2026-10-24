@@ -494,6 +494,108 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	assert.JSONEq(t, `{"ok":true}`, string(payload))
 }
 
+// TestQueueIntegrationEnqueueOnceDeduplicates covers the producer-retry path:
+// the same tenant/key returns the original row, a different tenant gets its
+// own row, and a rolled-back transactional enqueue leaves nothing behind.
+func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const tenantTwo int64 = 2
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-once-tenant-2', 'Jobs Once Tenant 2')`,
+		tenantTwo,
+	)
+	require.NoError(t, err)
+
+	queue := NewQueue(pool)
+	key := "event:evt-1:handler:1"
+	firstID, created, err := queue.EnqueueOnce(ctx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"first":true}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+
+	secondID, created, err := queue.EnqueueOnce(ctx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"second":true}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, firstID, secondID)
+
+	var (
+		count    int
+		payload  []byte
+		storedID int64
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*), min(id) FROM jobs WHERE tenant_id = 1 AND idempotency_key = $1`, key,
+	).Scan(&count, &storedID))
+	assert.Equal(t, 1, count)
+	assert.Equal(t, firstID, storedID)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT payload FROM jobs WHERE id = $1`, firstID).Scan(&payload))
+	assert.JSONEq(t, `{"first":true}`, string(payload), "deduplication must keep the original payload")
+
+	// The same key in another tenant is independent.
+	otherID, created, err := queue.EnqueueOnce(tenant.WithID(ctx, tenantTwo), Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"tenant":2}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotEqual(t, firstID, otherID)
+
+	// A transactional enqueue that rolls back leaves neither job nor dedupe
+	// state behind.
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, _, err = queue.EnqueueOnceTx(ctx, tx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:rolled-back",
+	})
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback(ctx))
+
+	var exists bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_key = 'event:rolled-back')`,
+	).Scan(&exists))
+	assert.False(t, exists)
+
+	// The transactional commit path deduplicates exactly like the pool path.
+	tx, err = pool.Begin(ctx)
+	require.NoError(t, err)
+	txID, created, err := queue.EnqueueOnceTx(ctx, tx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:tx",
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	require.NoError(t, tx.Commit(ctx))
+
+	tx2, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	againID, created, err := queue.EnqueueOnceTx(ctx, tx2, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:tx",
+	})
+	require.NoError(t, err)
+	require.NoError(t, tx2.Commit(ctx))
+	assert.False(t, created)
+	assert.Equal(t, txID, againID)
+}
+
 // TestQueueIntegrationPropagatesTenant covers tenant resolution at enqueue,
 // claim, and handler time: an explicit context tenant is stored on the row and
 // restored by the worker, while an empty context falls back to the default
