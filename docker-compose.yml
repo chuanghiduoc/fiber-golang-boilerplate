@@ -137,7 +137,7 @@ services:
       - app-network
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     restart: unless-stopped
     deploy:
       resources:
@@ -163,7 +163,7 @@ services:
   # the collector: an outage only drops spans.
   otel-collector:
     profiles: ["otel"]
-    image: otel/opentelemetry-collector:0.145.0
+    image: otel/opentelemetry-collector:0.162.0
     restart: unless-stopped
     command: ["--config=/etc/otelcol/config.yaml"]
     volumes:
