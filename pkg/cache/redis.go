@@ -73,6 +73,24 @@ func (r *RedisCache) Increment(ctx context.Context, key string, ttl time.Duratio
 	return incrExpireScript.Run(ctx, r.client, []string{key}, ttl.Milliseconds()).Int64()
 }
 
+// compareAndDeleteScript deletes the key only when its value still matches the
+// owner token. Keeping the comparison in Redis makes release atomic, so an
+// expired-and-reacquired lock cannot be deleted by its previous owner.
+var compareAndDeleteScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+	return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
+func (r *RedisCache) CompareAndDelete(ctx context.Context, key string, value []byte) (bool, error) {
+	deleted, err := compareAndDeleteScript.Run(ctx, r.client, []string{key}, value).Int64()
+	if err != nil {
+		return false, err
+	}
+	return deleted == 1, nil
+}
+
 func (r *RedisCache) Close() error {
 	return r.client.Close()
 }

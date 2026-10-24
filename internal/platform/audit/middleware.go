@@ -31,6 +31,11 @@ func Middleware(recorder Recorder) fiber.Handler {
 		if status < 200 || status >= 300 || c.Route().Path == "" {
 			return nil
 		}
+		// Idempotency replay is a read of an earlier mutation's result, not a
+		// new mutation; recording it would duplicate the audit trail.
+		if fiber.Locals[bool](c, "idempotency_replayed") {
+			return nil
+		}
 
 		actorID := fiber.Locals[int64](c, "user_id")
 		event := Event{

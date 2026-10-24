@@ -60,7 +60,8 @@ func (a AppConfig) TrustedProxiesList() []string {
 type CORSConfig struct {
 	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
 	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
-	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization"`
+	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization,Idempotency-Key"`
+	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed"`
 	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }
 
@@ -160,9 +161,14 @@ func (c CORSConfig) Methods() []string {
 	return splitCSV(c.AllowMethods)
 }
 
-// Headers returns the list of allowed CORS headers.
+// Headers returns the list of allowed CORS request headers.
 func (c CORSConfig) Headers() []string {
 	return splitCSV(c.AllowHeaders)
+}
+
+// ExposedHeaders returns the response headers browser clients may read.
+func (c CORSConfig) ExposedHeaders() []string {
+	return splitCSV(c.ExposeHeaders)
 }
 
 // Validate checks the database connection and pool settings.

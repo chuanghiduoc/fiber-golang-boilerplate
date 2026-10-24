@@ -66,6 +66,22 @@ func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {
 	assert.Empty(t, recorder.events)
 }
 
+func TestMiddleware_SkipsIdempotentReplay(t *testing.T) {
+	recorder := &recordingRecorder{}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Post("/mutate", func(c fiber.Ctx) error {
+		fiber.Locals[bool](c, "idempotency_replayed", true)
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	req, _ := http.NewRequest("POST", "/mutate", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	assert.Empty(t, recorder.events, "a replayed idempotent request must not be audited again")
+}
+
 func counterValue(t *testing.T, counter prometheus.Counter) float64 {
 	t.Helper()
 	var m dto.Metric

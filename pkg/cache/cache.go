@@ -8,6 +8,13 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
+// CompareDeleter is an optional capability for compare-and-delete operations.
+// It is separate from Cache so existing implementations and test doubles do not
+// need to provide it. Callers must type-assert before use.
+type CompareDeleter interface {
+	CompareAndDelete(ctx context.Context, key string, value []byte) (bool, error)
+}
+
 type Cache interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error

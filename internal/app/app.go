@@ -102,6 +102,7 @@ func (a *App) setupGlobalMiddleware() {
 		AllowOrigins:     a.cfg.CORS.Origins(),
 		AllowMethods:     a.cfg.CORS.Methods(),
 		AllowHeaders:     a.cfg.CORS.Headers(),
+		ExposeHeaders:    a.cfg.CORS.ExposedHeaders(),
 		AllowCredentials: a.cfg.CORS.AllowCredentials,
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))

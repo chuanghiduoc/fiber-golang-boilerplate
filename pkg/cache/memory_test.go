@@ -149,6 +149,22 @@ func TestIncrement(t *testing.T) {
 	}
 }
 
+func TestIncrementRejectsNonIntegerValue(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "token", []byte("owner-token"), time.Minute); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+	if _, err := mc.Increment(ctx, "token", time.Minute); err == nil {
+		t.Fatal("Increment should reject a non-integer value")
+	}
+	if value, _ := mc.Get(ctx, "token"); string(value) != "owner-token" {
+		t.Fatalf("token = %q, want it untouched", value)
+	}
+}
+
 func TestIncrementExpiryNotExtended(t *testing.T) {
 	mc := NewMemoryCache()
 	defer mc.Close()
@@ -165,6 +181,70 @@ func TestIncrementExpiryNotExtended(t *testing.T) {
 	if got, _ := mc.Get(ctx, "c"); got != nil {
 		t.Errorf("counter should have expired on its original window, got %q", got)
 	}
+}
+
+func TestCompareAndDelete(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "lock", []byte("owner-1"), time.Minute); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	deleted, err := mc.CompareAndDelete(ctx, "lock", []byte("owner-2"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete(stale owner) failed: %v", err)
+	}
+	if deleted {
+		t.Fatal("CompareAndDelete deleted a lock owned by a different token")
+	}
+	if value, _ := mc.Get(ctx, "lock"); string(value) != "owner-1" {
+		t.Fatalf("lock value = %q, want owner-1", value)
+	}
+
+	deleted, err = mc.CompareAndDelete(ctx, "lock", []byte("owner-1"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete(owner) failed: %v", err)
+	}
+	if !deleted {
+		t.Fatal("CompareAndDelete did not delete the matching owner")
+	}
+	if value, _ := mc.Get(ctx, "lock"); value != nil {
+		t.Fatalf("lock survived deletion: %q", value)
+	}
+
+	deleted, err = mc.CompareAndDelete(ctx, "missing", []byte("owner-1"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete(missing) failed: %v", err)
+	}
+	if deleted {
+		t.Fatal("CompareAndDelete reported deleting a missing key")
+	}
+}
+
+func TestCompareAndDeleteExpired(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "lock", []byte("owner-1"), time.Millisecond); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	deleted, err := mc.CompareAndDelete(ctx, "lock", []byte("owner-1"))
+	if err != nil {
+		t.Fatalf("CompareAndDelete failed: %v", err)
+	}
+	if deleted {
+		t.Fatal("CompareAndDelete deleted an expired key")
+	}
+}
+
+func TestCompareDeleterImplementations(t *testing.T) {
+	var _ CompareDeleter = (*MemoryCache)(nil)
+	var _ CompareDeleter = (*RedisCache)(nil)
 }
 
 func TestPing(t *testing.T) {
