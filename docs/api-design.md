@@ -115,12 +115,13 @@ Rules:
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
   Login, registration, refresh, password reset, and email verification use the
   resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
-  every call. Cross-tenant user ids return 404 and cross-tenant tokens fail as
-  invalid.
+  every call. Cross-tenant user/file ids return 404 and cross-tenant tokens fail
+  as invalid.
 - Google OAuth binds the tenant into `state`; the callback uses that tenant
   rather than the header and rejects a tenant suspended mid-flow.
-- `UserResponse` includes an additive `tenantId` field. Tokens without a
-  `tenant_id` claim are rejected (fail-closed).
+- `UserResponse`/`FileResponse` include additive `tenantId` fields. Tokens
+  without a `tenant_id` claim are rejected (fail-closed).
+- **Remaining:** row-level security and per-tenant limits/quotas.
 
 ## Headers
 
@@ -150,8 +151,10 @@ Rules:
 
 ## Files
 
-- `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist.
-- Downloads are authenticated and ownership-checked; no public `/uploads` tree.
+- `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist,
+  and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+- Downloads are authenticated and tenant/ownership-checked; there is no public
+  `/uploads` tree. A cross-tenant id returns `404`, never `403`.
 - Deletes are soft; `includeDeleted=true` exposes trash to the owner.
 - `Content-Disposition` follows RFC 6266/5987.
 

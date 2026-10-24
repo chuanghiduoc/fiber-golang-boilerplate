@@ -107,11 +107,11 @@ When releasing, move `[Unreleased]` entries under a version header:
   requests without `X-Tenant-Slug`; emails and Google IDs are unique per tenant.
 - The `users` last-admin trigger is per tenant. Application checks must use the
   same tenant scope as the trigger.
-- Tenant resolution, the JWT `tenant_id` claim, and the schema are in place.
-  Identity SQL and repositories are tenant-scoped, public auth flows resolve the
-  tenant, and Google state carries it; keep that invariant in new queries.
-  Files query isolation and RLS are still future work, so do not describe the
-  whole application as fully isolated.
+- Identity and files are tenant-scoped: their queries filter `tenant_id`,
+  repositories derive it from `tenant.EffectiveID(ctx)`, public auth flows
+  resolve the tenant, and Google state carries it. Uploads use
+  `<tenantID>/<userID>/<uuid>.<ext>`. RLS and per-tenant limits remain future
+  work, so do not describe the whole application as fully isolated.
 
 ### Upgrading an existing database
 
@@ -131,9 +131,12 @@ The multi-tenant foundation also changes `000001` (tenants table, `tenant_id`
 columns, per-tenant indexes and last-admin trigger). Existing databases need a
 new numbered migration or reviewed manual DDL; see the README's "Upgrading an
 existing database" section. Do not assume the baseline created the tenant
-objects on an already-deployed database. Identity isolation itself needs no new
-schema, but legacy access tokens without `tenant_id` are rejected after the
-upgrade (users must log in again); old token rows remain on tenant 1.
+objects on an already-deployed database. Identity/files isolation needs no
+further schema, but legacy access tokens without `tenant_id` are rejected after
+the upgrade (users must log in again); old token rows remain on tenant 1.
+Existing files keep their old `<user>/<uuid>` storage keys; only new uploads use
+the `<tenantID>/<userID>/<uuid>` layout. If you copy blobs, update
+`files.storage_path` atomically.
 
 ## Adding a New Module
 

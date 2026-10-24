@@ -57,12 +57,13 @@ they never depend on the `tenants` table.
   job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
-- Identity is tenant-isolated: every user/admin/stat and refresh/reset/
-  verification-token query is scoped by `tenant_id`, repositories derive it from
-  `tenant.EffectiveID(ctx)`, and cross-tenant ids or tokens behave as not found.
+- Identity and files are tenant-isolated: every user/admin/stat and
+  refresh/reset/verification query filters `tenant_id`; every file metadata
+  read/write, list, admin list/stats, download, delete, and restore filters the
+  request tenant. Repositories derive it from `tenant.EffectiveID(ctx)`; services
+  verify returned tenant/owner. Cross-tenant ids or tokens behave as not found.
   Public login/register/forgot/reset/resend/verify/refresh use the request
-  tenant; non-default tenants must send `X-Tenant-Slug` consistently. Files SQL
-  is not yet scoped, and RLS is future work.
+  tenant; non-default tenants must send `X-Tenant-Slug` consistently.
 - Google OAuth binds the tenant into `state` and the state cookie. The callback
   resolves that state tenant (and rejects suspended/unknown tenants) instead of
   trusting `X-Tenant-Slug`.
@@ -70,6 +71,8 @@ they never depend on the `tenants` table.
   validator compares the claim with the stored user tenant and tenant status,
   so a suspended tenant cannot keep using an issued token beyond the 5-second
   session-cache TTL.
+- New blobs use `<tenantID>/<userID>/<uuid>.<ext>`; existing rows keep their
+  old `<userID>/<uuid>` path. RLS and per-tenant limits remain future work.
 
 
 ## Dependency rules
@@ -111,6 +114,10 @@ they never depend on the `tenants` table.
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
   `default` tenant as row 1, so existing rows and header-less requests remain on
   the compatibility tenant.
+- File blobs are external to PostgreSQL but follow the row's tenant: new keys
+  are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
+  authoritative key for downloads. Moving a blob without updating that column
+  (or vice versa) breaks the file.
 - `cmd/migrate` verifies required tenant tables/columns/indexes and that the
   default tenant exists with id 1.
 

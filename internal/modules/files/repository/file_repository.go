@@ -9,11 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// FileRepository is the files module's data access contract.
+// FileRepository is the files module's data access contract. Every method
+// scopes its query to the request tenant resolved from ctx.
 type FileRepository interface {
 	Create(ctx context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error)
 	GetByID(ctx context.Context, id int64) (*filesqlc.File, error)
@@ -39,7 +41,17 @@ func NewFileRepository(db filesqlc.DBTX) FileRepository {
 	}
 }
 
+// tenantID returns the request tenant every repository query must scope to.
+// EffectiveID falls back to the default tenant only for pre-tenant call sites
+// and tests; production requests always carry an explicit context value.
+func tenantID(ctx context.Context) int64 {
+	return tenant.EffectiveID(ctx)
+}
+
 func (r *fileRepository) Create(ctx context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error) {
+	// The request tenant is authoritative; callers cannot create a file on
+	// behalf of another tenant even if they set the generated field.
+	params.TenantID = tenantID(ctx)
 	file, err := r.q.CreateFile(ctx, params)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -48,7 +60,10 @@ func (r *fileRepository) Create(ctx context.Context, params filesqlc.CreateFileP
 }
 
 func (r *fileRepository) GetByID(ctx context.Context, id int64) (*filesqlc.File, error) {
-	file, err := r.q.GetFileByID(ctx, id)
+	file, err := r.q.GetFileByID(ctx, filesqlc.GetFileByIDParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -56,7 +71,10 @@ func (r *fileRepository) GetByID(ctx context.Context, id int64) (*filesqlc.File,
 }
 
 func (r *fileRepository) GetByIDIncludingDeleted(ctx context.Context, id int64) (*filesqlc.File, error) {
-	file, err := r.q.GetFileByIDIncludingDeleted(ctx, id)
+	file, err := r.q.GetFileByIDIncludingDeleted(ctx, filesqlc.GetFileByIDIncludingDeletedParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -65,14 +83,16 @@ func (r *fileRepository) GetByIDIncludingDeleted(ctx context.Context, id int64) 
 
 func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]filesqlc.File, error) {
 	return r.q.ListFilesByUserID(ctx, filesqlc.ListFilesByUserIDParams{
-		UserID: userID,
-		Limit:  limit,
-		Offset: offset,
+		TenantID: tenantID(ctx),
+		UserID:   userID,
+		Limit:    limit,
+		Offset:   offset,
 	})
 }
 
 func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesqlc.File, error) {
 	return r.q.ListFilesByUserCursor(ctx, filesqlc.ListFilesByUserCursorParams{
+		TenantID:        tenantID(ctx),
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
 		HasCursor:       cur.HasCursor,
@@ -83,11 +103,17 @@ func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur
 }
 
 func (r *fileRepository) CountByUserID(ctx context.Context, userID int64) (int64, error) {
-	return r.q.CountFilesByUserID(ctx, userID)
+	return r.q.CountFilesByUserID(ctx, filesqlc.CountFilesByUserIDParams{
+		TenantID: tenantID(ctx),
+		UserID:   userID,
+	})
 }
 
 func (r *fileRepository) Delete(ctx context.Context, id int64) (*filesqlc.File, error) {
-	file, err := r.q.DeleteFile(ctx, id)
+	file, err := r.q.DeleteFile(ctx, filesqlc.DeleteFileParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -95,7 +121,10 @@ func (r *fileRepository) Delete(ctx context.Context, id int64) (*filesqlc.File, 
 }
 
 func (r *fileRepository) Restore(ctx context.Context, id int64) (*filesqlc.File, error) {
-	file, err := r.q.RestoreFile(ctx, id)
+	file, err := r.q.RestoreFile(ctx, filesqlc.RestoreFileParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -104,13 +133,15 @@ func (r *fileRepository) Restore(ctx context.Context, id int64) (*filesqlc.File,
 
 func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]filesqlc.File, error) {
 	return r.q.AdminListFiles(ctx, filesqlc.AdminListFilesParams{
-		Limit:  limit,
-		Offset: offset,
+		TenantID: tenantID(ctx),
+		Limit:    limit,
+		Offset:   offset,
 	})
 }
 
 func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
 	return r.q.AdminListFilesCursor(ctx, filesqlc.AdminListFilesCursorParams{
+		TenantID:        tenantID(ctx),
 		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
@@ -119,11 +150,11 @@ func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBC
 }
 
 func (r *fileRepository) AdminCount(ctx context.Context) (int64, error) {
-	return r.q.AdminCountFiles(ctx)
+	return r.q.AdminCountFiles(ctx, tenantID(ctx))
 }
 
 func (r *fileRepository) AdminFileStats(ctx context.Context) (filesqlc.AdminFileStatsRow, error) {
-	return r.q.AdminFileStats(ctx)
+	return r.q.AdminFileStats(ctx, tenantID(ctx))
 }
 
 // wrapErr translates pgx errors to app-level sentinel errors without pulling

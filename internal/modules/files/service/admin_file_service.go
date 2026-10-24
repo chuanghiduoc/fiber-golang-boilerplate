@@ -9,13 +9,14 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 // AdminFileService owns the files side of the back-office surface: listing all
-// metadata (including soft-deleted), admin downloads, takedowns, restores, and
-// the files half of the dashboard statistics.
+// metadata (including soft-deleted) for the request tenant, admin downloads,
+// takedowns, restores, and the files half of the dashboard statistics.
 type AdminFileService interface {
 	ListFiles(ctx context.Context, limit int, startingAfter string) ([]dto.FileResponse, bool, error)
 	Download(ctx context.Context, id int64) (*dto.FileResponse, io.ReadCloser, error)
@@ -66,6 +67,7 @@ func (s *adminFileService) ListFiles(ctx context.Context, limit int, startingAft
 func (s *adminFileService) toAdminFileResponse(file *filesqlc.File) *dto.FileResponse {
 	resp := &dto.FileResponse{
 		ID:           file.ID,
+		TenantID:     file.TenantID,
 		UserID:       file.UserID,
 		OriginalName: file.OriginalName,
 		MimeType:     file.MimeType,
@@ -88,6 +90,9 @@ func (s *adminFileService) Download(ctx context.Context, id int64) (*dto.FileRes
 			return nil, nil, apperror.NewNotFound("file not found")
 		}
 		return nil, nil, apperror.NewInternal("failed to get file")
+	}
+	if file.TenantID != tenant.EffectiveID(ctx) {
+		return nil, nil, apperror.NewNotFound("file not found")
 	}
 
 	reader, err := s.storage.Get(context.WithoutCancel(ctx), file.StoragePath)
@@ -114,6 +119,9 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.File
 			return nil, apperror.NewNotFound("file not found")
 		}
 		return nil, apperror.NewInternal("failed to get file")
+	}
+	if existing.TenantID != tenant.EffectiveID(ctx) {
+		return nil, apperror.NewNotFound("file not found")
 	}
 	if !existing.DeletedAt.Valid {
 		return nil, apperror.NewCode(apperror.CodeFileNotDeleted, "file is not deleted")

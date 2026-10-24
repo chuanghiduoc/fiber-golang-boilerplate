@@ -81,19 +81,19 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   `tenant_id`.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
   tenant; the `users` last-admin trigger is scoped per tenant.
-- The multi-tenant identity isolation is implemented: identity queries and
-  repositories scope users, admin lists/stats, and refresh/reset/verification
-  tokens by `tenant_id`; public auth flows resolve the request tenant; Google
-  OAuth binds the tenant into `state`; the session validator rejects tenant
-  mismatches and suspended tenants. Files SQL is not yet tenant-scoped.
+- Identity and files are tenant-isolated: identity queries scope users/admin
+  lists/stats/refresh/reset/verification tokens; files scope every metadata
+  read/write and admin operation. Public auth flows resolve the request tenant;
+  Google OAuth binds the tenant into `state`; the session validator rejects
+  tenant mismatches and suspended tenants.
 - Tokens without a `tenant_id` claim are rejected fail-closed; rotate them after
-  upgrading. Keep `tenant_id` predicates in every new identity query and index
-  tenant-owned tables with `tenant_id` first.
+  upgrading. Keep `tenant_id` predicates in every new query and index
+  tenant-owned tables with `tenant_id` first. RLS and per-tenant limits remain
+  future work; do not claim whole-application isolation.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Row-level security for every table, files query isolation, per-tenant limits,
-distributed tracing, and environment promotion/rollout automation remain future
-work.
+Row-level security, per-tenant limits/quotas, distributed tracing, and
+environment promotion/rollout automation remain future work.
 `identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
@@ -139,6 +139,12 @@ Offset helpers are for small admin/export tables only.
   scope every query with `tenant.EffectiveID(ctx)`. Refresh tokens are atomic
   single-use, tenant-scoped, and version-bound. `pkg/token` pins HS256 and
   requires `exp`.
+- **Files/tenant isolation:** repository methods always add
+  `tenant.EffectiveID(ctx)` to the SQL parameters; service methods also compare
+  the returned row's `TenantID`/`UserID` before exposing it. Uploads reject an
+  invalid tenant and store blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+  Cross-tenant ids must behave as not found (`404`), never forbidden, so file
+  existence is not disclosed.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their

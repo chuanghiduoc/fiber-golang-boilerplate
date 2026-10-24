@@ -2020,6 +2020,9 @@ const docTemplate = `{
                 "size": {
                     "type": "integer"
                 },
+                "tenantId": {
+                    "type": "integer"
+                },
                 "url": {
                     "type": "string"
                 },

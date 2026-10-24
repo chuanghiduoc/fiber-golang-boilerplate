@@ -107,7 +107,7 @@ func TestGetFileInfo(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -144,7 +144,7 @@ func TestGetFileInfo(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -173,7 +173,7 @@ func TestUploadDelete(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -208,7 +208,7 @@ func TestUploadDelete(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -237,7 +237,7 @@ func TestUploadDownload(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 		store.files["10/abc.pdf"] = []byte("pdf-content")
@@ -279,7 +279,7 @@ func TestUploadDownload(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -303,7 +303,7 @@ func TestUploadDownload(t *testing.T) {
 		svc := newTestUploadService(repo, store)
 
 		repo.files[1] = &filesqlc.File{
-			ID: 1, UserID: 10, OriginalName: "doc.pdf",
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
@@ -324,9 +324,9 @@ func TestUploadList(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{ID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
-		repo.files[2] = &filesqlc.File{ID: 2, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
-		repo.files[3] = &filesqlc.File{ID: 3, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
+		repo.files[1] = &filesqlc.File{ID: 1, TenantID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
+		repo.files[2] = &filesqlc.File{ID: 2, TenantID: 1, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
+		repo.files[3] = &filesqlc.File{ID: 3, TenantID: 1, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
 		files, hasMore, err := svc.List(context.Background(), 10, 10, "", false)

@@ -68,6 +68,7 @@ func (a *AdminFiles) GetFileStats(ctx context.Context) (contracts.FileStats, err
 func toFile(file dto.FileResponse) contracts.File {
 	return contracts.File{
 		ID:           file.ID,
+		TenantID:     file.TenantID,
 		UserID:       file.UserID,
 		OriginalName: file.OriginalName,
 		MimeType:     file.MimeType,
