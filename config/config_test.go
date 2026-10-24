@@ -137,6 +137,119 @@ func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestValidate_WebhookSettings(t *testing.T) {
+	t.Run("dedicated key", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = strings.Repeat("k", 32)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() rejected a valid webhook key: %v", err)
+		}
+		if got := cfg.Webhook.ResolvedSecretKey("jwt"); got != strings.Repeat("k", 32) {
+			t.Errorf("ResolvedSecretKey() = %q, want the dedicated key", got)
+		}
+	})
+
+	t.Run("fallback to JWT secret", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if got := cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret); got != cfg.JWT.Secret {
+			t.Errorf("ResolvedSecretKey() = %q, want JWT fallback", got)
+		}
+	})
+
+	t.Run("short key", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = "too-short"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject a short webhook key")
+		}
+	})
+
+	t.Run("production requires dedicated key", func(t *testing.T) {
+		cfg := productionValidConfig()
+		cfg.Webhook.SecretEncryptionKey = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should require a dedicated key in production")
+		}
+	})
+
+	t.Run("timeout bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.ConnectTimeoutSeconds = 20
+		cfg.Webhook.RequestTimeoutSeconds = 10
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject connect timeout above request timeout")
+		}
+	})
+
+	t.Run("retry bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.RetryMaxSeconds = 1
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject retry max below retry base")
+		}
+	})
+
+	t.Run("attempt cap", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.MaxAttempts = 51
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject more than 50 attempts")
+		}
+	})
+
+	t.Run("retention bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.RetentionDays = 0
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject zero retention")
+		}
+	})
+
+	t.Run("timestamp tolerance", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.TimestampToleranceSeconds = 5
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject a 5s timestamp tolerance")
+		}
+	})
+
+	t.Run("invalid SSRF allowlist", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SSRFAllowlist = "10.0.0.0/99"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject an invalid allowlist CIDR")
+		}
+	})
+}
+
+func TestLoad_WebhookDefaults(t *testing.T) {
+	t.Setenv("WEBHOOK_CONNECT_TIMEOUT_SECS", "")
+	t.Setenv("WEBHOOK_REQUEST_TIMEOUT_SECS", "")
+	t.Setenv("WEBHOOK_RETRY_BASE_SECS", "")
+	t.Setenv("WEBHOOK_RETRY_MAX_SECS", "")
+	t.Setenv("WEBHOOK_MAX_ATTEMPTS", "")
+	t.Setenv("WEBHOOK_RETENTION_DAYS", "")
+	t.Setenv("WEBHOOK_TIMESTAMP_TOLERANCE_SECS", "")
+	t.Setenv("WEBHOOK_SECRET_ENCRYPTION_KEY", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Webhook.ConnectTimeoutSeconds != 5 || cfg.Webhook.RequestTimeoutSeconds != 10 {
+		t.Errorf("unexpected timeout defaults: %+v", cfg.Webhook)
+	}
+	if cfg.Webhook.MaxAttempts != 8 || cfg.Webhook.RetentionDays != 30 {
+		t.Errorf("unexpected attempt/retention defaults: %+v", cfg.Webhook)
+	}
+	if cfg.Webhook.TimestampTolerance().Seconds() != 300 {
+		t.Errorf("timestamp tolerance = %s, want 5m", cfg.Webhook.TimestampTolerance())
+	}
+	if cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret) == "" {
+		t.Error("local webhook key must fall back to JWT_SECRET")
+	}
+}
+
 func TestAppConfig_TrustedProxiesList(t *testing.T) {
 	a := AppConfig{TrustedProxies: "10.0.0.1, 192.168.0.0/16 ,"}
 	got := a.TrustedProxiesList()
@@ -179,6 +292,11 @@ func baseValidConfig() Config {
 		Cache:     CacheConfig{Driver: "memory"},
 		Email:     EmailConfig{Driver: "console"},
 		Tenant:    TenantConfig{DefaultSlug: "default"},
+		Webhook: WebhookConfig{
+			ConnectTimeoutSeconds: 5, RequestTimeoutSeconds: 10,
+			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
+			RetentionDays: 30, TimestampToleranceSeconds: 300,
+		},
 	}
 }
 
@@ -575,6 +693,7 @@ func productionValidConfig() Config {
 	cfg.App.Env = "production"
 	cfg.App.FrontendURL = "https://app.example.com"
 	cfg.JWT.Secret = strings.Repeat("a", 32)
+	cfg.Webhook.SecretEncryptionKey = strings.Repeat("w", 32)
 	cfg.Storage.AllowedMIMETypes = "image/png,application/pdf"
 	cfg.CORS.AllowOrigins = "https://app.example.com"
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}

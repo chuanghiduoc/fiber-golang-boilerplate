@@ -1,0 +1,114 @@
+package webhook
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func loopbackClient(t *testing.T, timeout time.Duration) *Client {
+	t.Helper()
+	guard, err := NewGuard([]string{"127.0.0.1", "::1", "localhost"})
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	return NewClient(ClientConfig{Guard: guard, Timeout: timeout, ConnectTimeout: time.Second})
+}
+
+func TestClient_RejectsPrivateTargetWithoutAllowlist(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	guard, _ := NewGuard(nil)
+	client := NewClient(ClientConfig{Guard: guard, Timeout: time.Second})
+
+	_, err := client.Do(context.Background(), server.URL, nil, []byte(`{}`))
+	if !errors.Is(err, ErrBlockedTarget) {
+		t.Fatalf("Do() = %v, want ErrBlockedTarget", err)
+	}
+}
+
+func TestClient_PostsSignedRequestAndDoesNotFollowRedirects(t *testing.T) {
+	var gotBody string
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		data, _ := io.ReadAll(r.Body)
+		gotBody = string(data)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := loopbackClient(t, 2*time.Second)
+	headers := http.Header{}
+	headers.Set(HeaderID, "evt_1")
+	headers.Set(HeaderTimestamp, "123")
+	result, err := client.Do(context.Background(), server.URL, headers, []byte(`{"hello":"world"}`))
+	if err != nil {
+		t.Fatalf("Do(): %v", err)
+	}
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", result.StatusCode)
+	}
+	if gotHeaders.Get(HeaderID) != "evt_1" || gotHeaders.Get(HeaderTimestamp) != "123" {
+		t.Fatalf("headers not forwarded: %v", gotHeaders)
+	}
+	if gotHeaders.Get("User-Agent") != UserAgent {
+		t.Errorf("User-Agent = %q, want %q", gotHeaders.Get("User-Agent"), UserAgent)
+	}
+	if gotBody != `{"hello":"world"}` {
+		t.Errorf("body = %q", gotBody)
+	}
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/next", http.StatusFound)
+	}))
+	defer redirect.Close()
+	result, err = client.Do(context.Background(), redirect.URL, nil, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("redirect Do(): %v", err)
+	}
+	if result.StatusCode != http.StatusFound {
+		t.Fatalf("redirect status = %d, want 302 (must not follow)", result.StatusCode)
+	}
+	if got := ClassifyStatus(result.StatusCode); got != OutcomePermanent {
+		t.Fatalf("classify 302 = %s, want permanent", got)
+	}
+}
+
+func TestClient_TimeoutIsRetryable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := loopbackClient(t, 50*time.Millisecond)
+	_, err := client.Do(context.Background(), server.URL, nil, []byte(`{}`))
+	if err == nil {
+		t.Fatal("Do() should time out")
+	}
+	if IsBlocked(err) {
+		t.Fatalf("timeout must not be classified as blocked: %v", err)
+	}
+	if got := ClassifyError(err); got != OutcomeRetry {
+		t.Fatalf("timeout classification = %s, want retry", got)
+	}
+}
+
+func TestClient_InvalidSchemeIsPermanent(t *testing.T) {
+	client := loopbackClient(t, time.Second)
+	_, err := client.Do(context.Background(), "file:///etc/passwd", nil, nil)
+	if !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("Do(file://) = %v, want ErrInvalidTarget", err)
+	}
+	if got := ClassifyError(err); got != OutcomePermanent {
+		t.Fatalf("classification = %s, want permanent", got)
+	}
+}

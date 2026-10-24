@@ -105,6 +105,151 @@ definitions:
     - currentPassword
     - newPassword
     type: object
+  dto.CreateEndpointRequest:
+    properties:
+      description:
+        maxLength: 255
+        type: string
+      eventTypes:
+        items:
+          type: string
+        maxItems: 20
+        type: array
+      maxAttempts:
+        maximum: 50
+        minimum: 1
+        type: integer
+      timeoutMs:
+        maximum: 120000
+        minimum: 100
+        type: integer
+      url:
+        maxLength: 2048
+        type: string
+    required:
+    - url
+    type: object
+  dto.CreateInboundSourceRequest:
+    properties:
+      name:
+        maxLength: 255
+        type: string
+      slug:
+        maxLength: 63
+        minLength: 1
+        type: string
+    required:
+    - name
+    - slug
+    type: object
+  dto.DeliveryAttemptResponse:
+    properties:
+      attempt:
+        type: integer
+      createdAt:
+        type: string
+      deliveryId:
+        type: integer
+      durationMs:
+        type: integer
+      error:
+        type: string
+      id:
+        type: integer
+      statusCode:
+        type: integer
+    type: object
+  dto.DeliveryResponse:
+    properties:
+      attempts:
+        type: integer
+      createdAt:
+        type: string
+      deliveredAt:
+        type: string
+      endpointId:
+        type: integer
+      eventId:
+        type: string
+      eventType:
+        type: string
+      id:
+        type: integer
+      lastError:
+        type: string
+      lastStatusCode:
+        type: integer
+      maxAttempts:
+        type: integer
+      nextAttemptAt:
+        type: string
+      payload:
+        type: object
+      replayedFromId:
+        type: integer
+      status:
+        type: string
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
+    type: object
+  dto.EndpointResponse:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      description:
+        type: string
+      eventTypes:
+        items:
+          type: string
+        type: array
+      id:
+        type: integer
+      maxAttempts:
+        type: integer
+      status:
+        type: string
+      tenantId:
+        type: integer
+      timeoutMs:
+        type: integer
+      updatedAt:
+        type: string
+      url:
+        type: string
+    type: object
+  dto.EndpointSecretResponse:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      description:
+        type: string
+      eventTypes:
+        items:
+          type: string
+        type: array
+      id:
+        type: integer
+      maxAttempts:
+        type: integer
+      secret:
+        type: string
+      status:
+        type: string
+      tenantId:
+        type: integer
+      timeoutMs:
+        type: integer
+      updatedAt:
+        type: string
+      url:
+        type: string
+    type: object
   dto.FileResponse:
     properties:
       createdAt:
@@ -133,6 +278,86 @@ definitions:
         type: string
     required:
     - email
+    type: object
+  dto.InboundEventResponse:
+    properties:
+      duplicate:
+        type: boolean
+      eventId:
+        type: string
+      eventType:
+        type: string
+      id:
+        type: integer
+      payload:
+        type: object
+      receivedAt:
+        type: string
+      sourceId:
+        type: integer
+      tenantId:
+        type: integer
+    type: object
+  dto.InboundReceipt:
+    properties:
+      duplicate:
+        type: boolean
+      eventId:
+        type: string
+      eventType:
+        type: string
+      id:
+        type: integer
+      receivedAt:
+        type: string
+      sourceId:
+        type: integer
+      tenantId:
+        type: integer
+    type: object
+  dto.InboundSourceResponse:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      receiverUrl:
+        type: string
+      slug:
+        type: string
+      status:
+        type: string
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
+    type: object
+  dto.InboundSourceSecretResponse:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      receiverUrl:
+        type: string
+      secret:
+        type: string
+      slug:
+        type: string
+      status:
+        type: string
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
     type: object
   dto.LoginRequest:
     properties:
@@ -196,6 +421,55 @@ definitions:
     required:
     - password
     - token
+    type: object
+  dto.UpdateEndpointRequest:
+    properties:
+      description:
+        maxLength: 255
+        type: string
+      eventTypes:
+        items:
+          type: string
+        maxItems: 20
+        type: array
+      maxAttempts:
+        maximum: 50
+        minimum: 1
+        type: integer
+      status:
+        enum:
+        - active
+        - disabled
+        type: string
+      timeoutMs:
+        maximum: 120000
+        minimum: 100
+        type: integer
+      url:
+        maxLength: 2048
+        type: string
+    required:
+    - status
+    - url
+    type: object
+  dto.UpdateInboundSourceRequest:
+    properties:
+      name:
+        maxLength: 255
+        type: string
+      slug:
+        maxLength: 63
+        minLength: 1
+        type: string
+      status:
+        enum:
+        - active
+        - disabled
+        type: string
+    required:
+    - name
+    - slug
+    - status
     type: object
   dto.UpdateUserRequest:
     properties:
@@ -1794,6 +2068,781 @@ paths:
       summary: Change password
       tags:
       - Users
+  /webhooks/deliveries:
+    get:
+      description: List delivery history for the request tenant, optionally filtered
+        by endpoint or status.
+      parameters:
+      - description: Endpoint ID
+        in: query
+        name: endpointId
+        type: integer
+      - description: Delivery status
+        enum:
+        - pending
+        - succeeded
+        - dead
+        in: query
+        name: status
+        type: string
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.DeliveryResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List webhook deliveries
+      tags:
+      - Webhooks
+  /webhooks/deliveries/{id}:
+    get:
+      description: Get one delivery including its retained payload snapshot.
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.DeliveryResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a webhook delivery
+      tags:
+      - Webhooks
+  /webhooks/deliveries/{id}/attempts:
+    get:
+      description: List every recorded HTTP attempt for one delivery.
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.DeliveryAttemptResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List delivery attempts
+      tags:
+      - Webhooks
+  /webhooks/deliveries/{id}/replay:
+    post:
+      description: Create a new delivery from a retained payload, using the endpoint's
+        current URL and active secret.
+      parameters:
+      - description: Delivery ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.DeliveryResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Replay a webhook delivery
+      tags:
+      - Webhooks
+  /webhooks/endpoints:
+    get:
+      description: List outbound endpoints for the request tenant.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.EndpointResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List webhook endpoints
+      tags:
+      - Webhooks
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant-scoped outbound endpoint. The signing secret is
+        returned once.
+      parameters:
+      - description: Endpoint configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateEndpointRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.EndpointSecretResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create a webhook endpoint
+      tags:
+      - Webhooks
+  /webhooks/endpoints/{id}:
+    delete:
+      description: Soft-delete an endpoint and stop matching it for new events.
+      parameters:
+      - description: Endpoint ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete a webhook endpoint
+      tags:
+      - Webhooks
+    get:
+      description: Get one outbound endpoint by ID.
+      parameters:
+      - description: Endpoint ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.EndpointResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a webhook endpoint
+      tags:
+      - Webhooks
+    put:
+      consumes:
+      - application/json
+      description: Replace endpoint URL, filters, status, attempts, and timeout.
+      parameters:
+      - description: Endpoint ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Endpoint configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateEndpointRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.EndpointResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a webhook endpoint
+      tags:
+      - Webhooks
+  /webhooks/endpoints/{id}/rotate-secret:
+    post:
+      description: Deactivate the current secret and return a new one once. In-flight
+        deliveries keep their secret snapshot.
+      parameters:
+      - description: Endpoint ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.EndpointSecretResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Rotate a webhook signing secret
+      tags:
+      - Webhooks
+  /webhooks/inbound-sources:
+    get:
+      description: List inbound sources for the request tenant.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.InboundSourceResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List inbound webhook sources
+      tags:
+      - Webhooks
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant-scoped HMAC-authenticated receiver. The secret
+        is returned once.
+      parameters:
+      - description: Inbound source configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateInboundSourceRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.InboundSourceSecretResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create an inbound webhook source
+      tags:
+      - Webhooks
+  /webhooks/inbound-sources/{id}:
+    delete:
+      description: Soft-delete an inbound source and reject future receiver calls.
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete an inbound webhook source
+      tags:
+      - Webhooks
+    get:
+      description: Get one inbound source by ID.
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.InboundSourceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get an inbound webhook source
+      tags:
+      - Webhooks
+    put:
+      consumes:
+      - application/json
+      description: Replace an inbound source's name, slug, and status.
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Inbound source configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateInboundSourceRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.InboundSourceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update an inbound webhook source
+      tags:
+      - Webhooks
+  /webhooks/inbound-sources/{id}/events:
+    get:
+      description: List deduplicated events received by one inbound source.
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.InboundEventResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List inbound webhook events
+      tags:
+      - Webhooks
+  /webhooks/inbound-sources/{id}/rotate-secret:
+    post:
+      description: Replace the HMAC verification secret and return the new value once.
+      parameters:
+      - description: Source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.InboundSourceSecretResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Rotate an inbound source secret
+      tags:
+      - Webhooks
+  /webhooks/inbound/{id}:
+    post:
+      consumes:
+      - application/json
+      description: Public HMAC-authenticated receiver. Deduplicates on X-Webhook-Id
+        per source.
+      parameters:
+      - description: Inbound source ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: External event ID
+        in: header
+        name: X-Webhook-Id
+        required: true
+        type: string
+      - description: Event type
+        in: header
+        name: X-Webhook-Event
+        type: string
+      - description: Unix seconds used in the signature
+        in: header
+        name: X-Webhook-Timestamp
+        required: true
+        type: string
+      - description: v1=<hex HMAC-SHA256>
+        in: header
+        name: X-Webhook-Signature
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.InboundReceipt'
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/dto.InboundReceipt'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      summary: Receive an inbound webhook
+      tags:
+      - Webhooks
 securityDefinitions:
   BearerAuth:
     description: 'Enter your bearer token in the format: Bearer {token}'

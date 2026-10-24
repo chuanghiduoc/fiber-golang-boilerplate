@@ -17,6 +17,12 @@ DROP FUNCTION IF EXISTS protect_last_admin();
 
 DROP TABLE IF EXISTS scheduler_runs;
 DROP TABLE IF EXISTS scheduler_leases;
+DROP TABLE IF EXISTS webhook_inbound_events;
+DROP TABLE IF EXISTS webhook_inbound_sources;
+DROP TABLE IF EXISTS webhook_delivery_attempts;
+DROP TABLE IF EXISTS webhook_deliveries;
+DROP TABLE IF EXISTS webhook_endpoint_secrets;
+DROP TABLE IF EXISTS webhook_endpoints;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS feature_flag_targets;

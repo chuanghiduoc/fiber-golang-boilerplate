@@ -12,6 +12,7 @@ import (
 	"github.com/caarlos0/env/v11"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
 type Config struct {
@@ -30,6 +31,7 @@ type Config struct {
 	I18N         I18NConfig
 	FeatureFlags FeatureFlagsConfig
 	Scheduler    SchedulerConfig
+	Webhook      WebhookConfig
 }
 
 // I18NConfig controls request locale negotiation. Locale tags are matched
@@ -293,6 +295,69 @@ func (s SchedulerConfig) Validate() error {
 		return fmt.Errorf("SCHEDULER_RETENTION_DAYS must be at least 1")
 	}
 	return nil
+}
+
+// WebhookConfig controls outbound delivery, inbound verification, and secret
+// encryption at rest. The signing key is sealed with a key derived from
+// SecretEncryptionKey; when that is empty the JWT secret is used as a
+// compatibility fallback (never in production).
+type WebhookConfig struct {
+	SecretEncryptionKey       string `env:"WEBHOOK_SECRET_ENCRYPTION_KEY"`
+	ConnectTimeoutSeconds     int    `env:"WEBHOOK_CONNECT_TIMEOUT_SECS" envDefault:"5"`
+	RequestTimeoutSeconds     int    `env:"WEBHOOK_REQUEST_TIMEOUT_SECS" envDefault:"10"`
+	RetryBaseSeconds          int    `env:"WEBHOOK_RETRY_BASE_SECS" envDefault:"5"`
+	RetryMaxSeconds           int    `env:"WEBHOOK_RETRY_MAX_SECS" envDefault:"3600"`
+	MaxAttempts               int    `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"8"`
+	RetentionDays             int    `env:"WEBHOOK_RETENTION_DAYS" envDefault:"30"`
+	TimestampToleranceSeconds int    `env:"WEBHOOK_TIMESTAMP_TOLERANCE_SECS" envDefault:"300"`
+	// SSRFAllowlist permits private/loopback targets for trusted receivers.
+	// Entries are comma-separated IPs, CIDRs, or exact hostnames. Empty keeps
+	// the default deny for every non-public address.
+	SSRFAllowlist string `env:"WEBHOOK_SSRF_ALLOWLIST"`
+}
+
+// ResolvedSecretKey returns the dedicated webhook encryption key, or the JWT
+// secret as the documented compatibility fallback.
+func (w WebhookConfig) ResolvedSecretKey(jwtSecret string) string {
+	if key := strings.TrimSpace(w.SecretEncryptionKey); key != "" {
+		return key
+	}
+	return jwtSecret
+}
+
+// SSRFAllowlistEntries returns the parsed allowlist entries.
+func (w WebhookConfig) SSRFAllowlistEntries() []string {
+	return splitCSV(w.SSRFAllowlist)
+}
+
+// RequestTimeout returns the per-delivery HTTP timeout.
+func (w WebhookConfig) RequestTimeout() time.Duration {
+	return time.Duration(w.RequestTimeoutSeconds) * time.Second
+}
+
+// ConnectTimeout returns the TCP/TLS connect timeout.
+func (w WebhookConfig) ConnectTimeout() time.Duration {
+	return time.Duration(w.ConnectTimeoutSeconds) * time.Second
+}
+
+// RetryBase returns the first retry backoff delay.
+func (w WebhookConfig) RetryBase() time.Duration {
+	return time.Duration(w.RetryBaseSeconds) * time.Second
+}
+
+// RetryMax returns the maximum retry backoff delay.
+func (w WebhookConfig) RetryMax() time.Duration {
+	return time.Duration(w.RetryMaxSeconds) * time.Second
+}
+
+// Retention returns how long delivery and inbound-event history is retained.
+func (w WebhookConfig) Retention() time.Duration {
+	return time.Duration(w.RetentionDays) * 24 * time.Hour
+}
+
+// TimestampTolerance returns the accepted inbound signature clock skew.
+func (w WebhookConfig) TimestampTolerance() time.Duration {
+	return time.Duration(w.TimestampToleranceSeconds) * time.Second
 }
 
 // TenantConfig controls request-tenant resolution. The default slug preserves
@@ -612,6 +677,53 @@ func (cfg *Config) Validate() error {
 			"FEATURE_FLAGS_MAX_STALENESS_SECONDS (%d) must be at least FEATURE_FLAGS_CACHE_TTL_SECONDS (%d)",
 			cfg.FeatureFlags.MaxStalenessSeconds, cfg.FeatureFlags.CacheTTLSeconds,
 		)
+	}
+
+	// Webhook delivery bounds and secret encryption. The dedicated key must be
+	// strong and is mandatory in production; outside production the JWT secret
+	// is the documented fallback so local installs work without extra setup.
+	wh := cfg.Webhook
+	if wh.ConnectTimeoutSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_CONNECT_TIMEOUT_SECS must be at least 1")
+	}
+	if wh.RequestTimeoutSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_REQUEST_TIMEOUT_SECS must be at least 1")
+	}
+	if wh.RequestTimeoutSeconds > 120 {
+		return fmt.Errorf("WEBHOOK_REQUEST_TIMEOUT_SECS must be at most 120")
+	}
+	if wh.ConnectTimeoutSeconds > wh.RequestTimeoutSeconds {
+		return fmt.Errorf("WEBHOOK_CONNECT_TIMEOUT_SECS must not exceed WEBHOOK_REQUEST_TIMEOUT_SECS")
+	}
+	if wh.RetryBaseSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_RETRY_BASE_SECS must be at least 1")
+	}
+	if wh.RetryMaxSeconds < wh.RetryBaseSeconds {
+		return fmt.Errorf("WEBHOOK_RETRY_MAX_SECS must be at least WEBHOOK_RETRY_BASE_SECS")
+	}
+	if wh.RetryMaxSeconds > 604800 {
+		return fmt.Errorf("WEBHOOK_RETRY_MAX_SECS must be at most 604800")
+	}
+	if wh.MaxAttempts < 1 || wh.MaxAttempts > 50 {
+		return fmt.Errorf("WEBHOOK_MAX_ATTEMPTS must be between 1 and 50")
+	}
+	if wh.RetentionDays < 1 || wh.RetentionDays > 3650 {
+		return fmt.Errorf("WEBHOOK_RETENTION_DAYS must be between 1 and 3650")
+	}
+	if wh.TimestampToleranceSeconds < 30 || wh.TimestampToleranceSeconds > 3600 {
+		return fmt.Errorf("WEBHOOK_TIMESTAMP_TOLERANCE_SECS must be between 30 and 3600")
+	}
+	if key := strings.TrimSpace(wh.SecretEncryptionKey); key != "" && len(key) < 32 {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY must be at least 32 characters")
+	}
+	if cfg.App.Env == "production" && strings.TrimSpace(wh.SecretEncryptionKey) == "" {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY must be set in production")
+	}
+	if strings.TrimSpace(wh.ResolvedSecretKey(cfg.JWT.Secret)) == "" {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY or JWT_SECRET must be set")
+	}
+	if _, err := webhook.NewGuard(wh.SSRFAllowlistEntries()); err != nil {
+		return fmt.Errorf("invalid WEBHOOK_SSRF_ALLOWLIST: %w", err)
 	}
 
 	if cfg.App.BodyLimit < 1 {

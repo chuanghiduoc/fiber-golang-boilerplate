@@ -39,6 +39,10 @@ import (
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
+	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
+	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
@@ -55,6 +59,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 
 	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
 )
@@ -296,6 +301,34 @@ func main() {
 	featureSvc := featuressvc.New(featureRepo, flagEvaluator)
 	featureHandler := featureshandler.NewHandler(featureSvc)
 
+	// Webhooks: tenant-scoped endpoints, durable outbound deliveries, and the
+	// public inbound receiver. Secrets are sealed with a dedicated webhook key
+	// (JWT_SECRET is the local-only fallback). The HTTP client pins DNS results
+	// to vetted public IPs and never follows redirects.
+	webhookCodec, err := webhookservice.NewSecretCodec(cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret))
+	if err != nil {
+		pool.Close()
+		fail("failed to initialize webhook secret encryption", err)
+	}
+	webhookGuard, err := webhook.NewGuard(cfg.Webhook.SSRFAllowlistEntries())
+	if err != nil {
+		pool.Close()
+		fail("failed to initialize webhook SSRF guard", err)
+	}
+	webhookClient := webhook.NewClient(webhook.ClientConfig{
+		Guard:          webhookGuard,
+		Timeout:        cfg.Webhook.RequestTimeout(),
+		ConnectTimeout: cfg.Webhook.ConnectTimeout(),
+	})
+	webhookRepo := webhookrepo.New(pool, jobQueue)
+	webhookSvc := webhookservice.New(webhookRepo, webhookRepo, webhookRepo, webhookCodec, auditRecorder, webhookservice.Options{
+		DefaultMaxAttempts: cfg.Webhook.MaxAttempts,
+		DefaultTimeoutMS:   int32(cfg.Webhook.RequestTimeoutSeconds * 1000), // #nosec G115 -- validated 1..120 seconds
+		TimestampTolerance: cfg.Webhook.TimestampTolerance(),
+	})
+	webhookHandler := webhookshandler.New(webhookSvc)
+	webhookDispatcher := webhookservice.NewDispatcher(webhookRepo)
+
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)
 
@@ -313,6 +346,7 @@ func main() {
 		Events:         eventBus,
 		Jobs:           worker,
 		Schedules:      scheduleRegistry,
+		Webhooks:       webhookDispatcher,
 	})
 	// Module providers register routes, event subscriptions, job handlers, and
 	// schedules. The bus turns durable subscriptions into worker handlers once
@@ -322,6 +356,7 @@ func main() {
 		files.New(uploadHandler),
 		admin.New(adminHandler),
 		features.New(featureHandler),
+		webhooks.New(webhookHandler),
 	)
 
 	// Durable email worker. It shares the pool but runs outside the request
@@ -366,6 +401,11 @@ func main() {
 	}
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
+	webhookWorker := webhookservice.NewDeliveryWorker(webhookRepo, webhookCodec, webhookClient, webhookservice.WorkerOptions{
+		RetryBase: cfg.Webhook.RetryBase(),
+		RetryMax:  cfg.Webhook.RetryMax(),
+	})
+	worker.Register(webhookservice.DeliveryJobKind, webhookWorker.Handle)
 	workerDone := make(chan struct{})
 	go func() {
 		if err := worker.Run(workerCtx); err != nil {
@@ -373,6 +413,8 @@ func main() {
 		}
 		close(workerDone)
 	}()
+	// Retention is best-effort and shares the worker lifecycle.
+	go webhookservice.RunRetention(workerCtx, webhookSvc, int32(cfg.Webhook.RetentionDays), time.Hour) // #nosec G115 -- validated 1..3650 days
 
 	// Graceful shutdown
 	serverErr := make(chan error, 1)
@@ -424,6 +466,7 @@ func main() {
 	}
 
 	// Cleanup all resources
+	webhookClient.CloseIdleConnections()
 	if err := appCache.Close(); err != nil {
 		slog.Error("failed to close cache", slog.Any("error", err))
 	}

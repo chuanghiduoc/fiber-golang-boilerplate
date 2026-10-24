@@ -190,6 +190,8 @@ Rules:
 - The scope includes the tenant ID and slug (plus user ID, or IP for public
   routes), so one key cannot replay a `201` across tenants.
 - Auth token-minting endpoints are excluded by design.
+- Secret-returning webhook creates are excluded so plaintext secrets are never
+  written to the shared response cache.
 
 ## Audit and fail-closed behavior
 
@@ -215,9 +217,43 @@ Rules:
 - Deletes are soft; `includeDeleted=true` exposes trash to the owner.
 - `Content-Disposition` follows RFC 6266/5987.
 
+## Webhooks
+
+- Admin/permission routes: `/api/v1/webhooks/endpoints`,
+  `/api/v1/webhooks/deliveries`, and `/api/v1/webhooks/inbound-sources` with
+  `webhooks:read` / `webhooks:write` (`admin` role).
+- Endpoint create and inbound-source create return a plaintext `secret` once;
+  reads never include it. Rotation returns the new secret once.
+  Secret-returning creates deliberately omit `Idempotency-Key` caching; all
+  other mutations accept it.
+- Delivery list filters: `endpointId`, `status=pending|succeeded|dead`, plus
+  cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the retained
+  payload snapshot; list responses omit it.
+- `POST /deliveries/:id/replay` creates a new delivery with the endpoint's
+  current URL and active secret. The response is `201`.
+- Outbound delivery is at-least-once. Requests carry `X-Webhook-Id`,
+  `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`,
+  `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, and
+  `X-Webhook-Attempt`. Sign `<timestamp>.<raw-body>` with HMAC-SHA256.
+- Retryable responses are `408`, `425`, `429`, and `5xx`; all other `3xx`/`4xx`
+  are permanent (`dead`). `Retry-After` is honored (seconds or HTTP date) and
+  capped by config.
+- `POST /api/v1/webhooks/inbound/{id}` is public and has no JWT, tenant header,
+  or idempotency middleware. It requires `X-Webhook-Id`,
+  `X-Webhook-Timestamp`, and `X-Webhook-Signature`; unknown/disabled sources
+  return `404`, bad/stale signatures `401`, malformed JSON/IDs `400`. New
+  events return `202`; a repeat `(source, X-Webhook-Id)` returns `200` with
+  `duplicate: true`.
+- Delivery targets are SSRF-checked at dial time; private/loopback/link-local
+  targets require `WEBHOOK_SSRF_ALLOWLIST`. Redirects are never followed.
+- See [Webhooks](webhooks.md) for the full signing, retry, secret, and
+  operations contract.
+
 ## Jobs and asynchronous work
 
 - Email verification/reset and other durable work are queued in PostgreSQL.
+- Outbound webhook delivery uses the same queue (`webhook.delivery`) and is
+  at-least-once; receivers deduplicate on `X-Webhook-Delivery`.
 - Delivery is at-least-once; clients must tolerate duplicate emails.
 - Terminal jobs clear payloads; success/dead rows are retained 30 days.
 - Email payloads are encrypted at rest.

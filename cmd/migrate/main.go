@@ -34,6 +34,12 @@ var requiredTables = []string{
 	"scheduler_leases",
 	"scheduler_runs",
 	"audit_events",
+	"webhook_endpoints",
+	"webhook_endpoint_secrets",
+	"webhook_deliveries",
+	"webhook_delivery_attempts",
+	"webhook_inbound_sources",
+	"webhook_inbound_events",
 }
 
 // requiredColumns catches a legacy schema that has the right table names but
@@ -54,6 +60,15 @@ var requiredColumns = map[string][]string{
 		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
 		"status_code", "error_code", "idempotency_key_hash", "completed_at",
 	},
+	"webhook_endpoints":        {"tenant_id", "url", "event_types", "status", "max_attempts", "timeout_ms", "deleted_at"},
+	"webhook_endpoint_secrets": {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active"},
+	"webhook_deliveries": {
+		"tenant_id", "endpoint_id", "event_id", "event_type", "url", "payload",
+		"secret_ciphertext", "status", "attempts", "max_attempts", "next_attempt_at",
+	},
+	"webhook_delivery_attempts": {"tenant_id", "delivery_id", "attempt", "status_code", "duration_ms"},
+	"webhook_inbound_sources":   {"tenant_id", "name", "slug", "secret_ciphertext", "status", "deleted_at"},
+	"webhook_inbound_events":    {"tenant_id", "source_id", "external_event_id", "signature", "payload"},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
@@ -70,6 +85,12 @@ var requiredUniqueIndexes = []string{
 	"idx_feature_flag_targets_user_target",
 	"idx_jobs_tenant_idempotency_key",
 	"idx_scheduler_runs_schedule_slot",
+	"idx_webhook_endpoint_secrets_endpoint_version",
+	"idx_webhook_endpoint_secrets_active",
+	"idx_webhook_deliveries_endpoint_event",
+	"idx_webhook_delivery_attempts_delivery_attempt",
+	"idx_webhook_inbound_sources_tenant_slug_active",
+	"idx_webhook_inbound_events_source_event",
 }
 
 // requiredTenantLeadingIndexes are the query indexes that must start with

@@ -58,7 +58,13 @@ internal/modules/
                                      + queries + generated sqlc)
   admin/                            Back-office facade
                                     (dto + service + handler, contracts-only)
-internal/contracts/                 Narrow cross-module identity/files admin interfaces (stdlib only)
+  webhooks/                         Outbound endpoints/deliveries, inbound
+                                    sources/events, public HMAC receiver
+                                    (dto + repository + service + handler
+                                     + queries + generated sqlc)
+internal/contracts/                 Narrow cross-module identity/files admin
+                                    interfaces and webhook event/dispatcher
+                                    types (stdlib only)
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
@@ -76,6 +82,7 @@ pkg/
   apperror/                         RFC 9457 errors + typed error catalog
   response/                         JSON response helpers
   database/                         Pool, TxManager, migration runner
+  webhook/                          HMAC signing/verification + SSRF-safe client
   validator/ token/ cache/ storage/ email/ pagination/ logger/ health/ oauth/ metrics/ async/
 migrations/000001_init_schema.*     Single consolidated init schema (up/down)
 docs/                               Swagger + architecture/API/module/ops docs
@@ -86,10 +93,12 @@ See [docs/architecture.md](docs/architecture.md) for dependency rules and the
 strangler status, [docs/api-design.md](docs/api-design.md) for the API design
 system (errors, pagination, idempotency, status codes),
 [docs/module-template.md](docs/module-template.md) for the canonical module
-layout and scaffold, and [docs/operations.md](docs/operations.md) for the
-operations runbook. Tracing configuration, privacy rules, and the local
-collector live in [docs/tracing.md](docs/tracing.md). Feature flags are
-documented in [docs/feature-flags.md](docs/feature-flags.md).
+layout and scaffold, [docs/operations.md](docs/operations.md) for the
+operations runbook, and [docs/webhooks.md](docs/webhooks.md) for outbound
+dispatch, signing, SSRF, retries, and the inbound receiver. Tracing
+configuration, privacy rules, and the local collector live in
+[docs/tracing.md](docs/tracing.md). Feature flags are documented in
+[docs/feature-flags.md](docs/feature-flags.md).
 
 Request flow: `Client → app middleware (request ID, locale) → /api/vN version guard → tenant middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
@@ -142,6 +151,10 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
   repository derives the tenant from context, and a composite foreign key
   rejects a target pointing at a user in another tenant. Flag defaults/kill
   switches are process-wide. See [Feature Flags](docs/feature-flags.md).
+- Webhook endpoints, versioned signing secrets, deliveries, attempts, inbound
+  sources, and inbound events are tenant-scoped in SQL and indexes. The public
+  inbound receiver resolves the tenant from the source ID, verifies the source
+  HMAC, and writes/audits under that tenant regardless of `X-Tenant-Slug`.
 - Google OAuth binds the tenant into the OAuth `state` (and state cookie). The
   callback ignores `X-Tenant-Slug`, uses the state tenant, and refuses an
   unknown or suspended tenant even in `TENANT_REQUIRE_HEADER=true` mode.
@@ -400,6 +413,34 @@ returns `404`, including for admins. Blobs are stored under
 | PUT | `/api/v1/admin/features/flags/:key/targets` | Upsert tenant-wide or user target |
 | DELETE | `/api/v1/admin/features/flags/:key/targets/:id` | Delete a current-tenant target |
 
+### Webhooks (protected — `webhooks:read` / `webhooks:write`; admin role)
+
+All endpoint, delivery, and inbound-source routes are tenant-scoped. Secret
+values are returned once on create/rotate and are never included in reads.
+See [docs/webhooks.md](docs/webhooks.md) for signing, retry, SSRF, and receiver
+details.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/webhooks/endpoints` | List outbound endpoints |
+| POST | `/api/v1/webhooks/endpoints` | Create endpoint; returns a signing secret |
+| GET | `/api/v1/webhooks/endpoints/:id` | Get endpoint |
+| PUT | `/api/v1/webhooks/endpoints/:id` | Replace endpoint configuration |
+| DELETE | `/api/v1/webhooks/endpoints/:id` | Soft-delete/disable endpoint |
+| POST | `/api/v1/webhooks/endpoints/:id/rotate-secret` | Rotate signing secret |
+| GET | `/api/v1/webhooks/deliveries` | List deliveries (`endpointId`, `status`) |
+| GET | `/api/v1/webhooks/deliveries/:id` | Get delivery with payload snapshot |
+| GET | `/api/v1/webhooks/deliveries/:id/attempts` | List delivery attempts |
+| POST | `/api/v1/webhooks/deliveries/:id/replay` | Replay with the current URL/secret |
+| GET | `/api/v1/webhooks/inbound-sources` | List inbound sources |
+| POST | `/api/v1/webhooks/inbound-sources` | Create source; returns an HMAC secret |
+| GET | `/api/v1/webhooks/inbound-sources/:id` | Get inbound source |
+| PUT | `/api/v1/webhooks/inbound-sources/:id` | Update inbound source |
+| DELETE | `/api/v1/webhooks/inbound-sources/:id` | Soft-delete/disable source |
+| POST | `/api/v1/webhooks/inbound-sources/:id/rotate-secret` | Rotate HMAC secret |
+| GET | `/api/v1/webhooks/inbound-sources/:id/events` | List deduplicated inbound events |
+| POST | `/api/v1/webhooks/inbound/:id` | Public HMAC receiver (no JWT) |
+
 ### Infrastructure
 | Method | Path | Description |
 |--------|------|-------------|
@@ -579,6 +620,15 @@ already exists.
   failures that exhaust their attempts; a job dead-lettered by lease expiry is
   visible as `status = 'dead'` in the table but is not counted by that
   handler-outcome metric.
+- Webhook delivery uses the same durable queue under the
+  `webhook.delivery` kind. A delivery row and its first job commit atomically;
+  the worker sends one signed HTTP attempt and schedules the next attempt as a
+  **new** job with webhook-specific exponential backoff or `Retry-After`.
+  Permanent 3xx/4xx responses (except `408`, `425`, `429`) mark the delivery
+  `dead` immediately. Delivery is at-least-once, so receivers must deduplicate
+  on `X-Webhook-Delivery`; every attempt is retained in
+  `webhook_delivery_attempts`. A separate hourly retention loop deletes terminal
+  deliveries and old inbound events after `WEBHOOK_RETENTION_DAYS`.
 - On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
   the app waits up to 10s for them to drain. Handlers must honor context
   cancellation: the worker cannot preempt a handler that ignores it, heartbeats
@@ -707,6 +757,9 @@ Key settings:
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
 - `OTEL_ENABLED` — enable OpenTelemetry tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`, and `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317`
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on API startup (also available via `make seed`; password must be 12+ chars in production)
+- `WEBHOOK_SECRET_ENCRYPTION_KEY` — AES-256-GCM key for stored webhook secrets; required in production (local/test fall back to `JWT_SECRET`)
+- `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` — delivery/verification bounds
+- `WEBHOOK_SSRF_ALLOWLIST` — comma-separated private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on
 
 ## Pagination
 
@@ -736,20 +789,21 @@ monolith, durable jobs, audit trail, permission-based authorization, single
 migration entrypoint, and tenant foundation (schema, resolution, JWT claim,
 config) exist. Remaining work:
 
-- Tenant isolation is implemented for identity and files, including
-  tenant-scoped SQL, admin lists/stats, tenant-bound Google OAuth state,
-  tenant-aware sessions, and tenant-prefixed storage keys. Row-level security
-  and per-tenant limits remain future work.
+- Tenant isolation is implemented for identity, files, and webhooks, including
+  tenant-scoped SQL/indexes, admin lists/stats, tenant-bound Google OAuth state,
+  tenant-aware sessions, tenant-prefixed storage keys, and source-resolved
+  inbound webhook tenants. Row-level security and per-tenant limits remain
+  future work.
 - Distributed tracing is available (HTTP, sanitized pgx queries, and durable
   jobs) but disabled by default; enable it per environment with
   `OTEL_ENABLED=true` and a collector endpoint. Environment promotion/rollout
-  automation: metrics, Kubernetes manifests (`deploy/k8s`), and the GHCR
-  release workflow exist, as does an optional gated CD workflow.
+  automation: metrics, Kubernetes manifests (`deploy/k8s`), the GHCR release
+  workflow, and an optional gated CD workflow exist.
 
 All bounded-context internals are module-owned under `internal/modules`;
-identity and files own their `queries/` and generated `sqlc/` packages, and
-`admin` composes through `internal/contracts`. No shared generated package and
-no legacy handler/service/DTO/repository packages remain.
+identity, files, and webhooks own their `queries/` and generated `sqlc/`
+packages, and `admin` composes through `internal/contracts`. No shared generated
+package and no legacy handler/service/DTO/repository packages remain.
 
 ## Security notes
 
@@ -772,6 +826,16 @@ no legacy handler/service/DTO/repository packages remain.
 - Uploaded files are never served from a public directory; downloads require
   authentication and ownership (or admin role). File metadata and blob keys are
   tenant-scoped, and another tenant's id returns 404.
+- Outbound webhook targets are SSRF-checked at dial time: private, loopback,
+  link-local, multicast, CGNAT, and reserved ranges are blocked unless the exact
+  host/IP/CIDR is in `WEBHOOK_SSRF_ALLOWLIST`; DNS is resolved once and the
+  connection is pinned to the vetted IP; environment proxies and redirects are
+  disabled. Delivery signing uses HMAC-SHA256 with a per-endpoint secret and a
+  timestamp; receivers must deduplicate on `X-Webhook-Delivery`.
+- Webhook secrets are AES-256-GCM encrypted at rest with a dedicated key
+  (`WEBHOOK_SECRET_ENCRYPTION_KEY`, required in production). Plaintext is
+  returned only on create/rotate. Rotating the encryption key requires rotating
+  every outbound and inbound webhook secret.
 - Banned emails cannot be reused through registration or Google login;
   self-deleted accounts can still be re-registered.
 - `POST /auth/logout` revokes one refresh token by possession, even if the

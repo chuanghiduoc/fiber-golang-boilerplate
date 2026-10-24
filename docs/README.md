@@ -15,6 +15,9 @@
 - [Feature Flags](feature-flags.md) — compile-time catalog, precedence,
   environment force-off, database defaults and tenant/user targets, cache
   staleness, admin API, audit metadata, and metrics.
+- [Webhooks](webhooks.md) — outbound event dispatch, HMAC signing and
+  verification, SSRF-safe delivery, retries, replay, inbound sources, secrets,
+  configuration, and operations.
 - [Swagger UI](../docs/swagger.json) — generated OpenAPI (served at `/swagger`
   outside production).
 
