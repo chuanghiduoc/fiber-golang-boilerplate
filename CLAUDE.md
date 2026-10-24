@@ -40,8 +40,8 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
-internal/contracts/         narrow cross-module identity/files admin interfaces and stdlib-only webhook event/dispatcher types
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
+internal/contracts/         narrow cross-module identity/files admin, notification, and principal-reader interfaces plus stdlib-only webhook event/dispatcher types
 internal/platform/          authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
@@ -52,14 +52,14 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
-idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts),
-`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents), `docs/tracing.md` (OpenTelemetry configuration,
-span privacy rules, collector, job trace links), `docs/feature-flags.md`
-(catalog, precedence, cache, admin API, metrics), and `docs/webhooks.md`
-(outbound dispatch/signing/SSRF/retries, inbound receiver, secrets). Keep them
-current when routes/contracts change.
+idempotency, notifications, compatibility), `docs/module-template.md` (canonical
+module layout, scaffold, routes/permissions/tables/contracts),
+`docs/operations.md` (health, metrics, logs, jobs, notification email,
+idempotency, migrations, Kubernetes, incidents), `docs/tracing.md`
+(OpenTelemetry configuration, span privacy rules, collector, job trace links),
+`docs/feature-flags.md` (catalog, precedence, cache, admin API, metrics), and
+`docs/webhooks.md` (outbound dispatch/signing/SSRF/retries, inbound receiver,
+secrets). Keep them current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -82,9 +82,10 @@ current when routes/contracts change.
   boilerplate has no deployed database; a database already at version 1 needs
   the `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT` upgrade in
   `docs/tracing.md` before running this build.
-- Every tenant-owned table (`users`, `files`, `refresh_tokens`,
-  `password_reset_tokens`, `email_verification_tokens`, `jobs`,
-  `audit_events`, `feature_flag_targets`, `webhook_*`) has
+- Every tenant-owned table (`users`, `files`, `notifications`,
+  `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
+  `email_verification_tokens`, `jobs`, `audit_events`,
+  `feature_flag_targets`, `webhook_*`) has
   `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
   New tenant-owned tables must do the same and lead their query indexes with
   `tenant_id`. `feature_flags` is process-wide configuration and is the
@@ -120,11 +121,13 @@ Row-level security, per-tenant limits/quotas, and environment
 promotion/rollout automation remain future work. OpenTelemetry tracing exists
 for HTTP, sanitized pgx queries, and durable jobs but is disabled by default
 (`OTEL_ENABLED=false`); see `docs/tracing.md`.
-`identity`, `files`, `webhooks`, and `admin` own all of
+`identity`, `files`, `webhooks`, `notifications`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
-never imports those modules. Each module with SQL owns its `queries/` and
+never imports those modules. Notifications exposes `contracts.Notifier` and
+consumes `contracts.NotificationRecipientLookup`, implemented by identity, so
+it never reads the users table. Each module with SQL owns its `queries/` and
 generated `sqlc/` package (`admin` is contract-only); there is no shared
 generated package and no cross-module sqlc imports, and no legacy
 handler/service/DTO/repository packages remain.
@@ -280,6 +283,18 @@ Offset helpers are for small admin/export tables only.
   parent. Jobs persist `trace_parent` on enqueue and start each attempt as a
   new-root `job.process` span linked to the enqueue span. See
   `docs/tracing.md` before adding attributes.
+- **Notifications:** `internal/modules/notifications` owns the in-app feed,
+  per-type `in_app`/`email` preferences, and the email channel. Read/list/
+  unread/read-all and preference queries filter both `tenant_id` and `user_id`;
+  cross-tenant or other-user ids return `404`. Missing preferences mean both
+  channels are enabled. `contracts.Notifier` is the cross-module create API;
+  `contracts.NotificationRecipientLookup` lets identity supply the email
+  address without a module import. When email is enabled, the in-app row and
+  `email.send` job commit in one transaction (a queue failure rolls the row
+  back); the job inherits `jobs.tenant_id`. A suppressed notification (both
+  channels disabled) is a successful no-op. Routes are under
+  `/notifications` and `/notification-preferences`; writes use
+  `Idempotency-Key`, and admin sends require `notifications:send`.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
   Protect routes with `authz.Require(authz.PermissionX)`.
 - **Feature flags:** the compile-time catalog and evaluator live in

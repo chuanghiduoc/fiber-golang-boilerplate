@@ -509,6 +509,51 @@ definitions:
       user:
         $ref: '#/definitions/dto.UserResponse'
     type: object
+  dto.NotificationResponse:
+    properties:
+      body:
+        type: string
+      createdAt:
+        type: string
+      data:
+        type: object
+      id:
+        type: integer
+      readAt:
+        type: string
+      tenantId:
+        type: integer
+      title:
+        type: string
+      type:
+        type: string
+      userId:
+        type: integer
+    type: object
+  dto.PreferenceResponse:
+    properties:
+      channel:
+        type: string
+      createdAt:
+        type: string
+      enabled:
+        type: boolean
+      id:
+        type: integer
+      tenantId:
+        type: integer
+      type:
+        type: string
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
+  dto.ReadAllResponse:
+    properties:
+      updated:
+        type: integer
+    type: object
   dto.RefreshRequest:
     properties:
       refreshToken:
@@ -551,6 +596,39 @@ definitions:
     required:
     - password
     - token
+    type: object
+  dto.SendNotificationRequest:
+    properties:
+      body:
+        maxLength: 10000
+        type: string
+      data:
+        type: object
+      title:
+        maxLength: 255
+        type: string
+      type:
+        maxLength: 100
+        type: string
+      userId:
+        type: integer
+    required:
+    - body
+    - title
+    - type
+    - userId
+    type: object
+  dto.SendNotificationResponse:
+    properties:
+      emailQueued:
+        type: boolean
+      notification:
+        $ref: '#/definitions/dto.NotificationResponse'
+    type: object
+  dto.UnreadCountResponse:
+    properties:
+      count:
+        type: integer
     type: object
   dto.UpdateEndpointRequest:
     properties:
@@ -600,6 +678,22 @@ definitions:
     - name
     - slug
     - status
+    type: object
+  dto.UpdatePreferenceRequest:
+    properties:
+      channel:
+        enum:
+        - in_app
+        - email
+        type: string
+      enabled:
+        type: boolean
+      type:
+        maxLength: 100
+        type: string
+    required:
+    - channel
+    - type
     type: object
   dto.UpdateUserRequest:
     properties:
@@ -2246,6 +2340,293 @@ paths:
       summary: Upload a file
       tags:
       - Files
+  /notification-preferences:
+    get:
+      description: List explicit channel preferences for the authenticated user. Missing
+        rows mean the channel is enabled.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.PreferenceResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List notification preferences
+      tags:
+      - Notifications
+    put:
+      consumes:
+      - application/json
+      description: Enable or disable one channel for one notification type
+      parameters:
+      - description: Preference
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdatePreferenceRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.PreferenceResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a notification preference
+      tags:
+      - Notifications
+  /notifications:
+    get:
+      description: List the authenticated user's notifications in the request tenant
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      - description: Return only unread notifications
+        in: query
+        name: unreadOnly
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.NotificationResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List notifications
+      tags:
+      - Notifications
+  /notifications/{id}:
+    get:
+      description: Get one notification owned by the authenticated user
+      parameters:
+      - description: Notification ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.NotificationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a notification
+      tags:
+      - Notifications
+  /notifications/{id}/read:
+    post:
+      description: Mark one notification owned by the authenticated user as read (idempotent)
+      parameters:
+      - description: Notification ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.NotificationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Mark a notification as read
+      tags:
+      - Notifications
+  /notifications/read-all:
+    post:
+      description: Mark every unread notification of the authenticated user as read
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.ReadAllResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Mark all notifications as read
+      tags:
+      - Notifications
+  /notifications/send:
+    post:
+      consumes:
+      - application/json
+      description: 'Admin-only: create an in-app notification and enqueue its email
+        channel for a user in the request tenant'
+      parameters:
+      - description: Notification
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.SendNotificationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.SendNotificationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Send a notification to a user
+      tags:
+      - Notifications
+  /notifications/unread-count:
+    get:
+      description: Count unread notifications for the authenticated user
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.UnreadCountResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get unread notification count
+      tags:
+      - Notifications
   /users:
     get:
       description: Get a paginated list of users

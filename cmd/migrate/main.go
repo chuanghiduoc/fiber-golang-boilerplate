@@ -31,6 +31,8 @@ var requiredTables = []string{
 	"files",
 	"feature_flags",
 	"feature_flag_targets",
+	"notifications",
+	"notification_preferences",
 	"jobs",
 	"scheduler_leases",
 	"scheduler_runs",
@@ -56,11 +58,13 @@ var requiredColumns = map[string][]string{
 		"tenant_id", "user_id", "key_hash", "scopes", "expires_at",
 		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",
 	},
-	"feature_flags":        {"flag_key", "enabled", "kill_switch", "description"},
-	"feature_flag_targets": {"flag_key", "tenant_id", "user_id", "enabled"},
-	"jobs":                 {"tenant_id", "trace_parent", "idempotency_key"},
-	"scheduler_leases":     {"name", "holder", "expires_at", "heartbeat_at"},
-	"scheduler_runs":       {"schedule", "scheduled_for", "status", "job_id"},
+	"feature_flags":            {"flag_key", "enabled", "kill_switch", "description"},
+	"feature_flag_targets":     {"flag_key", "tenant_id", "user_id", "enabled"},
+	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at"},
+	"notification_preferences": {"tenant_id", "user_id", "type", "channel", "enabled"},
+	"jobs":                     {"tenant_id", "trace_parent", "idempotency_key"},
+	"scheduler_leases":         {"name", "holder", "expires_at", "heartbeat_at"},
+	"scheduler_runs":           {"schedule", "scheduled_for", "status", "job_id"},
 	"audit_events": {
 		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
 		"status_code", "error_code", "idempotency_key_hash", "completed_at",
@@ -89,6 +93,7 @@ var requiredUniqueIndexes = []string{
 	"idx_webhook_inbound_sources_tenant_slug_active",
 	"idx_webhook_inbound_events_source_event",
 	"idx_api_keys_key_hash",
+	"idx_notification_preferences_unique",
 }
 
 // requiredTenantLeadingIndexes are the query indexes that must start with
@@ -123,6 +128,13 @@ var requiredTenantLeadingIndexes = map[string][]string{
 		"idx_audit_events_tenant_created",
 		"idx_audit_events_tenant_actor_created",
 		"idx_audit_events_tenant_action_created",
+	},
+	"notifications": {
+		"idx_notifications_tenant_user_created_at_id",
+		"idx_notifications_tenant_user_unread",
+	},
+	"notification_preferences": {
+		"idx_notification_preferences_unique",
 	},
 }
 

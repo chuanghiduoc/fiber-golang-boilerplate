@@ -296,6 +296,41 @@ until retention removes the row.
 Delivery is **at-least-once**, never exactly-once. Duplicate emails and
 duplicate side effects must be expected.
 
+### Notification email
+
+Notifications use the same queue and `email.send`/`email.send.encrypted` kinds
+as identity email. The notifications service resolves the recipient through
+identity's `contracts.NotificationRecipientLookup`; it never reads `users`
+directly. When the `email` channel is enabled, it inserts the in-app row and
+enqueues the email job in one transaction, so a queue outage returns `500` and
+rolls the in-app row back. Channel preferences are applied before any write: an
+explicit `enabled=false` row skips that channel, while a missing row means the
+channel is enabled.
+
+Inspect the feed and preferences:
+
+```sql
+-- Unread backlog per tenant/user
+SELECT tenant_id, user_id, count(*) AS unread,
+       max(created_at) AS newest
+FROM notifications
+WHERE read_at IS NULL
+GROUP BY tenant_id, user_id
+ORDER BY unread DESC;
+
+-- Explicit channel opt-outs
+SELECT tenant_id, user_id, type, channel, enabled, updated_at
+FROM notification_preferences
+WHERE enabled = false
+ORDER BY updated_at DESC;
+```
+
+Notification emails have no links or secrets, so dead-lettered rows only need a
+re-send through the admin endpoint or the producing module. The generic audit
+trail records successful `POST /notifications/:id/read`,
+`POST /notifications/read-all`, `PUT /notification-preferences`, and
+`POST /notifications/send` requests; replays are skipped.
+
 ### Retention and payload clearing
 
 Workers purge `succeeded` and `dead` rows older than 30 days, hourly by
@@ -668,11 +703,11 @@ uses a separate Job and ordered flow (see below).
 
 The baseline now creates `tenants`, seeds tenant id 1 (`default`), adds
 `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to users, files,
-refresh/reset/verification tokens, jobs, and audit events, adds tenant-leading
-indexes, and scopes the last-admin trigger per tenant. A database deployed
-before this change does **not** receive those objects from the edited baseline.
-Create the next numbered migration above its recorded version (or apply
-reviewed DDL manually) that:
+notifications, notification preferences, refresh/reset/verification tokens,
+jobs, and audit events, adds tenant-leading indexes, and scopes the last-admin
+trigger per tenant. A database deployed before this change does **not** receive
+those objects from the edited baseline. Create the next numbered migration
+above its recorded version (or apply reviewed DDL manually) that:
 
 1. creates `tenants` and inserts `('default','Default')` first so it gets id 1;
 2. adds/backfills the `tenant_id` columns (default 1) and foreign keys;
@@ -684,10 +719,13 @@ reviewed DDL manually) that:
    and a unique index on `users(tenant_id, id)` for tenant-safe user targets.
 
 Keep tenant id 1 as the compatibility anchor unless you also change the column
-defaults and backfill every row. After the upgrade, run `cmd/migrate`; it
-verifies the tenant table/columns/indexes, `tenant_id` on `jobs`,
-`audit_events`, and `feature_flag_targets`, the feature-flag tables/indexes,
-and the default tenant row.
+defaults and backfill every row. The notifications schema is additive:
+create `notifications` and `notification_preferences` with tenant/user
+columns, the feed/unread indexes, and the unique preference index. After the
+upgrade, run `cmd/migrate`; it verifies the tenant table/columns/indexes,
+`tenant_id` on `jobs`, `audit_events`, and `feature_flag_targets`, the
+feature-flag tables/indexes, the notification tables and unique preference
+index, and the default tenant row.
 
 `TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
 requests resolve to in local/test compatibility mode; `TENANT_REQUIRE_HEADER=true`

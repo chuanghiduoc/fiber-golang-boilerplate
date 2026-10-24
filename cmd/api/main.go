@@ -48,6 +48,10 @@ import (
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications"
+	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
+	notificationsrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
+	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
@@ -347,6 +351,18 @@ func main() {
 	apiKeySvc := apikeyservice.NewService(apiKeyRepo, principalReader, txManager)
 	apiKeyHandler := apikeyhandler.NewHandler(apiKeySvc)
 
+	// Notifications own their in-app feed and preferences. Identity supplies
+	// the email recipient through contracts.NotificationRecipientLookup, and
+	// queuedEmail writes the email channel job into the shared outbox.
+	notificationRepo := notificationsrepo.NewNotificationRepository(pool)
+	notificationSvc := notificationsservice.NewNotificationService(
+		notificationRepo,
+		identityadapter.NewNotificationRecipient(userRepo),
+		queuedEmail,
+		txManager,
+	)
+	notificationHandler := notificationshandler.New(notificationSvc)
+
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)
 
@@ -377,6 +393,7 @@ func main() {
 		features.New(featureHandler),
 		webhooks.New(webhookHandler),
 		apikeys.New(apiKeyHandler),
+		notifications.New(notificationHandler),
 	)
 
 	// Durable email worker. It shares the pool but runs outside the request

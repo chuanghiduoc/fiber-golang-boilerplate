@@ -18,6 +18,7 @@ internal/modules
   files        upload, metadata, download, soft delete, restore
                (dto/repository/service/handler + adapter + queries + generated sqlc)
   features     admin feature-flag catalogue surface
+  notifications in-app feed, channel preferences, durable email channel
                (dto/repository/service/handler + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
   webhooks     outbound endpoints/deliveries, inbound sources/events,
@@ -25,7 +26,8 @@ internal/modules
                (dto/repository/service/handler + queries + generated sqlc)
   apikeys      tenant-scoped API-key lifecycle (dto/repository/service/handler + adapter)
 internal/contracts  narrow cross-module interfaces (identity/files admin +
-                    principal reader + stdlib-only webhook event/dispatcher types)
+                    notification + principal reader + stdlib-only webhook
+                    event/dispatcher types)
 internal/platform
   apikey       key generation/hash, verifier, rotation grace, ApiKey middleware
   authz        subject/policies, permission catalog, ABAC + route middleware
@@ -67,6 +69,12 @@ route instead of on the `/webhooks` group, so `POST /webhooks/inbound/:id`
 bypasses JWT and tenant-header selection. The source row supplies the tenant and
 the source HMAC authenticates the caller.
 
+Notification creation follows the same flow for HTTP reads and preferences.
+Other modules call `contracts.Notifier`, and the notifications service resolves
+the recipient's email through `contracts.NotificationRecipientLookup`
+(implemented by identity). The service never imports identity or reads the
+`users` table.
+
 `tenant.Middleware` runs on the `/api/v1` and `/api/v2` groups, before module
 auth. It validates `[a-z0-9-]{1,63}`, resolves the slug (header; validated
 `?tenant=` fallback on `/auth/google`, `/auth/reset-password`, and
@@ -92,8 +100,9 @@ outside tenant resolution so they never depend on the `tenants` table.
   `TENANT_REQUIRE_HEADER=true`, so every HTTP write selects a tenant explicitly.
   Startup checks tenant existence regardless of status; a suspended default
   tenant starts normally and its requests return 404.
-- `tenant_id` is present on `users`, `files`, all identity/platform token,
-  job, audit, and `webhook_*` tables, with
+- `tenant_id` is present on `users`, `files`, `notifications`,
+  `notification_preferences`, `feature_flag_targets`, `webhook_*`, and all
+  identity/platform token, job, and audit tables, with
   `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
@@ -113,11 +122,18 @@ outside tenant resolution so they never depend on the `tenants` table.
   with `tenant_id`. The only unscoped lookup is the public receiver's source
   lookup by ID; it authenticates with the source HMAC and installs the source
   tenant before writing or auditing.
+- Notifications are tenant- and user-scoped. Every repository query filters
+  `(tenant_id, user_id)`, so a notification id from another tenant or another
+  user in the same tenant behaves as not found. Preferences use the same scope
+  and a unique `(tenant_id, user_id, type, channel)` index; a missing row means
+  both channels are enabled.
 - Durable jobs, events, and audit records propagate the resolved tenant:
   enqueue writes `jobs.tenant_id` from the context, the worker restores it with
   `tenant.WithID` before calling a handler, event metadata carries the
   publishing tenant/request/actor, and the audit middleware records the request
-  tenant. Job retention and job/event metrics stay global.
+  tenant. Job retention and job/event metrics stay global. Notification email
+  jobs are enqueued inside the notification transaction, so they inherit the
+  notification tenant.
 - The scheduler is a single global leader, not a tenant-scoped worker. Each
   schedule chooses a tenant in its spec; the enqueued job stores that tenant and
   the worker restores it like any other job. `scheduler_leases` and
@@ -218,6 +234,12 @@ outside tenant resolution so they never depend on the `tenants` table.
 - The public inbound receiver resolves its tenant from the source row and
   verifies HMAC over `<timestamp>.<raw-body>`; deduplication is unique per
   `(tenant, source, external_event_id)`. See [Webhooks](webhooks.md).
+- Notification creation is atomic when the email channel is enabled: the
+  in-app row and its email job commit or roll back together. A suppressed
+  notification (both channels disabled) writes nothing. If an email sender is
+  wired without transactional support, the service falls back to a
+  post-insert send; production wiring always uses the queued transactional
+  sender.
 
 ## Schema ownership
 
@@ -242,15 +264,22 @@ outside tenant resolution so they never depend on the `tenants` table.
   are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
   authoritative key for downloads. Moving a blob without updating that column
   (or vice versa) breaks the file.
-- `cmd/migrate` verifies required tenant tables/columns/indexes and that the
-  default tenant exists with id 1.
+- `notifications` and `notification_preferences` belong to the notifications
+  module. The feed index leads with `(tenant_id, user_id, created_at DESC,
+  id DESC)` and has a partial unread variant; the unique preference index makes
+  the upsert idempotent.
+- `cmd/migrate` verifies required tenant tables/columns/indexes (including
+  notifications and the unique preference index) and that the default tenant
+  exists with id 1.
 
 ## Cross-cutting conventions
 
 - **Authorization:** permissions live in `internal/platform/authz`; every route
   uses `authz.Require`. Roles are an implementation detail of the permission
-  matrix. Current legacy exceptions (`files` routes, some identity handler
-  checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
+  matrix. Notification routes use `notifications:read`/`notifications:write`;
+  sending to another user requires the admin-only `notifications:send`. Current
+  legacy exceptions (`files` routes, some identity handler checks) are listed in
+  the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** every privileged mutation is audited fail-closed. Tier 1 services
   (identity registration/profile/password/delete, admin role/ban/unban, admin
   file delete/restore) call `audit.TxRecorder.RecordTx` inside the same
@@ -289,8 +318,8 @@ outside tenant resolution so they never depend on the `tenants` table.
 
 ## Strangler status
 
-The migration is complete. `identity`, `files`, `admin`, and `webhooks` own
-their DTOs, repositories, services, and HTTP handlers under
+The migration is complete. `identity`, `files`, `notifications`, `admin`, and
+`webhooks` own their DTOs, repositories, services, and HTTP handlers under
 `internal/modules/<name>`; there are no shared legacy
 handler/service/DTO/repository packages or compatibility aliases.
 
@@ -301,11 +330,14 @@ module, its repository, generated SQL, storage, database transactions, or
 session store. Identity and files each own their half of the dashboard stats
 (`AdminUserStats` / `AdminFileStats`), so no cross-module SQL remains.
 
-`identity`, `files`, and `webhooks` own module-scoped `queries/` and generated
-`sqlc/` packages; `sqlc.yaml` has one block per module. There is no shared
-generated package, and no module imports another module's sqlc types. New code
-should start in `internal/modules/<name>/` and use contracts for cross-module
-reads; webhook producers use `internal/contracts/webhooks`.
+`identity`, `files`, `webhooks`, and `notifications` own module-scoped
+`queries/` and generated `sqlc/` packages; `sqlc.yaml` has one block per module.
+There is no shared generated package, and no module imports another module's
+sqlc types. Notifications exposes `contracts.Notifier` to other modules and
+consumes `contracts.NotificationRecipientLookup`, implemented by the identity
+adapter; neither direction imports module internals. New code should start in
+`internal/modules/<name>/` and use contracts for cross-module reads; webhook
+producers use `internal/contracts/webhooks`.
 
 ## Extension checklist
 

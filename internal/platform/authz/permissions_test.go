@@ -26,6 +26,8 @@ func TestPermissionsForRole_User(t *testing.T) {
 		PermissionFilesDelete,
 		PermissionFilesRestore,
 		PermissionSessionsRevoke,
+		PermissionNotificationsRead,
+		PermissionNotificationsWrite,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("user has %d permissions, want %d: %v", len(got), len(want), got)
@@ -51,6 +53,7 @@ func TestPermissionsForRole_User(t *testing.T) {
 		PermissionAdminAPIKeysUpdate,
 		PermissionAdminAPIKeysRevoke,
 		PermissionAdminAPIKeysRotate,
+		PermissionNotificationsSend,
 	}
 	for _, permission := range denied {
 		if _, ok := got[permission]; ok {
