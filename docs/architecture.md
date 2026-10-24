@@ -67,8 +67,10 @@ client
 
 ## Cross-cutting conventions
 
-- **Authorization:** permissions live in `internal/platform/authz`; routes use
-  `authz.Require`. Roles are an implementation detail of the permission matrix.
+- **Authorization:** permissions live in `internal/platform/authz`; every route
+  uses `authz.Require`. Roles are an implementation detail of the permission
+  matrix. Current legacy exceptions (`files` routes, some identity handler
+  checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** successful mutating requests are recorded with actor, request ID,
   IP, and route. Explicit domain events use `audit.Recorder`.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
@@ -93,6 +95,10 @@ new code should start in `internal/modules/<name>/` and use contracts for
 cross-module reads.
 
 ## Extension checklist
+
+Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the canonical
+[Module Template](module-template.md) for the full layout, skeleton, and
+ownership rules. Short form:
 
 1. Create the module, tables, and queries; update the baseline for fresh
    installs (or add a numbered migration for deployed DBs).

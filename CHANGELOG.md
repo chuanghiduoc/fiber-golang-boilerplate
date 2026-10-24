@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- Canonical module template (`docs/module-template.md`) and Bash scaffold (`scripts/new-module.sh`): compile-safe `module.go`, handler/service/repository/DTO layout, route/permission/audit/idempotency conventions, table ownership and migration rules, cross-module contracts, tests, and an add-a-module checklist; the script validates lower_snake_case, rejects Go keywords/reserved directories, supports `--dry-run`, refuses overwrites, runs `gofmt` when available, and verifies the generated package with `go build`
+- Operations runbook (`docs/operations.md`): health/readiness, Prometheus metrics, structured logs and request IDs, job retry/dead-letter/retention/heartbeat/drain behavior with the JWT rotation caveat, idempotency/Redis TTLs and fail-open behavior, migration and legacy-upgrade guidance with backup/restore notes, Kubernetes ordering/HPA/NetworkPolicy/SMTP/S3/Redis caveats, and incident checklists for DB/Redis/SMTP/job backlog
 - Kubernetes production foundation under `deploy/k8s` (namespace, ConfigMap, Secret template, one-shot migration Job, Deployment, Service, HPA, PDB, NetworkPolicy, Ingress) and a GHCR multi-arch release workflow with semver/SHA tags, provenance/SBOM, and CI manifest validation
 - Modular-monolith composition root (`internal/app`) with module-owned route tables (`internal/modules/identity`, `files`, `admin`); platform packages for cross-cutting mechanics
 - Durable PostgreSQL job queue (`internal/platform/jobs`): transactional enqueue, `FOR UPDATE SKIP LOCKED` claiming, lease heartbeats with stale-lock reclamation, exponential backoff, dead-lettering, graceful drain; email delivery now runs through queued jobs. Password-reset and verification tokens are committed together with their `email.send` job via `QueuedSender.SendTx`, so an enqueue failure rolls the token back. Registration is atomic too: the user row, verification token, and `email.send` job commit in one transaction, and registration fails closed if the outbox write fails (no user is created). Resend-verification and email-change flows still provision their token and email separately after the account exists. Delivery is at-least-once, so handlers must be idempotent.
@@ -32,6 +34,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Moved the files repository and its SQL access into `internal/modules/files/repository`; `repository.Cursor` is now an alias of the neutral `pagination.DBCursor`, preserving cursor compatibility across the remaining legacy repositories
 
 ### Fixed
+- Kubernetes ConfigMap CORS now allows the `Idempotency-Key` request header and exposes `Idempotent-Replayed`, so browser idempotency works behind the template policy
 - `MemoryCache.Increment` now rejects non-integer values like Redis `INCR`, so an idempotency owner token is never mistaken for a free claim counter
 - Worker claim errors are retried with exponential backoff capped at 30s instead of terminating the worker (and the API process that hosts it)
 - Job heartbeat, success, and failure writes are fenced by `attempts`, so a worker whose lease was reclaimed cannot finish the job under its new owner

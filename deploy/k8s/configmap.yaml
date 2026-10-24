@@ -34,7 +34,8 @@ data:
   # Explicit origins only; "*" is rejected when APP_ENV=production.
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
-  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization,Idempotency-Key"
+  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed"
   CORS_ALLOW_CREDENTIALS: "false"
 
   # ---------------------------------------------------------------------------

@@ -118,11 +118,17 @@ golang-migrate CLI's `force 1`) instead of re-running the file.
 
 ## Adding a New Module
 
+Run `scripts/new-module.sh <name>` and follow
+[`docs/module-template.md`](docs/module-template.md). The runtime behavior of
+the resulting module is covered by [`docs/operations.md`](docs/operations.md).
+
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`
    (`Name`, `RegisterRoutes`). Keep the module's handler/service/repository/DTO
    inside that directory.
-2. Add permissions to `internal/platform/authz` and protect mutation routes
-   with `authz.Require(...)`.
+2. Add permissions to `internal/platform/authz` and protect every route with
+   `authz.Require(...)`. The legacy exceptions are documented in the
+   [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
+   do not copy them.
 3. Add queries in `queries/<name>.sql` and run `make sqlc-generate`.
 4. For a deployed DB, add a numbered migration; for this boilerplate's fresh
    installs, update the single init schema.
