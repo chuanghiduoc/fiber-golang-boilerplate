@@ -87,6 +87,12 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 				}
 				return apperror.NewConflict("request with this idempotency key is already in progress")
 			}
+			// The owner may have completed and released the lock between our
+			// failed increment and the held check. Re-check the response before
+			// failing open, otherwise a completed mutation could execute twice.
+			if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
+				return writeCachedResponse(c, cached, bodyHash)
+			}
 			slog.Warn("idempotency lock failed; proceeding without a lock",
 				slog.String("method", c.Method()),
 				slog.String("path", c.Path()),
@@ -113,8 +119,10 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 				slog.String("request_id", fiber.Locals[string](c, "request_id")),
 				slog.Any("error", err),
 			)
-			// The numeric claim is still ours; release it best-effort.
-			deleteLock(c, appCache, lockKey)
+			// Release only if the token write actually landed. If it did not,
+			// the numeric claim expires after the lock TTL instead of deleting a
+			// lock that another request may have acquired in the meantime.
+			releaseLock(c, appCache, lockKey, token)
 			return nextAndCache(c, appCache, responseKey, bodyHash)
 		}
 
@@ -197,17 +205,6 @@ func setLockToken(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byt
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheOpTimeout)
 	defer cancel()
 	return appCache.Set(ctx, lockKey, token, idempotencyLockTTL)
-}
-
-func deleteLock(c fiber.Ctx, appCache cache.Cache, lockKey string) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheOpTimeout)
-	defer cancel()
-	if err := appCache.Delete(ctx, lockKey); err != nil {
-		slog.Warn("idempotency lock cleanup failed; it will expire",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-	}
 }
 
 // releaseLock only deletes the lock when this request still owns it. When the
