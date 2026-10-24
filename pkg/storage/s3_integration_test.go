@@ -1,0 +1,147 @@
+//go:build integration
+
+package storage
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+)
+
+const (
+	seaweedImage     = "chrislusf/seaweedfs:4.48"
+	seaweedAccessKey = "testkey"
+	seaweedSecretKey = "testsecret"
+	seaweedS3Config  = `{"identities":[{"name":"app","credentials":[{"accessKey":"testkey","secretKey":"testsecret"}],"actions":["Admin","Read","Write","List","Tagging"]}]}`
+)
+
+// seaweedEndpoint returns a SeaweedFS S3 endpoint (host:port). Set
+// TEST_SEAWEEDFS_ENDPOINT to reuse a running gateway that accepts the test
+// credentials; otherwise a disposable container is started.
+func seaweedEndpoint(t *testing.T) string {
+	t.Helper()
+	if endpoint := os.Getenv("TEST_SEAWEEDFS_ENDPOINT"); endpoint != "" {
+		return endpoint
+	}
+
+	ctx := context.Background()
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        seaweedImage,
+			ExposedPorts: []string{"8333/tcp"},
+			Cmd:          []string{"server", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-dir=/data"},
+			Files: []testcontainers.ContainerFile{{
+				Reader:            strings.NewReader(seaweedS3Config),
+				ContainerFilePath: "/etc/seaweedfs/s3.json",
+				FileMode:          0o644,
+			}},
+			WaitingFor: wait.ForLog("Start Seaweed S3 API Server").WithStartupTimeout(90 * time.Second),
+		},
+		Started: true,
+	})
+	if err != nil {
+		t.Fatalf("start seaweedfs: %v", err)
+	}
+	t.Cleanup(func() { _ = container.Terminate(context.Background()) })
+
+	endpoint, err := container.PortEndpoint(ctx, "8333/tcp", "")
+	if err != nil {
+		t.Fatalf("seaweedfs endpoint: %v", err)
+	}
+	return endpoint
+}
+
+// newSeaweedStorage retries because the S3 gateway logs readiness slightly
+// before the filer accepts bucket operations.
+func newSeaweedStorage(t *testing.T, endpoint, bucket string) *S3Storage {
+	t.Helper()
+	cfg := config.StorageConfig{
+		Driver:      DriverSeaweedFS,
+		S3Endpoint:  endpoint,
+		S3Region:    "us-east-1",
+		S3Bucket:    bucket,
+		S3AccessKey: seaweedAccessKey,
+		S3SecretKey: seaweedSecretKey,
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		store, err := NewS3Storage(cfg)
+		if err == nil {
+			return store
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("NewS3Storage: %v", err)
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+func TestSeaweedFSStorageRoundTrip(t *testing.T) {
+	endpoint := seaweedEndpoint(t)
+	ctx := context.Background()
+
+	// The first construction creates the bucket; a second one must accept the
+	// existing bucket.
+	newSeaweedStorage(t, endpoint, "uploads-it")
+	store := newSeaweedStorage(t, endpoint, "uploads-it")
+
+	payload := []byte("hello seaweedfs")
+	// io.MultiReader is not seekable, exercising the buffered Put path; the
+	// bytes.Reader case exercises the direct seekable path.
+	readers := map[string]io.Reader{
+		"seekable":     bytes.NewReader(payload),
+		"non-seekable": io.MultiReader(bytes.NewReader(payload)),
+	}
+	for name, reader := range readers {
+		t.Run(name, func(t *testing.T) {
+			key := "1/1/" + strings.ReplaceAll(name, "-", "_") + ".txt"
+			if err := store.Put(ctx, key, reader, int64(len(payload)), "text/plain"); err != nil {
+				t.Fatalf("Put: %v", err)
+			}
+
+			body, err := store.Get(ctx, key)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			got, err := io.ReadAll(body)
+			_ = body.Close()
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("Get = %q, want %q", got, payload)
+			}
+
+			if err := store.Delete(ctx, key); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			if _, err := store.Get(ctx, key); err == nil {
+				t.Fatal("Get after Delete should fail")
+			}
+		})
+	}
+}
+
+func TestSeaweedFSStorageRejectsBadCredentials(t *testing.T) {
+	endpoint := seaweedEndpoint(t)
+	_, err := NewS3Storage(config.StorageConfig{
+		Driver:      DriverSeaweedFS,
+		S3Endpoint:  endpoint,
+		S3Region:    "us-east-1",
+		S3Bucket:    "uploads-denied",
+		S3AccessKey: seaweedAccessKey,
+		S3SecretKey: "wrong-secret",
+	})
+	if err == nil {
+		t.Fatal("NewS3Storage should fail with an invalid secret key")
+	}
+}

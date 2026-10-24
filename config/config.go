@@ -865,7 +865,7 @@ func (cfg *Config) Validate() error {
 		if cfg.Storage.LocalPath == "" {
 			return fmt.Errorf("STORAGE_LOCAL_PATH is required for local driver")
 		}
-	case "s3", "minio":
+	case "s3", "seaweedfs":
 		if cfg.Storage.S3Endpoint == "" {
 			return fmt.Errorf("STORAGE_S3_ENDPOINT is required for %s driver", cfg.Storage.Driver)
 		}
@@ -879,7 +879,7 @@ func (cfg *Config) Validate() error {
 			return fmt.Errorf("STORAGE_S3_BUCKET is required for %s driver", cfg.Storage.Driver)
 		}
 	default:
-		return fmt.Errorf("STORAGE_DRIVER must be one of: local, s3, minio (got %q)", cfg.Storage.Driver)
+		return fmt.Errorf("STORAGE_DRIVER must be one of: local, s3, seaweedfs (got %q)", cfg.Storage.Driver)
 	}
 
 	// Production-only safety rails. These would break local development

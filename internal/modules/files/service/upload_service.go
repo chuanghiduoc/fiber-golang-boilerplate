@@ -261,7 +261,7 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 
 	// The response body is streamed after the handler returns, at which point
 	// the request timeout context is canceled. Use a non-canceled context so
-	// S3/MinIO object reads do not fail mid-stream; the HTTP server still
+	// S3/SeaweedFS object reads do not fail mid-stream; the HTTP server still
 	// bounds the response lifetime.
 	reader, err := s.storage.Get(context.WithoutCancel(ctx), file.StoragePath)
 	if err != nil {
