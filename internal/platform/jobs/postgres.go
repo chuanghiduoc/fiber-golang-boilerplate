@@ -22,6 +22,13 @@ import (
 // requeued forever, which prevents poison jobs from crash-looping. The due CTE
 // locks candidate rows with SKIP LOCKED so concurrent workers never claim the
 // same job, and the UPDATE increments attempts at claim time.
+//
+// $4 (include) and $5 (exclude) are optional kind filters set by WithKinds and
+// WithExcludeKinds; NULL disables a filter. They only narrow the due CTE: the
+// expired-lease CTE stays global so any worker can recover a crashed job of
+// any kind (it is merely requeued, never executed by the wrong worker). The
+// last column is the queue lag (claim time minus run_at) computed by the
+// database clock, so the metric needs no extra query and no clock-skew math.
 const claimJobsSQL = `
 WITH expired AS (
     UPDATE jobs
@@ -44,6 +51,8 @@ due AS (
     FROM jobs
     WHERE status = 'queued'
       AND run_at <= now()
+      AND ($4::text[] IS NULL OR kind = ANY($4::text[]))
+      AND ($5::text[] IS NULL OR kind <> ALL($5::text[]))
     ORDER BY run_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT $1
@@ -56,7 +65,8 @@ SET status = 'running',
     updated_at = now()
 FROM due
 WHERE j.id = due.id
-RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts, j.trace_parent`
+RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts, j.trace_parent,
+          GREATEST(EXTRACT(EPOCH FROM (now() - j.run_at)), 0)::double precision`
 
 // heartbeatJobSQL renews the lease for a job that is still running under the
 // supplied worker and attempt. Matching attempts fences out a stale owner whose
@@ -105,6 +115,24 @@ WHERE id = $1
   AND attempts = $5
   AND status = 'running'`
 
+// releaseJobSQL requeues a job interrupted by worker shutdown and gives back
+// the attempt the claim consumed, so a drain on the final attempt cannot
+// dead-letter work that never got a fair run. The same locked_by/attempts
+// fence as failJobSQL applies; the next claim increments attempts again.
+const releaseJobSQL = `
+UPDATE jobs
+SET status = 'queued',
+    attempts = attempts - 1,
+    run_at = now(),
+    last_error = $3,
+    locked_at = NULL,
+    locked_by = NULL,
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2
+  AND attempts = $4
+  AND status = 'running'`
+
 // purgeTerminalJobsSQL deletes one batch of terminal rows older than the
 // retention window. Only succeeded and dead jobs are eligible: queued and
 // running jobs are live work and must never be removed by retention. The CTE
@@ -133,6 +161,9 @@ const purgeBatchSize = 1000
 // pgStore is the PostgreSQL implementation of store.
 type pgStore struct {
 	pool *pgxpool.Pool
+	// includeKinds and excludeKinds narrow claims; nil means no filter.
+	includeKinds []string
+	excludeKinds []string
 }
 
 var _ store = (*pgStore)(nil)
@@ -152,7 +183,7 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAf
 		staleAfter = defaultLeaseDuration
 	}
 
-	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, staleAfter.Seconds())
+	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, staleAfter.Seconds(), s.includeKinds, s.excludeKinds)
 	if err != nil {
 		return nil, fmt.Errorf("jobs: claim: %w", err)
 	}
@@ -164,11 +195,13 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAf
 			job         claimedJob
 			payload     string
 			traceParent *string
+			lagSeconds  float64
 		)
-		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts, &traceParent); err != nil {
+		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts, &traceParent, &lagSeconds); err != nil {
 			return nil, fmt.Errorf("jobs: scan claimed job: %w", err)
 		}
 		job.Payload = json.RawMessage(payload)
+		job.QueueLag = time.Duration(lagSeconds * float64(time.Second))
 		if traceParent != nil {
 			job.TraceParent = *traceParent
 		}
@@ -201,6 +234,20 @@ func (s *pgStore) Fail(ctx context.Context, id int64, workerID string, attempts 
 	tag, err := s.pool.Exec(ctx, failJobSQL, id, workerID, reason, retryAt, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: mark %d failed: %w", id, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)
+	}
+	return nil
+}
+
+func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error {
+	if s == nil || s.pool == nil {
+		return ErrNoPool
+	}
+	tag, err := s.pool.Exec(ctx, releaseJobSQL, id, workerID, reason, attempts)
+	if err != nil {
+		return fmt.Errorf("jobs: release %d: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%w: job %d worker %q attempt %d", ErrLeaseLost, id, workerID, attempts)

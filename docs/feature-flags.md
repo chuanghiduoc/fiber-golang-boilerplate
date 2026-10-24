@@ -10,23 +10,62 @@ service, and no new module-to-module imports.
 
 ## Catalog
 
-Only flags declared in `internal/platform/features/catalog.go` exist. Add a
-`Key` constant and a `Definition` before referencing the flag from environment
-configuration or the admin API. Unknown keys fail startup validation and
-return `404` from the admin API, so a typo cannot silently disable a feature.
+Only registered flags exist. Each module declares its flags in
+`internal/modules/<m>/catalog/flags.go` (a `features.Key` constant plus a
+`features.Definition`) and returns them from `FeatureFlags()`
+(`app.FlagProvider`); `app.RegisterCatalogs` registers them at startup, owned
+by the module, and fails on a key another module already owns. `config.Load`
+checks `FEATURE_FLAGS`/`FEATURE_FLAGS_FORCE_OFF` syntax only; `cmd/api` calls
+`cfg.FeatureFlags.ValidateKnownKeys()` right after registration, so unknown
+keys still fail startup, and the admin API returns `404` for them, so a typo
+cannot silently disable a feature.
 
 Current catalog:
 
-| Key | Compiled default | Purpose |
-| --- | --- | --- |
-| `user_registration` | `true` | Allow public registration. |
-| `email_verification` | `false` | Require email verification before authenticated actions. |
-| `google_oauth` | `false` | Expose Google OAuth login/callback. |
-| `file_uploads` | `true` | Allow authenticated file uploads. |
+| Key | Owner | Compiled default | Purpose |
+| --- | --- | --- | --- |
+| `user_registration` | identity | `true` | Allow public registration. |
+| `email_verification` | identity | `false` | Require email verification before authenticated actions. |
+| `google_oauth` | identity | `true` | Expose Google OAuth login/callback. |
+| `file_uploads` | files | `true` | Allow authenticated file uploads. |
 
-These defaults describe the baseline behavior; using a flag to change a route
-is a product decision made by the owning module. The evaluator is available to
-every module through `app.Deps.Flags`:
+### Gates
+
+Each flag is enforced by its owning module with the request subject
+(tenant, plus the user when one is known), so tenant/user targets apply:
+
+| Key | Enforced at | Subject | When off |
+| --- | --- | --- | --- |
+| `user_registration` | `POST /auth/register` (handler) | request tenant | `404 feature.disabled` |
+| `google_oauth` | `GET /auth/google` and `GET /auth/google/callback` (handler) | redirect: resolved tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
+| `file_uploads` | `POST /files/upload` (route middleware after auth, before idempotency/audit) | request tenant + JWT user | `404 feature.disabled` |
+| `email_verification` | `POST /auth/login`, `POST /auth/refresh` | user's tenant + user | when **on**, unverified users get `403 auth.email_not_verified` |
+
+- `email_verification` is a requirement, not a route gate. It is OR-ed with
+  `REQUIRE_EMAIL_VERIFICATION`: the flag can add the requirement for a tenant
+  or user but never lifts the configured one. Like the config, it is checked
+  when tokens are minted (login/refresh); already-issued access tokens stay
+  valid until they expire.
+- `google_oauth` defaults to **on** so existing deployments keep working;
+  Google credentials (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`) remain the
+  real switch. Disable it globally or per tenant to return
+  `404 feature.disabled`.
+- Google sign-up of a *new* user is not yet gated by `user_registration`: the
+  find-or-create decision lives in the identity service. Use `google_oauth`
+  to disable Google sign-in entirely for a tenant.
+
+`feature.disabled` is a `404`: a disabled feature behaves like an absent
+route (consistent with "Google OAuth not configured"), and the stable code
+lets clients distinguish it from a mistyped URL. `403` was rejected because it
+implies a permission problem the caller could fix by changing role.
+
+Platform helpers: `features.Require(ctx, evaluator, key, subject)` returns the
+typed error, and `features.Middleware(evaluator, key)` gates a route using the
+request tenant and `user_id` local. A nil evaluator uses compiled defaults
+only, so an unwired gate fails closed for default-off flags.
+
+Using a flag to change a route is a product decision made by the owning
+module. The evaluator is available to every module through `app.Deps.Flags`:
 
 ```go
 enabled := deps.Flags.Enabled(
@@ -49,7 +88,9 @@ Evaluation stops at the first matching source, highest first:
 3. **User target** — `feature_flag_targets` row for `(flag, tenant, user)`.
 4. **Tenant target** — `feature_flag_targets` row for `(flag, tenant)` with
    `user_id IS NULL`.
-5. **Database default** — `feature_flags.enabled`.
+5. **Database default** — `feature_flags.enabled` when it is not NULL. A row
+   with a NULL default (created to anchor targets or to carry a kill switch)
+   falls through to the environment.
 6. **Environment** — `FEATURE_FLAGS` assignment.
 7. **Compiled default** — `Definition.Default`.
 
@@ -76,11 +117,17 @@ fall back to the defaults (useful for tests that build `Config` literals).
 Both tables are created by the fresh-install baseline `000001_init_schema`:
 
 - `feature_flags` is process-wide configuration: `flag_key` primary key,
-  `enabled` (database default), `kill_switch`, `description`, timestamps.
+  nullable `enabled` (database default; NULL = none), `kill_switch`,
+  `description`, timestamps.
 - `feature_flag_targets` is tenant-owned: `flag_key`, `tenant_id`, nullable
   `user_id`, `enabled`, timestamps. A `(tenant_id, user_id)` composite foreign
   key references `users(tenant_id, id)`, so a target cannot point at a user in
-  another tenant. Deleting a flag cascades to its targets.
+  another tenant. `feature_flag_targets_flag_key_fk` references
+  `feature_flags(flag_key)` with `ON DELETE RESTRICT`: deleting a flag can never
+  wipe another tenant's targets.
+- A target upsert creates the parent flag row in the same statement when it is
+  missing, with `enabled = NULL`, so a tenant can target a flag no platform
+  admin has configured without forcing a default on every other tenant.
 
 Partial unique indexes allow one tenant-wide target and one target per user per
 flag:
@@ -101,12 +148,19 @@ The evaluator keeps one full snapshot in process memory:
   database query.
 - An expired snapshot triggers one reload; concurrent callers serialize behind
   the refresh lock and reuse the fresh result.
+- Loads are detached from the request context (`context.WithoutCancel`) and
+  bounded by a 5s timeout, so a client disconnect cannot fail a load for
+  everyone. A load that still returns `context.Canceled` is not counted as a
+  database failure and does not throttle the next reload.
 - If a reload fails, the last good snapshot is served only while it is no older
   than `FEATURE_FLAGS_MAX_STALENESS_SECONDS`. After that, evaluation falls back
   to force-off/environment/compiled defaults. Failed reloads are throttled for
   one TTL so an outage does not cause a query on every request.
 - The admin service calls `Evaluator.Invalidate` after every successful write,
-  so the writing replica sees the change immediately. Other replicas converge
+  so the writing replica sees the change immediately. Invalidate marks the
+  snapshot stale instead of dropping it: the next evaluation reloads, and if
+  that reload fails the previous snapshot remains the fallback (so a database
+  blip right after a write cannot lift a kill switch). Other replicas converge
   within the cache TTL; there is no pub/sub dependency.
 
 Force-off is checked before any snapshot lookup, so an operator can disable a
@@ -116,30 +170,43 @@ flag even while the database is unavailable.
 
 All routes require a JWT and are mounted under `/api/v1/admin/features`.
 `admin:features:read` guards reads; `admin:features:write` guards mutations.
-Mutating routes accept `Idempotency-Key` through the normal middleware.
+Mutating routes accept `Idempotency-Key` through the normal middleware and then
+run behind a required `audit.Guard` (fail-closed: an unavailable audit store
+returns `503 system.audit_unavailable` before the write).
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/flags` | List every catalog flag with database default, kill switch, configured state, and the caller's effective value/source. |
 | GET | `/flags/{key}` | Flag plus tenant targets. |
-| PUT | `/flags/{key}` | Upsert the database default, kill switch, and description (description defaults to the existing value or catalog description). |
-| DELETE | `/flags/{key}` | Delete the database row and cascade its targets; the flag reverts to env/compiled defaults. Idempotent for a valid catalog key. |
+| PUT | `/flags/{key}` | Platform tenant only. Upsert the database default, kill switch, and description (description defaults to the existing value or catalog description). Omitting `enabled` stores NULL (no database default). |
+| DELETE | `/flags/{key}` | Platform tenant only. Delete the database row; the flag reverts to env/compiled defaults. Idempotent for a valid catalog key; `409` while targets exist in any tenant. |
 | GET | `/flags/{key}/targets` | List tenant-wide and user targets in the request tenant. |
 | PUT | `/flags/{key}/targets` | Upsert a target. Omit `userId` for a tenant-wide target; include it for a user target. The tenant always comes from context, never the body. |
 | DELETE | `/flags/{key}/targets/{id}` | Delete a target by ID, scoped to the request tenant and flag key. |
 
-`enabled` and `killSwitch` are required on `PUT /flags/{key}`; `enabled` is
-required on `PUT .../targets`. Requests reject unknown JSON fields. A user
-target whose user is not in the request tenant returns `400` (composite FK).
+`killSwitch` is required on `PUT /flags/{key}`; `enabled` is required on
+`PUT .../targets`. Requests reject unknown JSON fields. A user target whose
+user is not in the request tenant returns `400` (composite FK); a target upsert
+that races a concurrent flag delete returns `409`.
 
-Flag definitions are process-wide; targets are tenant-scoped. An administrator
-of any tenant can change the global default/kill switch because deployments
-are expected to treat back-office admins as trusted operators. Use
-tenant/user targets for per-tenant rollout.
+Flag rows are process-wide; targets are tenant-scoped. `PUT`/`DELETE
+/flags/{key}` change behavior for every tenant, so they are allowed only for
+administrators of the platform tenant (the compatibility tenant, id 1, read
+strictly from the request context without the `EffectiveID` fallback). Any
+other tenant's admin gets `403 permission.denied` and keeps read access and
+management of its own tenant/user targets. `DELETE /flags/{key}` relies on the
+RESTRICT foreign key (not a count-then-delete check), so a target created
+concurrently in any tenant still blocks it; the `409` never names the tenants
+that own targets. Use tenant/user targets for per-tenant rollout.
 
-Successful mutations enrich the generic audit event with non-secret metadata:
-`feature`, `enabled`, `killSwitch`, `source`, and, for targets, `targetId` and
-`userId`. The flag key is also used as the audit resource ID.
+Audit: each mutation writes a required Guard intent row
+(`admin.feature_flag.updated`, `admin.feature_flag.deleted`,
+`admin.feature_flag_target.updated`, `admin.feature_flag_target.deleted`) and
+completes it with the outcome. After a successful write the service records a
+domain event with the same action, linked to the intent, carrying non-secret
+metadata: `feature`, `enabled` (omitted when NULL), `killSwitch`, `source`,
+and, for targets, `targetId`, `enabled`, and `userId`. The resource ID is the
+flag key or the target ID.
 
 ## Metrics
 
@@ -165,8 +232,10 @@ serving defaults instead of database state.
   kill switch through the admin API). Force-off does not depend on the database.
 - To roll out by tenant, leave the database default off and add tenant/user
   targets.
-- Rotating or deleting a flag row is safe: evaluation falls back to environment
-  and compiled defaults. The catalog is code, so removing a key from the catalog
+- Deleting a flag row is safe once its targets are removed (the API returns
+  `409` until then): evaluation falls back to environment and compiled
+  defaults. To clear only the database default while targets remain, `PUT` the
+  flag without `enabled`. The catalog is code, so removing a key from the catalog
   makes any remaining database row unreachable; delete the row during the same
   release.
 - The evaluator never writes DDL and the API never migrates. Run
@@ -175,11 +244,16 @@ serving defaults instead of database state.
 ## Tests
 
 - `internal/platform/features`: catalog/parsing, every precedence layer,
-  tenant scoping, TTL expiry, invalidation, stale serving, max staleness, and
-  in-flight invalidation.
+  NULL database defaults and targets without a row, tenant scoping, TTL expiry,
+  invalidation (with stale fallback), detached/canceled loads, stale serving,
+  max staleness, in-flight invalidation, and the `Require`/`Middleware` gates.
 - `internal/modules/features/{service,handler}`: catalog merge, target tenant
-  scoping, idempotent delete, validation, audit metadata, permissions, and
-  route-level idempotency.
+  scoping, platform-tenant restriction, idempotent delete and `409` conflicts,
+  validation, audit domain events, permissions, route-level idempotency, and
+  fail-closed audit guards.
+- `internal/modules/identity/handler/feature_gates_test.go` and
+  `internal/modules/files/module_test.go`: each gated key with tenant targets.
 - `test/integration/feature_flags_test.go`: fresh-schema SQL, admin lifecycle,
-  tenant/user precedence, cross-tenant rejection, audit metadata, and
+  tenant/user precedence, cross-tenant rejection, platform-tenant 403, RESTRICT
+  409, targets without a database default, audit metadata/intents, and
   permission enforcement.

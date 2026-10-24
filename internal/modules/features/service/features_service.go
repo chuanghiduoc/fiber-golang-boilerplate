@@ -1,21 +1,37 @@
 // Package service owns feature-flag administration rules. Evaluation
 // precedence and caching live in internal/platform/features; this service
-// validates compile-time keys, scopes targets to the request tenant, and
-// invalidates the local snapshot after a successful write.
+// validates compile-time keys, restricts process-wide flag writes to the
+// platform tenant, scopes targets to the request tenant, and invalidates the
+// local snapshot after a successful write.
 package service
 
 import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+)
+
+// Audit actions for the domain events written after each mutation. The
+// route-level audit.Guard intent row is the fail-closed record; these events
+// carry the flag-specific metadata and link to it through ParentID.
+const (
+	actionFlagUpdated   = "admin.feature_flag.updated"
+	actionFlagDeleted   = "admin.feature_flag.deleted"
+	actionTargetUpdated = "admin.feature_flag_target.updated"
+	actionTargetDeleted = "admin.feature_flag_target.deleted"
+	resourceFlag        = "feature_flag"
+	resourceTarget      = "feature_flag_target"
 )
 
 // Service is the feature-flag administration surface.
@@ -32,6 +48,7 @@ type Service interface {
 type service struct {
 	repository Repository
 	flags      features.Evaluator
+	audit      audit.Recorder
 }
 
 // Repository is the persistence surface the service needs.
@@ -46,12 +63,16 @@ type Repository interface {
 }
 
 // New returns a service. A nil evaluator falls back to compiled/environment
-// defaults so tests and minimal deployments stay nil-safe.
-func New(repository Repository, flags features.Evaluator) Service {
+// defaults and a nil recorder discards domain events, so tests and minimal
+// deployments stay nil-safe.
+func New(repository Repository, flags features.Evaluator, recorder audit.Recorder) Service {
 	if flags == nil {
 		flags = features.NewEvaluator(features.Options{})
 	}
-	return &service{repository: repository, flags: flags}
+	if recorder == nil {
+		recorder = audit.Noop{}
+	}
+	return &service{repository: repository, flags: flags, audit: recorder}
 }
 
 func (s *service) ListFlags(ctx context.Context, subject features.Subject) ([]featuresdto.FlagResponse, error) {
@@ -103,8 +124,11 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	if err != nil {
 		return nil, err
 	}
-	if req.Enabled == nil || req.KillSwitch == nil {
-		return nil, apperror.NewBadRequest("enabled and killSwitch are required")
+	if err := requirePlatformTenant(ctx); err != nil {
+		return nil, err
+	}
+	if req.KillSwitch == nil {
+		return nil, apperror.NewBadRequest("killSwitch is required")
 	}
 
 	description := def.Description
@@ -112,16 +136,22 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	if err != nil {
 		return nil, err
 	}
-	if configured {
+	if configured && existing.Description != "" {
 		description = existing.Description
 	}
 	if req.Description != nil {
 		description = *req.Description
 	}
 
+	// A nil Enabled stores NULL: the row keeps its kill switch and targets but
+	// has no database default, so environment/compiled defaults apply.
+	enabled := pgtype.Bool{}
+	if req.Enabled != nil {
+		enabled = pgtype.Bool{Bool: *req.Enabled, Valid: true}
+	}
 	row, err := s.repository.UpsertFlag(ctx, featuressqlc.UpsertFeatureFlagParams{
 		FlagKey:     key,
-		Enabled:     *req.Enabled,
+		Enabled:     enabled,
 		KillSwitch:  *req.KillSwitch,
 		Description: description,
 	})
@@ -131,6 +161,15 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	s.invalidate(ctx)
 
 	resp := s.flagResponse(ctx, def, &row, subject)
+	metadata := map[string]any{
+		"feature":    resp.Key,
+		"killSwitch": resp.KillSwitch,
+		"source":     resp.Source,
+	}
+	if row.Enabled.Valid {
+		metadata["enabled"] = row.Enabled.Bool
+	}
+	s.recordEvent(ctx, actionFlagUpdated, resourceFlag, key, metadata)
 	return &resp, nil
 }
 
@@ -138,10 +177,16 @@ func (s *service) DeleteFlag(ctx context.Context, key string) error {
 	if _, err := lookup(key); err != nil {
 		return err
 	}
+	if err := requirePlatformTenant(ctx); err != nil {
+		return err
+	}
+	// Targets reference the flag with ON DELETE RESTRICT; the repository maps
+	// that violation to 409 without naming the tenants that own them.
 	if err := s.repository.DeleteFlag(ctx, key); err != nil && !errors.Is(err, apperror.ErrNotFound) {
 		return err
 	}
 	s.invalidate(ctx)
+	s.recordEvent(ctx, actionFlagDeleted, resourceFlag, key, map[string]any{"feature": key})
 	return nil
 }
 
@@ -179,6 +224,15 @@ func (s *service) UpsertTarget(ctx context.Context, key string, req featuresdto.
 	s.invalidate(ctx)
 
 	resp := toTargetResponse(target)
+	metadata := map[string]any{
+		"feature":  resp.FlagKey,
+		"targetId": resp.ID,
+		"enabled":  resp.Enabled,
+	}
+	if resp.UserID != nil {
+		metadata["userId"] = *resp.UserID
+	}
+	s.recordEvent(ctx, actionTargetUpdated, resourceTarget, strconv.FormatInt(resp.ID, 10), metadata)
 	return &resp, nil
 }
 
@@ -193,6 +247,20 @@ func (s *service) DeleteTarget(ctx context.Context, key string, id int64) error 
 		return err
 	}
 	s.invalidate(ctx)
+	s.recordEvent(ctx, actionTargetDeleted, resourceTarget, strconv.FormatInt(id, 10),
+		map[string]any{"feature": key, "targetId": id})
+	return nil
+}
+
+// requirePlatformTenant restricts process-wide flag rows (database default,
+// kill switch, delete) to administrators of the compatibility tenant: those
+// writes change behavior for every tenant. The strict context lookup (no
+// EffectiveID fallback) fails closed when the tenant was never resolved.
+func requirePlatformTenant(ctx context.Context) error {
+	if tenant.IDFromContext(ctx) != tenant.DefaultID {
+		return apperror.NewCode(apperror.CodePermissionDenied,
+			"global feature flag changes require a platform tenant administrator")
+	}
 	return nil
 }
 
@@ -215,6 +283,21 @@ func (s *service) invalidate(ctx context.Context) {
 	}
 }
 
+// recordEvent writes the post-commit domain event. It cannot roll the
+// committed write back, so a failure is logged; the route's required
+// audit.Guard intent row still records the mutation and its outcome.
+func (s *service) recordEvent(ctx context.Context, action, resource, resourceID string, metadata map[string]any) {
+	event := audit.NewServiceEvent(ctx, action, resource)
+	event.ResourceID = resourceID
+	event.Metadata = metadata
+	if err := s.audit.Record(ctx, event); err != nil {
+		slog.Warn("failed to record feature flag audit event",
+			slog.String("action", action),
+			slog.Any("error", err),
+		)
+	}
+}
+
 func (s *service) flagResponse(ctx context.Context, def features.Definition, row *featuressqlc.FeatureFlag, subject features.Subject) featuresdto.FlagResponse {
 	resp := featuresdto.FlagResponse{
 		Key:         string(def.Key),
@@ -223,10 +306,16 @@ func (s *service) flagResponse(ctx context.Context, def features.Definition, row
 		Configured:  false,
 	}
 	if row != nil {
-		resp.Description = row.Description
-		resp.Enabled = row.Enabled
+		if row.Description != "" {
+			resp.Description = row.Description
+		}
 		resp.KillSwitch = row.KillSwitch
-		resp.Configured = true
+		// A row without a database default (created to anchor targets or a
+		// kill switch) is not "configured": the compiled default is shown.
+		if row.Enabled.Valid {
+			resp.Enabled = row.Enabled.Bool
+			resp.Configured = true
+		}
 		resp.CreatedAt = timePtr(row.CreatedAt)
 		resp.UpdatedAt = timePtr(row.UpdatedAt)
 	}

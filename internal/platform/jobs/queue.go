@@ -26,8 +26,8 @@ RETURNING id`
 // The conflict target matches idx_jobs_tenant_idempotency_key, including its
 // partial predicate, so PostgreSQL can infer the unique index.
 const enqueueOnceSQL = `
-INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts, idempotency_key, created_at, updated_at)
-VALUES ($1, $2, $3::jsonb, 'queued', $4, $5, $6, now(), now())
+INSERT INTO jobs (tenant_id, kind, payload, trace_parent, status, run_at, max_attempts, idempotency_key, created_at, updated_at)
+VALUES ($1, $2, $3::jsonb, NULLIF($4, ''), 'queued', $5, $6, $7, now(), now())
 ON CONFLICT (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL
 DO NOTHING
 RETURNING id`
@@ -148,6 +148,7 @@ func insertJobOnce(ctx context.Context, db queryRower, job Job) (id int64, creat
 		job.TenantID,
 		job.Kind,
 		string(job.Payload),
+		tracing.CaptureRemoteContext(ctx),
 		job.RunAt,
 		job.MaxAttempts,
 		job.IdempotencyKey,

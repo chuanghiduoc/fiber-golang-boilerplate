@@ -34,7 +34,7 @@ func newTracingTestApp(t *testing.T) (*fiber.App, *tracetest.SpanRecorder) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(provider, []string{"/healthz", "/readyz", "/health", "/metrics"}))
+	app.Use(Tracing(provider, []string{"/healthz", "/readyz", "/health", "/metrics"}, true))
 	return app, recorder
 }
 
@@ -98,6 +98,50 @@ func TestTracingMiddlewareExtractsW3CTraceParent(t *testing.T) {
 	assert.Equal(t, parentSpanID, span.Parent().SpanID().String())
 	assert.True(t, span.Parent().IsRemote())
 	assert.True(t, span.SpanContext().IsSampled())
+}
+
+func TestTracingMiddlewareIgnoresUntrustedTraceParent(t *testing.T) {
+	const (
+		traceID     = "4bf92f3577b34da6a3ce929d0e0e4736"
+		traceparent = "00-" + traceID + "-00f067aa0ba902b7-01"
+	)
+	cases := map[string]struct {
+		cfg           fiber.Config
+		trustIncoming bool
+	}{
+		"flag disabled": {cfg: fiber.Config{}, trustIncoming: false},
+		// app.Test connects from 0.0.0.0, which is not in the allowlist.
+		"peer is not a trusted proxy": {cfg: fiber.Config{
+			TrustProxy:       true,
+			TrustProxyConfig: fiber.TrustProxyConfig{Proxies: []string{"10.0.0.1"}},
+		}, trustIncoming: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			recorder := tracetest.NewSpanRecorder()
+			provider := sdktrace.NewTracerProvider(
+				sdktrace.WithSpanProcessor(recorder),
+				sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			)
+			t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+			tc.cfg.ErrorHandler = apperror.FiberErrorHandler
+			app := fiber.New(tc.cfg)
+			app.Use(Tracing(provider, nil, tc.trustIncoming))
+			app.Get("/traced", func(c fiber.Ctx) error { return c.SendString("ok") })
+
+			req, _ := http.NewRequest("GET", "/traced", http.NoBody)
+			req.Header.Set("traceparent", traceparent)
+			resp, err := app.Test(req)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			ended := recorder.Ended()
+			require.Len(t, ended, 1)
+			assert.NotEqual(t, traceID, ended[0].SpanContext().TraceID().String())
+			assert.False(t, ended[0].Parent().IsValid(), "untrusted traceparent must not become the parent")
+		})
+	}
 }
 
 func TestTracingMiddlewareSkipsExcludedPaths(t *testing.T) {
@@ -214,7 +258,7 @@ func TestTracingMiddlewareUnmatchedRouteDoesNotUseRawPath(t *testing.T) {
 func TestTracingMiddlewareNilProviderIsSafe(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(nil, nil))
+	app.Use(Tracing(nil, nil, false))
 	app.Get("/ok", func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	req, _ := http.NewRequest("GET", "/ok", http.NoBody)
@@ -258,7 +302,7 @@ func TestLoggerAddsTraceIdentifiers(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(provider, nil))
+	app.Use(Tracing(provider, nil, false))
 	app.Use(Logger())
 	app.Get("/logged", func(c fiber.Ctx) error { return c.SendString("ok") })
 

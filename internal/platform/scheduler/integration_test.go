@@ -56,11 +56,11 @@ func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	const tenantTwo int64 = 2
-	_, err := pool.Exec(ctx,
-		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'scheduler-tenant-2', 'Scheduler Tenant 2')`,
-		tenantTwo,
-	)
+	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
+	var tenantTwo int64
+	err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('scheduler-tenant-2', 'Scheduler Tenant 2') RETURNING id`,
+	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
 	store := newPGStore(pool)
@@ -130,6 +130,67 @@ func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
 	purged, err := store.PurgeRuns(ctx, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), purged)
+}
+
+// TestSchedulerIntegrationPurgeKeepsLatestSlot reproduces a ledger purge that
+// deleted a sparse schedule's only (newest) row: the scheduler then treated the
+// schedule as never-run and re-enqueued the already executed slot.
+func TestSchedulerIntegrationPurgeKeepsLatestSlot(t *testing.T) {
+	pool := setupSchedulerIntegrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const name = "integration.yearly"
+	_, err := pool.Exec(ctx, `
+		INSERT INTO scheduler_runs (schedule, scheduled_for, status, created_at)
+		VALUES ($1, '2025-01-01T00:00:00Z', 'enqueued', now() - interval '400 days'),
+		       ($1, '2026-01-01T00:00:00Z', 'enqueued', now() - interval '60 days')`,
+		name)
+	require.NoError(t, err)
+
+	registry := NewRegistry()
+	require.NoError(t, registry.Register(Spec{
+		Name:     name,
+		Cron:     "@yearly",
+		Kind:     "integration.scheduler.yearly",
+		TenantID: tenant.DefaultID,
+	}))
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	sched := New(pool, registry, jobs.NewQueue(pool), "integration-node-purge",
+		WithPollInterval(10*time.Millisecond),
+		WithHeartbeatInterval(50*time.Millisecond),
+		WithLeaseTTL(time.Second),
+		WithCatchup(CatchupLatest),
+		WithRetention(30*24*time.Hour),
+		WithPurgeInterval(time.Nanosecond),
+		WithClock(func() time.Time { return now }),
+	)
+
+	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- sched.Run(runCtx) }()
+
+	require.Eventually(t, func() bool {
+		var count int
+		err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM scheduler_runs WHERE schedule = $1`, name).Scan(&count)
+		return err == nil && count == 1
+	}, 5*time.Second, 20*time.Millisecond, "the older row must be purged")
+	// Let several poll+purge cycles pass on the purged ledger.
+	time.Sleep(200 * time.Millisecond)
+	stop()
+	require.NoError(t, <-done)
+
+	var (
+		slot     time.Time
+		jobCount int
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT scheduled_for FROM scheduler_runs WHERE schedule = $1`, name).Scan(&slot))
+	assert.True(t, slot.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)), "the newest slot must survive retention")
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = 'integration.scheduler.yearly'`).Scan(&jobCount))
+	assert.Zero(t, jobCount, "an already executed slot must not be re-enqueued")
 }
 
 func TestSchedulerIntegrationSingleLeaderEnqueuesOnce(t *testing.T) {

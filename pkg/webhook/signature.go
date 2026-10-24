@@ -1,9 +1,13 @@
 // Package webhook implements outbound webhook signing, SSRF-safe delivery,
 // retry classification, and inbound signature verification.
 //
-// Signatures use HMAC-SHA256 over "<unix-timestamp>.<raw-body>" and are sent as
-// "v1=<hex>" in X-Webhook-Signature. Verifiers must reject timestamps outside a
-// configured tolerance so a captured request cannot be replayed forever.
+// Signatures use HMAC-SHA256 over
+// "<X-Webhook-Id>.<unix-timestamp>.<X-Webhook-Event>.<raw-body>" and are sent
+// as "v1=<hex>" in X-Webhook-Signature. Binding the id and event type means a
+// captured request cannot be replayed under a fresh id to slip past
+// id-based deduplication, nor relabeled as another event. Verifiers must also
+// reject timestamps outside a configured tolerance so a captured request
+// cannot be replayed forever.
 package webhook
 
 import (
@@ -47,6 +51,9 @@ var (
 	ErrMissingSignature = errors.New("webhook: signature header is missing")
 	// ErrInvalidSignature is returned when no signature authenticates the body.
 	ErrInvalidSignature = errors.New("webhook: signature is invalid")
+	// ErrMissingID is returned when the signed event id (X-Webhook-Id) is
+	// absent.
+	ErrMissingID = errors.New("webhook: id header is missing")
 	// ErrMissingTimestamp is returned when the timestamp header is absent.
 	ErrMissingTimestamp = errors.New("webhook: timestamp header is missing")
 	// ErrInvalidTimestamp is returned when the timestamp is not Unix seconds.
@@ -56,12 +63,18 @@ var (
 	ErrTimestampOutOfRange = errors.New("webhook: timestamp is outside the allowed tolerance")
 )
 
-// Sign returns the lowercase hex HMAC-SHA256 of "<timestamp>.<body>". The
-// timestamp is truncated to Unix seconds so it round-trips through the
-// X-Webhook-Timestamp header.
-func Sign(secret []byte, timestamp time.Time, body []byte) string {
+// Sign returns the lowercase hex HMAC-SHA256 of
+// "<id>.<timestamp>.<eventType>.<body>". The timestamp is truncated to Unix
+// seconds so it round-trips through the X-Webhook-Timestamp header. id and
+// eventType are the exact X-Webhook-Id and X-Webhook-Event header values; an
+// absent event header signs as the empty string.
+func Sign(secret []byte, id, eventType string, timestamp time.Time, body []byte) string {
 	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(id))
+	_, _ = mac.Write([]byte("."))
 	_, _ = mac.Write([]byte(strconv.FormatInt(timestamp.Unix(), 10)))
+	_, _ = mac.Write([]byte("."))
+	_, _ = mac.Write([]byte(eventType))
 	_, _ = mac.Write([]byte("."))
 	_, _ = mac.Write(body)
 	return hex.EncodeToString(mac.Sum(nil))
@@ -72,14 +85,17 @@ func SignatureHeader(signature string) string {
 	return SignaturePrefix + signature
 }
 
-// Verify checks a signature over body at timestamp against secret. A
-// non-positive tolerance uses DefaultTolerance. Multiple comma- or
+// Verify checks a signature over id, timestamp, eventType, and body against
+// secret. A non-positive tolerance uses DefaultTolerance. Multiple comma- or
 // whitespace-separated signatures are accepted so a sender can publish several
 // valid digests during a key transition; every candidate is compared in
 // constant time.
-func Verify(secret []byte, timestamp time.Time, signature string, body []byte, tolerance time.Duration, now time.Time) error {
+func Verify(secret []byte, id, eventType string, timestamp time.Time, signature string, body []byte, tolerance time.Duration, now time.Time) error {
 	if len(secret) == 0 {
 		return ErrEmptySecret
+	}
+	if id == "" {
+		return ErrMissingID
 	}
 	if tolerance <= 0 {
 		tolerance = DefaultTolerance
@@ -99,7 +115,7 @@ func Verify(secret []byte, timestamp time.Time, signature string, body []byte, t
 	if len(candidates) == 0 {
 		return ErrMissingSignature
 	}
-	expected := Sign(secret, timestamp, body)
+	expected := Sign(secret, id, eventType, timestamp, body)
 	for _, candidate := range candidates {
 		if hmac.Equal([]byte(candidate), []byte(expected)) {
 			return nil
@@ -108,10 +124,16 @@ func Verify(secret []byte, timestamp time.Time, signature string, body []byte, t
 	return ErrInvalidSignature
 }
 
-// VerifyRequest verifies the standard headers on an inbound request.
+// VerifyRequest verifies the standard headers on an inbound request. The id
+// and event type are taken verbatim from X-Webhook-Id and X-Webhook-Event, so
+// callers must use those same raw header values after verification.
 func VerifyRequest(secret []byte, headers http.Header, body []byte, tolerance time.Duration, now time.Time) error {
 	if len(secret) == 0 {
 		return ErrEmptySecret
+	}
+	id := headers.Get(HeaderID)
+	if id == "" {
+		return ErrMissingID
 	}
 	rawTimestamp := strings.TrimSpace(headers.Get(HeaderTimestamp))
 	if rawTimestamp == "" {
@@ -125,7 +147,7 @@ func VerifyRequest(secret []byte, headers http.Header, body []byte, tolerance ti
 	if strings.TrimSpace(signature) == "" {
 		return ErrMissingSignature
 	}
-	return Verify(secret, time.Unix(seconds, 0).UTC(), signature, body, tolerance, now)
+	return Verify(secret, id, headers.Get(HeaderEvent), time.Unix(seconds, 0).UTC(), signature, body, tolerance, now)
 }
 
 // splitSignatures extracts every v1 digest from a signature header. Unknown

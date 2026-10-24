@@ -22,6 +22,7 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -70,7 +71,7 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	principalReader := identityadapter.NewPrincipalReader(identityrepo.NewUserRepository(pool))
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, nil)
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, nil, audit.Noop{})
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	api := app.Group("/api/v1", tenant.Middleware(
@@ -102,7 +103,7 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	}
 }
 
-func (h *apiKeyHarness) request(t *testing.T, key, slug string) (*http.Response, []byte) {
+func (h *apiKeyHarness) request(t *testing.T, key, slug string) (res *http.Response, payload []byte) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, "/api/v1/protected/", http.NoBody)
 	require.NoError(t, err)

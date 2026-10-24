@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -19,14 +19,14 @@ const (
 // the current owner principal. Callers must not log Hash or the plaintext key.
 type Verified struct {
 	Key       Key
-	Principal contracts.Principal
+	Principal identitycontracts.Principal
 }
 
 // Verifier validates credentials against the store and binds them to the
 // current owner principal.
 type Verifier struct {
 	store           Store
-	principals      contracts.PrincipalReader
+	principals      identitycontracts.PrincipalReader
 	now             func() time.Time
 	touchInterval   time.Duration
 	lastUsedTimeout time.Duration
@@ -57,7 +57,7 @@ func WithLastUsedInterval(interval time.Duration) Option {
 // deployments; in that case the key's own tenant/user binding is used and the
 // principal role is left empty. Production always supplies the identity
 // adapter so bans and role changes take effect immediately.
-func NewVerifier(store Store, principals contracts.PrincipalReader, opts ...Option) *Verifier {
+func NewVerifier(store Store, principals identitycontracts.PrincipalReader, opts ...Option) *Verifier {
 	v := &Verifier{
 		store:           store,
 		principals:      principals,
@@ -77,7 +77,8 @@ func NewVerifier(store Store, principals contracts.PrincipalReader, opts ...Opti
 // tenant is authoritative otherwise, so non-default keys work without a header.
 //
 // Expired, revoked, malformed, unknown, or rotation-grace-expired keys fail
-// with 401. A missing owner account fails with 401 as well.
+// with 401. A missing owner account or a non-active owning tenant fails with
+// 401 as well.
 func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int64) (Verified, error) {
 	if v == nil || v.store == nil {
 		return Verified{}, apperror.NewUnauthorized("invalid API key")
@@ -113,7 +114,7 @@ func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int6
 		}
 	}
 
-	principal := contracts.Principal{
+	principal := identitycontracts.Principal{
 		ID:       key.UserID,
 		TenantID: key.TenantID,
 	}
@@ -124,6 +125,13 @@ func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int6
 				return Verified{}, apperror.NewUnauthorized("API key owner is not active")
 			}
 			return Verified{}, apperror.NewInternal("failed to verify API key owner")
+		}
+		// The JWT path rejects suspended tenants through the session store;
+		// keys must not outlive a tenant suspension either. The request tenant
+		// middleware cannot catch this because the key's tenant is
+		// authoritative and may differ from the header-less default.
+		if loaded.TenantStatus != identitycontracts.TenantStatusActive {
+			return Verified{}, apperror.NewUnauthorized("tenant is not active")
 		}
 		principal = loaded
 	}
@@ -144,8 +152,9 @@ func (v *Verifier) touchLastUsed(ctx context.Context, key Key, now time.Time) {
 	if key.LastUsedAt != nil && now.Sub(*key.LastUsedAt) < v.touchInterval {
 		return
 	}
-	// A last-used write must never add latency to authentication or fail the
-	// request when the database is briefly unavailable.
+	// The write is synchronous but throttled to once per touchInterval per key
+	// and bounded by lastUsedTimeout, so it adds at most that latency to one
+	// request per interval. A failure is logged and never fails the request.
 	touchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v.lastUsedTimeout)
 	defer cancel()
 	if err := v.store.TouchLastUsed(touchCtx, key.ID, now); err != nil {

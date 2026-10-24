@@ -47,8 +47,30 @@ contract changes; treat them as breaking unless additive.
 ```
 
 Pagination is forward-only: `limit` (1-100, default 20) + `startingAfter`.
-Cursors are opaque base64url `(created_at:id)`. Offset helpers are for small
-admin/export tables only.
+Cursors are opaque base64url `(created_at:id)`. Handlers build `nextCursor`
+with `pagination.NextCursor` from the last item's sort key. Offset helpers are
+for small admin/export tables only.
+
+## Update semantics
+
+Existing `PUT` routes keep their current, documented behavior:
+
+- **Partial update (pointer DTO fields):** `PUT /users/me`, `PUT /users/:id`
+  (`name`, `email`) and `PUT /admin/api-keys/:id` (`name`, `scopes`) change
+  only the fields present; omitted fields are left unchanged.
+- **Full replace:** `PUT /webhooks/endpoints/:id` and
+  `PUT /webhooks/inbound-sources/:id` require the full representation
+  (`url`/`status`, `name`/`slug`/`status`); omitted optional fields reset to
+  their defaults. `PUT /admin/features/flags/{key}` likewise replaces the
+  database default/kill switch/description, and the preference and target
+  `PUT`s are upserts.
+- **New modules:** use `PUT` only for full replacement and `PATCH` with
+  pointer (or explicitly nullable) fields for partial updates.
+- **RPC-style routes kept for compatibility:** `POST /files/upload` (multipart
+  create) and the `POST /admin/api-keys/:id/revoke` alias of
+  `DELETE /admin/api-keys/:id` stay as-is. New modules create with
+  `POST /<collection>` and model state transitions as sub-resource actions
+  only when no standard method fits.
 
 ## Errors (RFC 9457)
 
@@ -130,8 +152,13 @@ Rules:
   deny-overrides policy evaluation: deny maps to `403 permission.denied` and
   conceal maps to `404` so cross-tenant/foreign-owner resources are not
   disclosed.
-- `POST /auth/logout-all` revokes all refresh tokens and bumps the token
-  version, invalidating access tokens immediately.
+- Every authenticated module route accepts both credential types through one
+  chain (`app.Deps.Authenticate()`); the route's `authz.Require` decides
+  access, so an API key reaches a route only when its scopes include the
+  permission. The exception is `POST /auth/logout-all`, which is JWT-only.
+- `POST /auth/logout-all` requires `sessions:revoke` (every built-in role holds
+  it), revokes all refresh tokens, and bumps the token version, invalidating
+  access tokens immediately.
 
 ## Tenants
 
@@ -153,8 +180,14 @@ Rules:
   Zero or negative tenant claims are rejected with `401`.
 - An API key without an explicit header remains usable for its own tenant; an
   explicit header is only accepted when it resolves to the key's tenant. The
-  key owner is re-read on every successful authentication, so bans, deletions,
-  and role changes take effect immediately.
+  key owner and the owning tenant's status are re-read on every successful
+  authentication, so bans, deletions, role changes, and tenant suspensions
+  take effect immediately (`401`).
+- Slug resolution for `X-Tenant-Slug`/`?tenant=` is cached in-process
+  (`tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries
+  per process). Suspending a tenant therefore reaches header-resolved public
+  routes within 30s; authenticated JWT/API-key requests are rejected
+  independently by the session/API-key tenant-status checks.
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
   Login, registration, refresh, password reset, and email verification use the
   resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
@@ -215,8 +248,10 @@ Rules:
 - The scope includes the tenant ID and slug (plus user ID, or IP for public
   routes), so one key cannot replay a `201` across tenants.
 - Auth token-minting endpoints are excluded by design.
-- Secret-returning webhook creates are excluded so plaintext secrets are never
-  written to the shared response cache.
+- Secret-returning routes are excluded so plaintext secrets are never written
+  to the shared response cache: API-key create/rotate and webhook
+  endpoint/inbound-source create and `rotate-secret`. A retried rotation
+  rotates again and returns the newest secret.
 
 ## Audit and fail-closed behavior
 
@@ -253,8 +288,14 @@ Rules:
   `webhooks:read` / `webhooks:write` (`admin` role).
 - Endpoint create and inbound-source create return a plaintext `secret` once;
   reads never include it. Rotation returns the new secret once.
-  Secret-returning creates deliberately omit `Idempotency-Key` caching; all
-  other mutations accept it.
+  Secret-returning creates and `rotate-secret` deliberately omit
+  `Idempotency-Key` caching; update/delete/replay accept it.
+- Every administration mutation (endpoint/source create, update, delete,
+  rotate-secret, and delivery replay) is Tier 2: a required `audit.Guard`
+  intent row is written first, so an unavailable audit store returns
+  `503 system.audit_unavailable` without changing anything. The service's
+  domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`,
+  `webhook.delivery.replayed`) is recorded as a child of that intent.
 - Delivery list filters: `endpointId`, `status=pending|succeeded|dead`, plus
   cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the retained
   payload snapshot; list responses omit it.
@@ -287,16 +328,22 @@ Rules:
 - `PUT /admin/api-keys/:id` updates name/scopes, `DELETE /admin/api-keys/:id`
   or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent), and
   `POST /admin/api-keys/:id/rotate` issues a new secret while the old key stays
-  valid for 24 hours unless revoked.
+  valid for 24 hours unless revoked. Create, update, and rotate reject (`400`)
+  any key scope the caller does not hold, so an API-key caller cannot mint or
+  rotate a key broader than itself.
 - All routes are tenant-scoped and return `404` for another tenant's key id.
   Lifecycle mutations accept `Idempotency-Key`; create and rotate deliberately
   omit it so a plaintext secret is never written to the shared response cache.
-  Audit metadata carries `apiKeyId`/scope/rotation state, never the secret or
-  hash.
+  Every lifecycle mutation (create/update/revoke/rotate) is Tier 1 audited: the
+  service writes `api_key.created|updated|revoked|rotated` in the mutation
+  transaction, so if the audit row cannot be written the change rolls back and
+  the request fails with `503 system.audit_unavailable` (no secret is
+  returned). Re-revoking an already revoked key writes no second row. Audit
+  metadata never carries the secret or hash.
 
 ## Notifications
 
-All notification routes require a JWT and are scoped to the authenticated user
+All notification routes require a JWT or a scoped API key and are scoped to the authenticated user
 and request tenant. A notification id from another user or tenant returns
 `404`, never `403`.
 
@@ -310,9 +357,11 @@ and request tenant. A notification id from another user or tenant returns
 - `POST /notifications/read-all` marks every unread row and returns
   `{updated}`.
 - `POST /notifications/send` is the admin-only back-office send. It requires
-  `notifications:send` and targets a user in the request tenant. The response
-  carries `notification` (null when the in-app channel is disabled) and
-  `emailQueued`.
+  `notifications:send` and targets a user in the request tenant. It returns
+  `201` with `notification` (null when the in-app channel is disabled) and
+  `emailQueued`. It is Tier 2 audited: a required `audit.Guard` intent
+  (`notification.sent`) is written first, so an unavailable audit store
+  returns `503 system.audit_unavailable` and nothing is sent.
 
 Preferences are per `(user, tenant, type, channel)` with channels `in_app` and
 `email`:
@@ -323,8 +372,9 @@ Preferences are per `(user, tenant, type, channel)` with channels `in_app` and
   is a lower-case identifier (`^[a-z0-9][a-z0-9._-]*$`, max 100). The unique
   index makes the upsert idempotent.
 
-Writes use `Idempotency-Key`. Reads and preference updates are audited by the
-generic mutating-request middleware. When the email channel is enabled, the
+Writes use `Idempotency-Key`. The caller's own state changes (mark read,
+read-all, preference updates) are audited by the best-effort generic
+mutating-request middleware. When the email channel is enabled, the
 in-app row and the durable `email.send` job commit in one transaction; an
 enqueue failure returns `500` and leaves no in-app row. A notification is
 suppressed when both channels are disabled (create is a successful no-op; the
@@ -355,17 +405,22 @@ delivery is at-least-once.
   kill switch, configured marker, and the caller's effective value/source.
 - `GET /admin/features/flags/{key}` returns the flag and current-tenant targets.
 - `PUT /admin/features/flags/{key}` replaces the database default, kill switch,
-  and description. `enabled` and `killSwitch` are required.
-- `DELETE /admin/features/flags/{key}` removes the database row and cascades
-  targets, reverting to environment/compiled defaults; it is idempotent for a
-  valid catalog key.
+  and description. `killSwitch` is required; omitting `enabled` clears the
+  database default (NULL).
+- `DELETE /admin/features/flags/{key}` removes the database row, reverting to
+  environment/compiled defaults; it is idempotent for a valid catalog key and
+  returns `409` while any tenant still has a target for the flag.
+- Flag-row writes (`PUT`/`DELETE /flags/{key}`) are process-wide and allowed
+  only for admins of the platform tenant (id 1); other tenants get
+  `403 permission.denied`.
 - `GET`/`PUT /admin/features/flags/{key}/targets` list/upsert targets. Omit
   `userId` for a tenant-wide target; the tenant always comes from the request
   context. `DELETE .../targets/{id}` is scoped to the tenant and flag.
 - Reads require `admin:features:read`; mutations require
-  `admin:features:write` and accept `Idempotency-Key`. Flag definitions are
-  process-wide; targets are tenant-scoped. A user target from another tenant is
-  rejected with `400`.
+  `admin:features:write`, accept `Idempotency-Key`, and are wrapped by a
+  required `audit.Guard`. Targets are tenant-scoped. A user target from another
+  tenant is rejected with `400`.
+- A route gated by a disabled flag returns `404 feature.disabled`.
 
 ## Compatibility checklist
 
@@ -376,12 +431,14 @@ delivery is at-least-once.
 - New endpoint: additive.
 - New permission: additive; grant it deliberately.
 - New migration: fresh installs update the baseline; deployed DBs get a
-  numbered migration.
+  timestamped migration (`make migrate-create module=<owner> name=<purpose>`).
 - Tenant-aware behavior: sending/omitting `X-Tenant-Slug` must preserve the
   default tenant when omitted; changing tenant selection is breaking.
 
 ## References
 
-- Typed codes: `pkg/apperror/catalog.go`.
-- Permissions: `internal/platform/authz/permissions.go`.
+- Typed codes: platform-wide in `pkg/apperror/catalog.go`; module-owned in
+  `internal/modules/<m>/catalog/errors.go`.
+- Permissions: module-owned in `internal/modules/<m>/catalog/permissions.go`;
+  shared back-office permissions in `internal/platform/authz/permissions.go`.
 - Architecture: `docs/architecture.md`.

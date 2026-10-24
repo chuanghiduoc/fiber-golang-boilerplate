@@ -18,13 +18,17 @@ func effectiveStatus(c fiber.Ctx, err error) int {
 		return c.Response().StatusCode()
 	}
 
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fiber.StatusGatewayTimeout
-	}
-
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
 		return appErr.Status
+	}
+	// Mirror apperror's error handler precedence: an explicit AppError wins,
+	// then context errors.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fiber.StatusGatewayTimeout
+	}
+	if errors.Is(err, context.Canceled) {
+		return apperror.StatusClientClosedRequest
 	}
 	var fiberErr *fiber.Error
 	if errors.As(err, &fiberErr) {

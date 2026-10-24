@@ -15,6 +15,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -69,13 +70,14 @@ func setupOAuthIntegrationApp(t *testing.T, info *oauth.GoogleUserInfo) (*fiber.
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	txManager := database.NewTxManager(pool)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, nil)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, audit.Noop{})
 	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
 	authHandler := NewAuthHandler(
 		userSvc, refreshSvc, nil, nil, "oauth-integration-secret", 24, false,
 		&fakeGoogleOAuth{info: info}, tenantRepo,
 	)
 
+	authHandler.SetFeatureFlags(googleOAuthEnabled())
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	// require-header mode: defaultSlug is empty, so only a header or the
 	// validated browser `tenant` query can start a flow.
@@ -117,7 +119,7 @@ func TestOAuthIntegration_NonDefaultTenantStartAndCallback(t *testing.T) {
 	location, err := url.Parse(start.Header.Get("Location"))
 	require.NoError(t, err)
 	state := location.Query().Get("state")
-	_, stateTenantID, ok := decodeOAuthState(state)
+	_, stateTenantID, ok := decodeOAuthState(oauthStateKey("oauth-integration-secret"), state)
 	require.True(t, ok)
 	assert.Equal(t, h.activeID, stateTenantID)
 
@@ -168,7 +170,7 @@ func TestOAuthIntegration_CallbackRejectsSuspendedAndUnknownTenant(t *testing.T)
 		"unknown":   h.activeID + h.suspendedID + 1000,
 	} {
 		t.Run(name, func(t *testing.T) {
-			state := encodeOAuthState("nonce-"+name, tenantID)
+			state := encodeOAuthState(oauthStateKey("oauth-integration-secret"), "nonce-"+name, tenantID)
 			req := mustOAuthRequest(t, http.MethodGet,
 				"/api/v1/auth/google/callback?state="+url.QueryEscape(state)+"&code=test-code")
 			req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})

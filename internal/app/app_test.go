@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -16,8 +18,10 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -37,6 +41,15 @@ type flagModule struct {
 }
 
 func (m flagModule) Name() string { return "flag" }
+
+// FeatureFlags implements app.FlagProvider so Register adds the key to the
+// catalog before any request evaluates it.
+func (m flagModule) FeatureFlags() []features.Definition {
+	return []features.Definition{{Key: testFlagKey, Description: "app test flag", Default: true}}
+}
+
+const testFlagKey features.Key = "app_test_flag"
+
 func (m flagModule) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	v1.Get("/flag", func(c fiber.Ctx) error {
 		if m.enabled(deps) {
@@ -79,14 +92,14 @@ func TestAppProvidesNilSafeFeatureEvaluator(t *testing.T) {
 		CORS:         config.CORSConfig{AllowOrigins: "*"},
 		RateLimit:    config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
 		Tenant:       config.TenantConfig{DefaultSlug: "default"},
-		FeatureFlags: config.FeatureFlagsConfig{Flags: "file_uploads=false"},
+		FeatureFlags: config.FeatureFlagsConfig{Flags: "app_test_flag=false"},
 	}
 	application := app.New(cfg, app.Deps{})
 	application.Register(flagModule{enabled: func(deps app.Deps) bool {
 		if deps.Flags == nil {
 			t.Fatal("app.New must install a default feature evaluator")
 		}
-		return deps.Flags.Enabled(context.Background(), features.KeyFileUploads, features.Subject{})
+		return deps.Flags.Enabled(context.Background(), testFlagKey, features.Subject{})
 	}})
 
 	req, _ := http.NewRequest("GET", "/api/v1/flag", http.NoBody)
@@ -95,6 +108,77 @@ func TestAppProvidesNilSafeFeatureEvaluator(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, "false", string(body), "FEATURE_FLAGS must apply when Deps.Flags is nil")
+	assert.True(t, features.IsKnown(testFlagKey), "Register must add FlagProvider keys to the catalog")
+}
+
+// catalogModule exercises every catalog provider hook.
+type catalogModule struct {
+	name       string
+	permission authz.Permission
+	code       apperror.Code
+	flag       features.Key
+	locales    fstest.MapFS
+}
+
+func (m catalogModule) Name() string                          { return m.name }
+func (m catalogModule) RegisterRoutes(fiber.Router, app.Deps) {}
+func (m catalogModule) Permissions() []authz.Grant {
+	return []authz.Grant{{Permission: m.permission, Roles: []string{authz.RoleUser}}}
+}
+func (m catalogModule) ErrorCodes() map[apperror.Code]apperror.Spec {
+	return map[apperror.Code]apperror.Spec{m.code: {Status: 409, Title: "Gadget busy", DocPath: "/errors/gadget-busy"}}
+}
+func (m catalogModule) FeatureFlags() []features.Definition {
+	return []features.Definition{{Key: m.flag, Description: "gadget flag"}}
+}
+func (m catalogModule) Locales() fs.FS { return m.locales }
+
+func TestRegisterCatalogsWiresEveryProvider(t *testing.T) {
+	module := catalogModule{
+		name:       "gadgets",
+		permission: "gadgets:read",
+		code:       "gadget.busy",
+		flag:       "gadgets_beta",
+		locales: fstest.MapFS{
+			"en.json": {Data: []byte(`{"errors.gadget.busy.title": "Gadget busy"}`)},
+			"vi.json": {Data: []byte(`{"errors.gadget.busy.title": "Thiết bị bận"}`)},
+		},
+	}
+	require.NoError(t, app.RegisterCatalogs(module))
+	require.NoError(t, app.RegisterCatalogs(module), "re-registering the same module is a no-op")
+
+	assert.True(t, authz.Has(authz.RoleUser, "gadgets:read"))
+	assert.True(t, authz.Has(authz.RoleAdmin, "gadgets:read"), "admins receive every permission")
+	spec, ok := apperror.SpecFor("gadget.busy")
+	require.True(t, ok)
+	assert.Equal(t, 409, spec.Status)
+	assert.True(t, features.IsKnown("gadgets_beta"))
+
+	bundle, err := i18n.New("en", app.LocaleSources(module)...)
+	require.NoError(t, err)
+	assert.Equal(t, "Thiết bị bận", bundle.Translate("vi", "errors.gadget.busy.title", nil))
+}
+
+func TestRegisterCatalogsRejectsConflicts(t *testing.T) {
+	owner := catalogModule{name: "owner_mod", permission: "ownermod:read", code: "ownermod.busy", flag: "ownermod_beta"}
+	require.NoError(t, app.RegisterCatalogs(owner))
+
+	thief := owner
+	thief.name = "thief_mod"
+	err := app.RegisterCatalogs(thief)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already owned")
+
+	err = app.RegisterCatalogs(pingModule{}, pingModule{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "registered twice")
+
+	application := app.New(&config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}, app.Deps{})
+	assert.Panics(t, func() { application.Register(thief) }, "a catalog conflict at Register is a programming error")
 }
 
 func TestTenantMiddlewareRejectsUnknownHeader(t *testing.T) {

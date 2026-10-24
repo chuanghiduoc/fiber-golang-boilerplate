@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -590,7 +590,7 @@ func TestMetrics_Passthrough(t *testing.T) {
 
 func TestNewLimiter(t *testing.T) {
 	app := newTestApp()
-	app.Get("/test", NewLimiter(2, 60, "test"), func(c fiber.Ctx) error {
+	app.Get("/test", NewLimiter(2, 60, "test", nil), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -654,31 +654,11 @@ func TestEffectiveStatus(t *testing.T) {
 	if got := effectiveStatus(nil, context.DeadlineExceeded); got != fiber.StatusGatewayTimeout {
 		t.Errorf("deadline status = %d, want 504", got)
 	}
+	if got := effectiveStatus(nil, fmt.Errorf("query: %w", context.Canceled)); got != apperror.StatusClientClosedRequest {
+		t.Errorf("canceled status = %d, want 499", got)
+	}
 	if got := effectiveStatus(nil, errors.New("generic")); got != fiber.StatusInternalServerError {
 		t.Errorf("generic error status = %d, want 500", got)
-	}
-}
-
-func TestCacheLimiterStorage(t *testing.T) {
-	mem := cache.NewMemoryCache()
-	defer func() { _ = mem.Close() }()
-
-	storage := NewLimiterStorage(mem)
-	if storage == nil {
-		t.Fatal("NewLimiterStorage returned nil")
-	}
-	if err := storage.Set("key", []byte("value"), time.Minute); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-	got, err := storage.Get("key")
-	if err != nil || string(got) != "value" {
-		t.Fatalf("get = (%q, %v), want (value, nil)", got, err)
-	}
-	if err := storage.Delete("key"); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	if got, _ := storage.Get("key"); got != nil {
-		t.Fatalf("get after delete = %q, want nil", got)
 	}
 }
 

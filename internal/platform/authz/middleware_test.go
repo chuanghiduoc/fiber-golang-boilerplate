@@ -79,7 +79,7 @@ func assertForbidden(t *testing.T, status int, contentType string, body []byte) 
 func TestRequire_AllowsGrantedPermission(t *testing.T) {
 	app := newTestApp()
 	called := false
-	app.Get("/files", Require(PermissionFilesRead), func(c fiber.Ctx) error {
+	app.Get("/files", Require(testPermissionRead), func(c fiber.Ctx) error {
 		called = true
 		return c.SendString("ok")
 	})
@@ -126,7 +126,7 @@ func TestRequire_DeniesUserOnAdminPermission(t *testing.T) {
 func TestRequire_DeniesMissingRole(t *testing.T) {
 	app := newTestApp()
 	called := false
-	app.Get("/profile", Require(PermissionProfileRead), func(c fiber.Ctx) error {
+	app.Get("/profile", Require(testPermissionWrite), func(c fiber.Ctx) error {
 		called = true
 		return c.SendString("ok")
 	})
@@ -140,7 +140,7 @@ func TestRequire_DeniesMissingRole(t *testing.T) {
 
 func TestRequire_DeniesUnknownRole(t *testing.T) {
 	app := newTestApp()
-	app.Get("/profile", Require(PermissionProfileRead), func(c fiber.Ctx) error {
+	app.Get("/profile", Require(testPermissionWrite), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -151,7 +151,7 @@ func TestRequire_DeniesUnknownRole(t *testing.T) {
 func TestRequireAny_AllowsAnyGrantedPermission(t *testing.T) {
 	app := newTestApp()
 	app.Get("/either",
-		RequireAny(PermissionAdminStatsRead, PermissionFilesRead),
+		RequireAny(PermissionAdminStatsRead, testPermissionRead),
 		func(c fiber.Ctx) error { return c.SendString("ok") },
 	)
 
@@ -190,7 +190,7 @@ func TestRequireAny_EmptyListDeniesEvenAdmin(t *testing.T) {
 func TestRequireAny_DeniesMissingRole(t *testing.T) {
 	app := newTestApp()
 	app.Get("/either",
-		RequireAny(PermissionProfileRead, PermissionAdminStatsRead),
+		RequireAny(testPermissionWrite, PermissionAdminStatsRead),
 		func(c fiber.Ctx) error { return c.SendString("ok") },
 	)
 
@@ -203,10 +203,10 @@ func TestRequire_UsesExplicitSubjectScopes(t *testing.T) {
 	app.Use(func(c fiber.Ctx) error {
 		// An administrator's API key limited to files:read must not inherit the
 		// administrator role catalog.
-		SetSubject(c, NewSubjectWithPermissions(1, 1, RoleAdmin, PermissionFilesRead))
+		SetSubject(c, NewSubjectWithPermissions(1, 1, RoleAdmin, testPermissionRead))
 		return c.Next()
 	})
-	app.Get("/files", Require(PermissionFilesRead), func(c fiber.Ctx) error { return c.SendString("ok") })
+	app.Get("/files", Require(testPermissionRead), func(c fiber.Ctx) error { return c.SendString("ok") })
 	app.Get("/admin", Require(PermissionAdminUsersRead), func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	status, _, body := doGet(t, app, "/files", "")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/smtp"
 	"strings"
@@ -134,5 +135,14 @@ func (s *SMTPSender) Send(ctx context.Context, msg Message) error {
 		return fmt.Errorf("close SMTP data: %w", err)
 	}
 
-	return client.Quit()
+	// The server accepted the message once DATA closed successfully. A QUIT
+	// failure must not fail the send, or the email job would retry and deliver
+	// a duplicate.
+	if err := client.Quit(); err != nil {
+		slog.Warn("SMTP QUIT failed after the message was accepted",
+			slog.String("host", s.host),
+			slog.String("error", err.Error()),
+		)
+	}
+	return nil
 }

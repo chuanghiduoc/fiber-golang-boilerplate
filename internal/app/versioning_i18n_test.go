@@ -3,9 +3,11 @@ package app_test
 import (
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -45,9 +47,26 @@ func (versionedModule) RegisterV2Routes(v2 fiber.Router, _ app.Deps) {
 type localizedModule struct{}
 
 func (localizedModule) Name() string { return "localized" }
+
+// localizedCode is registered through ErrorProvider and translated through
+// LocaleProvider, exercising the module catalog path end to end.
+const localizedCode apperror.Code = "localized.user_missing"
+
+func (localizedModule) ErrorCodes() map[apperror.Code]apperror.Spec {
+	return map[apperror.Code]apperror.Spec{localizedCode: {
+		Status: fiber.StatusNotFound, Title: "User not found", DocPath: "/errors/localized-user-missing",
+	}}
+}
+
+func (localizedModule) Locales() fs.FS {
+	return fstest.MapFS{
+		"en.json": {Data: []byte(`{"errors.localized.user_missing.title": "User not found"}`)},
+		"vi.json": {Data: []byte(`{"errors.localized.user_missing.title": "Không tìm thấy người dùng"}`)},
+	}
+}
 func (localizedModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
 	v1.Get("/localized", func(c fiber.Ctx) error {
-		return apperror.NewCode(apperror.CodeUserNotFound, "fallback detail").
+		return apperror.NewCode(localizedCode, "fallback detail").
 			WithDetailKey("errors.api.version_unsupported.detail", map[string]any{"version": "v9"})
 	})
 	v1.Get("/validate", func(c fiber.Ctx) error {
@@ -196,7 +215,7 @@ func TestDeprecatedVersionHeaders(t *testing.T) {
 }
 
 func TestI18nLocalizesErrorsWithoutChangingContract(t *testing.T) {
-	bundle, err := i18n.New("en")
+	bundle, err := i18n.New("en", app.LocaleSources(localizedModule{})...)
 	require.NoError(t, err)
 	application := app.New(versioningTestConfig(), app.Deps{I18n: bundle})
 	application.Register(localizedModule{})
@@ -210,8 +229,8 @@ func TestI18nLocalizesErrorsWithoutChangingContract(t *testing.T) {
 	body := decodeMap(t, raw)
 	assert.Equal(t, "Không tìm thấy người dùng", body["title"])
 	assert.Equal(t, "Phiên bản API v9 không được hỗ trợ.", body["detail"])
-	assert.Equal(t, string(apperror.CodeUserNotFound), body["code"])
-	assert.Equal(t, "/errors/user-not-found", body["type"])
+	assert.Equal(t, string(localizedCode), body["code"])
+	assert.Equal(t, "/errors/localized-user-missing", body["type"])
 
 	resp, raw = doAppRequest(t, application, "/api/v1/validate",
 		map[string]string{fiber.HeaderAcceptLanguage: "vi"})
@@ -226,7 +245,7 @@ func TestI18nLocalizesErrorsWithoutChangingContract(t *testing.T) {
 }
 
 func TestI18nFallbackLocale(t *testing.T) {
-	bundle, err := i18n.New("en")
+	bundle, err := i18n.New("en", app.LocaleSources(localizedModule{})...)
 	require.NoError(t, err)
 	application := app.New(versioningTestConfig(), app.Deps{I18n: bundle})
 	application.Register(localizedModule{})

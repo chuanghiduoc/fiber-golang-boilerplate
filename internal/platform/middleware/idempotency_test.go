@@ -612,6 +612,38 @@ func TestIdempotency_Non2xxNotCachedAndLockReleased(t *testing.T) {
 	}
 }
 
+func TestIdempotency_NormalizesEquivalentPaths(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+
+	var calls atomic.Int32
+	app := newTestApp()
+	app.Post("/users/:id/ban", Idempotency(mem), func(c fiber.Ctx) error {
+		calls.Add(1)
+		return c.Status(fiber.StatusCreated).SendString("banned-" + c.Params("id"))
+	})
+
+	// Case-insensitive, non-strict routing sends all of these to one route and
+	// resource, so they must share one idempotency scope.
+	for _, path := range []string{"/users/7/ban", "/Users/7/Ban", "/users/7/ban/"} {
+		resp, body := doIdempotencyRequest(t, app, http.MethodPost, path, "same-key", "")
+		if resp.StatusCode != fiber.StatusCreated || body != "banned-7" {
+			t.Fatalf("POST %s = %d %q, want 201 banned-7", path, resp.StatusCode, body)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1 (equivalent paths must replay)", got)
+	}
+
+	// A different parameter value is a different resource.
+	if resp, body := doIdempotencyRequest(t, app, http.MethodPost, "/users/8/ban", "same-key", ""); resp.StatusCode != fiber.StatusCreated || body != "banned-8" {
+		t.Fatalf("different id = %d %q, want 201 banned-8", resp.StatusCode, body)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls after id change = %d, want 2", got)
+	}
+}
+
 func TestIdempotency_ScopesByUserPathAndMethod(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })

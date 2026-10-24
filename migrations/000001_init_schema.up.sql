@@ -8,7 +8,12 @@
 --   * active-row uniqueness uses partial indexes (soft delete friendly);
 --   * cursor pagination is backed by (created_at DESC, id DESC) indexes;
 --   * timestamps are NOT NULL so pagination cannot hide rows;
---   * every tenant-owned row carries tenant_id and tenant-leading indexes.
+--   * every tenant-owned row carries tenant_id and tenant-leading indexes;
+--   * surrogate keys are BIGINT GENERATED ALWAYS AS IDENTITY, so an explicit
+--     id needs OVERRIDING SYSTEM VALUE (only the default tenant seed uses it);
+--   * a cross-module child of users references (tenant_id, user_id) with
+--     ON DELETE RESTRICT: users are soft-deleted and another module's rows
+--     must never vanish through a cascade it does not own.
 
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$
@@ -21,11 +26,12 @@ $$ LANGUAGE plpgsql;
 -- ---------------------------------------------------------------------------
 -- platform: tenants
 --
--- The default tenant is inserted as the first row of a fresh database, so
--- BIGSERIAL assigns id 1. Rows that predate multi-tenancy default to that id.
+-- The default tenant is pinned to id 1 because every tenant_id column defaults
+-- to 1. The identity sequence is then advanced past it so the next tenant
+-- gets id 2 instead of colliding with the seed row.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS tenants (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     slug VARCHAR(63) NOT NULL UNIQUE,
     name VARCHAR(255) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'active'
@@ -34,9 +40,12 @@ CREATE TABLE IF NOT EXISTS tenants (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO tenants (slug, name)
-VALUES ('default', 'Default')
+INSERT INTO tenants (id, slug, name)
+OVERRIDING SYSTEM VALUE
+VALUES (1, 'default', 'Default')
 ON CONFLICT (slug) DO NOTHING;
+
+SELECT setval(pg_get_serial_sequence('tenants', 'id'), (SELECT max(id) FROM tenants));
 
 DROP TRIGGER IF EXISTS trigger_tenants_updated_at ON tenants;
 CREATE TRIGGER trigger_tenants_updated_at
@@ -48,7 +57,7 @@ CREATE TRIGGER trigger_tenants_updated_at
 -- identity: users
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS users (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     email VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255),
@@ -96,9 +105,15 @@ CREATE TRIGGER trigger_users_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 -- At least one active administrator must always remain in each tenant, even
--- under concurrent demote/ban requests. Application checks return a friendly
--- 409; this trigger is the database-level guarantee. Counting and locking are
--- scoped to OLD.tenant_id so one tenant's admins cannot satisfy another's.
+-- under concurrent demote/ban requests. This trigger is the database-level
+-- guarantee; counting and locking are scoped to OLD.tenant_id so one tenant's
+-- admins cannot satisfy another's. The other admins are locked in id order.
+-- The UPDATE already holds the target row before the trigger runs, so two
+-- concurrent demotions could still wait on each other's rows; identity
+-- services therefore take a per-tenant advisory lock (LockTenantAdminChanges)
+-- before touching an admin row and return a friendly 409. A deadlock (40P01)
+-- or this trigger's exception (P0001) from any other writer is mapped to 409
+-- by the identity repository.
 CREATE OR REPLACE FUNCTION protect_last_admin()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -112,6 +127,7 @@ BEGIN
           AND role = 'admin'
           AND deleted_at IS NULL
           AND id <> OLD.id
+        ORDER BY id
         FOR UPDATE;
         IF NOT FOUND THEN
             RAISE EXCEPTION 'cannot remove the last active admin';
@@ -131,7 +147,7 @@ CREATE TRIGGER trigger_protect_last_admin
 -- identity: refresh tokens (stores SHA-256 hashes, never plaintext)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS refresh_tokens (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token VARCHAR(255) NOT NULL UNIQUE,
@@ -140,7 +156,7 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token ON refresh_tokens(token);
+-- Token lookups use the implicit refresh_tokens_token_key UNIQUE index.
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant_user_id
     ON refresh_tokens (tenant_id, user_id);
@@ -149,7 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant_user_id
 -- identity: password-reset tokens (one live token per user)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token VARCHAR(255) NOT NULL UNIQUE,
@@ -166,7 +182,7 @@ CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_tenant_user_id
 -- identity: email-verification tokens (bound to the target address)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS email_verification_tokens (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     email VARCHAR(255) NOT NULL,
@@ -186,11 +202,15 @@ CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_tenant_user_id
 -- prefix_<32-byte base64url> credentials are shown once at creation/rotation.
 -- A rotated key remains valid until rotation_grace_until; explicit revocation
 -- always wins. Scopes are an authz.Permission array validated by the module.
+-- The stored permission strings (e.g. "files:read") are a persisted, stable
+-- API: renaming a permission in authz requires a data migration of scopes.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS api_keys (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- The composite FK below makes the database reject a key whose owner
+    -- belongs to a different tenant (parent key: idx_users_tenant_id_id).
+    user_id BIGINT NOT NULL,
     name VARCHAR(255) NOT NULL,
     prefix VARCHAR(16) NOT NULL,
     key_hash VARCHAR(64) NOT NULL,
@@ -202,7 +222,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
     rotation_grace_until TIMESTAMP WITH TIME ZONE,
     last_used_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_api_keys_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash
@@ -222,28 +244,35 @@ CREATE TRIGGER trigger_api_keys_updated_at
 -- files: metadata (blobs live in local/S3 storage)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS files (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     original_name VARCHAR(255) NOT NULL,
     storage_path VARCHAR(512) NOT NULL UNIQUE,
     mime_type VARCHAR(127) NOT NULL,
     size BIGINT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT fk_files_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
 );
 
-CREATE INDEX IF NOT EXISTS idx_files_user_id ON files(user_id);
-CREATE INDEX IF NOT EXISTS idx_files_deleted_at ON files(deleted_at) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_files_user_id_deleted_at ON files(user_id) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_files_user_created ON files(user_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_files_created_at_id ON files(created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_files_tenant_user_id_deleted_at
-    ON files (tenant_id, user_id) WHERE deleted_at IS NULL;
+-- Deliberately NOT partial: it serves ListFilesByUserCursor for both
+-- include_deleted values under a generic plan, ListFilesByUserID and
+-- CountFilesByUserID (deleted_at is a cheap heap filter), and the
+-- fk_files_tenant_user check when a users row is deleted or re-keyed.
 CREATE INDEX IF NOT EXISTS idx_files_tenant_user_created
-    ON files (tenant_id, user_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
+    ON files (tenant_id, user_id, created_at DESC, id DESC);
+-- AdminListFilesCursor / AdminListFiles / AdminFileStats.
 CREATE INDEX IF NOT EXISTS idx_files_tenant_created_at_id
     ON files (tenant_id, created_at DESC, id DESC);
+
+DROP TRIGGER IF EXISTS trigger_files_updated_at ON files;
+CREATE TRIGGER trigger_files_updated_at
+    BEFORE UPDATE ON files
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- platform: feature flags
@@ -255,10 +284,16 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_created_at_id
 -- pointing at a user in another tenant. The evaluator precedence is
 -- force-off > kill switch > user target > tenant target > database default >
 -- environment > compiled default.
+--
+-- feature_flags.enabled is nullable: NULL means "no database default", so a
+-- row that only anchors targets (or carries a kill switch) does not override
+-- FEATURE_FLAGS/compiled defaults for every tenant. Targets reference the flag
+-- with ON DELETE RESTRICT so deleting a process-wide flag can never silently
+-- wipe other tenants' targets.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS feature_flags (
     flag_key VARCHAR(128) PRIMARY KEY,
-    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    enabled BOOLEAN,
     kill_switch BOOLEAN NOT NULL DEFAULT FALSE,
     description VARCHAR(500) NOT NULL DEFAULT '',
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
@@ -272,15 +307,17 @@ CREATE TRIGGER trigger_feature_flags_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 CREATE TABLE IF NOT EXISTS feature_flag_targets (
-    id BIGSERIAL PRIMARY KEY,
-    flag_key VARCHAR(128) NOT NULL REFERENCES feature_flags(flag_key) ON DELETE CASCADE,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    flag_key VARCHAR(128) NOT NULL,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT,
     enabled BOOLEAN NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT feature_flag_targets_flag_key_fk
+        FOREIGN KEY (flag_key) REFERENCES feature_flags (flag_key) ON DELETE RESTRICT,
     CONSTRAINT feature_flag_targets_user_tenant_fk
-        FOREIGN KEY (tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE CASCADE
+        FOREIGN KEY (tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE RESTRICT
 );
 
 -- One tenant-wide target (user_id IS NULL) and one target per user are
@@ -306,34 +343,47 @@ CREATE TRIGGER trigger_feature_flag_targets_updated_at
 -- type; a missing preference row means both channels are enabled.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS notifications (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     type VARCHAR(100) NOT NULL,
     title VARCHAR(255) NOT NULL,
     body TEXT NOT NULL,
     data JSONB NOT NULL DEFAULT '{}'::jsonb,
     read_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_notifications_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
 );
 
+-- The non-partial index also serves the fk_notifications_tenant_user check.
 CREATE INDEX IF NOT EXISTS idx_notifications_tenant_user_created_at_id
     ON notifications (tenant_id, user_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_tenant_user_unread
     ON notifications (tenant_id, user_id, created_at DESC, id DESC)
     WHERE read_at IS NULL;
 
+DROP TRIGGER IF EXISTS trigger_notifications_updated_at ON notifications;
+CREATE TRIGGER trigger_notifications_updated_at
+    BEFORE UPDATE ON notifications
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
 CREATE TABLE IF NOT EXISTS notification_preferences (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     type VARCHAR(100) NOT NULL,
     channel VARCHAR(20) NOT NULL CHECK (channel IN ('in_app', 'email')),
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_notification_preferences_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
 );
 
+-- Also serves the fk_notification_preferences_tenant_user check.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_preferences_unique
     ON notification_preferences (tenant_id, user_id, type, channel);
 
@@ -347,7 +397,7 @@ CREATE TRIGGER trigger_notification_preferences_updated_at
 -- platform: durable jobs / outbox
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS jobs (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     kind TEXT NOT NULL,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -369,8 +419,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
+-- claimJobsSQL is a cross-tenant pass: the due CTE (status = 'queued',
+-- run_at <= now()) and the lease-expiry CTE (status = 'running') use this.
 CREATE INDEX IF NOT EXISTS idx_jobs_status_run_at ON jobs (status, run_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_kind_status ON jobs (kind, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_run_at
     ON jobs (tenant_id, status, run_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_tenant_kind_status
@@ -379,6 +430,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_kind_status
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_tenant_idempotency_key
     ON jobs (tenant_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
+-- Supports the batched retention purge, which orders terminal rows by age.
+-- The predicate matches purgeTerminalJobsSQL so the planner can use it.
+CREATE INDEX IF NOT EXISTS idx_jobs_terminal_updated_at
+    ON jobs (updated_at)
+    WHERE status IN ('succeeded', 'dead');
 
 -- ---------------------------------------------------------------------------
 -- platform: scheduler leader lease and run ledger
@@ -399,7 +455,7 @@ CREATE TABLE IF NOT EXISTS scheduler_leases (
 );
 
 CREATE TABLE IF NOT EXISTS scheduler_runs (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     schedule TEXT NOT NULL,
     scheduled_for TIMESTAMP WITH TIME ZONE NOT NULL,
     status TEXT NOT NULL DEFAULT 'enqueued'
@@ -418,7 +474,7 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_runs_created_at
 -- platform: audit trail
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS audit_events (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     parent_id BIGINT,
     actor_id BIGINT,
@@ -443,12 +499,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_events_actor_created
-    ON audit_events (actor_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_action_created
-    ON audit_events (action, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_events_resource
-    ON audit_events (resource, resource_id);
+-- The application only inserts rows and completes them by primary key; the
+-- secondary indexes back operator investigation queries, always tenant-scoped
+-- (by time, actor, action, or resource), plus request-id correlation, parent
+-- (intent -> domain event) lookups, and the stale-intent check in
+-- docs/operations.md (outcome = 'started' AND created_at < ...). The global
+-- actor/action/resource duplicates of the tenant-leading indexes were dropped:
+-- the table is append-only and write-heavy, and investigations are per tenant.
 CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_created
     ON audit_events (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_actor_created
@@ -517,7 +574,7 @@ CREATE TRIGGER trigger_audit_events_completion
 -- created with, so rotation never breaks in-flight work.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_endpoints (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     url VARCHAR(2048) NOT NULL,
     description VARCHAR(255) NOT NULL DEFAULT '',
@@ -533,6 +590,9 @@ CREATE TABLE IF NOT EXISTS webhook_endpoints (
     deleted_at TIMESTAMP WITH TIME ZONE
 );
 
+-- Parent key for the tenant-composite FKs from secrets and deliveries.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant_id_id
+    ON webhook_endpoints (tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant_created_at_id
     ON webhook_endpoints (tenant_id, created_at DESC, id DESC)
     WHERE deleted_at IS NULL;
@@ -547,13 +607,16 @@ CREATE TRIGGER trigger_webhook_endpoints_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 CREATE TABLE IF NOT EXISTS webhook_endpoint_secrets (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    endpoint_id BIGINT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    endpoint_id BIGINT NOT NULL,
     version INTEGER NOT NULL CHECK (version > 0),
     secret_ciphertext TEXT NOT NULL,
     active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    -- Secrets are fully owned by their endpoint (same module), so CASCADE.
+    CONSTRAINT fk_webhook_endpoint_secrets_tenant_endpoint FOREIGN KEY (tenant_id, endpoint_id)
+        REFERENCES webhook_endpoints (tenant_id, id) ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_endpoint_version
@@ -573,9 +636,11 @@ CREATE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_tenant_endpoint
 -- cannot change a queued delivery's signed request.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    endpoint_id BIGINT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    -- Deliveries are history: endpoints are soft-deleted and a hard delete
+    -- must not silently erase the delivery log (RESTRICT, tenant-composite).
+    endpoint_id BIGINT NOT NULL,
     event_id VARCHAR(128) NOT NULL,
     event_type VARCHAR(128) NOT NULL,
     event_created_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -586,13 +651,20 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
         CHECK (status IN ('pending', 'succeeded', 'dead')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 50),
+    -- Per-request timeout snapshotted from the endpoint, like url/secret.
+    timeout_ms INTEGER NOT NULL DEFAULT 10000
+        CHECK (timeout_ms BETWEEN 100 AND 120000),
     next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     last_status_code INTEGER,
     last_error TEXT,
     delivered_at TIMESTAMP WITH TIME ZONE,
+    -- Single-column on purpose: a composite FK with ON DELETE SET NULL would
+    -- also null tenant_id when the original delivery is purged.
     replayed_from_id BIGINT REFERENCES webhook_deliveries(id) ON DELETE SET NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_webhook_deliveries_tenant_endpoint FOREIGN KEY (tenant_id, endpoint_id)
+        REFERENCES webhook_endpoints (tenant_id, id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint_event
@@ -603,6 +675,16 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_endpoint_created
     ON webhook_deliveries (tenant_id, endpoint_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status_next
     ON webhook_deliveries (tenant_id, status, next_attempt_at);
+-- Retention is a cross-tenant maintenance pass, so these purge indexes are
+-- deliberately not tenant-leading. The predicate matches PurgeWebhookDeliveries.
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_terminal_updated_at
+    ON webhook_deliveries (updated_at)
+    WHERE status IN ('succeeded', 'dead');
+-- Purging an original delivery runs ON DELETE SET NULL against its replays;
+-- without this index every deleted row would scan webhook_deliveries.
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_replayed_from_id
+    ON webhook_deliveries (replayed_from_id)
+    WHERE replayed_from_id IS NOT NULL;
 
 DROP TRIGGER IF EXISTS trigger_webhook_deliveries_updated_at ON webhook_deliveries;
 CREATE TRIGGER trigger_webhook_deliveries_updated_at
@@ -611,8 +693,14 @@ CREATE TRIGGER trigger_webhook_deliveries_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    -- CASCADE by design: attempts are fully owned by their delivery, and the
+    -- batched retention purge (PurgeWebhookDeliveries) deletes deliveries and
+    -- relies on this cascade to remove their attempts in the same statement.
+    -- Kept single-column: a tenant-composite FK would need another unique
+    -- (tenant_id, id) index on the high-volume webhook_deliveries table, and
+    -- attempts are only written by the worker with the delivery's tenant_id.
     delivery_id BIGINT NOT NULL REFERENCES webhook_deliveries(id) ON DELETE CASCADE,
     attempt INTEGER NOT NULL CHECK (attempt > 0),
     status_code INTEGER,
@@ -636,7 +724,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_created
 -- Inbound events deduplicate on (tenant, source, external_event_id).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_inbound_sources (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     name VARCHAR(255) NOT NULL,
     slug VARCHAR(63) NOT NULL,
@@ -651,6 +739,9 @@ CREATE TABLE IF NOT EXISTS webhook_inbound_sources (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_slug_active
     ON webhook_inbound_sources (tenant_id, slug)
     WHERE deleted_at IS NULL;
+-- Parent key for the tenant-composite FK from webhook_inbound_events.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_id_id
+    ON webhook_inbound_sources (tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_created
     ON webhook_inbound_sources (tenant_id, created_at DESC, id DESC)
     WHERE deleted_at IS NULL;
@@ -662,14 +753,18 @@ CREATE TRIGGER trigger_webhook_inbound_sources_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 CREATE TABLE IF NOT EXISTS webhook_inbound_events (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    source_id BIGINT NOT NULL REFERENCES webhook_inbound_sources(id) ON DELETE CASCADE,
+    source_id BIGINT NOT NULL,
     external_event_id VARCHAR(255) NOT NULL,
     event_type VARCHAR(128) NOT NULL DEFAULT '',
     signature VARCHAR(255) NOT NULL,
     payload JSONB NOT NULL,
-    received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    -- Inbound events are history and sources are soft-deleted: RESTRICT so a
+    -- hard delete of a source cannot erase its events; retention purges them.
+    CONSTRAINT fk_webhook_inbound_events_tenant_source FOREIGN KEY (tenant_id, source_id)
+        REFERENCES webhook_inbound_sources (tenant_id, id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_events_source_event
@@ -678,3 +773,6 @@ CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_source_received
     ON webhook_inbound_events (tenant_id, source_id, received_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_received
     ON webhook_inbound_events (tenant_id, received_at DESC, id DESC);
+-- Cross-tenant retention purge (PurgeWebhookInboundEvents).
+CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_received_at
+    ON webhook_inbound_events (received_at);

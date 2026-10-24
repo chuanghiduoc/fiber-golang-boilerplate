@@ -42,6 +42,23 @@ type Options struct {
 	DefaultMaxAttempts int
 	DefaultTimeoutMS   int32
 	TimestampTolerance time.Duration
+	// Tenants gates the public inbound receiver on the source tenant being
+	// active. Nil skips the check (unit tests); production must set it.
+	Tenants TenantChecker
+}
+
+// TenantChecker reports whether a tenant is active. The composition root
+// adapts the identity tenant store, so this module never reads tenants.
+type TenantChecker interface {
+	TenantActive(ctx context.Context, tenantID int64) (bool, error)
+}
+
+// TenantCheckerFunc adapts a function to TenantChecker.
+type TenantCheckerFunc func(ctx context.Context, tenantID int64) (bool, error)
+
+// TenantActive implements TenantChecker.
+func (f TenantCheckerFunc) TenantActive(ctx context.Context, tenantID int64) (bool, error) {
+	return f(ctx, tenantID)
 }
 
 // Service is the webhooks application surface: tenant-scoped endpoint CRUD,
@@ -357,6 +374,7 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 		Payload:          json.RawMessage(original.Payload),
 		SecretCiphertext: ciphertext,
 		MaxAttempts:      original.MaxAttempts,
+		TimeoutMS:        endpoint.TimeoutMs,
 		RunAt:            s.now(),
 		ReplayedFromID:   original.ID,
 	})
@@ -556,6 +574,31 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 	if source.Status != dto.StatusActive {
 		return nil, apperror.NewNotFound("inbound source not found")
 	}
+	if s.opts.Tenants != nil {
+		// A suspended tenant is indistinguishable from a missing source, like
+		// every other request for that tenant.
+		active, err := s.opts.Tenants.TenantActive(ctx, source.TenantID)
+		if err != nil {
+			slog.Error("webhooks: failed to check inbound source tenant",
+				slog.Int64("source_id", source.ID),
+				slog.Any("error", err),
+			)
+			return nil, apperror.NewInternal("failed to resolve inbound source")
+		}
+		if !active {
+			return nil, apperror.NewNotFound("inbound source not found")
+		}
+	}
+
+	// The id is part of the signed content, so it is validated before
+	// verification and used verbatim afterwards.
+	externalID := headers.Get(webhook.HeaderID)
+	if strings.TrimSpace(externalID) == "" {
+		return nil, apperror.NewBadRequest("X-Webhook-Id is required")
+	}
+	if externalID != strings.TrimSpace(externalID) || len(externalID) > maxEventIDLen || hasControl(externalID) {
+		return nil, apperror.NewBadRequest("X-Webhook-Id is invalid")
+	}
 
 	secret, err := s.codec.Open(source.SecretCiphertext)
 	if err != nil {
@@ -567,7 +610,7 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 	}
 	if err := webhook.VerifyRequest(secret, headers, body, s.opts.TimestampTolerance, s.now()); err != nil {
 		switch {
-		case errors.Is(err, webhook.ErrMissingSignature), errors.Is(err, webhook.ErrMissingTimestamp):
+		case errors.Is(err, webhook.ErrMissingSignature), errors.Is(err, webhook.ErrMissingTimestamp), errors.Is(err, webhook.ErrMissingID):
 			return nil, apperror.NewUnauthorized("webhook signature is required")
 		case errors.Is(err, webhook.ErrTimestampOutOfRange), errors.Is(err, webhook.ErrInvalidTimestamp):
 			return nil, apperror.NewUnauthorized("webhook timestamp is invalid or expired")
@@ -576,14 +619,7 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 		}
 	}
 
-	externalID := strings.TrimSpace(headers.Get(webhook.HeaderID))
-	if externalID == "" {
-		return nil, apperror.NewBadRequest("X-Webhook-Id is required")
-	}
-	if len(externalID) > maxEventIDLen || hasControl(externalID) {
-		return nil, apperror.NewBadRequest("X-Webhook-Id is invalid")
-	}
-	eventType := strings.TrimSpace(headers.Get(webhook.HeaderEvent))
+	eventType := headers.Get(webhook.HeaderEvent)
 	if eventType == "" {
 		eventType = "inbound"
 	}
@@ -696,6 +732,12 @@ func (s *service) recordAudit(ctx context.Context, actorID int64, action, resour
 		ResourceID: fmt.Sprintf("%d", resourceID),
 		Metadata:   metadata,
 		CreatedAt:  s.now(),
+	}
+	// Link the domain event to the route's audit.Guard intent row, if any.
+	// The tenant stays the service's effective tenant: the public receiver
+	// resolves it from the source, not from the request.
+	if info := audit.RequestInfoFromContext(ctx); info != nil {
+		event.ParentID = info.EventID
 	}
 	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditTimeout)
 	defer cancel()

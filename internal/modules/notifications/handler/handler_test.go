@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -35,15 +35,15 @@ type fakeService struct {
 	lastAfter      string
 	lastUnreadOnly bool
 	lastPreference dto.UpdatePreferenceRequest
-	lastInput      contracts.CreateNotificationInput
+	lastInput      notificationcontracts.CreateNotificationInput
 }
 
-func (f *fakeService) Create(_ context.Context, input contracts.CreateNotificationInput) (service.CreateResult, error) {
+func (f *fakeService) Create(_ context.Context, input notificationcontracts.CreateNotificationInput) (service.CreateResult, error) {
 	f.lastInput = input
 	return f.createResult, f.err
 }
 
-func (f *fakeService) Notify(_ context.Context, _ contracts.CreateNotificationInput) error {
+func (f *fakeService) Notify(_ context.Context, _ notificationcontracts.CreateNotificationInput) error {
 	return f.err
 }
 
@@ -253,7 +253,7 @@ func TestSendHandler(t *testing.T) {
 		"body":   "Body",
 		"data":   map[string]any{"k": "v"},
 	})
-	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
 	assert.Equal(t, true, body["emailQueued"])
 	assert.Equal(t, int64(1), svc.lastInput.TenantID)
 	assert.Equal(t, int64(10), svc.lastInput.UserID)

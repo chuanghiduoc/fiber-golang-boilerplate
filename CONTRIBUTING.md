@@ -97,8 +97,10 @@ When releasing, move `[Unreleased]` entries under a version header:
   migrating.
 - Fresh installs start from one baseline schema file:
   `migrations/000001_init_schema.up.sql` (and its `.down.sql`).
-- Once a database is deployed, never edit a shipped migration. Add the next
-  numbered migration instead (`make migrate-create name=...`).
+- Once a database is deployed, never edit a shipped migration. Add a
+  timestamped migration instead (`make migrate-create module=<owner> name=<purpose>`
+  -> `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch`
+  rejects duplicate versions and missing up/down pairs).
 - One module owns each table. Cross-module access goes through a contract or
   read model, not another module's repository.
 - Every tenant-owned table carries
@@ -126,15 +128,14 @@ applied the old migrations, and do not reset `schema_migrations` to force it.
 Keep the applied history, restore the old `000002`/`000003` files from git
 history (golang-migrate requires the recorded version to exist in the source),
 and add a migration with only the missing objects, numbered above the
-database's current version (a fully migrated old deployment is at 3, so
-`000004`+). `make migrate-create` derives the number from this repository, so
-set or rename it explicitly. A fresh schema created out-of-band that already
+database's current version (a fully migrated old deployment is at 3; the
+timestamp versions from `make migrate-create` are always above it). A fresh schema created out-of-band that already
 matches `000001` can be baselined manually after verification (for example, the
 golang-migrate CLI's `force 1`) instead of re-running the file.
 
 The multi-tenant foundation also changes `000001` (tenants table, `tenant_id`
 columns, per-tenant indexes and last-admin trigger). Existing databases need a
-new numbered migration or reviewed manual DDL; see the README's "Upgrading an
+new timestamped migration or reviewed manual DDL; see the README's "Upgrading an
 existing database" section. Do not assume the baseline created the tenant
 objects on an already-deployed database. Identity/files isolation needs no
 further schema, but legacy access tokens without `tenant_id` are rejected after
@@ -149,18 +150,19 @@ Run `scripts/new-module.sh <name>` and follow
 [`docs/module-template.md`](docs/module-template.md). The runtime behavior of
 the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 
-1. Create `internal/modules/<name>/module.go` implementing `app.Module`
-   (`Name`, `RegisterRoutes`). Keep the module's handler/service/repository/DTO
-   inside that directory.
-2. Add permissions to `internal/platform/authz` and protect every route with
-   `authz.Require(...)`. The legacy exceptions are documented in the
+1. The scaffold creates `module.go` (`Build(app.Infra)` + catalog providers),
+   `catalog/` (permissions, error codes, en/vi strings), the layers, queries,
+   the `sqlc.yaml` block, and a module test. Keep everything inside that
+   directory.
+2. Adjust the permissions in `catalog/permissions.go` and protect every route
+   with `authz.Require(...)` (`test/arch` enforces it). The legacy exceptions are documented in the
    [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
    do not copy them.
-3. Add queries in `internal/modules/<name>/queries/<name>.sql`, add the module
-   block to `sqlc.yaml`, and run `make sqlc-generate`.
-4. For a deployed DB, add a numbered migration; for this boilerplate's fresh
-   installs, update the single init schema.
-5. Register the module once in `cmd/api/main.go`.
+3. Replace `internal/modules/<name>/queries/<name>.sql` and run
+   `make sqlc-generate`.
+4. For a deployed DB, `make migrate-create module=<name> name=<purpose>`; for
+   this boilerplate's fresh installs, update the single init schema.
+5. Register the module once in `internal/bootstrap/modules.go`.
 6. Add unit tests plus an integration test; `test/arch` rejects cross-module
    imports.
 7. Run `make swagger`, `make check`, and `go test -race ./...`.

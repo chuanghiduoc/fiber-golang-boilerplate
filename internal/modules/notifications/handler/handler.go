@@ -4,10 +4,11 @@ package handler
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
@@ -51,7 +52,7 @@ func (h *Handler) List(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, nextCursor(items))
+	return response.List(c, items, hasMore, pagination.NextCursor(items, func(n dto.NotificationResponse) (time.Time, int64) { return n.CreatedAt, n.ID }))
 }
 
 // Get godoc
@@ -192,7 +193,7 @@ func (h *Handler) SetPreference(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param request body dto.SendNotificationRequest true "Notification"
-// @Success 200 {object} dto.SendNotificationResponse
+// @Success 201 {object} dto.SendNotificationResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
@@ -219,7 +220,7 @@ func (h *Handler) Send(c fiber.Ctx) error {
 	if tenantID == 0 {
 		tenantID = tenant.EffectiveID(c.Context())
 	}
-	result, err := h.service.Create(c.Context(), contracts.CreateNotificationInput{
+	result, err := h.service.Create(c.Context(), notificationcontracts.CreateNotificationInput{
 		TenantID: tenantID,
 		UserID:   req.UserID,
 		Type:     req.Type,
@@ -230,16 +231,8 @@ func (h *Handler) Send(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, dto.SendNotificationResponse{
+	return response.Created(c, dto.SendNotificationResponse{
 		Notification: result.Notification,
 		EmailQueued:  result.EmailQueued,
 	})
-}
-
-func nextCursor(items []dto.NotificationResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }

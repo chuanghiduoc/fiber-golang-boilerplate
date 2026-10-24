@@ -10,7 +10,7 @@ import (
 
 type FeatureFlag struct {
 	FlagKey     string             `json:"flag_key"`
-	Enabled     bool               `json:"enabled"`
+	Enabled     pgtype.Bool        `json:"enabled"`
 	KillSwitch  bool               `json:"kill_switch"`
 	Description string             `json:"description"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`

@@ -29,11 +29,11 @@ is enabled. Both tables are tenant-owned and cascade with the user.
 
 ## Cross-module API
 
-Other modules import `internal/contracts`:
+Other modules import `internal/contracts/notifications`:
 
-- `contracts.Notifier.Notify(ctx, CreateNotificationInput)` creates a
+- `notifications.Notifier.Notify(ctx, CreateNotificationInput)` creates a
   notification.
-- `contracts.NotificationRecipientLookup` is implemented by the identity
+- `identity.NotificationRecipientLookup` (`internal/contracts/identity`) is implemented by the identity
   adapter; notifications never read the `users` table.
 
 When email is enabled, the service resolves the recipient, inserts the in-app

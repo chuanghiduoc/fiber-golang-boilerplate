@@ -6,7 +6,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -58,8 +60,9 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 		// Only an explicit header can conflict. The tenant middleware resolves
 		// an absent header to the default tenant; that must not make a
 		// non-default key fail. The key's tenant is authoritative otherwise.
+		headerSlug := strings.TrimSpace(c.Get(tenant.Header))
 		expectedTenantID := int64(0)
-		if strings.TrimSpace(c.Get(tenant.Header)) != "" {
+		if headerSlug != "" {
 			expectedTenantID = tenant.ID(c)
 		}
 
@@ -70,6 +73,15 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 
 		key := verified.Key
 		principal := verified.Principal
+
+		// Mirror JWTAuth: when the key's tenant overrides a header-less
+		// default resolution, the resolved slug describes another tenant, so
+		// clear it rather than leave a misleading value for link builders.
+		resolvedTenantID := tenant.ID(c)
+		if headerSlug == "" && resolvedTenantID != 0 && resolvedTenantID != key.TenantID {
+			fiber.Locals[string](c, "tenant_slug", "")
+			c.SetContext(tenant.WithSlug(c.Context(), ""))
+		}
 
 		fiber.Locals[int64](c, LocalAPIKeyID, key.ID)
 		fiber.Locals[string](c, LocalAuthMethod, AuthMethodAPIKey)
@@ -83,6 +95,17 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 			WithAttribute(authz.AttributeAuthMethod, AuthMethodAPIKey).
 			WithAttribute(authz.AttributeAPIKeyID, strconv.FormatInt(key.ID, 10))
 		authz.SetSubject(c, subject)
+
+		// Services publish events and Tier 1 audit rows from the request
+		// context, so the actor and request metadata must be there too, exactly
+		// as JWTAuth installs them. The audit actor model has no credential
+		// field; the key id stays on the authz subject (AttributeAPIKeyID) and
+		// the api_key_id local.
+		c.SetContext(requestctx.WithActorID(c.Context(), principal.ID))
+		ctx := audit.WithActor(c.Context(), principal.ID, principal.Role)
+		ctx = audit.WithRequestMeta(ctx,
+			fiber.Locals[string](c, "request_id"), c.IP(), c.Get("User-Agent"))
+		c.SetContext(ctx)
 
 		return c.Next()
 	}

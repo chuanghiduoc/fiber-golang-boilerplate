@@ -9,6 +9,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 )
 
 func seedAdminUsers(repo *mockUserRepo, n int) {
@@ -28,7 +29,7 @@ func seedAdminUsers(repo *mockUserRepo, n int) {
 func newAdminUserServiceForTest() (*adminUserService, *mockUserRepo, *mockRefreshTokenRepo) {
 	ur := newMockUserRepo()
 	rtr := newMockRefreshTokenRepo()
-	svc := NewAdminUserService(ur, rtr, nil, nil).(*adminUserService)
+	svc := NewAdminUserService(ur, rtr, nil, audit.Noop{}).(*adminUserService)
 	return svc, ur, rtr
 }
 
@@ -146,6 +147,7 @@ func TestAdminUnbanUser(t *testing.T) {
 		svc, ur, rtr := newAdminUserServiceForTest()
 		seedAdminUsers(ur, 1)
 		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		ur.users[1].BannedAt = ur.users[1].DeletedAt
 		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash1"}
 
 		user, err := svc.UnbanUser(context.Background(), 1)
@@ -160,6 +162,19 @@ func TestAdminUnbanUser(t *testing.T) {
 		}
 		if len(rtr.deletedUserIDs) == 0 || rtr.deletedUserIDs[0] != 1 {
 			t.Error("refresh tokens should be cleared for unbanned user")
+		}
+	})
+
+	t.Run("self-deleted user is not restorable by unban", func(t *testing.T) {
+		svc, ur, _ := newAdminUserServiceForTest()
+		seedAdminUsers(ur, 1)
+		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+
+		if _, err := svc.UnbanUser(context.Background(), 1); err == nil {
+			t.Fatal("unban must not restore an account that was deleted, not banned")
+		}
+		if !ur.users[1].DeletedAt.Valid {
+			t.Fatal("self-deleted account must stay deleted")
 		}
 	})
 

@@ -71,7 +71,7 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 
 		bodyHash := idempotencyBodyHash(c)
 		scope := idempotencyScope(
-			c.Method(), c.Path(), tenant.ID(c), tenant.Slug(c), idempotencyIdentity(c), key,
+			c.Method(), idempotencyRoutePath(c), tenant.ID(c), tenant.Slug(c), idempotencyIdentity(c), key,
 		)
 		responseKey := idempotencyResponseKey(scope)
 		if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
@@ -188,6 +188,32 @@ func idempotencyScope(method, path string, tenantID int64, tenantSlug, identity,
 	return "idempotency:" + method + ":" + path +
 		":tenant=" + strconv.FormatInt(tenantID, 10) + ":" + tenantSlug +
 		":" + identity + ":" + key
+}
+
+// idempotencyRoutePath identifies the target resource as the matched route
+// template plus its parameter values. Routing is case-insensitive and
+// non-strict, so /Users/7/ and /users/7 hit the same handler; the raw path
+// would give them different scopes and let a retry run the mutation twice.
+// Parameter values keep their case because they may be case-sensitive IDs.
+func idempotencyRoutePath(c fiber.Ctx) string {
+	route := c.Route()
+	if route == nil || route.Path == "" {
+		return c.Path()
+	}
+	var b strings.Builder
+	b.WriteString(route.Path)
+	for _, name := range route.Params {
+		// Length-prefix each value so a value containing the separator cannot
+		// collide with a different parameter split.
+		value := c.Params(name)
+		b.WriteString("|")
+		b.WriteString(name)
+		b.WriteString("=")
+		b.WriteString(strconv.Itoa(len(value)))
+		b.WriteString(":")
+		b.WriteString(value)
+	}
+	return b.String()
 }
 
 func idempotencyIdentity(c fiber.Ctx) string {

@@ -56,6 +56,7 @@ type store interface {
 	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
 	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
 	Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error
+	Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error
 	PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
@@ -67,6 +68,9 @@ type claimedJob struct {
 	Attempts    int
 	MaxAttempts int
 	TraceParent string
+	// QueueLag is how long the job waited between becoming due (run_at) and
+	// this claim, measured by the database clock.
+	QueueLag time.Duration
 }
 
 // Option configures a Worker.
@@ -152,6 +156,46 @@ func WithPurgeInterval(d time.Duration) Option {
 	}
 }
 
+// WithKinds restricts the worker to claiming only the listed kinds. Use it with
+// WithExcludeKinds on the general worker to run a dedicated worker (separate
+// pool, concurrency, or deployment) for slow kinds so they cannot
+// head-of-line block fast ones. Blank kinds are ignored; no kinds (or only
+// blank ones) means no include filter. Register a handler for every listed
+// kind: a claimed kind without a handler retries until it is dead-lettered.
+func WithKinds(kinds ...string) Option {
+	return func(w *Worker) {
+		w.includeKinds = normalizeKinds(kinds)
+	}
+}
+
+// WithExcludeKinds stops the worker from claiming the listed kinds, typically
+// the kinds handled by a dedicated WithKinds worker. Blank kinds are ignored.
+// When combined with WithKinds both filters apply.
+func WithExcludeKinds(kinds ...string) Option {
+	return func(w *Worker) {
+		w.excludeKinds = normalizeKinds(kinds)
+	}
+}
+
+// normalizeKinds trims, de-duplicates, and drops blank kinds. It returns nil
+// for an empty result so the claim query receives NULL (no filter).
+func normalizeKinds(kinds []string) []string {
+	var out []string
+	seen := make(map[string]struct{}, len(kinds))
+	for _, kind := range kinds {
+		kind = strings.TrimSpace(kind)
+		if kind == "" {
+			continue
+		}
+		if _, ok := seen[kind]; ok {
+			continue
+		}
+		seen[kind] = struct{}{}
+		out = append(out, kind)
+	}
+	return out
+}
+
 // WithTracerProvider enables a job.process consumer span per claimed job. Each
 // span is a new root with a link to the enqueue-time traceparent, so retries do
 // not masquerade as children of the original request. Nil disables tracing.
@@ -177,6 +221,10 @@ type Worker struct {
 	jobTimeout        time.Duration
 	retention         time.Duration
 	purgeInterval     time.Duration
+	// includeKinds and excludeKinds narrow the claim query (WithKinds,
+	// WithExcludeKinds). Nil means no filter.
+	includeKinds []string
+	excludeKinds []string
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
@@ -207,7 +255,6 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		purgeInterval:     defaultPurgeInterval,
 		handlers:          make(map[string]Handler),
 		tracer:            noop.NewTracerProvider().Tracer(jobsInstrumentationName),
-		store:             newPGStore(pool),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -215,6 +262,7 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		}
 	}
 	w.normalizeLease()
+	w.store = &pgStore{pool: pool, includeKinds: w.includeKinds, excludeKinds: w.excludeKinds}
 	return w
 }
 
@@ -323,6 +371,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		for _, job := range claimed {
 			metrics.JobsClaimedTotal.WithLabelValues(job.Kind).Inc()
+			metrics.JobsQueueLagSeconds.WithLabelValues(job.Kind).Observe(job.QueueLag.Seconds())
 			// Claims never exceed the free slot count, so this send does not
 			// block and the concurrency limit is respected.
 			slots <- struct{}{}
@@ -371,7 +420,10 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	defer span.End()
 
 	handler, ok := w.handler(job.Kind)
-	var handlerErr error
+	var (
+		handlerErr  error
+		interrupted bool
+	)
 	if !ok {
 		handlerErr = fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	} else {
@@ -396,6 +448,9 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 		// job timeout. Require the parent context to still be active so an
 		// already-expired parent deadline is not mislabeled as a job timeout.
 		timedOut := w.jobTimeout > 0 && ctx.Err() == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
+		// A failure while the worker itself is stopping is most likely the
+		// shutdown cancellation, not a verdict on the job.
+		interrupted = handlerErr != nil && ctx.Err() != nil
 		if cancel != nil {
 			cancel()
 		}
@@ -422,6 +477,17 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	}
 
 	reason := handlerErr.Error()
+	if interrupted {
+		// Requeue without consuming the attempt so a drain on the final
+		// attempt cannot dead-letter the job. Delivery stays at-least-once.
+		if err := w.store.Release(writeCtx, job.ID, w.id, job.Attempts, "jobs: interrupted by worker shutdown: "+reason); err != nil {
+			tracing.MarkError(span, err)
+			return fmt.Errorf("jobs: release job %d: %w", job.ID, err)
+		}
+		span.SetAttributes(jobOutcomeAttributes("released", nil)...)
+		return nil
+	}
+
 	var retryAt *time.Time
 	// Every failure retries while attempts remain, including an unregistered
 	// kind. A rollout may register the missing handler before the budget runs

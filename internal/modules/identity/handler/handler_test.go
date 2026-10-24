@@ -14,8 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -760,4 +762,44 @@ func TestUpdate_MalformedJSON(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
+}
+
+// TestCrossUserAccess_ScopedAPIKeyCannotUseOwnerRole guards against an API key
+// inheriting its owner's admin role: an admin key scoped to profile access
+// only must not read, update, or delete other users.
+func TestCrossUserAccess_ScopedAPIKeyCannotUseOwnerRole(t *testing.T) {
+	svc := newMockService()
+	userHandler := NewUserHandler(svc)
+
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	users := app.Group("/users", func(c fiber.Ctx) error {
+		fiber.Locals[int64](c, "user_id", 2)
+		fiber.Locals[string](c, "role", authz.RoleAdmin)
+		authz.SetSubject(c, authz.NewSubjectWithPermissions(2, 1, authz.RoleAdmin,
+			identitycatalog.PermissionProfileRead, identitycatalog.PermissionProfileWrite))
+		return c.Next()
+	})
+	users.Get("/:id", userHandler.GetByID)
+	users.Put("/:id", userHandler.Update)
+	users.Delete("/:id", userHandler.Delete)
+
+	name := "Hijacked"
+	body, _ := json.Marshal(dto.UpdateUserRequest{Name: &name})
+	cases := []struct {
+		method string
+		body   []byte
+		want   int
+	}{
+		{http.MethodGet, nil, fiber.StatusNotFound},
+		{http.MethodPut, body, fiber.StatusForbidden},
+		{http.MethodDelete, nil, fiber.StatusForbidden},
+	}
+	for _, tc := range cases {
+		req, _ := http.NewRequest(tc.method, "/users/1", bytes.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := app.Test(req)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, resp.StatusCode, tc.method)
+	}
+	assert.Equal(t, "Test User", svc.users[1].Name)
 }

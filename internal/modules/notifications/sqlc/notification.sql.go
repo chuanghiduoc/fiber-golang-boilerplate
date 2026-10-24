@@ -33,7 +33,7 @@ func (q *Queries) CountUnreadNotifications(ctx context.Context, arg CountUnreadN
 const createNotification = `-- name: CreateNotification :one
 INSERT INTO notifications (tenant_id, user_id, type, title, body, data)
 VALUES ($1::bigint, $2::bigint, $3::varchar, $4::varchar, $5::text, $6::jsonb)
-RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at
+RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at
 `
 
 type CreateNotificationParams struct {
@@ -65,12 +65,13 @@ func (q *Queries) CreateNotification(ctx context.Context, arg CreateNotification
 		&i.Data,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const getNotificationByID = `-- name: GetNotificationByID :one
-SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at FROM notifications
+SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
 WHERE id = $1::bigint
   AND tenant_id = $2::bigint
   AND user_id = $3::bigint
@@ -95,6 +96,7 @@ func (q *Queries) GetNotificationByID(ctx context.Context, arg GetNotificationBy
 		&i.Data,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -177,7 +179,7 @@ func (q *Queries) ListNotificationPreferences(ctx context.Context, arg ListNotif
 }
 
 const listNotificationsCursor = `-- name: ListNotificationsCursor :many
-SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at FROM notifications
+SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
 WHERE tenant_id = $1::bigint
   AND user_id = $2::bigint
   AND (NOT $3::boolean OR read_at IS NULL)
@@ -223,6 +225,7 @@ func (q *Queries) ListNotificationsCursor(ctx context.Context, arg ListNotificat
 			&i.Data,
 			&i.ReadAt,
 			&i.CreatedAt,
+			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -261,7 +264,7 @@ SET read_at = COALESCE(read_at, NOW())
 WHERE id = $1::bigint
   AND tenant_id = $2::bigint
   AND user_id = $3::bigint
-RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at
+RETURNING id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at
 `
 
 type MarkNotificationReadParams struct {
@@ -283,6 +286,7 @@ func (q *Queries) MarkNotificationRead(ctx context.Context, arg MarkNotification
 		&i.Data,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }

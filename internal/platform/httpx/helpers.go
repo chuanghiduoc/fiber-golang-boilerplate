@@ -13,6 +13,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
@@ -32,10 +33,12 @@ func AuthUserID(c fiber.Ctx) int64 {
 	return fiber.Locals[int64](c, "user_id")
 }
 
-// AuthRole returns the authenticated user's role from the JWT context.
-// The key is set by middleware.JWTAuth.
-func AuthRole(c fiber.Ctx) string {
-	return fiber.Locals[string](c, "role")
+// Can reports whether the authenticated subject holds permission. Use it
+// instead of comparing the "role" local: the subject honors API-key scopes, so
+// a key an admin issued with only profile scopes cannot act on other users.
+func Can(c fiber.Ctx, permission authz.Permission) bool {
+	subject, ok := authz.SubjectFromFiber(c)
+	return ok && subject.Has(permission)
 }
 
 // BindAndValidate parses the request body and runs struct validation. Unknown

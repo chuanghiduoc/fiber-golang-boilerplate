@@ -78,25 +78,25 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, tenantTwo, second.TenantID)
 
-	// A deliberately inconsistent row (tenant two owns a notification for a
-	// tenant-one user id) must still respect the tenant predicate. It proves
-	// queries are scoped by tenant, not only by user id.
-	var crossID int64
-	require.NoError(t, pool.QueryRow(ctx,
+	// An inconsistent row (tenant two owning a notification for a tenant-one
+	// user id) is rejected by the tenant-composite foreign key.
+	_, err = pool.Exec(ctx,
 		`INSERT INTO notifications (tenant_id, user_id, type, title, body)
-		 VALUES ($1, $2, 'system.info', 'Cross tenant', 'Body') RETURNING id`,
+		 VALUES ($1, $2, 'system.info', 'Cross tenant', 'Body')`,
 		tenantTwo, userOne,
-	).Scan(&crossID))
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fk_notifications_tenant_user")
 
 	rows, err := repo.ListCursor(ctxOne, userOne, pagination.DBCursor{Limit: 10}, false)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, first.ID, rows[0].ID)
 
+	// Queries are scoped by tenant, not only by user id.
 	rows, err = repo.ListCursor(ctxTwo, userOne, pagination.DBCursor{Limit: 10}, false)
 	require.NoError(t, err)
-	require.Len(t, rows, 1)
-	assert.Equal(t, crossID, rows[0].ID)
+	assert.Empty(t, rows, "a tenant-one user id must not expose rows in tenant two")
 
 	rows, err = repo.ListCursor(ctxOne, userTwo, pagination.DBCursor{Limit: 10}, false)
 	require.NoError(t, err)

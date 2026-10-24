@@ -21,6 +21,7 @@ type WebhookDelivery struct {
 	Status           string             `json:"status"`
 	Attempts         int32              `json:"attempts"`
 	MaxAttempts      int32              `json:"max_attempts"`
+	TimeoutMs        int32              `json:"timeout_ms"`
 	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
 	LastStatusCode   pgtype.Int4        `json:"last_status_code"`
 	LastError        pgtype.Text        `json:"last_error"`

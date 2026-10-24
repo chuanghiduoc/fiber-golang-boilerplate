@@ -6,7 +6,6 @@ import (
 
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featuresservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -79,7 +78,7 @@ func (h *Handler) GetFlag(c fiber.Ctx) error {
 
 // UpsertFlag godoc
 // @Summary Create or update a feature flag (admin)
-// @Description Replace the database default, kill switch, and description for a compile-time flag
+// @Description Replace the process-wide database default (omit enabled to clear it), kill switch, and description for a compile-time flag. Platform tenant administrators only; other tenants get 403 permission.denied.
 // @Tags Admin
 // @Accept json
 // @Produce json
@@ -107,19 +106,12 @@ func (h *Handler) UpsertFlag(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-
-	audit.AddMetadata(c, map[string]any{
-		"feature":    flag.Key,
-		"enabled":    flag.Enabled,
-		"killSwitch": flag.KillSwitch,
-		"source":     flag.Source,
-	})
 	return response.Success(c, flag)
 }
 
 // DeleteFlag godoc
 // @Summary Delete a feature flag override (admin)
-// @Description Delete the database default and all targets, reverting the flag to environment and compiled defaults
+// @Description Delete the process-wide flag row, reverting the flag to environment and compiled defaults. Platform tenant administrators only; returns 409 while targets exist in any tenant.
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -128,6 +120,7 @@ func (h *Handler) UpsertFlag(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/features/flags/{key} [delete]
 func (h *Handler) DeleteFlag(c fiber.Ctx) error {
 	key, err := flagKey(c)
@@ -137,7 +130,6 @@ func (h *Handler) DeleteFlag(c fiber.Ctx) error {
 	if err := h.service.DeleteFlag(c.Context(), key); err != nil {
 		return err
 	}
-	audit.AddMetadata(c, map[string]any{"feature": key})
 	return response.NoContent(c)
 }
 
@@ -195,16 +187,6 @@ func (h *Handler) UpsertTarget(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-
-	metadata := map[string]any{
-		"feature":  target.FlagKey,
-		"targetId": target.ID,
-		"enabled":  target.Enabled,
-	}
-	if target.UserID != nil {
-		metadata["userId"] = *target.UserID
-	}
-	audit.AddMetadata(c, metadata)
 	return response.Success(c, target)
 }
 
@@ -234,6 +216,5 @@ func (h *Handler) DeleteTarget(c fiber.Ctx) error {
 	if err := h.service.DeleteTarget(c.Context(), key, id); err != nil {
 		return err
 	}
-	audit.AddMetadata(c, map[string]any{"feature": key, "targetId": id})
 	return response.NoContent(c)
 }

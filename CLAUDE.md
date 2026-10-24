@@ -36,15 +36,16 @@ builds multi-arch GHCR images on `v*` tags.
 packages own cross-cutting mechanics.
 
 ```
-cmd/api/main.go             bootstrap + module registration + graceful shutdown
+cmd/api/main.go             infra setup, catalog registration, lifecycle + graceful shutdown
+internal/bootstrap/         the single ordered module list + contract cross-wiring (shared with test/arch)
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
-internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
-internal/contracts/         narrow cross-module identity/files admin, notification, and principal-reader interfaces plus stdlib-only webhook event/dispatcher types
+internal/app/               Fiber app, global middleware, Module registry, provider hooks, app.Infra
+internal/modules/           each module: module.go (Build + providers), catalog/ (permissions, error codes, flags, locales), dto/handler/service/repository, queries/sqlc. identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
+internal/contracts/<provider>/ stdlib-only cross-module contracts per providing module: identity (admin, principal reader, notification recipient), files (admin), notifications (notifier), webhooks (event/dispatcher)
 internal/platform/          authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
-migrations/000001_init_schema.*   single consolidated up/down schema
+migrations/000001_init_schema.*   consolidated baseline; later migrations are <UTC ts>_<owner>_<purpose>.{up,down}.sql
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 ```
 
@@ -67,7 +68,12 @@ secrets). Keep them current when routes/contracts change.
 - `platform`/`pkg` must not import business modules.
 - One module owns each table; cross-module reads use a contract/read model,
   not another module's repository.
-- Enforce with `test/arch/imports_test.go`; do not weaken it.
+- Enforce with `test/arch/imports_test.go`; do not weaken it. `test/arch` also
+  builds every module from `internal/bootstrap` and fails when a route under
+  `/api/v1` lacks `authz.Require` (explicit public allowlist), when a
+  mutating route is neither Tier 1 nor `audit.Guard`ed, when one module's
+  group middleware covers another module's routes (the `/admin` overlap
+  class), or when a module's `queries/*.sql` touch another module's tables.
 
 **Schema ownership**
 - Only `cmd/migrate` applies DDL. API/seed assume the schema exists.
@@ -75,8 +81,15 @@ secrets). Keep them current when routes/contracts change.
   secrets).
 - Fresh installs: one `migrations/000001_init_schema.up.sql`.
 - Existing databases: keep their `schema_migrations` history and add a
-  migration above the current version (a fully migrated old deployment is at 3,
-  so `000004`+) with only the missing objects. Never point an old database at
+  migration above the current version with only the missing objects. New
+  migrations use UTC timestamp versions (`make migrate-create module=<owner>
+  name=<purpose>` -> `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`), which
+  are always above the legacy sequential versions (an old deployment is at 3)
+  and do not collide across branches. `test/arch/migrations_test.go` rejects
+  duplicate versions, missing up/down pairs, non-timestamp versions, and
+  unknown owners. golang-migrate never applies a version below the recorded
+  one, so regenerate a branch migration whose timestamp is older than the
+  newest migration on main before merging. Never point an old database at
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
   The `jobs.trace_parent` column is folded into the baseline because this
   boilerplate has no deployed database; a database already at version 1 needs
@@ -125,8 +138,9 @@ for HTTP, sanitized pgx queries, and durable jobs but is disabled by default
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
-never imports those modules. Notifications exposes `contracts.Notifier` and
-consumes `contracts.NotificationRecipientLookup`, implemented by identity, so
+never imports those modules. Notifications exposes `notifications.Notifier`
+(`internal/contracts/notifications`) and consumes the identity contract
+`NotificationRecipientLookup` (`internal/contracts/identity`), so
 it never reads the users table. Each module with SQL owns its `queries/` and
 generated `sqlc/` package (`admin` is contract-only); there is no shared
 generated package and no cross-module sqlc imports, and no legacy
@@ -138,7 +152,14 @@ complete CD platform.
 ## Error Handling
 
 - Return `*apperror.AppError` from services/handlers. Prefer the typed catalog:
-  `apperror.NewCode(apperror.CodeUserEmailTaken, "public detail")`.
+  `apperror.NewCode(identitycatalog.CodeUserEmailTaken, "public detail")`.
+  Module codes live in `internal/modules/<m>/catalog/errors.go` and are
+  registered through `app.ErrorProvider`; only platform-wide codes
+  (`permission.denied`, `feature.disabled`, `rate_limit.exceeded`,
+  `api.version_unsupported`, `system.*`, and `user.last_admin` until the
+  identity repository moves it) stay in `pkg/apperror`. An unregistered code
+  renders as 500 `system.internal` and logs an error, so handler/service unit
+  tests call `<m>catalog.Register()` (see `catalog_test.go` files).
 - `pkg/apperror` renders RFC 9457 `application/problem+json` with `type`,
   `title`, `status`, `code`, `detail`, `instance`, `requestId`, `timestamp`,
   and optional `errors[]`.
@@ -160,16 +181,23 @@ Use `pkg/response`; never write raw JSON in handlers:
   `{object,url,data,hasMore,nextCursor}`
 
 Cursor pagination: `limit` (max 100) + `startingAfter`; repositories use
-`(created_at, id)` indexes; handlers return `nextCursor` when `hasMore`.
-Offset helpers are for small admin/export tables only.
+`(created_at, id)` indexes; handlers return `nextCursor` (built with
+`pagination.NextCursor`) when `hasMore`. Offset helpers are for small
+admin/export tables only. Existing `PUT`s are partial (identity, apikeys) or
+full replace (webhooks); new modules use `PATCH` for partial updates (see
+`docs/api-design.md` "Update semantics").
 
 ## Key Patterns
 
 - **i18n:** `internal/platform/i18n` embeds `en`/`vi` catalogs and runs right
   after request ID. It negotiates q-values, truncation, and wildcards; sets
   `Content-Language` and `Vary: Accept-Language`; and localizes error titles
-  and validation messages through `pkg/apperror`. Keep `en.json`/`vi.json` keys
-  and `{placeholders}` in parity (startup fails otherwise).
+  and validation messages through `pkg/apperror`. Platform strings live in
+  `internal/platform/i18n/locales`; module strings in
+  `internal/modules/<m>/catalog/locales/{en,vi}.json` (keys `<m>.*` or
+  `errors.<code>.*`), merged via `app.LocaleSources` into `i18n.New`. Keep
+  keys and `{placeholders}` in parity; startup fails on parity mismatch, a
+  missing locale file, a non-namespaced key, or a key defined twice.
 - **API versions:** `/api/v1` is always mounted. Implement `app.V2Module`
   (`RegisterV2Routes`) to opt into `/api/v2`. `Accept-Version: 1|v1|2|v2` must
   match the path, otherwise 406 `api.version_unsupported`. Version middleware
@@ -200,7 +228,7 @@ Offset helpers are for small admin/export tables only.
   work; password-reset and verification tokens are committed with their
   `email.send` job in one transaction (`QueuedSender.SendTx`), so an enqueue
   failure rolls the token back. When transactional email provisioning is wired
-  (as in `cmd/api/main.go`), registration is atomic too: `UserService.Register`
+  (as in `identity.Build`), registration is atomic too: `UserService.Register`
   creates the user, verification token, and `email.send` job in one transaction,
   so a failed outbox write rolls the account back (fail-closed); without that
   wiring the handler falls back to a post-commit email. Resend and email-change
@@ -224,7 +252,14 @@ Offset helpers are for small admin/export tables only.
   `jobs_retried_total{kind}`, `jobs_dead_total{kind}`), claim failures
   (`jobs_claim_errors_total`), purges (`jobs_purged_total`), and audit write
   failures (`audit_write_failures_total`). `jobs_dead_total` covers handler
-  failures that exhaust attempts, not lease-expiry dead letters. Email job
+  failures that exhaust attempts, not lease-expiry dead letters.
+  `jobs_queue_lag_seconds{kind}` (histogram) is observed per claimed job from
+  the claim query itself (database `now() - run_at`), so it adds no query; a
+  fully stalled queue shows as missing observations. `jobs.WithKinds(...)` /
+  `jobs.WithExcludeKinds(...)` filter the claim query so a deployment can run
+  a dedicated worker (own concurrency/pod) for slow kinds; the expired-lease
+  reclaim stays global. A worker must register a handler for every kind it
+  claims. Email job
   payloads are sealed with AES-256-GCM using an HKDF-SHA256 key derived from
   `JWT_SECRET` (`jobs.PayloadCodec`); `EmailHandler` also accepts legacy
   plaintext JSON, which remains readable at rest until delivered or cleared.
@@ -267,14 +302,23 @@ Offset helpers are for small admin/export tables only.
   `scheduler:<name>:<slot>`.
 - **Optional module hooks:** implement `app.EventProvider`,
   `app.JobProvider`, or `app.ScheduleProvider` to register events, jobs, or
-  schedules. `app.Register` invokes them only when the corresponding dependency
-  is non-nil, then registers durable event job handlers.
+  schedules (the webhooks module registers `webhook.delivery`/`webhook.dispatch`
+  this way). `app.Register` invokes them only when the corresponding dependency
+  is non-nil, then registers durable event job handlers. Catalog hooks
+  (`PermissionProvider`, `ErrorProvider`, `FlagProvider`, `LocaleProvider`)
+  are registered by `app.RegisterCatalogs`, which `cmd/api` calls right after
+  `bootstrap.Build` and before FEATURE_FLAGS validation, `i18n.New`, and
+  `app.New`; `app.Register` repeats it idempotently. The `email.send` handler
+  stays in `cmd/api`: it is a platform outbox kind produced by several
+  modules.
 - **Audit:** privileged mutations are fail-closed. Tier 1 services call
   `audit.TxRecorder.RecordTx` in the mutation transaction (failure rolls back
   and returns `503 system.audit_unavailable`); Tier 2 routes use
   `audit.Guard` after idempotency to write a started intent row and complete it
-  as succeeded/failed/denied. `platform/audit.Middleware` remains a fallback
-  and skips routes that set `audit_guarded`. Use `audit.NewServiceEvent` for
+  as succeeded/failed/denied (webhook admin mutations and
+  `POST /notifications/send` are Guarded). `platform/audit.Middleware` remains
+  a fallback (only the webhook receiver and a user's own notification state
+  rely on it) and skips routes that set `audit_guarded`. Use `audit.NewServiceEvent` for
   domain events; never place secrets or PII in metadata.
 - **Tracing:** `internal/platform/tracing` owns the provider; `app.Deps.Tracing`
   is nil-safe and disabled means a no-op provider. Install the middleware after
@@ -288,18 +332,28 @@ Offset helpers are for small admin/export tables only.
   per-type `in_app`/`email` preferences, and the email channel. Read/list/
   unread/read-all and preference queries filter both `tenant_id` and `user_id`;
   cross-tenant or other-user ids return `404`. Missing preferences mean both
-  channels are enabled. `contracts.Notifier` is the cross-module create API;
-  `contracts.NotificationRecipientLookup` lets identity supply the email
+  channels are enabled. `notifications.Notifier` is the cross-module create API;
+  `identity.NotificationRecipientLookup` lets identity supply the email
   address without a module import. When email is enabled, the in-app row and
   `email.send` job commit in one transaction (a queue failure rolls the row
   back); the job inherits `jobs.tenant_id`. A suppressed notification (both
   channels disabled) is a successful no-op. Routes are under
   `/notifications` and `/notification-preferences`; writes use
   `Idempotency-Key`, and admin sends require `notifications:send`.
-- **Authz:** permissions live in `platform/authz`; roles map to permissions.
-  Protect routes with `authz.Require(authz.PermissionX)`.
-- **Feature flags:** the compile-time catalog and evaluator live in
-  `platform/features`; modules read `deps.Flags` (never nil after `app.New`).
+- **Authz:** module permissions live in `internal/modules/<m>/catalog/permissions.go`
+  and are registered through `app.PermissionProvider` (`authz.Grant{Permission,
+  Roles}`; admins get every permission). Only permissions checked by more than
+  one module stay in `platform/authz` (the `admin:users:*`, `admin:files:*`,
+  `admin:stats:read` set used by the admin routes and the identity/files
+  services). Duplicate or conflicting registrations fail startup. Protect
+  routes with `authz.Require(<m>catalog.PermissionX)` behind
+  `deps.Authenticate()` (API key or JWT; API-key scopes are the subject's
+  permissions). Only `POST /auth/logout-all` is JWT-only (with
+  `sessions:revoke`).
+- **Feature flags:** the evaluator lives in `platform/features`; flags are
+  declared in `internal/modules/<m>/catalog/flags.go` and registered through
+  `app.FlagProvider`. `config.Load` checks `FEATURE_FLAGS` syntax only;
+  `cmd/api` rejects unknown keys after `app.RegisterCatalogs`. Modules read `deps.Flags` (never nil after `app.New`).
   Precedence is force-off > kill switch > user > tenant > database default >
   environment > compiled default. The `features` module owns the admin API,
   scopes targets to `tenant.EffectiveID(ctx)`, and invalidates the local
@@ -318,26 +372,37 @@ Offset helpers are for small admin/export tables only.
   (compare-and-delete when the cache supports it), concurrent duplicates get
   409, and cache errors fail open. Replays set `Idempotent-Replayed: true` and
   `idempotency_replayed=true` so audit skips them. Keep `Idempotency-Key` in
-  `CORS_ALLOW_HEADERS`; never add the middleware to token-minting endpoints or
-  GET/HEAD/OPTIONS.
+  `CORS_ALLOW_HEADERS`; never add the middleware to token-minting or
+  secret-returning endpoints (API-key create/rotate, webhook create and
+  `rotate-secret`) or GET/HEAD/OPTIONS.
 
 ## Adding a Module
 
-Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
+Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`. The
+scaffold generates `module.go` (`Build(app.Infra)` constructor + catalog
+providers + one protected sample route), `module_test.go`, `catalog/`
+(`permissions.go`, `errors.go`, `locales/en.json`, `locales/vi.json`),
+handler/service/repository/dto, `queries/<name>.sql`, a `sqlc.yaml` block,
+and `README.md`, then builds, vets, and tests the module.
 
-1. Create `internal/modules/<name>/module.go` implementing `app.Module`;
-   add `RegisterV2Routes` (`app.V2Module`) only for a breaking v2 surface.
-2. Keep handler/service/repository/DTO inside the module.
-3. Add permissions and protect every route (legacy exceptions are documented
-   in `docs/module-template.md`).
-4. Add queries under `internal/modules/<name>/queries/`, add the module's
-   sqlc block to `sqlc.yaml`, and run `make sqlc-generate`.
-5. Add a migration only for a deployed DB; otherwise update the single init
-   schema.
-6. Register the module in `cmd/api/main.go`; use the optional
-   `EventProvider`/`JobProvider`/`ScheduleProvider` hooks for durable work.
-7. Add unit + integration tests; `test/arch` must stay green.
-8. Run `make swagger` and `make check`.
+1. Register it in `internal/bootstrap/modules.go` (`<name>.Build(infra)` in
+   `List`, passing only contracts from earlier modules). This is the only
+   central edit: permissions, error codes, flags, and strings self-register
+   through `app.PermissionProvider`/`ErrorProvider`/`FlagProvider`/
+   `LocaleProvider`; jobs/events/schedules through `JobProvider`/
+   `EventProvider`/`ScheduleProvider`. Add `RegisterV2Routes`
+   (`app.V2Module`) only for a breaking v2 surface.
+2. Keep handler/service/repository/DTO/catalog inside the module; protect
+   every route with `authz.Require` (`test/arch` enforces it).
+3. Name tables `<name>` / `<name>_*` (or add them to
+   `test/arch/table_ownership_test.go`); queries must not touch other
+   modules' tables. Run `make sqlc-generate`.
+4. Add a migration with `make migrate-create module=<name> name=<purpose>`
+   for a deployed DB; otherwise update the single init schema.
+5. Expose data to other modules only through
+   `internal/contracts/<name>/` (stdlib-only).
+6. Add unit + integration tests; `test/arch` must stay green.
+7. Run `make swagger` and `make check`.
 
 ## Testing
 

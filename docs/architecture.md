@@ -7,11 +7,12 @@ support many business modules without microservice overhead.
 ## Runtime shape
 
 ```
-cmd/api        bootstrap, DI, worker lifecycle, graceful shutdown
+cmd/api        infra setup, catalog registration, worker lifecycle, graceful shutdown
 cmd/migrate    the only DDL entrypoint
 cmd/seed       standalone admin seeder (schema must already exist)
 
-internal/app   composition root: Fiber, middleware, infra routes, module registry
+internal/app   Fiber, middleware, infra routes, module registry + provider hooks, app.Infra
+internal/bootstrap  the single ordered module list + contract cross-wiring (cmd/api, test/arch)
 internal/modules
   identity     auth, users, sessions, tokens, admin seed
                (dto/repository/service/handler + adapter + queries + generated sqlc)
@@ -25,9 +26,10 @@ internal/modules
                public HMAC receiver, dispatcher + delivery worker
                (dto/repository/service/handler + queries + generated sqlc)
   apikeys      tenant-scoped API-key lifecycle (dto/repository/service/handler + adapter)
-internal/contracts  narrow cross-module interfaces (identity/files admin +
-                    notification + principal reader + stdlib-only webhook
-                    event/dispatcher types)
+internal/contracts/<provider>  stdlib-only cross-module contracts grouped by the
+                    providing module: identity (admin, principal reader,
+                    notification recipient), files (admin), notifications
+                    (notifier), webhooks (event/dispatcher)
 internal/platform
   apikey       key generation/hash, verifier, rotation grace, ApiKey middleware
   authz        subject/policies, permission catalog, ABAC + route middleware
@@ -70,8 +72,9 @@ bypasses JWT and tenant-header selection. The source row supplies the tenant and
 the source HMAC authenticates the caller.
 
 Notification creation follows the same flow for HTTP reads and preferences.
-Other modules call `contracts.Notifier`, and the notifications service resolves
-the recipient's email through `contracts.NotificationRecipientLookup`
+Other modules call `notifications.Notifier` (`internal/contracts/notifications`),
+and the notifications service resolves the recipient's email through
+`identity.NotificationRecipientLookup` (`internal/contracts/identity`)
 (implemented by identity). The service never imports identity or reads the
 `users` table.
 
@@ -249,7 +252,8 @@ outside tenant resolution so they never depend on the `tenants` table.
 
 - Only `cmd/migrate` applies DDL. The API and seed assume the schema exists.
 - Fresh installs use one baseline: `migrations/000001_init_schema.{up,down}.sql`.
-- Once a database is deployed, add numbered migrations; never edit a shipped
+- Once a database is deployed, add timestamped migrations
+  (`make migrate-create module=<owner> name=<purpose>`); never edit a shipped
   migration. Legacy databases must keep their recorded history (see README).
 - Tenant-owned tables carry `tenant_id` with a default of 1 and a foreign key to
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
@@ -278,11 +282,13 @@ outside tenant resolution so they never depend on the `tenants` table.
 
 ## Cross-cutting conventions
 
-- **Authorization:** permissions live in `internal/platform/authz`; every route
-  uses `authz.Require`. Roles are an implementation detail of the permission
+- **Authorization:** module permissions live in each module's
+  `catalog/permissions.go` and are registered via `app.PermissionProvider`;
+  only cross-module shared permissions stay in `internal/platform/authz`.
+  Every route uses `authz.Require` (enforced by `test/arch`). Roles are an implementation detail of the permission
   matrix. Notification routes use `notifications:read`/`notifications:write`;
   sending to another user requires the admin-only `notifications:send`. Current
-  legacy exceptions (`files` routes, some identity handler checks) are listed in
+  legacy exceptions (public auth routes, some identity handler checks) are listed in
   the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** every privileged mutation is audited fail-closed. Tier 1 services
   (identity registration/profile/password/delete, admin role/ban/unban, admin
@@ -312,7 +318,8 @@ outside tenant resolution so they never depend on the `tenants` table.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,
   24h replay, body-bound for non-multipart requests. Secret-returning creates
   are excluded so plaintext secrets never enter the shared response cache.
-- **Feature flags:** compile-time catalog in `platform/features`; precedence
+- **Feature flags:** module-declared catalog (`catalog/flags.go`,
+  `app.FlagProvider`) evaluated by `platform/features`; precedence
   force-off > kill switch > user > tenant > database default > environment >
   compiled default. Admin writes go through the `features` module and invalidate
   the local snapshot. See [Feature Flags](feature-flags.md).
@@ -327,8 +334,8 @@ The migration is complete. `identity`, `files`, `notifications`, `admin`, and
 `internal/modules/<name>`; there are no shared legacy
 handler/service/DTO/repository packages or compatibility aliases.
 
-The `admin` module depends on `internal/contracts.IdentityAdmin` and
-`internal/contracts.FilesAdmin`; identity and files implement those contracts
+The `admin` module depends on `internal/contracts/identity.IdentityAdmin` and
+`internal/contracts/files.FilesAdmin`; identity and files implement those contracts
 with adapters in their own `adapter` packages. Admin never imports another
 module, its repository, generated SQL, storage, database transactions, or
 session store. Identity and files each own their half of the dashboard stats
@@ -337,8 +344,8 @@ session store. Identity and files each own their half of the dashboard stats
 `identity`, `files`, `webhooks`, and `notifications` own module-scoped
 `queries/` and generated `sqlc/` packages; `sqlc.yaml` has one block per module.
 There is no shared generated package, and no module imports another module's
-sqlc types. Notifications exposes `contracts.Notifier` to other modules and
-consumes `contracts.NotificationRecipientLookup`, implemented by the identity
+sqlc types. Notifications exposes `notifications.Notifier` to other modules and
+consumes `identity.NotificationRecipientLookup`, implemented by the identity
 adapter; neither direction imports module internals. New code should start in
 `internal/modules/<name>/` and use contracts for cross-module reads; webhook
 producers use `internal/contracts/webhooks`.
@@ -349,15 +356,49 @@ Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the canonical
 [Module Template](module-template.md) for the full layout, skeleton, and
 ownership rules. Short form:
 
-1. Create the module, its `queries/` directory and sqlc block, plus tables;
-   update the baseline for fresh installs (or add a numbered migration for
-   deployed DBs).
-2. Add permissions and audit actions.
-3. Add handler/service/repository/DTO in the module directory.
-4. Register routes and the module in `cmd/api/main.go`; implement the optional
-   `app.EventProvider`, `app.JobProvider`, or `app.ScheduleProvider` hooks for
-   durable events, jobs, or schedules instead of wiring them imperatively.
-5. Add unit + integration tests; run `make check`, `go test -race ./...`, and
+1. `scripts/new-module.sh <name>`: module.go (`Build` + providers), catalog
+   (permissions, error codes, en/vi strings), layers, `queries/`, sqlc block,
+   module test, README.
+2. Add the module to `internal/bootstrap/modules.go` (the only central edit).
+3. Add tables: update the baseline for fresh installs, or
+   `make migrate-create module=<name> name=<purpose>` for deployed DBs.
+4. Add handler/service/repository/DTO and protected routes in the module.
+5. Implement the optional `app.EventProvider`, `app.JobProvider`,
+   `app.ScheduleProvider`, or `app.FlagProvider` hooks for durable events,
+   jobs, schedules, or flags instead of wiring them imperatively.
+6. Add unit + integration tests; run `make check`, `go test -race ./...`, and
    `make swagger`.
-6. For durable work, enqueue a job transactionally; never use `async.Go` for
+7. For durable work, enqueue a job transactionally; never use `async.Go` for
    work that must survive a restart.
+
+## Module registration and catalogs
+
+Startup is one explicit path in `cmd/api/main.go`:
+
+```
+config.Load (FEATURE_FLAGS syntax only)
+  -> infra: tracing, pool, storage, cache, flag evaluator, email, tx, audit,
+     job queue/worker, event bus, queued email sender  => app.Infra
+  -> bootstrap.Build(infra)         every module's Build, contract cross-wiring
+  -> app.RegisterCatalogs(list...)  permissions, error codes, flags (owner = Name())
+  -> cfg.FeatureFlags.ValidateKnownKeys()   unknown FEATURE_FLAGS keys fail here
+  -> i18n.New(locale, app.LocaleSources(list...)...)   merge + parity check
+  -> Modules.Startup(ctx)           tenant existence + admin seed
+  -> app.New(cfg, deps) ; app.Register(list...)   routes, jobs, events, schedules
+  -> email.send handlers, scheduler, worker, Modules.Background, HTTP listen
+```
+
+- Catalog registries (`authz`, `apperror`, `features`) are process-wide,
+  copy-on-write snapshots behind an `atomic.Pointer`, so the per-request read
+  path takes no lock. Registration fails on invalid identifiers, unknown
+  roles, or a key already owned by another module; identical re-registration
+  by the same owner is a no-op so tests can build the app repeatedly.
+- Platform-wide entries stay central: `permission.denied`, `feature.disabled`,
+  `rate_limit.exceeded`, `api.version_unsupported`, `system.*`, generic
+  status titles, and validation messages; and the shared back-office
+  permissions (`admin:users:*`, `admin:files:*`, `admin:stats:read`) that the
+  admin module and the identity/files services both check.
+- `internal/bootstrap` is the only package besides `cmd/*` that imports
+  several modules. `test/arch` uses the same `bootstrap.Build`, so route
+  authorization, audit coverage, group-middleware overlap, and SQL table
+  ownership are checked for every registered module.

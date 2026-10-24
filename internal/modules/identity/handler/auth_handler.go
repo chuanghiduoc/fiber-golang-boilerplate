@@ -2,19 +2,25 @@ package handler
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"golang.org/x/crypto/hkdf"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -26,23 +32,58 @@ import (
 
 const oauthStateCookieName = "oauth_state"
 
-// encodeOAuthState binds the OAuth state nonce to the tenant that started the
-// flow. The callback must use this tenant instead of X-Tenant-Slug, otherwise
-// an attacker could start a flow for tenant A and complete it under tenant B.
-func encodeOAuthState(nonce string, tenantID int64) string {
-	return nonce + "." + strconv.FormatInt(tenantID, 10)
+// oauthStateKeyInfo domain-separates the OAuth state MAC key from every other
+// use of the JWT secret.
+const oauthStateKeyInfo = "fiber-golang-boilerplate/identity/oauth-state/v1"
+
+// oauthStateKey derives the HMAC-SHA256 key for OAuth state from the JWT
+// secret with HKDF, so the state MAC never reuses the token-signing key.
+func oauthStateKey(jwtSecret string) []byte {
+	key := make([]byte, sha256.Size)
+	if _, err := io.ReadFull(hkdf.New(sha256.New, []byte(jwtSecret), nil, []byte(oauthStateKeyInfo)), key); err != nil {
+		// HKDF-SHA256 can always produce 32 bytes; failure is a programming error.
+		panic("identity: derive oauth state key: " + err.Error())
+	}
+	return key
 }
 
-func decodeOAuthState(state string) (nonce string, tenantID int64, ok bool) {
-	sep := strings.LastIndexByte(state, '.')
-	if sep <= 0 || sep == len(state)-1 {
+// encodeOAuthState binds the OAuth state nonce to the tenant that started the
+// flow and signs both: "<nonce>.<tenantID>.<hex HMAC>". The callback uses
+// this tenant instead of X-Tenant-Slug, otherwise an attacker could start a
+// flow for tenant A and complete it under tenant B. The cookie comparison
+// alone does not prove integrity, because whoever can set the state cookie
+// can choose its tenant; the MAC does.
+func encodeOAuthState(key []byte, nonce string, tenantID int64) string {
+	payload := nonce + "." + strconv.FormatInt(tenantID, 10)
+	return payload + "." + oauthStateMAC(key, payload)
+}
+
+// decodeOAuthState verifies the MAC in constant time before trusting the
+// tenant carried in state.
+func decodeOAuthState(key []byte, state string) (nonce string, tenantID int64, ok bool) {
+	macSep := strings.LastIndexByte(state, '.')
+	if macSep <= 0 || macSep == len(state)-1 {
 		return "", 0, false
 	}
-	id, err := strconv.ParseInt(state[sep+1:], 10, 64)
+	payload, mac := state[:macSep], state[macSep+1:]
+	if !hmac.Equal([]byte(mac), []byte(oauthStateMAC(key, payload))) {
+		return "", 0, false
+	}
+	sep := strings.LastIndexByte(payload, '.')
+	if sep <= 0 || sep == len(payload)-1 {
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(payload[sep+1:], 10, 64)
 	if err != nil || id <= 0 {
 		return "", 0, false
 	}
-	return state[:sep], id, true
+	return payload[:sep], id, true
+}
+
+func oauthStateMAC(key []byte, payload string) string {
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(payload))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // GoogleOAuthProvider is the subset of oauth.GoogleOAuth the auth handler
@@ -68,6 +109,34 @@ type AuthHandler struct {
 	// redirect/callback can resolve and validate the tenant carried through
 	// the OAuth state.
 	tenants repository.TenantRepository
+	// oauthStateKey signs the OAuth state (see encodeOAuthState).
+	oauthStateKey []byte
+	// flags gates registration, Google OAuth, and the email-verification
+	// requirement. The module installs app.Deps.Flags; when unset,
+	// features.Require uses compiled defaults (google_oauth defaults on;
+	// Google credentials remain the real switch).
+	flags features.Evaluator
+}
+
+// SetFeatureFlags installs the evaluator used for feature gates. It is called
+// once during route registration, before the handler serves requests.
+func (h *AuthHandler) SetFeatureFlags(flags features.Evaluator) {
+	h.flags = flags
+}
+
+// emailVerificationRequired combines REQUIRE_EMAIL_VERIFICATION with the
+// email_verification flag for the user's tenant/user targets. The flag can
+// only add the requirement; it never lifts the configured one.
+func (h *AuthHandler) emailVerificationRequired(ctx context.Context, user *dto.UserResponse) bool {
+	if h.requireEmailVerification {
+		return true
+	}
+	flags := h.flags
+	if flags == nil {
+		flags = features.NewEvaluator(features.Options{})
+	}
+	return flags.Enabled(ctx, identitycatalog.KeyEmailVerification,
+		features.Subject{TenantID: user.TenantID, UserID: user.ID})
 }
 
 func NewAuthHandler(
@@ -95,6 +164,7 @@ func NewAuthHandler(
 		requireEmailVerification: requireEmailVerification,
 		googleOAuth:              googleOAuth,
 		tenants:                  tenantRepo,
+		oauthStateKey:            oauthStateKey(jwtSecret),
 	}
 }
 
@@ -107,11 +177,15 @@ func NewAuthHandler(
 // @Param request body dto.RegisterRequest true "Register request"
 // @Success 201 {object} dto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails "feature.disabled when user_registration is off"
 // @Failure 422 {object} apperror.ProblemDetails
 // @Failure 429 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/register [post]
 func (h *AuthHandler) Register(c fiber.Ctx) error {
+	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyUserRegistration, features.SubjectFromContext(c.Context(), 0)); err != nil {
+		return err
+	}
 	var req dto.RegisterRequest
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
@@ -173,7 +247,12 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	// Authenticate is tenant-scoped, but keep the invariant explicit: a token
 	// must never be minted for a user outside the request tenant.
 	if user.TenantID != tenant.EffectiveID(c.Context()) {
-		return apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
+		return apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
+	}
+	// Authenticate already enforces REQUIRE_EMAIL_VERIFICATION; this adds the
+	// email_verification flag for the user's tenant/user targets.
+	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {
+		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
@@ -215,11 +294,32 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return err
 	}
 
+	// Look the token up without consuming it first, so a recoverable refusal
+	// (email not yet verified) does not burn a valid token. Verify checks
+	// expiry and the request tenant.
+	ownerID, err := h.refreshSvc.Verify(c.Context(), req.RefreshToken)
+	if err != nil {
+		return err
+	}
+	user, err := h.userSvc.GetByID(c.Context(), ownerID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewUnauthorized("account is not active")
+		}
+		return err
+	}
+	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {
+		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	}
+
 	// Consume atomically: a replayed or concurrent refresh token can only be
 	// used once, even if two requests arrive at the same time.
 	userID, tokenTenantID, tokenVersion, err := h.refreshSvc.Consume(c.Context(), req.RefreshToken)
 	if err != nil {
 		return err
+	}
+	if userID != user.ID {
+		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
 	// Refresh tokens are scoped to the request tenant. A token issued by
 	// tenant A can never be replayed against tenant B (or the default tenant
@@ -227,24 +327,15 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	if tokenTenantID != tenant.EffectiveID(c.Context()) {
 		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
-
-	user, err := h.userSvc.GetByID(c.Context(), userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewUnauthorized("account is not active")
-		}
-		return err
-	}
 	if user.TenantID != tokenTenantID {
 		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
 	// A token issued before a password change/reset, ban, or role change must
-	// not be allowed to mint a new session.
+	// not be allowed to mint a new session. CreateRefreshToken re-checks the
+	// stored version, so a change committed after the lookup above still
+	// cannot mint a refresh token.
 	if user.TokenVersion != tokenVersion {
 		return apperror.NewUnauthorized("refresh token is no longer valid")
-	}
-	if h.requireEmailVerification && !user.EmailVerified {
-		return apperror.NewCode(apperror.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
@@ -460,11 +551,14 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	if tenantID <= 0 {
 		return apperror.NewInternal("tenant context is required")
 	}
+	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: tenantID}); err != nil {
+		return err
+	}
 	fiber.Locals[int64](c, "tenant_id", tenantID)
 	fiber.Locals[string](c, "tenant_slug", tenantSlug)
 	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
 
-	state := encodeOAuthState(hex.EncodeToString(b), tenantID)
+	state := encodeOAuthState(h.oauthStateKey, hex.EncodeToString(b), tenantID)
 
 	c.Cookie(&fiber.Cookie{
 		Name:     oauthStateCookieName,
@@ -504,7 +598,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
 		return apperror.NewBadRequest("invalid oauth state")
 	}
-	_, tenantID, ok := decodeOAuthState(state)
+	_, tenantID, ok := decodeOAuthState(h.oauthStateKey, state)
 	if !ok {
 		return apperror.NewBadRequest("invalid oauth state")
 	}
@@ -517,6 +611,11 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	stateTenant, err := h.tenants.GetByID(c.Context(), tenantID)
 	if err != nil {
 		return apperror.NewBadRequest("invalid oauth state")
+	}
+	// Gate on the signed-state tenant: the callback skips tenant middleware,
+	// so the request context tenant is not the one that started the flow.
+	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: stateTenant.ID}); err != nil {
+		return err
 	}
 	fiber.Locals[int64](c, "tenant_id", stateTenant.ID)
 	fiber.Locals[string](c, "tenant_slug", stateTenant.Slug)
@@ -551,6 +650,11 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	}
 	if user.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
+	}
+	// Same rule as Login/Refresh. A Google-linked account whose email was
+	// later changed (which clears email_verified_at) must not mint a session.
+	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {
+		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)

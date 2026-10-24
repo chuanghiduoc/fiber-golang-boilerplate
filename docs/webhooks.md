@@ -36,11 +36,34 @@ type Dispatcher interface {
 - A zero `TenantID` resolves from the context (`tenant.EffectiveID`).
 - `Data` defaults to `{}`; it must be valid JSON.
 
-`cmd/api/main.go` installs the dispatcher in `app.Deps.Webhooks`; identity
+`internal/bootstrap` attaches the webhooks module's dispatcher to identity and
+files and `cmd/api/main.go` installs it in `app.Deps.Webhooks`; identity
 registration and file upload/delete emit `user.registered`, `file.uploaded`,
 and `file.deleted` through it. Modules can also inject the contract directly. A
 nil dispatcher is a no-op, so tests and minimal deployments do not need the
 webhooks module.
+
+### Transactional dispatch (outbox)
+
+`Dispatch` runs after the producer's commit, so a crash between the two could
+lose (or, on a retry, duplicate) the event. Producers that own a transaction
+use the webhooks dispatcher's `DispatchTx(ctx, tx pgx.Tx, events...)` instead.
+It is not on the stdlib-only contract (it takes a `pgx.Tx`); producers declare
+a narrow `WebhookTxDispatcher` interface and type-assert the injected
+dispatcher, mirroring `jobs.EnqueueTx`/`events.PublishTx`.
+
+`DispatchTx` fixes the event ID (assigning `evt_...` if empty) and enqueues one
+`webhook.dispatch` job per event in the caller's transaction, deduplicated by
+the idempotency key `webhook.dispatch:<eventId>`. The event and the business
+change therefore commit or roll back together; an enqueue failure fails the
+producer's mutation (fail-closed, like the email outbox). The job then runs the
+normal fan-out with that stable ID; because deliveries are unique per
+`(tenant, endpoint, event)`, a retried job only creates the deliveries still
+missing. Endpoints are matched when the job runs, not at commit time.
+
+Identity registration (when `TxManager` is wired) and file upload/delete (when
+`filesvc.AttachTxManager` is wired, as in `files.Build`) use this path;
+without it they fall back to the best-effort post-commit `Dispatch`.
 
 ### Endpoint model
 
@@ -48,9 +71,9 @@ webhooks module.
 |---|---|
 | `url` | Absolute `http(s)` URL. The URL is snapshotted per delivery. |
 | `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. |
-| `status` | `active` or `disabled`. Disabled endpoints are not matched. |
+| `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried (see below). |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
-| `timeoutMs` | Per-attempt HTTP timeout, 100-120000 ms (default request timeout). |
+| `timeoutMs` | Per-attempt HTTP timeout, 100-120000 ms (default request timeout). Snapshotted per delivery; it can only shorten the global `WEBHOOK_REQUEST_TIMEOUT_SECS`. |
 | `description` | Free-form label. |
 
 Delete is soft: the row keeps its delivery history but is excluded from
@@ -65,13 +88,22 @@ For each event, the dispatcher:
 3. Filters by `eventTypes`.
 4. Inserts a `webhook_deliveries` row and a `webhook.delivery` job in **one
    transaction**. The delivery snapshots the event payload, event timestamp,
-   endpoint URL, secret ciphertext, and max attempts.
+   endpoint URL, secret ciphertext, max attempts, and timeout.
 5. Returns the number of newly created deliveries. `(tenant_id, endpoint_id,
    event_id)` is unique, so re-dispatching the same event is a no-op.
 
 The worker then signs and sends one attempt per job. Retries are new jobs
 scheduled at the delivery's next attempt time; the platform job is not used for
 webhook-level backoff.
+
+A delivery is only claimed while its endpoint is `active` and not deleted.
+Once the request has been sent, the attempt row and the outcome are written
+with a detached, bounded context, so a worker shutdown cannot lose a sent
+attempt. When a pending delivery can never be claimed again — its endpoint was
+disabled/deleted, or every attempt was consumed but the final bookkeeping write
+failed — the next job for it marks it `dead` (`last_error` is `endpoint is
+disabled or deleted` or `delivery attempts exhausted`) instead of leaving it
+`pending` forever. A live claim lease is never touched.
 
 ### Signed request
 
@@ -101,12 +133,23 @@ Body:
 Signature input is the exact bytes:
 
 ```
-<unix-timestamp>.<raw-request-body>
+<X-Webhook-Id>.<X-Webhook-Timestamp>.<X-Webhook-Event>.<raw-request-body>
 ```
 
-Verify with `webhook.Sign`/`webhook.VerifyRequest` and a small timestamp
-tolerance (default 5 minutes); always compare in constant time. Support
-multiple comma-separated signatures to allow a receiver-side key transition.
+> **Breaking change for receivers.** Earlier builds signed only
+> `<timestamp>.<raw-body>`. The prefix stays `v1=` (still HMAC-SHA256), but a
+> receiver verifying the old input will now reject every request as an invalid
+> signature. Update receivers to the new input before deploying this build, or
+> temporarily accept both inputs during the rollout. Binding the event ID and
+> type closes a replay gap: previously an attacker who captured a request could
+> resend it within the timestamp window under a fresh `X-Webhook-Id` (bypassing
+> ID-based deduplication) or a different `X-Webhook-Event`.
+
+Use the raw header values exactly as received (an absent `X-Webhook-Event`
+signs as the empty string). Verify with `webhook.Sign`/`webhook.VerifyRequest`
+and a small timestamp tolerance (default 5 minutes); always compare in constant
+time. Support multiple comma-separated signatures to allow a receiver-side key
+transition.
 
 ### Retry classification
 
@@ -121,7 +164,9 @@ multiple comma-separated signatures to allow a receiver-side key transition.
 | blocked/invalid target | Dead immediately. |
 
 Backoff is `base * 2^(attempt-1)` capped at `WEBHOOK_RETRY_MAX_SECS`. A valid
-`Retry-After` (seconds or HTTP date) wins and is capped at the same maximum.
+`Retry-After` (seconds or HTTP date) can only lengthen that backoff, never
+shorten it, so `Retry-After: 0` or a past date cannot trigger immediate
+retries; it is capped at the same maximum.
 When attempts are exhausted, or the failure is permanent, the delivery becomes
 `dead`. Every attempt is recorded in `webhook_delivery_attempts` with status
 code, duration, and a truncated error (never the response body).
@@ -137,6 +182,11 @@ The original row is untouched.
 - accepts only absolute `http(s)` URLs with no userinfo;
 - resolves the hostname itself, rejects private, loopback, link-local,
   multicast, unspecified, CGNAT, and reserved/documentation ranges;
+- treats IPv6 transition addresses by what they reach: NAT64 `64:ff9b::/96`,
+  6to4 `2002::/16`, IPv4-compatible `::/96`, and IPv4-translated
+  `::ffff:0:0:0/96` are re-checked against their embedded IPv4 address, while
+  local-use NAT64 `64:ff9b:1::/48`, Teredo `2001::/32`, and site-local
+  `fec0::/10` are blocked outright;
 - dials the vetted IP while preserving the hostname for `Host`/TLS SNI, which
   prevents DNS rebinding between check and connect;
 - sets `Proxy: nil` so `HTTP_PROXY` cannot bypass validation;
@@ -152,8 +202,8 @@ intentionally internal. Never use `0.0.0.0/0` or `::/0`.
 
 `POST /api/v1/webhooks/inbound/{sourceID}` is public: no JWT and no
 `X-Tenant-Slug`. The source ID selects the owning tenant and the source secret
-authenticates the request. An unknown or disabled source, or a soft-deleted
-one, returns `404`.
+authenticates the request. An unknown or disabled source, a soft-deleted one,
+or a source whose tenant is suspended returns `404`.
 
 Required headers use the same scheme as outbound:
 
@@ -164,8 +214,10 @@ Required headers use the same scheme as outbound:
 - `X-Webhook-Event`: optional event type (default `inbound`).
 
 The raw body must be valid JSON and at most 1 MiB. The signature covers
-`<timestamp>.<raw-body>` and must be within
-`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`. Invalid/missing signatures and stale
+`<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>` (the same breaking
+change as outbound; senders must sign the new input) and must be within
+`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`. Because the ID is signed, a captured
+request cannot be replayed under a new ID to bypass deduplication. Invalid/missing signatures and stale
 timestamps return `401`; malformed bodies/IDs return `400`.
 
 Responses:
@@ -192,7 +244,8 @@ rotate.
 
 Rotation:
 
-- Endpoint rotation deactivates the old secret and inserts a new version. Queued
+- Endpoint rotation locks the endpoint row, deactivates the old secret, and
+  inserts the next version, so concurrent rotations serialize. Queued
   deliveries keep the ciphertext snapshot they were created with, so rotation
   does not break in-flight work. Replays use the current active secret.
 - Inbound rotation replaces the verification secret immediately; old signatures
@@ -215,15 +268,22 @@ Rotation:
 ## Permissions and audit
 
 `webhooks:read` and `webhooks:write` are granted to the built-in `admin` role.
-Every route uses `authz.Require`; regular users receive `403`. The public
-receiver is the only unauthenticated route.
+Administration routes accept a JWT or an API key scoped to these permissions
+(`app.Deps.Authenticate()`) and use `authz.Require`; regular users receive
+`403`. The public receiver is the only unauthenticated route.
 
-Domain audit actions include `webhook.endpoint.created|updated|deleted|
-secret_rotated`, `webhook.delivery.replayed`,
-`webhook.inbound_source.created|updated|deleted|secret_rotated`, and
-`webhook.inbound.received`. Metadata contains IDs, URL/filter/status, event
-type, and duplicate flag; it never contains secrets or payloads. Audit write
-failures are logged and do not fail the mutation.
+Administration mutations (endpoint/source create, update, delete,
+rotate-secret, and delivery replay) are Tier 2: a required `audit.Guard`
+writes a `started` intent row before the handler and completes it with the
+outcome, so an unavailable audit store returns `503 system.audit_unavailable`
+and the mutation does not run. The service then records the domain event as a
+child (`parent_id`) of that intent: `webhook.endpoint.created|updated|deleted|
+secret_rotated`, `webhook.delivery.replayed`, or
+`webhook.inbound_source.created|updated|deleted|secret_rotated`. The public
+receiver records `webhook.inbound.received` best-effort. Metadata contains
+IDs, URL/filter/status, event type, and duplicate flag; it never contains
+secrets or payloads. A domain-event write failure is logged and does not fail
+the (already intent-audited) mutation.
 
 ## HTTP API
 
@@ -248,9 +308,11 @@ failures are logged and do not fail the mutation.
 | GET | `/api/v1/webhooks/inbound-sources/:id/events` | `webhooks:read` |
 | POST | `/api/v1/webhooks/inbound/{id}` | Public, HMAC |
 
-Idempotency: creates that return a secret deliberately omit `Idempotency-Key`
-caching. Every other mutation accepts it; replaying a rotate request returns the
-same secret instead of rotating again. The public receiver relies on
+Idempotency: routes that return a secret (endpoint/source create and both
+`rotate-secret` routes) deliberately omit `Idempotency-Key` caching so the
+plaintext secret never sits in the shared response cache. A retried rotation
+rotates again and returns the newest secret; only the latest one is active.
+Update, delete, and replay accept the header. The public receiver relies on
 `(source, X-Webhook-Id)` deduplication and does not use the middleware.
 
 ## Tables and retention
@@ -262,11 +324,19 @@ same secret instead of rotating again. The public receiver relies on
   external event ID).
 
 All tables carry `tenant_id` with tenant-leading indexes. There are no
-cross-module foreign keys; module-internal FKs cascade delivery attempts and
-source events. A retention loop runs hourly (first pass at startup) and deletes
+cross-module foreign keys. Module-internal FKs are tenant-composite
+(`(tenant_id, endpoint_id)`, `(tenant_id, source_id)`); secrets cascade with
+their endpoint and attempts with their delivery, while deliveries and inbound
+events are history and `RESTRICT` deletion of their endpoint/source. A retention loop runs hourly (first pass at startup) and deletes
 `webhook_deliveries` in `succeeded`/`dead` state older than
 `WEBHOOK_RETENTION_DAYS`, plus inbound events older than the same window.
-Pending deliveries are never purged.
+Pending deliveries are never purged. Each purge deletes in batches of at most
+1,000 rows (`FOR UPDATE SKIP LOCKED`) until a batch is short, bounded by a 30s
+pass. Retention is cross-tenant, so its supporting indexes
+(`idx_webhook_deliveries_terminal_updated_at`,
+`idx_webhook_inbound_events_received_at`) are deliberately not tenant-leading;
+`idx_webhook_deliveries_replayed_from_id` keeps the `ON DELETE SET NULL` on
+replays from scanning the table per deleted row.
 
 ## Inspecting and operating
 
@@ -291,10 +361,10 @@ FROM webhook_delivery_attempts
 WHERE delivery_id = $1
 ORDER BY attempt;
 
--- Outstanding delivery jobs
-SELECT id, tenant_id, status, attempts, run_at, last_error
+-- Outstanding fan-out and delivery jobs
+SELECT id, tenant_id, kind, status, attempts, run_at, last_error
 FROM jobs
-WHERE kind = 'webhook.delivery' AND status IN ('queued', 'running')
+WHERE kind IN ('webhook.dispatch', 'webhook.delivery') AND status IN ('queued', 'running')
 ORDER BY run_at
 LIMIT 50;
 ```

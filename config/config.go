@@ -76,6 +76,11 @@ type TracingConfig struct {
 	// InstrumentDB adds sanitized client spans for pgx queries that run under
 	// a recording parent span.
 	InstrumentDB bool `env:"OTEL_INSTRUMENT_DB" envDefault:"true"`
+	// TrustIncoming honors an incoming W3C traceparent. It is off by default
+	// because a client-supplied sampled flag would force sampling under the
+	// parent-based sampler. With APP_TRUST_PROXY=true it is honored only from
+	// peers in APP_TRUSTED_PROXIES.
+	TrustIncoming bool `env:"OTEL_TRUST_INCOMING_TRACE" envDefault:"false"`
 
 	BatchTimeout       int `env:"OTEL_BATCH_TIMEOUT_SECS" envDefault:"5"`
 	ExportTimeout      int `env:"OTEL_EXPORT_TIMEOUT_SECS" envDefault:"30"`
@@ -218,6 +223,28 @@ func (f FeatureFlagsConfig) EnvValues() map[features.Key]bool {
 		return map[features.Key]bool{}
 	}
 	return values
+}
+
+// ValidateKnownKeys rejects FEATURE_FLAGS / FEATURE_FLAGS_FORCE_OFF entries
+// that are not in the registered flag catalog, so a typo cannot silently
+// disable a feature. Flags are registered by modules at startup, so call this
+// after app.RegisterCatalogs; Validate only checks syntax.
+func (f FeatureFlagsConfig) ValidateKnownKeys() error {
+	parsed, err := features.ParseFlags(f.Flags)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	if err := features.KnownKeysError(parsed); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	forceOff, err := features.ParseForceOff(f.ForceOff)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	if err := features.KnownForceOffError(forceOff); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	return nil
 }
 
 // ForceOffValues parses FEATURE_FLAGS_FORCE_OFF.
@@ -382,7 +409,10 @@ type AppConfig struct {
 	Env  string `env:"APP_ENV" envDefault:"local"`
 	// BodyLimit must be larger than STORAGE_MAX_FILE_SIZE because multipart
 	// framing adds overhead before the upload handler sees the file.
-	BodyLimit                int    `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
+	BodyLimit int `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
+	// JSONBodyLimit caps every non-multipart request body (JSON, form, raw).
+	// Only multipart/form-data uploads may use the larger APP_BODY_LIMIT.
+	JSONBodyLimit            int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
 	LogLevel                 string `env:"LOG_LEVEL" envDefault:"info"`
 	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"30"` // seconds
 	FrontendURL              string `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
@@ -403,6 +433,19 @@ type AppConfig struct {
 // TrustedProxiesList returns the parsed list of trusted proxy IPs/CIDRs.
 func (a AppConfig) TrustedProxiesList() []string {
 	return splitCSV(a.TrustedProxies)
+}
+
+// DefaultJSONBodyLimit is the APP_JSON_BODY_LIMIT default (1 MiB).
+const DefaultJSONBodyLimit = 1 << 20
+
+// EffectiveJSONBodyLimit returns JSONBodyLimit, or the 1 MiB default for a
+// zero value. Load rejects explicit values below 1; the fallback only covers
+// AppConfig literals built in tests and tools.
+func (a AppConfig) EffectiveJSONBodyLimit() int {
+	if a.JSONBodyLimit <= 0 {
+		return DefaultJSONBodyLimit
+	}
+	return a.JSONBodyLimit
 }
 
 type CORSConfig struct {
@@ -446,6 +489,11 @@ type JWTConfig struct {
 type CacheConfig struct {
 	Driver   string `env:"CACHE_DRIVER" envDefault:"memory"`
 	RedisURL string `env:"REDIS_URL"`
+	// AllowMemoryInProduction acknowledges a single-replica production
+	// deployment. The memory driver keeps rate limits, idempotency, login
+	// lockout, and session invalidation per process, so it is rejected in
+	// production unless this is explicitly true.
+	AllowMemoryInProduction bool `env:"CACHE_ALLOW_MEMORY_IN_PRODUCTION" envDefault:"false"`
 }
 
 type EmailConfig struct {
@@ -648,21 +696,15 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("TENANT_DEFAULT_SLUG must match [a-z0-9-]{1,63} (got %q)", cfg.Tenant.DefaultSlug)
 	}
 
-	// Feature flags: reject unknown/malformed keys so a typo cannot silently
-	// disable a feature. Zero cache values mean "use the package defaults";
+	// Feature flags: reject malformed or duplicate entries here. Unknown keys
+	// are rejected by FeatureFlagsConfig.ValidateKnownKeys, which cmd/api calls
+	// after modules register their flags (the catalog is not complete yet when
+	// config loads). Zero cache values mean "use the package defaults";
 	// negative values are configuration errors.
-	parsedFlags, err := features.ParseFlags(cfg.FeatureFlags.Flags)
-	if err != nil {
+	if _, err := features.ParseFlags(cfg.FeatureFlags.Flags); err != nil {
 		return fmt.Errorf("FEATURE_FLAGS: %w", err)
 	}
-	if err := features.KnownKeysError(parsedFlags); err != nil {
-		return fmt.Errorf("FEATURE_FLAGS: %w", err)
-	}
-	forceOff, err := features.ParseForceOff(cfg.FeatureFlags.ForceOff)
-	if err != nil {
-		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
-	}
-	if err := features.KnownForceOffError(forceOff); err != nil {
+	if _, err := features.ParseForceOff(cfg.FeatureFlags.ForceOff); err != nil {
 		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
 	}
 	if cfg.FeatureFlags.CacheTTLSeconds < 0 {
@@ -728,6 +770,12 @@ func (cfg *Config) Validate() error {
 
 	if cfg.App.BodyLimit < 1 {
 		return fmt.Errorf("APP_BODY_LIMIT must be at least 1 byte")
+	}
+	if cfg.App.JSONBodyLimit < 1 {
+		return fmt.Errorf("APP_JSON_BODY_LIMIT must be at least 1 byte")
+	}
+	if cfg.App.JSONBodyLimit > cfg.App.BodyLimit {
+		return fmt.Errorf("APP_JSON_BODY_LIMIT (%d) must not exceed APP_BODY_LIMIT (%d)", cfg.App.JSONBodyLimit, cfg.App.BodyLimit)
 	}
 	if cfg.RateLimit.StrictMax < 1 || cfg.RateLimit.NormalMax < 1 || cfg.RateLimit.RelaxedMax < 1 {
 		return fmt.Errorf("all RATE_LIMIT_*_MAX values must be at least 1")
@@ -845,6 +893,9 @@ func (cfg *Config) Validate() error {
 		}
 		if cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
 			return fmt.Errorf("APP_BODY_LIMIT (%d) must be greater than STORAGE_MAX_FILE_SIZE (%d) to allow multipart framing", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
+		}
+		if cfg.Cache.Driver == "memory" && !cfg.Cache.AllowMemoryInProduction {
+			return fmt.Errorf("CACHE_DRIVER=memory is not shared across replicas; use redis in production or set CACHE_ALLOW_MEMORY_IN_PRODUCTION=true for a single-replica deployment")
 		}
 		if len(cfg.Storage.AllowedTypes()) == 0 {
 			return fmt.Errorf("STORAGE_ALLOWED_MIME_TYPES must not be empty in production")
