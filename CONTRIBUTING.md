@@ -139,17 +139,20 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 8. Update `CHANGELOG.md`.
 
 > `identity` owns its DTOs, repositories, services, and handlers under
-> `internal/modules/identity`. `files` owns its upload handler/service/repository
-> in the module but still uses the legacy DTO layer. `admin` still wraps the
-> global handler/service packages. Moving the remaining internals is the
-> next strangler phase; new modules should start in the module layout.
+> `internal/modules/identity`. `files` owns its repository, service, and handlers
+> in the module but still uses the legacy DTO layer. `admin` owns its DTOs,
+> service, and handler and consumes identity/files only through
+> `internal/contracts`; it does not import their internals. Only the files
+> upload compatibility wrappers, the files DTO, and shared generated SQL remain
+> in the legacy layer.
 
 ## Code Style
 
 - Error handling: return `*apperror.AppError` via the typed catalog
   (`apperror.NewCode(...)`), not raw errors or magic strings
 - Responses: use `pkg/response` helpers, not `c.JSON()`
-- Roles: use `identity/dto.RoleAdmin` / `identity/dto.RoleUser`, not magic strings
+- Roles: use the owning module's constants (`identity/dto` or `admin/dto`), not
+  magic strings
 - Permissions: use `authz.Permission*`, not ad-hoc role checks
 - Int conversion: use `pagination.clampInt32()`, not direct `int32()` cast
 - Durable background work: enqueue in `internal/platform/jobs`; never use

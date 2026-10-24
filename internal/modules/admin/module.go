@@ -4,18 +4,18 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
-// Module owns the back-office surface. It is deliberately thin; reporting and
-// cross-module operations should move behind contracts over time.
+// Module owns the back-office surface. Its services compose narrow
+// identity/files contracts and never import those modules' internals.
 type Module struct {
-	admin *handler.AdminHandler
+	admin *adminhandler.Handler
 }
 
-func New(admin *handler.AdminHandler) *Module {
+func New(admin *adminhandler.Handler) *Module {
 	return &Module{admin: admin}
 }
 

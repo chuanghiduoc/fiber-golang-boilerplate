@@ -110,6 +110,12 @@ RETURNING *;
 -- name: CountActiveAdmins :one
 SELECT count(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL;
 
+-- name: AdminUserStats :one
+SELECT
+    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS active_users,
+    count(*) FILTER (WHERE deleted_at IS NOT NULL)::bigint AS deleted_users
+FROM users;
+
 -- name: AdminListUsers :many
 SELECT * FROM users ORDER BY id LIMIT $1 OFFSET $2;
 

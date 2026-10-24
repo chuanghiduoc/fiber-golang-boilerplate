@@ -7,25 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 )
-
-func TestAdmin_CannotRemoveLastAdmin(t *testing.T) {
-	svc, repo, _, _, _ := newAdminServiceForTest()
-	repo.users[1] = &sqlc.User{
-		ID: 1, Email: "admin@example.com", Name: "Admin", Role: dto.RoleAdmin,
-		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-	}
-
-	if _, err := svc.UpdateRole(context.Background(), 1, dto.RoleUser); err == nil {
-		t.Fatal("expected last-admin demotion to be rejected")
-	}
-	if err := svc.BanUser(context.Background(), 1); err == nil {
-		t.Fatal("expected last-admin ban to be rejected")
-	}
-}
 
 func TestUploadList_IncludeDeleted(t *testing.T) {
 	repo := newMockFileRepo()

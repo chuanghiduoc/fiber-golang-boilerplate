@@ -40,9 +40,10 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed), files (handler/service/repository), admin
+internal/modules/           identity (full vertical slice + admin seed), files (handler/service/repository), admin (dto/service/handler, contracts-only)
+internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
-internal/handler|service|dto|sqlc   remaining legacy internals (strangler phase)
+internal/handler|service|dto|sqlc   remaining legacy upload wrappers, files DTO, shared generated SQL
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -80,9 +81,12 @@ Tenant isolation, per-module sqlc generation, distributed tracing, environment
 promotion/rollout automation, and moving the remaining legacy
 handler/service/repository/DTO internals into modules remain future work.
 `identity` owns its DTOs, repositories, services, and handlers under
-`internal/modules/identity`. `files` owns its upload handler/service but still
-uses the legacy repository/DTO layer, and `admin` still wraps the global
-handler/service packages. Kubernetes manifests and a GHCR release workflow exist
+`internal/modules/identity`. `files` owns its repository, service, and handlers
+but still uses the legacy DTO layer. `admin` owns its DTOs, service, and handler
+and depends only on the stdlib-only `internal/contracts` interfaces for
+identity/files reads; it never imports those modules. Only the files upload
+compatibility wrappers, the files DTO, and shared sqlc generation remain in the
+legacy layer. Kubernetes manifests and a GHCR release workflow exist
 under `deploy/k8s/` and `.github/workflows/release.yml`; they are a production
 foundation, not a complete CD platform.
 

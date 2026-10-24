@@ -47,6 +47,57 @@ func TestModuleBoundaries(t *testing.T) {
 	for _, dir := range []string{"internal/platform", "internal/shared", "pkg"} {
 		checkNoBusinessImports(t, filepath.Join(root, dir))
 	}
+
+	t.Run("contracts stay transport-neutral", func(t *testing.T) {
+		checkForbiddenImports(t, filepath.Join(root, "internal", "contracts"), []string{
+			"internal/modules/",
+			"internal/repository",
+			"internal/dto",
+			"internal/sqlc",
+			"pkg/storage",
+			"pkg/database",
+			"internal/platform/session",
+		})
+	})
+
+	t.Run("admin depends on contracts not module internals", func(t *testing.T) {
+		checkForbiddenImports(t, filepath.Join(root, "internal", "modules", "admin"), []string{
+			"internal/modules/identity",
+			"internal/modules/files",
+			"internal/repository",
+			"internal/dto",
+			"internal/sqlc",
+			"internal/service",
+			"internal/handler",
+			"pkg/storage",
+			"pkg/database",
+			"internal/platform/session",
+		})
+	})
+}
+
+func checkForbiddenImports(t *testing.T, dir string, forbidden []string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		for _, imp := range parseImports(t, path) {
+			for _, prefix := range forbidden {
+				needle := "github.com/chuanghiduoc/fiber-golang-boilerplate/" + prefix
+				if strings.HasPrefix(imp, needle) {
+					t.Errorf("%s must not import %s", path, imp)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
 }
 
 func checkNoBusinessImports(t *testing.T, dir string) {

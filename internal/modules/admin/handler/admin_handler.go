@@ -3,21 +3,22 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
+	adminsvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
-type AdminHandler struct {
-	service service.AdminService
+// Handler serves the back-office HTTP surface. It owns only admin DTOs and
+// delegates cross-module work to the admin service contracts.
+type Handler struct {
+	service adminsvc.Service
 }
 
-func NewAdminHandler(svc service.AdminService) *AdminHandler {
-	return &AdminHandler{service: svc}
+func NewHandler(svc adminsvc.Service) *Handler {
+	return &Handler{service: svc}
 }
 
 // GetStats godoc
@@ -26,11 +27,11 @@ func NewAdminHandler(svc service.AdminService) *AdminHandler {
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
-// @Success 200 {object} dto.AdminStatsResponse
+// @Success 200 {object} admindto.AdminStatsResponse
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/stats [get]
-func (h *AdminHandler) GetStats(c fiber.Ctx) error {
+func (h *Handler) GetStats(c fiber.Ctx) error {
 	stats, err := h.service.GetStats(c.Context())
 	if err != nil {
 		return err
@@ -47,11 +48,11 @@ func (h *AdminHandler) GetStats(c fiber.Ctx) error {
 // @Security BearerAuth
 // @Param limit query int false "Max items to return" default(20)
 // @Param startingAfter query string false "Cursor from the last item of the previous page"
-// @Success 200 {object} response.ListResponse{data=[]dto.UserResponse}
+// @Success 200 {object} response.ListResponse{data=[]admindto.UserResponse}
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/users [get]
-func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
+func (h *Handler) ListUsers(c fiber.Ctx) error {
 	limit, startingAfter, err := httpx.CursorQuery(c)
 	if err != nil {
 		return err
@@ -73,15 +74,15 @@ func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param id path int true "User ID"
-// @Param request body dto.UpdateRoleRequest true "Role update request"
-// @Success 200 {object} dto.UserResponse
+// @Param request body admindto.UpdateRoleRequest true "Role update request"
+// @Success 200 {object} admindto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/role [put]
-func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
+func (h *Handler) UpdateRole(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -90,7 +91,7 @@ func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 		return apperror.NewBadRequest("you cannot change your own role")
 	}
 
-	var req dto.UpdateRoleRequest
+	var req admindto.UpdateRoleRequest
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
@@ -117,7 +118,7 @@ func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/ban [post]
-func (h *AdminHandler) BanUser(c fiber.Ctx) error {
+func (h *Handler) BanUser(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -140,14 +141,14 @@ func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param id path int true "User ID"
-// @Success 200 {object} dto.UserResponse
+// @Success 200 {object} admindto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/unban [post]
-func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
+func (h *Handler) UnbanUser(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -169,11 +170,11 @@ func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
 // @Security BearerAuth
 // @Param limit query int false "Max items to return" default(20)
 // @Param startingAfter query string false "Cursor from the last item of the previous page"
-// @Success 200 {object} response.ListResponse{data=[]dto.FileResponse}
+// @Success 200 {object} response.ListResponse{data=[]admindto.FileResponse}
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/files [get]
-func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
+func (h *Handler) ListFiles(c fiber.Ctx) error {
 	limit, startingAfter, err := httpx.CursorQuery(c)
 	if err != nil {
 		return err
@@ -200,7 +201,7 @@ func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/files/{id}/download [get]
-func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
+func (h *Handler) DownloadFile(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -228,7 +229,7 @@ func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/files/{id} [delete]
-func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
+func (h *Handler) DeleteFile(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -246,14 +247,14 @@ func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param id path int true "File ID"
-// @Success 200 {object} dto.FileResponse
+// @Success 200 {object} admindto.FileResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/files/{id}/restore [post]
-func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
+func (h *Handler) RestoreFile(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
@@ -268,7 +269,7 @@ func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
 
 // nextUserCursor exposes the opaque cursor clients must pass as startingAfter
 // on the next request.
-func nextUserCursor(items []identitydto.UserResponse) string {
+func nextUserCursor(items []admindto.UserResponse) string {
 	if len(items) == 0 {
 		return ""
 	}
@@ -276,7 +277,7 @@ func nextUserCursor(items []identitydto.UserResponse) string {
 	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }
 
-func nextFileCursor(items []dto.FileResponse) string {
+func nextFileCursor(items []admindto.FileResponse) string {
 	if len(items) == 0 {
 		return ""
 	}

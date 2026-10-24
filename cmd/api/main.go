@@ -21,13 +21,16 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	legacyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
+	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
+	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
+	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
@@ -35,7 +38,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -191,9 +193,15 @@ func main() {
 	uploadSvc := filesvc.NewUploadService(fileRepo, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
 
-	// Admin
-	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager, sessionStore)
-	adminHandler := legacyhandler.NewAdminHandler(adminSvc)
+	// Admin composes narrow identity/files contracts; it never imports those
+	// modules' repositories, SQL, storage, or session internals.
+	identityAdminSvc := identityservice.NewAdminUserService(userRepo, refreshTokenRepo, txManager, sessionStore)
+	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, store)
+	adminSvc := adminservice.NewService(
+		identityadapter.NewAdminIdentity(identityAdminSvc),
+		filesadapter.NewAdminFiles(filesAdminSvc),
+	)
+	adminHandler := adminhandler.NewHandler(adminSvc)
 
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)

@@ -1,5 +1,68 @@
 basePath: /api/v1
 definitions:
+  admindto.AdminStatsResponse:
+    properties:
+      activeUsers:
+        type: integer
+      deletedUsers:
+        type: integer
+      totalFileSize:
+        type: integer
+      totalFiles:
+        type: integer
+    type: object
+  admindto.FileResponse:
+    properties:
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      id:
+        type: integer
+      mimeType:
+        type: string
+      originalName:
+        type: string
+      size:
+        type: integer
+      url:
+        type: string
+      userId:
+        type: integer
+    type: object
+  admindto.UpdateRoleRequest:
+    properties:
+      role:
+        enum:
+        - user
+        - admin
+        type: string
+    required:
+    - role
+    type: object
+  admindto.UserResponse:
+    properties:
+      bannedAt:
+        type: string
+      createdAt:
+        type: string
+      deletedAt:
+        type: string
+      email:
+        type: string
+      emailVerified:
+        type: boolean
+      hasPassword:
+        type: boolean
+      id:
+        type: integer
+      name:
+        type: string
+      role:
+        type: string
+      updatedAt:
+        type: string
+    type: object
   apperror.FieldError:
     properties:
       code:
@@ -31,17 +94,6 @@ definitions:
         type: string
       type:
         type: string
-    type: object
-  dto.AdminStatsResponse:
-    properties:
-      activeUsers:
-        type: integer
-      deletedUsers:
-        type: integer
-      totalFileSize:
-        type: integer
-      totalFiles:
-        type: integer
     type: object
   dto.ChangePasswordRequest:
     properties:
@@ -143,16 +195,6 @@ definitions:
     - password
     - token
     type: object
-  dto.UpdateRoleRequest:
-    properties:
-      role:
-        enum:
-        - user
-        - admin
-        type: string
-    required:
-    - role
-    type: object
   dto.UpdateUserRequest:
     properties:
       currentPassword:
@@ -240,7 +282,7 @@ paths:
             - properties:
                 data:
                   items:
-                    $ref: '#/definitions/dto.FileResponse'
+                    $ref: '#/definitions/admindto.FileResponse'
                   type: array
               type: object
         "401":
@@ -339,7 +381,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/dto.FileResponse'
+            $ref: '#/definitions/admindto.FileResponse'
         "400":
           description: Bad Request
           schema:
@@ -374,7 +416,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/dto.AdminStatsResponse'
+            $ref: '#/definitions/admindto.AdminStatsResponse'
         "401":
           description: Unauthorized
           schema:
@@ -412,7 +454,7 @@ paths:
             - properties:
                 data:
                   items:
-                    $ref: '#/definitions/dto.UserResponse'
+                    $ref: '#/definitions/admindto.UserResponse'
                   type: array
               type: object
         "401":
@@ -483,14 +525,14 @@ paths:
         name: request
         required: true
         schema:
-          $ref: '#/definitions/dto.UpdateRoleRequest'
+          $ref: '#/definitions/admindto.UpdateRoleRequest'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/dto.UserResponse'
+            $ref: '#/definitions/admindto.UserResponse'
         "400":
           description: Bad Request
           schema:
@@ -531,7 +573,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/dto.UserResponse'
+            $ref: '#/definitions/admindto.UserResponse'
         "400":
           description: Bad Request
           schema:

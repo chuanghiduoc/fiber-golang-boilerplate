@@ -26,6 +26,7 @@ type FileRepository interface {
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.File, error)
 	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error)
 	AdminCount(ctx context.Context) (int64, error)
+	AdminFileStats(ctx context.Context) (sqlc.AdminFileStatsRow, error)
 }
 
 type fileRepository struct {
@@ -119,6 +120,10 @@ func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBC
 
 func (r *fileRepository) AdminCount(ctx context.Context) (int64, error) {
 	return r.q.AdminCountFiles(ctx)
+}
+
+func (r *fileRepository) AdminFileStats(ctx context.Context) (sqlc.AdminFileStatsRow, error) {
+	return r.q.AdminFileStats(ctx)
 }
 
 // wrapErr translates pgx errors to app-level sentinel errors. Keeping it local

@@ -1,6 +1,6 @@
 //go:build integration
 
-package handler
+package integration_test
 
 import (
 	"bytes"
@@ -17,8 +17,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
+	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
+	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
+	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
+	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -26,7 +31,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -57,8 +61,12 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 	fileRepo := filesrepo.NewFileRepository(pool)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshRepo, store, txManager, sessionStore)
-	adminHandler := NewAdminHandler(adminSvc)
+
+	identityAdmin := identityadapter.NewAdminIdentity(
+		identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, sessionStore),
+	)
+	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, store))
+	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: apperror.FiberErrorHandler,
@@ -95,7 +103,7 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 func TestIntegration_AdminOperations(t *testing.T) {
 	app, userRepo := setupIntegrationApp(t)
 
-	// Register a regular user
+	// Register a regular user.
 	body, _ := json.Marshal(identitydto.RegisterRequest{
 		Email:    "regular@test.com",
 		Password: "Password1!",
@@ -131,14 +139,14 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	adminToken, err := token.GenerateWithVersion(admin.ID, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
-	// Get stats
+	// Get stats.
 	req, _ = http.NewRequest("GET", "/admin/stats", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
 
-	// List users
+	// List users.
 	req, _ = http.NewRequest("GET", "/admin/users", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
@@ -159,7 +167,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
-	// Unban user (restore)
+	// Unban user (restore).
 	req, _ = http.NewRequest("POST", "/admin/users/1/unban", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
 	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
@@ -186,7 +194,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 
 	// Update role after unbanning, otherwise the last-admin guard would (by
 	// design) reject banning the only active admin.
-	body, _ = json.Marshal(dto.UpdateRoleRequest{Role: "admin"})
+	body, _ = json.Marshal(admindto.UpdateRoleRequest{Role: "admin"})
 	req, _ = http.NewRequest("PUT", "/admin/users/1/role", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+adminToken)

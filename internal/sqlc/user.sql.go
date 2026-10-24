@@ -120,6 +120,25 @@ func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCu
 	return items, nil
 }
 
+const adminUserStats = `-- name: AdminUserStats :one
+SELECT
+    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS active_users,
+    count(*) FILTER (WHERE deleted_at IS NOT NULL)::bigint AS deleted_users
+FROM users
+`
+
+type AdminUserStatsRow struct {
+	ActiveUsers  int64 `json:"active_users"`
+	DeletedUsers int64 `json:"deleted_users"`
+}
+
+func (q *Queries) AdminUserStats(ctx context.Context) (AdminUserStatsRow, error) {
+	row := q.db.QueryRow(ctx, adminUserStats)
+	var i AdminUserStatsRow
+	err := row.Scan(&i.ActiveUsers, &i.DeletedUsers)
+	return i, err
+}
+
 const banUser = `-- name: BanUser :one
 UPDATE users
 SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),

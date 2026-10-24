@@ -295,11 +295,6 @@ not the convention for new modules:
   owner/admin checks in the handler (`authRole`/`authUserID`) rather than route
   permissions. Target: permission middleware, with ownership checks in the
   service only for row-level access.
-- **`admin` cross-module facade:** its stats/read paths reach `users` and
-  `files`; `GetSystemStats` is a single query in the identity-owned user
-  repository that reads both tables (subqueries today, effectively a
-  cross-module read). Target: a contract or read model, not another module's
-  repository/query.
 - **`files.user_id`:** the existing foreign key uses `ON DELETE CASCADE` to
   `users`, so a hard delete of a user removes file metadata across a module
   boundary. Target: no cross-module foreign key or cascade; core identity
@@ -502,11 +497,11 @@ repository. When module B needs data or behavior from module A, define a
 contract package outside both modules:
 
 ```text
-internal/contracts/identity/identity.go
+internal/contracts/identity.go
 ```
 
 ```go
-package identity
+package contracts
 
 import "context"
 
@@ -528,6 +523,8 @@ type UserReader interface {
 Rules:
 
 - The contract package must not import `internal/modules/*`, Fiber, or sqlc.
+  Contracts in `internal/contracts` are stdlib-only; they also must not import
+  repositories, DTOs, storage, database, or session packages.
 - The provider implements the interface structurally; the consumer depends on
   the interface, not the implementation.
 - Wire the implementation in `cmd/api/main.go`. The composition root is the
@@ -555,7 +552,7 @@ owner. Never reach into another module's repository.
 | `internal/platform/*`, `pkg/*` | any `internal/modules/*` |
 | A module handler | its own repository, another module, Fiber global setup |
 | A module service | Fiber context/handlers, another module |
-| `internal/contracts/*` | any module implementation, Fiber, sqlc |
+| `internal/contracts/*` | any module implementation, repository, DTO, sqlc, storage, database, session, or Fiber |
 | `cmd/api` | module internals other than exported constructors |
 
 `test/arch/imports_test.go` fails the build on cross-module and
