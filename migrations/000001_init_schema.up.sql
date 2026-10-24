@@ -84,6 +84,10 @@ CREATE INDEX IF NOT EXISTS idx_users_tenant_role_active
     WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_users_tenant_created_at_id
     ON users (tenant_id, created_at DESC, id DESC);
+-- Required as the parent key for tenant-aware feature flag user targets:
+-- a target's (tenant_id, user_id) must reference a user in the same tenant.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_id_id
+    ON users (tenant_id, id);
 
 DROP TRIGGER IF EXISTS trigger_users_updated_at ON users;
 CREATE TRIGGER trigger_users_updated_at
@@ -202,6 +206,59 @@ CREATE INDEX IF NOT EXISTS idx_files_tenant_user_created
     ON files (tenant_id, user_id, created_at DESC, id DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_files_tenant_created_at_id
     ON files (tenant_id, created_at DESC, id DESC);
+
+-- ---------------------------------------------------------------------------
+-- platform: feature flags
+--
+-- feature_flags is process-wide configuration (compile-time keys, database
+-- defaults, and emergency kill switches). feature_flag_targets carries the
+-- tenant/user overrides and is therefore tenant-owned: tenant_id comes from
+-- the request context and the composite FK prevents a user target from
+-- pointing at a user in another tenant. The evaluator precedence is
+-- force-off > kill switch > user target > tenant target > database default >
+-- environment > compiled default.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS feature_flags (
+    flag_key VARCHAR(128) PRIMARY KEY,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    kill_switch BOOLEAN NOT NULL DEFAULT FALSE,
+    description VARCHAR(500) NOT NULL DEFAULT '',
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trigger_feature_flags_updated_at ON feature_flags;
+CREATE TRIGGER trigger_feature_flags_updated_at
+    BEFORE UPDATE ON feature_flags
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS feature_flag_targets (
+    id BIGSERIAL PRIMARY KEY,
+    flag_key VARCHAR(128) NOT NULL REFERENCES feature_flags(flag_key) ON DELETE CASCADE,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    user_id BIGINT,
+    enabled BOOLEAN NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT feature_flag_targets_user_tenant_fk
+        FOREIGN KEY (tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE CASCADE
+);
+
+-- One tenant-wide target (user_id IS NULL) and one target per user are
+-- allowed per flag. The tenant-leading index backs the admin list query.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_flag_targets_tenant_target
+    ON feature_flag_targets (flag_key, tenant_id) WHERE user_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_flag_targets_user_target
+    ON feature_flag_targets (flag_key, tenant_id, user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_feature_flag_targets_tenant_flag_user
+    ON feature_flag_targets (tenant_id, flag_key, user_id);
+
+DROP TRIGGER IF EXISTS trigger_feature_flag_targets_updated_at ON feature_flag_targets;
+CREATE TRIGGER trigger_feature_flag_targets_updated_at
+    BEFORE UPDATE ON feature_flag_targets
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- platform: durable jobs / outbox

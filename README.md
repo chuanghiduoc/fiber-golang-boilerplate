@@ -52,12 +52,16 @@ internal/modules/
   files/                            Upload, download, soft delete, restore
                                     (dto + repository + service + handler + adapter
                                      + queries + generated sqlc)
+  features/                         Feature-flag admin API
+                                    (dto + repository + service + handler
+                                     + queries + generated sqlc)
   admin/                            Back-office facade
                                     (dto + service + handler, contracts-only)
 internal/contracts/                 Narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
+  features/                         Compile-time flag catalog, evaluator, snapshot cache, DB store
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
   tenant/                           Tenant resolution from X-Tenant-Slug
@@ -77,7 +81,8 @@ strangler status, [docs/api-design.md](docs/api-design.md) for the API design
 system (errors, pagination, idempotency, status codes),
 [docs/module-template.md](docs/module-template.md) for the canonical module
 layout and scaffold, and [docs/operations.md](docs/operations.md) for the
-operations runbook.
+operations runbook. Feature flags are documented in
+[docs/feature-flags.md](docs/feature-flags.md).
 
 Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
@@ -117,6 +122,10 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
 - Durable jobs and audit events carry `tenant_id`: enqueue records the request
   tenant, the worker restores tenant context for handlers, and audit rows are
   tenant-scoped.
+- Feature-flag targets carry `tenant_id` and a nullable `user_id`; the admin
+  repository derives the tenant from context, and a composite foreign key
+  rejects a target pointing at a user in another tenant. Flag defaults/kill
+  switches are process-wide. See [Feature Flags](docs/feature-flags.md).
 - Google OAuth binds the tenant into the OAuth `state` (and state cookie); the
   callback uses that tenant, not `X-Tenant-Slug`, and refuses a tenant suspended
   during consent.
@@ -235,7 +244,9 @@ reviewed DDL manually) that:
    `email_verification_tokens`, `jobs`, and `audit_events`;
 3. rebuilds the user indexes with `tenant_id` leading, then adds the
    tenant-leading indexes used by scoped queries;
-4. replaces `protect_last_admin()` with the per-tenant version.
+4. replaces `protect_last_admin()` with the per-tenant version;
+5. adds `feature_flags`, `feature_flag_targets`, their partial unique indexes,
+   and a unique index on `users(tenant_id, id)` for tenant-safe user targets.
 
 Keep the default tenant id 1 unless you also change the column defaults and
 backfill every row. Fresh installs get all of this from `000001`.
@@ -247,6 +258,10 @@ verification rows were backfilled to tenant 1 and remain usable only there.
 New uploads use the blob key `<tenantID>/<userID>/<uuid>.<ext>`, while existing
 rows keep their old `<userID>/<uuid>.<ext>` path; if you copy blobs, update
 `files.storage_path` atomically.
+
+Feature flags need the tables above on an existing database; without them the
+evaluator still uses environment/compiled defaults, but the admin API fails
+until the migration is applied and `cmd/migrate` verifies the objects.
 
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
@@ -315,6 +330,13 @@ returns `404`, including for admins. Blobs are stored under
 | GET | `/api/v1/admin/files/:id/download` | Download any active file |
 | DELETE | `/api/v1/admin/files/:id` | Soft-delete any file (takedown) |
 | POST | `/api/v1/admin/files/:id/restore` | Restore any soft-deleted file |
+| GET | `/api/v1/admin/features/flags` | List feature flags and effective values |
+| GET | `/api/v1/admin/features/flags/:key` | Get a flag and current-tenant targets |
+| PUT | `/api/v1/admin/features/flags/:key` | Upsert flag default, kill switch, description |
+| DELETE | `/api/v1/admin/features/flags/:key` | Delete flag state (revert to env/compiled) |
+| GET | `/api/v1/admin/features/flags/:key/targets` | List current-tenant targets |
+| PUT | `/api/v1/admin/features/flags/:key/targets` | Upsert tenant-wide or user target |
+| DELETE | `/api/v1/admin/features/flags/:key/targets/:id` | Delete a current-tenant target |
 
 ### Infrastructure
 | Method | Path | Description |
@@ -532,6 +554,9 @@ Key settings:
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `TENANT_DEFAULT_SLUG` — tenant for requests without `X-Tenant-Slug` (default `default`)
 - `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`)
+- `FEATURE_FLAGS` — comma-separated `key=true|false` overrides; a bare key means true (unknown keys fail startup)
+- `FEATURE_FLAGS_FORCE_OFF` — comma-separated keys that always evaluate false, even during a database outage
+- `FEATURE_FLAGS_CACHE_TTL_SECONDS` / `FEATURE_FLAGS_MAX_STALENESS_SECONDS` — snapshot freshness and stale-serving bounds (defaults 30/300)
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)

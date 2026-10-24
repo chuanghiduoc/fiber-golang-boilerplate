@@ -19,13 +19,15 @@ const (
 
 	PermissionSessionsRevoke Permission = "sessions:revoke"
 
-	PermissionAdminUsersRead    Permission = "admin:users:read"
-	PermissionAdminUsersRole    Permission = "admin:users:role"
-	PermissionAdminUsersBan     Permission = "admin:users:ban"
-	PermissionAdminFilesRead    Permission = "admin:files:read"
-	PermissionAdminFilesDelete  Permission = "admin:files:delete"
-	PermissionAdminFilesRestore Permission = "admin:files:restore"
-	PermissionAdminStatsRead    Permission = "admin:stats:read"
+	PermissionAdminUsersRead     Permission = "admin:users:read"
+	PermissionAdminUsersRole     Permission = "admin:users:role"
+	PermissionAdminUsersBan      Permission = "admin:users:ban"
+	PermissionAdminFilesRead     Permission = "admin:files:read"
+	PermissionAdminFilesDelete   Permission = "admin:files:delete"
+	PermissionAdminFilesRestore  Permission = "admin:files:restore"
+	PermissionAdminStatsRead     Permission = "admin:stats:read"
+	PermissionAdminFeaturesRead  Permission = "admin:features:read"
+	PermissionAdminFeaturesWrite Permission = "admin:features:write"
 )
 
 // Role identifiers. Kept local so authz does not import module DTOs.
@@ -50,6 +52,8 @@ var allPermissions = []Permission{
 	PermissionAdminFilesDelete,
 	PermissionAdminFilesRestore,
 	PermissionAdminStatsRead,
+	PermissionAdminFeaturesRead,
+	PermissionAdminFeaturesWrite,
 }
 
 // rolePermissions is the built-in role catalog. An unknown role has no

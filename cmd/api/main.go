@@ -24,6 +24,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
+	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	featuresrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/repository"
+	featuressvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
 	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
@@ -36,6 +40,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -123,6 +128,18 @@ func main() {
 		fail("failed to initialize cache", err)
 	}
 	slog.Info("cache initialized", slog.String("driver", cfg.Cache.Driver))
+
+	// Feature flags: database defaults/targets are optional. The evaluator
+	// serves environment/compiled defaults when the store is unavailable and
+	// bounds stale snapshots with FEATURE_FLAGS_MAX_STALENESS_SECONDS.
+	flagEvaluator := featureflags.NewEvaluator(featureflags.Options{
+		Store:        featureflags.NewPostgresStore(pool),
+		Env:          cfg.FeatureFlags.EnvValues(),
+		ForceOff:     cfg.FeatureFlags.ForceOffValues(),
+		CacheTTL:     cfg.FeatureFlags.CacheTTL(),
+		MaxStaleness: cfg.FeatureFlags.MaxStaleness(),
+	})
+	slog.Info("feature flags initialized", slog.Int("catalog_size", len(featureflags.Catalog())))
 
 	// Email
 	emailSender, err := email.NewSender(cfg.Email)
@@ -217,6 +234,12 @@ func main() {
 	)
 	adminHandler := adminhandler.NewHandler(adminSvc)
 
+	// Feature-flag administration shares the evaluator so a successful write
+	// invalidates the local snapshot immediately.
+	featureRepo := featuresrepo.New(pool)
+	featureSvc := featuressvc.New(featureRepo, flagEvaluator)
+	featureHandler := featureshandler.NewHandler(featureSvc)
+
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)
 
@@ -228,11 +251,13 @@ func main() {
 		Health:         healthChecker,
 		Audit:          audit.NewPostgresRecorder(pool),
 		TenantResolver: tenantResolver,
+		Flags:          flagEvaluator,
 	})
 	application.Register(
 		identity.New(authHandler, userHandler),
 		files.New(uploadHandler),
 		admin.New(adminHandler),
+		features.New(featureHandler),
 	)
 
 	// Durable email worker. It shares the pool but runs outside the request

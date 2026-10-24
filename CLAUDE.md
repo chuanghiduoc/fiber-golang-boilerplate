@@ -40,9 +40,9 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
+internal/platform/          authz, audit, features, jobs, session, tenant, and future shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -53,9 +53,10 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
 idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts), and
-`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents). Keep them current when routes/contracts change.
+layout, scaffold, routes/permissions/tables/contracts), `docs/operations.md`
+(health, metrics, logs, jobs, idempotency, migrations, Kubernetes, incidents),
+and `docs/feature-flags.md` (catalog, precedence, cache, admin API, metrics).
+Keep them current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -76,9 +77,10 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
 - Every tenant-owned table (`users`, `files`, `refresh_tokens`,
   `password_reset_tokens`, `email_verification_tokens`, `jobs`,
-  `audit_events`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
+  `audit_events`, `feature_flag_targets`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
   New tenant-owned tables must do the same and lead their query indexes with
-  `tenant_id`.
+  `tenant_id`. `feature_flags` is process-wide configuration and is the
+  deliberate exception.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
   tenant; the `users` last-admin trigger is scoped per tenant.
 - Identity and files are tenant-isolated: identity queries scope users/admin
@@ -188,6 +190,12 @@ Offset helpers are for small admin/export tables only.
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
   Protect routes with `authz.Require(authz.PermissionX)`.
+- **Feature flags:** the compile-time catalog and evaluator live in
+  `platform/features`; modules read `deps.Flags` (never nil after `app.New`).
+  Precedence is force-off > kill switch > user > tenant > database default >
+  environment > compiled default. The `features` module owns the admin API,
+  scopes targets to `tenant.EffectiveID(ctx)`, and invalidates the local
+  snapshot after writes. See `docs/feature-flags.md`.
 - **Transactions:** `database.TxManager.WithTx` scopes a transaction to one
   module/aggregate. Do not span modules; use jobs/events.
 - **Drivers:** storage (`local|s3|minio`), cache (`memory|redis`), email

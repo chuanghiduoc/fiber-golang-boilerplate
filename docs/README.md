@@ -11,6 +11,9 @@
 - [Operations](operations.md) — health/readiness, metrics, logs and request
   IDs, jobs, idempotency and Redis, migrations, Kubernetes caveats, and
   incident checklists.
+- [Feature Flags](feature-flags.md) — compile-time catalog, precedence,
+  environment force-off, database defaults and tenant/user targets, cache
+  staleness, admin API, audit metadata, and metrics.
 - [Swagger UI](../docs/swagger.json) — generated OpenAPI (served at `/swagger`
   outside production).
 

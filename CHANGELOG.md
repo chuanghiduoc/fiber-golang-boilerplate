@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- Compile-time feature flags (`internal/platform/features`) with a code-owned key catalog, `FEATURE_FLAGS`/`FEATURE_FLAGS_FORCE_OFF` config, optional PostgreSQL store, in-process snapshot cache with TTL and max-staleness fallback, precedence `force-off > kill switch > user target > tenant target > database default > environment > compiled default`, an `Evaluator` interface (`Enabled`/`Evaluate`/`Invalidate`), and Prometheus metrics. `app.Deps.Flags` is nil-safe (app installs an env/compiled-default evaluator) and is available to every module.
+- Feature-flag admin module (`internal/modules/features`): `GET/PUT/DELETE /api/v1/admin/features/flags[/{key}]` and `GET/PUT/DELETE .../targets` with tenant-scoped targets, `admin:features:read`/`admin:features:write` permissions, audit metadata, idempotency, DTOs, repository/queries/sqlc, and unit/integration tests. `feature_flags` holds process-wide defaults and kill switches; `feature_flag_targets` carries `tenant_id` + nullable `user_id` with a composite FK to `users(tenant_id, id)`. Baseline migration, down migration, and `cmd/migrate` required tables/columns/indexes updated, plus config validation, docs, and operations guidance.
 - Multi-tenant foundation: `tenants` table (seeded `default` tenant id 1), `tenant_id` columns and tenant-leading indexes on users, files, refresh/reset/verification tokens, jobs, and audit events; per-tenant email/Google uniqueness and last-admin trigger. Requests resolve `X-Tenant-Slug` (empty -> `TENANT_DEFAULT_SLUG`, invalid/unknown -> 404) through `internal/platform/tenant`; JWTs carry `tenant_id`, authenticated requests use the claim, and a conflicting explicit header returns 403 `permission.denied`. Adds `TENANT_DEFAULT_SLUG`/`TENANT_REQUIRE_HEADER` config and the identity tenant repository/resolver.
 - Tenant-isolated identity: all identity SQL is scoped by `tenant_id`; registration/login/refresh/reset/verification/OAuth use the request tenant; per-tenant emails/Google IDs; tokens carry tenant; suspended/legacy tenantless tokens are rejected; admin user operations/stats/last-admin are tenant-scoped. Adds `tenantId` to `UserResponse`.
 - Files tenant isolation: every file metadata query and admin list/count/stats query filters `tenant_id`; cross-tenant file ids return 404; delete/restore never cross tenants; new blobs use `<tenantID>/<userID>/<uuid>.<ext>` (old keys remain readable); `FileResponse`/`contracts.File` carry `tenantId`.
@@ -69,6 +71,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   guidance for legacy history and verifies required tables, columns, and unique
   indexes after migrating. See
   "Upgrading an existing database" in the README.
+- **Feature flags on an existing database:** add `feature_flags`,
+  `feature_flag_targets`, their partial unique indexes, and a unique index on
+  `users(tenant_id, id)` (the parent key for tenant-safe user targets) in the
+  next numbered migration. Without the optional database store the evaluator
+  still runs on `FEATURE_FLAGS`/compiled defaults, but the admin API fails until
+  the tables exist; `cmd/migrate` reports the missing objects.
 
 ### Changed (API contract — breaking)
 - Errors now follow RFC 9457 Problem Details (`application/problem+json`): `type`, `title`, `status`, `code` (stable dotted domain code), `detail`, `instance`, `requestId`, `timestamp`, and a flat `errors[]` for validation. Configurable docs base via `ERROR_DOCS_BASE_URL`; typed codes use their catalog `DocPath` for `type`.

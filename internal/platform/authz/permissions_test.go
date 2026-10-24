@@ -43,6 +43,8 @@ func TestPermissionsForRole_User(t *testing.T) {
 		PermissionAdminFilesDelete,
 		PermissionAdminFilesRestore,
 		PermissionAdminStatsRead,
+		PermissionAdminFeaturesRead,
+		PermissionAdminFeaturesWrite,
 	}
 	for _, permission := range denied {
 		if _, ok := got[permission]; ok {
@@ -82,6 +84,8 @@ func TestHas(t *testing.T) {
 		{"admin profile read", RoleAdmin, PermissionProfileRead, true},
 		{"admin stats read", RoleAdmin, PermissionAdminStatsRead, true},
 		{"admin files delete", RoleAdmin, PermissionAdminFilesDelete, true},
+		{"admin features read", RoleAdmin, PermissionAdminFeaturesRead, true},
+		{"admin features write", RoleAdmin, PermissionAdminFeaturesWrite, true},
 		{"user profile read", RoleUser, PermissionProfileRead, true},
 		{"user files write", RoleUser, PermissionFilesWrite, true},
 		{"user sessions revoke", RoleUser, PermissionSessionsRevoke, true},

@@ -13,6 +13,8 @@ DROP FUNCTION IF EXISTS protect_last_admin();
 
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS jobs;
+DROP TABLE IF EXISTS feature_flag_targets;
+DROP TABLE IF EXISTS feature_flags;
 DROP TABLE IF EXISTS files;
 DROP TABLE IF EXISTS email_verification_tokens;
 DROP TABLE IF EXISTS password_reset_tokens;

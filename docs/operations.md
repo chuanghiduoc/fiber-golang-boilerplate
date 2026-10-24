@@ -88,6 +88,13 @@ Application metrics:
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
 | `audit_write_failures_total` | — | Audit events that could not be recorded. |
+| `feature_flag_evaluations_total` | `key`, `source`, `enabled` | Feature evaluations by precedence source. |
+| `feature_flag_snapshot_loads_total` | `result` | Feature snapshot loads (`success`/`error`). |
+| `feature_flag_cache_hits_total` / `feature_flag_cache_misses_total` | — | In-process snapshot cache behavior. |
+| `feature_flag_snapshot_stale_total` | — | Evaluations served from a stale snapshot during a DB outage. |
+| `feature_flag_snapshot_fallback_total` | — | Evaluations that used env/compiled defaults because no snapshot was usable. |
+| `feature_flag_snapshot_age_seconds` | — | Age of the snapshot currently used. |
+| `feature_flag_invalidations_total` | — | Local snapshot invalidations after admin writes. |
 
 The default Prometheus registry also exposes Go runtime and process metrics
 (for example `go_goroutines`, `process_resident_memory_bytes`).
@@ -129,6 +136,21 @@ WHERE status = 'dead' AND updated_at > now() - interval '1 hour';
 Alert on symptoms (5xx, latency, dead letters, claim errors, audit failures)
 and on queue age, not only on raw queue depth. A large but draining queue is
 different from a stuck one.
+
+### Feature flags
+
+Feature-flag evaluation falls back in this order: last good snapshot (up to
+`FEATURE_FLAGS_MAX_STALENESS_SECONDS`), then `FEATURE_FLAGS` environment
+values, then compiled defaults. `FEATURE_FLAGS_FORCE_OFF` and a flag's kill
+switch always win. Check `feature_flag_snapshot_loads_total{result="error"}`,
+`feature_flag_snapshot_fallback_total`, and
+`feature_flag_snapshot_age_seconds` when behavior diverges between replicas.
+
+Admin writes invalidate only the replica that served the request; other
+replicas converge within `FEATURE_FLAGS_CACHE_TTL_SECONDS` (30s by default).
+For an immediate global stop, set `FEATURE_FLAGS_FORCE_OFF` or the kill switch
+through the admin API. A database outage does not prevent force-off. See
+[Feature Flags](feature-flags.md) for the API and precedence details.
 
 ## 3. Logs and request IDs
 
@@ -417,12 +439,15 @@ reviewed DDL manually) that:
 3. rebuilds user uniqueness as `(tenant_id, lower(email))` and
    `(tenant_id, google_id)` for active rows, and adds the tenant-leading
    indexes;
-4. replaces `protect_last_admin()` with the per-tenant body.
+4. replaces `protect_last_admin()` with the per-tenant body;
+5. adds `feature_flags`, `feature_flag_targets`, their partial unique indexes,
+   and a unique index on `users(tenant_id, id)` for tenant-safe user targets.
 
 Keep tenant id 1 as the compatibility anchor unless you also change the column
 defaults and backfill every row. After the upgrade, run `cmd/migrate`; it
-verifies the tenant table/columns/indexes, `tenant_id` on `jobs` and
-`audit_events`, and the default tenant row.
+verifies the tenant table/columns/indexes, `tenant_id` on `jobs`,
+`audit_events`, and `feature_flag_targets`, the feature-flag tables/indexes,
+and the default tenant row.
 
 `TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
 requests resolve to; `TENANT_REQUIRE_HEADER=true` rejects requests that omit

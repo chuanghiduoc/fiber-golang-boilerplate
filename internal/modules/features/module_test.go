@@ -1,0 +1,114 @@
+package features
+
+import (
+	"bytes"
+	"context"
+	"net/http"
+	"testing"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
+	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
+)
+
+type stubService struct {
+	upserts int
+}
+
+func (s *stubService) ListFlags(context.Context, features.Subject) ([]featuresdto.FlagResponse, error) {
+	return []featuresdto.FlagResponse{{Key: "file_uploads", Enabled: true}}, nil
+}
+
+func (s *stubService) GetFlag(context.Context, string, features.Subject) (*featuresdto.FlagDetailResponse, error) {
+	return &featuresdto.FlagDetailResponse{Flag: featuresdto.FlagResponse{Key: "file_uploads"}}, nil
+}
+
+func (s *stubService) UpsertFlag(context.Context, string, featuresdto.UpsertFlagRequest, features.Subject) (*featuresdto.FlagResponse, error) {
+	s.upserts++
+	return &featuresdto.FlagResponse{Key: "file_uploads", Configured: true}, nil
+}
+
+func (s *stubService) DeleteFlag(context.Context, string) error { return nil }
+
+func (s *stubService) ListTargets(context.Context, string) ([]featuresdto.TargetResponse, error) {
+	return []featuresdto.TargetResponse{}, nil
+}
+
+func (s *stubService) UpsertTarget(context.Context, string, featuresdto.UpsertTargetRequest) (*featuresdto.TargetResponse, error) {
+	return &featuresdto.TargetResponse{ID: 1}, nil
+}
+
+func (s *stubService) DeleteTarget(context.Context, string, int64) error { return nil }
+
+func moduleTestConfig() *config.Config {
+	return &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		JWT:       config.JWTConfig{Secret: "module-test-secret"},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+}
+
+func setupModuleApp(t *testing.T) (*fiber.App, *stubService) {
+	t.Helper()
+	svc := &stubService{}
+	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache()})
+	application.Register(New(featureshandler.NewHandler(svc)))
+	return application.Fiber(), svc
+}
+
+func bearer(t *testing.T, userID int64, role string) string {
+	t.Helper()
+	tok, err := token.GenerateWithTenant(userID, 1, "user@example.com", role, "module-test-secret", 24)
+	require.NoError(t, err)
+	return "Bearer " + tok
+}
+
+func TestModuleRoutesRequireFeaturePermissions(t *testing.T) {
+	application, _ := setupModuleApp(t)
+
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/admin/features/flags", http.NoBody)
+	resp, err := application.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
+
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/admin/features/flags", http.NoBody)
+	req.Header.Set("Authorization", bearer(t, 1, "user"))
+	resp, err = application.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
+	req, _ = http.NewRequest(http.MethodGet, "/api/v1/admin/features/flags", http.NoBody)
+	req.Header.Set("Authorization", bearer(t, 2, "admin"))
+	resp, err = application.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
+	application, svc := setupModuleApp(t)
+	body := []byte(`{"enabled":true,"killSwitch":false}`)
+
+	for i := 0; i < 2; i++ {
+		req, _ := http.NewRequest(http.MethodPut, "/api/v1/admin/features/flags/file_uploads", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", bearer(t, 2, "admin"))
+		req.Header.Set("Idempotency-Key", "feature-flag-update-1")
+		resp, err := application.Test(req)
+		require.NoError(t, err)
+		assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+		if i == 1 {
+			assert.Equal(t, "true", resp.Header.Get("Idempotent-Replayed"))
+		}
+	}
+	assert.Equal(t, 1, svc.upserts, "replayed PUT must not call the service twice")
+}

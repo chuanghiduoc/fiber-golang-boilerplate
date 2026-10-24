@@ -81,6 +81,32 @@ func TestMiddleware_RecordsResolvedTenant(t *testing.T) {
 	assert.Equal(t, "9", recorder.events[0].ResourceID)
 }
 
+func TestMiddleware_MergesDomainMetadata(t *testing.T) {
+	recorder := &recordingRecorder{}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Put("/admin/features/flags/:key", func(c fiber.Ctx) error {
+		AddMetadata(c, map[string]any{
+			"feature": "file_uploads",
+			"enabled": true,
+		})
+		AddMetadata(c, map[string]any{"killSwitch": false})
+		return c.SendStatus(fiber.StatusOK)
+	})
+
+	req, _ := http.NewRequest("PUT", "/admin/features/flags/file_uploads", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+	require.Len(t, recorder.events, 1)
+	event := recorder.events[0]
+	assert.Equal(t, "file_uploads", event.ResourceID, "key path params must populate the audit resource id")
+	assert.Equal(t, "file_uploads", event.Metadata["feature"])
+	assert.Equal(t, true, event.Metadata["enabled"])
+	assert.Equal(t, false, event.Metadata["killSwitch"])
+	assert.Equal(t, fiber.StatusOK, event.Metadata["status"])
+}
+
 func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {
 	recorder := &recordingRecorder{}
 	app := fiber.New()

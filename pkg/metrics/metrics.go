@@ -75,4 +75,62 @@ var (
 			Help: "Total number of audit events that could not be recorded.",
 		},
 	)
+
+	FeatureFlagEvaluationsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "feature_flag_evaluations_total",
+			Help: "Total number of feature flag evaluations, partitioned by key, precedence source, and result.",
+		},
+		[]string{"key", "source", "enabled"},
+	)
+
+	FeatureFlagSnapshotLoadsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "feature_flag_snapshot_loads_total",
+			Help: "Total number of database snapshot loads, partitioned by result (success or error).",
+		},
+		[]string{"result"},
+	)
+
+	FeatureFlagCacheHitsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "feature_flag_cache_hits_total",
+			Help: "Total number of feature flag evaluations served from a fresh in-process snapshot.",
+		},
+	)
+
+	FeatureFlagCacheMissesTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "feature_flag_cache_misses_total",
+			Help: "Total number of feature flag evaluations that found the snapshot cold or expired.",
+		},
+	)
+
+	FeatureFlagSnapshotStaleTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "feature_flag_snapshot_stale_total",
+			Help: "Total number of evaluations served from a stale snapshot while the database was unavailable.",
+		},
+	)
+
+	FeatureFlagSnapshotFallbackTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "feature_flag_snapshot_fallback_total",
+			Help: "Total number of evaluations that fell back to environment/compiled defaults because no snapshot was usable.",
+		},
+	)
+
+	FeatureFlagSnapshotAgeSeconds = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "feature_flag_snapshot_age_seconds",
+			Help: "Age in seconds of the feature flag snapshot currently used for evaluation.",
+		},
+	)
+
+	FeatureFlagInvalidationsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "feature_flag_invalidations_total",
+			Help: "Total number of local feature flag snapshot invalidations.",
+		},
+	)
 )
