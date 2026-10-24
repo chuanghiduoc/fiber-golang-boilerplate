@@ -135,6 +135,92 @@ func TestEmailHandlerWithCodecReturnsErrorForTamperedPayload(t *testing.T) {
 	assert.Empty(t, sender.messages, "a tampered payload must not reach the sender")
 }
 
+func TestEmailHandlerWithoutCodecRejectsEncryptedPayload(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	msg := testEmailMessage()
+	job, err := emailJob(msg, codec)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	err = EmailHandler(sender)(context.Background(), job.Payload)
+	require.ErrorIs(t, err, ErrEncryptedPayloadWithoutCodec)
+	assert.Empty(t, sender.messages, "an encrypted payload must not be sent as an empty email")
+}
+
+func TestEmailHandlerWithoutCodecRejectsEnvelopeLikePayload(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload json.RawMessage
+	}{
+		{name: "nonce only", payload: json.RawMessage(`{"nonce":"abc"}`)},
+		{name: "mixed case", payload: json.RawMessage(`{"V":1,"Data":"abc"}`)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sender := &recordingEmailSender{}
+			err := EmailHandler(sender)(context.Background(), tt.payload)
+			require.ErrorIs(t, err, ErrEncryptedPayloadWithoutCodec)
+			assert.Empty(t, sender.messages)
+		})
+	}
+}
+
+func TestEmailHandlerWithWrongCodecFails(t *testing.T) {
+	t.Parallel()
+
+	sealer, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	opener, err := NewPayloadCodec("a-different-jwt-secret-at-least-32-characters")
+	require.NoError(t, err)
+
+	job, err := emailJob(testEmailMessage(), sealer)
+	require.NoError(t, err)
+
+	sender := &recordingEmailSender{}
+	err = EmailHandler(sender, WithEmailPayloadCodec(opener))(context.Background(), job.Payload)
+	require.ErrorIs(t, err, ErrPayloadDecryption)
+	assert.Empty(t, sender.messages)
+}
+
+func TestEmailHandlerRejectsZeroRecipients(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name  string
+		codec *PayloadCodec
+	}{
+		{name: "plaintext", codec: nil},
+		{name: "encrypted", codec: codec},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			msg := email.Message{Subject: "No recipients"}
+			job, err := emailJob(msg, tt.codec)
+			require.NoError(t, err)
+
+			sender := &recordingEmailSender{}
+			handler := EmailHandler(sender, WithEmailPayloadCodec(tt.codec))
+			err = handler(context.Background(), job.Payload)
+			require.ErrorIs(t, err, ErrEmailNoRecipients)
+			assert.Empty(t, sender.messages)
+		})
+	}
+}
+
 func TestEmailHandlerPropagatesSenderError(t *testing.T) {
 	t.Parallel()
 

@@ -35,6 +35,9 @@ var (
 	// ErrInvalidPayloadEnvelope is returned for a malformed or unsupported
 	// encrypted payload envelope.
 	ErrInvalidPayloadEnvelope = errors.New("jobs: invalid payload envelope")
+	// ErrEncryptedPayloadWithoutCodec is returned when a handler encounters an
+	// encrypted envelope but was not configured with a payload codec.
+	ErrEncryptedPayloadWithoutCodec = errors.New("jobs: encrypted payload requires a payload codec")
 	// ErrPayloadDecryption is returned when an envelope cannot be
 	// authenticated with the codec's key.
 	ErrPayloadDecryption = errors.New("jobs: payload decryption failed")
@@ -95,7 +98,7 @@ func (c *PayloadCodec) Seal(plaintext []byte) (json.RawMessage, error) {
 	sealed, err := json.Marshal(payloadEnvelope{
 		Version: payloadEnvelopeVersion,
 		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
-		Data:    base64.RawURLEncoding.EncodeToString(c.aead.Seal(nil, nonce, plaintext, nil)),
+		Data:    base64.RawURLEncoding.EncodeToString(c.aead.Seal(nil, nonce, plaintext, []byte(payloadKeyInfo))),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("jobs: encode payload envelope: %w", err)
@@ -114,16 +117,7 @@ func (c *PayloadCodec) Open(payload json.RawMessage) ([]byte, error) {
 	if !json.Valid(payload) {
 		return nil, fmt.Errorf("%w: payload is not valid JSON", ErrInvalidPayloadEnvelope)
 	}
-
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &fields); err != nil {
-		// Valid JSON that is not an object cannot be an envelope; keep
-		// treating it as legacy plaintext for backward compatibility.
-		return payload, nil
-	}
-	_, hasVersion := fields["v"]
-	_, hasData := fields["data"]
-	if !hasVersion && !hasData {
+	if !payloadLooksEncrypted(payload) {
 		return payload, nil
 	}
 
@@ -151,11 +145,29 @@ func (c *PayloadCodec) Open(payload json.RawMessage) ([]byte, error) {
 		return nil, fmt.Errorf("%w: ciphertext is truncated", ErrInvalidPayloadEnvelope)
 	}
 
-	plaintext, err := c.aead.Open(nil, nonce, data, nil)
+	plaintext, err := c.aead.Open(nil, nonce, data, []byte(payloadKeyInfo))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPayloadDecryption, err)
 	}
 	return plaintext, nil
+}
+
+// payloadLooksEncrypted reports whether payload is a JSON object carrying any
+// envelope field. Keys are matched case-insensitively, mirroring encoding/json
+// struct matching, so nonce-only and mixed-case envelopes are not mistaken for
+// legacy plaintext.
+func payloadLooksEncrypted(payload json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return false
+	}
+	for key := range fields {
+		switch strings.ToLower(key) {
+		case "v", "nonce", "data":
+			return true
+		}
+	}
+	return false
 }
 
 // decodePayloadBase64 accepts base64url with or without padding so envelopes

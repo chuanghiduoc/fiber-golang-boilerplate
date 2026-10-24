@@ -3,6 +3,7 @@ package jobs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -12,6 +13,11 @@ import (
 
 // EmailJobKind is the job kind registered for durable email delivery.
 const EmailJobKind = "email.send"
+
+// ErrEmailNoRecipients is returned when a queued email has no recipients. The
+// guard prevents a malformed or undecodable payload from being sent as an empty
+// message.
+var ErrEmailNoRecipients = errors.New("jobs: email has no recipients")
 
 // QueuedSender enqueues emails instead of sending them inline. A Worker
 // registered for EmailJobKind performs the actual SMTP/console send with
@@ -129,11 +135,16 @@ func EmailHandler(sender email.Sender, opts ...EmailHandlerOption) Handler {
 			if err != nil {
 				return fmt.Errorf("jobs: open email payload: %w", err)
 			}
+		} else if payloadLooksEncrypted(payload) {
+			return ErrEncryptedPayloadWithoutCodec
 		}
 
 		var msg email.Message
 		if err := json.Unmarshal(decoded, &msg); err != nil {
 			return fmt.Errorf("jobs: decode email payload: %w", err)
+		}
+		if len(msg.To) == 0 {
+			return ErrEmailNoRecipients
 		}
 		return sender.Send(ctx, msg)
 	}

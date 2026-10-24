@@ -117,6 +117,112 @@ func TestPayloadCodecPlaintextFallback(t *testing.T) {
 	assert.Equal(t, []byte(nonObject), opened)
 }
 
+func TestPayloadCodecOpenCaseVariantEnvelope(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+
+	plaintext := []byte(`{"token":"secret-token"}`)
+	sealed, err := codec.Seal(plaintext)
+	require.NoError(t, err)
+
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(sealed, &envelope))
+	mixedCase, err := json.Marshal(map[string]any{
+		"V":     envelope.Version,
+		"Nonce": envelope.Nonce,
+		"Data":  envelope.Data,
+	})
+	require.NoError(t, err)
+	assert.True(t, payloadLooksEncrypted(mixedCase))
+
+	opened, err := codec.Open(mixedCase)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, opened)
+}
+
+func TestPayloadCodecRejectsEnvelopeWithoutAAD(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+
+	nonce := make([]byte, codec.aead.NonceSize())
+	ciphertext := codec.aead.Seal(nil, nonce, []byte(`{"token":"secret-token"}`), nil)
+	envelope, err := json.Marshal(payloadEnvelope{
+		Version: payloadEnvelopeVersion,
+		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
+		Data:    base64.RawURLEncoding.EncodeToString(ciphertext),
+	})
+	require.NoError(t, err)
+
+	_, err = codec.Open(envelope)
+	require.ErrorIs(t, err, ErrPayloadDecryption,
+		"an envelope sealed without the version/context AAD must not authenticate")
+}
+
+func TestPayloadLooksEncrypted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		payload string
+		want    bool
+	}{
+		{name: "version", payload: `{"v":1}`, want: true},
+		{name: "nonce only", payload: `{"nonce":"abc"}`, want: true},
+		{name: "data only", payload: `{"data":"abc"}`, want: true},
+		{name: "mixed case version and data", payload: `{"V":1,"Data":"abc"}`, want: true},
+		{name: "mixed case nonce", payload: `{"Nonce":"abc"}`, want: true},
+		{name: "plaintext email", payload: `{"To":["user@example.com"],"Subject":"Hello","Body":"body"}`, want: false},
+		{name: "empty object", payload: `{}`, want: false},
+		{name: "array", payload: `[1,2,3]`, want: false},
+		{name: "null", payload: `null`, want: false},
+		{name: "invalid JSON", payload: `not-json`, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, payloadLooksEncrypted(json.RawMessage(tt.payload)))
+		})
+	}
+}
+
+func TestPayloadCodecErrorsDoNotLeakPlaintext(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+
+	sealed, err := codec.Seal([]byte(`{"token":"secret-token"}`))
+	require.NoError(t, err)
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(sealed, &envelope))
+	data, err := base64.RawURLEncoding.DecodeString(envelope.Data)
+	require.NoError(t, err)
+	data[0] ^= 0xff
+	envelope.Data = base64.RawURLEncoding.EncodeToString(data)
+	tampered, err := json.Marshal(envelope)
+	require.NoError(t, err)
+
+	payloads := []json.RawMessage{
+		tampered,
+		json.RawMessage(`{"v":"secret-token"}`),
+		json.RawMessage(`{"nonce":"secret-token"}`),
+		json.RawMessage(`{"v":1,"nonce":"secret-token","data":"secret-token"}`),
+		json.RawMessage(`secret-token`),
+	}
+
+	for _, payload := range payloads {
+		_, err := codec.Open(payload)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "secret-token",
+			"a payload error must not echo plaintext or secret material")
+	}
+}
+
 func TestNewPayloadCodecRejectsEmptySecret(t *testing.T) {
 	t.Parallel()
 
@@ -144,6 +250,8 @@ func TestPayloadCodecRejectsInvalidPayloads(t *testing.T) {
 		{name: "truncated JSON", payload: `{"v":1`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "missing data", payload: `{"v":1,"nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "missing nonce", payload: `{"v":1,"data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "nonce only", payload: `{"nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "mixed case envelope missing nonce", payload: `{"V":1,"Data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "unsupported version", payload: `{"v":2,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "invalid nonce encoding", payload: `{"v":1,"nonce":"***","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "invalid nonce length", payload: `{"v":1,"nonce":"c2hvcnQ","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
