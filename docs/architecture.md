@@ -80,10 +80,17 @@ client
 
 ## Strangler status
 
-The module wrappers own route tables, but many handler/service/repository/DTO
-internals still live in the legacy global packages. Moving one module's
-internals at a time is the next phase; new code should start in
-`internal/modules/<name>/` and use contracts for cross-module reads.
+The module wrappers own route tables. The `files` module now also owns its
+upload service and HTTP handler under `internal/modules/files/service` and
+`internal/modules/files/handler`; `internal/service` and `internal/handler`
+keep thin deprecated aliases and constructors so legacy call sites continue to
+compile. The files repository and DTOs still live in the legacy global
+packages.
+
+Other modules still keep their handler/service/repository/DTO internals in the
+legacy layer. Moving one module's internals at a time remains the next phase;
+new code should start in `internal/modules/<name>/` and use contracts for
+cross-module reads.
 
 ## Extension checklist
 
