@@ -1,0 +1,100 @@
+# The empty podSelector applies these rules to every pod in the namespace,
+# including the migration Job. NetworkPolicy rules are additive; this policy
+# both denies unlisted traffic and allows the flows below.
+#
+# Adjust the CIDRs/ports to the managed services you actually use. The
+# 10.0.0.0/8 entries assume a private VPC peering/private service endpoint; a
+# publicly reachable database or Redis endpoint needs its provider CIDRs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fiber-boilerplate
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only the ingress-nginx controller may reach the API. Change the namespace
+    # label if your controller runs elsewhere. Metrics scrapers need an extra
+    # rule (see the commented block below).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Kubelet readiness/liveness probes originate from the node, not from
+    # ingress-nginx. Support for node-to-pod probe traffic under NetworkPolicy
+    # is CNI-dependent: many CNIs allow it implicitly, but some enforce policy.
+    # If probes fail on your CNI, uncomment this rule and replace the CIDR with
+    # your node (or node/pod) CIDR. Do not widen it to 0.0.0.0/0.
+    #
+    # - from:
+    #     - ipBlock:
+    #         cidr: 10.0.0.0/8
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8080
+    # Optional: allow Prometheus in a "monitoring" namespace to scrape the
+    # authenticated /metrics endpoint on 8080. Uncomment and adapt the label.
+    #
+    # - from:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    #   ports:
+    #     - protocol: TCP
+    #       port: 8080
+  egress:
+    # DNS (CoreDNS is normally labelled k8s-app=kube-dns in kube-system).
+    # For NodeLocal DNSCache, allow UDP/TCP 53 to 169.254.20.10/32 instead.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # PostgreSQL. Narrow this to the database's security group / subnet.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Redis. Add 6380 here if your managed Redis uses TLS on that port.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 6379
+    # SMTP submission (STARTTLS on 587; this app does not speak implicit TLS
+    # on 465). Replace 0.0.0.0/0 with your relay/provider ranges if the relay
+    # is reachable over the public internet.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 587
+    # HTTPS: S3 API, Google OAuth token exchange, and other outbound HTTPS.
+    # This is intentionally broad because S3/OAuth endpoints are external;
+    # prefer a VPC endpoint or provider prefix lists to tighten it further.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443

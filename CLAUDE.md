@@ -22,8 +22,13 @@ make swagger
 Production build: `CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o server ./cmd/api`.
 
 CI builds both binaries and its `Migrations` job applies the baseline up/down
-on a fresh PostgreSQL service, then runs `cmd/migrate` twice. Reproduce the
-fresh-DB check locally against a disposable database before merging.
+on a fresh PostgreSQL service, then runs `cmd/migrate` twice. Its `Manifests`
+job runs actionlint, kustomize, and kubeconform. Reproduce the fresh-DB check
+locally against a disposable database before merging.
+
+Kubernetes manifests live in `deploy/k8s/`; follow `deploy/k8s/README.md`
+(migration Job first, then the app kustomization). `.github/workflows/release.yml`
+builds multi-arch GHCR images on `v*` tags.
 
 ## Architecture
 
@@ -41,6 +46,7 @@ internal/handler|service|repository|dto|sqlc   current internals (strangler phas
 internal/middleware|session
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
+deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 ```
 
 **Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
@@ -64,8 +70,11 @@ migrations/000001_init_schema.*   single consolidated up/down schema
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant isolation, per-module sqlc generation, tracing/CD, and moving the current
-handler/service/repository internals into modules remain future work.
+Tenant isolation, per-module sqlc generation, distributed tracing, environment
+promotion/rollout automation, and moving the current handler/service/repository
+internals into modules remain future work. Kubernetes manifests and a GHCR
+release workflow exist under `deploy/k8s/` and `.github/workflows/release.yml`;
+they are a production foundation, not a complete CD platform.
 
 ## Error Handling
 

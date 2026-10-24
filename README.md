@@ -68,6 +68,7 @@ pkg/
 migrations/000001_init_schema.*     Single consolidated init schema (up/down)
 queries/                            sqlc query files
 docs/                               Generated Swagger docs
+deploy/k8s/                         Kubernetes production manifests (see deploy/k8s/README.md)
 ```
 
 Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
@@ -112,6 +113,17 @@ make run
 `make run` applies the schema through `cmd/migrate` before starting the API.
 Docker Compose runs a one-shot `migrate` service before the app; the API seeds
 the admin user on startup.
+
+## Kubernetes Deployment
+
+Production-oriented manifests live in [`deploy/k8s`](deploy/k8s/README.md), and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
+pushes multi-arch images to GHCR on `v*` tags. PostgreSQL and Redis are expected
+to be managed services; no stateful database is bundled in the app Deployment.
+
+The migration Job is deliberately outside the app kustomization. Apply and
+await it before `kubectl apply -k deploy/k8s`; see the deploy README for the
+full ordered flow, placeholders, secret creation, verification, and rollback.
 
 ## Database & Migrations
 
@@ -445,8 +457,9 @@ migration entrypoint exist. Remaining work:
 - Tenant isolation: tenant-scoped data, query enforcement/row-level security,
   and per-tenant limits.
 - Per-module sqlc generation: `internal/sqlc` is still one shared package.
-- Tracing and CD: metrics exist, but distributed tracing and deployment
-  pipelines do not.
+- Distributed tracing, plus environment promotion/rollout automation: metrics,
+  Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
+  tracing and a full CD platform do not.
 - Moving `internal/handler|service|repository|dto` internals into the module
   directories (the strangler phase noted above).
 

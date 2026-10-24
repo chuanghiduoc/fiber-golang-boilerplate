@@ -1,0 +1,77 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fiber-boilerplate-migrate
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: migrate
+spec:
+  # One-shot schema migration. Only cmd/migrate may apply DDL; the API and
+  # seed commands never migrate.
+  #
+  # This Job is intentionally NOT part of the app kustomization. Apply it and
+  # wait for completion BEFORE `kubectl apply -k deploy/k8s` (see README.md).
+  # The app kustomization deliberately excludes this Job, so it must be applied
+  # explicitly and awaited; an unordered apply cannot guarantee this ordering.
+  #
+  # The Job name is stable. Jobs are immutable, so delete a previous completed
+  # Job before applying a changed manifest (see README.md). ttlSecondsAfterFinished
+  # removes it automatically after 24h.
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 3
+  activeDeadlineSeconds: 900
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fiber-boilerplate
+        app.kubernetes.io/part-of: fiber-boilerplate
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      # Private GHCR package? Create ghcr-pull (see README.md) and uncomment.
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      securityContext:
+        # Match the Docker image user: appuser is UID 100 / GID 101.
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          # This Job is applied outside kustomize, so the images transformer
+          # does not update it. Set the same immutable tag here that you set
+          # in kustomization.yaml when pinning a release.
+          image: ghcr.io/OWNER/REPO:latest
+          # Mutable placeholder tag: always pull. Switch to IfNotPresent after
+          # pinning an immutable release tag.
+          imagePullPolicy: Always
+          command: ["/app/migrate"]
+          envFrom:
+            - configMapRef:
+                name: fiber-boilerplate-config
+            - secretRef:
+                name: fiber-boilerplate-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

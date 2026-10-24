@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiber-boilerplate
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/instance: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: api
+spec:
+  # This Deployment never runs migrations and has no migration initContainer.
+  # Apply migration-job.yaml and wait for it to complete before rolling out
+  # this Deployment (see README.md).
+  # The HPA owns the replica count (minReplicas: 2); do not add spec.replicas
+  # here, or the two controllers will fight over it.
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fiber-boilerplate
+      app.kubernetes.io/instance: fiber-boilerplate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fiber-boilerplate
+        app.kubernetes.io/instance: fiber-boilerplate
+        app.kubernetes.io/part-of: fiber-boilerplate
+        app.kubernetes.io/component: api
+    spec:
+      # The API does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # Match the Docker image user: appuser is UID 100 / GID 101. The
+        # appuser owns /app/uploads in the image, so local PVCs should use the
+        # same fsGroup or be made writable for 100:101.
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas across zones and nodes where the cluster allows it.
+      # ScheduleAnyway keeps single-zone clusters usable.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: fiber-boilerplate
+              app.kubernetes.io/instance: fiber-boilerplate
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: fiber-boilerplate
+              app.kubernetes.io/instance: fiber-boilerplate
+      # If the GHCR package is private, create a docker-registry secret and
+      # uncomment this. Prefer making the package public when possible.
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      containers:
+        - name: api
+          # The kustomize images: transformer (kustomization.yaml) rewrites
+          # this image. Replace the transformer's newName/newTag, or edit this
+          # literal and migration-job.yaml together when applying raw files.
+          image: ghcr.io/OWNER/REPO:latest
+          # The placeholder tag is mutable, so pull it on every start. Switch
+          # to IfNotPresent after pinning an immutable release tag.
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: fiber-boilerplate-config
+            - secretRef:
+                name: fiber-boilerplate-secrets
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            # Liveness, not readiness: a dependency outage should not
+            # restartloop the pod before it has had a chance to become ready.
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Give kube-proxy/ingress time to stop sending new traffic before
+              # the process receives SIGTERM and drains its job worker.
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          # Writable scratch space. Fiber buffers multipart bodies by default,
+          # but a writable /tmp avoids surprises from library temp files while
+          # the image root stays read-only.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # Production default is STORAGE_DRIVER=s3, so the root filesystem can
+          # stay read-only. For STORAGE_DRIVER=local, the app writes under
+          # /app/uploads and needs a WRITABLE volume shared by every replica.
+          # Use a ReadWriteMany PVC (or a per-pod emptyDir for a single replica
+          # only; emptyDir loses uploads on restart). Add to volumeMounts above:
+          #
+          # - name: uploads
+          #   mountPath: /app/uploads
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+      # - name: uploads
+      #   persistentVolumeClaim:
+      #     claimName: fiber-boilerplate-uploads
