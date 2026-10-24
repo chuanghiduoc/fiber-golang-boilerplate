@@ -28,7 +28,7 @@ const (
 	PermissionAdminStatsRead    Permission = "admin:stats:read"
 )
 
-// Role identifiers. Kept local so authz does not import internal/dto.
+// Role identifiers. Kept local so authz does not import module DTOs.
 const (
 	RoleUser  = "user"
 	RoleAdmin = "admin"

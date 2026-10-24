@@ -40,9 +40,10 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed), files (handler/service/repository), admin
+internal/modules/           identity (full vertical slice + admin seed), files (dto/repository/service/handler + adapter), admin (dto/service/handler, contracts-only)
+internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
-internal/handler|service|dto|sqlc   remaining legacy internals (strangler phase)
+internal/sqlc/              shared generated SQL (the only shared generated package)
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -76,15 +77,16 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant isolation, per-module sqlc generation, distributed tracing, environment
-promotion/rollout automation, and moving the remaining legacy
-handler/service/repository/DTO internals into modules remain future work.
-`identity` owns its DTOs, repositories, services, and handlers under
-`internal/modules/identity`. `files` owns its upload handler/service but still
-uses the legacy repository/DTO layer, and `admin` still wraps the global
-handler/service packages. Kubernetes manifests and a GHCR release workflow exist
-under `deploy/k8s/` and `.github/workflows/release.yml`; they are a production
-foundation, not a complete CD platform.
+Tenant isolation, per-module sqlc generation, distributed tracing, and
+environment promotion/rollout automation remain future work. `identity`,
+`files`, and `admin` own all of their DTOs, repositories, services, and
+handlers under `internal/modules/<name>`; `admin` depends only on the
+stdlib-only `internal/contracts` interfaces implemented by identity/files
+adapters and never imports those modules. `internal/sqlc` is the only shared
+generated package; no legacy handler/service/DTO/repository packages remain.
+Kubernetes manifests and a GHCR release workflow exist under `deploy/k8s/` and
+`.github/workflows/release.yml`; they are a production foundation, not a
+complete CD platform.
 
 ## Error Handling
 

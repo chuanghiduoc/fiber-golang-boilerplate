@@ -22,6 +22,25 @@ func (q *Queries) AdminCountFiles(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const adminFileStats = `-- name: AdminFileStats :one
+SELECT
+    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
+    COALESCE(SUM(size) FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_file_size
+FROM files
+`
+
+type AdminFileStatsRow struct {
+	TotalFiles    int64 `json:"total_files"`
+	TotalFileSize int64 `json:"total_file_size"`
+}
+
+func (q *Queries) AdminFileStats(ctx context.Context) (AdminFileStatsRow, error) {
+	row := q.db.QueryRow(ctx, adminFileStats)
+	var i AdminFileStatsRow
+	err := row.Scan(&i.TotalFiles, &i.TotalFileSize)
+	return i, err
+}
+
 const adminListFiles = `-- name: AdminListFiles :many
 SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files ORDER BY id DESC LIMIT $1 OFFSET $2
 `

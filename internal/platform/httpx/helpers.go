@@ -1,5 +1,5 @@
-// Package httpx contains HTTP helpers shared by module handlers and the
-// legacy handler package without creating an import cycle.
+// Package httpx contains HTTP helpers shared by module handlers without
+// creating an import cycle.
 package httpx
 
 import (

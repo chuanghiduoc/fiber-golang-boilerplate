@@ -12,7 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -251,8 +251,7 @@ func (s *uploadService) toFileResponse(file *sqlc.File) *dto.FileResponse {
 	return resp
 }
 
-// buildCursor mirrors the legacy service helper while the files slice lives in
-// the module. It normalizes the page size and decodes an optional cursor.
+// buildCursor normalizes the page size and decodes an optional cursor.
 func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {
 	pageSize = pagination.NormalizeLimit(limit)
 	cur = pagination.DBCursor{Limit: pagination.RowLimit(pageSize + 1)}

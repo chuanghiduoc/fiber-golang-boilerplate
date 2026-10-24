@@ -13,14 +13,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
-// mockUploadService is a manual mock for testing the legacy upload handler
-// wrapper. The files module owns the production handler.
+// mockUploadService is a manual mock for testing the upload handler.
 type mockUploadService struct {
 	files map[int64]*dto.FileResponse
 }

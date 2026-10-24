@@ -31,6 +31,12 @@ SELECT * FROM files ORDER BY id DESC LIMIT $1 OFFSET $2;
 -- name: AdminCountFiles :one
 SELECT count(*) FROM files;
 
+-- name: AdminFileStats :one
+SELECT
+    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
+    COALESCE(SUM(size) FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_file_size
+FROM files;
+
 -- name: ListFilesByUserCursor :many
 SELECT * FROM files
 WHERE user_id = @user_id::bigint

@@ -47,6 +47,81 @@ func TestModuleBoundaries(t *testing.T) {
 	for _, dir := range []string{"internal/platform", "internal/shared", "pkg"} {
 		checkNoBusinessImports(t, filepath.Join(root, dir))
 	}
+
+	t.Run("modules do not use deleted legacy packages", func(t *testing.T) {
+		// These packages no longer exist. The rule documents the target layout
+		// so a future module does not reintroduce a shared legacy layer.
+		legacy := []string{"handler", "service", "dto", "repository"}
+		forbidden := make([]string, 0, len(legacy))
+		for _, pkg := range legacy {
+			forbidden = append(forbidden, "internal/"+pkg)
+		}
+		checkForbiddenImports(t, modulesDir, forbidden)
+	})
+
+	t.Run("contracts stay stdlib-only", func(t *testing.T) {
+		checkStdlibOnly(t, filepath.Join(root, "internal", "contracts"))
+	})
+
+	t.Run("admin depends on contracts not module internals", func(t *testing.T) {
+		checkForbiddenImports(t, filepath.Join(root, "internal", "modules", "admin"), []string{
+			"internal/modules/identity",
+			"internal/modules/files",
+			"internal/sqlc",
+			"pkg/storage",
+			"pkg/database",
+			"internal/platform/session",
+		})
+	})
+}
+
+func checkForbiddenImports(t *testing.T, dir string, forbidden []string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		for _, imp := range parseImports(t, path) {
+			for _, prefix := range forbidden {
+				needle := "github.com/chuanghiduoc/fiber-golang-boilerplate/" + prefix
+				if strings.HasPrefix(imp, needle) {
+					t.Errorf("%s must not import %s", path, imp)
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+}
+
+// checkStdlibOnly rejects any import whose first path segment contains a dot,
+// which is how Go distinguishes standard-library packages from external or
+// module-local ones.
+func checkStdlibOnly(t *testing.T, dir string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		for _, imp := range parseImports(t, path) {
+			first := strings.SplitN(imp, "/", 2)[0]
+			if strings.Contains(first, ".") {
+				t.Errorf("%s must stay stdlib-only, found import %s", path, imp)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
 }
 
 func checkNoBusinessImports(t *testing.T, dir string) {

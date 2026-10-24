@@ -32,7 +32,7 @@ type UserRepository interface {
 	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.User, error)
 	AdminCount(ctx context.Context) (int64, error)
 	CountActiveAdmins(ctx context.Context) (int64, error)
-	GetSystemStats(ctx context.Context) (sqlc.GetSystemStatsRow, error)
+	AdminUserStats(ctx context.Context) (sqlc.AdminUserStatsRow, error)
 }
 
 type userRepository struct {
@@ -212,6 +212,6 @@ func (r *userRepository) CountActiveAdmins(ctx context.Context) (int64, error) {
 	return r.q.CountActiveAdmins(ctx)
 }
 
-func (r *userRepository) GetSystemStats(ctx context.Context) (sqlc.GetSystemStatsRow, error) {
-	return r.q.GetSystemStats(ctx)
+func (r *userRepository) AdminUserStats(ctx context.Context) (sqlc.AdminUserStatsRow, error) {
+	return r.q.AdminUserStats(ctx)
 }

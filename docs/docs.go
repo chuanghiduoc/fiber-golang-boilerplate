@@ -59,7 +59,7 @@ const docTemplate = `{
                                         "data": {
                                             "type": "array",
                                             "items": {
-                                                "$ref": "#/definitions/dto.FileResponse"
+                                                "$ref": "#/definitions/admindto.FileResponse"
                                             }
                                         }
                                     }
@@ -217,7 +217,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/dto.FileResponse"
+                            "$ref": "#/definitions/admindto.FileResponse"
                         }
                     },
                     "400": {
@@ -272,7 +272,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/dto.AdminStatsResponse"
+                            "$ref": "#/definitions/admindto.AdminStatsResponse"
                         }
                     },
                     "401": {
@@ -334,7 +334,7 @@ const docTemplate = `{
                                         "data": {
                                             "type": "array",
                                             "items": {
-                                                "$ref": "#/definitions/dto.UserResponse"
+                                                "$ref": "#/definitions/admindto.UserResponse"
                                             }
                                         }
                                     }
@@ -450,7 +450,7 @@ const docTemplate = `{
                         "in": "body",
                         "required": true,
                         "schema": {
-                            "$ref": "#/definitions/dto.UpdateRoleRequest"
+                            "$ref": "#/definitions/admindto.UpdateRoleRequest"
                         }
                     }
                 ],
@@ -458,7 +458,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/dto.UserResponse"
+                            "$ref": "#/definitions/admindto.UserResponse"
                         }
                     },
                     "400": {
@@ -522,7 +522,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/dto.UserResponse"
+                            "$ref": "#/definitions/admindto.UserResponse"
                         }
                     },
                     "400": {
@@ -1839,6 +1839,102 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "admindto.AdminStatsResponse": {
+            "type": "object",
+            "properties": {
+                "activeUsers": {
+                    "type": "integer"
+                },
+                "deletedUsers": {
+                    "type": "integer"
+                },
+                "totalFileSize": {
+                    "type": "integer"
+                },
+                "totalFiles": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admindto.FileResponse": {
+            "type": "object",
+            "properties": {
+                "createdAt": {
+                    "type": "string"
+                },
+                "deletedAt": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "mimeType": {
+                    "type": "string"
+                },
+                "originalName": {
+                    "type": "string"
+                },
+                "size": {
+                    "type": "integer"
+                },
+                "url": {
+                    "type": "string"
+                },
+                "userId": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admindto.UpdateRoleRequest": {
+            "type": "object",
+            "required": [
+                "role"
+            ],
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": [
+                        "user",
+                        "admin"
+                    ]
+                }
+            }
+        },
+        "admindto.UserResponse": {
+            "type": "object",
+            "properties": {
+                "bannedAt": {
+                    "type": "string"
+                },
+                "createdAt": {
+                    "type": "string"
+                },
+                "deletedAt": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "emailVerified": {
+                    "type": "boolean"
+                },
+                "hasPassword": {
+                    "type": "boolean"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "updatedAt": {
+                    "type": "string"
+                }
+            }
+        },
         "apperror.FieldError": {
             "type": "object",
             "properties": {
@@ -1885,23 +1981,6 @@ const docTemplate = `{
                 },
                 "type": {
                     "type": "string"
-                }
-            }
-        },
-        "dto.AdminStatsResponse": {
-            "type": "object",
-            "properties": {
-                "activeUsers": {
-                    "type": "integer"
-                },
-                "deletedUsers": {
-                    "type": "integer"
-                },
-                "totalFileSize": {
-                    "type": "integer"
-                },
-                "totalFiles": {
-                    "type": "integer"
                 }
             }
         },
@@ -2050,21 +2129,6 @@ const docTemplate = `{
                 "token": {
                     "type": "string",
                     "maxLength": 256
-                }
-            }
-        },
-        "dto.UpdateRoleRequest": {
-            "type": "object",
-            "required": [
-                "role"
-            ],
-            "properties": {
-                "role": {
-                    "type": "string",
-                    "enum": [
-                        "user",
-                        "admin"
-                    ]
                 }
             }
         },
