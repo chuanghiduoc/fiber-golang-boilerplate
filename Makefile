@@ -26,10 +26,14 @@ docker-down:
 	@docker compose down
 
 # Verify the application (fast local gate)
-check: vet lint test
+check: vet lint arch test
 
 vet:
 	@go vet ./...
+
+# Enforce module dependency boundaries
+arch:
+	@go test ./test/arch
 
 # Test the application
 test:
@@ -85,4 +89,4 @@ swagger:
 rename-module:
 	@bash scripts/rename-module.sh $(mod)
 
-.PHONY: all build run migrate-run check vet test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed rename-module
+.PHONY: all build run migrate-run check vet arch test test-integration clean watch docker-run docker-down migrate-up migrate-down migrate-create sqlc-generate lint swagger seed rename-module

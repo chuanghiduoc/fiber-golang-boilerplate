@@ -5,7 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module owns file upload, metadata, download, soft delete, and restore.

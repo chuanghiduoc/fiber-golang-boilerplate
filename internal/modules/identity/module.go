@@ -5,8 +5,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module owns authentication, user profiles, sessions, and token lifecycle.

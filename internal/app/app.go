@@ -15,9 +15,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
