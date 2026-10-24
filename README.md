@@ -290,6 +290,20 @@ already exists.
   `last_error`; use them to inspect retries and dead letters. Successful and
   dead jobs have their `payload` cleared, so reset/verification links from email
   jobs are not retained after delivery.
+- Email job payloads are encrypted at rest. `cmd/api/main.go` derives a
+  32-byte AES-256-GCM key from `JWT_SECRET` with HKDF-SHA256 (domain-separated
+  for the `jobs/payload/v1` context) and passes a `jobs.PayloadCodec` to
+  `NewQueuedSender` and `EmailHandler`. The stored `jobs.payload` is a versioned
+  envelope (`v`, `nonce`, `data`) instead of readable JSON, so a database dump,
+  backup, or replication stream during the queue window does not expose usable
+  reset/verification links. Jobs queued as plaintext JSON before deployment are
+  still delivered, but they remain readable at rest until delivered or cleared.
+  External tooling that inspects `jobs.payload` sees the envelope, not email
+  JSON. Drain the queue and stop old workers before enabling encryption: a
+  pre-codec binary cannot decrypt new jobs, and the unknown-kind retry path
+  does not help because `email.send` is already registered. Rotating
+  `JWT_SECRET` changes the derived key and makes already-queued encrypted jobs
+  undecryptable; drain the queue before rotating the secret.
 - A worker deletes terminal rows automatically: `succeeded` and `dead` jobs
   whose `updated_at` is older than 30 days are purged, by default every hour
   (the first pass runs as soon as the worker starts). Queued and running jobs

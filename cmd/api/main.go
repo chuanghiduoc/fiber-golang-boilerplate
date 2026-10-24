@@ -81,6 +81,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Email job payloads are encrypted at rest with a key derived from
+	// JWT_SECRET. Rotating that secret invalidates already-queued encrypted
+	// jobs, so drain the queue before rotating it.
+	payloadCodec, err := jobs.NewPayloadCodec(cfg.JWT.Secret)
+	if err != nil {
+		fail("failed to initialize job payload encryption", err)
+	}
+
 	// Create database pool
 	pool, err := database.NewPool(startupCtx, cfg.DB)
 	if err != nil {
@@ -149,7 +157,7 @@ func main() {
 
 	// Durable email delivery: services enqueue; the worker sends and retries.
 	jobQueue := jobs.NewQueue(pool)
-	queuedEmail := jobs.NewQueuedSender(jobQueue)
+	queuedEmail := jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(payloadCodec))
 
 	// Password reset
 	passwordResetRepo := repository.NewPasswordResetRepository(pool)
@@ -204,7 +212,7 @@ func main() {
 	hostname, _ := os.Hostname()
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	worker := jobs.NewWorker(pool, hostname, jobs.WithConcurrency(4))
-	worker.Register(jobs.EmailJobKind, jobs.EmailHandler(emailSender))
+	worker.Register(jobs.EmailJobKind, jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec)))
 	workerDone := make(chan struct{})
 	go func() {
 		if err := worker.Run(workerCtx); err != nil {

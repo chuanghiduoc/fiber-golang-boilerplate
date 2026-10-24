@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -586,6 +587,99 @@ func TestPurgeTerminalIntegrationBatches(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, recentID).Scan(&recentExists))
 	assert.True(t, recentExists)
+}
+
+// TestQueuedSenderIntegrationEncryptsEmailPayload verifies that the codec
+// wiring used by cmd/api stores an encrypted envelope instead of the reset
+// link, and that EmailHandler still delivers the decoded message.
+func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	codec, err := NewPayloadCodec("integration-jwt-secret-at-least-32-characters")
+	require.NoError(t, err)
+
+	msg := email.Message{
+		To:      []string{"encrypted-email@example.com"},
+		Subject: "Reset your password",
+		Body:    "Reset your password: https://app.example/reset?token=secret-token",
+		HTML:    `<a href="https://app.example/reset?token=secret-token">Reset</a>`,
+	}
+
+	sender := NewQueuedSender(NewQueue(pool), WithPayloadCodec(codec))
+	require.NoError(t, sender.Send(ctx, msg))
+
+	var raw []byte
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`,
+		EmailJobKind,
+	).Scan(&raw))
+
+	encoded := string(raw)
+	for _, secret := range []string{"secret-token", "encrypted-email@example.com", "Reset your password"} {
+		assert.NotContains(t, encoded, secret, "jobs.payload must not expose email contents")
+	}
+
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(raw, &envelope))
+	assert.Equal(t, payloadEnvelopeVersion, envelope.Version)
+	assert.NotEmpty(t, envelope.Nonce)
+	assert.NotEmpty(t, envelope.Data)
+
+	opened, err := codec.Open(json.RawMessage(raw))
+	require.NoError(t, err)
+	var decoded email.Message
+	require.NoError(t, json.Unmarshal(opened, &decoded))
+	assert.Equal(t, msg, decoded)
+
+	delivered := &recordingEmailSender{}
+	require.NoError(t, EmailHandler(delivered, WithEmailPayloadCodec(codec))(
+		ctx, json.RawMessage(raw),
+	))
+	require.Len(t, delivered.messages, 1)
+	assert.Equal(t, msg, delivered.messages[0])
+}
+
+// TestQueuedSenderIntegrationSendTxEncryptsEmailPayload covers the
+// transactional enqueue path with the same codec.
+func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	codec, err := NewPayloadCodec("integration-jwt-secret-at-least-32-characters")
+	require.NoError(t, err)
+
+	msg := email.Message{
+		To:      []string{"encrypted-tx@example.com"},
+		Subject: "Verify your email address",
+		Body:    "Verify: https://app.example/verify?token=tx-secret-token",
+	}
+
+	sender := NewQueuedSender(NewQueue(pool), WithPayloadCodec(codec))
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, sender.SendTx(ctx, tx, msg))
+	require.NoError(t, tx.Commit(ctx))
+
+	var raw []byte
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`,
+		EmailJobKind,
+	).Scan(&raw))
+
+	assert.NotContains(t, string(raw), "tx-secret-token")
+	assert.NotContains(t, string(raw), "encrypted-tx@example.com")
+
+	opened, err := codec.Open(json.RawMessage(raw))
+	require.NoError(t, err)
+	var decoded email.Message
+	require.NoError(t, json.Unmarshal(opened, &decoded))
+	assert.Equal(t, msg, decoded)
 }
 
 // setupIntegrationDB creates an isolated schema, applies the consolidated

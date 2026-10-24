@@ -124,7 +124,15 @@ Offset helpers are for small admin/export tables only.
   `jobs_retried_total{kind}`, `jobs_dead_total{kind}`), claim failures
   (`jobs_claim_errors_total`), purges (`jobs_purged_total`), and audit write
   failures (`audit_write_failures_total`). `jobs_dead_total` covers handler
-  failures that exhaust attempts, not lease-expiry dead letters.
+  failures that exhaust attempts, not lease-expiry dead letters. Email job
+  payloads are sealed with AES-256-GCM using an HKDF-SHA256 key derived from
+  `JWT_SECRET` (`jobs.PayloadCodec`); `EmailHandler` also accepts legacy
+  plaintext JSON, which remains readable at rest until delivered or cleared.
+  External tools see the envelope in `jobs.payload`. Drain the queue and stop
+  old workers before enabling encryption: pre-codec binaries cannot decrypt
+  new jobs, and unknown-kind retry does not help because `email.send` is
+  registered. Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain
+  the queue first.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
