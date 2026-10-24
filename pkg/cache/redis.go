@@ -44,6 +44,10 @@ func redisOptions(cfg config.CacheConfig) (*redis.Options, error) {
 	opts.ReadTimeout = cfg.RedisReadTimeout()
 	opts.WriteTimeout = cfg.RedisWriteTimeout()
 	opts.PoolTimeout = cfg.RedisPoolTimeout()
+	// Without this go-redis ignores context deadlines on socket I/O and waits
+	// the full read/write timeout, so callers' tighter per-call bounds (rate
+	// limit, idempotency) would have no effect against a stalled server.
+	opts.ContextTimeoutEnabled = true
 	// go-redis treats 0 as "use the default of 3 retries" and -1 as none.
 	opts.MaxRetries = cfg.RedisMaxRetries
 	if opts.MaxRetries == 0 {
@@ -65,6 +69,11 @@ func (r *RedisCache) Get(ctx context.Context, key string) ([]byte, error) {
 
 func (r *RedisCache) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	return r.client.Set(ctx, key, value, ttl).Err()
+}
+
+// SetNX maps to SET key value NX PX ttl, a single atomic command.
+func (r *RedisCache) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	return r.client.SetNX(ctx, key, value, ttl).Result()
 }
 
 func (r *RedisCache) Delete(ctx context.Context, key string) error {

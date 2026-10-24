@@ -133,3 +133,24 @@ func (q *Queries) GetEmailVerificationTokenByToken(ctx context.Context, arg GetE
 	)
 	return i, err
 }
+
+const purgeExpiredEmailVerificationTokens = `-- name: PurgeExpiredEmailVerificationTokens :execrows
+WITH batch AS (
+    SELECT id FROM email_verification_tokens
+    WHERE expires_at < now()
+    LIMIT $1::int
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM email_verification_tokens AS t
+USING batch
+WHERE t.id = batch.id
+`
+
+// Maintenance purge across every tenant; see PurgeExpiredPasswordResetTokens.
+func (q *Queries) PurgeExpiredEmailVerificationTokens(ctx context.Context, batchSize int32) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeExpiredEmailVerificationTokens, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

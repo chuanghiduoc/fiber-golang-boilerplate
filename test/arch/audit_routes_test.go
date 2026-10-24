@@ -1,12 +1,15 @@
 package arch_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 )
 
 // tier1Audit names the module whose service records a Tier 1 route's audit
@@ -155,20 +158,8 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 			continue
 		}
 
-		guardIndex := handlerIndex(route, auditPackage, "Guard")
-		idempotencyIndex := -1
-		for i, handler := range route.Handlers {
-			if strings.HasSuffix(handlerName(handler), "/test/arch_test.testIdempotency") {
-				idempotencyIndex = i
-			}
-		}
-		if guardIndex < 0 {
-			t.Errorf("module %s: mutating route %s is neither Tier 1 nor wrapped by audit.Guard", mounted.module, key)
-			continue
-		}
-		if idempotencyIndex >= 0 && idempotencyIndex > guardIndex {
-			t.Errorf("route %s must run idempotency before audit.Guard (idempotency=%d guard=%d)",
-				key, idempotencyIndex, guardIndex)
+		if problem := guardedRouteProblem(route); problem != "" {
+			t.Errorf("module %s: mutating route %s %s", mounted.module, key, problem)
 		}
 	}
 
@@ -180,6 +171,49 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 	for key := range fallbackAudited {
 		if !seenFallback[key] {
 			t.Errorf("fallback-audited route %s no longer exists (or became guarded); remove it from the list", key)
+		}
+	}
+}
+
+// guardedRouteProblem returns why a mutating route that is neither Tier 1
+// nor fallback-audited breaks the audit rule, or "". audit.Guard must run
+// before the final handler (otherwise it never wraps the mutation) and after
+// idempotency when the route has one (so replays are not audited again).
+func guardedRouteProblem(route fiber.Route) string {
+	guardIndex := handlerIndex(route, auditPackage, "Guard")
+	idempotencyIndex := -1
+	for i, handler := range route.Handlers {
+		if strings.HasSuffix(handlerName(handler), "/test/arch_test.testIdempotency") {
+			idempotencyIndex = i
+		}
+	}
+	switch {
+	case guardIndex < 0:
+		return "is neither Tier 1 nor wrapped by audit.Guard"
+	case !handlerBeforeFinal(route, auditPackage, "Guard"):
+		return "runs audit.Guard only after its final handler; move it before the handler"
+	case idempotencyIndex > guardIndex:
+		return fmt.Sprintf("must run idempotency before audit.Guard (idempotency=%d guard=%d)", idempotencyIndex, guardIndex)
+	}
+	return ""
+}
+
+func TestGuardedRouteProblem(t *testing.T) {
+	guard := audit.Guard(audit.Noop{}, audit.Policy{})
+	cases := map[string]struct {
+		handlers []fiber.Handler
+		ok       bool
+	}{
+		"idempotency then guard":    {handlers: []fiber.Handler{testIdempotency, guard, finalHandler}, ok: true},
+		"guard without idempotency": {handlers: []fiber.Handler{guard, finalHandler}, ok: true},
+		"no guard":                  {handlers: []fiber.Handler{testIdempotency, finalHandler}},
+		"guard after handler":       {handlers: []fiber.Handler{testIdempotency, finalHandler, guard}},
+		"guard before idempotency":  {handlers: []fiber.Handler{guard, testIdempotency, finalHandler}},
+	}
+	for name, tc := range cases {
+		route := fiber.Route{Method: fiber.MethodPost, Path: "/api/v1/x", Handlers: tc.handlers}
+		if problem := guardedRouteProblem(route); (problem == "") != tc.ok {
+			t.Errorf("%s: guardedRouteProblem = %q, want ok=%v", name, problem, tc.ok)
 		}
 	}
 }

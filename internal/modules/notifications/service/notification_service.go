@@ -127,20 +127,17 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 		return CreateResult{}, err
 	}
 
-	inAppEnabled, err := s.channelEnabled(scopedCtx, normalized.UserID, normalized.Type, ChannelInApp)
+	channels, err := s.enabledChannels(scopedCtx, normalized)
 	if err != nil {
 		return CreateResult{}, err
 	}
-	emailEnabled, err := s.channelEnabled(scopedCtx, normalized.UserID, normalized.Type, ChannelEmail)
-	if err != nil {
-		return CreateResult{}, err
-	}
-	if !inAppEnabled && !emailEnabled {
+	if !channels.inApp && !channels.email {
+		// Both channels are switched off: suppression is a successful no-op.
 		return CreateResult{}, nil
 	}
 
 	var message email.Message
-	if emailEnabled {
+	if channels.email {
 		message, err = s.buildEmailMessage(scopedCtx, normalized)
 		if err != nil {
 			return CreateResult{}, err
@@ -156,43 +153,82 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 	}
 
 	var created *notificationsqlc.Notification
-	persist := func(repo repository.NotificationRepository, tx pgx.Tx) error {
-		if inAppEnabled {
-			row, createErr := repo.Create(scopedCtx, params)
-			if createErr != nil {
-				return createErr
-			}
-			created = row
-		}
-		if !emailEnabled {
-			return nil
-		}
-		if txSender, ok := s.sender.(TransactionalEmailSender); ok && s.txManager != nil {
-			return txSender.SendTx(scopedCtx, tx, message)
-		}
-		if s.sender == nil {
-			return errors.New("notification email sender is not configured")
-		}
-		return s.sender.Send(scopedCtx, message)
-	}
-
-	switch {
-	case s.txManager != nil && emailEnabled:
+	if s.txManager != nil && channels.email {
 		err = s.txManager.WithTx(scopedCtx, func(tx pgx.Tx) error {
-			return persist(s.repo.WithTx(tx), tx)
+			var txErr error
+			created, txErr = s.deliver(scopedCtx, s.repo.WithTx(tx), tx, channels, params, message)
+			return txErr
 		})
-	case inAppEnabled || emailEnabled:
-		err = persist(s.repo, nil)
+	} else {
+		created, err = s.deliver(scopedCtx, s.repo, nil, channels, params, message)
 	}
 	if err != nil {
 		return CreateResult{}, s.createError(scopedCtx, err, normalized)
 	}
 
-	result := CreateResult{EmailQueued: emailEnabled}
+	result := CreateResult{EmailQueued: channels.email}
 	if created != nil {
 		result.Notification = toNotificationResponse(created)
 	}
 	return result, nil
+}
+
+// deliveryChannels are the channels a notification is delivered on after the
+// recipient's preferences are applied.
+type deliveryChannels struct {
+	inApp bool
+	email bool
+}
+
+func (s *notificationService) enabledChannels(ctx context.Context, input notificationcontracts.CreateNotificationInput) (deliveryChannels, error) {
+	inApp, err := s.channelEnabled(ctx, input.UserID, input.Type, ChannelInApp)
+	if err != nil {
+		return deliveryChannels{}, err
+	}
+	emailOn, err := s.channelEnabled(ctx, input.UserID, input.Type, ChannelEmail)
+	if err != nil {
+		return deliveryChannels{}, err
+	}
+	return deliveryChannels{inApp: inApp, email: emailOn}, nil
+}
+
+// deliver stores the in-app row and enqueues the email on the enabled
+// channels. tx is the surrounding transaction, or nil when the row and email
+// are not committed together.
+func (s *notificationService) deliver(
+	ctx context.Context,
+	repo repository.NotificationRepository,
+	tx pgx.Tx,
+	channels deliveryChannels,
+	params notificationsqlc.CreateNotificationParams,
+	message email.Message,
+) (*notificationsqlc.Notification, error) {
+	var created *notificationsqlc.Notification
+	if channels.inApp {
+		row, err := repo.Create(ctx, params)
+		if err != nil {
+			return nil, err
+		}
+		created = row
+	}
+	if channels.email {
+		if err := s.sendEmail(ctx, tx, message); err != nil {
+			return nil, err
+		}
+	}
+	return created, nil
+}
+
+// sendEmail enqueues inside tx when a transaction manager and a transactional
+// sender are wired, so a queue failure rolls the in-app row back.
+func (s *notificationService) sendEmail(ctx context.Context, tx pgx.Tx, message email.Message) error {
+	if txSender, ok := s.sender.(TransactionalEmailSender); ok && s.txManager != nil {
+		return txSender.SendTx(ctx, tx, message)
+	}
+	if s.sender == nil {
+		return errors.New("notification email sender is not configured")
+	}
+	return s.sender.Send(ctx, message)
 }
 
 // createError preserves domain errors and hides persistence/queue internals

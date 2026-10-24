@@ -139,6 +139,13 @@ type CompletionRecorder interface {
 // secrets such as plaintext tokens or API keys.
 const MetadataLocalKey = "audit_metadata"
 
+// WriteTimeout bounds each audit write the HTTP layer makes on a detached
+// context: the Guard intent and completion rows and the Middleware fallback
+// row. Completion and fallback run after the handler returned, so a request
+// can outlive its APP_REQUEST_TIMEOUT by up to one WriteTimeout (a guarded
+// route never also gets a fallback row).
+const WriteTimeout = 2 * time.Second
+
 // Noop discards every event. It is useful in tests and when auditing is
 // disabled by configuration.
 //

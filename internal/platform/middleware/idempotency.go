@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -27,15 +28,21 @@ const (
 	idempotencyLockTTL           = 2 * time.Minute
 	idempotencyResponseTTL       = 24 * time.Hour
 	idempotencyBodyMismatchError = "idempotency key was used with a different request body"
+	idempotencyInProgressError   = "request with this idempotency key is already in progress"
 
 	// idempotencyCacheReadTimeout bounds each cache call made before the
-	// handler runs (lookup, claim, lock token). These fail open, so a slow
+	// handler runs (lookup, claim, claim read-back). These fail open, so a slow
 	// cache must not stall the request for the client's full timeouts.
 	idempotencyCacheReadTimeout = 250 * time.Millisecond
 	// idempotencyCacheWriteTimeout bounds storing the response and releasing
 	// the lock after the handler ran. It is longer than the read bound because
 	// losing the stored response lets a retry repeat a completed mutation.
 	idempotencyCacheWriteTimeout = 500 * time.Millisecond
+
+	// IdempotencyPostHandlerBudget is the longest this middleware keeps a
+	// request running after its handler returned: storing the response, then
+	// releasing the lock, each on a detached context.
+	IdempotencyPostHandlerBudget = 2 * idempotencyCacheWriteTimeout
 )
 
 // cachedResponse is the replay payload persisted under the response key. Only
@@ -48,8 +55,20 @@ type cachedResponse struct {
 	Body     []byte            `json:"body,omitempty"`
 }
 
+// lockClaim is the outcome of trying to take the per-key execution lock.
+type lockClaim int
+
+const (
+	// lockAcquired: this request owns the lock and may run the handler.
+	lockAcquired lockClaim = iota
+	// lockHeldByOther: another request owns the lock; this one must not run.
+	lockHeldByOther
+	// lockUnavailable: the cache could not answer; the request fails open.
+	lockUnavailable
+)
+
 // Idempotency makes mutating routes opt-in idempotent through an
-// Idempotency-Key header. The first request claims an atomic cache lock,
+// Idempotency-Key header. The first request claims an atomic owner-token lock,
 // executes the handler, and stores any 2xx response for 24 hours. Retries with
 // the same key replay that response; concurrent retries while the first is
 // still running get 409. The scope includes the resolved tenant so identical
@@ -77,82 +96,211 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 			return apperror.NewBadRequest("invalid Idempotency-Key")
 		}
 
-		bodyHash := idempotencyBodyHash(c)
 		scope := idempotencyScope(
 			c.Method(), idempotencyRoutePath(c), tenant.ID(c), tenant.Slug(c), idempotencyIdentity(c), key,
 		)
-		responseKey := idempotencyResponseKey(scope)
-		if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
-			return writeCachedResponse(c, cached, bodyHash)
+		req := idempotentRequest{
+			c:           c,
+			cache:       appCache,
+			responseKey: idempotencyResponseKey(scope),
+			lockKey:     idempotencyLockKey(scope),
+			bodyHash:    idempotencyBodyHash(c),
 		}
-
-		lockKey := idempotencyLockKey(scope)
-		claimCtx, cancelClaim := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
-		claimed, err := appCache.Increment(claimCtx, lockKey, idempotencyLockTTL)
-		cancelClaim()
-		if err != nil {
-			// The claim counter is replaced by an owner token once acquired, so
-			// a non-integer increment means another request owns the lock (Redis
-			// INCR errors; MemoryCache matches that). A real cache outage fails
-			// open instead.
-			if held, checkErr := idempotencyLockHeld(c, appCache, lockKey); checkErr == nil && held {
-				if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
-					return writeCachedResponse(c, cached, bodyHash)
-				}
-				return apperror.NewConflict("request with this idempotency key is already in progress")
-			}
-			// The owner may have completed and released the lock between our
-			// failed increment and the held check. Re-check the response before
-			// failing open, otherwise a completed mutation could execute twice.
-			if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
-				return writeCachedResponse(c, cached, bodyHash)
-			}
-			slog.Warn("idempotency lock failed; proceeding without a lock",
-				slog.String("method", c.Method()),
-				slog.String("path", c.Path()),
-				slog.String("request_id", fiber.Locals[string](c, "request_id")),
-				slog.Any("error", err),
-			)
-			return nextAndCache(c, appCache, responseKey, bodyHash)
-		}
-		if claimed > 1 {
-			// Close the miss->claim->complete race: the owner may have written
-			// the response between our first read and the failed claim.
-			if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
-				return writeCachedResponse(c, cached, bodyHash)
-			}
-			return apperror.NewConflict("request with this idempotency key is already in progress")
-		}
-
-		// Increment only creates a numeric claim. Replace it with a unique owner
-		// token so release can prove ownership and cannot delete a lock that
-		// expired and was reacquired by another request.
-		token := []byte(uuid.NewString())
-		if err := setLockToken(c, appCache, lockKey, token); err != nil {
-			slog.Warn("idempotency lock token write failed; proceeding without a lock",
-				slog.String("request_id", fiber.Locals[string](c, "request_id")),
-				slog.Any("error", err),
-			)
-			// Release only if the token write actually landed. If it did not,
-			// the numeric claim expires after the lock TTL instead of deleting a
-			// lock that another request may have acquired in the meantime.
-			releaseLock(c, appCache, lockKey, token)
-			return nextAndCache(c, appCache, responseKey, bodyHash)
-		}
-
-		// The lock must be released even when the handler errors, returns a
-		// non-2xx status, or panics. WithoutCancel keeps cleanup independent of
-		// a client disconnect; the TTL covers an unreachable cache.
-		defer releaseLock(c, appCache, lockKey, token)
-
-		// A request that completed between the first read and the lock claim
-		// may have written the response already.
-		if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
-			return writeCachedResponse(c, cached, bodyHash)
-		}
-
-		return nextAndCache(c, appCache, responseKey, bodyHash)
+		return req.serve()
 	}
+}
+
+// idempotentRequest is one keyed mutating request and its cache keys.
+type idempotentRequest struct {
+	c           fiber.Ctx
+	cache       cache.Cache
+	responseKey string
+	lockKey     string
+	bodyHash    string
+}
+
+// serve replays a stored response when one exists; otherwise it claims the
+// lock and runs the handler at most once per key.
+func (r idempotentRequest) serve() error {
+	if cached, ok := r.loadResponse(); ok {
+		return r.replay(cached)
+	}
+
+	token := []byte(uuid.NewString())
+	switch r.claimLock(token) {
+	case lockHeldByOther:
+		// Close the miss->claim->complete race: the owner may have written the
+		// response between our first read and the failed claim.
+		if cached, ok := r.loadResponse(); ok {
+			return r.replay(cached)
+		}
+		return apperror.NewConflict(idempotencyInProgressError)
+	case lockUnavailable:
+		slog.Warn("idempotency lock unavailable; proceeding without a lock",
+			slog.String("method", r.c.Method()),
+			slog.String("path", r.c.Path()),
+			slog.String("request_id", r.requestID()),
+		)
+	case lockAcquired:
+	}
+
+	// Release on every exit path: handler error, non-2xx, or panic. It also
+	// runs after a fail-open claim, because a claim whose reply was lost may
+	// still land; compare-and-delete only ever removes this request's token.
+	defer r.releaseLock(token)
+
+	// A request that completed between the first read and the claim may have
+	// written the response already.
+	if cached, ok := r.loadResponse(); ok {
+		return r.replay(cached)
+	}
+	return r.runAndStore()
+}
+
+// claimLock takes the lock with one atomic SET NX carrying this request's
+// owner token. When the reply is lost (timeout, connection reset) the SET may
+// still have been applied, so the key is read back: our token means we hold
+// the lock, another token means someone else does, and a missing key or a
+// failed read means the cache cannot arbitrate and the request fails open.
+func (r idempotentRequest) claimLock(token []byte) lockClaim {
+	ctx, cancel := context.WithTimeout(r.c.Context(), idempotencyCacheReadTimeout)
+	stored, err := r.cache.SetNX(ctx, r.lockKey, token, idempotencyLockTTL)
+	cancel()
+	if err == nil {
+		if stored {
+			return lockAcquired
+		}
+		return lockHeldByOther
+	}
+
+	ctx, cancel = context.WithTimeout(r.c.Context(), idempotencyCacheReadTimeout)
+	defer cancel()
+	owner, readErr := r.cache.Get(ctx, r.lockKey)
+	switch {
+	case readErr != nil || len(owner) == 0:
+		slog.Warn("idempotency lock claim failed",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+			slog.Any("read_back_error", readErr),
+		)
+		return lockUnavailable
+	case bytes.Equal(owner, token):
+		return lockAcquired
+	default:
+		return lockHeldByOther
+	}
+}
+
+// releaseLock only deletes the lock when this request still owns it. When the
+// optional CompareDeleter capability is unavailable, it falls back to Delete.
+func (r idempotentRequest) releaseLock(token []byte) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.c.Context()), idempotencyCacheWriteTimeout)
+	defer cancel()
+
+	var err error
+	if deleter, ok := r.cache.(cache.CompareDeleter); ok {
+		_, err = deleter.CompareAndDelete(ctx, r.lockKey, token)
+	} else {
+		err = r.cache.Delete(ctx, r.lockKey)
+	}
+	if err != nil {
+		slog.Warn("idempotency lock release failed; it will expire",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+		)
+	}
+}
+
+// runAndStore runs the route and stores its response when it succeeded. The
+// original response is never replaced: cache write failures are logged only.
+func (r idempotentRequest) runAndStore() error {
+	if err := r.c.Next(); err != nil {
+		return err
+	}
+
+	status := r.c.Response().StatusCode()
+	if status < fiber.StatusOK || status >= fiber.StatusMultipleChoices {
+		return nil
+	}
+
+	headers := make(map[string]string, 3)
+	for _, header := range []string{fiber.HeaderContentType, fiber.HeaderLocation, fiber.HeaderETag} {
+		if value := r.c.GetRespHeader(header); value != "" {
+			headers[header] = value
+		}
+	}
+
+	payload, err := json.Marshal(cachedResponse{
+		Status:   status,
+		Headers:  headers,
+		BodyHash: r.bodyHash,
+		Body:     r.c.Response().Body(),
+	})
+	if err != nil {
+		slog.Warn("idempotency response encoding failed; not caching",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+		)
+		return nil
+	}
+
+	// Use a detached, bounded context so a client disconnect does not abandon a
+	// response that later retries need to replay.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.c.Context()), idempotencyCacheWriteTimeout)
+	defer cancel()
+	if err := r.cache.Set(ctx, r.responseKey, payload, idempotencyResponseTTL); err != nil {
+		slog.Warn("idempotency response cache failed; returning original response",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+		)
+	}
+	return nil
+}
+
+func (r idempotentRequest) loadResponse() (*cachedResponse, bool) {
+	ctx, cancel := context.WithTimeout(r.c.Context(), idempotencyCacheReadTimeout)
+	defer cancel()
+	data, err := r.cache.Get(ctx, r.responseKey)
+	if err != nil {
+		slog.Warn("idempotency cache read failed; proceeding normally",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+		)
+		return nil, false
+	}
+	if len(data) == 0 {
+		return nil, false
+	}
+
+	var cached cachedResponse
+	if err := json.Unmarshal(data, &cached); err != nil {
+		slog.Warn("idempotency cache entry is invalid; proceeding normally",
+			slog.String("request_id", r.requestID()),
+			slog.Any("error", err),
+		)
+		return nil, false
+	}
+	return &cached, true
+}
+
+// replay writes a stored response, unless the key is being reused with a
+// different request body.
+func (r idempotentRequest) replay(cached *cachedResponse) error {
+	if cached.BodyHash != "" && r.bodyHash != "" && cached.BodyHash != r.bodyHash {
+		return apperror.NewConflict(idempotencyBodyMismatchError)
+	}
+
+	fiber.Locals[bool](r.c, idempotencyReplayedLocal, true)
+	r.c.Set(idempotencyReplayedHeader, "true")
+	r.c.Status(cached.Status)
+	for header, value := range cached.Headers {
+		r.c.Set(header, value)
+	}
+	return r.c.Send(cached.Body)
+}
+
+func (r idempotentRequest) requestID() string {
+	return fiber.Locals[string](r.c, "request_id")
 }
 
 func validIdempotencyKey(key string) bool {
@@ -236,129 +384,3 @@ func idempotencyIdentity(c fiber.Ctx) string {
 func idempotencyResponseKey(scope string) string { return scope + ":response" }
 
 func idempotencyLockKey(scope string) string { return scope + ":lock" }
-
-func idempotencyLockHeld(c fiber.Ctx, appCache cache.Cache, lockKey string) (bool, error) {
-	ctx, cancel := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
-	defer cancel()
-	value, err := appCache.Get(ctx, lockKey)
-	if err != nil {
-		return false, err
-	}
-	return len(value) > 0, nil
-}
-
-func setLockToken(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byte) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheReadTimeout)
-	defer cancel()
-	return appCache.Set(ctx, lockKey, token, idempotencyLockTTL)
-}
-
-// releaseLock only deletes the lock when this request still owns it. When the
-// optional CompareDeleter capability is unavailable, it falls back to Delete.
-func releaseLock(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byte) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheWriteTimeout)
-	defer cancel()
-
-	if deleter, ok := appCache.(cache.CompareDeleter); ok {
-		if _, err := deleter.CompareAndDelete(ctx, lockKey, token); err != nil {
-			slog.Warn("idempotency lock release failed; it will expire",
-				slog.String("request_id", fiber.Locals[string](c, "request_id")),
-				slog.Any("error", err),
-			)
-		}
-		return
-	}
-
-	if err := appCache.Delete(ctx, lockKey); err != nil {
-		slog.Warn("idempotency lock release failed; it will expire",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-	}
-}
-
-// nextAndCache runs the route and stores its response when it succeeded. The
-// original response is never replaced: cache write failures are logged only.
-func nextAndCache(c fiber.Ctx, appCache cache.Cache, responseKey, bodyHash string) error {
-	if err := c.Next(); err != nil {
-		return err
-	}
-
-	status := c.Response().StatusCode()
-	if status < fiber.StatusOK || status >= fiber.StatusMultipleChoices {
-		return nil
-	}
-
-	headers := make(map[string]string, 3)
-	for _, header := range []string{fiber.HeaderContentType, fiber.HeaderLocation, fiber.HeaderETag} {
-		if value := c.GetRespHeader(header); value != "" {
-			headers[header] = value
-		}
-	}
-
-	payload, err := json.Marshal(cachedResponse{
-		Status:   status,
-		Headers:  headers,
-		BodyHash: bodyHash,
-		Body:     c.Response().Body(),
-	})
-	if err != nil {
-		slog.Warn("idempotency response encoding failed; not caching",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-		return nil
-	}
-
-	// Use a detached, bounded context so a client disconnect does not abandon a
-	// response that later retries need to replay.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheWriteTimeout)
-	defer cancel()
-	if err := appCache.Set(ctx, responseKey, payload, idempotencyResponseTTL); err != nil {
-		slog.Warn("idempotency response cache failed; returning original response",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-	}
-	return nil
-}
-
-func loadCachedResponse(c fiber.Ctx, appCache cache.Cache, responseKey string) (*cachedResponse, bool) {
-	ctx, cancel := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
-	defer cancel()
-	data, err := appCache.Get(ctx, responseKey)
-	if err != nil {
-		slog.Warn("idempotency cache read failed; proceeding normally",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-		return nil, false
-	}
-	if len(data) == 0 {
-		return nil, false
-	}
-
-	var cached cachedResponse
-	if err := json.Unmarshal(data, &cached); err != nil {
-		slog.Warn("idempotency cache entry is invalid; proceeding normally",
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Any("error", err),
-		)
-		return nil, false
-	}
-	return &cached, true
-}
-
-func writeCachedResponse(c fiber.Ctx, cached *cachedResponse, bodyHash string) error {
-	if cached.BodyHash != "" && bodyHash != "" && cached.BodyHash != bodyHash {
-		return apperror.NewConflict(idempotencyBodyMismatchError)
-	}
-
-	fiber.Locals[bool](c, idempotencyReplayedLocal, true)
-	c.Set(idempotencyReplayedHeader, "true")
-	c.Status(cached.Status)
-	for header, value := range cached.Headers {
-		c.Set(header, value)
-	}
-	return c.Send(cached.Body)
-}

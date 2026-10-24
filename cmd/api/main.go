@@ -15,6 +15,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -47,26 +48,134 @@ import (
 	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
 )
 
+const (
+	// startupTimeout bounds startup so an unreachable database cannot hang
+	// the process forever.
+	startupTimeout = 60 * time.Second
+	// workerConcurrency is how many jobs one process runs at once.
+	workerConcurrency = 4
+	// defaultTraceShutdownTimeout applies when OTEL_SHUTDOWN_TIMEOUT_SECS is
+	// not positive (config literals in tests and tools).
+	defaultTraceShutdownTimeout = 5 * time.Second
+	// instanceSuffixLength is the random suffix length in the instance ID.
+	instanceSuffixLength = 8
+)
+
+// Slices of config.ShutdownReserve. closeReserve is kept back from the tracing
+// flush for closing modules, the cache, and the pool; the minimums apply when
+// earlier phases already used their share, and the overrun stays inside the
+// 5s margin before SIGKILL.
+const (
+	closeReserve      = 2 * time.Second
+	traceFlushMinimum = time.Second
+	closeMinimum      = time.Second
+)
+
+// main reads top-down as the process lifecycle: load config, start (build
+// infrastructure, register catalogs and modules, run startup checks), start
+// background work, serve until a signal or listener error, then shut down
+// inside config.ShutdownBudget.
 func main() {
-	// Load configuration. Validate checks FEATURE_FLAGS syntax only; unknown
-	// keys are rejected below, once modules have registered their flags.
+	cfg := loadConfig()
+
+	rt, err := start(cfg)
+	if err != nil {
+		exitStartup(err)
+	}
+
+	bg, err := rt.startBackground()
+	if err != nil {
+		rt.infra.Pool.Close()
+		exitStartup(err)
+	}
+
+	exitCode := rt.serve()
+	if !rt.shutdown(bg) {
+		exitCode = 1
+	}
+
+	slog.Info("server exited")
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+// runtime is everything start builds that the later phases run or close.
+type runtime struct {
+	cfg *config.Config
+	// infra is the shared infrastructure handed to every module.
+	infra        app.Infra
+	trace        *tracing.Provider
+	emailSender  email.Sender
+	payloadCodec *jobs.PayloadCodec
+	worker       *jobs.Worker
+	events       *events.Bus
+	schedules    *scheduler.Registry // nil unless SCHEDULER_ENABLED
+	instanceID   string
+	modules      *bootstrap.Modules
+	i18n         *i18n.Bundle
+	app          *app.App
+}
+
+// background holds the stop handles of the goroutines started after startup.
+type background struct {
+	schedulerCancel context.CancelFunc // nil unless SCHEDULER_ENABLED
+	schedulerDone   <-chan struct{}
+	workerCancel    context.CancelFunc
+	workerDone      <-chan struct{}
+}
+
+// startupError carries the log message for the startup step that failed.
+type startupError struct {
+	msg string
+	err error
+}
+
+func (e *startupError) Error() string { return e.msg + ": " + e.err.Error() }
+func (e *startupError) Unwrap() error { return e.err }
+
+func startupFailed(msg string, err error) error {
+	return &startupError{msg: msg, err: err}
+}
+
+// exitStartup logs a startup failure and exits with status 1.
+func exitStartup(err error) {
+	var se *startupError
+	if errors.As(err, &se) {
+		slog.Error(se.msg, slog.Any("error", se.err))
+	} else {
+		slog.Error("startup failed", slog.Any("error", err))
+	}
+	os.Exit(1)
+}
+
+// loadConfig loads configuration, sets up logging, and warns about settings
+// that are allowed but risky. Validate checks FEATURE_FLAGS syntax only;
+// unknown keys are rejected in start, once modules have registered their flags.
+func loadConfig() *config.Config {
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("failed to load config", slog.Any("error", err))
 		os.Exit(1)
 	}
 
-	// Setup structured logging
 	logger.Setup(cfg.App.Env, cfg.App.LogLevel)
 
 	// Base URL for RFC 9457 problem "type" links in error responses.
 	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL
 
+	warnRiskySettings(cfg)
+	return cfg
+}
+
+// warnRiskySettings logs configurations that validation accepts on purpose
+// (explicit production opt-outs, or local defaults that limit uploads).
+func warnRiskySettings(cfg *config.Config) {
 	if cfg.App.Env == "production" {
 		if cfg.Cache.Driver == "memory" {
 			slog.Warn("CACHE_DRIVER=memory in production: rate limits and session invalidation are not shared across replicas")
 		}
-		if (cfg.Storage.Driver == "s3" || cfg.Storage.Driver == "seaweedfs") && !cfg.Storage.S3UseSSL {
+		if cfg.Storage.UsesS3() && !cfg.Storage.S3UseSSL {
 			slog.Warn("STORAGE_S3_ALLOW_INSECURE=true in production: object storage traffic is not encrypted")
 		}
 	}
@@ -77,22 +186,48 @@ func main() {
 			slog.Int64("max_file_size", cfg.Storage.MaxFileSize),
 		)
 	}
+}
 
-	// Bound startup so an unreachable database cannot hang the process forever.
-	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 60*time.Second)
-	fail := func(msg string, err error) {
-		cancelStartup()
-		slog.Error(msg, slog.Any("error", err))
-		os.Exit(1)
+// start builds the process inside the startup deadline: infrastructure, then
+// modules and their catalogs, then module startup checks. The HTTP
+// application is composed after the deadline is released. On any error after
+// the database pool exists, the pool is closed before returning.
+func start(cfg *config.Config) (_ *runtime, err error) {
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), startupTimeout)
+	defer cancelStartup()
+
+	rt := &runtime{cfg: cfg}
+	defer func() {
+		if err != nil && rt.infra.Pool != nil {
+			rt.infra.Pool.Close()
+		}
+	}()
+
+	if err := rt.buildInfrastructure(startupCtx); err != nil {
+		return nil, err
 	}
+	if err := rt.buildModules(startupCtx); err != nil {
+		return nil, err
+	}
+	cancelStartup()
+
+	rt.composeApplication()
+	return rt, nil
+}
+
+// buildInfrastructure creates tracing, the database pool, storage, cache,
+// feature flags, email, audit, and the durable job queue/worker/event bus.
+func (rt *runtime) buildInfrastructure(ctx context.Context) error {
+	cfg := rt.cfg
 
 	// Tracing is created before the database so pgx can emit sanitized client
 	// spans from the first query. The OTLP exporter connects lazily: an
 	// unreachable collector does not block or fail startup.
-	traceProvider, err := tracing.New(startupCtx, cfg.Tracing)
+	traceProvider, err := tracing.New(ctx, cfg.Tracing)
 	if err != nil {
-		fail("failed to initialize tracing", err)
+		return startupFailed("failed to initialize tracing", err)
 	}
+	rt.trace = traceProvider
 	if traceProvider.Enabled() {
 		slog.Info("tracing enabled",
 			slog.String("exporter", cfg.Tracing.Exporter),
@@ -104,40 +239,25 @@ func main() {
 	// Email job payloads are encrypted at rest with a key derived from
 	// JWT_SECRET. Rotating that secret invalidates already-queued encrypted
 	// jobs, so drain the queue before rotating it.
-	payloadCodec, err := jobs.NewPayloadCodec(cfg.JWT.Secret)
+	rt.payloadCodec, err = jobs.NewPayloadCodec(cfg.JWT.Secret)
 	if err != nil {
-		fail("failed to initialize job payload encryption", err)
+		return startupFailed("failed to initialize job payload encryption", err)
 	}
 
-	// Create database pool
-	poolOpts := make([]database.PoolOption, 0, 1)
-	if cfg.Tracing.Enabled && cfg.Tracing.InstrumentDB {
-		poolOpts = append(poolOpts, database.WithTracerProvider(traceProvider.TracerProvider()))
-	}
-	pool, err := database.NewPool(startupCtx, cfg.DB, poolOpts...)
+	pool, err := rt.connectDatabase(ctx)
 	if err != nil {
-		fail("failed to connect to database", err)
+		return err
 	}
 
-	slog.Info("connected to database")
-
-	// Schema management is owned by cmd/migrate only. The API never applies
-	// DDL, so replicas can start safely without a migration lock convoy.
-	slog.Info("database schema assumed up to date (run cmd/migrate)")
-
-	// Initialize storage
 	store, err := storage.NewStorage(cfg.Storage)
 	if err != nil {
-		pool.Close()
-		fail("failed to initialize storage", err)
+		return startupFailed("failed to initialize storage", err)
 	}
 	slog.Info("storage initialized", slog.String("driver", cfg.Storage.Driver))
 
-	// Cache
 	appCache, err := cache.NewCache(cfg.Cache)
 	if err != nil {
-		pool.Close()
-		fail("failed to initialize cache", err)
+		return startupFailed("failed to initialize cache", err)
 	}
 	slog.Info("cache initialized", slog.String("driver", cfg.Cache.Driver))
 
@@ -152,71 +272,98 @@ func main() {
 		MaxStaleness: cfg.FeatureFlags.MaxStaleness(),
 	})
 
-	// Email
-	emailSender, err := email.NewSender(cfg.Email)
+	rt.emailSender, err = email.NewSender(cfg.Email)
 	if err != nil {
-		pool.Close()
-		fail("failed to initialize email sender", err)
+		return startupFailed("failed to initialize email sender", err)
 	}
 	slog.Info("email sender initialized", slog.String("driver", cfg.Email.Driver))
 
-	// Transaction manager and the process-wide audit recorder. Tier 1 services
-	// write through the transaction; Tier 2 routes use it for intent rows.
-	txManager := database.NewTxManager(pool)
-	auditRecorder := audit.NewPostgresRecorder(pool)
+	jobQueue := rt.buildDurableWork(pool)
 
-	// Durable infrastructure. The queue is shared by email, events, and the
-	// optional scheduler; one worker processes every registered kind.
-	jobQueue := jobs.NewQueue(pool)
-	// Hostnames can collide (cloned VMs, host networking, fixed pod names), so
-	// the worker and scheduler identity also carries the PID and a random
-	// suffix; two processes must never share a lease/lock holder.
-	hostname, _ := os.Hostname()
-	instanceID := fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), rand.Text()[:8])
-	workerOpts := []jobs.Option{jobs.WithConcurrency(4)}
-	if traceProvider.Enabled() {
-		workerOpts = append(workerOpts, jobs.WithTracerProvider(traceProvider.TracerProvider()))
-	}
-	worker := jobs.NewWorker(pool, instanceID, workerOpts...)
-	eventBus := events.New(jobQueue)
-
-	var scheduleRegistry *scheduler.Registry
-	if cfg.Scheduler.Enabled {
-		scheduleRegistry = scheduler.NewRegistry()
-	}
-
-	// Durable email delivery: services enqueue; the worker sends and retries.
-	queuedEmail := jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(payloadCodec))
-
-	// Modules: internal/bootstrap holds the single ordered module list and
-	// the contract cross-wiring; each module builds its own repositories,
-	// services, and handlers from this shared infrastructure.
-	modules, err := bootstrap.Build(app.Infra{
-		Config:  cfg,
-		Pool:    pool,
-		Tx:      txManager,
+	rt.infra = app.Infra{
+		Config: cfg,
+		Pool:   pool,
+		// Transaction manager and the process-wide audit recorder. Tier 1
+		// services write through the transaction; Tier 2 routes use it for
+		// intent rows.
+		Tx:      database.NewTxManager(pool),
 		Cache:   appCache,
-		Audit:   auditRecorder,
+		Audit:   audit.NewPostgresRecorder(pool),
 		Queue:   jobQueue,
-		Email:   queuedEmail,
+		Email:   jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(rt.payloadCodec)),
 		Storage: store,
 		Flags:   flagEvaluator,
-	})
-	if err != nil {
-		pool.Close()
-		fail("failed to build modules", err)
 	}
+	return nil
+}
+
+// connectDatabase opens the pool (instrumented when tracing asks for it) and
+// records it in rt.infra so start closes it if a later step fails.
+func (rt *runtime) connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
+	poolOpts := make([]database.PoolOption, 0, 1)
+	if rt.cfg.Tracing.Enabled && rt.cfg.Tracing.InstrumentDB {
+		poolOpts = append(poolOpts, database.WithTracerProvider(rt.trace.TracerProvider()))
+	}
+	pool, err := database.NewPool(ctx, rt.cfg.DB, poolOpts...)
+	if err != nil {
+		return nil, startupFailed("failed to connect to database", err)
+	}
+	rt.infra.Pool = pool
+	slog.Info("connected to database")
+
+	// Schema management is owned by cmd/migrate only. The API never applies
+	// DDL, so replicas can start safely without a migration lock convoy.
+	slog.Info("database schema assumed up to date (run cmd/migrate)")
+	return pool, nil
+}
+
+// buildDurableWork creates the job queue, the worker, the event bus, and the
+// optional schedule registry. The queue is shared by email, events, and the
+// scheduler; one worker processes every registered kind.
+func (rt *runtime) buildDurableWork(pool *pgxpool.Pool) *jobs.Queue {
+	jobQueue := jobs.NewQueue(pool)
+	rt.instanceID = newInstanceID()
+	workerOpts := []jobs.Option{jobs.WithConcurrency(workerConcurrency)}
+	if rt.trace.Enabled() {
+		workerOpts = append(workerOpts, jobs.WithTracerProvider(rt.trace.TracerProvider()))
+	}
+	rt.worker = jobs.NewWorker(pool, rt.instanceID, workerOpts...)
+	rt.events = events.New(jobQueue)
+	if rt.cfg.Scheduler.Enabled {
+		rt.schedules = scheduler.NewRegistry()
+	}
+	return jobQueue
+}
+
+// newInstanceID identifies this process as a worker and scheduler lease
+// holder. Hostnames can collide (cloned VMs, host networking, fixed pod
+// names), so it also carries the PID and a random suffix; two processes must
+// never share a lease/lock holder.
+func newInstanceID() string {
+	hostname, _ := os.Hostname()
+	return fmt.Sprintf("%s-%d-%s", hostname, os.Getpid(), rand.Text()[:instanceSuffixLength])
+}
+
+// buildModules builds every module, registers and validates their catalogs,
+// and runs module startup checks inside the startup deadline.
+func (rt *runtime) buildModules(ctx context.Context) error {
+	// internal/bootstrap holds the single ordered module list and the
+	// contract cross-wiring; each module builds its own repositories,
+	// services, and handlers from this shared infrastructure.
+	modules, err := bootstrap.Build(rt.infra)
+	if err != nil {
+		return startupFailed("failed to build modules", err)
+	}
+	rt.modules = modules
 
 	// Module catalogs (permissions, error codes, flags) must be registered
 	// before anything validates against them: FEATURE_FLAGS keys here, the
 	// i18n bundle below, and API-key scopes/permission checks per request.
 	if err := app.RegisterCatalogs(modules.List...); err != nil {
-		pool.Close()
-		fail("failed to register module catalogs", err)
+		return startupFailed("failed to register module catalogs", err)
 	}
-	if err := cfg.FeatureFlags.ValidateKnownKeys(); err != nil {
-		pool.Close()
-		fail("invalid feature flag configuration", err)
+	if err := rt.cfg.FeatureFlags.ValidateKnownKeys(); err != nil {
+		return startupFailed("invalid feature flag configuration", err)
 	}
 	slog.Info("feature flags initialized", slog.Int("catalog_size", len(featureflags.Catalog())))
 
@@ -224,208 +371,221 @@ func main() {
 	// catalog drift (missing vi keys, placeholder mismatch, key collisions)
 	// or an unsupported I18N_DEFAULT_LOCALE fails fast instead of serving
 	// raw keys.
-	i18nBundle, err := i18n.New(cfg.I18N.Locale(), app.LocaleSources(modules.List...)...)
+	rt.i18n, err = i18n.New(rt.cfg.I18N.Locale(), app.LocaleSources(modules.List...)...)
 	if err != nil {
-		pool.Close()
-		fail("failed to initialize i18n", err)
+		return startupFailed("failed to initialize i18n", err)
 	}
 
 	// Module startup checks (tenant existence, idempotent admin seed) share
 	// the startup deadline.
-	if err := modules.Startup(startupCtx); err != nil {
-		pool.Close()
-		fail("module startup failed", err)
+	if err := modules.Startup(ctx); err != nil {
+		return startupFailed("module startup failed", err)
 	}
-	cancelStartup()
+	return nil
+}
 
-	// Health checker
-	healthChecker := health.NewChecker(pool, appCache)
-
+// composeApplication builds the HTTP application, registers module
+// providers, and registers the platform email handlers on the worker.
+func (rt *runtime) composeApplication() {
 	// Composition root. Modules own their route tables; app owns global
 	// middleware, infrastructure routes, and lifecycle.
-	application := app.New(cfg, app.Deps{
-		Cache:          appCache,
-		Sessions:       modules.Sessions,
-		Health:         healthChecker,
-		Audit:          auditRecorder,
-		TenantResolver: modules.TenantResolver,
-		Tracing:        traceProvider,
-		I18n:           i18nBundle,
-		Flags:          flagEvaluator,
-		Events:         eventBus,
-		Jobs:           worker,
-		Schedules:      scheduleRegistry,
-		Webhooks:       modules.Webhooks,
-		APIKeyVerifier: modules.APIKeyVerifier,
+	rt.app = app.New(rt.cfg, app.Deps{
+		Cache:          rt.infra.Cache,
+		Sessions:       rt.modules.Sessions,
+		Health:         health.NewChecker(rt.infra.Pool, rt.infra.Cache),
+		Audit:          rt.infra.Audit,
+		TenantResolver: rt.modules.TenantResolver,
+		Tracing:        rt.trace,
+		I18n:           rt.i18n,
+		Flags:          rt.infra.Flags,
+		Events:         rt.events,
+		Jobs:           rt.worker,
+		Schedules:      rt.schedules,
+		Webhooks:       rt.modules.Webhooks,
+		APIKeyVerifier: rt.modules.APIKeyVerifier,
 	})
 	// Module providers register routes, event subscriptions, job handlers
 	// (for example webhook delivery/dispatch), and schedules. The bus turns
 	// durable subscriptions into worker handlers once every module has
 	// registered.
-	application.Register(modules.List...)
+	rt.app.Register(rt.modules.List...)
 
 	// Durable email worker. email.send is a platform outbox kind: identity
 	// and notifications both enqueue it through jobs.QueuedSender and the
 	// sender/codec are platform infrastructure, so no module owns the
 	// handler. It shares the pool but runs outside the request path, so SMTP
 	// outages retry instead of failing a registration request.
-	emailHandler := jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec))
+	emailHandler := jobs.EmailHandler(rt.emailSender, jobs.WithEmailPayloadCodec(rt.payloadCodec))
 	// New workers consume both legacy plaintext jobs and encrypted jobs so a
 	// rolling deployment can drain the old queue without losing messages.
-	worker.Register(jobs.EmailJobKind, emailHandler)
-	worker.Register(jobs.EncryptedEmailJobKind, emailHandler)
+	rt.worker.Register(jobs.EmailJobKind, emailHandler)
+	rt.worker.Register(jobs.EncryptedEmailJobKind, emailHandler)
+}
 
-	// Optional scheduler. It is global (not tenant-scoped); schedules choose a
-	// tenant in their job spec, and the worker restores it from jobs.tenant_id.
-	var (
-		schedulerCancel context.CancelFunc
-		schedulerDone   <-chan struct{}
-	)
-	if cfg.Scheduler.Enabled {
-		catchup, err := scheduler.ParseCatchup(cfg.Scheduler.Catchup)
+// startBackground starts the optional scheduler, the job worker, and module
+// background loops (webhook retention), which share the worker lifecycle.
+func (rt *runtime) startBackground() (background, error) {
+	var bg background
+	if rt.cfg.Scheduler.Enabled {
+		cancel, done, err := rt.startScheduler()
 		if err != nil {
-			pool.Close()
-			fail("invalid scheduler catch-up policy", err)
+			return background{}, err
 		}
-		sched := scheduler.New(pool, scheduleRegistry, jobQueue, instanceID,
-			scheduler.WithLeaseTTL(cfg.Scheduler.LeaseTTL()),
-			scheduler.WithHeartbeatInterval(cfg.Scheduler.HeartbeatInterval()),
-			scheduler.WithPollInterval(cfg.Scheduler.PollInterval()),
-			scheduler.WithCatchup(catchup),
-			scheduler.WithCatchupLimit(cfg.Scheduler.CatchupLimit),
-			scheduler.WithRetention(cfg.Scheduler.Retention()),
-		)
-		schedulerCtx, cancel := context.WithCancel(context.Background())
-		schedulerCancel = cancel
-		done := make(chan struct{})
-		schedulerDone = done
-		go func() {
-			defer close(done)
-			if err := sched.Run(schedulerCtx); err != nil {
-				slog.Error("scheduler stopped", slog.Any("error", err))
-			}
-		}()
-		slog.Info("scheduler enabled", slog.Int("schedules", scheduleRegistry.Len()))
+		bg.schedulerCancel, bg.schedulerDone = cancel, done
 	}
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	workerDone := make(chan struct{})
 	go func() {
-		if err := worker.Run(workerCtx); err != nil {
+		if err := rt.worker.Run(workerCtx); err != nil {
 			slog.Error("job worker stopped", slog.Any("error", err))
 		}
 		close(workerDone)
 	}()
-	// Module background loops (webhook retention) are best-effort and share
-	// the worker lifecycle.
-	for _, run := range modules.Background {
+	// Module background loops are best-effort.
+	for _, run := range rt.modules.Background {
 		go run(workerCtx)
 	}
+	bg.workerCancel, bg.workerDone = workerCancel, workerDone
+	return bg, nil
+}
 
-	// Graceful shutdown
-	serverErr := make(chan error, 1)
-
+// startScheduler runs the scheduler. It is global (not tenant-scoped);
+// schedules choose a tenant in their job spec, and the worker restores it
+// from jobs.tenant_id.
+func (rt *runtime) startScheduler() (context.CancelFunc, <-chan struct{}, error) {
+	cfg := rt.cfg.Scheduler
+	catchup, err := scheduler.ParseCatchup(cfg.Catchup)
+	if err != nil {
+		return nil, nil, startupFailed("invalid scheduler catch-up policy", err)
+	}
+	sched := scheduler.New(rt.infra.Pool, rt.schedules, rt.infra.Queue, rt.instanceID,
+		scheduler.WithLeaseTTL(cfg.LeaseTTL()),
+		scheduler.WithHeartbeatInterval(cfg.HeartbeatInterval()),
+		scheduler.WithPollInterval(cfg.PollInterval()),
+		scheduler.WithCatchup(catchup),
+		scheduler.WithCatchupLimit(cfg.CatchupLimit),
+		scheduler.WithRetention(cfg.Retention()),
+	)
+	schedulerCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	go func() {
-		addr := fmt.Sprintf(":%d", cfg.App.Port)
-		slog.Info("server starting", slog.String("addr", addr), slog.String("env", cfg.App.Env))
-		serverErr <- application.Listen(addr)
+		defer close(done)
+		if err := sched.Run(schedulerCtx); err != nil {
+			slog.Error("scheduler stopped", slog.Any("error", err))
+		}
+	}()
+	slog.Info("scheduler enabled", slog.Int("schedules", rt.schedules.Len()))
+	return cancel, done, nil
+}
+
+// serve listens until the listener fails or SIGINT/SIGTERM arrives. It
+// returns exit code 1 for a listener error and 0 for a signal.
+func (rt *runtime) serve() int {
+	serverErr := make(chan error, 1)
+	go func() {
+		addr := fmt.Sprintf(":%d", rt.cfg.App.Port)
+		slog.Info("server starting", slog.String("addr", addr), slog.String("env", rt.cfg.App.Env))
+		serverErr <- rt.app.Listen(addr)
 	}()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
-	exitCode := 0
 	select {
 	case listenErr := <-serverErr:
 		if listenErr != nil {
 			slog.Error("server error", slog.Any("error", listenErr))
-			exitCode = 1
+			return 1
 		}
 	case sig := <-sigChan:
 		slog.Info("received signal, shutting down gracefully", slog.String("signal", sig.String()))
 	}
-	signal.Stop(sigChan)
+	return 0
+}
 
-	// One deadline (config.ShutdownBudget) covers every phase so the total
-	// stays inside Kubernetes' terminationGracePeriodSeconds (30s, of which
-	// preStop uses 5s). Draining HTTP, jobs, and async work gets the budget
-	// minus config.ShutdownReserve; config validation keeps
-	// APP_REQUEST_TIMEOUT inside that drain window, so the reserve is left for
-	// the tracing flush and closing shared resources.
+// shutdown stops everything inside config.ShutdownBudget and reports whether
+// HTTP drained cleanly. One deadline covers every phase so the total stays
+// inside Kubernetes' terminationGracePeriodSeconds (30s, of which preStop
+// uses 5s). Draining HTTP, jobs, and async work gets the budget minus
+// config.ShutdownReserve; config validation keeps APP_REQUEST_TIMEOUT inside
+// that drain window, so the reserve is left for the tracing flush and closing
+// shared resources.
+func (rt *runtime) shutdown(bg background) bool {
 	shutdownDeadline := time.Now().Add(config.ShutdownBudget)
-	shutdownCtx, cancelShutdown := context.WithDeadline(context.Background(), shutdownDeadline.Add(-config.ShutdownReserve))
+	drainCtx, cancelDrain := context.WithDeadline(context.Background(), shutdownDeadline.Add(-config.ShutdownReserve))
+	clean := rt.drain(drainCtx, bg)
+	cancelDrain()
 
+	rt.flushTraces(shutdownDeadline)
+	rt.closeResources(shutdownDeadline)
+	return clean
+}
+
+// drain stops HTTP, the scheduler, the worker, and async work within ctx and
+// reports whether HTTP shut down cleanly.
+func (rt *runtime) drain(ctx context.Context, bg background) bool {
 	// 1. Stop accepting HTTP and drain in-flight requests, concurrently with
 	//    the background workers: they are independent (both only need the
 	//    pool and cache, which stay open until the end).
 	httpDone := make(chan error, 1)
-	go func() { httpDone <- application.ShutdownWithContext(shutdownCtx) }()
+	go func() { httpDone <- rt.app.ShutdownWithContext(ctx) }()
 
 	// 2. Stop producing scheduled work first, then stop claiming new jobs and
 	//    let running handlers drain.
-	if schedulerCancel != nil {
-		schedulerCancel()
-		waitForShutdown(shutdownCtx, schedulerDone, "scheduler")
+	if bg.schedulerCancel != nil {
+		bg.schedulerCancel()
+		waitForShutdown(ctx, bg.schedulerDone, "scheduler")
 	}
-	workerCancel()
-	waitForShutdown(shutdownCtx, workerDone, "job worker")
+	bg.workerCancel()
+	waitForShutdown(ctx, bg.workerDone, "job worker")
 
+	clean := true
 	if err := <-httpDone; err != nil {
 		slog.Error("server forced to shutdown", slog.Any("error", err))
-		exitCode = 1
+		clean = false
 	}
 
 	// 3. HTTP handlers start async.Go work (e.g. post-commit emails); wait for
 	//    it only after HTTP has stopped so no new goroutines appear.
-	if err := async.Wait(shutdownCtx); err != nil {
+	if err := async.Wait(ctx); err != nil {
 		slog.Warn("async goroutines did not finish before the shutdown deadline", slog.Any("error", err))
 	}
+	return clean
+}
 
-	cancelShutdown()
-
-	// 4. Flush spans after HTTP, workers, and async work have stopped. The
-	//    flush gets OTEL_SHUTDOWN_TIMEOUT_SECS capped by what is left of the
-	//    budget after the close reserve, but never less than
-	//    traceFlushMinimum: a drain that used its whole window must not leave
-	//    tracing with a zero deadline. Export failures (for example a
-	//    collector outage) are logged but never change the exit code; losing
-	//    telemetry must not fail a clean shutdown.
-	traceShutdownTimeout := time.Duration(cfg.Tracing.ShutdownTimeout) * time.Second
-	if traceShutdownTimeout <= 0 {
-		traceShutdownTimeout = 5 * time.Second
+// flushTraces exports buffered spans after HTTP, workers, and async work have
+// stopped. The flush gets OTEL_SHUTDOWN_TIMEOUT_SECS capped by what is left of
+// the budget after the close reserve, but never less than traceFlushMinimum:
+// a drain that used its whole window must not leave tracing with a zero
+// deadline. Export failures (for example a collector outage) are logged but
+// never change the exit code; losing telemetry must not fail a clean shutdown.
+func (rt *runtime) flushTraces(shutdownDeadline time.Time) {
+	timeout := time.Duration(rt.cfg.Tracing.ShutdownTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = defaultTraceShutdownTimeout
 	}
-	traceShutdownTimeout = min(traceShutdownTimeout, time.Until(shutdownDeadline)-closeReserve)
-	traceShutdownTimeout = max(traceShutdownTimeout, traceFlushMinimum)
-	traceShutdownCtx, cancelTrace := context.WithTimeout(context.Background(), traceShutdownTimeout)
-	if err := traceProvider.Shutdown(traceShutdownCtx); err != nil {
+	timeout = min(timeout, time.Until(shutdownDeadline)-closeReserve)
+	timeout = max(timeout, traceFlushMinimum)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := rt.trace.Shutdown(ctx); err != nil {
 		slog.Warn("tracing shutdown incomplete; remaining spans were dropped", slog.Any("error", err))
-	}
-	cancelTrace()
-
-	// 5. Close shared resources last.
-	for _, closeModule := range modules.Close {
-		closeModule()
-	}
-	if err := appCache.Close(); err != nil {
-		slog.Error("failed to close cache", slog.Any("error", err))
-	}
-	closePool(pool, max(time.Until(shutdownDeadline), closeMinimum))
-
-	slog.Info("server exited")
-	if exitCode != 0 {
-		os.Exit(exitCode)
 	}
 }
 
-// Slices of config.ShutdownReserve. closeReserve is kept back from the tracing
-// flush for closing modules, the cache, and the pool; the minimums apply when
-// earlier phases already used their share, and the overrun stays inside the
-// 5s margin before SIGKILL.
-const (
-	closeReserve      = 2 * time.Second
-	traceFlushMinimum = time.Second
-	closeMinimum      = time.Second
-)
+// closeResources closes modules, the cache, and finally the pool, which gets
+// what is left of the budget but at least closeMinimum.
+func (rt *runtime) closeResources(shutdownDeadline time.Time) {
+	for _, closeModule := range rt.modules.Close {
+		closeModule()
+	}
+	if err := rt.infra.Cache.Close(); err != nil {
+		slog.Error("failed to close cache", slog.Any("error", err))
+	}
+	closePool(rt.infra.Pool, max(time.Until(shutdownDeadline), closeMinimum))
+}
 
 // closePool closes the database pool without blocking past timeout.
 // pgxpool.Close waits for every acquired connection to be released, so a

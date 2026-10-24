@@ -18,6 +18,11 @@ type CompareDeleter interface {
 type Cache interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Set(ctx context.Context, key string, value []byte, ttl time.Duration) error
+	// SetNX atomically stores value with ttl only when key is absent or expired
+	// and reports whether it was stored. It is the primitive for owner-token
+	// locks: the value is the owner's token, so a caller whose reply was lost can
+	// read the key back and recognise its own claim.
+	SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error)
 	Delete(ctx context.Context, key string) error
 	Exists(ctx context.Context, key string) (bool, error)
 	// Increment atomically increments the integer counter at key and returns the

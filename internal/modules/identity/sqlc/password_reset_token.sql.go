@@ -40,7 +40,11 @@ const createPasswordResetToken = `-- name: CreatePasswordResetToken :one
 INSERT INTO password_reset_tokens (tenant_id, user_id, token, expires_at)
 SELECT u.tenant_id, $1, $2, $3
 FROM users u
-WHERE u.id = $1 AND u.tenant_id = $4 AND u.deleted_at IS NULL
+WHERE u.id = $1
+  AND u.tenant_id = $4
+  AND u.deleted_at IS NULL
+  AND lower(u.email) = lower($5)
+FOR SHARE OF u
 ON CONFLICT (tenant_id, user_id) DO UPDATE
 SET token = EXCLUDED.token,
     expires_at = EXCLUDED.expires_at,
@@ -53,14 +57,20 @@ type CreatePasswordResetTokenParams struct {
 	Token     string             `json:"token"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	TenantID  int64              `json:"tenant_id"`
+	Email     string             `json:"email"`
 }
 
+// The reset job looks the account up by address outside this transaction.
+// Re-checking the address here (same normalization as GetUserByEmail) under a
+// FOR SHARE row lock means an email change committed in between, or still in
+// flight, yields zero rows instead of a valid link mailed to the old address.
 func (q *Queries) CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error) {
 	row := q.db.QueryRow(ctx, createPasswordResetToken,
 		arg.UserID,
 		arg.Token,
 		arg.ExpiresAt,
 		arg.TenantID,
+		arg.Email,
 	)
 	var i PasswordResetToken
 	err := row.Scan(
@@ -151,4 +161,27 @@ func (q *Queries) GetPasswordResetTokenByTokenForUpdate(ctx context.Context, arg
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const purgeExpiredPasswordResetTokens = `-- name: PurgeExpiredPasswordResetTokens :execrows
+WITH batch AS (
+    SELECT id FROM password_reset_tokens
+    WHERE expires_at < now()
+    LIMIT $1::int
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM password_reset_tokens AS t
+USING batch
+WHERE t.id = batch.id
+`
+
+// Maintenance purge across every tenant (an expired token is dead in any
+// tenant). One bounded batch per call; SKIP LOCKED avoids waiting on rows a
+// concurrent purge or reset already holds.
+func (q *Queries) PurgeExpiredPasswordResetTokens(ctx context.Context, batchSize int32) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeExpiredPasswordResetTokens, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

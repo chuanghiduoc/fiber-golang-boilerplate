@@ -41,10 +41,23 @@ Other modules import `internal/contracts/notifications`:
 - `identity.NotificationRecipientLookup` (`internal/contracts/identity`) is implemented by the identity
   adapter; notifications never read the `users` table.
 
-When email is enabled, the service resolves the recipient, inserts the in-app
-row, and enqueues `email.send` (or `email.send.encrypted`) in the same
-transaction. An enqueue failure rolls the row back. Suppression by both
-channels is a successful no-op. Delivery is at-least-once.
+```mermaid
+flowchart TD
+    A["Notify(ctx, input)"] --> B[Resolve tenant, validate input]
+    B --> C{"in_app / email enabled?<br/>(missing preference = enabled)"}
+    C -->|both off| N[Successful no-op]
+    C -->|email on| R["Look up recipient via<br/>NotificationRecipientLookup"]
+    C -->|in_app only| I[INSERT notification row]
+    R --> TX["One transaction:<br/>INSERT row if in_app on<br/>+ enqueue email.send(.encrypted)"]
+    TX -->|enqueue fails| RB[Rollback: no row, error]
+    TX -->|commit| OK[Row + email job committed]
+```
+
+When email is enabled (and a transaction manager plus transactional sender are
+wired, as in the default build), the in-app row and the `email.send` (or
+`email.send.encrypted`) job commit in one transaction; an enqueue failure rolls
+the row back. The job inherits the notification's tenant. Delivery is
+at-least-once.
 
 ## Tests
 

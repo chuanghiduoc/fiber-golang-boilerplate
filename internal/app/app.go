@@ -331,8 +331,25 @@ func (a *App) setupGlobalMiddleware() {
 	// capped here before auth, rate limiting, or decoding run.
 	a.fiber.Use(middleware.BodyLimit(a.cfg.App.EffectiveJSONBodyLimit()))
 	a.fiber.Use(audit.Middleware(a.deps.Audit))
-	a.fiber.Use(middleware.Timeout(time.Duration(a.cfg.App.RequestTimeout) * time.Second))
+	requestTimeout := time.Duration(a.cfg.App.RequestTimeout) * time.Second
+	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
+		slog.Warn("APP_REQUEST_TIMEOUT plus post-handler work exceeds the shutdown drain window; in-flight requests may be cut off on shutdown",
+			slog.Duration("request_timeout", requestTimeout),
+			slog.Duration("post_handler_budget", PostHandlerBudget),
+			slog.Duration("drain_window", drain),
+		)
+	}
+	a.fiber.Use(middleware.Timeout(requestTimeout))
 }
+
+// PostHandlerBudget is the longest a request keeps running after its handler
+// returned at the APP_REQUEST_TIMEOUT deadline. Each piece runs on a detached,
+// bounded context so it cannot be skipped by the deadline: one audit write
+// (Guard completion or the fallback row, never both) and the idempotency
+// response store plus lock release. APP_REQUEST_TIMEOUT + PostHandlerBudget
+// must fit the shutdown drain window (config.ShutdownBudget -
+// config.ShutdownReserve).
+const PostHandlerBudget = audit.WriteTimeout + middleware.IdempotencyPostHandlerBudget
 
 func (a *App) setupInfrastructureRoutes() {
 	a.fiber.Get("/healthz", func(c fiber.Ctx) error {

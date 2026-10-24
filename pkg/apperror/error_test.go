@@ -199,3 +199,18 @@ func TestFiberErrorHandler_UnknownError(t *testing.T) {
 		t.Errorf("code = %v, want internal_error", result["code"])
 	}
 }
+
+func TestAppErrorIsNotFound(t *testing.T) {
+	if !errors.Is(NewNotFound("user not found"), ErrNotFound) {
+		t.Fatal("a 404 AppError must match ErrNotFound")
+	}
+	if !errors.Is(fmt.Errorf("wrapped: %w", NewNotFound("x")), ErrNotFound) {
+		t.Fatal("a wrapped 404 AppError must match ErrNotFound")
+	}
+	if errors.Is(NewUnauthorized("x"), ErrNotFound) {
+		t.Fatal("a non-404 AppError must not match ErrNotFound")
+	}
+	if errors.Is(NewNotFound("x"), context.Canceled) {
+		t.Fatal("a 404 AppError must not match unrelated sentinels")
+	}
+}

@@ -11,7 +11,11 @@ import (
 
 // claimJobsSQL atomically requeues jobs whose worker lease expired and claims
 // due work. The expired CTE releases stale leases before the due CTE selects
-// candidates. A concurrently committed Heartbeat moves locked_at forward, and
+// candidates. Expiry is the row's own lease_expires_at, written by the owning
+// worker with its own lease duration, so a worker configured with a shorter
+// lease never reclaims a healthy job held by a longer-lease worker. $3 is the
+// claiming worker's lease and only stamps the rows this claim takes. A
+// concurrently committed Heartbeat moves lease_expires_at forward, and
 // PostgreSQL rechecks the row after waiting on the heartbeat's row lock, so a
 // live job is not reclaimed. Requeued rows become visible to the next claim,
 // which is why a call may reclaim a job without returning it.
@@ -37,13 +41,14 @@ WITH expired AS (
         run_at = CASE WHEN attempts >= max_attempts THEN run_at ELSE now() END,
         locked_at = NULL,
         locked_by = NULL,
+        lease_expires_at = NULL,
         last_error = CASE WHEN attempts >= max_attempts
             THEN 'jobs: worker lease expired after max attempts'
             ELSE 'jobs: worker lease expired'
         END,
         updated_at = now()
     WHERE status = 'running'
-      AND locked_at < now() - make_interval(secs => $3::double precision)
+      AND lease_expires_at < now()
     RETURNING id
 ),
 due AS (
@@ -62,6 +67,7 @@ SET status = 'running',
     attempts = j.attempts + 1,
     locked_at = now(),
     locked_by = $2,
+    lease_expires_at = now() + make_interval(secs => $3::double precision),
     updated_at = now()
 FROM due
 WHERE j.id = due.id
@@ -70,11 +76,13 @@ RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts, j.tr
 
 // heartbeatJobSQL renews the lease for a job that is still running under the
 // supplied worker and attempt. Matching attempts fences out a stale owner whose
-// job was reclaimed at a higher attempt. It changes only locked_at: a heartbeat
+// job was reclaimed at a higher attempt. It extends the deadline by the owning
+// worker's lease ($4) and records the heartbeat time in locked_at. A heartbeat
 // is not a state transition, so updated_at is deliberately left alone.
 const heartbeatJobSQL = `
 UPDATE jobs
-SET locked_at = now()
+SET locked_at = now(),
+    lease_expires_at = now() + make_interval(secs => $4::double precision)
 WHERE id = $1
   AND locked_by = $2
   AND attempts = $3
@@ -90,6 +98,7 @@ SET status = 'succeeded',
     payload = '{}'::jsonb,
     locked_at = NULL,
     locked_by = NULL,
+    lease_expires_at = NULL,
     last_error = NULL,
     updated_at = now()
 WHERE id = $1
@@ -109,6 +118,7 @@ SET status = CASE WHEN $4::timestamptz IS NULL THEN 'dead' ELSE 'queued' END,
     last_error = $3,
     locked_at = NULL,
     locked_by = NULL,
+    lease_expires_at = NULL,
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2
@@ -127,6 +137,7 @@ SET status = 'queued',
     last_error = $3,
     locked_at = NULL,
     locked_by = NULL,
+    lease_expires_at = NULL,
     updated_at = now()
 WHERE id = $1
   AND locked_by = $2
@@ -172,18 +183,20 @@ func newPGStore(pool *pgxpool.Pool) *pgStore {
 	return &pgStore{pool: pool}
 }
 
-func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAfter time.Duration) ([]claimedJob, error) {
+// Claim takes up to limit due jobs for workerID and stamps each with a lease
+// deadline of now() + lease. Expired leases of any worker are recovered first.
+func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease time.Duration) ([]claimedJob, error) {
 	if s == nil || s.pool == nil {
 		return nil, ErrNoPool
 	}
 	if limit <= 0 {
 		return nil, nil
 	}
-	if staleAfter <= 0 {
-		staleAfter = defaultLeaseDuration
+	if lease <= 0 {
+		lease = defaultLeaseDuration
 	}
 
-	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, staleAfter.Seconds(), s.includeKinds, s.excludeKinds)
+	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, lease.Seconds(), s.includeKinds, s.excludeKinds)
 	if err != nil {
 		return nil, fmt.Errorf("jobs: claim: %w", err)
 	}
@@ -258,11 +271,15 @@ func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attemp
 // Heartbeat renews the lease of a running job owned by workerID at attempts. A
 // job that was already reclaimed, finished, or claimed by another worker is
 // reported as ErrLeaseLost; the caller logs it but leaves the handler running.
-func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error {
+// The new deadline is now() + lease, the owning worker's own lease duration.
+func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error {
 	if s == nil || s.pool == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID, attempts)
+	if lease <= 0 {
+		lease = defaultLeaseDuration
+	}
+	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID, attempts, lease.Seconds())
 	if err != nil {
 		return fmt.Errorf("jobs: heartbeat %d: %w", id, err)
 	}

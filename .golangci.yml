@@ -2,9 +2,14 @@ version: "2"
 linters:
   enable:
     - gocritic
+    - gocognit
     - gosec
     - prealloc
   settings:
+    gocognit:
+      # Functions above this are split into intent-named steps. Raising it
+      # needs a reason in the PR; tests are exempt below.
+      min-complexity: 30
     gocritic:
       enabled-tags:
         - diagnostic
@@ -24,6 +29,7 @@ linters:
       - linters:
           - errcheck
           - gosec
+          - gocognit
         path: _test\.go
       - linters:
           - gosec
@@ -34,6 +40,8 @@ linters:
       - builtin$
       - examples$
 formatters:
+  enable:
+    - gofmt
   exclusions:
     generated: lax
     paths:

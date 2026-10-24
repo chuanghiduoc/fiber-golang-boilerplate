@@ -25,6 +25,27 @@ func TestGetSet(t *testing.T) {
 	}
 }
 
+func TestSetNX(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if stored, err := mc.SetNX(ctx, "lock", []byte("owner-1"), 20*time.Millisecond); err != nil || !stored {
+		t.Fatalf("SetNX(absent) = %v, %v; want true, nil", stored, err)
+	}
+	if stored, err := mc.SetNX(ctx, "lock", []byte("owner-2"), time.Minute); err != nil || stored {
+		t.Fatalf("SetNX(held) = %v, %v; want false, nil", stored, err)
+	}
+	if got, _ := mc.Get(ctx, "lock"); !bytes.Equal(got, []byte("owner-1")) {
+		t.Fatalf("lock value = %q, want the first owner", got)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	if stored, err := mc.SetNX(ctx, "lock", []byte("owner-2"), time.Minute); err != nil || !stored {
+		t.Fatalf("SetNX(expired) = %v, %v; want true, nil", stored, err)
+	}
+}
+
 func TestGetMiss(t *testing.T) {
 	mc := NewMemoryCache()
 	defer mc.Close()

@@ -163,12 +163,21 @@ func (s *S3Storage) Get(ctx context.Context, path string) (io.ReadCloser, error)
 	return &cancelReadCloser{ReadCloser: obj.Body, cancel: cancel}, nil
 }
 
+// s3NoSuchBucketCode is the S3 error code for a missing bucket.
+const s3NoSuchBucketCode = "NoSuchBucket"
+
 // isS3NotFound reports a missing object: the typed NoSuchKey error, or any
 // HTTP 404 response (some S3-compatible servers omit the typed error code).
+// A missing bucket is also a 404 but is a configuration error, not a missing
+// blob, so it stays an internal error instead of reading as data loss.
 func isS3NotFound(err error) bool {
 	var noSuchKey *types.NoSuchKey
 	if errors.As(err, &noSuchKey) {
 		return true
+	}
+	var apiErr interface{ ErrorCode() string }
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == s3NoSuchBucketCode {
+		return false
 	}
 	var status interface{ HTTPStatusCode() int }
 	return errors.As(err, &status) && status.HTTPStatusCode() == http.StatusNotFound

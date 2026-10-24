@@ -33,6 +33,9 @@ func (failingCache) Get(context.Context, string) ([]byte, error) { return nil, e
 func (failingCache) Set(context.Context, string, []byte, time.Duration) error {
 	return errStubCache
 }
+func (failingCache) SetNX(context.Context, string, []byte, time.Duration) (bool, error) {
+	return false, errStubCache
+}
 func (failingCache) Delete(context.Context, string) error         { return errStubCache }
 func (failingCache) Exists(context.Context, string) (bool, error) { return false, errStubCache }
 func (failingCache) Increment(context.Context, string, time.Duration) (int64, error) {
@@ -71,9 +74,9 @@ func (r *recordingCache) Set(ctx context.Context, key string, value []byte, ttl 
 	return r.Cache.Set(ctx, key, value, ttl)
 }
 
-func (r *recordingCache) Increment(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+func (r *recordingCache) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
 	r.record(key)
-	return r.Cache.Increment(ctx, key, ttl)
+	return r.Cache.SetNX(ctx, key, value, ttl)
 }
 
 func (r *recordingCache) Delete(ctx context.Context, key string) error {
@@ -465,8 +468,8 @@ func (c *tailWindowCache) Get(ctx context.Context, key string) ([]byte, error) {
 	return c.Cache.Get(ctx, key)
 }
 
-func (c *tailWindowCache) Increment(context.Context, string, time.Duration) (int64, error) {
-	return 2, nil
+func (c *tailWindowCache) SetNX(context.Context, string, []byte, time.Duration) (bool, error) {
+	return false, nil
 }
 
 func TestIdempotency_TailWindowReplaysCompletedResponse(t *testing.T) {
@@ -504,12 +507,86 @@ func TestIdempotency_TailWindowReplaysCompletedResponse(t *testing.T) {
 	}
 }
 
+// lostReplyCache models a claim whose reply never arrives: SetNX optionally
+// applies the write, then reports a timeout as a network round trip would.
+type lostReplyCache struct {
+	cache.Cache
+	applies bool
+}
+
+func (c *lostReplyCache) SetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	if c.applies {
+		if _, err := c.Cache.SetNX(ctx, key, value, ttl); err != nil {
+			return false, err
+		}
+	}
+	return false, context.DeadlineExceeded
+}
+
+// A claim that landed but whose reply timed out is our own lock: the handler
+// must run once, a retry must replay it, and the lock must not be left behind
+// (previously every retry got 409 for the whole lock TTL).
+func TestIdempotency_ClaimAppliedButReplyLostRunsOnce(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+
+	var calls atomic.Int32
+	app := newTestApp()
+	app.Post("/test", Idempotency(&lostReplyCache{Cache: mem, applies: true}), func(c fiber.Ctx) error {
+		n := calls.Add(1)
+		return c.Status(fiber.StatusCreated).SendString("call-" + strconv.Itoa(int(n)))
+	})
+
+	first, firstBody := doIdempotencyRequest(t, app, http.MethodPost, "/test", "lost-reply", "")
+	retry, retryBody := doIdempotencyRequest(t, app, http.MethodPost, "/test", "lost-reply", "")
+
+	if first.StatusCode != fiber.StatusCreated || firstBody != "call-1" {
+		t.Fatalf("first = %d %q, want 201 call-1", first.StatusCode, firstBody)
+	}
+	if retry.StatusCode != fiber.StatusCreated || retryBody != "call-1" || retry.Header.Get(idempotencyReplayedHeader) != "true" {
+		t.Fatalf("retry = %d %q replayed=%q, want a 201 replay of call-1",
+			retry.StatusCode, retryBody, retry.Header.Get(idempotencyReplayedHeader))
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "lost-reply"))
+	if held, _ := mem.Exists(context.Background(), lockKey); held {
+		t.Fatal("lock survived after the owning request finished")
+	}
+}
+
+// A lost reply while another request holds the lock must still conflict.
+func TestIdempotency_ClaimReplyLostWhileHeldConflicts(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "held-key"))
+	if err := mem.Set(context.Background(), lockKey, []byte("other-owner"), 30*time.Second); err != nil {
+		t.Fatalf("prime lock: %v", err)
+	}
+
+	var calls atomic.Int32
+	app := newTestApp()
+	app.Post("/test", Idempotency(&lostReplyCache{Cache: mem}), func(c fiber.Ctx) error {
+		calls.Add(1)
+		return c.SendString("should not run")
+	})
+
+	resp, body := doIdempotencyRequest(t, app, http.MethodPost, "/test", "held-key", "")
+	if resp.StatusCode != fiber.StatusConflict || calls.Load() != 0 {
+		t.Fatalf("status = %d, calls = %d; want 409 and 0; body = %s", resp.StatusCode, calls.Load(), body)
+	}
+	if owner, _ := mem.Get(context.Background(), lockKey); string(owner) != "other-owner" {
+		t.Fatalf("lock owner = %q, want other-owner untouched", owner)
+	}
+}
+
 func TestIdempotency_ConcurrentClaimConflict(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
 
 	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "busy-key"))
-	if _, err := mem.Increment(context.Background(), lockKey, 30*time.Second); err != nil {
+	if err := mem.Set(context.Background(), lockKey, []byte("other-owner"), 30*time.Second); err != nil {
 		t.Fatalf("prime lock: %v", err)
 	}
 
@@ -834,9 +911,10 @@ func TestIdempotency_HangingCacheFailsOpenFast(t *testing.T) {
 	if resp.StatusCode != fiber.StatusCreated || calls.Load() != 1 {
 		t.Fatalf("status = %d, handler calls = %d; want 201 and 1 (fail open)", resp.StatusCode, calls.Load())
 	}
-	// Every call is bounded: lookup, claim, held check, and re-lookup use the
-	// read bound; storing the response uses the write bound.
-	budget := 4*idempotencyCacheReadTimeout + idempotencyCacheWriteTimeout
+	// Every call is bounded: lookup, claim, claim read-back, and re-lookup use
+	// the read bound; storing the response and releasing the lock use the
+	// write bound.
+	budget := 4*idempotencyCacheReadTimeout + IdempotencyPostHandlerBudget
 	if elapsed > budget+time.Second {
 		t.Fatalf("request took %v with a hanging cache, want at most about %v", elapsed, budget)
 	}

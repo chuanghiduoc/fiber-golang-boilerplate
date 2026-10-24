@@ -356,10 +356,10 @@ func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 	var oldRunningID int64
 	require.NoError(t, pool.QueryRow(ctx, `
 		INSERT INTO jobs (kind, payload, status, run_at, max_attempts,
-		                  created_at, updated_at, attempts, locked_at, locked_by)
+		                  created_at, updated_at, attempts, locked_at, locked_by, lease_expires_at)
 		VALUES ($1, '{}'::jsonb, 'running', now(), 3,
 		        now() - interval '40 days', now() - interval '40 days',
-		        1, now(), 'pre-existing-worker')
+		        1, now(), 'pre-existing-worker', now() + interval '1 hour')
 		RETURNING id`, kind+".old_running").Scan(&oldRunningID))
 
 	for i := 0; i < liveJobs; i++ {

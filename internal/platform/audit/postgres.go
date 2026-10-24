@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -111,7 +112,7 @@ func (r *PostgresRecorder) values(ctx context.Context, event Event) (eventValues
 		tenantID:   tenantID,
 		parentID:   nullableInt64(event.ParentID),
 		actorID:    nullableInt64(event.ActorID),
-		actorType:  event.EffectiveActorType(),
+		actorType:  pgText(event.EffectiveActorType()),
 		actorRole:  nullableString(event.ActorRole),
 		metadata:   metadata,
 		resourceID: nullableString(event.ResourceID),
@@ -212,8 +213,8 @@ func (r *PostgresRecorder) Complete(ctx context.Context, id int64, completion Co
 		nullableString(completion.ErrorCode),
 		completedAt,
 		nullableInt64(completion.ActorID),
-		completion.ActorType,
-		completion.ActorRole,
+		pgText(completion.ActorType),
+		pgText(completion.ActorRole),
 	)
 	if err != nil {
 		return fmt.Errorf("audit: complete event: %w", err)
@@ -231,8 +232,8 @@ func insertArgs(event Event, values eventValues) []any {
 		values.actorID,
 		values.actorType,
 		values.actorRole,
-		event.Action,
-		event.Resource,
+		pgText(event.Action),
+		pgText(event.Resource),
 		values.resourceID,
 		values.metadata,
 		values.ip,
@@ -255,7 +256,18 @@ func nullableInt64(value int64) *int64 {
 	return &value
 }
 
+// pgText makes text storable in a PostgreSQL text column. Request-derived
+// fields (User-Agent, IP, request and resource ids) are client-controlled:
+// invalid UTF-8 fails the insert with SQLSTATE 22021 and text cannot hold NUL,
+// so without this a crafted header could turn every guarded mutation into a
+// 503 or let a fallback-audited mutation succeed with no audit row.
+func pgText(value string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(value, "\uFFFD"), "\x00", "")
+}
+
+// nullableString stores "" as NULL and sanitizes everything else with pgText.
 func nullableString(value string) *string {
+	value = pgText(value)
 	if value == "" {
 		return nil
 	}

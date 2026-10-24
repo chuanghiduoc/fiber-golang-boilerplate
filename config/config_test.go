@@ -284,7 +284,7 @@ func baseValidConfig() Config {
 	return Config{
 		App: AppConfig{
 			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
-			RequestTimeout: 15, FrontendURL: "http://localhost:3000",
+			RequestTimeout: 12, FrontendURL: "http://localhost:3000",
 		},
 		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30},
 		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
@@ -844,7 +844,7 @@ func TestValidate_RequestTimeoutFitsShutdownBudget(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("APP_REQUEST_TIMEOUT beyond the shutdown drain window must be rejected")
 	}
-	if time.Duration(MaxRequestTimeoutSeconds)*time.Second+ShutdownReserve > ShutdownBudget {
+	if time.Duration(MaxRequestTimeoutSeconds)*time.Second+PostHandlerReserve+ShutdownReserve > ShutdownBudget {
 		t.Fatal("the maximum request timeout plus the reserve must fit the shutdown budget")
 	}
 }

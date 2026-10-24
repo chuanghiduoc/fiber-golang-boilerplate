@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,6 +25,15 @@ import (
 // database recorded at 2..999999 is a legacy sequential history whose source
 // files were consolidated away.
 const maxSequentialVersion = 999999
+
+const (
+	// connectTimeout bounds the initial database connection.
+	connectTimeout = 60 * time.Second
+	// schemaCheckTimeout bounds each read-only pass (the pre-migration
+	// version check and the post-migration verification) separately, so a
+	// slow migration cannot consume the verification budget.
+	schemaCheckTimeout = 10 * time.Second
+)
 
 // requiredTables lists the schema objects the application assumes exist. The
 // check catches a legacy database that reports migration version 1 but predates
@@ -68,7 +79,7 @@ var requiredColumns = map[string][]string{
 	"feature_flag_targets":     {"flag_key", "tenant_id", "user_id", "enabled"},
 	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at", "updated_at"},
 	"notification_preferences": {"tenant_id", "user_id", "type", "channel", "enabled"},
-	"jobs":                     {"tenant_id", "trace_parent", "idempotency_key"},
+	"jobs":                     {"tenant_id", "trace_parent", "idempotency_key", "lease_expires_at"},
 	"scheduler_leases":         {"name", "holder", "expires_at", "heartbeat_at"},
 	"scheduler_runs":           {"schedule", "scheduled_for", "status", "job_id"},
 	"audit_events": {
@@ -212,7 +223,7 @@ func run() error {
 
 	logger.Setup(os.Getenv("APP_ENV"), os.Getenv("LOG_LEVEL"))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	pool, err := database.NewPool(ctx, dbCfg)
 	cancel()
 	if err != nil {
@@ -220,7 +231,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	checkCtx, cancelCheck := context.WithTimeout(context.Background(), 10*time.Second)
+	checkCtx, cancelCheck := context.WithTimeout(context.Background(), schemaCheckTimeout)
 	version, dirty, hasHistory, err := currentMigrationVersion(checkCtx, pool)
 	cancelCheck()
 	if err != nil {
@@ -242,7 +253,7 @@ func run() error {
 	}
 	// Use a fresh timeout: a slow migration must not consume the verification
 	// budget and turn a successful schema change into a false failure.
-	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 10*time.Second)
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), schemaCheckTimeout)
 	defer cancelVerify()
 	if err := verifySchema(verifyCtx, pool, dbCfg.Schema); err != nil {
 		return err
@@ -269,204 +280,37 @@ func currentMigrationVersion(ctx context.Context, pool *pgxpool.Pool) (version i
 	return version, dirty, true, nil
 }
 
-// verifySchema fails loudly when the database is missing expected tables. This
-// is the safety net for installations whose migration history is older than the
-// consolidated baseline: their version may be "current" while the schema is not.
+// defaultTenantID and defaultTenantSlug identify the compatibility tenant the
+// baseline seeds.
+const (
+	defaultTenantID   = 1
+	defaultTenantSlug = "default"
+)
+
+// verifySchema fails loudly when the database is missing expected objects.
+// This is the safety net for installations whose migration history is older
+// than the consolidated baseline: their version may be "current" while the
+// schema is not. Each check returns a description of every missing object, so
+// one run reports the whole gap rather than the first difference.
 func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {
-	missing := make([]string, 0)
-
-	rows, err := pool.Query(ctx,
-		`SELECT table_name FROM information_schema.tables
-		 WHERE table_schema = $1 AND table_name = ANY($2)`,
-		schema, requiredTables,
-	)
+	foundTables, missing, err := checkTables(ctx, pool, schema)
 	if err != nil {
-		return fmt.Errorf("verify schema: %w", err)
-	}
-	defer rows.Close()
-
-	foundTables := make(map[string]struct{}, len(requiredTables))
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return fmt.Errorf("verify schema: scan table name: %w", err)
-		}
-		foundTables[name] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("verify schema: %w", err)
-	}
-	for _, table := range requiredTables {
-		if _, ok := foundTables[table]; !ok {
-			missing = append(missing, "table "+table)
-		}
+		return err
 	}
 
-	columnRows, err := pool.Query(ctx,
-		`SELECT table_name, column_name FROM information_schema.columns
-		 WHERE table_schema = $1 AND table_name = ANY($2)`,
-		schema, requiredTables,
-	)
-	if err != nil {
-		return fmt.Errorf("verify schema columns: %w", err)
+	checks := []func() ([]string, error){
+		func() ([]string, error) { return checkColumns(ctx, pool, schema, foundTables) },
+		func() ([]string, error) { return checkUniqueIndexes(ctx, pool, schema) },
+		func() ([]string, error) { return checkTenantLeadingIndexes(ctx, pool, schema) },
+		func() ([]string, error) { return checkTriggers(ctx, pool, schema) },
+		func() ([]string, error) { return checkDefaultTenant(ctx, pool, foundTables) },
 	}
-	defer columnRows.Close()
-
-	foundColumns := make(map[string]struct{})
-	for columnRows.Next() {
-		var table, column string
-		if err := columnRows.Scan(&table, &column); err != nil {
-			return fmt.Errorf("verify schema: scan column: %w", err)
+	for _, check := range checks {
+		gaps, err := check()
+		if err != nil {
+			return err
 		}
-		foundColumns[table+"."+column] = struct{}{}
-	}
-	if err := columnRows.Err(); err != nil {
-		return fmt.Errorf("verify schema columns: %w", err)
-	}
-	for table, columns := range requiredColumns {
-		if _, ok := foundTables[table]; !ok {
-			continue // already reported as a missing table
-		}
-		for _, column := range columns {
-			if _, ok := foundColumns[table+"."+column]; !ok {
-				missing = append(missing, "column "+table+"."+column)
-			}
-		}
-	}
-
-	indexRows, err := pool.Query(ctx,
-		`SELECT c.relname
-		 FROM pg_index i
-		 JOIN pg_class c ON c.oid = i.indexrelid
-		 JOIN pg_namespace n ON n.oid = c.relnamespace
-		 WHERE n.nspname = $1 AND c.relname = ANY($2) AND i.indisunique`,
-		schema, requiredUniqueIndexes,
-	)
-	if err != nil {
-		return fmt.Errorf("verify schema indexes: %w", err)
-	}
-	defer indexRows.Close()
-
-	foundIndexes := make(map[string]struct{}, len(requiredUniqueIndexes))
-	for indexRows.Next() {
-		var name string
-		if err := indexRows.Scan(&name); err != nil {
-			return fmt.Errorf("verify schema: scan index: %w", err)
-		}
-		foundIndexes[name] = struct{}{}
-	}
-	if err := indexRows.Err(); err != nil {
-		return fmt.Errorf("verify schema indexes: %w", err)
-	}
-	for _, index := range requiredUniqueIndexes {
-		if _, ok := foundIndexes[index]; !ok {
-			missing = append(missing, "unique index "+index)
-		}
-	}
-
-	// Tenant-owned query indexes must lead with tenant_id, not merely exist.
-	// A legacy global index with the same name would otherwise pass.
-	tenantIndexNames := make([]string, 0, len(requiredTenantLeadingIndexes))
-	for _, indexes := range requiredTenantLeadingIndexes {
-		tenantIndexNames = append(tenantIndexNames, indexes...)
-	}
-	leadingRows, err := pool.Query(ctx,
-		`SELECT c.relname, a.attname
-		 FROM pg_index i
-		 JOIN pg_class c ON c.oid = i.indexrelid
-		 JOIN pg_class t ON t.oid = i.indrelid
-		 JOIN pg_namespace n ON n.oid = t.relnamespace
-		 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
-		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
-		schema, tenantIndexNames,
-	)
-	if err != nil {
-		return fmt.Errorf("verify tenant-leading indexes: %w", err)
-	}
-	defer leadingRows.Close()
-
-	foundLeading := make(map[string]string, len(tenantIndexNames))
-	for leadingRows.Next() {
-		var index, firstColumn string
-		if err := leadingRows.Scan(&index, &firstColumn); err != nil {
-			return fmt.Errorf("verify schema: scan tenant-leading index: %w", err)
-		}
-		foundLeading[index] = firstColumn
-	}
-	if err := leadingRows.Err(); err != nil {
-		return fmt.Errorf("verify tenant-leading indexes: %w", err)
-	}
-	for table, indexes := range requiredTenantLeadingIndexes {
-		for _, index := range indexes {
-			firstColumn, ok := foundLeading[index]
-			switch {
-			case !ok:
-				missing = append(missing, "tenant-leading index "+table+"."+index)
-			case firstColumn != "tenant_id":
-				missing = append(missing, "tenant-leading index "+table+"."+index+
-					" starts with "+firstColumn+", want tenant_id")
-			}
-		}
-	}
-
-	// Triggers enforce invariants the application does not re-check, so a
-	// disabled trigger is as bad as a missing one.
-	triggerNames := make([]string, 0)
-	for _, triggers := range requiredTriggers {
-		triggerNames = append(triggerNames, triggers...)
-	}
-	triggerRows, err := pool.Query(ctx,
-		`SELECT c.relname, tg.tgname, tg.tgenabled <> 'D'
-		 FROM pg_trigger tg
-		 JOIN pg_class c ON c.oid = tg.tgrelid
-		 JOIN pg_namespace n ON n.oid = c.relnamespace
-		 WHERE n.nspname = $1 AND NOT tg.tgisinternal AND tg.tgname = ANY($2)`,
-		schema, triggerNames,
-	)
-	if err != nil {
-		return fmt.Errorf("verify schema triggers: %w", err)
-	}
-	defer triggerRows.Close()
-
-	foundTriggers := make(map[string]bool, len(triggerNames))
-	for triggerRows.Next() {
-		var table, trigger string
-		var enabled bool
-		if err := triggerRows.Scan(&table, &trigger, &enabled); err != nil {
-			return fmt.Errorf("verify schema: scan trigger: %w", err)
-		}
-		foundTriggers[table+"."+trigger] = enabled
-	}
-	if err := triggerRows.Err(); err != nil {
-		return fmt.Errorf("verify schema triggers: %w", err)
-	}
-	for table, triggers := range requiredTriggers {
-		for _, trigger := range triggers {
-			enabled, ok := foundTriggers[table+"."+trigger]
-			switch {
-			case !ok:
-				missing = append(missing, "trigger "+table+"."+trigger)
-			case !enabled:
-				missing = append(missing, "enabled trigger "+table+"."+trigger)
-			}
-		}
-	}
-
-	// The default tenant is the backward-compatibility anchor: rows without an
-	// explicit tenant (and legacy requests without X-Tenant-Slug) resolve to it.
-	if _, ok := foundTables["tenants"]; ok {
-		var tenantID int64
-		err := pool.QueryRow(ctx,
-			`SELECT id FROM tenants WHERE slug = 'default'`,
-		).Scan(&tenantID)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			missing = append(missing, "default tenant row (slug default)")
-		case err != nil:
-			return fmt.Errorf("verify default tenant: %w", err)
-		case tenantID != 1:
-			missing = append(missing, "default tenant id 1")
-		}
+		missing = append(missing, gaps...)
 	}
 
 	if len(missing) > 0 {
@@ -476,4 +320,246 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 		)
 	}
 	return nil
+}
+
+// checkTables returns the required tables that exist and those that do not.
+func checkTables(ctx context.Context, pool *pgxpool.Pool, schema string) (found map[string]struct{}, missing []string, err error) {
+	found = make(map[string]struct{}, len(requiredTables))
+	err = scanRows(ctx, pool, "verify schema", "verify schema: scan table name",
+		func(rows pgx.Rows) error {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			found[name] = struct{}{}
+			return nil
+		},
+		`SELECT table_name FROM information_schema.tables
+		 WHERE table_schema = $1 AND table_name = ANY($2)`,
+		schema, requiredTables,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, table := range requiredTables {
+		if _, ok := found[table]; !ok {
+			missing = append(missing, "table "+table)
+		}
+	}
+	return found, missing, nil
+}
+
+// checkColumns reports required columns absent from existing tables. A
+// missing table is already reported by checkTables, so its columns are not.
+func checkColumns(ctx context.Context, pool *pgxpool.Pool, schema string, foundTables map[string]struct{}) ([]string, error) {
+	found := make(map[string]struct{})
+	err := scanRows(ctx, pool, "verify schema columns", "verify schema: scan column",
+		func(rows pgx.Rows) error {
+			var table, column string
+			if err := rows.Scan(&table, &column); err != nil {
+				return err
+			}
+			found[table+"."+column] = struct{}{}
+			return nil
+		},
+		`SELECT table_name, column_name FROM information_schema.columns
+		 WHERE table_schema = $1 AND table_name = ANY($2)`,
+		schema, requiredTables,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, table := range sortedKeys(requiredColumns) {
+		if _, ok := foundTables[table]; !ok {
+			continue
+		}
+		for _, column := range requiredColumns[table] {
+			if _, ok := found[table+"."+column]; !ok {
+				missing = append(missing, "column "+table+"."+column)
+			}
+		}
+	}
+	return missing, nil
+}
+
+// checkUniqueIndexes reports required unique indexes that are absent or not
+// unique.
+func checkUniqueIndexes(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	found := make(map[string]struct{}, len(requiredUniqueIndexes))
+	err := scanRows(ctx, pool, "verify schema indexes", "verify schema: scan index",
+		func(rows pgx.Rows) error {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return err
+			}
+			found[name] = struct{}{}
+			return nil
+		},
+		`SELECT c.relname
+		 FROM pg_index i
+		 JOIN pg_class c ON c.oid = i.indexrelid
+		 JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = $1 AND c.relname = ANY($2) AND i.indisunique`,
+		schema, requiredUniqueIndexes,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, index := range requiredUniqueIndexes {
+		if _, ok := found[index]; !ok {
+			missing = append(missing, "unique index "+index)
+		}
+	}
+	return missing, nil
+}
+
+// checkTenantLeadingIndexes reports tenant-owned query indexes that are
+// absent or do not lead with tenant_id. Checking the first key column (not
+// just the name) catches a legacy global index that kept its name after the
+// tenant rewrite.
+func checkTenantLeadingIndexes(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	tables := sortedKeys(requiredTenantLeadingIndexes)
+	names := make([]string, 0, len(requiredTenantLeadingIndexes))
+	for _, table := range tables {
+		names = append(names, requiredTenantLeadingIndexes[table]...)
+	}
+
+	firstColumns := make(map[string]string, len(names))
+	err := scanRows(ctx, pool, "verify tenant-leading indexes", "verify schema: scan tenant-leading index",
+		func(rows pgx.Rows) error {
+			var index, firstColumn string
+			if err := rows.Scan(&index, &firstColumn); err != nil {
+				return err
+			}
+			firstColumns[index] = firstColumn
+			return nil
+		},
+		`SELECT c.relname, a.attname
+		 FROM pg_index i
+		 JOIN pg_class c ON c.oid = i.indexrelid
+		 JOIN pg_class t ON t.oid = i.indrelid
+		 JOIN pg_namespace n ON n.oid = t.relnamespace
+		 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+		schema, names,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, table := range tables {
+		for _, index := range requiredTenantLeadingIndexes[table] {
+			firstColumn, ok := firstColumns[index]
+			switch {
+			case !ok:
+				missing = append(missing, "tenant-leading index "+table+"."+index)
+			case firstColumn != "tenant_id":
+				missing = append(missing, "tenant-leading index "+table+"."+index+
+					" starts with "+firstColumn+", want tenant_id")
+			}
+		}
+	}
+	return missing, nil
+}
+
+// checkTriggers reports required triggers that are absent or disabled.
+// Triggers enforce invariants the application does not re-check, so a
+// disabled trigger is as bad as a missing one.
+func checkTriggers(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	tables := sortedKeys(requiredTriggers)
+	names := make([]string, 0, len(requiredTriggers))
+	for _, table := range tables {
+		names = append(names, requiredTriggers[table]...)
+	}
+
+	enabled := make(map[string]bool, len(names))
+	err := scanRows(ctx, pool, "verify schema triggers", "verify schema: scan trigger",
+		func(rows pgx.Rows) error {
+			var table, trigger string
+			var isEnabled bool
+			if err := rows.Scan(&table, &trigger, &isEnabled); err != nil {
+				return err
+			}
+			enabled[table+"."+trigger] = isEnabled
+			return nil
+		},
+		`SELECT c.relname, tg.tgname, tg.tgenabled <> 'D'
+		 FROM pg_trigger tg
+		 JOIN pg_class c ON c.oid = tg.tgrelid
+		 JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = $1 AND NOT tg.tgisinternal AND tg.tgname = ANY($2)`,
+		schema, names,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, table := range tables {
+		for _, trigger := range requiredTriggers[table] {
+			isEnabled, ok := enabled[table+"."+trigger]
+			switch {
+			case !ok:
+				missing = append(missing, "trigger "+table+"."+trigger)
+			case !isEnabled:
+				missing = append(missing, "enabled trigger "+table+"."+trigger)
+			}
+		}
+	}
+	return missing, nil
+}
+
+// checkDefaultTenant reports a missing or renumbered default tenant. It is
+// the backward-compatibility anchor: rows without an explicit tenant (and
+// legacy requests without X-Tenant-Slug) resolve to it. Without a tenants
+// table there is nothing to check; checkTables already reported it.
+func checkDefaultTenant(ctx context.Context, pool *pgxpool.Pool, foundTables map[string]struct{}) ([]string, error) {
+	if _, ok := foundTables["tenants"]; !ok {
+		return nil, nil
+	}
+	var tenantID int64
+	err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = $1`, defaultTenantSlug).Scan(&tenantID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return []string{"default tenant row (slug default)"}, nil
+	case err != nil:
+		return nil, fmt.Errorf("verify default tenant: %w", err)
+	case tenantID != defaultTenantID:
+		return []string{"default tenant id 1"}, nil
+	}
+	return nil, nil
+}
+
+// scanRows runs sql and passes every row to scan. queryErr prefixes query and
+// iteration errors and scanErr prefixes scan errors, so each check keeps its
+// own operator-facing message.
+func scanRows(ctx context.Context, pool *pgxpool.Pool, queryErr, scanErr string,
+	scan func(pgx.Rows) error, sql string, args ...any,
+) error {
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		return fmt.Errorf("%s: %w", queryErr, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return fmt.Errorf("%s: %w", scanErr, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%s: %w", queryErr, err)
+	}
+	return nil
+}
+
+// sortedKeys returns m's keys in order so the missing-object report is stable
+// across runs.
+func sortedKeys[V any](m map[string]V) []string {
+	return slices.Sorted(maps.Keys(m))
 }

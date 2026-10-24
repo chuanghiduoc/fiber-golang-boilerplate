@@ -72,18 +72,19 @@ func NewService(
 }
 
 // mutate runs fn on a transaction-backed repository (or the pool repository
-// when no transaction manager is wired) and records the audit event fn
-// returns in the same transaction. A nil event means nothing changed.
-func (s *service) mutate(ctx context.Context, fn func(repo repository.APIKeyRepository) (*audit.Event, error)) error {
+// when no transaction manager is wired, in which case tx is nil) and records
+// the audit event fn returns in the same transaction. A nil event means
+// nothing changed.
+func (s *service) mutate(ctx context.Context, fn func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error)) error {
 	if s.txManager == nil {
-		event, err := fn(s.repo)
+		event, err := fn(nil, s.repo)
 		if err != nil {
 			return err
 		}
 		return s.recordAudit(ctx, nil, event)
 	}
 	return s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-		event, err := fn(repository.NewAPIKeyRepository(tx))
+		event, err := fn(tx, repository.NewAPIKeyRepository(tx))
 		if err != nil {
 			return err
 		}
@@ -142,29 +143,30 @@ func (s *service) Create(ctx context.Context, callerUserID int64, req apikeydto.
 		return nil, apperror.NewBadRequest("userId is required")
 	}
 
-	principal, err := s.loadPrincipal(ctx, ownerID)
-	if err != nil {
-		return nil, err
-	}
-	scopes, err := normalizeScopes(req.Scopes, principal.Role)
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureCallerCanGrant(ctx, scopes); err != nil {
-		return nil, err
-	}
 	expiresAt, err := validateExpiry(req.ExpiresAt, s.now())
 	if err != nil {
 		return nil, err
 	}
-
 	credentials, err := apikey.Generate()
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate API key")
 	}
 
 	var created *repository.APIKey
-	err = s.mutate(ctx, func(repo repository.APIKeyRepository) (*audit.Event, error) {
+	err = s.mutate(ctx, func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
+		// The owner stays locked until the key commits, so a concurrent ban
+		// either finishes first (no row: 404) or waits and then revokes it.
+		principal, ownerErr := s.lockActiveOwner(ctx, tx, ownerID)
+		if ownerErr != nil {
+			return nil, ownerErr
+		}
+		scopes, scopeErr := normalizeScopes(req.Scopes, principal.Role)
+		if scopeErr != nil {
+			return nil, scopeErr
+		}
+		if grantErr := ensureCallerCanGrant(ctx, scopes); grantErr != nil {
+			return nil, grantErr
+		}
 		key, createErr := repo.Create(ctx, repository.CreateParams{
 			UserID:    ownerID,
 			Name:      name,
@@ -256,7 +258,7 @@ func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequ
 	}
 
 	var updated *repository.APIKey
-	err = s.mutate(ctx, func(repo repository.APIKeyRepository) (*audit.Event, error) {
+	err = s.mutate(ctx, func(_ pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
 		key, updateErr := repo.Update(ctx, id, name, scopes)
 		if updateErr != nil {
 			if errors.Is(updateErr, apperror.ErrNotFound) {
@@ -275,7 +277,7 @@ func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequ
 }
 
 func (s *service) Revoke(ctx context.Context, id int64) error {
-	return s.mutate(ctx, func(repo repository.APIKeyRepository) (*audit.Event, error) {
+	return s.mutate(ctx, func(_ pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
 		revoked, err := repo.Revoke(ctx, id)
 		if err == nil {
 			return keyEvent(ctx, "api_key.revoked", revoked, nil), nil
@@ -305,8 +307,8 @@ func (s *service) Rotate(ctx context.Context, id int64) (*apikeydto.RotateRespon
 	graceSeconds := int32(RotationGrace / time.Second)
 
 	var result *apikeydto.RotateResponse
-	err := s.mutate(ctx, func(repo repository.APIKeyRepository) (*audit.Event, error) {
-		rotated, rotateErr := s.rotate(ctx, repo, id, graceSeconds)
+	err := s.mutate(ctx, func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
+		rotated, rotateErr := s.rotate(ctx, tx, repo, id, graceSeconds)
 		if rotateErr != nil {
 			return nil, rotateErr
 		}
@@ -328,6 +330,7 @@ func (s *service) Rotate(ctx context.Context, id int64) (*apikeydto.RotateRespon
 
 func (s *service) rotate(
 	ctx context.Context,
+	tx pgx.Tx,
 	repo repository.APIKeyRepository,
 	id int64,
 	graceSeconds int32,
@@ -344,6 +347,9 @@ func (s *service) rotate(
 	}
 	if existing.RotatedAt != nil {
 		return nil, apperror.NewConflict("API key has already been rotated")
+	}
+	if err := s.ensureOwnerCanRotate(ctx, tx, existing); err != nil {
+		return nil, err
 	}
 	// Rotation returns a fresh secret carrying the existing scopes, so the
 	// caller must hold all of them, exactly as for create/update. Otherwise
@@ -403,14 +409,72 @@ func (s *service) get(ctx context.Context, id int64) (*repository.APIKey, error)
 	return key, nil
 }
 
+// ensureOwnerCanRotate refuses to mint a successor for a key whose owner is
+// no longer active, or whose credentials a ban revoked after the key was
+// created: the verifier already rejects such a key, and rotating it would
+// otherwise turn a dead credential into a live one (for example after an
+// unban, which keeps credentials_revoked_at).
+func (s *service) ensureOwnerCanRotate(ctx context.Context, tx pgx.Tx, key *repository.APIKey) error {
+	owner, err := s.lockActiveOwner(ctx, tx, key.UserID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewConflict("API key owner is not active")
+		}
+		return err
+	}
+	if owner.CredentialsRevokedAt != nil && !key.CreatedAt.After(*owner.CredentialsRevokedAt) {
+		return apperror.NewConflict("API key has been revoked")
+	}
+	return nil
+}
+
+// PrincipalLocker is the transactional side of the identity principal reader
+// (identity's adapter implements it). It lives here rather than in the
+// stdlib-only contracts package because it takes the caller's pgx.Tx.
+type PrincipalLocker interface {
+	LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (identitycontracts.Principal, error)
+}
+
+// lockActiveOwner loads the key owner and, inside a transaction, holds the
+// owner's user row FOR SHARE until the key write commits. The API-key FK only
+// takes KEY SHARE, which a ban's UPDATE does not wait for; without this lock
+// a key inserted while its owner is being banned would survive the ban and
+// come back to life on unban. Without a transaction (unit tests) it falls
+// back to an unlocked read. A wired reader that cannot lock fails closed.
+func (s *service) lockActiveOwner(ctx context.Context, tx pgx.Tx, userID int64) (identitycontracts.Principal, error) {
+	if tx == nil || s.principals == nil {
+		return s.loadPrincipal(ctx, userID)
+	}
+	locker, ok := s.principals.(PrincipalLocker)
+	if !ok {
+		slog.Error("API key owner reader cannot lock the owner row; refusing the key write")
+		return identitycontracts.Principal{}, apperror.NewInternal("failed to load API key owner")
+	}
+	return s.checkPrincipal(ctx, userID, func(tenantID int64) (identitycontracts.Principal, error) {
+		return locker.LockPrincipalTx(ctx, tx, tenantID, userID)
+	})
+}
+
 func (s *service) loadPrincipal(ctx context.Context, userID int64) (identitycontracts.Principal, error) {
-	tenantID := tenant.EffectiveID(ctx)
 	if s.principals == nil {
 		// Tests and minimal deployments may omit the identity adapter. Scope
 		// validation is then limited to the catalog; production always wires it.
-		return identitycontracts.Principal{ID: userID, TenantID: tenantID}, nil
+		return identitycontracts.Principal{ID: userID, TenantID: tenant.EffectiveID(ctx)}, nil
 	}
-	principal, err := s.principals.GetPrincipal(ctx, tenantID, userID)
+	return s.checkPrincipal(ctx, userID, func(tenantID int64) (identitycontracts.Principal, error) {
+		return s.principals.GetPrincipal(ctx, tenantID, userID)
+	})
+}
+
+// checkPrincipal runs load for the request tenant and conceals a missing,
+// inactive, or cross-tenant owner as 404 user not found.
+func (s *service) checkPrincipal(
+	ctx context.Context,
+	userID int64,
+	load func(tenantID int64) (identitycontracts.Principal, error),
+) (identitycontracts.Principal, error) {
+	tenantID := tenant.EffectiveID(ctx)
+	principal, err := load(tenantID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return identitycontracts.Principal{}, apperror.NewNotFound("user not found")

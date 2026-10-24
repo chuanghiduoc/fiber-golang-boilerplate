@@ -20,6 +20,17 @@ FROM users u
 JOIN tenants t ON t.id = u.tenant_id
 WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL;
 
+-- name: LockUserPrincipal :one
+-- GetUserPrincipal under a FOR SHARE lock on the user row, for a caller's
+-- transaction that writes a credential for this owner (API-key create and
+-- rotate). A concurrent ban/delete waits for that transaction, and one that
+-- committed first makes this return no row, so no key is minted for it.
+SELECT u.id, u.tenant_id, u.email, u.name, u.role, u.credentials_revoked_at, t.status AS tenant_status
+FROM users u
+JOIN tenants t ON t.id = u.tenant_id
+WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+FOR SHARE OF u;
+
 -- name: GetUserByEmail :one
 SELECT * FROM users
 WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NULL;
@@ -92,7 +103,11 @@ UPDATE users
 SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),
     token_version = token_version + 1, password_changed_at = NOW(),
     -- Kept by RestoreUser, so API keys issued before the ban stay dead.
-    credentials_revoked_at = NOW()
+    -- clock_timestamp(), not NOW(): an API-key insert holding the owner row
+    -- FOR SHARE (LockUserPrincipal) makes this UPDATE wait, and that key's
+    -- created_at (its transaction start) must still compare at or before the
+    -- revocation, which NOW() (this transaction's start) does not guarantee.
+    credentials_revoked_at = clock_timestamp()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 RETURNING *;
 

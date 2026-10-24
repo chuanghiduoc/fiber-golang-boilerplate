@@ -1,8 +1,7 @@
 # ---- Build stage ----
 FROM golang:1.27.3-alpine AS build
 
-RUN apk add --no-cache git
-
+# No git: modules come from GOPROXY and -buildvcs=false skips VCS stamping.
 WORKDIR /app
 
 COPY go.mod go.sum ./

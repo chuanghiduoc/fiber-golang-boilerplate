@@ -154,7 +154,11 @@ UPDATE users
 SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),
     token_version = token_version + 1, password_changed_at = NOW(),
     -- Kept by RestoreUser, so API keys issued before the ban stay dead.
-    credentials_revoked_at = NOW()
+    -- clock_timestamp(), not NOW(): an API-key insert holding the owner row
+    -- FOR SHARE (LockUserPrincipal) makes this UPDATE wait, and that key's
+    -- created_at (its transaction start) must still compare at or before the
+    -- revocation, which NOW() (this transaction's start) does not guarantee.
+    credentials_revoked_at = clock_timestamp()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
 `
@@ -792,6 +796,48 @@ SELECT pg_advisory_xact_lock(hashtextextended('identity.last_admin', $1::bigint)
 func (q *Queries) LockTenantAdminChanges(ctx context.Context, tenantID int64) error {
 	_, err := q.db.Exec(ctx, lockTenantAdminChanges, tenantID)
 	return err
+}
+
+const lockUserPrincipal = `-- name: LockUserPrincipal :one
+SELECT u.id, u.tenant_id, u.email, u.name, u.role, u.credentials_revoked_at, t.status AS tenant_status
+FROM users u
+JOIN tenants t ON t.id = u.tenant_id
+WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+FOR SHARE OF u
+`
+
+type LockUserPrincipalParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+type LockUserPrincipalRow struct {
+	ID                   int64              `json:"id"`
+	TenantID             int64              `json:"tenant_id"`
+	Email                string             `json:"email"`
+	Name                 string             `json:"name"`
+	Role                 string             `json:"role"`
+	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
+	TenantStatus         string             `json:"tenant_status"`
+}
+
+// GetUserPrincipal under a FOR SHARE lock on the user row, for a caller's
+// transaction that writes a credential for this owner (API-key create and
+// rotate). A concurrent ban/delete waits for that transaction, and one that
+// committed first makes this return no row, so no key is minted for it.
+func (q *Queries) LockUserPrincipal(ctx context.Context, arg LockUserPrincipalParams) (LockUserPrincipalRow, error) {
+	row := q.db.QueryRow(ctx, lockUserPrincipal, arg.ID, arg.TenantID)
+	var i LockUserPrincipalRow
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Email,
+		&i.Name,
+		&i.Role,
+		&i.CredentialsRevokedAt,
+		&i.TenantStatus,
+	)
+	return i, err
 }
 
 const restoreUser = `-- name: RestoreUser :one

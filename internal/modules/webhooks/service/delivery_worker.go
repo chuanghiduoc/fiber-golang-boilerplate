@@ -99,13 +99,12 @@ func NewDeliveryWorker(store WorkerStore, codec *SecretCodec, client *webhook.Cl
 	}
 }
 
-// Handle is registered on the platform jobs worker under DeliveryJobKind.
+// Handle is registered on the platform jobs worker under DeliveryJobKind. It
+// follows the delivery protocol step by step: claim the attempt, build and
+// sign the body, send one request, then classify and record the outcome.
 func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) error {
-	if w == nil || w.store == nil {
-		return errors.New("webhooks: delivery worker is not configured")
-	}
-	if w.codec == nil {
-		return errors.New("webhooks: delivery worker has no secret codec")
+	if err := w.checkConfigured(); err != nil {
+		return err
 	}
 	var job repository.DeliveryJobPayload
 	if err := json.Unmarshal(payload, &job); err != nil || job.DeliveryID <= 0 {
@@ -113,131 +112,190 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	}
 
 	delivery, err := w.store.ClaimDelivery(ctx, job.DeliveryID, w.opts.Lease)
+	if errors.Is(err, repository.ErrNotClaimable) {
+		return w.handleNotClaimable(ctx, job.DeliveryID)
+	}
 	if err != nil {
-		if errors.Is(err, repository.ErrNotClaimable) {
-			return w.handleNotClaimable(ctx, job.DeliveryID)
-		}
 		return fmt.Errorf("webhooks: claim delivery %d: %w", job.DeliveryID, err)
 	}
 
+	secret, body, unsendable := w.prepare(delivery)
+	if unsendable != "" {
+		return w.deadLetterUnsendable(ctx, delivery, unsendable)
+	}
+
+	headers := w.requestHeaders(ctx, delivery, secret, body)
+	sent := w.send(ctx, delivery, headers, body)
+	// The job context itself ended (worker shutdown or job timeout), as
+	// opposed to the per-endpoint request timeout, before any response
+	// arrived. That says nothing about the receiver.
+	interrupted := sent.err != nil && ctx.Err() != nil
+	jobErr := ctx.Err()
+
+	// The request has been sent, so its outcome must be recorded even if the
+	// job is being canceled for shutdown; otherwise the attempt is lost and a
+	// retry can deliver a duplicate before the lease even expires.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+	defer cancel()
+
+	if interrupted {
+		return w.releaseInterrupted(writeCtx, delivery, jobErr)
+	}
+	attempt := classifyAttempt(sent)
+	if err := w.recordAttempt(writeCtx, delivery, attempt); err != nil {
+		return err
+	}
+	return w.finish(writeCtx, delivery, attempt)
+}
+
+func (w *DeliveryWorker) checkConfigured() error {
+	if w == nil || w.store == nil {
+		return errors.New("webhooks: delivery worker is not configured")
+	}
+	if w.codec == nil {
+		return errors.New("webhooks: delivery worker has no secret codec")
+	}
+	return nil
+}
+
+// prepare opens the snapshotted secret and builds the signed envelope. A
+// non-empty unsendable reason means retrying cannot help: the delivery is
+// dead-lettered without sending anything.
+func (w *DeliveryWorker) prepare(delivery *webhooksqlc.WebhookDelivery) (secret, body []byte, unsendable string) {
 	secret, err := w.codec.Open(delivery.SecretCiphertext)
 	if err != nil {
-		reason := "secret snapshot could not be decrypted"
 		slog.Error("webhooks: delivery secret decryption failed",
 			slog.Int64("delivery_id", delivery.ID),
 			slog.Any("error", err),
 		)
-		_ = w.store.CreateDeliveryAttempt(ctx, repository.AttemptDraft{
-			DeliveryID: delivery.ID,
-			Attempt:    delivery.Attempts,
-			Error:      reason,
-		})
-		return w.fenced(delivery, "mark delivery dead",
-			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
+		return nil, nil, "secret snapshot could not be decrypted"
 	}
-
-	body, err := json.Marshal(DeliveryEnvelope{
+	body, err = json.Marshal(DeliveryEnvelope{
 		ID:        delivery.EventID,
 		Type:      delivery.EventType,
 		CreatedAt: delivery.EventCreatedAt.Time.UTC(),
 		Data:      json.RawMessage(delivery.Payload),
 	})
 	if err != nil {
-		reason := "delivery payload is not valid JSON"
-		if attemptErr := w.store.CreateDeliveryAttempt(ctx, repository.AttemptDraft{
-			DeliveryID: delivery.ID,
-			Attempt:    delivery.Attempts,
-			Error:      reason,
-		}); attemptErr != nil {
-			return attemptErr
-		}
-		return w.fenced(delivery, "mark delivery dead",
-			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
+		return nil, nil, "delivery payload is not valid JSON"
 	}
+	return secret, body, ""
+}
 
+// deadLetterUnsendable records the failed attempt and dead-letters a
+// delivery that could not even be built.
+func (w *DeliveryWorker) deadLetterUnsendable(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, reason string) error {
+	if err := w.recordAttempt(ctx, delivery, attemptResult{outcome: webhook.OutcomePermanent, reason: reason}); err != nil {
+		return err
+	}
+	return w.fenced(delivery, "mark delivery dead",
+		w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
+}
+
+// requestHeaders builds the delivery headers, including the timestamped
+// signature over the exact body that will be sent.
+func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, secret, body []byte) http.Header {
 	timestamp := w.now()
-	reqHeaders := http.Header{}
-	reqHeaders.Set(webhook.HeaderID, delivery.EventID)
-	reqHeaders.Set(webhook.HeaderDelivery, strconv.FormatInt(delivery.ID, 10))
-	reqHeaders.Set(webhook.HeaderEvent, delivery.EventType)
-	reqHeaders.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
-	reqHeaders.Set(webhook.HeaderSignature, w.signatureHeader(ctx, delivery, secret, timestamp, body))
-	reqHeaders.Set(webhook.HeaderAttempt, strconv.FormatInt(int64(delivery.Attempts), 10))
-	reqHeaders.Set("Content-Type", "application/json")
+	headers := http.Header{}
+	headers.Set(webhook.HeaderID, delivery.EventID)
+	headers.Set(webhook.HeaderDelivery, strconv.FormatInt(delivery.ID, 10))
+	headers.Set(webhook.HeaderEvent, delivery.EventType)
+	headers.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
+	headers.Set(webhook.HeaderSignature, w.signatureHeader(ctx, delivery, secret, timestamp, body))
+	headers.Set(webhook.HeaderAttempt, strconv.FormatInt(int64(delivery.Attempts), 10))
+	headers.Set("Content-Type", "application/json")
+	return headers
+}
 
-	// The endpoint timeout (snapshotted on the delivery) can only shorten the
-	// client's global request timeout.
-	reqCtx, cancelReq := context.WithTimeout(ctx, deliveryTimeout(delivery.TimeoutMs))
-	started := time.Now()
-	result, doErr := w.client.Do(reqCtx, delivery.Url, reqHeaders, body)
-	elapsed := time.Since(started)
-	cancelReq()
-	// The job context itself ended (worker shutdown or job timeout), as
-	// opposed to the per-endpoint request timeout, before any response
-	// arrived. That says nothing about the receiver.
-	interrupted := doErr != nil && ctx.Err() != nil
-	jobErr := ctx.Err()
-
-	// The request has been sent, so its outcome must be recorded even if the
-	// job is being canceled for shutdown; otherwise the attempt is lost and a
-	// retry can deliver a duplicate before the lease even expires.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+// send performs the single HTTP request of this attempt. The endpoint timeout
+// (snapshotted on the delivery) can only shorten the client's global request
+// timeout.
+func (w *DeliveryWorker) send(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, headers http.Header, body []byte) sentRequest {
+	reqCtx, cancel := context.WithTimeout(ctx, deliveryTimeout(delivery.TimeoutMs))
 	defer cancel()
+	started := time.Now()
+	result, err := w.client.Do(reqCtx, delivery.Url, headers, body)
+	return sentRequest{result: result, err: err, elapsed: time.Since(started)}
+}
 
-	if interrupted {
-		// Give the attempt back instead of recording a failure: on the final
-		// attempt a failure would dead-letter a delivery that may never have
-		// reached the receiver. The request may still have arrived, which is
-		// within the at-least-once contract (receivers deduplicate).
-		if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
-			if !errors.Is(err, repository.ErrDeliveryLeaseLost) {
-				return fmt.Errorf("webhooks: release interrupted delivery %d: %w", delivery.ID, err)
-			}
-			slog.Warn("webhooks: interrupted delivery claim was already superseded",
-				slog.Int64("delivery_id", delivery.ID),
-				slog.Int("attempt", int(delivery.Attempts)),
-			)
+// sentRequest is what one HTTP request produced: a response or a transport
+// error, and how long it took.
+type sentRequest struct {
+	result  *webhook.Result
+	err     error
+	elapsed time.Duration
+}
+
+// releaseInterrupted gives the attempt back instead of recording a failure:
+// on the final attempt a failure would dead-letter a delivery that may never
+// have reached the receiver. The request may still have arrived, which is
+// within the at-least-once contract (receivers deduplicate). Returning the job
+// context's error lets the jobs worker requeue the job without consuming its
+// attempt when it is shutting down.
+func (w *DeliveryWorker) releaseInterrupted(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, jobErr error) error {
+	if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
+		if !errors.Is(err, repository.ErrDeliveryLeaseLost) {
+			return fmt.Errorf("webhooks: release interrupted delivery %d: %w", delivery.ID, err)
 		}
-		// Returning the job context's error lets the jobs worker requeue the
-		// job without consuming its attempt when it is shutting down.
-		return fmt.Errorf("webhooks: delivery %d interrupted before a response: %w", delivery.ID, jobErr)
+		slog.Warn("webhooks: interrupted delivery claim was already superseded",
+			slog.Int64("delivery_id", delivery.ID),
+			slog.Int("attempt", int(delivery.Attempts)),
+		)
 	}
+	return fmt.Errorf("webhooks: delivery %d interrupted before a response: %w", delivery.ID, jobErr)
+}
 
-	if doErr != nil {
-		outcome := webhook.ClassifyError(doErr)
-		statusCode := 0
-		reason := truncateError(fmt.Sprintf("request failed: %v", doErr))
-		if err := w.store.CreateDeliveryAttempt(ctx, repository.AttemptDraft{
-			DeliveryID: delivery.ID,
-			Attempt:    delivery.Attempts,
-			StatusCode: statusCode,
-			Duration:   elapsed,
-			Error:      reason,
-		}); err != nil {
-			return fmt.Errorf("webhooks: record delivery attempt: %w", err)
+// attemptResult is the classified outcome of one delivery attempt.
+type attemptResult struct {
+	outcome    webhook.Outcome
+	statusCode int
+	reason     string
+	retryAfter string
+	elapsed    time.Duration
+}
+
+// classifyAttempt maps a transport error or an HTTP response to an outcome.
+func classifyAttempt(sent sentRequest) attemptResult {
+	if sent.err != nil {
+		return attemptResult{
+			outcome: webhook.ClassifyError(sent.err),
+			reason:  truncateError(fmt.Sprintf("request failed: %v", sent.err)),
+			elapsed: sent.elapsed,
 		}
-		return w.finish(ctx, delivery, outcome, statusCode, reason, "")
 	}
+	result := sent.result
+	attempt := attemptResult{
+		outcome:    webhook.ClassifyStatus(result.StatusCode),
+		statusCode: result.StatusCode,
+		retryAfter: result.Header.Get("Retry-After"),
+		elapsed:    sent.elapsed,
+	}
+	if attempt.outcome != webhook.OutcomeSuccess {
+		attempt.reason = webhook.StatusError(result.StatusCode)
+	}
+	return attempt
+}
 
-	outcome := webhook.ClassifyStatus(result.StatusCode)
-	reason := ""
-	if outcome != webhook.OutcomeSuccess {
-		reason = webhook.StatusError(result.StatusCode)
-	}
+// recordAttempt appends the attempt to the delivery log before the delivery
+// row changes state.
+func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, attempt attemptResult) error {
 	if err := w.store.CreateDeliveryAttempt(ctx, repository.AttemptDraft{
 		DeliveryID: delivery.ID,
 		Attempt:    delivery.Attempts,
-		StatusCode: result.StatusCode,
-		Duration:   elapsed,
-		Error:      reason,
+		StatusCode: attempt.statusCode,
+		Duration:   attempt.elapsed,
+		Error:      attempt.reason,
 	}); err != nil {
 		return fmt.Errorf("webhooks: record delivery attempt: %w", err)
 	}
-	return w.finish(ctx, delivery, outcome, result.StatusCode, reason, result.Header.Get("Retry-After"))
+	return nil
 }
 
-func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, outcome webhook.Outcome, statusCode int, reason, retryAfter string) error {
-	switch outcome {
+// finish applies the attempt outcome to the delivery row: succeeded, dead, or
+// rescheduled with Retry-After/backoff while attempts remain.
+func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, attempt attemptResult) error {
+	statusCode, reason := attempt.statusCode, attempt.reason
+	switch attempt.outcome {
 	case webhook.OutcomeSuccess:
 		return w.fenced(delivery, "mark delivery succeeded",
 			w.store.MarkDeliverySucceeded(ctx, delivery.ID, delivery.Attempts, statusCode))
@@ -252,7 +310,7 @@ func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.Webho
 				w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, statusCode, reason))
 		}
 		now := w.now()
-		delay, _ := webhook.RetryDelay(int(delivery.Attempts), w.opts.RetryBase, w.opts.RetryMax, retryAfter, now)
+		delay, _ := webhook.RetryDelay(int(delivery.Attempts), w.opts.RetryBase, w.opts.RetryMax, attempt.retryAfter, now)
 		if delay < 0 {
 			delay = 0
 		}

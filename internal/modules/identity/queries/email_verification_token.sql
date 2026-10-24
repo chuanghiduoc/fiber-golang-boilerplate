@@ -26,3 +26,15 @@ WHERE token = $1 AND tenant_id = $2;
 -- name: DeleteEmailVerificationTokensByUserID :exec
 DELETE FROM email_verification_tokens
 WHERE user_id = $1 AND tenant_id = $2;
+
+-- name: PurgeExpiredEmailVerificationTokens :execrows
+-- Maintenance purge across every tenant; see PurgeExpiredPasswordResetTokens.
+WITH batch AS (
+    SELECT id FROM email_verification_tokens
+    WHERE expires_at < now()
+    LIMIT @batch_size::int
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM email_verification_tokens AS t
+USING batch
+WHERE t.id = batch.id;

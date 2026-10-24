@@ -24,10 +24,16 @@ type Module struct {
 
 	// userSvc and startup are set by Build; a module built with New (tests)
 	// has neither.
-	userSvc  identityservice.UserService
-	resetSvc identityservice.PasswordResetService
-	startup  func(ctx context.Context) error
+	userSvc     identityservice.UserService
+	resetSvc    identityservice.PasswordResetService
+	tokenPurger *identityservice.TokenPurger
+	startup     func(ctx context.Context) error
 }
+
+var (
+	_ app.JobProvider      = (*Module)(nil)
+	_ app.ScheduleProvider = (*Module)(nil)
+)
 
 // New builds the module from its handlers. Production uses Build.
 func New(auth *identityhandler.AuthHandler, users *identityhandler.UserHandler) *Module {

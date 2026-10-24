@@ -10,6 +10,7 @@ import (
 	"mime"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -212,8 +213,12 @@ func dispatchWebhookAfterCommit(ctx context.Context, dispatcher webhookcontracts
 	}
 }
 
+// cleanOriginalName makes the client filename safe to store and display: valid
+// UTF-8 (PostgreSQL rejects anything else with 22021, after the blob was
+// already written), no control characters, no path, and at most
+// maxOriginalNameRunes runes.
 func cleanOriginalName(name string) string {
-	name = strings.TrimSpace(filepath.Base(name))
+	name = strings.ToValidUTF8(strings.TrimSpace(filepath.Base(name)), string(utf8.RuneError))
 	name = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
 			return -1

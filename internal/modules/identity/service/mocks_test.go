@@ -385,6 +385,10 @@ func (m *mockUserRepo) GetPrincipal(ctx context.Context, id int64) (*identitysql
 	}, nil
 }
 
+func (m *mockUserRepo) LockPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error) {
+	return m.GetPrincipal(ctx, id)
+}
+
 func (m *mockUserRepo) LockAdminChanges(context.Context) error { return nil }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +605,15 @@ func (m *mockCache) Set(_ context.Context, key string, value []byte, ttl time.Du
 	m.items[key] = value
 	m.ttls[key] = ttl
 	return nil
+}
+
+func (m *mockCache) SetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	if _, ok := m.items[key]; ok {
+		return false, nil
+	}
+	m.items[key] = value
+	m.ttls[key] = ttl
+	return true, nil
 }
 
 func (m *mockCache) Delete(_ context.Context, key string) error {

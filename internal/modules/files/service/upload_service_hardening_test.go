@@ -2,13 +2,25 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 )
+
+// PostgreSQL rejects invalid UTF-8 (22021), so a crafted filename must not
+// reach the metadata insert after the blob was already written.
+func TestCleanOriginalName_ProducesValidUTF8(t *testing.T) {
+	for _, name := range []string{"bad\xffname.png", strings.Repeat("\xff", maxOriginalNameRunes+10)} {
+		if got := cleanOriginalName(name); !utf8.ValidString(got) {
+			t.Fatalf("cleanOriginalName(%q) = %q, not valid UTF-8", name, got)
+		}
+	}
+}
 
 func TestUploadList_IncludeDeleted(t *testing.T) {
 	repo := newMockFileRepo()

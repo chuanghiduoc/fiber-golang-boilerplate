@@ -14,6 +14,16 @@ type statusError int
 func (e statusError) Error() string       { return "http status" }
 func (e statusError) HTTPStatusCode() int { return int(e) }
 
+// codedStatusError is an S3 API error with both an error code and a status.
+type codedStatusError struct {
+	code   string
+	status int
+}
+
+func (e codedStatusError) Error() string       { return e.code }
+func (e codedStatusError) ErrorCode() string   { return e.code }
+func (e codedStatusError) HTTPStatusCode() int { return e.status }
+
 func TestIsS3NotFound(t *testing.T) {
 	cases := []struct {
 		name string
@@ -22,6 +32,8 @@ func TestIsS3NotFound(t *testing.T) {
 	}{
 		{"typed NoSuchKey", fmt.Errorf("get: %w", &types.NoSuchKey{}), true},
 		{"plain 404 response", fmt.Errorf("get: %w", statusError(http.StatusNotFound)), true},
+		{"missing bucket is a configuration error", fmt.Errorf("get: %w", codedStatusError{"NoSuchBucket", http.StatusNotFound}), false},
+		{"typed NoSuchBucket", fmt.Errorf("get: %w", &types.NoSuchBucket{}), false},
 		{"403 response", fmt.Errorf("get: %w", statusError(http.StatusForbidden)), false},
 		{"transport error", errors.New("connection refused"), false},
 	}

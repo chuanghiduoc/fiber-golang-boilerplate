@@ -14,9 +14,9 @@ connection is opened.
    ```
 
    The collector receives OTLP/gRPC on `127.0.0.1:4317` and OTLP/HTTP on
-   `127.0.0.1:4318`, and prints batches to its log. The collector is an
-   optional Compose profile, so a normal `docker compose up` never starts it
-   and the app has no `depends_on` on it.
+   `127.0.0.1:4318` and prints batches to its log. It is an optional Compose
+   profile: a normal `docker compose up` never starts it and the app has no
+   `depends_on` on it.
 
 2. Enable tracing for the app:
 
@@ -27,8 +27,8 @@ connection is opened.
    ```
 
    `OTEL_TRACES_EXPORTER=none` is also accepted: spans are sampled and
-   propagated (so logs still carry `trace_id`/`span_id`) but not exported.
-   This is useful when debugging sampling without a collector.
+   propagated (so logs still carry `trace_id`/`span_id`) but not exported,
+   which is useful when debugging sampling without a collector.
 
 3. Send a request and look for a `trace_id` in the request log:
 
@@ -39,7 +39,7 @@ connection is opened.
 
 ## Configuration
 
-All settings are optional and read at startup through `config.Load`.
+All settings are optional and read at startup.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -57,10 +57,10 @@ All settings are optional and read at startup through `config.Load`.
 | `OTEL_TRACES_SAMPLER_ARG` | `1.0` | Ratio in `[0,1]` for the ratio samplers. |
 | `OTEL_TRACING_EXCLUDE_PATHS` | `/healthz,/readyz,/health,/metrics` | Exact request paths that never create spans. |
 | `OTEL_INSTRUMENT_DB` | `true` | Emit sanitized pgx client spans under a recording parent. |
-| `OTEL_TRUST_INCOMING_TRACE` | `false` | Honor an inbound W3C `traceparent`. With `APP_TRUST_PROXY=true` it is honored only from a peer in `APP_TRUSTED_PROXIES`. Off by default so a client cannot force sampling. |
+| `OTEL_TRUST_INCOMING_TRACE` | `false` | Honor an inbound W3C `traceparent` (see [incoming traceparent](#http-server-span)). Off by default so a client cannot force sampling. |
 | `OTEL_BATCH_TIMEOUT_SECS` | `5` | Maximum delay before a batch is exported. |
 | `OTEL_EXPORT_TIMEOUT_SECS` | `30` | Per-export timeout. |
-| `OTEL_SHUTDOWN_TIMEOUT_SECS` | `10` | Bounded flush on process shutdown. The flush runs after HTTP/jobs drain and is also capped by what remains of the 20s shutdown budget minus a 2s close reserve, but always gets at least 1s (see [Graceful shutdown](operations.md#graceful-shutdown)). |
+| `OTEL_SHUTDOWN_TIMEOUT_SECS` | `10` | Bounded flush on shutdown. The flush runs after HTTP/jobs drain and is also capped by what remains of the 20s shutdown budget minus a 2s close reserve, but always gets at least 1s (see [Graceful shutdown](operations.md#graceful-shutdown)). |
 | `OTEL_BATCH_MAX_QUEUE_SIZE` | `2048` | Spans buffered in memory; new spans are dropped when full. |
 | `OTEL_BATCH_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request; must not exceed the queue size. |
 
@@ -71,70 +71,106 @@ lazily and export failures only drop spans.
 
 ## What is recorded
 
+```mermaid
+flowchart LR
+    subgraph TA["Trace A: HTTP request"]
+        H["server span<br/>POST /api/v1/files/upload"]
+        D1["client span<br/>db INSERT (files)"]
+        D2["client span<br/>db INSERT (jobs)<br/>stores trace_parent"]
+        H --> D1
+        H --> D2
+    end
+    subgraph TB["Trace B: one job attempt (new root)"]
+        J["consumer span<br/>job.process"]
+        D3["client span<br/>db SELECT / UPDATE"]
+        J --> D3
+    end
+    J -. "span link to the<br/>enqueuing span" .-> H
+```
+
+Solid arrows are parent/child; the dotted arrow is a span link, not a parent.
+The persisted `traceparent` is the span active when the job was enqueued (the
+HTTP server span here, or a `job.process` span when one job enqueues another).
+
 ### HTTP server span
 
 Created for every request except the excluded probe paths, after `RequestID`
-and before `Metrics`/`Logger`/`Recovery`:
+and before `Metrics`/`Logger`/`Recovery`.
 
-- name: `METHOD /route/template` (for unmatched routes: just `METHOD`)
-- kind: server
-- `http.request.method`, `http.route` (route template, never the raw path or
-  query), `http.response.status_code`
-- `app.request_id`, `enduser.id`, `tenant.id`
-- `app.error_code` for `apperror.AppError` values (for example
-  `internal_error`, `not_found`)
-- 5xx: status `Error` and a bounded `error.type`; 4xx stays `Unset`
-- inbound W3C `traceparent` is extracted only when
-  `OTEL_TRUST_INCOMING_TRACE=true` (and, behind `APP_TRUST_PROXY`, only from a
-  trusted proxy). Otherwise it is ignored and every request starts a new root
-  trace sampled by the local ratio: with a parent-based sampler an untrusted
-  client's sampled flag would otherwise force 100% sampling and export cost.
+| Aspect | Value |
+| --- | --- |
+| Name | `METHOD /route/template` (unmatched routes: just `METHOD`) |
+| Kind | server |
+| Attributes | `http.request.method`, `http.route` (route template, never the raw path or query), `http.response.status_code`, `app.request_id`, `enduser.id`, `tenant.id` |
+| App errors | `app.error_code` for `apperror.AppError` values (for example `internal_error`, `not_found`) |
+| Status | 5xx: `Error` plus a bounded `error.type`; 4xx stays `Unset` |
+
+Incoming `traceparent` handling:
+
+```mermaid
+flowchart TD
+    A[Request carries traceparent] --> B{OTEL_TRUST_INCOMING_TRACE?}
+    B -->|false| R[Ignore header:<br/>new root, local sampler ratio]
+    B -->|true| C{APP_TRUST_PROXY?}
+    C -->|false| P[Use as parent]
+    C -->|true| D{Peer in APP_TRUSTED_PROXIES?}
+    D -->|yes| P
+    D -->|no| R
+```
+
+Untrusted headers are ignored because, with a parent-based sampler, a client's
+sampled flag would otherwise force 100% sampling and export cost.
 
 ### PostgreSQL client span
 
-Each `Query`/`QueryRow`/`Exec` that runs while a recording span is active gets a
-client span:
+Each `Query`/`QueryRow`/`Exec` that runs while a **recording** span is active
+gets a client span.
 
-- name: `db SELECT` / `db INSERT` / ...
-- `db.system.name=postgresql`, `db.operation.name`
-- failures: `db.response.status_code` with the PostgreSQL SQLSTATE and a
-  bounded `error.type`
-- no span is created when the parent is not recording, so background work
-  without a trace does not create orphan spans
-- `pgx.ErrNoRows` is a normal miss, not an error
+| Aspect | Value |
+| --- | --- |
+| Name | `db SELECT` / `db INSERT` / ... |
+| Kind | client |
+| Attributes | `db.system.name=postgresql`, `db.operation.name` |
+| Failures | `db.response.status_code` (PostgreSQL SQLSTATE) and a bounded `error.type` |
+| No recording parent | No span, so background work without a trace creates no orphan spans |
+| `pgx.ErrNoRows` | A normal miss, not an error |
 
 ### Job consumer span
 
-`Queue.Enqueue`/`EnqueueTx` persist the active W3C `traceparent` in
-`jobs.trace_parent`. The worker starts each attempt as a **new root**
-`job.process` consumer span and adds a link to the enqueue span, then installs
-the tenant context before running the handler:
+Every enqueue variant (`Enqueue`, `EnqueueTx`, `EnqueueOnce`, `EnqueueOnceTx`)
+persists the active W3C `traceparent` in `jobs.trace_parent`. The worker starts
+each attempt as a **new root** `job.process` consumer span linked to the
+enqueue span, then installs the tenant context before running the handler.
 
-- `job.id`, `job.kind`, `job.tenant_id`, `job.attempt`, `job.max_attempts`
-- `job.outcome` (`succeeded`, `retried`, `dead`, `released` on shutdown), `job.dead_letter`,
-  `job.retry_at` when retried
-- failures: status `Error` and a bounded `error.type`
+| Aspect | Value |
+| --- | --- |
+| Kind | consumer |
+| Attributes | `job.id`, `job.kind`, `job.tenant_id`, `job.attempt`, `job.max_attempts` |
+| Outcome | `job.outcome` (`succeeded`, `retried`, `dead`, `released` on shutdown), `job.dead_letter`, `job.retry_at` when retried |
+| Failures | Status `Error` and a bounded `error.type` |
 
 The handler's `context.Context` carries the span, so sanitized DB spans nest
-under `job.process`. Retries create a fresh root, which keeps each attempt
-independently inspectable.
+under `job.process`. Each retry is a fresh root, which keeps every attempt
+independently inspectable. A `NULL` or unparsable `trace_parent` yields a root
+span without a link.
 
 ## Privacy rules
 
 Spans are designed to be safe to export to a third-party backend:
 
-- No request or response bodies, headers, query strings, emails, tokens,
-  uploaded file names, SQL text, bind parameters, or raw error messages.
-- `error.type` is a bounded class (Go type name or `http_<status>`), never
-  `err.Error()`. `error.description` is never set.
-- Errors are not recorded as span events or exceptions.
-- The request path is recorded only as the matched route template. Unmatched
-  requests record no route.
-- Trace IDs are safe correlation identifiers and may appear in logs.
+| Never recorded | Instead |
+| --- | --- |
+| Request/response bodies, headers, query strings | Method, route template, status |
+| Emails, tokens, uploaded file names | IDs only (`enduser.id`, `tenant.id`, `job.id`) |
+| SQL text, bind parameters | `db.operation.name` |
+| Raw error messages (`err.Error()`), `error.description`, span events/exceptions | Bounded `error.type` (Go type name or `http_<status>`) |
+| Raw path of unmatched requests | No route attribute |
+
+Trace IDs are safe correlation identifiers and may appear in logs.
 
 ## Kubernetes
 
-`deploy/k8s/prereqs/configmap.yaml` contains a disabled tracing block and the
+`deploy/k8s/prereqs/configmap.yaml` contains a disabled tracing block, and the
 NetworkPolicy already allows egress to a collector on TCP 4317 (narrow the
 CIDR to your collector namespace/service range). Enable it per environment:
 
@@ -167,15 +203,9 @@ span without a link.
 
 ## Operations
 
-- Collector down: spans queue up to `OTEL_BATCH_MAX_QUEUE_SIZE`, then drop.
-  The API stays ready. Check the collector endpoint and network policy; do not
-  restart the API expecting spans to recover.
-- Missing traces: verify `OTEL_ENABLED=true`, the endpoint, the sampler ratio,
-  and that the route is not excluded. With `OTEL_TRUST_INCOMING_TRACE=true`,
-  inbound sampling follows the trusted parent; a `traceparent` with the sampled
-  flag off keeps the trace unsampled. Upstream traces not joining is expected
-  while the flag is off.
-- Shutdown: the provider flushes last, after HTTP and the job worker stop. A
-  failed flush logs a warning but never changes the process exit code.
-- Logs: request records include `trace_id` and `span_id` when a recording span
-  exists. Search logs by `request_id`, then pivot to the trace by `trace_id`.
+| Symptom | What to check |
+| --- | --- |
+| Collector down | Spans queue up to `OTEL_BATCH_MAX_QUEUE_SIZE`, then drop; the API stays ready. Check the collector endpoint and NetworkPolicy; restarting the API does not recover spans. |
+| Missing traces | `OTEL_ENABLED=true`, the endpoint, the sampler ratio, and that the route is not excluded. With `OTEL_TRUST_INCOMING_TRACE=true`, sampling follows the trusted parent; a `traceparent` with the sampled flag off keeps the trace unsampled. Upstream traces not joining is expected while the flag is off. |
+| Shutdown | The provider flushes last, after HTTP and the job worker stop. A failed flush logs a warning but never changes the exit code. |
+| Correlating logs | Request records include `trace_id` and `span_id` when a recording span exists. Search logs by `request_id`, then pivot to the trace by `trace_id`. |

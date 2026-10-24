@@ -1,31 +1,20 @@
 # Documentation
 
-- [Architecture](architecture.md) — module map, dependency rules, request flow,
-  tenant model, i18n/versioning mechanics, data ownership, jobs/outbox,
-  migration policy.
-- [API Design System](api-design.md) — URL/versioning, Accept-Version,
-  localization, JSON conventions, success/error shapes, pagination, auth,
-  idempotency, rate limits, status codes, compatibility rules.
-- [Module Template](module-template.md) — canonical module layout, copy-paste
-  skeleton, route/permission/audit/idempotency wiring, table ownership,
-  cross-module contracts, migrations, tests, and the add-a-module checklist.
-- [Operations](operations.md) — health/readiness, metrics, logs and request
-  IDs, jobs, idempotency and Redis, migrations, Kubernetes caveats, and
-  incident checklists.
-- [Feature Flags](feature-flags.md) — compile-time catalog, precedence,
-  environment force-off, database defaults and tenant/user targets, cache
-  staleness, admin API, audit metadata, and metrics.
-- [Webhooks](webhooks.md) — outbound event dispatch, HMAC signing and
-  verification, SSRF-safe delivery, retries, replay, inbound sources, secrets,
-  configuration, and operations.
-- [Swagger UI](../docs/swagger.json) — generated OpenAPI (served at `/swagger`
-  outside production).
+| Document | Covers |
+|---|---|
+| [Architecture](architecture.md) | Module map and dependency rules, request lifecycle, cross-module communication, tenant model, authorization, transactions/outbox, migration policy |
+| [Data Model](data-model.md) | ER diagrams of the baseline schema, table ownership, keys, and FK delete actions |
+| [API Design System](api-design.md) | URLs/versioning, JSON conventions, success/error (RFC 9457) shapes, pagination, JWT vs API-key auth, tenants, headers, rate limits, idempotency, compatibility rules |
+| [Module Template](module-template.md) | Canonical module layout, skeleton, route/permission/audit/idempotency wiring, table ownership, contracts, migrations, tests, add-a-module checklist |
+| [Operations](operations.md) | Health/readiness, metrics, logs and request IDs, jobs, scheduler, shutdown, idempotency and Redis, migrations, Kubernetes caveats, incident checklists |
+| [Feature Flags](feature-flags.md) | Compile-time catalog, precedence, environment force-off, database defaults and tenant/user targets, cache staleness, admin API, metrics |
+| [Webhooks](webhooks.md) | Outbound dispatch, HMAC signing and verification, SSRF-safe delivery, retries, replay, inbound sources, secrets, configuration |
+| [Tracing](tracing.md) | OpenTelemetry configuration, span privacy rules, collector, job trace links |
+| [Swagger](swagger.json) | Generated OpenAPI (served at `/swagger` outside production) |
 
-Operational deployment and tooling:
+Deployment and tooling:
 
-- [Kubernetes](../deploy/k8s/README.md) — manifests, staging/production
-  overlays, GitHub Actions CD, migration Job, release workflow, external
-  DB/Redis, storage choices.
-- [New module scaffold](../scripts/new-module.sh) — `scripts/new-module.sh
-  <name>` creates the module layout described in the module template and
-  verifies the generated package with `go build`.
+| Link | Covers |
+|---|---|
+| [Kubernetes](../deploy/k8s/README.md) | Manifests, staging/production overlays, GitHub Actions CD, migration Job, release workflow, external DB/Redis, storage choices |
+| [New module scaffold](../scripts/new-module.sh) | `scripts/new-module.sh <name>` creates the module layout from the template and verifies it with `go build` |

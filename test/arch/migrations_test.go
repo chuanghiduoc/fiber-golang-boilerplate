@@ -19,6 +19,9 @@ var migrationFile = regexp.MustCompile(`^(\d+)_([a-z0-9_]+)\.(up|down)\.sql$`)
 // migration uses a UTC timestamp version (make migrate-create).
 const baselineVersion = 1
 
+// baselineSpelling is the only accepted spelling of the baseline version.
+const baselineSpelling = "000001"
+
 // timestampLayout is the golang-migrate -format used by make migrate-create.
 const timestampLayout = "20060102150405"
 
@@ -86,6 +89,17 @@ func TestMigrationCheckRejectsBadSets(t *testing.T) {
 		}, baseline...)},
 		"bad file name": {files: append([]string{"20261024101500_files.sql"}, baseline...)},
 		"no baseline":   {files: []string{"20261024101500_files_x.up.sql", "20261024101500_files_x.down.sql"}},
+		"baseline with extra zero": {files: []string{
+			"0000001_init_schema.up.sql",
+			"0000001_init_schema.down.sql",
+		}},
+		"version spelled twice": {files: append([]string{
+			"0000001_init_schema.up.sql",
+		}, baseline...)},
+		"timestamp spelled twice": {files: append([]string{
+			"20261024101500_files_add_checksum.up.sql",
+			"020261024101500_files_add_checksum.down.sql",
+		}, baseline...)},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -102,6 +116,7 @@ func TestMigrationCheckRejectsBadSets(t *testing.T) {
 
 func migrationProblems(files []string, owners map[string]bool) []string {
 	type migration struct {
+		spelling   string // the version digits exactly as written
 		name       string
 		directions map[string]bool
 	}
@@ -122,8 +137,16 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 
 		existing, ok := byVersion[version]
 		if !ok {
-			existing = &migration{name: name, directions: map[string]bool{}}
+			existing = &migration{spelling: match[1], name: name, directions: map[string]bool{}}
 			byVersion[version] = existing
+		}
+		// golang-migrate compares versions numerically, so 000001 and
+		// 0000001 are the same version: a second spelling is a duplicate.
+		if existing.spelling != match[1] {
+			problems = append(problems, fmt.Sprintf(
+				"migrations/%s: version %d is also spelled %q; golang-migrate sees a duplicate version",
+				file, version, existing.spelling))
+			continue
 		}
 		if existing.name != name {
 			problems = append(problems, fmt.Sprintf(
@@ -134,6 +157,10 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 		existing.directions[direction] = true
 
 		if version == baselineVersion {
+			if match[1] != baselineSpelling {
+				problems = append(problems, fmt.Sprintf(
+					"migrations/%s: the baseline version must be spelled %s", file, baselineSpelling))
+			}
 			continue
 		}
 		if len(match[1]) != len(timestampLayout) {

@@ -37,41 +37,61 @@ type Guard struct {
 // may be an IP, a CIDR, or a hostname (case-insensitive, trailing dot ignored).
 // Public targets are always allowed; entries only relax the private/blocked
 // check for matching destinations.
+//
+// The dial timeout defaults to 5s; a Client replaces it with its configured
+// ConnectTimeout.
 func NewGuard(allowlist []string) (*Guard, error) {
 	g := &Guard{
 		allowedHosts: make(map[string]struct{}, len(allowlist)),
-		dialTimeout:  5 * time.Second,
+		dialTimeout:  defaultConnectTimeout,
 		resolver:     net.DefaultResolver,
 	}
 	for _, raw := range allowlist {
-		entry := strings.TrimSpace(raw)
-		if entry == "" {
-			continue
+		if err := g.allow(strings.TrimSpace(raw)); err != nil {
+			return nil, err
 		}
-		if strings.Contains(entry, "/") {
-			_, network, err := net.ParseCIDR(entry)
-			if err != nil {
-				return nil, fmt.Errorf("webhook: invalid allowlist CIDR %q: %w", entry, err)
-			}
-			g.allowedIPs = append(g.allowedIPs, network)
-			continue
-		}
-		if ip := net.ParseIP(entry); ip != nil {
-			bits := 128
-			if v4 := ip.To4(); v4 != nil {
-				ip = v4
-				bits = 32
-			}
-			g.allowedIPs = append(g.allowedIPs, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
-			continue
-		}
-		host := normalizeHost(entry)
-		if host == "" || strings.ContainsAny(host, " \t\r\n/") {
-			return nil, fmt.Errorf("webhook: invalid allowlist host %q", entry)
-		}
-		g.allowedHosts[host] = struct{}{}
 	}
 	return g, nil
+}
+
+// allow adds one allowlist entry: a CIDR, a single IP (stored as a host
+// network), or a hostname. Blank entries are ignored.
+func (g *Guard) allow(entry string) error {
+	if entry == "" {
+		return nil
+	}
+	if strings.Contains(entry, "/") {
+		_, network, err := net.ParseCIDR(entry)
+		if err != nil {
+			return fmt.Errorf("webhook: invalid allowlist CIDR %q: %w", entry, err)
+		}
+		g.allowedIPs = append(g.allowedIPs, network)
+		return nil
+	}
+	if ip := net.ParseIP(entry); ip != nil {
+		bits := 128
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+			bits = 32
+		}
+		g.allowedIPs = append(g.allowedIPs, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+		return nil
+	}
+	host := normalizeHost(entry)
+	if host == "" || strings.ContainsAny(host, " \t\r\n/") {
+		return fmt.Errorf("webhook: invalid allowlist host %q", entry)
+	}
+	g.allowedHosts[host] = struct{}{}
+	return nil
+}
+
+// withDialTimeout returns a copy of g whose dialer uses timeout for the TCP
+// connect. The allowlist is shared read-only, so the copy is cheap and the
+// original Guard keeps its own timeout.
+func (g *Guard) withDialTimeout(timeout time.Duration) *Guard {
+	clone := *g
+	clone.dialTimeout = timeout
+	return &clone
 }
 
 // ValidateURL parses rawURL and enforces the delivery URL contract: absolute
@@ -213,31 +233,35 @@ func isBlockedIP(ip net.IP) bool {
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
 	}
-
 	if v4 := ip.To4(); v4 != nil {
-		switch {
-		case v4[0] == 0: // 0.0.0.0/8 "this network"
-			return true
-		case v4[0] >= 240: // 240.0.0.0/4 reserved + 255.255.255.255
-			return true
-		case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // 100.64.0.0/10 CGNAT
-			return true
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24
-			return true
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 2: // 192.0.2.0/24 TEST-NET-1
-			return true
-		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15 benchmark
-			return true
-		case v4[0] == 198 && v4[1] == 51 && v4[2] == 100: // 198.51.100.0/24 TEST-NET-2
-			return true
-		case v4[0] == 203 && v4[1] == 0 && v4[2] == 113: // 203.0.113.0/24 TEST-NET-3
-			return true
-		}
-		return false
+		return isReservedIPv4(v4)
 	}
-
 	if v6 := ip.To16(); v6 != nil {
 		return isBlockedIPv6(v6)
+	}
+	return false
+}
+
+// isReservedIPv4 covers the special-purpose IPv4 ranges the standard library
+// does not classify as private.
+func isReservedIPv4(v4 net.IP) bool {
+	switch {
+	case v4[0] == 0: // 0.0.0.0/8 "this network"
+		return true
+	case v4[0] >= 240: // 240.0.0.0/4 reserved + 255.255.255.255
+		return true
+	case v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127: // 100.64.0.0/10 CGNAT
+		return true
+	case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24
+		return true
+	case v4[0] == 192 && v4[1] == 0 && v4[2] == 2: // 192.0.2.0/24 TEST-NET-1
+		return true
+	case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15 benchmark
+		return true
+	case v4[0] == 198 && v4[1] == 51 && v4[2] == 100: // 198.51.100.0/24 TEST-NET-2
+		return true
+	case v4[0] == 203 && v4[1] == 0 && v4[2] == 113: // 203.0.113.0/24 TEST-NET-3
+		return true
 	}
 	return false
 }

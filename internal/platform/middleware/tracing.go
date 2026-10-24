@@ -65,45 +65,53 @@ func Tracing(tp trace.TracerProvider, excludePaths []string, trustIncoming bool)
 
 		err := c.Next()
 		status := effectiveStatus(c, err)
-
-		// Fiber resolves the route before middleware runs, but refresh after
-		// the handler so mounted/sub-router templates are never missed.
-		route = routeTemplate(c)
-		if route != "" {
-			span.SetName(httpSpanName(c.Method(), route))
-			span.SetAttributes(semconv.HTTPRouteKey.String(route))
-		}
-		span.SetAttributes(semconv.HTTPResponseStatusCodeKey.Int(status))
-
-		if requestID := fiber.Locals[string](c, "request_id"); requestID != "" {
-			span.SetAttributes(attribute.String("app.request_id", requestID))
-		}
-		if userID := fiber.Locals[int64](c, "user_id"); userID != 0 {
-			span.SetAttributes(semconv.EnduserIDKey.String(strconv.FormatInt(userID, 10)))
-		}
-		if tenantID := requestTenantID(c); tenantID != 0 {
-			span.SetAttributes(attribute.Int64("tenant.id", tenantID))
-		}
-
-		var appErr *apperror.AppError
-		if errors.As(err, &appErr) && appErr.Code != "" {
-			span.SetAttributes(attribute.String("app.error_code", appErr.Code))
-		}
-
-		// 4xx responses are expected client outcomes and stay Unset. Only 5xx
-		// marks the span failed, using a bounded error type rather than the
-		// error message.
-		if status >= fiber.StatusInternalServerError {
-			if err != nil {
-				tracing.MarkError(span, err)
-			} else {
-				span.SetStatus(codes.Error, "")
-				span.SetAttributes(semconv.ErrorTypeKey.String("http_" + strconv.Itoa(status)))
-			}
-		}
+		annotateServerSpan(c, span, err, status)
+		markServerFailure(span, err, status)
 
 		return err
 	}
+}
+
+// annotateServerSpan records the bounded, non-sensitive request attributes
+// known once the handler has run.
+func annotateServerSpan(c fiber.Ctx, span trace.Span, err error, status int) {
+	// Fiber resolves the route before middleware runs, but refresh after the
+	// handler so mounted/sub-router templates are never missed.
+	if route := routeTemplate(c); route != "" {
+		span.SetName(httpSpanName(c.Method(), route))
+		span.SetAttributes(semconv.HTTPRouteKey.String(route))
+	}
+	span.SetAttributes(semconv.HTTPResponseStatusCodeKey.Int(status))
+
+	if requestID := fiber.Locals[string](c, "request_id"); requestID != "" {
+		span.SetAttributes(attribute.String("app.request_id", requestID))
+	}
+	if userID := fiber.Locals[int64](c, "user_id"); userID != 0 {
+		span.SetAttributes(semconv.EnduserIDKey.String(strconv.FormatInt(userID, 10)))
+	}
+	if tenantID := requestTenantID(c); tenantID != 0 {
+		span.SetAttributes(attribute.Int64("tenant.id", tenantID))
+	}
+
+	var appErr *apperror.AppError
+	if errors.As(err, &appErr) && appErr.Code != "" {
+		span.SetAttributes(attribute.String("app.error_code", appErr.Code))
+	}
+}
+
+// markServerFailure marks only 5xx spans failed, using a bounded error type
+// rather than the error message. 4xx responses are expected client outcomes
+// and stay Unset.
+func markServerFailure(span trace.Span, err error, status int) {
+	if status < fiber.StatusInternalServerError {
+		return
+	}
+	if err != nil {
+		tracing.MarkError(span, err)
+		return
+	}
+	span.SetStatus(codes.Error, "")
+	span.SetAttributes(semconv.ErrorTypeKey.String("http_" + strconv.Itoa(status)))
 }
 
 // routeTemplate returns the registered route pattern. An unmatched request

@@ -34,3 +34,16 @@ WHERE token = $1;
 -- name: DeleteRefreshTokensByUserID :exec
 DELETE FROM refresh_tokens
 WHERE user_id = $1 AND tenant_id = $2;
+
+-- name: PurgeExpiredRefreshTokens :execrows
+-- Maintenance purge across every tenant; see PurgeExpiredPasswordResetTokens.
+-- Served by idx_refresh_tokens_expires_at.
+WITH batch AS (
+    SELECT id FROM refresh_tokens
+    WHERE expires_at < now()
+    LIMIT @batch_size::int
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM refresh_tokens AS t
+USING batch
+WHERE t.id = batch.id;

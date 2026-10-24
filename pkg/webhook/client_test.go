@@ -19,6 +19,22 @@ func loopbackClient(t *testing.T, timeout time.Duration) *Client {
 	return NewClient(ClientConfig{Guard: guard, Timeout: timeout, ConnectTimeout: time.Second})
 }
 
+func TestClient_ConnectTimeoutReachesGuardDialer(t *testing.T) {
+	guard, err := NewGuard(nil)
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	const connect = 750 * time.Millisecond
+	client := NewClient(ClientConfig{Guard: guard, ConnectTimeout: connect})
+
+	if client.guard.dialTimeout != connect {
+		t.Fatalf("guard dial timeout = %v, want configured %v", client.guard.dialTimeout, connect)
+	}
+	if guard.dialTimeout != defaultConnectTimeout {
+		t.Fatalf("caller's guard was mutated: dial timeout = %v", guard.dialTimeout)
+	}
+}
+
 func TestClient_RejectsPrivateTargetWithoutAllowlist(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

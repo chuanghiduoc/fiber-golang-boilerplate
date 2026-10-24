@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/gofiber/fiber/v3"
 
@@ -29,16 +28,19 @@ const (
 	// that already wrote and completed an intent row.
 	auditGuardedLocal = "audit_guarded"
 
-	// ModeBestEffort logs intent failures and still runs the handler.
-	ModeBestEffort Mode = "best_effort"
 	// ModeRequired fails the request with system.audit_unavailable when the
-	// intent cannot be stored. This is the tier-2 default for mutating routes.
+	// intent cannot be stored. It is the default: privileged mutations are
+	// fail-closed.
 	ModeRequired Mode = "required"
+	// ModeBestEffort logs intent failures and still runs the handler. It must
+	// be chosen explicitly.
+	ModeBestEffort Mode = "best_effort"
 )
 
 // Policy configures a route-level audit guard.
 type Policy struct {
-	// Mode defaults to ModeBestEffort when empty.
+	// Mode defaults to ModeRequired when empty; any value other than
+	// ModeBestEffort is treated as ModeRequired so a typo cannot fail open.
 	Mode Mode
 	// RequireDomain requires the handler to create an explicit service event.
 	// A successful mutation without one completes the intent as unknown and
@@ -48,6 +50,34 @@ type Policy struct {
 	Action string
 	// Resource defaults to the route template.
 	Resource string
+}
+
+func (p Policy) effectiveMode() Mode {
+	if p.Mode == ModeBestEffort {
+		return ModeBestEffort
+	}
+	return ModeRequired
+}
+
+// guardTarget names what a guarded request mutates.
+type guardTarget struct {
+	routePath string
+	action    string
+	resource  string
+}
+
+func (p Policy) target(c fiber.Ctx) guardTarget {
+	t := guardTarget{routePath: c.Route().Path, action: p.Action, resource: p.Resource}
+	if t.routePath == "" {
+		t.routePath = c.Path()
+	}
+	if t.action == "" {
+		t.action = c.Method() + " " + t.routePath
+	}
+	if t.resource == "" {
+		t.resource = t.routePath
+	}
+	return t
 }
 
 // Guard writes a pre-write intent row for a mutating route, then completes it
@@ -62,13 +92,7 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 	if recorder == nil {
 		recorder = Noop{}
 	}
-	mode := policy.Mode
-	if mode == "" {
-		mode = ModeBestEffort
-	}
-	if mode != ModeBestEffort && mode != ModeRequired {
-		mode = ModeRequired
-	}
+	mode := policy.effectiveMode()
 
 	return func(c fiber.Ctx) error {
 		// Idempotency middleware normally short-circuits a replay before this
@@ -78,111 +102,116 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 			return c.Next()
 		}
 
-		action := policy.Action
-		resource := policy.Resource
-		routePath := c.Route().Path
-		if routePath == "" {
-			routePath = c.Path()
-		}
-		if action == "" {
-			action = c.Method() + " " + routePath
-		}
-		if resource == "" {
-			resource = routePath
+		target := policy.target(c)
+		eventID, err := beginIntent(c, recorder, mode, target)
+		if err != nil {
+			return err
 		}
 
-		eventID := int64(0)
-		idRecorder, canRecordID := recorder.(IDRecorder)
-		if !canRecordID {
-			metrics.AuditIntentFailuresTotal.Inc()
-			slog.Error("audit guard recorder cannot write intent rows",
-				slog.String("action", action),
-				slog.String("mode", string(mode)),
-				slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			)
-			if mode == ModeRequired {
-				return apperror.NewCode(apperror.CodeSystemAuditUnavailable, "audit service unavailable")
-			}
-		} else {
-			info := requestInfoFor(c, 0, action, resource)
-			// Feature-flag routes name the target :key, not :id; fall back
-			// like audit.Middleware so a denied attempt still records it.
-			resourceID := c.Params("id")
-			if resourceID == "" {
-				resourceID = c.Params("key")
-			}
-			intent := Event{
-				TenantID:           info.TenantID,
-				ActorID:            info.ActorID,
-				ActorType:          info.ActorType,
-				ActorRole:          info.ActorRole,
-				Action:             action,
-				Resource:           resource,
-				ResourceID:         resourceID,
-				Metadata:           map[string]any{"method": c.Method(), "route": routePath},
-				IP:                 info.IP,
-				UserAgent:          info.UserAgent,
-				RequestID:          info.RequestID,
-				Source:             SourceHTTP,
-				Outcome:            OutcomeStarted,
-				IdempotencyKeyHash: info.IdempotencyKeyHash,
-			}
-			if intent.ActorType == "" {
-				intent.ActorType = ActorTypeAnonymous
-			}
-			ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 2*time.Second)
-			id, err := idRecorder.RecordID(ctx, intent)
-			cancel()
-			if err != nil {
-				metrics.AuditIntentFailuresTotal.Inc()
-				slog.Warn("failed to write audit intent row",
-					slog.String("action", action),
-					slog.String("request_id", info.RequestID),
-					slog.Any("error", err),
-				)
-				if mode == ModeRequired {
-					return apperror.NewCode(apperror.CodeSystemAuditUnavailable, "audit service unavailable")
-				}
-			} else {
-				eventID = id
-			}
-		}
-
-		info := requestInfoFor(c, eventID, action, resource)
+		info := requestInfoFor(c, eventID, target.action, target.resource)
 		c.SetContext(WithRequestInfo(c.Context(), info))
 		fiber.Locals[int64](c, "audit_event_id", eventID)
 		fiber.Locals[bool](c, auditGuardedLocal, true)
 
 		if eventID == 0 {
+			// Best-effort mode with no intent row: nothing to complete.
 			return c.Next()
 		}
-
-		var handlerErr error
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				completeGuarded(c, recorder, eventID, Completion{
-					Outcome:    OutcomeFailed,
-					StatusCode: fiber.StatusInternalServerError,
-					ErrorCode:  "panic",
-				})
-				panic(recovered)
-			}
-		}()
-
-		handlerErr = c.Next()
-		completion := classifyOutcome(c, handlerErr, info)
-		if policy.RequireDomain && completion.Outcome == OutcomeSucceeded && info.DomainEvents == 0 {
-			metrics.AuditDomainMissingTotal.Inc()
-			completion.Outcome = OutcomeUnknown
-			completion.ErrorCode = "audit.domain_missing"
-			slog.Warn("guarded mutation completed without a domain audit event",
-				slog.String("action", action),
-				slog.String("request_id", info.RequestID),
-			)
-		}
-		completeGuarded(c, recorder, eventID, completion)
-		return handlerErr
+		return runAndCompleteIntent(c, recorder, policy, eventID, info)
 	}
+}
+
+// beginIntent stores the started intent row and returns its id. When the row
+// cannot be stored it returns system.audit_unavailable in required mode and a
+// zero id with no error in best-effort mode.
+func beginIntent(c fiber.Ctx, recorder Recorder, mode Mode, target guardTarget) (int64, error) {
+	idRecorder, ok := recorder.(IDRecorder)
+	if !ok {
+		metrics.AuditIntentFailuresTotal.Inc()
+		slog.Error("audit guard recorder cannot write intent rows",
+			slog.String("action", target.action),
+			slog.String("mode", string(mode)),
+			slog.String("request_id", fiber.Locals[string](c, "request_id")),
+		)
+		return 0, intentUnavailable(mode)
+	}
+
+	intent := intentEvent(c, target)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), WriteTimeout)
+	defer cancel()
+	id, err := idRecorder.RecordID(ctx, intent)
+	if err != nil {
+		metrics.AuditIntentFailuresTotal.Inc()
+		slog.Warn("failed to write audit intent row",
+			slog.String("action", target.action),
+			slog.String("request_id", intent.RequestID),
+			slog.Any("error", err),
+		)
+		return 0, intentUnavailable(mode)
+	}
+	return id, nil
+}
+
+func intentUnavailable(mode Mode) error {
+	if mode == ModeRequired {
+		return apperror.NewCode(apperror.CodeSystemAuditUnavailable, "audit service unavailable")
+	}
+	return nil
+}
+
+func intentEvent(c fiber.Ctx, target guardTarget) Event {
+	info := requestInfoFor(c, 0, target.action, target.resource)
+	intent := Event{
+		TenantID:  info.TenantID,
+		ActorID:   info.ActorID,
+		ActorType: info.ActorType,
+		ActorRole: info.ActorRole,
+		Action:    target.action,
+		Resource:  target.resource,
+		// Like audit.Middleware, fall back to :key so a denied feature-flag
+		// attempt still records its target.
+		ResourceID:         routeResourceID(c),
+		Metadata:           map[string]any{"method": c.Method(), "route": target.routePath},
+		IP:                 info.IP,
+		UserAgent:          info.UserAgent,
+		RequestID:          info.RequestID,
+		Source:             SourceHTTP,
+		Outcome:            OutcomeStarted,
+		IdempotencyKeyHash: info.IdempotencyKeyHash,
+	}
+	if intent.ActorType == "" {
+		intent.ActorType = ActorTypeAnonymous
+	}
+	return intent
+}
+
+// runAndCompleteIntent runs the handler and completes the intent row with the
+// observed outcome, including a panic, which is recorded and re-raised.
+func runAndCompleteIntent(c fiber.Ctx, recorder Recorder, policy Policy, eventID int64, info *RequestInfo) error {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			completeGuarded(c, recorder, eventID, Completion{
+				Outcome:    OutcomeFailed,
+				StatusCode: fiber.StatusInternalServerError,
+				ErrorCode:  "panic",
+			})
+			panic(recovered)
+		}
+	}()
+
+	handlerErr := c.Next()
+	completion := classifyOutcome(c, handlerErr, info)
+	if policy.RequireDomain && completion.Outcome == OutcomeSucceeded && info.DomainEvents == 0 {
+		metrics.AuditDomainMissingTotal.Inc()
+		completion.Outcome = OutcomeUnknown
+		completion.ErrorCode = "audit.domain_missing"
+		slog.Warn("guarded mutation completed without a domain audit event",
+			slog.String("action", info.Action),
+			slog.String("request_id", info.RequestID),
+		)
+	}
+	completeGuarded(c, recorder, eventID, completion)
+	return handlerErr
 }
 
 func completeGuarded(c fiber.Ctx, recorder Recorder, eventID int64, completion Completion) {
@@ -202,7 +231,7 @@ func completeGuarded(c fiber.Ctx, recorder Recorder, eventID int64, completion C
 	if completion.ActorID == 0 {
 		completion.ActorType = ActorTypeAnonymous
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), WriteTimeout)
 	defer cancel()
 	if err := completer.Complete(ctx, eventID, completion); err != nil {
 		metrics.AuditCompletionFailuresTotal.Inc()

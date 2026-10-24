@@ -40,6 +40,11 @@ func TestRedisOptionsDefaultsAndZeroRetries(t *testing.T) {
 	if opts.MaxRetries != -1 {
 		t.Fatalf("MaxRetries = %d, want -1 (disabled) for REDIS_MAX_RETRIES=0", opts.MaxRetries)
 	}
+	// Callers bound each op with a context deadline; go-redis only honours it
+	// on socket I/O when ContextTimeoutEnabled is set.
+	if !opts.ContextTimeoutEnabled {
+		t.Fatal("ContextTimeoutEnabled = false, want true so context deadlines bound socket I/O")
+	}
 }
 
 func TestRedisOptionsRejectsInvalidURL(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -235,7 +236,8 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 	_, err = pool.Exec(ctx, `
 		UPDATE jobs
 		SET status = 'running', attempts = 1, max_attempts = 1,
-		    locked_at = now() - interval '10 minutes', locked_by = 'crashed-worker'
+		    locked_at = now() - interval '10 minutes', locked_by = 'crashed-worker',
+		    lease_expires_at = now() - interval '5 minutes'
 		WHERE id = $1`, id)
 	require.NoError(t, err)
 
@@ -278,6 +280,7 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 		SET status = 'running',
 		    attempts = 1,
 		    locked_at = now() - interval '1 hour',
+		    lease_expires_at = now() - interval '55 minutes',
 		    locked_by = 'crashed-worker',
 		    updated_at = now()
 		WHERE id = $1`, id)
@@ -373,6 +376,7 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 		SET status = 'queued',
 		    locked_by = NULL,
 		    locked_at = NULL,
+		    lease_expires_at = NULL,
 		    run_at = now()
 		WHERE id = $1`, id)
 	require.NoError(t, err)
@@ -388,11 +392,11 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 
 	// The current owner can heartbeat with its attempt. This also exercises
 	// heartbeatJobSQL's $3 parameter order against the database.
-	require.NoError(t, store.Heartbeat(ctx, id, workerID, currentAttempt))
+	require.NoError(t, store.Heartbeat(ctx, id, workerID, currentAttempt, time.Minute))
 
 	// Every stale bookkeeping write must be rejected by the attempt fence,
 	// even though the worker ID still matches.
-	require.ErrorIs(t, store.Heartbeat(ctx, id, workerID, staleAttempt), ErrLeaseLost)
+	require.ErrorIs(t, store.Heartbeat(ctx, id, workerID, staleAttempt, time.Minute), ErrLeaseLost)
 	require.ErrorIs(t, store.Fail(ctx, id, workerID, staleAttempt, "stale failure", nil), ErrLeaseLost)
 	require.ErrorIs(t, store.Succeed(ctx, id, workerID, staleAttempt), ErrLeaseLost)
 
@@ -442,16 +446,17 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 		SET status = 'running',
 		    attempts = 1,
 		    locked_at = now() - interval '1 hour',
+		    lease_expires_at = now() - interval '55 minutes',
 		    locked_by = 'live-worker',
 		    updated_at = now()
 		WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	// Simulate an in-flight heartbeat: locked_at moves forward, but the row
-	// lock is held until the transaction commits.
+	// Simulate an in-flight heartbeat: the lease deadline moves forward, but
+	// the row lock is held until the transaction commits.
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	_, err = tx.Exec(ctx, `UPDATE jobs SET locked_at = now() WHERE id = $1`, id)
+	_, err = tx.Exec(ctx, `UPDATE jobs SET locked_at = now(), lease_expires_at = now() + interval '1 minute' WHERE id = $1`, id)
 	require.NoError(t, err)
 
 	type claimResult struct {
@@ -725,10 +730,11 @@ func TestPurgeTerminalIntegration(t *testing.T) {
 		t.Helper()
 		var id int64
 		err := pool.QueryRow(ctx, `
-			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, lease_expires_at)
 			VALUES ($1, '{}'::jsonb, $2, now(), 3,
 			        now() - make_interval(secs => $3::double precision),
-			        now() - make_interval(secs => $3::double precision))
+			        now() - make_interval(secs => $3::double precision),
+			        CASE WHEN $2 = 'running' THEN now() + interval '1 hour' END)
 			RETURNING id`,
 			kind, status, age.Seconds(),
 		).Scan(&id)
@@ -966,6 +972,91 @@ func integrationMigrationPath(t *testing.T) string {
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok, "resolve test file path")
 	return filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "000001_init_schema.up.sql")
+}
+
+// TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob runs a long-lease worker
+// and a short-lease worker on the same kind. The long-lease worker's job is
+// healthy (its lease has not expired), so the short-lease worker must never
+// reclaim it: expiry is the row's own deadline, not the claimer's lease.
+func TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const kind = "jobs.integration.mixed_lease"
+	id, err := NewQueue(pool).Enqueue(ctx, Job{Kind: kind, MaxAttempts: 5})
+	require.NoError(t, err)
+
+	var (
+		mu            sync.Mutex
+		running       int
+		maxConcurrent int
+		executions    int
+	)
+	started := make(chan struct{}, 1)
+	handler := func(ctx context.Context, _ json.RawMessage) error {
+		mu.Lock()
+		running++
+		executions++
+		maxConcurrent = max(maxConcurrent, running)
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			running--
+			mu.Unlock()
+		}()
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		// Hold the job far longer than the short worker's lease.
+		select {
+		case <-time.After(time.Second):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	long := NewWorker(pool, "long-lease-worker",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+	)
+	long.Register(kind, handler)
+	runIntegrationWorker(t, long)
+
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("long-lease worker did not start the job")
+	}
+
+	short := NewWorker(pool, "short-lease-worker",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(100*time.Millisecond),
+		WithHeartbeatInterval(20*time.Millisecond),
+	)
+	short.Register(kind, handler)
+	runIntegrationWorker(t, short)
+
+	var (
+		status   string
+		attempts int
+		lockedBy *string
+	)
+	require.Eventually(t, func() bool {
+		err := pool.QueryRow(ctx,
+			`SELECT status, attempts, locked_by FROM jobs WHERE id = $1`, id,
+		).Scan(&status, &attempts, &lockedBy)
+		return err == nil && status == "succeeded"
+	}, 10*time.Second, 20*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, executions, "the healthy job must run exactly once")
+	assert.Equal(t, 1, maxConcurrent, "the job must never run on two workers at once")
+	assert.Equal(t, 1, attempts, "a reclaim would have burned an attempt")
 }
 
 func runIntegrationWorker(t *testing.T, worker *Worker) {

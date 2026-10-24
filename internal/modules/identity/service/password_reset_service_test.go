@@ -66,7 +66,7 @@ func TestForgotPassword(t *testing.T) {
 		}
 
 		// Verify rate limit was set
-		if _, ok := cache.items["password_reset:test@example.com:tenant=1"]; !ok {
+		if _, ok := cache.items[scopedKey(context.Background(), "password_reset:", "test@example.com")]; !ok {
 			t.Error("expected rate limit cache key to be set")
 		}
 	})
@@ -116,7 +116,7 @@ func TestForgotPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		// Pre-set rate limit
-		cache.items["password_reset:test@example.com:tenant=1"] = []byte("1")
+		cache.items[scopedKey(context.Background(), "password_reset:", "test@example.com")] = []byte("1")
 
 		err := svc.ForgotPassword(context.Background(), dto.ForgotPasswordRequest{
 			Email: "test@example.com",
