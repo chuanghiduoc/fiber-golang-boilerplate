@@ -147,3 +147,25 @@ func (q *Queries) GetRefreshTokenByToken(ctx context.Context, arg GetRefreshToke
 	)
 	return i, err
 }
+
+const purgeExpiredRefreshTokens = `-- name: PurgeExpiredRefreshTokens :execrows
+WITH batch AS (
+    SELECT id FROM refresh_tokens
+    WHERE expires_at < now()
+    LIMIT $1::int
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM refresh_tokens AS t
+USING batch
+WHERE t.id = batch.id
+`
+
+// Maintenance purge across every tenant; see PurgeExpiredPasswordResetTokens.
+// Served by idx_refresh_tokens_expires_at.
+func (q *Queries) PurgeExpiredRefreshTokens(ctx context.Context, batchSize int32) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeExpiredRefreshTokens, batchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

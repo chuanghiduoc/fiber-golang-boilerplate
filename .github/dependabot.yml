@@ -9,15 +9,22 @@ updates:
     labels:
       - "dependencies"
     open-pull-requests-limit: 15
+    # Modules released together are upgraded together so a PR never mixes
+    # versions of one SDK.
     groups:
       golang-x:
         patterns:
           - "golang.org/x/*"
+      opentelemetry:
+        patterns:
+          - "go.opentelemetry.io/*"
+      aws-sdk:
+        patterns:
+          - "github.com/aws/*"
       testcontainers:
         patterns:
           - "github.com/testcontainers/*"
           - "github.com/moby/*"
-          - "go.opentelemetry.io/*"
 
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -30,7 +37,21 @@ updates:
       - "ci"
     open-pull-requests-limit: 5
 
+  # Dockerfile base images (Go toolchain and Alpine runtime).
   - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore(deps):"
+    labels:
+      - "dependencies"
+      - "docker"
+    open-pull-requests-limit: 5
+
+  # docker-compose.yml service images (PostgreSQL, Redis, SeaweedFS, OTel
+  # Collector).
+  - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
       interval: "weekly"

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -112,5 +113,20 @@ func TestRegister_ClearsPreexistingLockout(t *testing.T) {
 	}
 	if _, err := svc.Authenticate(ctx, dto.LoginRequest{Email: "future@example.com", Password: "Password1!"}); err != nil {
 		t.Fatalf("login after registration: %v", err)
+	}
+}
+
+// Lockout keys must not carry the raw address (PII in the cache), yet every
+// spelling of one normalized address must share its counters.
+func TestLoginAttemptKeysHashTheEmail(t *testing.T) {
+	ctx := WithClientIP(context.Background(), "203.0.113.7")
+	source, account := loginAttemptKeys(ctx, "Victim@Example.com")
+	for _, key := range []string{source, account} {
+		if strings.Contains(strings.ToLower(key), "victim") || strings.Contains(key, "@") {
+			t.Fatalf("lockout key %q contains the email address", key)
+		}
+	}
+	if _, sameAccount := loginAttemptKeys(ctx, "  victim@example.com "); sameAccount != account {
+		t.Fatalf("normalized spellings must share one account key: %q vs %q", sameAccount, account)
 	}
 }

@@ -62,6 +62,9 @@ func NewClient(cfg ClientConfig) *Client {
 	if guard == nil {
 		guard, _ = NewGuard(nil)
 	}
+	// The connect timeout bounds both the guarded TCP dial and the TLS
+	// handshake. The copy leaves the caller's Guard untouched.
+	guard = guard.withDialTimeout(connectTimeout)
 
 	transport := &http.Transport{
 		Proxy:                 nil,

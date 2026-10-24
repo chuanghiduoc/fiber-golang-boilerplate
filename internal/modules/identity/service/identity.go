@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/url"
 	"strconv"
 	"strings"
@@ -35,11 +37,18 @@ func clientIPFromContext(ctx context.Context) string {
 	return ip
 }
 
-// scopedKey prefixes a rate-limit cache key with the request tenant. The same
-// address can exist in multiple tenants, so a failed login in one tenant must
-// not lock the account out in another.
+// emailKeyBytes is how much of the SHA-256 digest keys an address (128 bits:
+// collision-free in practice, half the key length).
+const emailKeyBytes = 16
+
+// scopedKey builds a per-address rate-limit cache key scoped to the request
+// tenant. The address appears only as a truncated SHA-256 of its normalized
+// form, so cache keys (visible to cache operators, dumps, and monitoring)
+// never carry the raw email. The same address can exist in multiple tenants,
+// so a failed login in one tenant must not lock the account out in another.
 func scopedKey(ctx context.Context, prefix, email string) string {
-	return prefix + strings.TrimSpace(email) + ":tenant=" + strconv.FormatInt(tenant.EffectiveID(ctx), 10)
+	digest := sha256.Sum256([]byte(NormalizeEmail(email)))
+	return prefix + hex.EncodeToString(digest[:emailKeyBytes]) + ":tenant=" + strconv.FormatInt(tenant.EffectiveID(ctx), 10)
 }
 
 // tokenLink builds a frontend link that carries both the token and the tenant

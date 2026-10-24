@@ -34,6 +34,25 @@ func TestSanitizeMetadata_DeniesSensitiveKeys(t *testing.T) {
 	assert.Equal(t, "kept", nested["safe"])
 }
 
+// jsonb rejects \u0000 and PostgreSQL rejects invalid UTF-8, so either in a
+// client-controlled value would fail the audit insert.
+func TestSanitizeMetadata_StripsNULAndInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	clean := SanitizeMetadata(map[string]any{"agent\x00": "bad\xff\x00value", "list": []string{"a\x00b"}})
+
+	assert.Equal(t, "badvalue", clean["agent"])
+	assert.Equal(t, []string{"ab"}, clean["list"])
+}
+
+func TestPgText_MakesClientTextStorable(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "bad�ua", pgText("bad\xff\x00ua"))
+	assert.Equal(t, "", pgText("\x00"))
+	assert.Nil(t, nullableString("\x00"))
+}
+
 func TestSanitizeMetadata_RedactsValueShapes(t *testing.T) {
 	t.Parallel()
 

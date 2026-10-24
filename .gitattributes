@@ -1,0 +1,4 @@
+# Go tooling (gofmt, golangci-lint formatters) and shell scripts expect LF.
+# Normalize every text file to LF on all platforms, including Windows
+# checkouts with core.autocrlf=true.
+* text=auto eol=lf

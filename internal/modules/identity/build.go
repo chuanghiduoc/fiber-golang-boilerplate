@@ -15,6 +15,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -102,6 +103,7 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 	m := New(authHandler, userHandler)
 	m.userSvc = userSvc
 	m.resetSvc = passwordResetSvc
+	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
 	m.startup = func(ctx context.Context) error {
 		return startup(ctx, infra, userRepo, tenantRepo)
 	}
@@ -134,10 +136,34 @@ func (m *Module) AttachWebhooks(dispatcher webhookcontracts.Dispatcher) {
 }
 
 // RegisterJobs implements app.JobProvider: the worker performs queued
-// forgot-password requests. A module built with New (tests) registers nothing.
+// forgot-password requests and the expired-token purge. A module built with
+// New (tests) registers nothing.
 func (m *Module) RegisterJobs(registrar jobs.Registrar) {
 	if m.resetSvc != nil {
 		registrar.Register(identityservice.ResetRequestJobKind, m.resetSvc.HandleResetRequestJob)
+	}
+	if m.tokenPurger != nil {
+		registrar.Register(identityservice.TokenPurgeJobKind, m.tokenPurger.HandleJob)
+	}
+}
+
+// tokenPurgeSchedule enqueues the expired-token purge. The scheduler is
+// optional (SCHEDULER_ENABLED, default false); without it expired tokens are
+// still rejected on use but are never deleted.
+var tokenPurgeSchedule = scheduler.Spec{
+	Name:     "identity.tokens.purge_expired",
+	Interval: identityservice.TokenPurgeInterval,
+	Kind:     identityservice.TokenPurgeJobKind,
+}
+
+// RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
+// so a registration error is a programming error and fails startup loudly.
+func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
+	if m.tokenPurger == nil {
+		return
+	}
+	if err := registry.Register(tokenPurgeSchedule); err != nil {
+		panic(fmt.Sprintf("identity: register %s schedule: %v", tokenPurgeSchedule.Name, err))
 	}
 }
 

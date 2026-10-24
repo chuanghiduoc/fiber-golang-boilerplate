@@ -20,7 +20,7 @@ data:
   APP_JSON_BODY_LIMIT: "1048576"
   # Seconds; at most 15 so in-flight requests finish inside the 20s shutdown
   # budget (terminationGracePeriodSeconds 30 = 5s preStop + 20s + 5s margin).
-  APP_REQUEST_TIMEOUT: "15"
+  APP_REQUEST_TIMEOUT: "12"
   LOG_LEVEL: "info"
   # Replace with the public frontend origin (https is enforced in production).
   APP_FRONTEND_URL: "https://app.example.com"
@@ -95,7 +95,7 @@ data:
   STORAGE_ALLOWED_MIME_TYPES: "image/jpeg,image/png,image/gif,image/webp,application/pdf"
   # S3 endpoint (host[:port], no scheme). Replace for another AWS region, or use
   # STORAGE_DRIVER=seaweedfs with the SeaweedFS S3 gateway (e.g.
-  # "seaweedfs-s3.storage.svc:8333"). S3_ACCESS_KEY / S3_SECRET_KEY live in the Secret.
+  # "seaweedfs-s3.storage.svc:8333"). STORAGE_S3_ACCESS_KEY / STORAGE_S3_SECRET_KEY live in the Secret.
   STORAGE_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
   STORAGE_S3_REGION: "us-east-1"
   STORAGE_S3_BUCKET: "REPLACE_WITH_S3_BUCKET"

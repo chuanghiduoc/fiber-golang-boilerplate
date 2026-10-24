@@ -582,7 +582,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		}
 		repo.nextID = 2
 
-		user, err := svc.FindOrCreateByGoogle(context.Background(), "google-123", "google@example.com", "Google User", true)
+		user, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-123", Email: "google@example.com", Name: "Google User", AllowSignUp: true})
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -602,7 +602,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		}
 		repo.nextID = 2
 
-		user, err := svc.FindOrCreateByGoogle(context.Background(), "google-456", "existing@example.com", "Existing", true)
+		user, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-456", Email: "existing@example.com", Name: "Existing", AllowSignUp: true})
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -623,7 +623,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		user, err := svc.FindOrCreateByGoogle(context.Background(), "google-789", "new@example.com", "New User", true)
+		user, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-789", Email: "new@example.com", Name: "New User", AllowSignUp: true})
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -643,7 +643,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		_, err := svc.FindOrCreateByGoogle(context.Background(), "google-new", "blocked@example.com", "Blocked", false)
+		_, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-new", Email: "blocked@example.com", Name: "Blocked", AllowSignUp: false})
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) || appErr.Code != string(apperror.CodeFeatureDisabled) {
 			t.Fatalf("expected feature.disabled, got %v", err)
@@ -663,7 +663,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		}
 		repo.nextID = 2
 
-		user, err := svc.FindOrCreateByGoogle(context.Background(), "google-123", "google@example.com", "Google User", false)
+		user, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-123", Email: "google@example.com", Name: "Google User", AllowSignUp: false})
 		if err != nil {
 			t.Fatalf("expected existing user to sign in, got %v", err)
 		}

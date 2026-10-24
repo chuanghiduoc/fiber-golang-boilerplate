@@ -74,6 +74,21 @@ func TestGuard_RequiredIntentFailureFailsClosed(t *testing.T) {
 	assert.False(t, called, "the handler must not run without a durable intent row")
 }
 
+// Privileged mutations are fail-closed: best-effort must be opted into.
+func TestGuard_ZeroModeFailsClosed(t *testing.T) {
+	recorder := &guardRecorder{intentErr: errors.New("database down")}
+	called := false
+	app := newGuardApp(recorder, Policy{}, func(c fiber.Ctx) error {
+		called = true
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	resp, err := doGuardRequest(t, app)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusServiceUnavailable, resp.StatusCode)
+	assert.False(t, called, "an empty Mode must default to ModeRequired")
+}
+
 func TestGuard_NoopRequiredFailsClosed(t *testing.T) {
 	app := newGuardApp(Noop{}, Policy{Mode: ModeRequired}, func(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNoContent)

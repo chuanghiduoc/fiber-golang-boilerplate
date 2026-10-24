@@ -71,6 +71,13 @@ func (e *AppError) WithDetailKey(key string, params map[string]any) *AppError {
 
 func (e *AppError) Error() string { return e.Detail }
 
+// Is makes a 404 AppError match ErrNotFound, so errors.Is(err, ErrNotFound)
+// means "not found" whether err is the repository sentinel or a service's
+// apperror.NewNotFound. No other status matches any sentinel.
+func (e *AppError) Is(target error) bool {
+	return target == ErrNotFound && e.Status == fiber.StatusNotFound
+}
+
 func newError(status int, code, title, detail string) *AppError {
 	return &AppError{Status: status, Code: code, Title: title, Detail: detail}
 }

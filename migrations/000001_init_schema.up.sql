@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 -- per-user query (and the FK cascade) filters (tenant_id, user_id).
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant_user_id
     ON refresh_tokens (tenant_id, user_id);
+-- The scheduled cross-tenant purge (PurgeExpiredRefreshTokens) deletes expired
+-- rows in bounded batches. Refresh tokens accrue one row per sign-in, so the
+-- purge must not scan the table; the one-row-per-user reset and verification
+-- token tables stay small enough to purge without an index.
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_expires_at
+    ON refresh_tokens (expires_at);
 
 -- ---------------------------------------------------------------------------
 -- identity: password-reset tokens (one live token per user)
@@ -430,16 +436,31 @@ CREATE TABLE IF NOT EXISTS jobs (
     run_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     locked_at TIMESTAMP WITH TIME ZONE,
     locked_by TEXT,
+    -- lease_expires_at is the owning worker's lease deadline, written as
+    -- now() + that worker's lease on claim and on every heartbeat. Keeping it
+    -- per row means a worker configured with a short lease cannot reclaim a
+    -- healthy job held by a worker with a longer lease.
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
     last_error TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    -- A running row without a deadline could never be reclaimed after its
+    -- worker crashed, so the database refuses it.
+    CONSTRAINT jobs_running_has_lease
+        CHECK (status <> 'running' OR lease_expires_at IS NOT NULL)
 );
 
 -- claimJobsSQL is a cross-tenant pass: the due CTE (status = 'queued',
--- run_at <= now()) and the lease-expiry CTE (status = 'running') use this.
--- Claim and purge are global by design, so there is no tenant-leading
--- status/kind index; the only tenant-scoped lookup is the idempotency key.
+-- run_at <= now()) uses this. Claim and purge are global by design, so there
+-- is no tenant-leading status/kind index; the only tenant-scoped lookup is the
+-- idempotency key.
 CREATE INDEX IF NOT EXISTS idx_jobs_status_run_at ON jobs (status, run_at);
+-- The lease-expiry CTE scans running rows by deadline
+-- (status = 'running' AND lease_expires_at < now()); the partial predicate
+-- keeps the index as small as the in-flight set.
+CREATE INDEX IF NOT EXISTS idx_jobs_running_lease_expires_at
+    ON jobs (lease_expires_at)
+    WHERE status = 'running';
 -- Keys are scoped by tenant because callers may use user-provided keys.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_tenant_idempotency_key
     ON jobs (tenant_id, idempotency_key)

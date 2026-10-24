@@ -52,10 +52,12 @@ var _ Registrar = (*Worker)(nil)
 // worker's retry, panic, and success paths can be unit tested without a
 // PostgreSQL server.
 type store interface {
-	Claim(ctx context.Context, workerID string, limit int, staleAfter time.Duration) ([]claimedJob, error)
+	// Claim and Heartbeat set the job's lease deadline to now() + lease, the
+	// calling worker's own lease, so workers with different leases coexist.
+	Claim(ctx context.Context, workerID string, limit int, lease time.Duration) ([]claimedJob, error)
 	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
 	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
-	Heartbeat(ctx context.Context, id int64, workerID string, attempts int) error
+	Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error
 	Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error
 	PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error)
 }
@@ -323,23 +325,14 @@ func (w *Worker) Run(ctx context.Context) error {
 	// restarted more often than the interval still performs retention.
 	lastPurge := time.Now().Add(-w.purgeInterval)
 
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-
-		if w.retention > 0 && time.Since(lastPurge) >= w.purgeInterval {
-			w.purgeTerminal(ctx)
-			// Reset even after a failure so a broken purge cannot hammer the
-			// database on every claim-loop iteration.
-			lastPurge = time.Now()
-		}
+	for ctx.Err() == nil {
+		lastPurge = w.purgeIfDue(ctx, lastPurge)
 
 		free := w.concurrency - len(slots)
 		if free == 0 {
+			// Every slot is busy: wait for a handler to finish (or shutdown).
 			select {
 			case <-ctx.Done():
-				return nil
 			case <-finished:
 			}
 			continue
@@ -347,72 +340,89 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		claimed, err := w.store.Claim(ctx, w.id, free, w.leaseDuration)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			metrics.JobsClaimErrorsTotal.Inc()
-			slog.Warn("jobs: claim failed; retrying",
-				"worker_id", w.id,
-				"retry_in", claimBackoff,
-				"error", err,
-			)
-			if !waitFor(ctx, claimBackoff) {
-				return nil
-			}
-			claimBackoff = cappedClaimBackoff(claimBackoff * 2)
+			claimBackoff = w.backOffAfterClaimError(ctx, err, claimBackoff)
 			continue
 		}
 		claimBackoff = cappedClaimBackoff(w.pollInterval)
 
 		if len(claimed) == 0 {
-			if !waitFor(ctx, w.pollInterval) {
-				return nil
-			}
+			waitFor(ctx, w.pollInterval)
 			continue
 		}
-
 		for _, job := range claimed {
-			metrics.JobsClaimedTotal.WithLabelValues(job.Kind).Inc()
-			metrics.JobsQueueLagSeconds.WithLabelValues(job.Kind).Observe(job.QueueLag.Seconds())
-			// Claims never exceed the free slot count, so this send does not
-			// block and the concurrency limit is respected.
-			slots <- struct{}{}
-			wg.Add(1)
-			go func(job claimedJob) {
-				defer wg.Done()
-				defer func() {
-					<-slots
-					// finished is only a wake-up hint for the free==0 case.
-					// Never block on it: when jobs are sparse the main loop may
-					// not be waiting, and a full buffer would leak this goroutine
-					// (and hang shutdown in wg.Wait).
-					select {
-					case finished <- struct{}{}:
-					default:
-					}
-				}()
-				if err := w.processJob(ctx, job); err != nil {
-					// The lease reclaimer is the safety net; log loudly so a
-					// persistent bookkeeping failure is visible in operations.
-					slog.Error("jobs: failed to record job outcome",
-						"job_id", job.ID,
-						"kind", job.Kind,
-						"worker_id", w.id,
-						"error", err,
-					)
-				}
-			}(job)
+			w.dispatch(ctx, job, slots, finished, &wg)
 		}
 	}
+	return nil
 }
 
-// processJob runs one claimed job and records its outcome. The handler is
-// always isolated behind callHandler so a panic is treated as a normal
-// failure. While the handler runs a background heartbeat keeps the job's lease
-// alive; it uses the worker context and is stopped and joined before the final
-// success/failure write so no heartbeat can race that write. The handler gets a
-// child context bounded by the job timeout, which does not affect the
-// heartbeat.
+// purgeIfDue runs a retention pass when one is due and returns the time of the
+// last pass. The time is reset even after a failure so a broken purge cannot
+// hammer the database on every claim-loop iteration.
+func (w *Worker) purgeIfDue(ctx context.Context, lastPurge time.Time) time.Time {
+	if w.retention <= 0 || time.Since(lastPurge) < w.purgeInterval {
+		return lastPurge
+	}
+	w.purgeTerminal(ctx)
+	return time.Now()
+}
+
+// backOffAfterClaimError records a failed claim, sleeps for the current
+// backoff, and returns the next (doubled, capped) backoff. A failure caused by
+// shutdown is not an error and returns at once.
+func (w *Worker) backOffAfterClaimError(ctx context.Context, err error, backoff time.Duration) time.Duration {
+	if ctx.Err() != nil {
+		return backoff
+	}
+	metrics.JobsClaimErrorsTotal.Inc()
+	slog.Warn("jobs: claim failed; retrying",
+		"worker_id", w.id,
+		"retry_in", backoff,
+		"error", err,
+	)
+	waitFor(ctx, backoff)
+	return cappedClaimBackoff(backoff * 2)
+}
+
+// dispatch runs one claimed job on its own goroutine. Claims never exceed the
+// free slot count, so taking a slot does not block and the concurrency limit
+// is respected.
+func (w *Worker) dispatch(ctx context.Context, job claimedJob, slots, finished chan struct{}, wg *sync.WaitGroup) {
+	metrics.JobsClaimedTotal.WithLabelValues(job.Kind).Inc()
+	metrics.JobsQueueLagSeconds.WithLabelValues(job.Kind).Observe(job.QueueLag.Seconds())
+
+	slots <- struct{}{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() {
+			<-slots
+			// finished is only a wake-up hint for the free==0 case. Never
+			// block on it: when jobs are sparse the main loop may not be
+			// waiting, and a full buffer would leak this goroutine (and hang
+			// shutdown in wg.Wait).
+			select {
+			case finished <- struct{}{}:
+			default:
+			}
+		}()
+		if err := w.processJob(ctx, job); err != nil {
+			// The lease reclaimer is the safety net; log loudly so a
+			// persistent bookkeeping failure is visible in operations.
+			slog.Error("jobs: failed to record job outcome",
+				"job_id", job.ID,
+				"kind", job.Kind,
+				"worker_id", w.id,
+				"error", err,
+			)
+		}
+	}()
+}
+
+// processJob runs one claimed job and records its outcome: success, a release
+// when the failure coincided with worker shutdown, or a failure that retries
+// or dead-letters by the attempt budget. A handler that hits its own job
+// timeout is a real failure, not a shutdown, so it consumes the attempt.
 //
 // Every store write carries job.Attempts as a fence: if the lease expired and
 // another worker reclaimed the job, attempts has advanced and the stale owner's
@@ -421,93 +431,106 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	processCtx, span := w.startJobSpan(ctx, job)
 	defer span.End()
 
-	handler, ok := w.handler(job.Kind)
-	var (
-		handlerErr  error
-		interrupted bool
-	)
-	if !ok {
-		handlerErr = fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
-	} else {
-		// Restore the tenant that owns the job so handlers (email, audit, and
-		// future work) see the same context they would inside a request. Rows
-		// written before multi-tenancy, and test doubles, may omit the column;
-		// those jobs run under the compatibility tenant.
-		tenantID := job.TenantID
-		if tenantID == 0 {
-			tenantID = tenant.DefaultID
-		}
-		handlerCtx := tenant.WithID(processCtx, tenantID)
-		var cancel context.CancelFunc
-		if w.jobTimeout > 0 {
-			handlerCtx, cancel = context.WithTimeout(handlerCtx, w.jobTimeout)
-		}
-
-		stopHeartbeat := w.startHeartbeat(processCtx, job.ID, job.Attempts)
-		handlerErr = callHandler(handlerCtx, handler, job.Payload)
-		// Capture the deadline result immediately: stopHeartbeat can take time,
-		// and a disabled timeout must never classify a parent cancellation as a
-		// job timeout. Require the parent context to still be active so an
-		// already-expired parent deadline is not mislabeled as a job timeout.
-		timedOut := w.jobTimeout > 0 && ctx.Err() == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
-		// A failure while the worker itself is stopping is most likely the
-		// shutdown cancellation, not a verdict on the job.
-		interrupted = handlerErr != nil && ctx.Err() != nil
-		if cancel != nil {
-			cancel()
-		}
-		stopHeartbeat()
-		if handlerErr == nil && timedOut {
-			// The handler ignored cancellation and returned after its deadline,
-			// but it reported success: its side effects already happened, so
-			// recording a failure would re-run them. Record success and make
-			// the overrun visible instead.
-			slog.Warn("jobs: handler succeeded after exceeding the job timeout",
-				"job_id", job.ID,
-				"kind", job.Kind,
-				"worker_id", w.id,
-				"timeout", w.jobTimeout.String(),
-			)
-		}
-	}
+	interrupted, handlerErr := w.runHandler(ctx, processCtx, job)
 
 	// The job has already been claimed in the database, so bookkeeping must
 	// still run when the caller's context was canceled during shutdown.
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(processCtx), bookkeepingTimeout)
 	defer cancel()
 
-	if handlerErr == nil {
-		if err := w.store.Succeed(writeCtx, job.ID, w.id, job.Attempts); err != nil {
-			tracing.MarkError(span, err)
-			return fmt.Errorf("jobs: mark job %d succeeded: %w", job.ID, err)
-		}
-		span.SetAttributes(jobOutcomeAttributes("succeeded", nil)...)
-		metrics.JobsSucceededTotal.WithLabelValues(job.Kind).Inc()
-		return nil
+	switch {
+	case handlerErr == nil:
+		return w.recordSuccess(writeCtx, span, job)
+	case interrupted:
+		return w.recordRelease(writeCtx, span, job, handlerErr)
+	default:
+		return w.recordFailure(writeCtx, span, job, handlerErr)
+	}
+}
+
+// runHandler executes the job's handler. The handler is isolated behind
+// callHandler so a panic is treated as a normal failure, runs under the
+// owning tenant and a child context bounded by the job timeout, and is covered
+// by a background heartbeat on the worker context that is stopped and joined
+// before returning, so no heartbeat can race the outcome write. interrupted
+// reports a failure while the worker itself was stopping, which is most likely
+// the shutdown cancellation rather than a verdict on the job.
+func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJob) (interrupted bool, err error) {
+	handler, ok := w.handler(job.Kind)
+	if !ok {
+		return false, fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	}
 
-	reason := handlerErr.Error()
-	if interrupted {
-		// Requeue without consuming the attempt so a drain on the final
-		// attempt cannot dead-letter the job. Delivery stays at-least-once.
-		if err := w.store.Release(writeCtx, job.ID, w.id, job.Attempts, "jobs: interrupted by worker shutdown: "+reason); err != nil {
-			tracing.MarkError(span, err)
-			return fmt.Errorf("jobs: release job %d: %w", job.ID, err)
-		}
-		span.SetAttributes(jobOutcomeAttributes("released", nil)...)
-		return nil
+	// Restore the tenant that owns the job so handlers (email, audit, and
+	// future work) see the same context they would inside a request. Rows
+	// written before multi-tenancy, and test doubles, may omit the column;
+	// those jobs run under the compatibility tenant.
+	handlerCtx := tenant.WithID(processCtx, jobTenantID(job))
+	cancel := context.CancelFunc(func() {})
+	if w.jobTimeout > 0 {
+		handlerCtx, cancel = context.WithTimeout(handlerCtx, w.jobTimeout)
 	}
 
+	stopHeartbeat := w.startHeartbeat(processCtx, job.ID, job.Attempts)
+	err = callHandler(handlerCtx, handler, job.Payload)
+	// Capture both classifications immediately: stopHeartbeat can take time.
+	// A disabled timeout must never classify a parent cancellation as a job
+	// timeout, and an already-expired parent deadline is not a job timeout.
+	timedOut := w.jobTimeout > 0 && workerCtx.Err() == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
+	interrupted = err != nil && workerCtx.Err() != nil
+	cancel()
+	stopHeartbeat()
+
+	if err == nil && timedOut {
+		// The handler ignored cancellation and returned after its deadline,
+		// but it reported success: its side effects already happened, so
+		// recording a failure would re-run them. Record success and make the
+		// overrun visible instead.
+		slog.Warn("jobs: handler succeeded after exceeding the job timeout",
+			"job_id", job.ID,
+			"kind", job.Kind,
+			"worker_id", w.id,
+			"timeout", w.jobTimeout.String(),
+		)
+	}
+	return interrupted, err
+}
+
+func (w *Worker) recordSuccess(ctx context.Context, span trace.Span, job claimedJob) error {
+	if err := w.store.Succeed(ctx, job.ID, w.id, job.Attempts); err != nil {
+		tracing.MarkError(span, err)
+		return fmt.Errorf("jobs: mark job %d succeeded: %w", job.ID, err)
+	}
+	span.SetAttributes(jobOutcomeAttributes("succeeded", nil)...)
+	metrics.JobsSucceededTotal.WithLabelValues(job.Kind).Inc()
+	return nil
+}
+
+// recordRelease requeues a job interrupted by shutdown without consuming the
+// attempt, so a drain on the final attempt cannot dead-letter it. Delivery
+// stays at-least-once.
+func (w *Worker) recordRelease(ctx context.Context, span trace.Span, job claimedJob, handlerErr error) error {
+	reason := "jobs: interrupted by worker shutdown: " + handlerErr.Error()
+	if err := w.store.Release(ctx, job.ID, w.id, job.Attempts, reason); err != nil {
+		tracing.MarkError(span, err)
+		return fmt.Errorf("jobs: release job %d: %w", job.ID, err)
+	}
+	span.SetAttributes(jobOutcomeAttributes("released", nil)...)
+	return nil
+}
+
+// recordFailure schedules a retry while attempts remain and dead-letters the
+// job otherwise. Every failure retries, including an unregistered kind: a
+// rollout may register the missing handler before the budget runs out, and
+// the attempt cap still dead-letters genuinely unknown work.
+func (w *Worker) recordFailure(ctx context.Context, span trace.Span, job claimedJob, handlerErr error) error {
 	var retryAt *time.Time
-	// Every failure retries while attempts remain, including an unregistered
-	// kind. A rollout may register the missing handler before the budget runs
-	// out, and the attempt cap still dead-letters genuinely unknown work.
 	if job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
 		next := time.Now().Add(scaledBackoff(job.Attempts, w.retryBase, w.retryMax))
 		retryAt = &next
 	}
 
-	if err := w.store.Fail(writeCtx, job.ID, w.id, job.Attempts, reason, retryAt); err != nil {
+	if err := w.store.Fail(ctx, job.ID, w.id, job.Attempts, handlerErr.Error(), retryAt); err != nil {
 		tracing.MarkError(span, err)
 		return fmt.Errorf("jobs: mark job %d failed: %w", job.ID, err)
 	}
@@ -526,23 +549,28 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	return nil
 }
 
+// jobTenantID returns the tenant that owns job, falling back to the
+// compatibility tenant for rows (and test doubles) without one.
+func jobTenantID(job claimedJob) int64 {
+	if job.TenantID == 0 {
+		return tenant.DefaultID
+	}
+	return job.TenantID
+}
+
 // startJobSpan creates the per-attempt consumer span. It is always a new root:
 // a retry is not a child of the previous attempt. When the enqueue context
 // carried a W3C traceparent, a link preserves causality without forcing the
 // request's sampling or parentage. A no-op tracer is used when tracing is
 // disabled, so the returned span is safe to annotate.
 func (w *Worker) startJobSpan(ctx context.Context, job claimedJob) (context.Context, trace.Span) {
-	tenantID := job.TenantID
-	if tenantID == 0 {
-		tenantID = tenant.DefaultID
-	}
 	opts := []trace.SpanStartOption{
 		trace.WithSpanKind(trace.SpanKindConsumer),
 		trace.WithNewRoot(),
 		trace.WithAttributes(
 			attribute.Int64("job.id", job.ID),
 			attribute.String("job.kind", job.Kind),
-			attribute.Int64("job.tenant_id", tenantID),
+			attribute.Int64("job.tenant_id", jobTenantID(job)),
 			attribute.Int("job.attempt", job.Attempts),
 			attribute.Int("job.max_attempts", job.MaxAttempts),
 		),
@@ -623,7 +651,7 @@ func (w *Worker) startHeartbeat(ctx context.Context, id int64, attempts int) fun
 					timeout = bookkeepingTimeout
 				}
 				callCtx, callCancel := context.WithTimeout(hbCtx, timeout)
-				err := w.store.Heartbeat(callCtx, id, w.id, attempts)
+				err := w.store.Heartbeat(callCtx, id, w.id, attempts, w.leaseDuration)
 				callCancel()
 				if err != nil {
 					// A missed heartbeat is not fatal here: either the lease is

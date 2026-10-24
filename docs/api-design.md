@@ -1,40 +1,44 @@
 # API Design System
 
 Conventions for every HTTP endpoint in this service. Changes here are public
-contract changes; treat them as breaking unless additive.
+contract changes; treat them as breaking unless additive. Middleware order and
+module boundaries are in [Architecture](architecture.md#request-lifecycle).
 
 ## Base and versioning
 
 - Base path: `/api/v1`. `/api/v2` exists only when at least one module
   implements `app.V2Module`; Swagger documents v1.
 - The path selects the surface. `Accept-Version` is an optional assertion
-  (`1`, `v1`, `2`, or `v2`); when present it must match the path. A mismatch
-  returns `406 api.version_unsupported`.
+  (`1`, `v1`, `2`, or `v2`); when present it must match the path, otherwise
+  `406 api.version_unsupported`.
 - Version-shaped paths that are not mounted (for example `/api/v3`) also return
   `406 api.version_unsupported`, never a generic 404.
-- Every versioned response carries `API-Version` (the serving version) and
-  `Vary: Accept-Version`. Deprecated versions add `Deprecation` (RFC 9745
-  `@<unix-seconds>`), `Sunset` (HTTP-date), and `Link` (`rel="deprecation"` to
-  `DocsURL`, `rel="successor-version"` to the successor path).
-- Additive fields are non-breaking. Removing/renaming fields, changing types,
+- Every versioned response carries `API-Version` and `Vary: Accept-Version`.
+  Deprecated versions add `Deprecation` (RFC 9745 `@<unix-seconds>`), `Sunset`
+  (HTTP-date), and `Link` (`rel="deprecation"` to `DocsURL`,
+  `rel="successor-version"` to the successor path).
+- Additive fields are non-breaking. Removing/renaming fields or changing types,
   status codes, or error codes requires a new major version or a documented
   deprecation window.
 
 ## JSON conventions
 
-- camelCase keys (`accessToken`, `nextCursor`).
-- IDs are JSON numbers (int64). Timestamps are RFC 3339 UTC strings.
-- Optional/absent values are omitted or `null`; empty lists are `[]`, never
-  `null`.
-- Requests reject unknown fields and trailing JSON values.
-- Request bodies use `application/json`; uploads use `multipart/form-data`.
+| Rule | Example |
+|---|---|
+| camelCase keys | `accessToken`, `nextCursor` |
+| IDs are JSON numbers (int64); timestamps are RFC 3339 UTC strings | `"createdAt": "2026-10-24T12:00:00Z"` |
+| Optional values are omitted or `null`; empty lists are `[]`, never `null` | `"data": []` |
+| Requests reject unknown fields and trailing JSON values | `{"name":"x","extra":1}` is rejected |
+| Bodies are `application/json`; uploads are `multipart/form-data` | `POST /files/upload` |
 
 ## Success responses
 
-- `200 OK` returns the resource directly (no `{data,meta}` wrapper).
-- `201 Created` returns the created resource; `Location` where applicable.
-- `204 No Content` has no body.
-- Lists use a Stripe-style envelope:
+| Status | Body |
+|---|---|
+| `200 OK` | The resource directly (no `{data,meta}` wrapper) |
+| `201 Created` | The created resource; `Location` where applicable |
+| `204 No Content` | No body |
+| List | Stripe-style envelope (below) |
 
 ```json
 {
@@ -46,39 +50,52 @@ contract changes; treat them as breaking unless additive.
 }
 ```
 
-Pagination is forward-only: `limit` (1-100, default 20) + `startingAfter`.
-Cursors are opaque base64url `(created_at:id)`. Handlers build `nextCursor`
-with `pagination.NextCursor` from the last item's sort key. Offset helpers are
-for small admin/export tables only.
+## Pagination
+
+Forward-only cursor pagination: `limit` (1-100, default 20; a non-positive
+value becomes 20 and anything above 100 becomes 100) + `startingAfter`. Cursors are opaque base64url of
+`<created_at RFC3339Nano>:<id>`. Offset helpers are for small admin/export
+tables only.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant H as Handler
+    participant S as Service
+    participant DB as Repository / PostgreSQL
+
+    C->>H: GET /files?limit=20&startingAfter=cursor
+    H->>S: limit, startingAfter
+    S->>S: NormalizeLimit, DecodeCursor (bad cursor: 400)
+    S->>DB: WHERE (created_at, id) < (cursor) ORDER BY created_at DESC, id DESC LIMIT 21
+    Note over DB: first page binds ('infinity', MaxInt64)<br/>so the same index condition applies
+    DB-->>S: up to limit + 1 rows
+    S->>S: hasMore = rows > limit, trim to limit
+    S-->>H: page, hasMore
+    H-->>C: response.List with nextCursor = NextCursor(last item) when hasMore
+    C->>H: next request with startingAfter = nextCursor
+```
 
 Cursor SQL always uses the plain row comparison
 `(created_at, id) < (@cursor_created_at, @cursor_id)`; repositories bind
-`DBCursor.CreatedAtParam()`/`IDParam()`, which return `('infinity',
-MaxInt64)` on the first page. Never write `NOT @has_cursor OR ...`: under a
-generic (prepared) plan the OR form can only filter, so a deep page scans every
-newer row (measured on 200k rows: 2,742 buffers vs 5 with the row comparison
-as an index condition).
+`DBCursor.CreatedAtParam()`/`IDParam()`. Never write `NOT @has_cursor OR ...`:
+under a generic (prepared) plan the OR form can only filter, so a deep page
+scans every newer row (measured on 200k rows: 2,742 buffers vs 5 with the row
+comparison as an index condition).
 
 ## Update semantics
 
-Existing `PUT` routes keep their current, documented behavior:
+| Style | Routes |
+|---|---|
+| **Partial update** (pointer DTO fields; omitted fields unchanged) | `PUT /users/me`, `PUT /users/:id` (`name`, `email`), `PUT /admin/api-keys/:id` (`name`, `scopes`) |
+| **Full replace** (omitted optional fields reset to defaults) | `PUT /webhooks/endpoints/:id` (`url`/`status`), `PUT /webhooks/inbound-sources/:id` (`name`/`slug`/`status`), `PUT /admin/features/flags/{key}` (database default/kill switch/description) |
+| **Upsert** | Notification preference and feature-flag target `PUT`s |
+| **RPC-style, kept for compatibility** | `POST /files/upload` (multipart create), `POST /admin/api-keys/:id/revoke` (alias of `DELETE /admin/api-keys/:id`) |
 
-- **Partial update (pointer DTO fields):** `PUT /users/me`, `PUT /users/:id`
-  (`name`, `email`) and `PUT /admin/api-keys/:id` (`name`, `scopes`) change
-  only the fields present; omitted fields are left unchanged.
-- **Full replace:** `PUT /webhooks/endpoints/:id` and
-  `PUT /webhooks/inbound-sources/:id` require the full representation
-  (`url`/`status`, `name`/`slug`/`status`); omitted optional fields reset to
-  their defaults. `PUT /admin/features/flags/{key}` likewise replaces the
-  database default/kill switch/description, and the preference and target
-  `PUT`s are upserts.
-- **New modules:** use `PUT` only for full replacement and `PATCH` with
-  pointer (or explicitly nullable) fields for partial updates.
-- **RPC-style routes kept for compatibility:** `POST /files/upload` (multipart
-  create) and the `POST /admin/api-keys/:id/revoke` alias of
-  `DELETE /admin/api-keys/:id` stay as-is. New modules create with
-  `POST /<collection>` and model state transitions as sub-resource actions
-  only when no standard method fits.
+New modules use `PUT` only for full replacement, `PATCH` with pointer (or
+explicitly nullable) fields for partial updates, create with
+`POST /<collection>`, and model state transitions as sub-resource actions only
+when no standard method fits.
 
 ## Errors (RFC 9457)
 
@@ -98,364 +115,311 @@ All errors use `application/problem+json`:
 }
 ```
 
-Rules:
+```mermaid
+flowchart TD
+    err["error returned by middleware,<br/>handler, or service"] --> eh{"Fiber error handler"}
+    eh -->|"*apperror.AppError"| app["use as-is"]
+    eh -->|context.DeadlineExceeded| t504["504 gateway_timeout"]
+    eh -->|context.Canceled| t499["499 client_closed_request"]
+    eh -->|"*fiber.Error"| fe["map status to code<br/>(413 becomes payload_too_large)"]
+    eh -->|anything else| t500["log type + path<br/>500 internal, generic detail"]
+    app --> wp
+    t504 --> wp
+    t499 --> wp
+    fe --> wp
+    t500 --> wp
+    wp["build problem"] --> type["type = ERROR_DOCS_BASE_URL + catalog DocPath"]
+    type --> loc{"localizer installed?"}
+    loc -->|yes| l10n["localize title, errors[].message,<br/>and detail only if DetailKey set"]
+    loc -->|no| raw["keep English text"]
+    l10n --> out["application/problem+json<br/>with instance, requestId, timestamp"]
+    raw --> out
+```
 
-- `code` is the stable, dotted catalog identifier; clients may branch on it.
-- `detail` is public text and never contains SQL, stack traces, or internals.
-- `type` is `ERROR_DOCS_BASE_URL` + the catalog `DocPath`.
-- Validation failures use `422` with a flat `errors[]`.
-- `title` and `errors[].message` are localized from `Accept-Language` (`en` /
-  `vi`) when i18n is enabled. `detail` is localized only when the handler
-  attaches `AppError.DetailKey`; otherwise the supplied text is preserved.
-  Localization never changes `code`, `type`, `status`, `instance`, or paths.
-- Authorization failures use `403 permission.denied`.
-- Do not expose whether another user's resource exists; return `404`.
+| Rule | Detail |
+|---|---|
+| `code` | Stable dotted catalog identifier; clients may branch on it. Platform codes in `pkg/apperror/catalog.go`, module codes in `internal/modules/<m>/catalog/errors.go`. |
+| `detail` | Public text only; never SQL, stack traces, or internal causes. Unhandled errors are logged and rendered as a generic 500. |
+| `type` | `ERROR_DOCS_BASE_URL` + the catalog `DocPath`. |
+| Validation | `422` with a flat `errors[]` (`path`, `code`, `message`). |
+| Localization | `title` and `errors[].message` follow `Accept-Language` (`en`/`vi`) when i18n is enabled; `detail` only when the error carries `DetailKey` (`WithDetailKey`). `code`, `type`, `status`, `instance`, and paths never change. |
+| Authorization | `403 permission.denied`. |
+| Existence | Never disclose another user's or tenant's resource; return `404`. |
 
-## Status codes
+### Status codes
 
 | Code | Meaning |
 |---|---|
 | 200 | Read/update success |
 | 201 | Resource created |
 | 204 | Deleted/no content |
-| 400 | Malformed request / invalid token |
+| 400 | Malformed request, invalid cursor, invalid token |
 | 401 | Missing/invalid authentication |
-| 403 | Authenticated but not permitted |
-| 404 | Not found (including non-owned resources) |
+| 403 | Authenticated but not permitted, or tenant mismatch |
+| 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-admin, idempotency body mismatch |
-| 413 | Upload too large |
+| 409 | Conflict, duplicate, last-admin, idempotency in progress or body mismatch |
+| 413 | Body or upload too large |
 | 415 | Unsupported media type |
 | 422 | Validation failed |
 | 429 | Rate limited |
+| 499 | Client closed the request (logged; usually never delivered) |
 | 500 | Internal error |
 | 503 | Dependency degraded / not ready, or required audit intent unavailable |
 | 504 | Request timeout |
 
 ## Authentication and authorization
 
-- `Authorization: Bearer <jwt>` for protected routes.
-- `Authorization: ApiKey <prefix>_<secret>` for API-key clients. The secret is
-  32 random bytes encoded as unpadded base64url; only its SHA-256 hash is
-  stored. Keys are bound to one tenant and user, carry an explicit
-  `authz.Permission` scope list, and may expire or be revoked. Rotating a key
-  issues a replacement and leaves the previous key valid for a 24-hour grace
-  window unless it is revoked; revocation is immediate. A key is shown once at
-  creation/rotation. Admin lifecycle routes live under `/admin/api-keys` and
-  require `admin:api_keys:read|create|update|revoke|rotate`. Successful API-key
-  authentication sets `user_id`, `tenant_id`, `api_key_id`, and
-  `auth_method=api_key`; JWT requests set `auth_method=jwt`.
-- JWT pins HS256, requires `exp`/`iat`/`aud`/`iss`, and carries `token_version`
-  plus `tenant_id`. Tokens minted before multi-tenancy omit `tenant_id` and are
-  rejected with 401; clients must log in again after the upgrade.
-- Access tokens are short-lived; refresh tokens rotate atomically, are
-  single-use/version-bound, and are scoped to the tenant that issued them.
-- Permissions live in `internal/platform/authz`; route middleware uses
-  `authz.Require`. Never check role strings ad hoc in handlers. API-key scopes
-  are intersected with the owner's current role, so a scoped key can neither
-  exceed its recorded scopes nor retain capabilities after a demotion.
-- Attribute-based checks use `authz.Subject` (explicit permissions, tenant,
-  owner, cross-tenant flag, attributes), `Policy`/`PolicySet`, `TenantPolicy`,
-  and `OwnerPolicy`. `Authorize` performs an RBAC pre-check followed by
-  deny-overrides policy evaluation: deny maps to `403 permission.denied` and
-  conceal maps to `404` so cross-tenant/foreign-owner resources are not
-  disclosed.
-- Every authenticated module route accepts both credential types through one
-  chain (`app.Deps.Authenticate()`); the route's `authz.Require` decides
-  access, so an API key reaches a route only when its scopes include the
-  permission. The exception is `POST /auth/logout-all`, which is JWT-only.
+Every authenticated module route accepts both credential types through one
+chain (`app.Deps.Authenticate()`), after a per-IP `auth` limiter. The route's
+`authz.Require` then decides access, so an API key reaches a route only when
+its scopes include the permission. `POST /auth/logout-all` is the exception:
+JWT-only.
+
+```mermaid
+flowchart TD
+    req["Authorization header"] --> lim{"per-IP auth limiter"}
+    lim -->|exceeded| r429["429"]
+    lim --> scheme{"scheme"}
+    scheme -->|ApiKey| fmt{"well-formed key?"}
+    scheme -->|"Bearer, other, or missing"| jwt{"HS256 signature, exp,<br/>iss, aud valid?"}
+    fmt -->|no| r401a["401"]
+    fmt -->|yes| hash{"SHA-256 hash found?"}
+    hash -->|no| r401a
+    hash -->|yes| khdr{"explicit X-Tenant-Slug<br/>matches key tenant?"}
+    khdr -->|no| r403["403 tenant mismatch"]
+    khdr -->|yes| kstate{"not revoked, not expired,<br/>rotation grace open?"}
+    kstate -->|no| r401a
+    kstate -->|yes| owner{"owner active, tenant active,<br/>key newer than ban?"}
+    owner -->|no| r401a
+    owner -->|yes| ksub["subject = key scopes intersected<br/>with owner's current role<br/>auth_method=api_key"]
+    jwt -->|no| r401b["401"]
+    jwt -->|yes| claim{"tenant_id claim > 0?"}
+    claim -->|no| r401b
+    claim -->|yes| jhdr{"explicit X-Tenant-Slug<br/>matches claim?"}
+    jhdr -->|no| r403
+    jhdr -->|yes| sess{"session store: role, token_version,<br/>tenant, tenant status current?"}
+    sess -->|no| r401b
+    sess -->|yes| jsub["subject from role catalog<br/>auth_method=jwt"]
+    ksub --> authz{"authz.Require(permission)"}
+    jsub --> authz
+    authz -->|missing| d403["403 permission.denied"]
+    authz -->|granted| next["route limiter, idempotency, handler"]
+```
+
+| Aspect | JWT (`Authorization: Bearer <jwt>`) | API key (`Authorization: ApiKey <prefix>_<secret>`) |
+|---|---|---|
+| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries `token_version` and `tenant_id` | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
+| Tenant | `tenant_id` claim is authoritative; missing/zero/negative claim is `401` (tokens minted before multi-tenancy must log in again) | Key's bound tenant is authoritative |
+| Revocation | Session store compares role, token version, tenant, and tenant status (5s cache, generation-keyed invalidation); `POST /auth/logout-all` bumps the version | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban revokes keys issued before it |
+| Permissions | Derived from the role catalog | Explicit scopes intersected with the owner's **current** role, so a key never exceeds its scopes or survives a demotion |
+| Locals set | `user_id`, `tenant_id`, `auth_method=jwt` | `user_id`, `tenant_id`, `api_key_id`, `auth_method=api_key` |
+
+- Refresh tokens rotate atomically, are single-use, version-bound, and scoped
+  to the issuing tenant. Access tokens are short-lived.
 - `POST /auth/logout-all` requires `sessions:revoke` (every built-in role holds
   it), revokes all refresh tokens, and bumps the token version, invalidating
   access tokens immediately.
+- Permissions are declared in module catalogs (`catalog/permissions.go`) and
+  shared back-office permissions in `internal/platform/authz/permissions.go`;
+  routes use `authz.Require`. Never check role strings ad hoc in handlers.
+- Object-level checks use `authz.Subject` (explicit permissions, tenant, owner,
+  cross-tenant flag, attributes) with `Policy`/`PolicySet`, `TenantPolicy`, and
+  `OwnerPolicy`. `Authorize` runs an RBAC pre-check, then deny-overrides
+  evaluation: deny is `403 permission.denied`, conceal is `404`.
 
 ## Tenants
 
-- `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) selects the request tenant on
-  `/api/v1` routes. In local/test compatibility mode, omitting it resolves to
-  `TENANT_DEFAULT_SLUG` (`default`). `TENANT_REQUIRE_HEADER=true` rejects
-  header-less requests instead and is **required in production** so header-less
-  HTTP writes cannot fall back to tenant 1.
-- Invalid, unknown, or suspended slugs (including the configured default)
-  return `404` with detail `tenant not found`. Startup existence checks ignore
-  status: a suspended configured/default tenant does not crash the API or seed
-  commands; its requests return `404` until reactivated.
-- Validated `?tenant=<slug>` is accepted as a fallback on `GET /auth/google`
-  and the reset/verify endpoints because browser navigation and emailed links
-  cannot set a custom header. An explicit `X-Tenant-Slug` takes precedence.
-- Authenticated requests use the JWT `tenant_id` claim or the API key's bound
-  tenant. If an explicit `X-Tenant-Slug` resolves to a different tenant, the
-  request fails with `403 permission.denied` and detail `tenant mismatch`.
-  Zero or negative tenant claims are rejected with `401`.
-- An API key without an explicit header remains usable for its own tenant; an
-  explicit header is only accepted when it resolves to the key's tenant. The
-  key owner and the owning tenant's status are re-read on every successful
-  authentication, so bans, deletions, role changes, and tenant suspensions
-  take effect immediately (`401`).
-- Slug resolution for `X-Tenant-Slug`/`?tenant=` is cached in-process
-  (`tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries
-  per process). Suspending a tenant therefore reaches header-resolved public
-  routes within 30s; authenticated JWT/API-key requests are rejected
-  independently by the session/API-key tenant-status checks.
-- One user belongs to one tenant; emails and Google IDs are unique per tenant.
-  Login, registration, refresh, password reset, and email verification use the
-  resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
-  every call unless a documented browser-auth query fallback applies.
-  Cross-tenant user/file/notification ids return `404`, refresh tokens fail as
-  invalid (`401`), and reset/verification link tokens return `400`.
-  Notification feed and preference reads are scoped to both the request tenant
-  and the authenticated user.
-- Password-reset and email-verification links include `?tenant=<slug>` in
-  addition to the opaque token. Token rows are tenant-bound, so completing a
-  link under another tenant fails without consuming the token.
-- Google OAuth binds the tenant into the signed `state`; the callback ignores
-  `X-Tenant-Slug`, uses that tenant, and rejects unknown or suspended tenants
-  (including one suspended mid-flow). Header-required mode does not block the
-  callback because tenant middleware exempts it and the handler validates
-  `state`.
-- `POST /auth/logout` revokes the presented refresh token by possession, with or
-  without `X-Tenant-Slug`; it returns `204` even if the token was already gone.
-- Idempotency scope includes method, path, tenant ID/slug, and caller (user ID
-  or public-route IP). The same key/body/IP in another tenant creates a new
-  response rather than replaying a cross-tenant `201`.
-- `UserResponse`/`FileResponse` include additive `tenantId` fields. Tokens
-  without a `tenant_id` claim are rejected (fail-closed).
-- **Remaining:** row-level security and per-tenant limits/quotas.
+| Rule | Behavior |
+|---|---|
+| Selection | `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) on `/api/v1` routes. Without it, local/test mode resolves `TENANT_DEFAULT_SLUG` (`default`); `TENANT_REQUIRE_HEADER=true` rejects header-less requests and is **required in production**. |
+| Unknown tenant | Invalid, unknown, or suspended slugs (including the default) return `404 tenant not found`. Startup checks only existence, so a suspended default tenant does not crash the API or seed. |
+| Browser fallback | Validated `?tenant=<slug>` is accepted on `GET /auth/google` and the reset/verify endpoints; an explicit header wins. Reset/verification links include `?tenant=<slug>`. |
+| Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. Key owner and tenant status are re-read on every authentication, so bans, deletions, role changes, and suspensions apply immediately (`401`). |
+| Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
+| Scoping | Emails and Google IDs are unique per tenant. Login, registration, refresh, reset, and verification use the request tenant. Cross-tenant user/file/notification ids return `404`, refresh tokens `401`, reset/verification tokens `400` (without consuming the token). |
+| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
+| Logout | `POST /auth/logout` revokes the presented refresh token by possession, with or without the header; `204` even if already gone. |
+| Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
+| Responses | `UserResponse`/`FileResponse` include additive `tenantId`. |
+| Remaining | Row-level security and per-tenant limits/quotas. |
 
 ## Headers
 
-- `X-Request-Id` is accepted if valid, otherwise generated; echoed on responses.
-- `X-Tenant-Slug` selects the tenant; it is in the default CORS allow list.
-  Browser-facing auth paths also accept a validated `?tenant=<slug>` fallback
-  (header wins).
-- `Idempotency-Key` is opt-in on mutating routes; 1-128 chars of
-  `[A-Za-z0-9._:-]`. Replays return `Idempotent-Replayed: true`.
-- `Accept-Language` negotiates `en`/`vi` with q-values, case-insensitive tags,
-  region truncation (`vi-VN` → `vi`), wildcards, and `I18N_DEFAULT_LOCALE`
-  fallback. Responses set `Content-Language` and `Vary: Accept-Language`.
-- `Accept-Version` asserts the path version; responses set `API-Version` and
-  `Vary: Accept-Version`, plus deprecation headers when applicable.
-- `Location`, `ETag`, locale, and version metadata are exposed through CORS.
-- Rate limits are tiered (strict/normal/relaxed) and keyed per API key when
-  authenticated with `ApiKey`, otherwise per user, then per IP. `429` is
-  retryable. Rotating a key moves subsequent requests to a new bucket.
+| Header | Direction | Contract |
+|---|---|---|
+| `X-Request-Id` | in/out | Accepted if valid, otherwise generated; echoed on responses. |
+| `X-Tenant-Slug` | in | Selects the tenant; in the default CORS allow list. |
+| `Idempotency-Key` | in | Opt-in on mutating routes; 1-128 chars of `[A-Za-z0-9._:-]`. |
+| `Idempotent-Replayed` | out | `true` on a replayed response. |
+| `Accept-Language` | in | `en`/`vi` with q-values, case-insensitive tags, region truncation (`vi-VN` → `vi`), wildcards, `I18N_DEFAULT_LOCALE` fallback. |
+| `Content-Language`, `Vary: Accept-Language` | out | Negotiated locale. |
+| `Accept-Version` | in | Asserts the path version. |
+| `API-Version`, `Vary: Accept-Version`, `Deprecation`, `Sunset`, `Link` | out | Version metadata. |
+
+`Location`, `ETag`, locale, and version metadata are exposed through CORS.
 
 ## Rate limits and quotas
 
-- Configured via `RATE_LIMIT_*`; separate keyspaces per tier.
-- Cache-backed (Redis in production); memory is single-replica only.
-- Login attempts, password-reset requests, and verification resends have
-  dedicated lockouts in addition to route limits. Login failures are counted
-  per (tenant, email, client IP); the account locks for every IP only after
-  5x the per-IP threshold, so a single client cannot lock someone else out.
-- Every authenticated route group runs an IP-keyed `auth` limiter
+- Configured via `RATE_LIMIT_*`; tiers are strict/normal/relaxed with separate
+  keyspaces. Cache-backed (Redis in production; memory is single-replica only).
+- Keyed per API key when authenticated with `ApiKey`, otherwise per user, then
+  per IP. `429` is retryable. Rotating a key moves later requests to a new
+  bucket.
+- Every authenticated route runs an IP-keyed `auth` limiter
   (`RATE_LIMIT_AUTH_MAX`/`RATE_LIMIT_AUTH_WINDOW_SECS`) before credential
   verification, so bogus credentials cannot drive unthrottled lookups.
+- Login attempts, password-reset requests, and verification resends have
+  dedicated lockouts. Login failures count per (tenant, email, client IP); the
+  account locks for every IP only after 5x the per-IP threshold, so one client
+  cannot lock someone else out.
 
 ## Idempotency
 
+| Situation | Response |
+|---|---|
+| First request with a key | Runs normally; a 2xx is cached for 24h |
+| Same key, same body, after success | Replayed response with `Idempotent-Replayed: true` (not re-audited) |
+| Same key while the first is in progress | `409` |
+| Same key, different body (non-multipart, up to 1 MiB, SHA-256 bound) | `409` |
+| Lock claim reply lost | The lock key is re-read: own token runs, another token gets `409`, missing key or read error fails open |
+| Cache unavailable | Fails open (request runs without idempotency) |
+
 - Send `Idempotency-Key` on POST/PUT/PATCH/DELETE when retries are possible.
-- First 2xx response is cached for 24h and replayed.
-- Concurrent duplicates return `409` while the first is in progress.
-- Non-multipart bodies up to 1 MiB are SHA-256-bound; same key with a different
-  body returns `409`.
-- The scope includes the tenant ID and slug (plus user ID, or IP for public
-  routes), so one key cannot replay a `201` across tenants.
-- Auth token-minting endpoints are excluded by design.
-- Secret-returning routes are excluded so plaintext secrets are never written
-  to the shared response cache: API-key create/rotate and webhook
-  endpoint/inbound-source create and `rotate-secret`. A retried rotation
-  rotates again and returns the newest secret.
+  The scope is method, path, tenant ID/slug, and caller (user ID, or IP for
+  public routes).
+- **Excluded by design:** auth token-minting endpoints, and secret-returning
+  routes (API-key create/rotate, webhook endpoint/inbound-source create and
+  `rotate-secret`) so plaintext secrets never enter the shared cache. A retried
+  rotation rotates again and returns the newest secret.
+- Operational detail (locks, TTLs, metrics): [Operations](operations.md).
 
 ## Audit and fail-closed behavior
 
 - Privileged mutations are audited before or atomically with the write. A
-  Tier 1 mutation whose audit row cannot be committed rolls back and returns
-  `503` with code `system.audit_unavailable` (retryable). A Tier 2 route whose
-  required pre-write intent cannot be stored returns the same 503 before the
-  handler runs; the mutation does not execute.
-- Retrying after 503 is safe when using the same `Idempotency-Key` where the
-  route supports it. Replayed responses are not re-audited.
+  Tier 1 mutation whose audit row cannot commit rolls back and returns
+  `503 system.audit_unavailable` (retryable). A Tier 2 route whose required
+  pre-write intent cannot be stored returns the same 503 before the handler
+  runs.
+- Retrying after 503 is safe with the same `Idempotency-Key` where supported.
+  Replayed responses are not re-audited.
 - Audit metadata is sanitized: passwords, tokens, emails, and URLs are
-  redacted, and size/depth are bounded. Do not design clients that depend on
-  request values being echoed back through audit endpoints (none are public).
-- A completion failure after a Tier 2 mutation cannot undo the write; operators
-  should alert on `audit_completion_failures_total` and stale `started` rows.
+  redacted; size/depth are bounded. No public endpoint echoes audit data.
+- A completion failure after a Tier 2 mutation cannot undo the write; alert on
+  `audit_completion_failures_total` and stale `started` rows.
 
 ## Files
 
-- `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist,
-  and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+- `POST /files/upload` accepts multipart `file`, enforces size and a MIME
+  allowlist, and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
 - Downloads are authenticated and tenant/ownership checked; there is no public
-  `/uploads` tree. A cross-tenant id returns `404`, never `403`; the same owner
-  check conceals another user's file within the tenant. Services enforce these
-  boundaries with `authz.TenantPolicy` + `authz.OwnerPolicy`; admin services use
-  the tenant policy only.
+  `/uploads` tree. Cross-tenant or other-owner ids return `404`, never `403`
+  (`authz.TenantPolicy` + `authz.OwnerPolicy`; admin services use the tenant
+  policy only).
 - Deletes are soft; `includeDeleted=true` exposes trash to the owner and
   `POST /files/:id/restore` requires `files:restore`.
 - `Content-Disposition` follows RFC 6266/5987.
 
 ## Webhooks
 
-- Admin/permission routes: `/api/v1/webhooks/endpoints`,
-  `/api/v1/webhooks/deliveries`, and `/api/v1/webhooks/inbound-sources` with
-  `webhooks:read` / `webhooks:write` (`admin` role).
-- Endpoint create and inbound-source create return a plaintext `secret` once;
-  reads never include it. Rotation returns the new secret once.
-  Secret-returning creates and `rotate-secret` deliberately omit
-  `Idempotency-Key` caching; update/delete/replay accept it.
-- Every administration mutation (endpoint/source create, update, delete,
-  rotate-secret, and delivery replay) is Tier 2: a required `audit.Guard`
-  intent row is written first, so an unavailable audit store returns
-  `503 system.audit_unavailable` without changing anything. The service's
-  domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`,
-  `webhook.delivery.replayed`) is recorded as a child of that intent.
-- Delivery list filters: `endpointId`, `status=pending|succeeded|dead`, plus
-  cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the retained
-  payload snapshot; list responses omit it.
-- `POST /deliveries/:id/replay` creates a new delivery with the endpoint's
-  current URL and active secret. The response is `201`.
-- Outbound delivery is at-least-once. Requests carry `X-Webhook-Id`,
-  `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`,
-  `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, and
-  `X-Webhook-Attempt`. Sign
-  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>` with HMAC-SHA256.
-- Retryable responses are `408`, `425`, `429`, and `5xx`; all other `3xx`/`4xx`
-  are permanent (`dead`). `Retry-After` is honored (seconds or HTTP date) and
-  capped by config.
-- `POST /api/v1/webhooks/inbound/{id}` is public and has no JWT, tenant header,
-  or idempotency middleware. It requires `X-Webhook-Id`,
-  `X-Webhook-Timestamp`, and `X-Webhook-Signature`; unknown/disabled sources
-  return `404`, bad/stale signatures `401`, malformed JSON/IDs `400`. New
-  events return `202`; a repeat `(source, X-Webhook-Id)` returns `200` with
-  `duplicate: true`.
-- Delivery targets are SSRF-checked at dial time; private/loopback/link-local
-  targets require `WEBHOOK_SSRF_ALLOWLIST`. Redirects are never followed.
-- See [Webhooks](webhooks.md) for the full signing, retry, secret, and
-  operations contract.
+| Route group | Contract |
+|---|---|
+| `/api/v1/webhooks/endpoints`, `/deliveries`, `/inbound-sources` | `webhooks:read` / `webhooks:write` (`admin` role). Endpoint/source create return a plaintext `secret` once; `rotate-secret` returns the new one once; reads never include it. |
+| Mutations | Create/update/delete, `rotate-secret`, and delivery replay are Tier 2: a required `audit.Guard` intent is written first (`503 system.audit_unavailable` changes nothing). The domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`, `webhook.delivery.replayed`) is recorded as its child. Update/delete/replay accept `Idempotency-Key`. |
+| Delivery list | Filters `endpointId`, `status=pending|succeeded|dead`, cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the payload snapshot; lists omit it. |
+| Replay | `POST /deliveries/:id/replay` creates a new delivery with the endpoint's current URL and active secret; `201`. |
+| Outbound requests | At-least-once. Headers `X-Webhook-Id`, `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`, `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, `X-Webhook-Attempt`. HMAC-SHA256 over `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`. |
+| Retries | `408`, `425`, `429`, `5xx` retry; other `3xx`/`4xx` are `dead`. `Retry-After` (seconds or HTTP date) is honored, capped by config. Targets are SSRF-checked at dial time (private/loopback/link-local need `WEBHOOK_SSRF_ALLOWLIST`); redirects are never followed. |
+| Inbound | `POST /api/v1/webhooks/inbound/{id}` is public: no JWT, tenant header, or idempotency middleware. Requires `X-Webhook-Id`, `X-Webhook-Timestamp`, `X-Webhook-Signature`. Unknown/disabled source `404`, bad/stale signature `401`, malformed JSON/IDs `400`, new event `202`, repeat `(source, X-Webhook-Id)` `200` with `duplicate: true`. |
+
+Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
 
 ## API keys
 
-- `POST /admin/api-keys` returns the plaintext key once; list/get responses
-  never contain it. Name, owner (`userId`, defaults to the caller), scopes, and
-  optional `expiresAt` are recorded. Scopes must be known permissions and a
-  subset of the owner's role.
-- `PUT /admin/api-keys/:id` updates name/scopes, `DELETE /admin/api-keys/:id`
-  or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent), and
-  `POST /admin/api-keys/:id/rotate` issues a new secret while the old key stays
+- `POST /admin/api-keys` returns the plaintext key once; list/get never do.
+  Name, owner (`userId`, defaults to the caller), scopes, and optional
+  `expiresAt` are recorded. Scopes must be known permissions within the owner's
+  role.
+- `PUT /admin/api-keys/:id` updates name/scopes; `DELETE /admin/api-keys/:id`
+  or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent);
+  `POST /admin/api-keys/:id/rotate` issues a new secret while the old one stays
   valid for 24 hours unless revoked. Create, update, and rotate reject (`400`)
-  any key scope the caller does not hold, so an API-key caller cannot mint or
-  rotate a key broader than itself.
-- All routes are tenant-scoped and return `404` for another tenant's key id.
-  Lifecycle mutations accept `Idempotency-Key`; create and rotate deliberately
-  omit it so a plaintext secret is never written to the shared response cache.
-  Every lifecycle mutation (create/update/revoke/rotate) is Tier 1 audited: the
-  service writes `api_key.created|updated|revoked|rotated` in the mutation
-  transaction, so if the audit row cannot be written the change rolls back and
-  the request fails with `503 system.audit_unavailable` (no secret is
-  returned). Re-revoking an already revoked key writes no second row. Audit
-  metadata never carries the secret or hash.
+  any scope the caller does not hold, so an API-key caller cannot mint a
+  broader key.
+- Routes require `admin:api_keys:read|create|update|revoke|rotate`, are
+  tenant-scoped, and return `404` for another tenant's key id. Mutations accept
+  `Idempotency-Key` except create and rotate.
+- Every lifecycle mutation is Tier 1 audited (`api_key.created|updated|revoked|rotated`
+  in the mutation transaction): an audit failure rolls back and returns
+  `503 system.audit_unavailable` with no secret. Re-revoking writes no second
+  row. Metadata never carries the secret or hash.
 
 ## Notifications
 
-All notification routes require a JWT or a scoped API key and are scoped to the authenticated user
-and request tenant. A notification id from another user or tenant returns
-`404`, never `403`.
+All routes require a JWT or a scoped API key and are scoped to the
+authenticated user and request tenant; other users' or tenants' ids return
+`404`.
 
-- `GET /notifications/` is cursor-paginated (`limit`, `startingAfter`) and
-  accepts `unreadOnly=true`. The list uses the standard
-  `{object,url,data,hasMore,nextCursor}` envelope.
-- `GET /notifications/unread-count` returns `{count}` for the badge.
-- `GET /notifications/:id` returns one owned notification.
-- `POST /notifications/:id/read` sets `read_at` once and returns the row;
-  repeating it is safe and does not move the timestamp.
-- `POST /notifications/read-all` marks every unread row and returns
-  `{updated}`.
-- `POST /notifications/send` is the admin-only back-office send. It requires
-  `notifications:send` and targets a user in the request tenant. It returns
-  `201` with `notification` (null when the in-app channel is disabled) and
-  `emailQueued`. It is Tier 2 audited: a required `audit.Guard` intent
-  (`notification.sent`) is written first, so an unavailable audit store
-  returns `503 system.audit_unavailable` and nothing is sent.
+| Route | Behavior |
+|---|---|
+| `GET /notifications/` | Cursor list (`limit`, `startingAfter`), `unreadOnly=true`, standard list envelope |
+| `GET /notifications/unread-count` | `{count}` |
+| `GET /notifications/:id` | One owned notification |
+| `POST /notifications/:id/read` | Sets `read_at` once; repeats do not move it |
+| `POST /notifications/read-all` | Marks every unread row; `{updated}` |
+| `POST /notifications/send` | Admin-only (`notifications:send`), target in the request tenant; `201` with `notification` (null when in-app is disabled) and `emailQueued`. Tier 2 audited (`notification.sent`). |
+| `GET /notification-preferences/` | Explicit rows only; a missing row means enabled |
+| `PUT /notification-preferences/` | Upsert `{type, channel, enabled}`; `type` matches `^[a-z0-9][a-z0-9._-]*$` (max 100); channels `in_app`, `email` |
 
-Preferences are per `(user, tenant, type, channel)` with channels `in_app` and
-`email`:
-
-- `GET /notification-preferences/` lists only explicit rows; a missing row
-  means the channel is enabled.
-- `PUT /notification-preferences/` upserts `{type, channel, enabled}`. `type`
-  is a lower-case identifier (`^[a-z0-9][a-z0-9._-]*$`, max 100). The unique
-  index makes the upsert idempotent.
-
-Writes use `Idempotency-Key`. The caller's own state changes (mark read,
-read-all, preference updates) are audited by the best-effort generic
-mutating-request middleware. When the email channel is enabled, the
-in-app row and the durable `email.send` job commit in one transaction; an
-enqueue failure returns `500` and leaves no in-app row. A notification is
-suppressed when both channels are disabled (create is a successful no-op; the
-admin send response has `notification: null` and `emailQueued: false`). Email
-delivery is at-least-once.
+Writes accept `Idempotency-Key`. The caller's own state changes are audited by
+the best-effort generic middleware. With email enabled, the in-app row and the
+durable `email.send` job commit together; an enqueue failure returns `500` and
+leaves no row. Both channels disabled suppresses the notification (create is a
+successful no-op; admin send returns `notification: null`,
+`emailQueued: false`). Email delivery is at-least-once.
 
 ## Jobs and asynchronous work
 
 - Email verification/reset, notification email, and other durable work are
-  queued in PostgreSQL.
-- Outbound webhook delivery uses the same queue (`webhook.delivery`) and is
-  at-least-once; receivers deduplicate on `X-Webhook-Delivery`. Identity
-  registration, file upload/delete (user and admin), and file restore emit
-  `user.registered`, `file.uploaded`, `file.deleted`, and `file.restored`.
-  When the transaction manager is wired (the default bootstrap), the event is
-  enqueued inside the mutation's transaction (`DispatchTx`), so an outbox
-  failure fails the mutation (fail-closed); only the unwired fallback
-  dispatches after commit and logs failures.
-- Delivery is at-least-once; clients must tolerate duplicate emails. A failed
-  notification enqueue rolls back the in-app row.
-- Terminal jobs clear payloads; success/dead rows are retained 30 days.
+  queued in PostgreSQL; delivery is at-least-once, so clients must tolerate
+  duplicate emails.
+- Outbound webhooks use the same queue. Identity registration, file
+  upload/delete (user and admin), and file restore emit `user.registered`,
+  `file.uploaded`, `file.deleted`, and `file.restored` inside the mutation's
+  transaction (`DispatchTx`), so an outbox failure fails the mutation; only the
+  unwired fallback dispatches after commit and logs failures.
+- Terminal jobs clear payloads; succeeded/dead rows are retained 30 days.
 - Email payloads are encrypted at rest; notification emails use the same
   `email.send`/`email.send.encrypted` kinds as identity emails.
 
 ## Feature flags
 
-- Compile-time keys only; unknown keys return `404`. The evaluator precedence is
-  force-off > kill switch > user target > tenant target > database default >
-  environment > compiled default. See [Feature Flags](feature-flags.md).
-- `GET /admin/features/flags` lists the catalog with the database default,
-  kill switch, configured marker, and the caller's effective value/source.
-- `GET /admin/features/flags/{key}` returns the flag and current-tenant targets.
-- `PUT /admin/features/flags/{key}` replaces the database default, kill switch,
-  and description. `killSwitch` is required; omitting `enabled` clears the
-  database default (NULL).
-- `DELETE /admin/features/flags/{key}` removes the database row, reverting to
-  environment/compiled defaults; it is idempotent for a valid catalog key and
-  returns `409` while any tenant still has a target for the flag.
-- Flag-row writes (`PUT`/`DELETE /flags/{key}`) are process-wide and allowed
-  only for admins of the platform tenant (id 1); other tenants get
-  `403 permission.denied`.
-- `GET`/`PUT /admin/features/flags/{key}/targets` list/upsert targets. Omit
-  `userId` for a tenant-wide target; the tenant always comes from the request
-  context. `DELETE .../targets/{id}` is scoped to the tenant and flag.
+| Route | Behavior |
+|---|---|
+| `GET /admin/features/flags` | Catalog with database default, kill switch, configured marker, and the caller's effective value/source |
+| `GET /admin/features/flags/{key}` | Flag plus current-tenant targets; unknown key `404` |
+| `PUT /admin/features/flags/{key}` | Replaces database default, kill switch, description. `killSwitch` required; omitting `enabled` clears the default (NULL) |
+| `DELETE /admin/features/flags/{key}` | Removes the row (reverts to environment/compiled defaults); idempotent; `409` while any tenant has a target |
+| `GET`/`PUT /admin/features/flags/{key}/targets` | List/upsert targets; omit `userId` for tenant-wide; tenant always from the request context; another tenant's user is `400` |
+| `DELETE .../targets/{id}` | Scoped to tenant and flag |
+
+- Precedence: force-off > kill switch > user target > tenant target > database
+  default > environment > compiled default ([Feature Flags](feature-flags.md)).
+- Flag-row writes are process-wide and allowed only for admins of the platform
+  tenant (id 1); others get `403 permission.denied`.
 - Reads require `admin:features:read`; mutations require
-  `admin:features:write`, accept `Idempotency-Key`, and are wrapped by a
-  required `audit.Guard`. Targets are tenant-scoped. A user target from another
-  tenant is rejected with `400`.
+  `admin:features:write`, accept `Idempotency-Key`, and use a required
+  `audit.Guard`.
 - A route gated by a disabled flag returns `404 feature.disabled`.
 
 ## Compatibility checklist
 
-- New field: allowed.
-- New enum value: allowed if clients are tolerant; document it.
-- New required request field: breaking.
-- Changed error code/status: breaking.
-- New endpoint: additive.
-- New permission: additive; grant it deliberately.
-- New migration: fresh installs update the baseline; deployed DBs get a
-  timestamped migration (`make migrate-create module=<owner> name=<purpose>`).
-- Tenant-aware behavior: sending/omitting `X-Tenant-Slug` must preserve the
-  default tenant when omitted; changing tenant selection is breaking.
-
-## References
-
-- Typed codes: platform-wide in `pkg/apperror/catalog.go`; module-owned in
-  `internal/modules/<m>/catalog/errors.go`.
-- Permissions: module-owned in `internal/modules/<m>/catalog/permissions.go`;
-  shared back-office permissions in `internal/platform/authz/permissions.go`.
-- Architecture: `docs/architecture.md`.
+| Change | Classification |
+|---|---|
+| New field, new endpoint | Additive |
+| New enum value | Allowed if clients are tolerant; document it |
+| New permission | Additive; grant it deliberately |
+| New required request field | Breaking |
+| Changed error code or status | Breaking |
+| Changed tenant selection (omitting `X-Tenant-Slug` must keep the default tenant) | Breaking |
+| New migration | Fresh installs update the baseline; deployed DBs get `make migrate-create module=<owner> name=<purpose>` |

@@ -186,6 +186,9 @@ func (b *blackholeCache) Get(ctx context.Context, _ string) ([]byte, error) { re
 func (b *blackholeCache) Set(ctx context.Context, _ string, _ []byte, _ time.Duration) error {
 	return b.wait(ctx)
 }
+func (b *blackholeCache) SetNX(ctx context.Context, _ string, _ []byte, _ time.Duration) (bool, error) {
+	return false, b.wait(ctx)
+}
 func (b *blackholeCache) Delete(ctx context.Context, _ string) error { return b.wait(ctx) }
 func (b *blackholeCache) Exists(ctx context.Context, _ string) (bool, error) {
 	return false, b.wait(ctx)

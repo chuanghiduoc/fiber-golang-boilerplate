@@ -86,9 +86,15 @@ func (m *mockUserService) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string, allowSignUp bool) (*dto.UserResponse, error) {
-	m.googleAllowSignUp = append(m.googleAllowSignUp, allowSignUp)
-	return &dto.UserResponse{ID: 1, TenantID: 1, Email: email, Name: name, Role: "user"}, nil
+func (m *mockUserService) SignInWithGoogle(ctx context.Context, req service.GoogleSignIn) (*dto.UserResponse, error) {
+	m.googleAllowSignUp = append(m.googleAllowSignUp, req.AllowSignUp)
+	user := &dto.UserResponse{ID: 1, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}
+	if req.Complete != nil {
+		if err := req.Complete(ctx, nil, user); err != nil {
+			return nil, err
+		}
+	}
+	return user, nil
 }
 
 func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.ChangePasswordRequest) error {
@@ -117,6 +123,10 @@ type mockRefreshTokenService struct{}
 
 func (m *mockRefreshTokenService) Create(_ context.Context, _ int64, _ int32) (string, error) {
 	return "mock-refresh-token", nil
+}
+
+func (m *mockRefreshTokenService) CreateTx(ctx context.Context, _ pgx.Tx, userID int64, tokenVersion int32) (string, error) {
+	return m.Create(ctx, userID, tokenVersion)
 }
 
 func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (int64, error) {
@@ -443,6 +453,22 @@ func TestRefreshHandler(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+// A valid token whose owner was deleted/banned is a 401, not a 404 (the
+// service's NewNotFound must match apperror.ErrNotFound).
+func TestRefreshHandler_InactiveOwnerIsUnauthorized(t *testing.T) {
+	svc := newMockService()
+	delete(svc.users, 1)
+	app := setupApp(svc)
+
+	body, _ := json.Marshal(dto.RefreshRequest{RefreshToken: "valid-refresh-token"})
+	req, _ := http.NewRequest("POST", "/auth/refresh", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestRefreshHandler_InvalidToken(t *testing.T) {

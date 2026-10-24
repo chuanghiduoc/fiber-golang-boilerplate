@@ -84,7 +84,7 @@ func (s *stressStore) Fail(_ context.Context, id int64, _ string, _ int, _ strin
 	return nil
 }
 
-func (s *stressStore) Heartbeat(_ context.Context, _ int64, _ string, _ int) error {
+func (s *stressStore) Heartbeat(_ context.Context, _ int64, _ string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.heartbeats++

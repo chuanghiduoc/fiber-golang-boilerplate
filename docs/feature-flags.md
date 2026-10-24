@@ -14,7 +14,7 @@ Only registered flags exist. Each module declares its flags in
 `internal/modules/<m>/catalog/flags.go` (a `features.Key` constant plus a
 `features.Definition`) and returns them from `FeatureFlags()`
 (`app.FlagProvider`); `app.RegisterCatalogs` registers them at startup, owned
-by the module, and fails on a key another module already owns. `config.Load`
+by the module, and fails on a key another module already owns. Config loading
 checks `FEATURE_FLAGS`/`FEATURE_FLAGS_FORCE_OFF` syntax only; `cmd/api` calls
 `cfg.FeatureFlags.ValidateKnownKeys()` right after registration, so unknown
 keys still fail startup, and the admin API returns `404` for them, so a typo
@@ -81,19 +81,42 @@ values, force-off, and compiled defaults, so modules never need a nil check.
 
 ## Precedence
 
-Evaluation stops at the first matching source, highest first:
+Evaluation stops at the first matching source, highest first. Each result is
+labelled with its `source` (the metric label and the admin API's effective
+source).
 
-1. **Force-off** — `FEATURE_FLAGS_FORCE_OFF` contains the key. Always `false`.
-2. **Kill switch** — `feature_flags.kill_switch` is true. Always `false`, but
-   the database row (and targets) remain for a later re-enable.
-3. **User target** — `feature_flag_targets` row for `(flag, tenant, user)`.
-4. **Tenant target** — `feature_flag_targets` row for `(flag, tenant)` with
-   `user_id IS NULL`.
-5. **Database default** — `feature_flags.enabled` when it is not NULL. A row
-   with a NULL default (created to anchor targets or to carry a kill switch)
-   falls through to the environment.
-6. **Environment** — `FEATURE_FLAGS` assignment.
-7. **Compiled default** — `Definition.Default`.
+```mermaid
+flowchart TD
+    A["Evaluate(key, tenant, user)"] --> F{"key in<br/>FEATURE_FLAGS_FORCE_OFF?"}
+    F -->|yes| FO["false · force_off"]
+    F -->|no| S{"usable DB snapshot?"}
+    S -->|no| E
+    S -->|yes| K{"flag row has<br/>kill_switch = true?"}
+    K -->|yes| KS["false · kill_switch"]
+    K -->|no| U{"user known and target for<br/>(flag, tenant, user)?"}
+    U -->|yes| UT["target value · user_target"]
+    U -->|no| T{"target for (flag, tenant)<br/>with user_id NULL?"}
+    T -->|yes| TT["target value · tenant_target"]
+    T -->|no| D{"flag row with<br/>enabled NOT NULL?"}
+    D -->|yes| DD["enabled · database_default"]
+    D -->|"no (NULL = none)"| E{"key in FEATURE_FLAGS?"}
+    E -->|yes| EV["env value · environment"]
+    E -->|no| CD["Definition.Default · compiled_default"]
+```
+
+| Source | Rule |
+| --- | --- |
+| Force-off | `FEATURE_FLAGS_FORCE_OFF` contains the key. Always `false`; checked before any snapshot lookup, so it works while the database is down. |
+| Kill switch | `feature_flags.kill_switch` is true. Always `false`; the row and targets remain for a later re-enable. |
+| User target | `feature_flag_targets` row for `(flag, tenant, user)`; only evaluated when a user is known. |
+| Tenant target | `feature_flag_targets` row for `(flag, tenant)` with `user_id IS NULL`. |
+| Database default | `feature_flags.enabled` when not NULL. A NULL default (a row created to anchor targets or carry a kill switch) falls through. |
+| Environment | `FEATURE_FLAGS` assignment. |
+| Compiled default | `Definition.Default`. |
+
+Without a usable snapshot (no store, cold start with the database down, or the
+last good snapshot is older than the max staleness), evaluation skips the
+database layers entirely.
 
 A target can be `true` or `false`; both override lower levels. Tenant/user
 lookups use the request tenant resolved by `tenant.Middleware` (and the JWT
@@ -143,33 +166,35 @@ indexes (plus `users(tenant_id, id)`, which backs the composite foreign key).
 
 ## Cache and invalidation
 
-The evaluator keeps one full snapshot in process memory:
+The evaluator keeps one full snapshot in process memory.
 
-- A snapshot younger than `FEATURE_FLAGS_CACHE_TTL_SECONDS` is served without a
-  database query.
-- An expired snapshot that is still within `FEATURE_FLAGS_MAX_STALENESS_SECONDS`
-  is served immediately while one background reload refreshes it
-  (stale-while-revalidate), so a slow database never stalls requests. Callers
-  block on the reload only when there is no usable snapshot (cold start, or
-  older than the max staleness) or after `Invalidate`; concurrent blocked
-  callers serialize behind the refresh lock and reuse the fresh result.
-- Loads are detached from the request context (`context.WithoutCancel`) and
-  bounded by a 5s timeout, so a client disconnect cannot fail a load for
-  everyone. A load that still returns `context.Canceled` is not counted as a
-  database failure and does not throttle the next reload.
-- If a reload fails, the last good snapshot is served only while it is no older
-  than `FEATURE_FLAGS_MAX_STALENESS_SECONDS`. After that, evaluation falls back
-  to force-off/environment/compiled defaults. Failed reloads are throttled for
-  one TTL so an outage does not cause a query on every request.
-- The admin service calls `Evaluator.Invalidate` after every successful write,
-  so the writing replica sees the change immediately. Invalidate marks the
-  snapshot stale instead of dropping it: the next evaluation reloads, and if
-  that reload fails the previous snapshot remains the fallback (so a database
-  blip right after a write cannot lift a kill switch). Other replicas converge
-  within the cache TTL; there is no pub/sub dependency.
+```mermaid
+flowchart TD
+    A[Evaluation needs snapshot] --> B{"fresh?<br/>age < CACHE_TTL and not invalidated"}
+    B -->|yes| HIT[Serve snapshot · cache hit]
+    B -->|no| C{"not invalidated and<br/>age <= MAX_STALENESS?"}
+    C -->|yes| SWR["Serve stale snapshot now<br/>+ at most one background reload"]
+    C -->|"no (cold, too old, or invalidated)"| L[Block on refresh lock]
+    L --> R{"another caller already<br/>refreshed?"}
+    R -->|yes| HIT
+    R -->|no| TH{"last load failed<br/>less than one TTL ago?"}
+    TH -->|yes| FB
+    TH -->|no| LOAD["Load snapshot<br/>(detached ctx, 5s timeout)"]
+    LOAD -->|success| NEW[Store and serve new snapshot]
+    LOAD -->|error| FB{"last good snapshot<br/>within MAX_STALENESS?"}
+    FB -->|yes| STALE[Serve last good snapshot · stale]
+    FB -->|no| DEF["No snapshot: env / compiled defaults · fallback"]
+```
 
-Force-off is checked before any snapshot lookup, so an operator can disable a
-flag even while the database is unavailable.
+| Behavior | Detail |
+| --- | --- |
+| Fresh | A snapshot younger than `FEATURE_FLAGS_CACHE_TTL_SECONDS` is served without a query. |
+| Stale-while-revalidate | An expired snapshot still within `FEATURE_FLAGS_MAX_STALENESS_SECONDS` is served immediately while one background reload runs, so a slow database never stalls requests. |
+| Blocking reload | Only with no usable snapshot (cold start, older than max staleness) or after `Invalidate`. Concurrent blocked callers serialize behind the refresh lock and reuse the fresh result. |
+| Detached loads | Loads use `context.WithoutCancel` plus a 5s timeout, so a client disconnect cannot fail a load for everyone. A load that still returns `context.Canceled` is not a database failure and does not throttle the next reload. |
+| Failed reload | The last good snapshot is served while no older than max staleness; after that, evaluation falls back to force-off/environment/compiled defaults. Failed reloads are throttled for one TTL so an outage does not query on every request. |
+| Invalidate | The admin service calls `Evaluator.Invalidate` after every successful write, so the writing replica sees the change immediately. It marks the snapshot stale instead of dropping it: if the next reload fails the previous snapshot remains the fallback, so a database blip right after a write cannot lift a kill switch. A load already in flight when `Invalidate` runs is discarded and reloaded. |
+| Other replicas | Converge within the cache TTL; there is no pub/sub dependency. |
 
 ## Admin API
 
@@ -232,19 +257,14 @@ serving defaults instead of database state.
 
 ## Operations
 
-- To stop a misbehaving feature immediately, set
-  `FEATURE_FLAGS_FORCE_OFF=<key>` and restart the process (or set the flag's
-  kill switch through the admin API). Force-off does not depend on the database.
-- To roll out by tenant, leave the database default off and add tenant/user
-  targets.
-- Deleting a flag row is safe once its targets are removed (the API returns
-  `409` until then): evaluation falls back to environment and compiled
-  defaults. To clear only the database default while targets remain, `PUT` the
-  flag without `enabled`. The catalog is code, so removing a key from the catalog
-  makes any remaining database row unreachable; delete the row during the same
-  release.
-- The evaluator never writes DDL and the API never migrates. Run
-  `cmd/migrate` before starting a release that introduces the feature tables.
+| Task | How |
+| --- | --- |
+| Stop a misbehaving feature now | Set `FEATURE_FLAGS_FORCE_OFF=<key>` and restart (independent of the database), or set the flag's kill switch through the admin API. |
+| Roll out by tenant | Leave the database default off and add tenant/user targets. |
+| Remove a flag row | Safe once its targets are removed (`409` until then); evaluation falls back to environment and compiled defaults. |
+| Clear only the database default | `PUT` the flag without `enabled` while targets remain. |
+| Remove a key from the catalog | Any remaining database row becomes unreachable; delete the row in the same release. |
+| Schema | The evaluator never writes DDL and the API never migrates. Run `cmd/migrate` before a release that introduces the feature tables. |
 
 ## Tests
 

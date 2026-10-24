@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/hkdf"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
@@ -596,40 +597,85 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if h.googleOAuth == nil {
 		return apperror.NewNotFound("Google OAuth not configured")
 	}
+	tenantID, tenantSlug, err := h.verifyOAuthCallbackState(c)
+	if err != nil {
+		return err
+	}
+	// Gate on the signed-state tenant: the callback skips tenant middleware,
+	// so the request context tenant is not the one that started the flow.
+	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: tenantID}); err != nil {
+		return err
+	}
+	fiber.Locals[int64](c, "tenant_id", tenantID)
+	fiber.Locals[string](c, "tenant_slug", tenantSlug)
+	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
+	ctx := c.Context()
+	clearOAuthStateCookie(c)
 
-	// Verify CSRF state. The state also carries the tenant that started the
-	// flow; the callback ignores X-Tenant-Slug and scopes every lookup to it.
+	code := c.Query("code")
+	if code == "" {
+		return apperror.NewBadRequest("missing authorization code")
+	}
+	info, err := h.googleOAuth.Exchange(ctx, code)
+	if err != nil {
+		return apperror.NewBadRequest("failed to exchange authorization code")
+	}
+
+	// An existing or linkable account may always sign in; only creating a new
+	// account is a registration, so it honors user_registration.
+	allowSignUp := features.Require(ctx, h.flags, identitycatalog.KeyUserRegistration, features.Subject{TenantID: tenantID}) == nil
+	var accessToken, refreshToken string
+	_, err = h.userSvc.SignInWithGoogle(ctx, service.GoogleSignIn{
+		GoogleID:    info.ID,
+		Email:       info.Email,
+		Name:        info.Name,
+		AllowSignUp: allowSignUp,
+		// Admission and session issuance run inside the sign-in transaction,
+		// before auth.google_login is recorded: a refused sign-in, or one
+		// whose session cannot be stored, rolls back and is not audited.
+		Complete: func(ctx context.Context, tx pgx.Tx, user *dto.UserResponse) error {
+			if err := h.admitGoogleUser(ctx, c, tenantID, user); err != nil {
+				return err
+			}
+			var issueErr error
+			accessToken, refreshToken, issueErr = h.issueGoogleSession(ctx, tx, user)
+			return issueErr
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return c.Redirect().To(h.googleOAuth.BuildCallbackURL(accessToken, refreshToken))
+}
+
+// verifyOAuthCallbackState checks the CSRF state against its cookie and
+// returns the active tenant bound into it. The callback ignores
+// X-Tenant-Slug: the signed state is the only trusted tenant source for this
+// browser redirect.
+func (h *AuthHandler) verifyOAuthCallbackState(c fiber.Ctx) (tenantID int64, tenantSlug string, err error) {
 	state := c.Query("state")
 	cookieState := c.Cookies(oauthStateCookieName)
 	if state == "" || cookieState == "" ||
 		subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
-		return apperror.NewBadRequest("invalid oauth state")
+		return 0, "", apperror.NewBadRequest("invalid oauth state")
 	}
-	_, tenantID, ok := decodeOAuthState(h.oauthStateKey, state)
+	_, stateTenantID, ok := decodeOAuthState(h.oauthStateKey, state)
 	if !ok {
-		return apperror.NewBadRequest("invalid oauth state")
+		return 0, "", apperror.NewBadRequest("invalid oauth state")
 	}
 	if h.tenants == nil {
-		return apperror.NewInternal("oauth tenant validation is not configured")
+		return 0, "", apperror.NewInternal("oauth tenant validation is not configured")
 	}
 	// GetByID only returns active tenants, so a tenant suspended during the
-	// consent round-trip cannot complete the login. Ignore X-Tenant-Slug here:
-	// the signed state is the only trusted source for this browser redirect.
-	stateTenant, err := h.tenants.GetByID(c.Context(), tenantID)
+	// consent round-trip cannot complete the login.
+	stateTenant, err := h.tenants.GetByID(c.Context(), stateTenantID)
 	if err != nil {
-		return apperror.NewBadRequest("invalid oauth state")
+		return 0, "", apperror.NewBadRequest("invalid oauth state")
 	}
-	// Gate on the signed-state tenant: the callback skips tenant middleware,
-	// so the request context tenant is not the one that started the flow.
-	if err := features.Require(c.Context(), h.flags, identitycatalog.KeyGoogleOAuth, features.Subject{TenantID: stateTenant.ID}); err != nil {
-		return err
-	}
-	fiber.Locals[int64](c, "tenant_id", stateTenant.ID)
-	fiber.Locals[string](c, "tenant_slug", stateTenant.Slug)
-	c.SetContext(tenant.WithIdentity(c.Context(), stateTenant.ID, stateTenant.Slug))
-	ctx := c.Context()
+	return stateTenant.ID, stateTenant.Slug, nil
+}
 
-	// Clear state cookie
+func clearOAuthStateCookie(c fiber.Ctx) {
 	c.Cookie(&fiber.Cookie{
 		Name:     oauthStateCookieName,
 		Value:    "",
@@ -640,45 +686,33 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		Path:     "/",
 		Expires:  time.Now().Add(-1 * time.Hour),
 	})
+}
 
-	code := c.Query("code")
-	if code == "" {
-		return apperror.NewBadRequest("missing authorization code")
-	}
-
-	info, err := h.googleOAuth.Exchange(ctx, code)
-	if err != nil {
-		return apperror.NewBadRequest("failed to exchange authorization code")
-	}
-
-	// An existing or linkable account may always sign in; only creating a new
-	// account is a registration, so it honors user_registration.
-	allowSignUp := features.Require(ctx, h.flags, identitycatalog.KeyUserRegistration, features.Subject{TenantID: tenantID}) == nil
-	user, err := h.userSvc.FindOrCreateByGoogle(ctx, info.ID, info.Email, info.Name, allowSignUp)
-	if err != nil {
-		return err
-	}
+// admitGoogleUser applies the Login/Refresh sign-in rules to the account a
+// Google identity resolved to. A Google-linked account whose email was later
+// changed (which clears email_verified_at) must not mint a session.
+func (h *AuthHandler) admitGoogleUser(ctx context.Context, c fiber.Ctx, tenantID int64, user *dto.UserResponse) error {
 	if user.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
 	}
 	// Attribute request-level audit/logging to the signed-in user, as Login does.
 	fiber.Locals(c, "user_id", user.ID)
-	// Same rule as Login/Refresh. A Google-linked account whose email was
-	// later changed (which clears email_verified_at) must not mint a session.
-	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {
+	if !user.EmailVerified && h.emailVerificationRequired(ctx, user) {
 		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
+	return nil
+}
 
-	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
+// issueGoogleSession mints the access token and stores the refresh token in
+// the sign-in transaction.
+func (h *AuthHandler) issueGoogleSession(ctx context.Context, tx pgx.Tx, user *dto.UserResponse) (accessToken, refreshToken string, err error) {
+	accessToken, err = token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
-		return apperror.NewInternal("failed to generate token")
+		return "", "", apperror.NewInternal("failed to generate token")
 	}
-
-	refreshToken, err := h.refreshSvc.Create(ctx, user.ID, user.TokenVersion)
+	refreshToken, err = h.refreshSvc.CreateTx(ctx, tx, user.ID, user.TokenVersion)
 	if err != nil {
-		return apperror.NewInternal("failed to generate refresh token")
+		return "", "", apperror.NewInternal("failed to generate refresh token")
 	}
-
-	redirectURL := h.googleOAuth.BuildCallbackURL(accessToken, refreshToken)
-	return c.Redirect().To(redirectURL)
+	return accessToken, refreshToken, nil
 }

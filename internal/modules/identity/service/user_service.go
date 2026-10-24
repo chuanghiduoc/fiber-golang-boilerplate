@@ -2,59 +2,34 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
-	"strconv"
-	"strings"
-	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-	"golang.org/x/crypto/bcrypt"
 
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
-	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
-const (
-	bcryptCost = 12
-	// maxLoginAttempts is the per-(tenant, email, client IP) budget. Keying by
-	// source means a stranger cannot lock a victim out from one address.
-	maxLoginAttempts = 5
-	// accountLockoutMultiplier sets the global per-(tenant, email) budget,
-	// which still stops guessing distributed across many addresses. One source
-	// contributes at most maxLoginAttempts per window to it.
-	accountLockoutMultiplier = 5
-	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
-	lockoutDuration          = 15 * time.Minute
-	loginAttemptPrefix       = "login_attempts:"
-)
+const bcryptCost = 12
 
-// dummyPasswordHash equalizes the bcrypt work for unknown-email logins so the
-// response time does not reveal whether an account exists.
-var dummyPasswordHash = func() []byte {
-	hash, _ := bcrypt.GenerateFromPassword([]byte("timing-only-dummy-password"), bcryptCost)
-	return hash
-}()
-
+// UserService owns the account lifecycle. Its methods are split by
+// responsibility across this package: registration.go, authentication.go and
+// lockout.go, oauth_google.go, profile.go (update/delete/sessions), and
+// password.go.
 type UserService interface {
 	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
 	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
-	// FindOrCreateByGoogle signs in an existing or linkable account. It creates a
-	// new account only when allowSignUp is true (the user_registration flag);
-	// otherwise a sign-up attempt fails with feature.disabled.
-	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string, allowSignUp bool) (*dto.UserResponse, error)
+	// SignInWithGoogle signs in an existing or linkable account, or creates
+	// one when req.AllowSignUp is set (see GoogleSignIn). The caller's
+	// Complete hook admits the account and issues the session in the same
+	// transaction as the auth.google_login audit row.
+	SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*dto.UserResponse, error)
 	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
 	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
 	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
@@ -109,181 +84,10 @@ func NewUserService(
 	}
 }
 
-func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	email := NormalizeEmail(req.Email)
-	name := strings.TrimSpace(req.Name)
-
-	existing, err := s.repo.GetByEmail(ctx, email)
-	if err != nil && !errors.Is(err, apperror.ErrNotFound) {
-		return nil, apperror.NewInternal("failed to check existing user")
-	}
-	if existing != nil {
-		return nil, apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
-	}
-	if err := ensureEmailNotBanned(ctx, s.repo, email); err != nil {
-		return nil, err
-	}
-
-	// Hash before opening a transaction: bcrypt is intentionally expensive and
-	// must not hold a pooled database connection for hundreds of milliseconds.
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to hash password")
-	}
-
-	var (
-		user          *identitysqlc.User
-		webhookQueued bool
-	)
-	if s.txManager != nil {
-		// Create the user, optional verification provisioning, and the audit
-		// row in one transaction. Any failure rolls the account back: a
-		// successful registration must never exist without its audit record.
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, hash)
-			if createErr != nil {
-				return createErr
-			}
-			if s.verificationProvisioner != nil && s.verificationProvisioner.SupportsTransactionalEnqueue() {
-				if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
-					slog.Error("failed to provision registration verification email",
-						slog.Int64("user_id", created.ID),
-						slog.Any("error", provErr),
-					)
-					// Provisioning details (including context deadlines) are for
-					// the logs only. Keep the public registration contract at 500.
-					return apperror.NewInternal("failed to create user")
-				}
-			}
-			event := audit.NewServiceEvent(ctx, "auth.registered", "user")
-			event.ResourceID = strconv.FormatInt(created.ID, 10)
-			event.ActorID = created.ID
-			event.ActorType = audit.ActorTypeUser
-			event.Metadata = map[string]any{
-				"email_verification_required": s.requireEmailVerification,
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-			if txDispatcher, ok := s.webhooks.(WebhookTxDispatcher); ok {
-				// The webhook outbox job commits with the account, so a
-				// registration never exists without its event (or vice versa).
-				if hookErr := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventUserRegistered, created.TenantID, ToUserResponse(created)); hookErr != nil {
-					slog.Error("failed to enqueue registration webhook",
-						slog.Int64("user_id", created.ID),
-						slog.Any("error", hookErr),
-					)
-					return apperror.NewInternal("failed to create user")
-				}
-				webhookQueued = true
-			}
-			user = created
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		user, err = s.createUser(ctx, s.repo, email, name, hash)
-		if err != nil {
-			return nil, err
-		}
-		event := audit.NewServiceEvent(ctx, "auth.registered", "user")
-		event.ResourceID = strconv.FormatInt(user.ID, 10)
-		event.ActorID = user.ID
-		event.ActorType = audit.ActorTypeUser
-		event.Metadata = map[string]any{
-			"email_verification_required": s.requireEmailVerification,
-		}
-		if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
-			return nil, auditWriteError(auditErr)
-		}
-	}
-
-	// A previous failed-login lockout must not survive registration.
-	clearLoginAttempts(ctx, s.cache, email)
-
-	response := ToUserResponse(user)
-	if !webhookQueued {
-		s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
-	}
-	return response, nil
-}
-
-// WebhookTxDispatcher is the optional transactional side of the webhooks
-// dispatcher. It cannot live in the stdlib-only contracts package because it
-// takes the producer's pgx.Tx.
-type WebhookTxDispatcher interface {
-	DispatchTx(ctx context.Context, tx pgx.Tx, events ...webhookcontracts.Event) error
-}
-
-// dispatchWebhookTx enqueues one domain event inside tx.
-func dispatchWebhookTx(ctx context.Context, dispatcher WebhookTxDispatcher, tx pgx.Tx, eventType string, tenantID int64, data any) error {
-	payload, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("marshal webhook payload: %w", err)
-	}
-	return dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
-		Type:     eventType,
-		TenantID: tenantID,
-		Data:     payload,
-	})
-}
-
-// SetWebhookDispatcher wires outbound domain events.
-func (s *userService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
-	s.webhooks = dispatcher
-}
-
-// AttachWebhookDispatcher wires the production dispatcher without widening the
-// UserService interface, so handler fakes remain small.
-func AttachWebhookDispatcher(svc UserService, dispatcher webhookcontracts.Dispatcher) {
-	if s, ok := svc.(*userService); ok {
-		s.webhooks = dispatcher
-	}
-}
-
-// dispatchWebhook emits one best-effort domain event. Delivery failures are
-// logged; they must not turn a committed registration into an API error.
-func (s *userService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
-	if s.webhooks == nil {
-		return
-	}
-	payload, err := json.Marshal(data)
-	if err != nil {
-		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
-		return
-	}
-	if _, err := s.webhooks.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
-		Type:     eventType,
-		TenantID: tenantID,
-		Data:     payload,
-	}); err != nil {
-		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
-	}
-}
-
-// createUser creates a local account with a precomputed password hash through
-// repo, which may be backed by the pool or by a caller-owned transaction.
-func (s *userService) createUser(
-	ctx context.Context,
-	repo repository.UserRepository,
-	email, name string,
-	hash []byte,
-) (*identitysqlc.User, error) {
-	user, err := repo.Create(ctx, identitysqlc.CreateUserParams{
-		TenantID:     tenant.EffectiveID(ctx),
-		Email:        email,
-		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-		Name:         name,
-	})
-	if err != nil {
-		if database.IsUniqueViolation(err) {
-			return nil, apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
-		}
-		return nil, apperror.NewInternal("failed to create user")
-	}
-	return user, nil
+// fallbackRepos are the pool-backed repositories inTx uses without a
+// transaction manager.
+func (s *userService) fallbackRepos() repos {
+	return repos{users: s.repo, refresh: s.refreshTokenRepo}
 }
 
 func (s *userService) SetVerificationProvisioner(p VerificationProvisioner) {
@@ -296,281 +100,8 @@ func (s *userService) RegistrationEmailsTransactional() bool {
 		s.verificationProvisioner.SupportsTransactionalEnqueue()
 }
 
-func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
-	email := NormalizeEmail(req.Email)
-
-	// Reserve an attempt before any lookup or password check. The counters
-	// are keyed by the normalized address (plus the client IP for the source
-	// budget) whether or not an account exists, so a locked response cannot
-	// reveal existence, and the atomic increments mean parallel guesses cannot
-	// all pass a stale "not locked yet" read. Registration clears the keys, so
-	// pre-locking an unregistered address cannot lock out its future owner.
-	if err := reserveLoginAttempt(ctx, s.cache, email); err != nil {
-		return nil, err
-	}
-
-	user, err := s.repo.GetByEmail(ctx, email)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			// Spend the same bcrypt time as an existing account so login
-			// timing cannot be used for account enumeration.
-			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
-			return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
-		}
-		return nil, apperror.NewInternal("failed to get user")
-	}
-
-	if !user.PasswordHash.Valid {
-		// OAuth-only account: equalize timing with a password check.
-		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
-		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.Password)); err != nil {
-		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
-	}
-
-	// The password was correct: clear the counters even if the account still
-	// needs verification, so a correct password never accrues a lockout.
-	clearLoginAttempts(ctx, s.cache, email)
-
-	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
-		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
-	}
-	return ToUserResponse(user), nil
-}
-
-// loginAttemptKeys returns the per-source key (tenant, email, client IP) and
-// the global per-account key (tenant, email) for one password attempt.
-func loginAttemptKeys(ctx context.Context, email string) (source, account string) {
-	account = scopedKey(ctx, loginAttemptPrefix, email)
-	return account + ":ip=" + clientIPFromContext(ctx), account
-}
-
-// reserveLoginAttempt atomically counts one password attempt and rejects it
-// once the source made more than maxLoginAttempts, or all sources together
-// more than maxAccountLoginAttempts, inside the lockout window. A source that
-// is already locked is rejected before it touches the account counter, so one
-// address alone can never exhaust the global budget. It fails closed: when
-// the cache is unavailable the attempt is denied (503) rather than allowed
-// without brute-force protection.
-func reserveLoginAttempt(ctx context.Context, store cache.Cache, email string) error {
-	sourceKey, accountKey := loginAttemptKeys(ctx, email)
-	locked := apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
-
-	attempts, err := store.Increment(ctx, sourceKey, lockoutDuration)
-	if err != nil {
-		return loginLockoutUnavailable(err)
-	}
-	if attempts > maxLoginAttempts {
-		return locked
-	}
-	attempts, err = store.Increment(ctx, accountKey, lockoutDuration)
-	if err != nil {
-		return loginLockoutUnavailable(err)
-	}
-	if attempts > maxAccountLoginAttempts {
-		return locked
-	}
-	return nil
-}
-
-func loginLockoutUnavailable(err error) error {
-	slog.Error("cache unavailable for login lockout check — denying request for safety", slog.Any("error", err))
-	return apperror.NewCode(apperror.CodeSystemUnavailable, "unable to verify login attempts, please try again later")
-}
-
-// clearLoginAttempts drops the caller's source counter and the account
-// counter after a proof of the password (or a registration/reset). Other
-// sources' counters expire on their own.
-func clearLoginAttempts(ctx context.Context, store cache.Cache, email string) {
-	if store == nil {
-		return
-	}
-	sourceKey, accountKey := loginAttemptKeys(ctx, email)
-	for _, key := range []string{sourceKey, accountKey} {
-		if err := store.Delete(ctx, key); err != nil {
-			slog.Warn("cache error clearing login attempts", slog.Any("error", err))
-		}
-	}
-}
-
-func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string, allowSignUp bool) (*dto.UserResponse, error) {
-	user, err := s.findOrCreateByGoogleUser(ctx, googleID, email, name, allowSignUp)
-	if err != nil {
-		return nil, err
-	}
-	return ToUserResponse(user), nil
-}
-
-func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string, allowSignUp bool) (*identitysqlc.User, error) {
-	email = NormalizeEmail(email)
-
-	findOrCreate := func(repo repository.UserRepository) (*identitysqlc.User, string, error) {
-		user, err := repo.GetByGoogleID(ctx, googleID)
-		if err == nil {
-			return user, googleAccountExisting, nil
-		}
-		if !errors.Is(err, apperror.ErrNotFound) {
-			return nil, "", apperror.NewInternal("failed to find user by google id")
-		}
-
-		existing, err := repo.GetByEmail(ctx, email)
-		if err == nil {
-			// Never silently attach a Google identity to an unverified local
-			// account. An attacker could otherwise pre-register a victim's
-			// address and take over the account when the victim uses Google.
-			if !existing.EmailVerifiedAt.Valid {
-				return nil, "", apperror.NewConflict("an account with this email already exists; verify it before linking Google")
-			}
-			linked, linkErr := repo.LinkGoogleAccount(ctx, identitysqlc.LinkGoogleAccountParams{
-				GoogleID: pgtype.Text{String: googleID, Valid: true},
-				ID:       existing.ID,
-			})
-			if linkErr != nil {
-				if database.IsUniqueViolation(linkErr) {
-					return nil, "", apperror.NewConflict("this Google account is already linked to another user")
-				}
-				// The guarded UPDATE matched no row: the account is already
-				// bound to a different Google identity, which is never replaced.
-				if errors.Is(linkErr, apperror.ErrNotFound) {
-					return nil, "", apperror.NewConflict("this account is already linked to a different Google account")
-				}
-				return nil, "", apperror.NewInternal("failed to link google account")
-			}
-			return linked, googleAccountLinked, nil
-		}
-		if !errors.Is(err, apperror.ErrNotFound) {
-			return nil, "", apperror.NewInternal("failed to find user by email")
-		}
-		if !allowSignUp {
-			return nil, "", apperror.NewCode(apperror.CodeFeatureDisabled, "feature user_registration is disabled")
-		}
-		if err := ensureEmailNotBanned(ctx, repo, email); err != nil {
-			return nil, "", err
-		}
-
-		newUser, err := repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
-			TenantID:     tenant.EffectiveID(ctx),
-			Email:        email,
-			Name:         name,
-			GoogleID:     pgtype.Text{String: googleID, Valid: true},
-			AuthProvider: "google",
-		})
-		if err != nil {
-			return nil, "", err
-		}
-		return newUser, googleAccountCreated, nil
-	}
-
-	if s.txManager != nil {
-		var result *identitysqlc.User
-		txErr := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			txUserRepo := repository.NewUserRepository(tx)
-			user, account, err := findOrCreate(txUserRepo)
-			if err != nil {
-				return err
-			}
-			// Tier 1: the login audit row commits with any account
-			// creation/link, or the whole sign-in rolls back.
-			if err := s.recordGoogleLogin(ctx, tx, user, account); err != nil {
-				return err
-			}
-			result = user
-			return nil
-		})
-		if txErr != nil {
-			if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, txErr); retryErr == nil {
-				if user != nil {
-					// A concurrent request created the account; this request
-					// still signs in and needs its own audit row.
-					if err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-						return s.recordGoogleLogin(ctx, tx, user, googleAccountExisting)
-					}); err != nil {
-						return nil, err
-					}
-					return user, nil
-				}
-			} else {
-				var appErr *apperror.AppError
-				if errors.As(retryErr, &appErr) {
-					return nil, retryErr
-				}
-			}
-			return nil, apperror.NewInternal("failed to create oauth user")
-		}
-		return result, nil
-	}
-
-	result, account, err := findOrCreate(s.repo)
-	if err == nil {
-		err = s.recordGoogleLogin(ctx, nil, result, account)
-	}
-	if err != nil {
-		if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, err); retryErr == nil {
-			if user != nil {
-				if err := s.recordGoogleLogin(ctx, nil, user, googleAccountExisting); err != nil {
-					return nil, err
-				}
-				return user, nil
-			}
-		} else {
-			var appErr *apperror.AppError
-			if errors.As(retryErr, &appErr) {
-				return nil, retryErr
-			}
-		}
-		return nil, apperror.NewInternal("failed to create oauth user")
-	}
-	return result, nil
-}
-
-// Google sign-in outcomes recorded in the auth.google_login audit metadata.
-const (
-	googleAccountExisting = "existing"
-	googleAccountLinked   = "linked"
-	googleAccountCreated  = "created"
-)
-
-// recordGoogleLogin writes the Tier 1 auth.google_login event. The OAuth
-// callback skips tenant middleware (its tenant comes from the signed state),
-// so the event takes its tenant and actor from the signed-in account rather
-// than from request-level audit state.
-func (s *userService) recordGoogleLogin(ctx context.Context, tx pgx.Tx, user *identitysqlc.User, account string) error {
-	event := audit.NewServiceEvent(ctx, "auth.google_login", "auth")
-	event.TenantID = user.TenantID
-	event.ResourceID = strconv.FormatInt(user.ID, 10)
-	event.ActorID = user.ID
-	event.ActorRole = user.Role
-	event.ActorType = audit.ActorTypeForRole(user.Role)
-	if event.ActorType == audit.ActorTypeUnknown {
-		event.ActorType = audit.ActorTypeUser
-	}
-	event.Metadata = map[string]any{
-		"account":        account,
-		"email_verified": user.EmailVerifiedAt.Valid,
-	}
-	if err := audit.RecordInTx(ctx, s.audit, tx, event); err != nil {
-		return auditWriteError(err)
-	}
-	return nil
-}
-
-// retryOAuthLookup handles the concurrent-create race. It returns a user when
-// another request won, or nil to let the caller surface the original error.
-func (s *userService) retryOAuthLookup(ctx context.Context, googleID, email string, cause error) (*identitysqlc.User, error) {
-	if !database.IsUniqueViolation(cause) {
-		return nil, cause
-	}
-	if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
-		return user, nil
-	}
-	if _, err := s.repo.GetByEmail(ctx, email); err == nil {
-		return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
-	}
-	return nil, cause
-}
-
-func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
+// getUser loads an active account in the request tenant as a public error.
+func (s *userService) getUser(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	user, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -578,7 +109,14 @@ func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse,
 		}
 		return nil, apperror.NewInternal("failed to get user")
 	}
+	return user, nil
+}
 
+func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
+	user, err := s.getUser(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	return ToUserResponse(user), nil
 }
 
@@ -606,318 +144,34 @@ func (s *userService) List(ctx context.Context, limit int, startingAfter string)
 	return responses, hasMore, nil
 }
 
-func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
-	existing, err := s.repo.GetByID(ctx, id)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("user not found")
-		}
-		return nil, apperror.NewInternal("failed to get user")
+// userWriteError maps a failed user-row write: a missing row becomes 404 with
+// notFoundDetail, a repository AppError (last admin, concurrent change) is
+// kept, and anything else becomes a 500 with internalDetail.
+func userWriteError(err error, notFoundDetail, internalDetail string) error {
+	if errors.Is(err, apperror.ErrNotFound) {
+		return apperror.NewNotFound(notFoundDetail)
 	}
-
-	name := existing.Name
-	email := existing.Email
-
-	if req.Name != nil {
-		name = strings.TrimSpace(*req.Name)
-	}
-	if req.Email != nil {
-		requested := NormalizeEmail(*req.Email)
-		if requested != NormalizeEmail(existing.Email) {
-			dup, err := s.repo.GetByEmail(ctx, requested)
-			if err != nil && !errors.Is(err, apperror.ErrNotFound) {
-				return nil, apperror.NewInternal("failed to check email availability")
-			}
-			if dup != nil {
-				return nil, apperror.NewConflict("email already in use")
-			}
-			if err := ensureEmailNotBanned(ctx, s.repo, requested); err != nil {
-				return nil, err
-			}
-			email = requested
-		}
-	}
-
-	emailChanged := NormalizeEmail(existing.Email) != NormalizeEmail(email)
-	nameChanged := req.Name != nil && strings.TrimSpace(*req.Name) != existing.Name
-
-	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*identitysqlc.User, error) {
-		user, err := userRepo.Update(ctx, identitysqlc.UpdateUserParams{
-			ID:          id,
-			Name:        name,
-			Email:       email,
-			UpdateEmail: req.Email != nil,
-		})
-		if err != nil {
-			if database.IsUniqueViolation(err) {
-				return nil, apperror.NewConflict("email already in use")
-			}
-			return nil, apperror.NewInternal("failed to update user")
-		}
-		if emailChanged {
-			// Changing the identity address must end every existing session.
-			if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
-				return nil, apperror.NewInternal("failed to revoke sessions")
-			}
-		}
-		return user, nil
-	}
-
-	auditEvent := func() audit.Event {
-		event := audit.NewServiceEvent(ctx, "user.profile_updated", "user")
-		event.ResourceID = strconv.FormatInt(id, 10)
-		event.Metadata = map[string]any{
-			"email_changed": emailChanged,
-			"name_changed":  nameChanged,
-		}
-		return event
-	}
-
-	var user *identitysqlc.User
-	if s.txManager != nil {
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			var updateErr error
-			user, updateErr = doUpdate(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
-			if updateErr != nil {
-				return updateErr
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-			return nil
-		})
-	} else {
-		user, err = doUpdate(s.repo, s.refreshTokenRepo)
-		if err == nil {
-			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
-				return nil, auditWriteError(auditErr)
-			}
-		}
-	}
-	if err != nil {
-		return nil, err
-	}
-	if emailChanged && s.sessions != nil {
-		_ = s.sessions.Invalidate(ctx, id)
-	}
-
-	return ToUserResponse(user), nil
-}
-
-// VerifyPassword checks a plaintext password against the stored hash. It is
-// used to require re-authentication for sensitive profile changes.
-func ensureEmailNotBanned(ctx context.Context, repo repository.UserRepository, email string) error {
-	_, err := repo.GetBannedByEmail(ctx, email)
-	switch {
-	case err == nil:
-		return apperror.NewConflict("email is not available")
-	case errors.Is(err, apperror.ErrNotFound):
-		return nil
-	default:
-		return apperror.NewInternal("failed to check email availability")
-	}
-}
-
-func (s *userService) VerifyPassword(ctx context.Context, userID int64, password string) error {
-	user, err := s.repo.GetByID(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found")
-		}
-		return apperror.NewInternal("failed to get user")
-	}
-	if !user.PasswordHash.Valid {
-		return apperror.NewBadRequest("current password is incorrect")
-	}
-
-	// Shares the login counters (per source and per account) so
-	// re-authentication cannot be used to guess the password in parallel.
-	emailAddr := NormalizeEmail(user.Email)
-	if err := reserveLoginAttempt(ctx, s.cache, emailAddr); err != nil {
+	var appErr *apperror.AppError
+	if errors.As(err, &appErr) {
 		return err
 	}
-	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(password)) != nil {
-		return apperror.NewBadRequest("current password is incorrect")
-	}
-	clearLoginAttempts(ctx, s.cache, emailAddr)
-	return nil
+	return apperror.NewInternal(internalDetail)
 }
 
-func (s *userService) Delete(ctx context.Context, id int64) error {
-	target, err := s.repo.GetByID(ctx, id)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found")
-		}
-		return apperror.NewInternal("failed to get user")
+// invalidateSessions drops the cached session state after a committed change
+// that bumped the user's token version. The database is already
+// authoritative, so a cache failure only delays the effect until the cached
+// entry expires; it is logged, not returned.
+func invalidateSessions(ctx context.Context, sessions session.Store, userID int64) {
+	if sessions == nil {
+		return
 	}
-	doDelete := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		// Checked on the transaction's repository, under the per-tenant
-		// admin-change lock, so it serializes with concurrent demotions/bans.
-		if target.Role == dto.RoleAdmin {
-			if err := ensureNotLastAdmin(ctx, userRepo, "cannot delete the last active admin"); err != nil {
-				return err
-			}
-		}
-		_, err := userRepo.Delete(ctx, id)
-		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("user not found")
-			}
-			var appErr *apperror.AppError
-			if errors.As(err, &appErr) {
-				return err
-			}
-			return apperror.NewInternal("failed to delete user")
-		}
-		// Revoke all refresh tokens so a deleted user's sessions cannot outlive
-		// the account. Failing here rolls back the delete when run in a tx.
-		if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
-			return apperror.NewInternal("failed to revoke refresh tokens")
-		}
-		return nil
+	if err := sessions.Invalidate(ctx, userID); err != nil {
+		slog.Warn("failed to invalidate cached session state",
+			slog.Int64("user_id", userID),
+			slog.Any("error", err),
+		)
 	}
-
-	auditEvent := func() audit.Event {
-		event := audit.NewServiceEvent(ctx, "user.deleted", "user")
-		event.ResourceID = strconv.FormatInt(id, 10)
-		return event
-	}
-
-	if s.txManager != nil {
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			if deleteErr := doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); deleteErr != nil {
-				return deleteErr
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-			return nil
-		})
-	} else {
-		err = doDelete(s.repo, s.refreshTokenRepo)
-		if err == nil {
-			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-		}
-	}
-	if err != nil {
-		return err
-	}
-
-	if s.sessions != nil {
-		_ = s.sessions.Invalidate(ctx, id)
-	}
-	return nil
-}
-
-// RevokeSessions invalidates every access and refresh token for a user, used
-// by the "logout all devices" endpoint.
-func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
-	doRevoke := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		if _, err := userRepo.RevokeSessions(ctx, userID); err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("user not found")
-			}
-			return apperror.NewInternal("failed to revoke sessions")
-		}
-		if err := refreshRepo.DeleteByUserID(ctx, userID); err != nil {
-			return apperror.NewInternal("failed to revoke refresh tokens")
-		}
-		return nil
-	}
-
-	var err error
-	if s.txManager != nil {
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doRevoke(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
-		})
-	} else {
-		err = doRevoke(s.repo, s.refreshTokenRepo)
-	}
-	if err != nil {
-		return err
-	}
-	if s.sessions != nil {
-		_ = s.sessions.Invalidate(ctx, userID)
-	}
-	return nil
-}
-
-func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error {
-	user, err := s.repo.GetByID(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found")
-		}
-		return apperror.NewInternal("failed to get user")
-	}
-
-	if !user.PasswordHash.Valid {
-		return apperror.NewBadRequest("cannot change password for OAuth accounts")
-	}
-
-	if err := s.VerifyPassword(ctx, userID, req.CurrentPassword); err != nil {
-		return err
-	}
-	if req.CurrentPassword == req.NewPassword {
-		return apperror.NewBadRequest("new password must be different from the current password")
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcryptCost)
-	if err != nil {
-		return apperror.NewInternal("failed to hash password")
-	}
-
-	doChange := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		if _, err := userRepo.UpdatePassword(ctx, identitysqlc.UpdateUserPasswordParams{
-			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-			ID:           userID,
-		}); err != nil {
-			return apperror.NewInternal("failed to update password")
-		}
-		// A password change must invalidate every existing session.
-		if err := refreshRepo.DeleteByUserID(ctx, userID); err != nil {
-			return apperror.NewInternal("failed to revoke sessions")
-		}
-		return nil
-	}
-
-	auditEvent := func() audit.Event {
-		event := audit.NewServiceEvent(ctx, "user.password_changed", "user")
-		event.ResourceID = strconv.FormatInt(userID, 10)
-		return event
-	}
-
-	if s.txManager != nil {
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			if changeErr := doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); changeErr != nil {
-				return changeErr
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-			return nil
-		})
-	} else {
-		err = doChange(s.repo, s.refreshTokenRepo)
-		if err == nil {
-			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
-				return auditWriteError(auditErr)
-			}
-		}
-	}
-	if err != nil {
-		return err
-	}
-
-	if s.sessions != nil {
-		_ = s.sessions.Invalidate(ctx, userID)
-	}
-	clearLoginAttempts(ctx, s.cache, NormalizeEmail(user.Email))
-
-	return nil
 }
 
 func ToUserResponse(user *identitysqlc.User) *dto.UserResponse {

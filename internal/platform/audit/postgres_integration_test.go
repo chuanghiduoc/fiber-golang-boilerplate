@@ -101,6 +101,44 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 	assert.Equal(t, wantMetadata, gotMetadata)
 }
 
+// TestPostgresRecorderAcceptsHostileText proves client-controlled text with
+// invalid UTF-8 or NUL bytes is stored instead of failing the insert (22021),
+// which would 503 guarded routes and drop fallback audit rows.
+func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	requestID := fmt.Sprintf("audit-hostile-%d", time.Now().UnixNano())
+	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
+
+	recorder := NewPostgresRecorder(pool)
+	require.NoError(t, recorder.Record(ctx, Event{
+		Action:     "POST /files",
+		Resource:   "/files",
+		ResourceID: "id\xff\x00",
+		Metadata:   map[string]any{"note": "nul\x00here\xfe"},
+		IP:         "203.0.113.10\xff",
+		UserAgent:  "bad\xff\x00agent",
+		RequestID:  requestID,
+	}))
+
+	var userAgent, resourceID string
+	var metadata []byte
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT user_agent, resource_id, metadata FROM audit_events WHERE request_id = $1`, requestID,
+	).Scan(&userAgent, &resourceID, &metadata))
+	assert.Equal(t, "bad�agent", userAgent)
+	assert.Equal(t, "id�", resourceID)
+	assert.JSONEq(t, `{"note":"nulhere"}`, string(metadata))
+}
+
 // TestPostgresRecorderIntegrationTenant writes tenant-scoped rows and verifies
 // that the recorder resolves a missing Event.TenantID from the context.
 func TestPostgresRecorderIntegrationTenant(t *testing.T) {

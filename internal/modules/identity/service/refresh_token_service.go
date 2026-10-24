@@ -8,6 +8,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
@@ -19,6 +20,10 @@ import (
 
 type RefreshTokenService interface {
 	Create(ctx context.Context, userID int64, tokenVersion int32) (string, error)
+	// CreateTx is Create inside the caller's transaction, so the token commits
+	// or rolls back with it (Google sign-in issues the session with its audit
+	// row). A nil tx behaves like Create.
+	CreateTx(ctx context.Context, tx pgx.Tx, userID int64, tokenVersion int32) (string, error)
 	// Verify validates the token and returns the associated user ID.
 	Verify(ctx context.Context, token string) (int64, error)
 	// Consume atomically validates and deletes a refresh token. Exactly one
@@ -45,6 +50,17 @@ func hashToken(token string) string {
 }
 
 func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVersion int32) (string, error) {
+	return s.create(ctx, s.repo, userID, tokenVersion)
+}
+
+func (s *refreshTokenService) CreateTx(ctx context.Context, tx pgx.Tx, userID int64, tokenVersion int32) (string, error) {
+	if tx == nil {
+		return s.create(ctx, s.repo, userID, tokenVersion)
+	}
+	return s.create(ctx, repository.NewRefreshTokenRepository(tx), userID, tokenVersion)
+}
+
+func (s *refreshTokenService) create(ctx context.Context, repo repository.RefreshTokenRepository, userID int64, tokenVersion int32) (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", apperror.NewInternal("failed to generate refresh token")
@@ -53,7 +69,7 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVer
 
 	expiresAt := time.Now().Add(time.Duration(s.expireDays) * 24 * time.Hour)
 
-	rt, err := s.repo.Create(ctx, identitysqlc.CreateRefreshTokenParams{
+	rt, err := repo.Create(ctx, identitysqlc.CreateRefreshTokenParams{
 		TenantID:     tenant.EffectiveID(ctx),
 		UserID:       userID,
 		Token:        hashToken(plainToken), // Store hash, not plaintext

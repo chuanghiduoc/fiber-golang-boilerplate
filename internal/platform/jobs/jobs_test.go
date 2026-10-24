@@ -1286,7 +1286,7 @@ func TestPGStoreHeartbeatRequiresPool(t *testing.T) {
 	t.Parallel()
 
 	store := newPGStore(nil)
-	err := store.Heartbeat(context.Background(), 1, "worker", 1)
+	err := store.Heartbeat(context.Background(), 1, "worker", 1, time.Minute)
 	require.ErrorIs(t, err, ErrNoPool)
 
 	_, err = store.Claim(context.Background(), "worker", 1, time.Second)
@@ -1500,7 +1500,7 @@ func (f *fakeStore) Fail(_ context.Context, id int64, workerID string, attempts 
 	return f.failErr
 }
 
-func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, attempts int) error {
+func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, attempts int, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})

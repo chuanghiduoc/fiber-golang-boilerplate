@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -126,7 +127,7 @@ func TestFindOrCreateByGoogleNeverReplacesAnotherGoogleIdentity(t *testing.T) {
 	}
 	repo.nextID = 2
 
-	_, err := svc.FindOrCreateByGoogle(context.Background(), "google-attacker", "linked@example.com", "Attacker", true)
+	_, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{GoogleID: "google-attacker", Email: "linked@example.com", Name: "Attacker", AllowSignUp: true})
 	assert.Equal(t, http.StatusConflict, appErrorOf(t, err).Status)
 	assert.Equal(t, "google-original", repo.users[1].GoogleID.String)
 }
@@ -156,7 +157,7 @@ func TestFindOrCreateByGoogleAuditsStateTenantAndUser(t *testing.T) {
 	// tenant or actor, and the handler installs the signed-state tenant.
 	ctx := audit.WithRequestInfo(context.Background(), &audit.RequestInfo{RequestID: "req-1"})
 	ctx = tenant.WithID(ctx, 2)
-	user, err := svc.FindOrCreateByGoogle(ctx, "google-2", "oauth@example.com", "OAuth", true)
+	user, err := svc.SignInWithGoogle(ctx, GoogleSignIn{GoogleID: "google-2", Email: "oauth@example.com", Name: "OAuth", AllowSignUp: true})
 	require.NoError(t, err)
 
 	require.Len(t, recorder.events, 1)
@@ -166,6 +167,27 @@ func TestFindOrCreateByGoogleAuditsStateTenantAndUser(t *testing.T) {
 	assert.Equal(t, user.ID, event.ActorID)
 	assert.Equal(t, audit.ActorTypeUser, event.ActorType)
 	assert.Equal(t, googleAccountCreated, event.Metadata["account"])
+}
+
+// A sign-in the caller refuses (here: unverified email) must not be audited
+// as a successful auth.google_login.
+func TestSignInWithGoogleRefusedByCallerIsNotAudited(t *testing.T) {
+	repo := newMockUserRepo()
+	repo.users[1] = &identitysqlc.User{
+		TenantID: 1, ID: 1, Email: "changed@example.com", Name: "Changed", Role: "user",
+		GoogleID: pgtype.Text{String: "google-1", Valid: true}, AuthProvider: "google",
+	}
+	repo.nextID = 2
+	recorder := &recordingAudit{}
+	svc := NewUserService(repo, newMockRefreshTokenRepo(), false, newMockCache(), nil, recorder)
+
+	refused := apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
+	_, err := svc.SignInWithGoogle(context.Background(), GoogleSignIn{
+		GoogleID: "google-1", Email: "changed@example.com", Name: "Changed", AllowSignUp: true,
+		Complete: func(context.Context, pgx.Tx, *dto.UserResponse) error { return refused },
+	})
+	require.ErrorIs(t, err, refused)
+	assert.Empty(t, recorder.events, "a refused sign-in must not write auth.google_login")
 }
 
 // ---------------------------------------------------------------------------

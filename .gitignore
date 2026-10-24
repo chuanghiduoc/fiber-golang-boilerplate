@@ -29,6 +29,7 @@ tmp/
 
 # Project build
 main
+/bin/
 
 # OS X generated file
 .DS_Store

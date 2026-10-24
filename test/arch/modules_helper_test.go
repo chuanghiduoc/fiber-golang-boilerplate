@@ -22,6 +22,9 @@ func testIdempotency(c fiber.Ctx) error { return c.Next() }
 
 func passthrough(c fiber.Ctx) error { return c.Next() }
 
+// finalHandler stands in for a route's endpoint in synthetic route tests.
+func finalHandler(fiber.Ctx) error { return nil }
+
 func handlerName(handler fiber.Handler) string {
 	if handler == nil {
 		return ""
@@ -145,6 +148,22 @@ func isPlatformFunc(name, pkg, fn string) bool {
 // handlerChainHas reports whether any handler in the chain is fn in pkg.
 func handlerChainHas(route fiber.Route, pkg string, fns ...string) bool {
 	return handlerIndex(route, pkg, fns...) >= 0
+}
+
+// handlerBeforeFinal reports whether fn in pkg appears in the chain before
+// the route's last handler (index < len(Handlers)-1). Fiber runs the chain in
+// order and the last handler is the endpoint, so middleware after it never
+// guards it.
+func handlerBeforeFinal(route fiber.Route, pkg string, fns ...string) bool {
+	for i := 0; i < len(route.Handlers)-1; i++ {
+		name := handlerName(route.Handlers[i])
+		for _, fn := range fns {
+			if isPlatformFunc(name, pkg, fn) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // handlerIndex returns the position of the last handler that is fn in pkg,

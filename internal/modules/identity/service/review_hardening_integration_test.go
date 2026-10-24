@@ -59,7 +59,7 @@ func TestLinkGoogleAccountIntegrationNeverReplacesGoogleID(t *testing.T) {
 
 	svc := NewUserService(userRepo, repository.NewRefreshTokenRepository(pool), false,
 		cache.NewMemoryCache(), database.NewTxManager(pool), audit.Noop{})
-	_, err = svc.FindOrCreateByGoogle(ctx, "google-attacker", "linked@example.com", "Attacker", true)
+	_, err = svc.SignInWithGoogle(ctx, GoogleSignIn{GoogleID: "google-attacker", Email: "linked@example.com", Name: "Attacker", AllowSignUp: true})
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
 	assert.Equal(t, http.StatusConflict, appErr.Status)

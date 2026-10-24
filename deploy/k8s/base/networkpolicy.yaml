@@ -73,6 +73,15 @@ spec:
       ports:
         - protocol: TCP
           port: 5432
+    # SeaweedFS S3 gateway (STORAGE_DRIVER=seaweedfs) on its default port.
+    # Remove this rule when using AWS S3 (covered by 443 below) or narrow the
+    # CIDR to the SeaweedFS service range.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 8333
     # Redis. Add 6380 here if your managed Redis uses TLS on that port.
     - to:
         - ipBlock:

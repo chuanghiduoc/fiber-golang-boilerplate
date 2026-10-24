@@ -6,6 +6,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/gofiber/fiber/v3"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 )
 
 // publicRoutes are the deliberate exceptions to "every /api/v1 route checks a
@@ -46,22 +50,58 @@ func TestEveryProtectedRouteRequiresAPermission(t *testing.T) {
 			continue
 		}
 		key := route.Method + " " + route.Path
-		hasAuthz := handlerChainHas(route, authzPackage, authzFuncs...)
-		if _, public := publicRoutes[key]; public {
+		_, public := publicRoutes[key]
+		if public {
 			seenPublic[key] = true
-			if hasAuthz {
-				t.Errorf("%s is listed as public but checks a permission; remove it from publicRoutes", key)
-			}
-			continue
 		}
-		if !hasAuthz {
-			t.Errorf("module %s: %s has no authz.Require in its handler chain; protect it or add it to publicRoutes with a reason",
-				mounted.module, key)
+		if problem := authzRouteProblem(route, public); problem != "" {
+			t.Errorf("module %s: %s %s", mounted.module, key, problem)
 		}
 	}
 	for key := range publicRoutes {
 		if !seenPublic[key] {
 			t.Errorf("public route %s no longer exists; remove it from publicRoutes", key)
+		}
+	}
+}
+
+// authzRouteProblem returns why route breaks the permission rule, or "". A
+// protected route needs authz.Require/RequireAny before its final handler:
+// Fiber runs the chain in order and the last handler is the endpoint, so a
+// check placed after it never guards it. A public route checks no permission.
+func authzRouteProblem(route fiber.Route, public bool) string {
+	hasAuthz := handlerChainHas(route, authzPackage, authzFuncs...)
+	switch {
+	case public && hasAuthz:
+		return "is listed as public but checks a permission; remove it from publicRoutes"
+	case public:
+		return ""
+	case !hasAuthz:
+		return "has no authz.Require in its handler chain; protect it or add it to publicRoutes with a reason"
+	case !handlerBeforeFinal(route, authzPackage, authzFuncs...):
+		return "runs authz.Require only after its final handler; move it before the handler"
+	}
+	return ""
+}
+
+func TestAuthzRouteProblem(t *testing.T) {
+	require := authz.Require(authz.PermissionAdminUsersRead)
+	cases := map[string]struct {
+		handlers []fiber.Handler
+		public   bool
+		ok       bool
+	}{
+		"authz before handler": {handlers: []fiber.Handler{passthrough, require, finalHandler}, ok: true},
+		"public without authz": {handlers: []fiber.Handler{passthrough, finalHandler}, public: true, ok: true},
+		"no authz":             {handlers: []fiber.Handler{passthrough, finalHandler}},
+		"authz after handler":  {handlers: []fiber.Handler{passthrough, finalHandler, require}},
+		"authz only":           {handlers: []fiber.Handler{require}},
+		"public with authz":    {handlers: []fiber.Handler{require, finalHandler}, public: true},
+	}
+	for name, tc := range cases {
+		route := fiber.Route{Method: fiber.MethodPost, Path: "/api/v1/x", Handlers: tc.handlers}
+		if problem := authzRouteProblem(route, tc.public); (problem == "") != tc.ok {
+			t.Errorf("%s: authzRouteProblem = %q, want ok=%v", name, problem, tc.ok)
 		}
 	}
 }

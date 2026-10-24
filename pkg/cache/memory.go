@@ -58,6 +58,21 @@ func (m *MemoryCache) Set(_ context.Context, key string, value []byte, ttl time.
 	return nil
 }
 
+func (m *MemoryCache) SetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if e, ok := m.items[key]; ok && !e.expired() {
+		return false, nil
+	}
+	var expiresAt time.Time
+	if ttl > 0 {
+		expiresAt = time.Now().Add(ttl)
+	}
+	m.items[key] = entry{data: value, expiresAt: expiresAt}
+	return true, nil
+}
+
 func (m *MemoryCache) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -99,8 +114,7 @@ func (m *MemoryCache) Increment(_ context.Context, key string, ttl time.Duration
 	if e, ok := m.items[key]; ok && !e.expired() {
 		n, err := strconv.ParseInt(string(e.data), 10, 64)
 		if err != nil {
-			// Match Redis INCR: a non-integer value is not a counter. Callers
-			// use the error to distinguish an owned token from a free counter.
+			// Match Redis INCR: a non-integer value is not a counter.
 			return 0, fmt.Errorf("cache: increment non-integer value at %q", key)
 		}
 		n++

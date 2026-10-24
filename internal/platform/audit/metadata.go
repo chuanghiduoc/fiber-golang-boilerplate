@@ -133,7 +133,8 @@ func sanitizeString(value string, budget *int) string {
 		value = value[:*budget]
 	}
 	*budget -= len(value)
-	return strings.ToValidUTF8(value, "")
+	// jsonb rejects \u0000, so a NUL would fail the whole audit insert.
+	return strings.ReplaceAll(strings.ToValidUTF8(value, ""), "\x00", "")
 }
 
 func sensitiveKey(key string) bool {

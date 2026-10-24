@@ -4,7 +4,7 @@ tmp_dir = "tmp"
 
 [build]
   args_bin = []
-  bin = ".\\main.exe"
+  bin = ".\\bin\\server.exe"
   cmd = "make build"
   delay = 1000
   exclude_dir = ["assets", "tmp", "vendor", "testdata", "node_modules", "docs"]

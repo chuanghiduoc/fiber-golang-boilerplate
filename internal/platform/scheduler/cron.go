@@ -93,56 +93,9 @@ func parseCronField(field string, minValue, maxValue int, allowSunday7 bool) (ma
 		if item == "" {
 			return 0, false, fmt.Errorf("empty list item")
 		}
-
-		base := item
-		step := 1
-		if before, after, found := strings.Cut(item, "/"); found {
-			base = strings.TrimSpace(before)
-			parsed, err := strconv.Atoi(strings.TrimSpace(after))
-			if err != nil || parsed <= 0 {
-				return 0, false, fmt.Errorf("invalid step %q", item)
-			}
-			step = parsed
-			if base == "" {
-				return 0, false, fmt.Errorf("invalid step %q", item)
-			}
-		}
-
-		lo, hi := minValue, maxValue
-		switch {
-		case base == "*":
-			// Full range, optionally stepped.
-		case strings.Contains(base, "-"):
-			left, right, found := strings.Cut(base, "-")
-			if !found {
-				return 0, false, fmt.Errorf("invalid range %q", base)
-			}
-			start, err := strconv.Atoi(strings.TrimSpace(left))
-			if err != nil {
-				return 0, false, fmt.Errorf("invalid range start %q", left)
-			}
-			end, err := strconv.Atoi(strings.TrimSpace(right))
-			if err != nil {
-				return 0, false, fmt.Errorf("invalid range end %q", right)
-			}
-			if start > end {
-				return 0, false, fmt.Errorf("range start %d is after end %d", start, end)
-			}
-			lo, hi = start, end
-		default:
-			value, err := strconv.Atoi(base)
-			if err != nil {
-				return 0, false, fmt.Errorf("invalid value %q", base)
-			}
-			lo, hi = value, value
-			if step > 1 {
-				// Vixie cron treats "N/step" as N through the field maximum.
-				hi = maxValue
-			}
-		}
-
-		if lo < minValue || lo > maxValue || hi < minValue || hi > maxValue {
-			return 0, false, fmt.Errorf("value out of range %d-%d in %q", minValue, maxValue, item)
+		lo, hi, step, err := parseCronItem(item, minValue, maxValue)
+		if err != nil {
+			return 0, false, err
 		}
 		for value := lo; value <= hi; value += step {
 			bit := value
@@ -153,6 +106,72 @@ func parseCronField(field string, minValue, maxValue int, allowSunday7 bool) (ma
 		}
 	}
 	return mask, star, nil
+}
+
+// parseCronItem parses one list item ("*", "N", "A-B", each optionally
+// "/step") into the inclusive range it selects and its step.
+func parseCronItem(item string, minValue, maxValue int) (lo, hi, step int, err error) {
+	base, step, err := splitCronStep(item)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	switch {
+	case base == "*":
+		// Full range, optionally stepped.
+		lo, hi = minValue, maxValue
+	case strings.Contains(base, "-"):
+		lo, hi, err = parseCronRange(base)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+	default:
+		value, convErr := strconv.Atoi(base)
+		if convErr != nil {
+			return 0, 0, 0, fmt.Errorf("invalid value %q", base)
+		}
+		lo, hi = value, value
+		if step > 1 {
+			// Vixie cron treats "N/step" as N through the field maximum.
+			hi = maxValue
+		}
+	}
+
+	if lo < minValue || lo > maxValue || hi < minValue || hi > maxValue {
+		return 0, 0, 0, fmt.Errorf("value out of range %d-%d in %q", minValue, maxValue, item)
+	}
+	return lo, hi, step, nil
+}
+
+// splitCronStep separates "base/step"; an item without a step has step 1.
+func splitCronStep(item string) (base string, step int, err error) {
+	before, after, found := strings.Cut(item, "/")
+	if !found {
+		return item, 1, nil
+	}
+	step, err = strconv.Atoi(strings.TrimSpace(after))
+	base = strings.TrimSpace(before)
+	if err != nil || step <= 0 || base == "" {
+		return "", 0, fmt.Errorf("invalid step %q", item)
+	}
+	return base, step, nil
+}
+
+// parseCronRange parses an inclusive "start-end" range.
+func parseCronRange(base string) (start, end int, err error) {
+	left, right, _ := strings.Cut(base, "-")
+	start, err = strconv.Atoi(strings.TrimSpace(left))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid range start %q", left)
+	}
+	end, err = strconv.Atoi(strings.TrimSpace(right))
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid range end %q", right)
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("range start %d is after end %d", start, end)
+	}
+	return start, end, nil
 }
 
 // Next returns the first occurrence strictly after t.

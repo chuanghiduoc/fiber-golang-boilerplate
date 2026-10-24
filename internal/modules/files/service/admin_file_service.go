@@ -170,58 +170,79 @@ func (s *adminFileService) DeleteFile(ctx context.Context, id int64) error {
 		return err
 	}
 
-	deleteFile := func(repo repository.FileRepository) (*filesqlc.File, error) {
-		file, err := repo.Delete(ctx, id)
-		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return nil, apperror.NewNotFound("file not found or already deleted")
+	_, err = s.commitAdminMutation(ctx, adminFileMutation{
+		id:           id,
+		auditAction:  "admin.file.deleted",
+		webhookEvent: webhookcontracts.EventFileDeleted,
+		apply: func(repo repository.FileRepository) (*filesqlc.File, error) {
+			file, err := repo.Delete(ctx, id)
+			if err != nil {
+				if errors.Is(err, apperror.ErrNotFound) {
+					return nil, apperror.NewNotFound("file not found or already deleted")
+				}
+				return nil, apperror.NewInternal("failed to delete file")
 			}
-			return nil, apperror.NewInternal("failed to delete file")
-		}
-		return file, nil
-	}
+			return file, nil
+		},
+	})
+	return err
+}
 
+// adminFileMutation is one audited admin change to a file row.
+type adminFileMutation struct {
+	id           int64
+	auditAction  string
+	webhookEvent string
+	apply        func(repository.FileRepository) (*filesqlc.File, error)
+}
+
+// commitAdminMutation applies m with its Tier 1 audit row and webhook. With a
+// transaction manager the row change, audit row, and webhook outbox job commit
+// together (an audit failure rolls the change back); a webhook that could not
+// be queued in the transaction is dispatched after commit.
+func (s *adminFileService) commitAdminMutation(ctx context.Context, m adminFileMutation) (*filesqlc.File, error) {
 	auditEvent := func() audit.Event {
-		event := audit.NewServiceEvent(ctx, "admin.file.deleted", "file")
-		event.ResourceID = strconv.FormatInt(id, 10)
+		event := audit.NewServiceEvent(ctx, m.auditAction, "file")
+		event.ResourceID = strconv.FormatInt(m.id, 10)
 		return event
 	}
 
-	if s.txManager != nil {
-		var (
-			deleted *filesqlc.File
-			queued  bool
-		)
-		err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			file, deleteErr := deleteFile(repository.NewFileRepository(tx))
-			if deleteErr != nil {
-				return deleteErr
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
-				return filesAuditWriteError(auditErr)
-			}
-			var hookErr error
-			queued, hookErr = s.dispatchInTx(ctx, tx, webhookcontracts.EventFileDeleted, file)
-			deleted = file
-			return hookErr
-		})
+	if s.txManager == nil {
+		file, err := m.apply(s.repo)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if !queued {
-			dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileDeleted, deleted.TenantID, fileEventData(deleted))
+		if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+			return nil, filesAuditWriteError(auditErr)
 		}
-		return nil
+		dispatchWebhookAfterCommit(ctx, s.webhooks, m.webhookEvent, file.TenantID, fileEventData(file))
+		return file, nil
 	}
-	deleted, err := deleteFile(s.repo)
+
+	var (
+		changed *filesqlc.File
+		queued  bool
+	)
+	err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+		file, applyErr := m.apply(repository.NewFileRepository(tx))
+		if applyErr != nil {
+			return applyErr
+		}
+		if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+			return filesAuditWriteError(auditErr)
+		}
+		var hookErr error
+		queued, hookErr = s.dispatchInTx(ctx, tx, m.webhookEvent, file)
+		changed = file
+		return hookErr
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
-		return filesAuditWriteError(auditErr)
+	if !queued {
+		dispatchWebhookAfterCommit(ctx, s.webhooks, m.webhookEvent, changed.TenantID, fileEventData(changed))
 	}
-	dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileDeleted, deleted.TenantID, fileEventData(deleted))
-	return nil
+	return changed, nil
 }
 
 func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.FileResponse, error) {
@@ -242,59 +263,25 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.File
 		return nil, apperror.NewCode(filescatalog.CodeFileNotDeleted, "file is not deleted")
 	}
 
-	restore := func(repo repository.FileRepository) (*filesqlc.File, error) {
-		file, err := repo.Restore(ctx, id)
-		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return nil, apperror.NewNotFound("file not found or not deleted")
+	restored, err := s.commitAdminMutation(ctx, adminFileMutation{
+		id:           id,
+		auditAction:  "admin.file.restored",
+		webhookEvent: webhookcontracts.EventFileRestored,
+		apply: func(repo repository.FileRepository) (*filesqlc.File, error) {
+			file, err := repo.Restore(ctx, id)
+			if err != nil {
+				if errors.Is(err, apperror.ErrNotFound) {
+					return nil, apperror.NewNotFound("file not found or not deleted")
+				}
+				return nil, apperror.NewInternal("failed to restore file")
 			}
-			return nil, apperror.NewInternal("failed to restore file")
-		}
-		return file, nil
-	}
-
-	auditEvent := func() audit.Event {
-		event := audit.NewServiceEvent(ctx, "admin.file.restored", "file")
-		event.ResourceID = strconv.FormatInt(id, 10)
-		return event
-	}
-
-	if s.txManager != nil {
-		var (
-			restored *filesqlc.File
-			queued   bool
-		)
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			file, restoreErr := restore(repository.NewFileRepository(tx))
-			if restoreErr != nil {
-				return restoreErr
-			}
-			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
-				return filesAuditWriteError(auditErr)
-			}
-			var hookErr error
-			queued, hookErr = s.dispatchInTx(ctx, tx, webhookcontracts.EventFileRestored, file)
-			restored = file
-			return hookErr
-		})
-		if err != nil {
-			return nil, err
-		}
-		if !queued {
-			dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileRestored, restored.TenantID, fileEventData(restored))
-		}
-		return s.toAdminFileResponse(restored), nil
-	}
-
-	file, err := restore(s.repo)
+			return file, nil
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
-	if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
-		return nil, filesAuditWriteError(auditErr)
-	}
-	dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileRestored, file.TenantID, fileEventData(file))
-	return s.toAdminFileResponse(file), nil
+	return s.toAdminFileResponse(restored), nil
 }
 
 func (s *adminFileService) GetFileStats(ctx context.Context) (FileStats, error) {

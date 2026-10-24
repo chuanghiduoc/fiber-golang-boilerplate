@@ -16,6 +16,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
 
+// seedTimeout bounds connecting, the tenant lookup, and the admin seed.
+const seedTimeout = 60 * time.Second
+
 func main() {
 	if err := run(); err != nil {
 		slog.Error("seed failed", slog.Any("error", err))
@@ -31,7 +34,7 @@ func run() error {
 
 	logger.Setup(cfg.App.Env, cfg.App.LogLevel)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), seedTimeout)
 	defer cancel()
 
 	pool, err := database.NewPool(ctx, cfg.DB)

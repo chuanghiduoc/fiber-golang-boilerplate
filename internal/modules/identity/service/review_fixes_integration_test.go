@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -50,6 +51,79 @@ func TestReviewIntegration_ExpiredResetTokenIsDeleted(t *testing.T) {
 		`SELECT count(*) FROM password_reset_tokens WHERE user_id = $1`, user.ID,
 	).Scan(&count))
 	require.Zero(t, count, "expired reset token must be deleted")
+}
+
+// The reset job looks the account up by address outside the token
+// transaction. An email change committed in between must not yield a valid
+// token (which would be mailed to the old address).
+func TestReviewIntegration_ResetTokenRequiresCurrentAddress(t *testing.T) {
+	h := setupTenantServiceHarness(t)
+	ctx := tenantContext(tenant.DefaultID)
+
+	stale, err := h.userRepo.Create(ctx, identitysqlc.CreateUserParams{
+		Email: "Old-Address@example.com", Name: "Mover",
+	})
+	require.NoError(t, err)
+
+	issued, err := replaceResetToken(ctx, h.resetRepo, stale, "token-for-current-address")
+	require.NoError(t, err)
+	require.True(t, issued, "the address check is case-insensitive like GetUserByEmail")
+
+	_, err = h.userRepo.Update(ctx, identitysqlc.UpdateUserParams{
+		ID: stale.ID, Name: stale.Name, Email: "new-address@example.com", UpdateEmail: true,
+	})
+	require.NoError(t, err)
+
+	issued, err = replaceResetToken(ctx, h.resetRepo, stale, "token-for-old-address")
+	require.NoError(t, err)
+	require.False(t, issued, "a token must not be issued for an address the account no longer has")
+
+	var count int64
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM password_reset_tokens WHERE user_id = $1`, stale.ID,
+	).Scan(&count))
+	require.Zero(t, count)
+}
+
+// The scheduled purge removes expired tokens from every tenant and keeps live
+// ones.
+func TestReviewIntegration_ExpiredTokensArePurged(t *testing.T) {
+	h := setupTenantServiceHarness(t)
+	ctx := context.Background()
+
+	tenants := []int64{tenant.DefaultID, h.tenantTwo}
+	userIDs := make([]int64, 0, len(tenants))
+	for _, tenantID := range tenants {
+		user, err := h.userRepo.Create(tenantContext(tenantID), identitysqlc.CreateUserParams{
+			Email: fmt.Sprintf("purge-%d@example.com", tenantID), Name: "Purge",
+		})
+		require.NoError(t, err)
+		userIDs = append(userIDs, user.ID)
+		for i, expiresIn := range []string{"-1 minute", "1 hour"} {
+			_, err = h.pool.Exec(ctx, `INSERT INTO refresh_tokens (tenant_id, user_id, token, expires_at)
+				VALUES ($1, $2, $3, NOW() + $4::interval)`,
+				tenantID, user.ID, fmt.Sprintf("refresh-%d-%d", user.ID, i), expiresIn)
+			require.NoError(t, err)
+		}
+		_, err = h.pool.Exec(ctx, `INSERT INTO password_reset_tokens (tenant_id, user_id, token, expires_at)
+			VALUES ($1, $2, $3, NOW() - INTERVAL '1 minute')`, tenantID, user.ID, fmt.Sprintf("reset-%d", user.ID))
+		require.NoError(t, err)
+		_, err = h.pool.Exec(ctx, `INSERT INTO email_verification_tokens (tenant_id, user_id, email, token, expires_at)
+			VALUES ($1, $2, $3, $4, NOW() - INTERVAL '1 minute')`, tenantID, user.ID, user.Email, fmt.Sprintf("verify-%d", user.ID))
+		require.NoError(t, err)
+	}
+
+	require.NoError(t, NewTokenPurger(repository.NewTokenPurgeRepository(h.pool)).HandleJob(ctx, nil))
+
+	count := func(query string) int64 {
+		var n int64
+		require.NoError(t, h.pool.QueryRow(ctx, query, userIDs).Scan(&n))
+		return n
+	}
+	require.Equal(t, int64(2), count(`SELECT count(*) FROM refresh_tokens WHERE user_id = ANY($1) AND expires_at > NOW()`))
+	require.Zero(t, count(`SELECT count(*) FROM refresh_tokens WHERE user_id = ANY($1) AND expires_at <= NOW()`))
+	require.Zero(t, count(`SELECT count(*) FROM password_reset_tokens WHERE user_id = ANY($1)`))
+	require.Zero(t, count(`SELECT count(*) FROM email_verification_tokens WHERE user_id = ANY($1)`))
 }
 
 // A link built without a request slug (credential tenant overrode a

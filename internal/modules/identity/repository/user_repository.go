@@ -46,6 +46,10 @@ type UserRepository interface {
 	// GetPrincipal returns the active user's authorization view plus the
 	// owning tenant's status, for API-key authentication.
 	GetPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error)
+	// LockPrincipal is GetPrincipal under a FOR SHARE row lock. It is only
+	// meaningful on a transaction-backed repository: a concurrent ban/delete
+	// of the user waits until that transaction ends.
+	LockPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error)
 	// LockAdminChanges takes a transaction-scoped per-tenant lock that
 	// serializes admin demotion/ban/delete. It is only meaningful on a
 	// transaction-backed repository and must run before the target row is
@@ -303,6 +307,19 @@ func (r *userRepository) GetPrincipal(ctx context.Context, id int64) (*identitys
 	if err != nil {
 		return nil, wrapErr(err)
 	}
+	return &row, nil
+}
+
+func (r *userRepository) LockPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error) {
+	locked, err := r.q.LockUserPrincipal(ctx, identitysqlc.LockUserPrincipalParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	// Both queries select the same columns, so the generated rows convert.
+	row := identitysqlc.GetUserPrincipalRow(locked)
 	return &row, nil
 }
 
