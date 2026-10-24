@@ -16,14 +16,14 @@ rendered Secret.
 | `namespace.yaml` | `fiber-boilerplate` namespace with `restricted` Pod Security labels |
 | `configmap.yaml` | Non-secret production defaults and hostname/bucket placeholders |
 | `secret.example.yaml` | Template for the real Secret; excluded from kustomize |
-| `migration-job.yaml` | One-shot `/app/migrate` Job; the only DDL entrypoint |
-| `deployment.yaml` | 2-replica RollingUpdate Deployment, probes, security context |
+| `migration-job.yaml` | One-shot `/app/migrate` Job; applied separately, before the app |
+| `deployment.yaml` | RollingUpdate Deployment (HPA owns replicas), probes, security context |
 | `service.yaml` | ClusterIP on port 8080 |
-| `hpa.yaml` | CPU-based HPA, 2–10 replicas |
+| `hpa.yaml` | CPU-based HPA, min 2 / max 10 |
 | `pdb.yaml` | `minAvailable: 1` |
-| `networkpolicy.yaml` | Ingress from ingress-nginx; restricted egress |
+| `networkpolicy.yaml` | Ingress from ingress-nginx; restricted egress; CNI probe caveat |
 | `ingress.yaml` | nginx Ingress with TLS host placeholder |
-| `kustomization.yaml` | Resource list; intentionally omits `secret.example.yaml` |
+| `kustomization.yaml` | App resources + image transformer; omits Job and `secret.example.yaml` |
 
 ## Prerequisites
 
@@ -46,7 +46,9 @@ rendered Secret.
 
 At minimum, replace:
 
-- `deployment.yaml` and `migration-job.yaml`: `ghcr.io/OWNER/REPO:latest`.
+- `deployment.yaml`, `kustomization.yaml`, and `migration-job.yaml`:
+  `ghcr.io/OWNER/REPO:latest`. The app kustomization's `images:` transformer
+  rewrites the Deployment; the raw Job uses its literal line.
 - `ingress.yaml`: `api.example.com` and `fiber-boilerplate-tls`.
 - `configmap.yaml`: `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`,
   `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET`, and the
@@ -62,19 +64,20 @@ grep -RInE 'OWNER/REPO|example\.com|REPLACE_|10\.0\.0\.0/8' deploy/k8s
 ```
 
 Use an immutable release tag (for example `1.4.2`) in production, not
-`:latest`. Replace the image in **both** `deployment.yaml` and
-`migration-job.yaml`: the migration Job is applied as a raw file before the
-Deployment, so changing only one leaves the two on different images. The
-manifests use `imagePullPolicy: IfNotPresent`; change it to `Always` if you
-deliberately deploy `:latest`.
+`:latest`. The app kustomization's `images:` transformer is the single source
+for the Deployment image; the raw migration Job is outside that kustomization
+by design, so keep its literal image line in sync when pinning a release. Both
+manifests use `imagePullPolicy: Always` for the mutable `:latest` placeholder;
+switch to `IfNotPresent` after pinning an immutable tag.
 
 `APP_TRUSTED_PROXIES` must contain only the cluster pod/service CIDR that
 contains ingress-nginx. Setting it to `0.0.0.0/0` lets clients spoof
 `X-Forwarded-For` and bypass per-IP rate limits.
 
-`APP_PORT` is part of the probe, Service, and container port contract. If you
-change it from 8080, update `containerPort`, the `http` port name target, the
-Service port, and the Ingress backend.
+`APP_PORT` is part of the probe, Service, container port, and NetworkPolicy
+contract. If you change it from 8080, update `containerPort`, the `http` named
+port used by the probes, the Service port, the Ingress backend, and the
+NetworkPolicy ingress port `8080`.
 
 ## 2. Create the namespace and Secret
 
@@ -118,11 +121,17 @@ kubectl -n fiber-boilerplate create secret docker-registry ghcr-pull \
 Only `cmd/migrate` is allowed to apply DDL. The API and seed commands never
 migrate, so API replicas do not race on schema changes.
 
-`kubectl apply -k deploy/k8s` applies resources without a cross-kind ordering
-guarantee. **Do not rely on it to run the Job before the Deployment.** On a
-fresh install or upgrade, apply and await the Job explicitly:
+The app kustomization intentionally **excludes** `migration-job.yaml`, so
+`kubectl apply -k deploy/k8s` cannot create the Job before the Deployment.
+`kubectl apply -k` also has no cross-resource ordering guarantee. The only safe
+flow is to apply the namespace/configmap/secret, apply and await the Job, and
+only then apply the app kustomization:
 
 ```bash
+kubectl apply -f deploy/k8s/namespace.yaml
+kubectl apply -f deploy/k8s/configmap.yaml
+# Create and apply the real Secret first (step 2).
+
 kubectl -n fiber-boilerplate delete job fiber-boilerplate-migrate --ignore-not-found
 kubectl apply -f deploy/k8s/migration-job.yaml
 kubectl -n fiber-boilerplate wait \
@@ -131,6 +140,11 @@ kubectl -n fiber-boilerplate wait \
   job/fiber-boilerplate-migrate
 kubectl -n fiber-boilerplate logs job/fiber-boilerplate-migrate
 ```
+
+Do not add the Job back to `kustomization.yaml`; that reintroduces the ordering
+ambiguity this split is meant to remove. The explicit `kubectl apply -f` path
+uses the Job's literal image tag, so keep it in sync with the app's `images:`
+transformer.
 
 On failure:
 
@@ -153,10 +167,14 @@ kubectl apply -k deploy/k8s
 kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate --timeout=10m
 ```
 
-This re-applies the already-completed Job (a no-op while it still exists) and
-creates/updates the Deployment, Service, HPA, PDB, NetworkPolicy, and Ingress.
-If the Job was already garbage-collected by its TTL, run the migration step
-again and wait before applying the rest.
+This applies only the app resources: Deployment, Service, HPA, PDB,
+NetworkPolicy, and Ingress. The migration Job is not part of this
+kustomization and is not re-applied here. If the Job was garbage-collected by
+its TTL after you ran it, rerun the Job apply/wait in step 3 before this step.
+
+The Deployment intentionally has no `spec.replicas`; the HPA's
+`minReplicas: 2` owns the replica count. Do not add `replicas` back to the
+Deployment, or the HPA and Deployment controllers will fight over it.
 
 The Deployment uses `maxUnavailable: 0` and `maxSurge: 1`; a new pod must pass
 `/readyz` before an old pod is removed. The in-process job workers use a
@@ -181,8 +199,10 @@ curl -fsS https://api.example.com/readyz
 ```
 
 `/healthz` is a process liveness check. `/readyz` also checks dependencies
-such as PostgreSQL and Redis. If `kubectl get hpa` shows `<unknown>` targets,
-install/fix metrics-server.
+such as PostgreSQL and Redis. The startup probe deliberately uses `/healthz`
+(not `/readyz`) so a dependency outage during boot does not restartloop the pod;
+once startup succeeds, `/readyz` gates traffic. If `kubectl get hpa` shows
+`<unknown>` targets, install/fix metrics-server.
 
 ## 6. Rollback
 
@@ -233,9 +253,10 @@ If you must use `STORAGE_DRIVER=local`:
 - Use a ReadWriteMany volume (NFS/EFS/CephFS) so every replica sees the same
   files; `emptyDir` is node-local, is lost on restart, and is only suitable for
   a single replica.
-- Ensure the volume is writable by UID/GID 1000 (`fsGroup: 1000` is set) or
-  adjust `runAsUser`/`runAsGroup` to match the image user and volume
-  permissions.
+- Ensure the volume is writable by UID 100 / GID 101 (`fsGroup: 101` is set)
+  or adjust `runAsUser`/`runAsGroup` to match the image user and volume
+  permissions. The image's `appuser` is UID 100 / GID 101, so 100:101 ownership
+  matches `/app/uploads` in the image.
 - A local upload volume is not a substitute for object storage durability or
   backups.
 
@@ -281,6 +302,11 @@ a rollout.
 - The NetworkPolicy allows ingress only from the `ingress-nginx` namespace. If
   your controller runs elsewhere, change the namespace label. A Prometheus rule
   for the `monitoring` namespace is included as a comment.
+- **Kubelet probes are CNI-dependent.** Many CNIs allow node-originated
+  readiness/liveness probes to the pod regardless of NetworkPolicy; some enforce
+  policy and will drop them. `networkpolicy.yaml` includes a commented ingress
+  rule for the node/node-pod CIDR: uncomment and set it if your CNI blocks
+  probes. Do not widen it to `0.0.0.0/0`.
 - Egress to HTTPS and SMTP is intentionally broad (`0.0.0.0/0`); tighten it
   with VPC endpoints/provider ranges. DB and Redis egress are limited to
   `10.0.0.0/8` by default.
@@ -288,20 +314,29 @@ a rollout.
 ### HPA and PDB
 
 The HPA requires metrics-server. It scales on CPU at 70% utilization from a
-minimum of 2 to a maximum of 10 replicas. The PDB keeps at least one API pod
-available during voluntary disruptions such as node drains. With exactly 2
-replicas, node drains must proceed one pod at a time.
+minimum of 2 to a maximum of 10 replicas, and it owns the Deployment's replica
+count; the Deployment intentionally has no `spec.replicas`. The PDB keeps at
+least one API pod available during voluntary disruptions such as node drains.
+With exactly 2 replicas, node drains must proceed one pod at a time.
 
-### Release workflow
+### Release workflow and CI
 
 `.github/workflows/release.yml` runs on `v*` tags and manual dispatch. It:
 
-- runs `go build ./...` and `go test -race ./...` before publishing;
+- runs `go vet ./...`, `go build ./...`, and `go test -race ./...` before
+  publishing;
 - builds `linux/amd64` and `linux/arm64` images with Buildx/QEMU;
 - pushes to `ghcr.io/${{ github.repository }}` using `GITHUB_TOKEN`;
-- emits semver tags (`1.4.2`, `1.4`, `1`), `latest` for semver tags, a
-  full-SHA tag, and branch tags for manual branch dispatches;
-- publishes provenance and an SBOM, with GitHub Actions cache.
+- emits semver tags (`1.4.2`, `1.4`, `1`) and `latest` for **stable** semver
+  tags; pre-releases keep only their full version tag. Every run also gets a
+  full-SHA tag, and manual branch dispatches get the branch name;
+- publishes provenance and an SBOM, with GitHub Actions cache;
+- pins actions to full commit SHAs (version comments alongside) verified on
+  2026-10-24.
+
+The CI `Manifests` job runs `actionlint`, renders `deploy/k8s` with kustomize,
+and runs kubeconform strict against Kubernetes 1.29, including the raw
+migration Job and `secret.example.yaml`.
 
 Example release:
 

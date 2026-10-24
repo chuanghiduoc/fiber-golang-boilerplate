@@ -9,6 +9,8 @@ metadata:
     app.kubernetes.io/part-of: fiber-boilerplate
     app.kubernetes.io/component: api
 spec:
+  # The HPA owns the Deployment replica count. Deployment must not set
+  # spec.replicas, or the two controllers will fight over it.
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment

@@ -77,6 +77,61 @@ jobs:
       - name: Build migrate binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o migrate ./cmd/migrate
 
+  manifests:
+    name: Manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install actionlint
+        run: |
+          curl -fsSLo actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          tar -xzf actionlint.tar.gz
+          sudo mv actionlint /usr/local/bin/actionlint
+          rm actionlint.tar.gz
+
+      - name: Lint workflows
+        run: actionlint
+
+      - name: Install kustomize
+        run: |
+          curl -fsSLo kustomize.tar.gz \
+            https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz
+          tar -xzf kustomize.tar.gz
+          sudo mv kustomize /usr/local/bin/kustomize
+          rm kustomize.tar.gz
+
+      - name: Render app manifests
+        run: kustomize build deploy/k8s > /tmp/app-manifests.yaml
+
+      - name: Check excluded resources
+        run: |
+          if grep -qx 'kind: Secret' /tmp/app-manifests.yaml; then
+            echo "::error::secret.example.yaml must not be part of the app kustomization"
+            exit 1
+          fi
+          if grep -q 'name: fiber-boilerplate-migrate' /tmp/app-manifests.yaml; then
+            echo "::error::migration-job.yaml must be applied separately, not via the app kustomization"
+            exit 1
+          fi
+
+      - name: Install kubeconform
+        run: |
+          curl -fsSLo kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz
+          sudo mv kubeconform /usr/local/bin/kubeconform
+          rm kubeconform.tar.gz
+
+      - name: Validate manifests
+        run: |
+          kubeconform -strict -summary -kubernetes-version 1.29.0 \
+            /tmp/app-manifests.yaml \
+            deploy/k8s/migration-job.yaml \
+            deploy/k8s/secret.example.yaml
+
   migrations:
     name: Migrations
     runs-on: ubuntu-latest

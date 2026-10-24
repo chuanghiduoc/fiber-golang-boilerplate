@@ -11,9 +11,10 @@ spec:
   # One-shot schema migration. Only cmd/migrate may apply DDL; the API and
   # seed commands never migrate.
   #
-  # Apply this Job and wait for completion BEFORE rolling out deployment.yaml.
-  # `kubectl apply -k deploy/k8s` does not guarantee Job-before-Deployment
-  # ordering, so the README uses an explicit Job apply + `kubectl wait`.
+  # This Job is intentionally NOT part of the app kustomization. Apply it and
+  # wait for completion BEFORE `kubectl apply -k deploy/k8s` (see README.md).
+  # The app kustomization deliberately excludes this Job, so it must be applied
+  # explicitly and awaited; an unordered apply cannot guarantee this ordering.
   #
   # The Job name is stable. Jobs are immutable, so delete a previous completed
   # Job before applying a changed manifest (see README.md). ttlSecondsAfterFinished
@@ -36,15 +37,22 @@ spec:
       # imagePullSecrets:
       #   - name: ghcr-pull
       securityContext:
+        # Match the Docker image user: appuser is UID 100 / GID 101.
         runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: migrate
+          # Same repository as the Deployment. The raw apply path uses this
+          # literal; update it with deployment.yaml/kustomization.yaml's
+          # images transformer when you pin a release.
           image: ghcr.io/OWNER/REPO:latest
-          imagePullPolicy: IfNotPresent
+          # Mutable placeholder tag: always pull. Switch to IfNotPresent after
+          # pinning an immutable release tag.
+          imagePullPolicy: Always
           command: ["/app/migrate"]
           envFrom:
             - configMapRef:
@@ -59,6 +67,9 @@ spec:
               cpu: 500m
               memory: 256Mi
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
