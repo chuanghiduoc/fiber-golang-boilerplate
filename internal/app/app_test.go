@@ -2,9 +2,11 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/gofiber/fiber/v3"
@@ -13,6 +15,9 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -138,4 +143,85 @@ func TestCORSPreflightAllowsIdempotencyKey(t *testing.T) {
 		"browser clients must be able to read the replay marker: %q",
 		resp.Header.Get(fiber.HeaderAccessControlExposeHeaders),
 	)
+}
+
+type providerModule struct {
+	events    int
+	jobs      int
+	schedules int
+}
+
+func (m *providerModule) Name() string { return "provider" }
+func (m *providerModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
+	v1.Get("/provider", func(c fiber.Ctx) error { return c.SendString("ok") })
+}
+func (m *providerModule) RegisterEvents(bus *events.Bus) {
+	m.events++
+	_ = bus.SubscribeDurable("provider.changed", "refresh", func(context.Context, events.Event) error {
+		return nil
+	})
+}
+func (m *providerModule) RegisterJobs(registrar jobs.Registrar) {
+	m.jobs++
+	registrar.Register("provider.reindex", func(context.Context, json.RawMessage) error { return nil })
+}
+func (m *providerModule) RegisterSchedules(registry *scheduler.Registry) {
+	m.schedules++
+	_ = registry.Register(scheduler.Spec{
+		Name:     "provider.heartbeat",
+		Interval: time.Minute,
+		Kind:     "provider.reindex",
+	})
+}
+
+type recordingRegistrar struct {
+	kinds map[string]struct{}
+}
+
+func (r *recordingRegistrar) Register(kind string, _ jobs.Handler) {
+	if r.kinds == nil {
+		r.kinds = make(map[string]struct{})
+	}
+	r.kinds[kind] = struct{}{}
+}
+
+func TestOptionalModuleProviders(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	registry := scheduler.NewRegistry()
+	registrar := &recordingRegistrar{}
+	module := &providerModule{}
+
+	application := app.New(cfg, app.Deps{
+		Events:    events.New(nil),
+		Jobs:      registrar,
+		Schedules: registry,
+	})
+	application.Register(module)
+
+	assert.Equal(t, 1, module.events)
+	assert.Equal(t, 1, module.jobs)
+	assert.Equal(t, 1, module.schedules)
+	assert.Equal(t, 1, registry.Len())
+	assert.Contains(t, registrar.kinds, "provider.reindex")
+	assert.Contains(t, registrar.kinds, "events.provider.changed.refresh")
+}
+
+func TestOptionalModuleProvidersAreNilSafe(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	module := &providerModule{}
+	application := app.New(cfg, app.Deps{})
+	require.NotPanics(t, func() { application.Register(module) })
+	assert.Equal(t, 0, module.events)
+	assert.Equal(t, 0, module.jobs)
+	assert.Equal(t, 0, module.schedules)
 }

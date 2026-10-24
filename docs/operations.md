@@ -87,6 +87,13 @@ Application metrics:
 | `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
+| `events_published_total` | `event`, `mode` | Events published locally or durably. |
+| `events_handled_total` | `event`, `outcome` | Event handler calls (`success`, `error`, `panic`). |
+| `events_enqueue_errors_total` | `event` | Durable event jobs that could not be enqueued. |
+| `scheduler_runs_total` | `schedule`, `outcome` | Scheduler slots processed (`enqueued`, `skipped`, `duplicate`). |
+| `scheduler_leader` | — | `1` on the process holding the scheduler lease. |
+| `scheduler_enqueue_errors_total` | `schedule` | Scheduled jobs that could not be enqueued. |
+| `scheduler_runs_purged_total` | — | Scheduler run-ledger rows deleted by retention. |
 | `audit_write_failures_total` | — | Audit events that could not be recorded. |
 
 The default Prometheus registry also exposes Go runtime and process metrics
@@ -108,6 +115,15 @@ increase(jobs_dead_total[15m]) > 0
 
 # Sustained claim failures
 rate(jobs_claim_errors_total[5m]) > 0
+
+# No scheduler leader in the fleet (expected value is 1 overall, not per pod)
+sum(scheduler_leader) != 1
+
+# Scheduled slots failing to enqueue
+increase(scheduler_enqueue_errors_total[15m]) > 0
+
+# Durable event fan-out failures
+increase(events_enqueue_errors_total[15m]) > 0
 ```
 
 There is no queue-depth gauge. Query PostgreSQL for backlog and age:
@@ -187,6 +203,13 @@ tenant-first inspection. Retention and Prometheus labels are deliberately
 global: terminal jobs are purged by age regardless of tenant, and the metric
 labels stay `kind` only to avoid cardinality growth.
 
+`Queue.EnqueueOnce`/`EnqueueOnceTx` use the nullable
+`jobs.idempotency_key` and a partial unique `(tenant_id, idempotency_key)`
+index. A duplicate returns the existing id and inserts nothing, so a producer
+retry (or an event fan-out retry) cannot create a second row. Plain
+`Enqueue`/`EnqueueTx` do not suppress duplicates. Terminal rows keep their key
+until retention removes the row.
+
 ### Lifecycle and retries
 
 - A job is `queued` -> `running` -> `succeeded` or `dead`. `attempts` increments
@@ -265,7 +288,8 @@ GROUP BY tenant_id, kind, status
 ORDER BY count(*) DESC;
 
 -- Recent failures and dead letters
-SELECT id, tenant_id, kind, status, attempts, max_attempts, last_error, updated_at
+SELECT id, tenant_id, kind, status, attempts, max_attempts,
+       idempotency_key, last_error, updated_at
 FROM jobs
 WHERE status IN ('running', 'dead')
 ORDER BY updated_at DESC
@@ -297,6 +321,61 @@ WHERE id = <id>
 ```
 
 Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
+
+### Durable events
+
+`internal/platform/events` publishes metadata-rich events locally and/or as
+jobs. A durable subscription adds one job per event and handler, with
+`jobs.idempotency_key = event:<eventId>:<handler>:<tenantId>`. The job payload
+is the event JSON, so `jobs.payload` contains the event data. Delivery is
+at-least-once; handlers must be idempotent. Local handler panics are recovered
+and combined with `errors.Join`; check `events_handled_total{outcome="panic"}`
+and `events_enqueue_errors_total` during an incident. Durable event handlers
+must be registered before `worker.Run`; the app does this after all
+`EventProvider` modules register.
+
+### Scheduler
+
+`internal/platform/scheduler` is enabled with `SCHEDULER_ENABLED=true` and runs
+in-process in every API replica. Only the holder of the single
+`scheduler_leases` row evaluates schedules. `scheduler_runs` is the unique
+`(schedule, scheduled_for)` ledger: the ledger row and the job enqueue share a
+transaction, so a leader restart or overlapping election cannot double-enqueue
+a slot. The lease is renewed every `SCHEDULER_HEARTBEAT_SECS`; a failed renewal
+cancels the current pass and steps down.
+
+- `SCHEDULER_CATCHUP`: `none` skips slots missed while no leader ran, `latest`
+  runs only the newest, `all` replays in order up to
+  `SCHEDULER_CATCHUP_LIMIT` per poll. A slow poll during continuous leadership
+  still runs the latest slot under `none`, so short schedules are not starved.
+- `SCHEDULER_RETENTION_DAYS` bounds `scheduler_runs`. Purging the ledger does
+  not replay old slots; the next evaluation starts from the current slot.
+- A schedule's job payload is `{"schedule","scheduledFor","data"}` and its key
+  is `scheduler:<name>:<slot>`. The job kind must have a worker handler; a
+  missing handler follows the normal retry/dead-letter path.
+- Scheduler logs include `holder`, `schedule`, `slot`, and the underlying
+  error. `scheduler_leader` should sum to 1 across replicas; if it is 0, check
+  database reachability and lease expiry. If it is greater than 1, check clock
+  skew and whether a process is running with an extremely short lease TTL.
+
+```sql
+-- Current leader and lease age
+SELECT name, holder, expires_at, now() - heartbeat_at AS since_heartbeat
+FROM scheduler_leases;
+
+-- Recent slots and whether they enqueued or were skipped
+SELECT schedule, scheduled_for, status, job_id, error, created_at
+FROM scheduler_runs
+ORDER BY scheduled_for DESC
+LIMIT 50;
+
+-- Per-schedule backlog of due but unledgered work (manual check)
+SELECT kind, count(*), min(run_at)
+FROM jobs
+WHERE status = 'queued'
+GROUP BY kind
+ORDER BY count(*) DESC;
+```
 
 ## 5. Idempotency and Redis
 
@@ -585,7 +664,9 @@ do not blindly roll the image back onto a newer schema.
    affected route or job kind.
 2. Correlate with `X-Request-Id` in logs, problem responses, and audit rows.
 3. Check the four golden signals plus `jobs_dead_total`,
-   `jobs_claim_errors_total`, and `audit_write_failures_total`.
+   `jobs_claim_errors_total`, `scheduler_leader`,
+   `scheduler_enqueue_errors_total`, `events_enqueue_errors_total`, and
+   `audit_write_failures_total`.
 4. Prefer reversible mitigations: roll back the Deployment, restore a
    dependency, or scale capacity. Do not flush Redis, rotate `JWT_SECRET`,
    delete jobs, or force a migration version as a first response.

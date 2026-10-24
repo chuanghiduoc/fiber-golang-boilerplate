@@ -11,6 +11,8 @@ END $$;
 
 DROP FUNCTION IF EXISTS protect_last_admin();
 
+DROP TABLE IF EXISTS scheduler_runs;
+DROP TABLE IF EXISTS scheduler_leases;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS files;

@@ -29,6 +29,8 @@ var requiredTables = []string{
 	"email_verification_tokens",
 	"files",
 	"jobs",
+	"scheduler_leases",
+	"scheduler_runs",
 	"audit_events",
 }
 
@@ -40,7 +42,9 @@ var requiredColumns = map[string][]string{
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id"},
-	"jobs":                      {"tenant_id"},
+	"jobs":                      {"tenant_id", "idempotency_key"},
+	"scheduler_leases":          {"name", "holder", "expires_at", "heartbeat_at"},
+	"scheduler_runs":            {"schedule", "scheduled_for", "status", "job_id"},
 	"audit_events":              {"tenant_id"},
 }
 
@@ -51,6 +55,8 @@ var requiredUniqueIndexes = []string{
 	"idx_users_tenant_google_id_active",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+	"idx_jobs_tenant_idempotency_key",
+	"idx_scheduler_runs_schedule_slot",
 }
 
 func main() {

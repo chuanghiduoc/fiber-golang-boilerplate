@@ -7,6 +7,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- Optional durable scheduler (`internal/platform/scheduler`): interval and 5-field UTC cron schedules (lists/ranges/steps and `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`), one PostgreSQL leader lease (`scheduler_leases`), a unique `scheduler_runs` run ledger, transactional enqueue, `none`/`latest`/`all` catch-up with a per-pass limit, run-ledger retention, graceful step-down/shutdown, and Prometheus metrics. Configure with `SCHEDULER_ENABLED` plus lease TTL/heartbeat/poll/catch-up/retention settings; `cmd/api` starts it only when enabled and stops it before the worker.
+- Typed in-process event bus (`internal/platform/events`) with `Publish`, `PublishLocal`, and transaction-aware `PublishTx`: metadata carries event id/name/tenant/request/actor, local handlers run synchronously with panic isolation and `errors.Join`, and durable subscriptions enqueue one idempotent job per event and handler (`event:<id>:<handler>:<tenant>`). Adds `requestctx` request/actor propagation, `jobs.EnqueueOnce`/`EnqueueOnceTx`, optional `app.EventProvider`/`JobProvider`/`ScheduleProvider` hooks, and event/scheduler metrics.
 - Multi-tenant foundation: `tenants` table (seeded `default` tenant id 1), `tenant_id` columns and tenant-leading indexes on users, files, refresh/reset/verification tokens, jobs, and audit events; per-tenant email/Google uniqueness and last-admin trigger. Requests resolve `X-Tenant-Slug` (empty -> `TENANT_DEFAULT_SLUG`, invalid/unknown -> 404) through `internal/platform/tenant`; JWTs carry `tenant_id`, authenticated requests use the claim, and a conflicting explicit header returns 403 `permission.denied`. Adds `TENANT_DEFAULT_SLUG`/`TENANT_REQUIRE_HEADER` config and the identity tenant repository/resolver.
 - Tenant-isolated identity: all identity SQL is scoped by `tenant_id`; registration/login/refresh/reset/verification/OAuth use the request tenant; per-tenant emails/Google IDs; tokens carry tenant; suspended/legacy tenantless tokens are rejected; admin user operations/stats/last-admin are tenant-scoped. Adds `tenantId` to `UserResponse`.
 - Files tenant isolation: every file metadata query and admin list/count/stats query filters `tenant_id`; cross-tenant file ids return 404; delete/restore never cross tenants; new blobs use `<tenantID>/<userID>/<uuid>.<ext>` (old keys remain readable); `FileResponse`/`contracts.File` carry `tenantId`.
@@ -29,7 +31,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed (architecture)
 - API and seed no longer auto-run migrations; only `cmd/migrate` applies DDL, preventing replica migration races
-- Consolidated all schema into a single `migrations/000001_init_schema.up.sql` / `.down.sql` (replaces the old shipped migrations `000001`–`000003`); `jobs` and `audit_events` live in that file
+- Consolidated all schema into a single `migrations/000001_init_schema.up.sql` / `.down.sql` (replaces the old shipped migrations `000001`–`000003`); `jobs`, `audit_events`, `scheduler_leases`, and `scheduler_runs` live in that file, and `jobs` carries a nullable `idempotency_key` with a partial unique `(tenant_id, idempotency_key)` index
 - Dockerfile builds both `server` and `migrate`; Compose adds a one-shot `migrate` service and app dependency
 - `make run` migrates before starting; `make seed` depends on migration
 - CI builds both binaries, runs `go vet`/`gofmt`, and includes a fresh-PostgreSQL migration job (baseline up/down + `cmd/migrate` twice)

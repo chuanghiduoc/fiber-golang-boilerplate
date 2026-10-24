@@ -58,7 +58,10 @@ internal/contracts/                 Narrow cross-module identity/files admin int
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
-  jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
+  events/                           Typed in-process bus + durable job-backed subscriptions
+  jobs/                             Durable PostgreSQL jobs, worker, leases, idempotent enqueue
+  requestctx/                       Request ID + actor propagation through context
+  scheduler/                        PostgreSQL-leader interval/cron scheduler and run ledger
   session/                          Token-version/session validation
   tenant/                           Tenant resolution from X-Tenant-Slug
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
@@ -409,6 +412,12 @@ post-commit verification email. Resend-verification and email-change flows
 still create their token and email in a separate transaction after the account
 already exists.
 
+- `Queue.EnqueueOnce` / `Queue.EnqueueOnceTx` accept a deterministic
+  `Job.IdempotencyKey` and insert at most one job per `(tenant_id, key)`. They
+  return the existing id and `created=false` for a duplicate, which makes
+  producer retries and event fan-out safe. The key is a normal nullable column
+  with a partial unique index; plain `Enqueue`/`EnqueueTx` do not suppress a
+  duplicate key.
 - Jobs are tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` write
   `jobs.tenant_id` resolved from the context (`tenant.EffectiveID`, default
   tenant 1); an explicit positive `Job.TenantID` is kept. The claim query
@@ -488,6 +497,68 @@ already exists.
   continue until that handler returns, and a non-cooperative handler can exceed
   the shutdown drain window.
 
+## Scheduler and Events
+
+`internal/platform/scheduler` is an optional global scheduler. It is disabled by
+default; set `SCHEDULER_ENABLED=true` to start it in `cmd/api`. The scheduler is
+not tenant-scoped: each schedule targets a tenant in its `Spec`, and the job
+payload records the schedule name and slot.
+
+- Every process competes for one row in `scheduler_leases`. The holder renews
+  the lease every `SCHEDULER_HEARTBEAT_SECS`; a failed renewal steps down before
+  the next pass so two leaders cannot both enqueue. A crashed holder is
+  replaced after `SCHEDULER_LEASE_TTL_SECS`.
+- `scheduler_runs` is a unique `(schedule, scheduled_for)` ledger. The ledger
+  insert and the job enqueue share one transaction, so a crash or duplicate
+  leader cannot enqueue the same slot twice. `scheduler_runs` is retained for
+  `SCHEDULER_RETENTION_DAYS` and is purged by the leader.
+- `Spec.Interval` schedules align to Unix epoch boundaries and must be a whole
+  number of seconds. `Spec.Cron` accepts standard 5-field expressions (lists,
+  ranges, steps, `0`/`7` Sunday) plus `@hourly`, `@daily`/`@midnight`,
+  `@weekly`, `@monthly`, `@yearly`, and `@annually`, evaluated in UTC. Set
+  exactly one of interval or cron.
+- `SCHEDULER_CATCHUP` controls slots missed while no leader ran: `none` skips
+  them and waits for the next boundary, `latest` enqueues only the newest,
+  `all` replays every slot up to `SCHEDULER_CATCHUP_LIMIT` per pass. A schedule
+  with no ledger history starts from the current slot; `all` cannot invent
+  pre-history. `none` still runs during continuous leadership when a poll
+  arrives late, so a schedule shorter than the poll interval is not starved.
+- Due slots enqueue the configured job kind with payload
+  `{"schedule":..., "scheduledFor":..., "data":...}` and idempotency key
+  `scheduler:<name>:<slot>`. `cmd/api` logs the registered schedule count and
+  stops the scheduler before draining the worker.
+- Modules can implement `app.ScheduleProvider` (`RegisterSchedules`) to add
+  schedules without importing another module.
+
+`internal/platform/events` is a typed in-process bus with optional durable
+delivery through the same jobs queue:
+
+- `events.NewEvent(name, data)` builds an `Event` with a fresh UUID and UTC
+  timestamp. `PublishLocal` runs subscribers synchronously; `Publish` also
+  enqueues durable subscriptions; `PublishTx` uses the caller's transaction so
+  the business row and durable fan-out commit or roll back together.
+- Event metadata carries `id`, `name`, `tenantId`, `requestId`, `actorId`,
+  `occurredAt`, and JSON `data`. Missing tenant/request/actor values are
+  resolved from the context (`tenant.WithID`, request middleware, and JWT
+  middleware); explicit values win. Durable handlers reinstall all three.
+- `Subscribe` registers a local handler. `SubscribeDurable` registers one
+  handler with a stable handler name and job kind (default
+  `events.<event>.<handler>`); each event enqueues one job per durable handler
+  with idempotency key `event:<id>:<handler>:<tenantId>`.
+- Handler panics are recovered per handler and errors are combined with
+  `errors.Join`; one failing subscriber never skips the others. Durable
+  delivery is at-least-once, so durable handlers must be idempotent.
+- `RegisterJobs` turns durable subscriptions into worker handlers. The app calls
+  it after modules register, so a module only implements `app.EventProvider`
+  (`RegisterEvents`) and `app.JobProvider` (`RegisterJobs`) when it needs them;
+  all three optional provider hooks are nil-safe.
+- Metrics: `events_published_total{event,mode}`,
+  `events_handled_total{event,outcome}`, and
+  `events_enqueue_errors_total{event}`. Scheduler metrics are
+  `scheduler_runs_total{schedule,outcome}`, `scheduler_leader`,
+  `scheduler_enqueue_errors_total{schedule}`, and
+  `scheduler_runs_purged_total`.
+
 ## Adding a New Module
 
 Use `scripts/new-module.sh <name>` to create the compile-safe layout, then
@@ -532,6 +603,10 @@ Key settings:
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `TENANT_DEFAULT_SLUG` — tenant for requests without `X-Tenant-Slug` (default `default`)
 - `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`)
+- `SCHEDULER_ENABLED` — run the optional PostgreSQL-leader scheduler (default `false`)
+- `SCHEDULER_LEASE_TTL_SECS` / `SCHEDULER_HEARTBEAT_SECS` / `SCHEDULER_POLL_SECS` — leader lease, renewal, and evaluation timings (defaults 30/10/15)
+- `SCHEDULER_CATCHUP` — `none` | `latest` | `all` (default `latest`); `SCHEDULER_CATCHUP_LIMIT` bounds `all` per pass
+- `SCHEDULER_RETENTION_DAYS` — `scheduler_runs` retention (default 30)
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)

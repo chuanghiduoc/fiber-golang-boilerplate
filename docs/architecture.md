@@ -22,7 +22,10 @@ internal/contracts  narrow cross-module identity/files admin interfaces (stdlib 
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
+  events       typed in-process bus + durable job-backed subscriptions
   jobs         durable PostgreSQL queue, worker, leases, retention
+  requestctx   request id + actor propagation through context
+  scheduler    PostgreSQL-leader interval/cron scheduler + unique run ledger
   session      token-version/session cache
   tenant       request tenant resolver + locals helpers (X-Tenant-Slug)
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
@@ -64,10 +67,15 @@ they never depend on the `tenants` table.
   verify returned tenant/owner. Cross-tenant ids or tokens behave as not found.
   Public login/register/forgot/reset/resend/verify/refresh use the request
   tenant; non-default tenants must send `X-Tenant-Slug` consistently.
-- Durable jobs and audit events propagate the resolved tenant: enqueue writes
-  `jobs.tenant_id` from the context, the worker restores it with
-  `tenant.WithID` before calling a handler, and the audit middleware records
-  the request tenant. Job retention and job metrics stay global.
+- Durable jobs, events, and audit records propagate the resolved tenant:
+  enqueue writes `jobs.tenant_id` from the context, the worker restores it with
+  `tenant.WithID` before calling a handler, event metadata carries the
+  publishing tenant/request/actor, and the audit middleware records the request
+  tenant. Job retention and job/event metrics stay global.
+- The scheduler is a single global leader, not a tenant-scoped worker. Each
+  schedule chooses a tenant in its spec; the enqueued job stores that tenant and
+  the worker restores it like any other job. `scheduler_leases` and
+  `scheduler_runs` deliberately have no tenant column or foreign keys.
 - Google OAuth binds the tenant into `state` and the state cookie. The callback
   resolves that state tenant (and rejects suspended/unknown tenants) instead of
   trusting `X-Tenant-Slug`.
@@ -105,10 +113,18 @@ they never depend on the `tenants` table.
   job commits atomically with the business row. Enqueue stores the request
   tenant in `jobs.tenant_id`; claims return it and the worker restores it in
   the handler context, so tenant-scoped side effects are possible after the
-  request ends.
-- Email delivery is at-least-once. Handlers must be idempotent. Terminal jobs
-  clear their payload and are purged after retention; retention is global and
-  ignores tenant boundaries.
+  request ends. `EnqueueOnce`/`EnqueueOnceTx` add a deterministic
+  `(tenant_id, idempotency_key)` unique constraint for producer retries and
+  event fan-out.
+- `events.PublishTx` enqueues one durable job per subscription inside the
+  caller's transaction. Local event handlers run synchronously before commit,
+  so keep them free of irreversible external side effects.
+- The scheduler writes `scheduler_runs` and its job in one transaction; the
+  unique `(schedule, scheduled_for)` ledger is the idempotency boundary across
+  leader changes. The lease row is the only cross-replica coordination point.
+- Email delivery and durable events are at-least-once. Handlers must be
+  idempotent. Terminal jobs clear their payload and are purged after
+  retention; retention is global and ignores tenant boundaries.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
 
@@ -122,6 +138,10 @@ they never depend on the `tenants` table.
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
   `default` tenant as row 1, so existing rows and header-less requests remain on
   the compatibility tenant.
+- Platform coordination tables are intentionally tenant-independent:
+  `scheduler_leases` holds one named lease, and `scheduler_runs` is a unique
+  run ledger with no foreign keys to jobs or tenants. `jobs.idempotency_key`
+  is nullable with a partial unique `(tenant_id, idempotency_key)` index.
 - File blobs are external to PostgreSQL but follow the row's tenant: new keys
   are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
   authoritative key for downloads. Moving a blob without updating that column
@@ -143,8 +163,9 @@ they never depend on the `tenants` table.
   HTTP renders RFC 9457 `application/problem+json`.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,
   24h replay, body-bound for non-multipart requests.
-- **Observability:** request IDs, structured `slog`, Prometheus HTTP/job/audit
-  metrics, readiness checks for DB/cache.
+- **Observability:** request IDs, structured `slog`, Prometheus HTTP/job/event/
+  scheduler/audit metrics, readiness checks for DB/cache. Event and scheduler
+  labels stay bounded (`event`, `schedule`, `outcome`), never tenant IDs.
 
 ## Strangler status
 
@@ -176,7 +197,9 @@ ownership rules. Short form:
    deployed DBs).
 2. Add permissions and audit actions.
 3. Add handler/service/repository/DTO in the module directory.
-4. Register routes and the module in `cmd/api/main.go`.
+4. Register routes and the module in `cmd/api/main.go`; implement the optional
+   `app.EventProvider`, `app.JobProvider`, or `app.ScheduleProvider` hooks for
+   durable events, jobs, or schedules instead of wiring them imperatively.
 5. Add unit + integration tests; run `make check`, `go test -race ./...`, and
    `make swagger`.
 6. For durable work, enqueue a job transactionally; never use `async.Go` for
