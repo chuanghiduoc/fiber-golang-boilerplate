@@ -112,6 +112,32 @@ data:
   # SMTP_USERNAME / SMTP_PASSWORD live in the Secret.
 
   # ---------------------------------------------------------------------------
+  # OpenTelemetry tracing (optional; disabled by default)
+  #
+  # Enable per environment after a collector is reachable. The app never waits
+  # for the collector at startup and readiness does not include it. Set
+  # OTEL_SERVICE_VERSION from the release tag in your CD overlay.
+  # ---------------------------------------------------------------------------
+  OTEL_ENABLED: "false"
+  OTEL_TRACES_EXPORTER: "otlp"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_SERVICE_NAME: "fiber-boilerplate"
+  OTEL_SERVICE_NAMESPACE: "fiber-boilerplate"
+  OTEL_SERVICE_VERSION: "dev"
+  OTEL_DEPLOYMENT_ENVIRONMENT: "production"
+  OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+  OTEL_TRACING_EXCLUDE_PATHS: "/healthz,/readyz,/health,/metrics"
+  OTEL_INSTRUMENT_DB: "true"
+  OTEL_BATCH_TIMEOUT_SECS: "5"
+  OTEL_EXPORT_TIMEOUT_SECS: "30"
+  OTEL_SHUTDOWN_TIMEOUT_SECS: "10"
+  OTEL_BATCH_MAX_QUEUE_SIZE: "2048"
+  OTEL_BATCH_MAX_EXPORT_BATCH_SIZE: "512"
+
+  # ---------------------------------------------------------------------------
   # Optional: Google OAuth (disabled by default)
   # ---------------------------------------------------------------------------
   # Uncomment all four values (including GOOGLE_CLIENT_SECRET in the Secret)

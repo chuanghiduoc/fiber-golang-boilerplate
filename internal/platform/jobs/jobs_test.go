@@ -13,8 +13,14 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -1497,4 +1503,191 @@ func (f *fakeStore) staleAfterSeen() time.Duration {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lastStaleAfter
+}
+
+func newJobsTestProvider(t *testing.T) (*sdktrace.TracerProvider, *tracetest.SpanRecorder) {
+	t.Helper()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(recorder),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+	return provider, recorder
+}
+
+func TestProcessJobSpanOmitsRawErrors(t *testing.T) {
+	t.Parallel()
+
+	provider, recorder := newJobsTestProvider(t)
+	fake := &fakeStore{}
+	worker := NewWorker(nil, "test-worker", WithTracerProvider(provider))
+	worker.store = fake
+	worker.retryBase = time.Millisecond
+	worker.retryMax = time.Millisecond
+
+	const secret = "smtp rejected user@example.com with token=super-secret"
+	worker.Register("fail", func(context.Context, json.RawMessage) error {
+		return errors.New(secret)
+	})
+
+	require.NoError(t, worker.processJob(context.Background(), claimedJob{
+		ID:          11,
+		TenantID:    2,
+		Kind:        "fail",
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    1,
+		MaxAttempts: 3,
+	}))
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+	span := ended[0]
+	assert.Equal(t, "job.process", span.Name())
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Empty(t, span.Status().Description)
+	assert.Empty(t, span.Events(), "raw error messages must not become span events")
+	assert.Equal(t, "application_error", jobsAttrString(span.Attributes(), semconv.ErrorTypeKey))
+	assert.Equal(t, "retried", jobsAttrString(span.Attributes(), attribute.Key("job.outcome")))
+	assert.Equal(t, int64(11), jobsAttrInt(span.Attributes(), attribute.Key("job.id")))
+	assert.Equal(t, "fail", jobsAttrString(span.Attributes(), attribute.Key("job.kind")))
+	assert.Equal(t, int64(2), jobsAttrInt(span.Attributes(), attribute.Key("job.tenant_id")))
+	assert.Equal(t, int64(1), jobsAttrInt(span.Attributes(), attribute.Key("job.attempt")))
+	assert.Equal(t, int64(3), jobsAttrInt(span.Attributes(), attribute.Key("job.max_attempts")))
+
+	for _, attr := range span.Attributes() {
+		assert.NotContains(t, attr.Value.String(), "user@example.com")
+		assert.NotContains(t, attr.Value.String(), "super-secret")
+	}
+}
+
+func TestProcessJobSpanOutcomeAttributes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("succeeded", func(t *testing.T) {
+		t.Parallel()
+		provider, recorder := newJobsTestProvider(t)
+		worker := NewWorker(nil, "test-worker", WithTracerProvider(provider))
+		worker.store = &fakeStore{}
+		worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID: 12, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		}))
+
+		ended := recorder.Ended()
+		require.Len(t, ended, 1)
+		assert.Equal(t, "succeeded", jobsAttrString(ended[0].Attributes(), attribute.Key("job.outcome")))
+		assert.False(t, jobsAttrBool(ended[0].Attributes(), attribute.Key("job.dead_letter")))
+	})
+
+	t.Run("dead letter", func(t *testing.T) {
+		t.Parallel()
+		provider, recorder := newJobsTestProvider(t)
+		worker := NewWorker(nil, "test-worker", WithTracerProvider(provider))
+		worker.store = &fakeStore{}
+		worker.Register("fail", func(context.Context, json.RawMessage) error {
+			return errors.New("permanent failure")
+		})
+
+		require.NoError(t, worker.processJob(context.Background(), claimedJob{
+			ID: 13, TenantID: 1, Kind: "fail", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		}))
+
+		ended := recorder.Ended()
+		require.Len(t, ended, 1)
+		attrs := ended[0].Attributes()
+		assert.Equal(t, "dead", jobsAttrString(attrs, attribute.Key("job.outcome")))
+		assert.True(t, jobsAttrBool(attrs, attribute.Key("job.dead_letter")))
+		assert.Empty(t, jobsAttrString(attrs, attribute.Key("job.retry_at")))
+		assert.Equal(t, codes.Error, ended[0].Status().Code)
+	})
+}
+
+func TestProcessJobSpanLinksEnqueueTraceAsNewRoot(t *testing.T) {
+	t.Parallel()
+
+	provider, recorder := newJobsTestProvider(t)
+
+	enqueueCtx, enqueueSpan := provider.Tracer("test").Start(context.Background(), "enqueue")
+	enqueueSpanCtx := enqueueSpan.SpanContext()
+	traceparent := tracing.CaptureRemoteContext(enqueueCtx)
+	require.NotEmpty(t, traceparent)
+	enqueueSpan.End()
+
+	worker := NewWorker(nil, "test-worker", WithTracerProvider(provider))
+	worker.store = &fakeStore{}
+	worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
+
+	require.NoError(t, worker.processJob(context.Background(), claimedJob{
+		ID: 14, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		TraceParent: traceparent,
+	}))
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 2)
+	jobSpan := ended[1]
+	require.Equal(t, "job.process", jobSpan.Name())
+	assert.False(t, jobSpan.Parent().IsValid(), "each attempt is a new root")
+	require.Len(t, jobSpan.Links(), 1)
+	assert.Equal(t, enqueueSpanCtx.TraceID(), jobSpan.Links()[0].SpanContext.TraceID())
+	assert.Equal(t, enqueueSpanCtx.SpanID(), jobSpan.Links()[0].SpanContext.SpanID())
+}
+
+func TestProcessJobSpanWithoutTraceParentHasNoLink(t *testing.T) {
+	t.Parallel()
+
+	provider, recorder := newJobsTestProvider(t)
+	worker := NewWorker(nil, "test-worker", WithTracerProvider(provider))
+	worker.store = &fakeStore{}
+	worker.Register("ok", func(context.Context, json.RawMessage) error { return nil })
+
+	require.NoError(t, worker.processJob(context.Background(), claimedJob{
+		ID: 15, TenantID: 1, Kind: "ok", Payload: json.RawMessage(`{}`), Attempts: 1, MaxAttempts: 1,
+		TraceParent: "corrupt-value",
+	}))
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+	assert.Empty(t, ended[0].Links())
+}
+
+func TestJobOutcomeAttributes(t *testing.T) {
+	t.Parallel()
+
+	retryAt := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	attrs := jobOutcomeAttributes("retried", &retryAt)
+	assert.Equal(t, "retried", jobsAttrString(attrs, attribute.Key("job.outcome")))
+	assert.False(t, jobsAttrBool(attrs, attribute.Key("job.dead_letter")))
+	assert.Equal(t, retryAt.Format(time.RFC3339), jobsAttrString(attrs, attribute.Key("job.retry_at")))
+
+	attrs = jobOutcomeAttributes("dead", nil)
+	assert.True(t, jobsAttrBool(attrs, attribute.Key("job.dead_letter")))
+}
+
+func jobsAttrString(attrs []attribute.KeyValue, key attribute.Key) string {
+	for _, attr := range attrs {
+		if attr.Key == key {
+			return attr.Value.AsString()
+		}
+	}
+	return ""
+}
+
+func jobsAttrInt(attrs []attribute.KeyValue, key attribute.Key) int64 {
+	for _, attr := range attrs {
+		if attr.Key == key {
+			return attr.Value.AsInt64()
+		}
+	}
+	return 0
+}
+
+func jobsAttrBool(attrs []attribute.KeyValue, key attribute.Key) bool {
+	for _, attr := range attrs {
+		if attr.Key == key {
+			return attr.Value.AsBool()
+		}
+	}
+	return false
 }

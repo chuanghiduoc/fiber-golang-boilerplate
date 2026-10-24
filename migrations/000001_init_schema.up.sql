@@ -211,6 +211,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     kind TEXT NOT NULL,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- W3C traceparent captured when the job was enqueued. The worker uses it
+    -- for a span link only; it never affects tenant scoping or retries.
+    trace_parent TEXT,
     status TEXT NOT NULL DEFAULT 'queued'
         CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'dead')),
     attempts INTEGER NOT NULL DEFAULT 0,

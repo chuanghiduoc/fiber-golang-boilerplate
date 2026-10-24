@@ -56,7 +56,7 @@ SET status = 'running',
     updated_at = now()
 FROM due
 WHERE j.id = due.id
-RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts`
+RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts, j.trace_parent`
 
 // heartbeatJobSQL renews the lease for a job that is still running under the
 // supplied worker and attempt. Matching attempts fences out a stale owner whose
@@ -161,13 +161,17 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, staleAf
 	var claimed []claimedJob
 	for rows.Next() {
 		var (
-			job     claimedJob
-			payload string
+			job         claimedJob
+			payload     string
+			traceParent *string
 		)
-		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts); err != nil {
+		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts, &traceParent); err != nil {
 			return nil, fmt.Errorf("jobs: scan claimed job: %w", err)
 		}
 		job.Payload = json.RawMessage(payload)
+		if traceParent != nil {
+			job.TraceParent = *traceParent
+		}
 		claimed = append(claimed, job)
 	}
 	if err := rows.Err(); err != nil {

@@ -80,6 +80,15 @@ spec:
       ports:
         - protocol: TCP
           port: 6379
+    # OpenTelemetry collector OTLP/gRPC. Narrow this CIDR to the collector's
+    # namespace/service range. The app keeps running (and drops spans) when the
+    # collector is unreachable or this rule is missing.
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 4317
     # SMTP submission (STARTTLS on 587; this app does not speak implicit TLS
     # on 465). Replace 0.0.0.0/0 with your relay/provider ranges if the relay
     # is reachable over the public internet.

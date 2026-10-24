@@ -9,14 +9,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // insertJobSQL inserts one queued job and returns its id. The cast makes the
 // parameter type explicit so a JSON document is never mistaken for bytea.
 const insertJobSQL = `
-INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts, created_at, updated_at)
-VALUES ($1, $2, $3::jsonb, 'queued', $4, $5, now(), now())
+INSERT INTO jobs (tenant_id, kind, payload, trace_parent, status, run_at, max_attempts, created_at, updated_at)
+VALUES ($1, $2, $3::jsonb, NULLIF($4, ''), 'queued', $5, $6, now(), now())
 RETURNING id`
 
 // queryRower is implemented by both *pgxpool.Pool and pgx.Tx.
@@ -81,6 +82,7 @@ func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
 		job.TenantID,
 		job.Kind,
 		string(job.Payload),
+		tracing.CaptureRemoteContext(ctx),
 		job.RunAt,
 		job.MaxAttempts,
 	).Scan(&id)

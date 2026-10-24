@@ -42,7 +42,7 @@ cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
 internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
+internal/platform/          authz, audit, jobs, session, tenant, tracing, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -53,9 +53,11 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
 idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts), and
+layout, scaffold, routes/permissions/tables/contracts),
 `docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents). Keep them current when routes/contracts change.
+Kubernetes, incidents), and `docs/tracing.md` (OpenTelemetry configuration,
+span privacy rules, collector, job trace links). Keep them current when
+routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -74,6 +76,10 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   migration above the current version (a fully migrated old deployment is at 3,
   so `000004`+) with only the missing objects. Never point an old database at
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
+  The `jobs.trace_parent` column is folded into the baseline because this
+  boilerplate has no deployed database; a database already at version 1 needs
+  the `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT` upgrade in
+  `docs/tracing.md` before running this build.
 - Every tenant-owned table (`users`, `files`, `refresh_tokens`,
   `password_reset_tokens`, `email_verification_tokens`, `jobs`,
   `audit_events`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
@@ -101,8 +107,10 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   whole-application isolation.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Row-level security, per-tenant limits/quotas, distributed tracing, and
-environment promotion/rollout automation remain future work.
+Row-level security, per-tenant limits/quotas, and environment
+promotion/rollout automation remain future work. OpenTelemetry tracing exists
+for HTTP, sanitized pgx queries, and durable jobs but is disabled by default
+(`OTEL_ENABLED=false`); see `docs/tracing.md`.
 `identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
@@ -200,6 +208,14 @@ Offset helpers are for small admin/export tables only.
   first.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
+- **Tracing:** `internal/platform/tracing` owns the provider; `app.Deps.Tracing`
+  is nil-safe and disabled means a no-op provider. Install the middleware after
+  `RequestID` and before `Metrics`/`Logger`; record only route templates and
+  bounded `error.type`, never raw paths, payloads, SQL, headers, or error text.
+  `pkg/database.WithTracerProvider` instruments pgx only under a recording
+  parent. Jobs persist `trace_parent` on enqueue and start each attempt as a
+  new-root `job.process` span linked to the enqueue span. See
+  `docs/tracing.md` before adding attributes.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
   Protect routes with `authz.Require(authz.PermissionX)`.
 - **Transactions:** `database.TxManager.WithTx` scopes a transaction to one

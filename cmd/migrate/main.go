@@ -41,7 +41,7 @@ var requiredColumns = map[string][]string{
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id"},
-	"jobs":                      {"tenant_id"},
+	"jobs":                      {"tenant_id", "trace_parent"},
 	"audit_events":              {"tenant_id"},
 }
 

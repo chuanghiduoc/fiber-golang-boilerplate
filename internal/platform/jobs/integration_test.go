@@ -15,8 +15,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -839,4 +842,76 @@ func runIntegrationWorker(t *testing.T, worker *Worker) {
 			t.Error("worker did not stop after cancellation")
 		}
 	})
+}
+
+// TestWorkerIntegrationPropagatesTraceParent verifies that the queue persists
+// the enqueue-time W3C traceparent and that the worker starts a new root job
+// span linked to it. The link, rather than parentage, keeps retries independent
+// while preserving causality in the trace UI.
+func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(recorder),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	enqueueCtx, enqueueSpan := provider.Tracer("test").Start(ctx, "enqueue")
+	enqueueSnapshot := enqueueSpan.SpanContext()
+	traceparent := tracing.CaptureRemoteContext(enqueueCtx)
+	require.NotEmpty(t, traceparent)
+
+	queue := NewQueue(pool)
+	id, err := queue.Enqueue(enqueueCtx, Job{
+		Kind:        "jobs.integration.traced",
+		Payload:     json.RawMessage(`{"value":1}`),
+		MaxAttempts: 2,
+	})
+	require.NoError(t, err)
+	enqueueSpan.End()
+
+	var stored *string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT trace_parent FROM jobs WHERE id = $1`, id).Scan(&stored))
+	require.NotNil(t, stored)
+	assert.Equal(t, traceparent, *stored)
+
+	worker := NewWorker(pool, "trace-integration-worker",
+		WithPollInterval(20*time.Millisecond),
+		WithTracerProvider(provider),
+	)
+	worker.Register("jobs.integration.traced", func(context.Context, json.RawMessage) error { return nil })
+	runIntegrationWorker(t, worker)
+
+	require.Eventually(t, func() bool {
+		var status string
+		err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, id).Scan(&status)
+		return err == nil && status == "succeeded"
+	}, 5*time.Second, 20*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		for _, span := range recorder.Ended() {
+			if span.Name() == "job.process" {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+
+	var jobSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "job.process" {
+			jobSpan = span
+			break
+		}
+	}
+	require.NotNil(t, jobSpan)
+	assert.False(t, jobSpan.Parent().IsValid(), "job.process must be a new root")
+	require.Len(t, jobSpan.Links(), 1)
+	assert.Equal(t, enqueueSnapshot.TraceID(), jobSpan.Links()[0].SpanContext.TraceID())
+	assert.Equal(t, enqueueSnapshot.SpanID(), jobSpan.Links()[0].SpanContext.SpanID())
 }
