@@ -42,7 +42,7 @@ func TestForgotPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-		userRepo.users[1] = &identitysqlc.User{
+		userRepo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			Role:         "user",
@@ -66,7 +66,7 @@ func TestForgotPassword(t *testing.T) {
 		}
 
 		// Verify rate limit was set
-		if _, ok := cache.items["password_reset:test@example.com"]; !ok {
+		if _, ok := cache.items["password_reset:test@example.com:tenant=1"]; !ok {
 			t.Error("expected rate limit cache key to be set")
 		}
 	})
@@ -84,7 +84,7 @@ func TestForgotPassword(t *testing.T) {
 			nil, // no txManager: the sender must not be used transactionally
 		)
 
-		userRepo.users[1] = &identitysqlc.User{ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
+		userRepo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
 
 		err := svc.ForgotPassword(context.Background(), dto.ForgotPasswordRequest{
 			Email: "test@example.com",
@@ -116,7 +116,7 @@ func TestForgotPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		// Pre-set rate limit
-		cache.items["password_reset:test@example.com"] = []byte("1")
+		cache.items["password_reset:test@example.com:tenant=1"] = []byte("1")
 
 		err := svc.ForgotPassword(context.Background(), dto.ForgotPasswordRequest{
 			Email: "test@example.com",
@@ -170,7 +170,7 @@ func TestResetPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		userRepo.users[1] = &identitysqlc.User{
+		userRepo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			Role:         "user",
@@ -178,7 +178,7 @@ func TestResetPassword(t *testing.T) {
 
 		// Create a valid reset token
 		// Repo stores only the hash, so key the mock by hashToken(plaintext).
-		resetRepo.tokens[hashToken("valid-token")] = &identitysqlc.PasswordResetToken{
+		resetRepo.tokens[hashToken("valid-token")] = &identitysqlc.PasswordResetToken{TenantID: 1,
 			ID:        1,
 			UserID:    1,
 			Token:     hashToken("valid-token"),
@@ -214,7 +214,7 @@ func TestResetPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		// Expired token
-		resetRepo.tokens[hashToken("expired-token")] = &identitysqlc.PasswordResetToken{
+		resetRepo.tokens[hashToken("expired-token")] = &identitysqlc.PasswordResetToken{TenantID: 1,
 			ID:        1,
 			UserID:    1,
 			Token:     hashToken("expired-token"),
@@ -262,18 +262,18 @@ func TestResetPassword(t *testing.T) {
 		svc := newTestPasswordResetService(userRepo, resetRepo, refreshRepo, emailSender, cache)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		userRepo.users[1] = &identitysqlc.User{
+		userRepo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			Role:         "user",
 		}
 
 		// Add some refresh tokens for the user
-		refreshRepo.tokens["rt1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "rt1"}
-		refreshRepo.tokens["rt2"] = &identitysqlc.RefreshToken{UserID: 1, Token: "rt2"}
+		refreshRepo.tokens["rt1"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "rt1"}
+		refreshRepo.tokens["rt2"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "rt2"}
 
 		// Repo stores only the hash, so key the mock by hashToken(plaintext).
-		resetRepo.tokens[hashToken("valid-token")] = &identitysqlc.PasswordResetToken{
+		resetRepo.tokens[hashToken("valid-token")] = &identitysqlc.PasswordResetToken{TenantID: 1,
 			ID:        1,
 			UserID:    1,
 			Token:     hashToken("valid-token"),

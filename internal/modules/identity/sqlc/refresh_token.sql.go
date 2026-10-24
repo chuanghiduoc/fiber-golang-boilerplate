@@ -12,14 +12,22 @@ import (
 )
 
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
-DELETE FROM refresh_tokens WHERE token = $1 RETURNING id, user_id, token, token_version, expires_at, created_at
+DELETE FROM refresh_tokens
+WHERE token = $1 AND tenant_id = $2
+RETURNING id, tenant_id, user_id, token, token_version, expires_at, created_at
 `
 
-func (q *Queries) ConsumeRefreshToken(ctx context.Context, token string) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, consumeRefreshToken, token)
+type ConsumeRefreshTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, consumeRefreshToken, arg.Token, arg.TenantID)
 	var i RefreshToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.TokenVersion,
@@ -30,16 +38,17 @@ func (q *Queries) ConsumeRefreshToken(ctx context.Context, token string) (Refres
 }
 
 const createRefreshToken = `-- name: CreateRefreshToken :one
-INSERT INTO refresh_tokens (user_id, token, expires_at, token_version)
-SELECT $1, $2, $3, u.token_version
+INSERT INTO refresh_tokens (tenant_id, user_id, token, expires_at, token_version)
+SELECT u.tenant_id, $1, $2, $3, u.token_version
 FROM users u
 WHERE u.id = $1
+  AND u.tenant_id = $5
   AND u.deleted_at IS NULL
   -- Compare with the version the caller authenticated/consumed. This closes
   -- the bcrypt-length window where a password change could commit after the
   -- password check but before this INSERT.
   AND u.token_version = $4
-RETURNING id, user_id, token, token_version, expires_at, created_at
+RETURNING id, tenant_id, user_id, token, token_version, expires_at, created_at
 `
 
 type CreateRefreshTokenParams struct {
@@ -47,6 +56,7 @@ type CreateRefreshTokenParams struct {
 	Token        string             `json:"token"`
 	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
 	TokenVersion int32              `json:"token_version"`
+	TenantID     int64              `json:"tenant_id"`
 }
 
 func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error) {
@@ -55,10 +65,12 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 		arg.Token,
 		arg.ExpiresAt,
 		arg.TokenVersion,
+		arg.TenantID,
 	)
 	var i RefreshToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.TokenVersion,
@@ -69,32 +81,64 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 }
 
 const deleteRefreshToken = `-- name: DeleteRefreshToken :exec
-DELETE FROM refresh_tokens WHERE token = $1
+DELETE FROM refresh_tokens
+WHERE token = $1 AND tenant_id = $2
 `
 
-func (q *Queries) DeleteRefreshToken(ctx context.Context, token string) error {
-	_, err := q.db.Exec(ctx, deleteRefreshToken, token)
+type DeleteRefreshTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) DeleteRefreshToken(ctx context.Context, arg DeleteRefreshTokenParams) error {
+	_, err := q.db.Exec(ctx, deleteRefreshToken, arg.Token, arg.TenantID)
+	return err
+}
+
+const deleteRefreshTokenByPossession = `-- name: DeleteRefreshTokenByPossession :exec
+DELETE FROM refresh_tokens
+WHERE token = $1
+`
+
+// Logout is possession-based: presenting the opaque token is sufficient to
+// revoke it, even if the caller omits X-Tenant-Slug. Possession cannot be used
+// to read or mint anything, so this does not weaken tenant isolation.
+func (q *Queries) DeleteRefreshTokenByPossession(ctx context.Context, token string) error {
+	_, err := q.db.Exec(ctx, deleteRefreshTokenByPossession, token)
 	return err
 }
 
 const deleteRefreshTokensByUserID = `-- name: DeleteRefreshTokensByUserID :exec
-DELETE FROM refresh_tokens WHERE user_id = $1
+DELETE FROM refresh_tokens
+WHERE user_id = $1 AND tenant_id = $2
 `
 
-func (q *Queries) DeleteRefreshTokensByUserID(ctx context.Context, userID int64) error {
-	_, err := q.db.Exec(ctx, deleteRefreshTokensByUserID, userID)
+type DeleteRefreshTokensByUserIDParams struct {
+	UserID   int64 `json:"user_id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) DeleteRefreshTokensByUserID(ctx context.Context, arg DeleteRefreshTokensByUserIDParams) error {
+	_, err := q.db.Exec(ctx, deleteRefreshTokensByUserID, arg.UserID, arg.TenantID)
 	return err
 }
 
 const getRefreshTokenByToken = `-- name: GetRefreshTokenByToken :one
-SELECT id, user_id, token, token_version, expires_at, created_at FROM refresh_tokens WHERE token = $1
+SELECT id, tenant_id, user_id, token, token_version, expires_at, created_at FROM refresh_tokens
+WHERE token = $1 AND tenant_id = $2
 `
 
-func (q *Queries) GetRefreshTokenByToken(ctx context.Context, token string) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, getRefreshTokenByToken, token)
+type GetRefreshTokenByTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) GetRefreshTokenByToken(ctx context.Context, arg GetRefreshTokenByTokenParams) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenByToken, arg.Token, arg.TenantID)
 	var i RefreshToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.TokenVersion,

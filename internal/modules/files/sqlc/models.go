@@ -10,6 +10,7 @@ import (
 
 type File struct {
 	ID           int64              `json:"id"`
+	TenantID     int64              `json:"tenant_id"`
 	UserID       int64              `json:"user_id"`
 	OriginalName string             `json:"original_name"`
 	StoragePath  string             `json:"storage_path"`

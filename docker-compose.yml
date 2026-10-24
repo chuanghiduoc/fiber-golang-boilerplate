@@ -25,6 +25,17 @@ services:
       EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-Fiber App}
       SMTP_REQUIRE_TLS: ${SMTP_REQUIRE_TLS:-false}
       METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-otel-collector:4317}
+      OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-fiber-golang-boilerplate}
+      OTEL_SERVICE_NAMESPACE: ${OTEL_SERVICE_NAMESPACE:-fiber-golang-boilerplate}
+      OTEL_SERVICE_VERSION: ${OTEL_SERVICE_VERSION:-dev}
+      OTEL_DEPLOYMENT_ENVIRONMENT: ${OTEL_DEPLOYMENT_ENVIRONMENT:-local}
+      OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-parentbased_traceidratio}
+      OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-1.0}
+      OTEL_INSTRUMENT_DB: ${OTEL_INSTRUMENT_DB:-true}
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
       JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-30}
       DB_HOST: postgres
@@ -139,6 +150,29 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - app-network
+
+  # Optional OpenTelemetry collector. Tracing stays disabled unless the app is
+  # started with OTEL_ENABLED=true; start this profile explicitly with
+  # `docker compose --profile otel up`. The app intentionally does not depend on
+  # the collector: an outage only drops spans.
+  otel-collector:
+    profiles: ["otel"]
+    image: otel/opentelemetry-collector:0.145.0
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./deploy/otel/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:13133:13133"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
     networks:
       - app-network
 

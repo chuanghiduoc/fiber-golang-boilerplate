@@ -1,15 +1,17 @@
 # Operations Runbook
 
-Runbook for the deployed API: health, metrics, logs, jobs, idempotency,
-migrations, Kubernetes, and incident response. It describes the behavior in
-this repository; replace every `<placeholder>` and adapt thresholds to your
-service levels.
+Runbook for the deployed API: health, metrics, logs, jobs, webhooks,
+idempotency, migrations, Kubernetes, and incident response. It describes the
+behavior in this repository; replace every `<placeholder>` and adapt thresholds
+to your service levels.
 
 Related documents:
 
 - [Kubernetes deployment](../deploy/k8s/README.md) — manifests, staging/
   production overlays, GitHub Actions CD, migration order, rollback.
 - [Architecture](architecture.md) — modules, dependency rules, data ownership.
+- [Webhooks](webhooks.md) — outbound signing/retries/SSRF, inbound receiver,
+  secrets, and configuration.
 - [Module Template](module-template.md) — adding a module, routes, permissions,
   tables, and contracts.
 
@@ -87,7 +89,25 @@ Application metrics:
 | `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
-| `audit_write_failures_total` | — | Audit events that could not be recorded. |
+| `audit_write_failures_total` | — | Best-effort audit events that could not be recorded. |
+| `audit_intent_failures_total` | — | Pre-write intent rows that could not be recorded (required guards returned 503). |
+| `audit_completion_failures_total` | — | Intent rows that could not be completed; inspect stale `started` rows. |
+| `audit_tx_missing_total` | — | Tier 1 audit writes attempted without a transaction (misconfiguration). |
+| `audit_domain_missing_total` | — | Guarded successes without the required domain event. |
+| `feature_flag_evaluations_total` | `key`, `source`, `enabled` | Feature evaluations by precedence source. |
+| `feature_flag_snapshot_loads_total` | `result` | Feature snapshot loads (`success`/`error`). |
+| `feature_flag_cache_hits_total` / `feature_flag_cache_misses_total` | — | In-process snapshot cache behavior. |
+| `feature_flag_snapshot_stale_total` | — | Evaluations served from a stale snapshot during a DB outage. |
+| `feature_flag_snapshot_fallback_total` | — | Evaluations that used env/compiled defaults because no snapshot was usable. |
+| `feature_flag_snapshot_age_seconds` | — | Age of the snapshot currently used. |
+| `feature_flag_invalidations_total` | — | Local snapshot invalidations after admin writes. |
+| `events_published_total` | `event`, `mode` | Events published locally or durably. |
+| `events_handled_total` | `event`, `outcome` | Event handler calls (`success`, `error`, `panic`). |
+| `events_enqueue_errors_total` | `event` | Durable event jobs that could not be enqueued. |
+| `scheduler_runs_total` | `schedule`, `outcome` | Scheduler slots processed (`enqueued`, `skipped`, `duplicate`). |
+| `scheduler_leader` | — | `1` on the process holding the scheduler lease. |
+| `scheduler_enqueue_errors_total` | `schedule` | Scheduled jobs that could not be enqueued. |
+| `scheduler_runs_purged_total` | — | Scheduler run-ledger rows deleted by retention. |
 
 The default Prometheus registry also exposes Go runtime and process metrics
 (for example `go_goroutines`, `process_resident_memory_bytes`).
@@ -108,6 +128,15 @@ increase(jobs_dead_total[15m]) > 0
 
 # Sustained claim failures
 rate(jobs_claim_errors_total[5m]) > 0
+
+# No scheduler leader in the fleet (expected value is 1 overall, not per pod)
+sum(scheduler_leader) != 1
+
+# Scheduled slots failing to enqueue
+increase(scheduler_enqueue_errors_total[15m]) > 0
+
+# Durable event fan-out failures
+increase(events_enqueue_errors_total[15m]) > 0
 ```
 
 There is no queue-depth gauge. Query PostgreSQL for backlog and age:
@@ -130,6 +159,21 @@ Alert on symptoms (5xx, latency, dead letters, claim errors, audit failures)
 and on queue age, not only on raw queue depth. A large but draining queue is
 different from a stuck one.
 
+### Feature flags
+
+Feature-flag evaluation falls back in this order: last good snapshot (up to
+`FEATURE_FLAGS_MAX_STALENESS_SECONDS`), then `FEATURE_FLAGS` environment
+values, then compiled defaults. `FEATURE_FLAGS_FORCE_OFF` and a flag's kill
+switch always win. Check `feature_flag_snapshot_loads_total{result="error"}`,
+`feature_flag_snapshot_fallback_total`, and
+`feature_flag_snapshot_age_seconds` when behavior diverges between replicas.
+
+Admin writes invalidate only the replica that served the request; other
+replicas converge within `FEATURE_FLAGS_CACHE_TTL_SECONDS` (30s by default).
+For an immediate global stop, set `FEATURE_FLAGS_FORCE_OFF` or the kill switch
+through the admin API. A database outage does not prevent force-off. See
+[Feature Flags](feature-flags.md) for the API and precedence details.
+
 ## 3. Logs and request IDs
 
 `APP_ENV=production` and `staging` use JSON `slog` output; other environments
@@ -139,7 +183,8 @@ Logs go to stdout; collect them with the platform's normal log pipeline.
 The request logger emits one record per request with:
 
 `method`, `path`, `status`, `latency`, `ip`, `request_id`, `user_id`,
-`content_length`, `user_agent`, and `query`.
+`content_length`, `user_agent`, and `query`. When tracing is enabled and the
+request is sampled, records also include `trace_id` and `span_id`.
 
 - `status` is the effective status after the Fiber error handler; a handler
   returning an error is not logged as `200`.
@@ -162,16 +207,71 @@ is echoed on the response and included in RFC 9457 problem responses as
 grep 'request_id=<id>' app.log
 ```
 
-Audit events carry the same request ID. The generic audit middleware records
-successful mutating requests; idempotent replays are skipped so a replay does
-not duplicate the trail. See [Module Template](module-template.md#5-audit) for
-explicit domain events.
+When OpenTelemetry tracing is enabled, sampled request records also carry
+`trace_id` and `span_id`. Search by `request_id` first, then use `trace_id` in
+the tracing backend to inspect the HTTP span, its sanitized PostgreSQL spans,
+and any job spans linked to the request. Tracing never adds emails, tokens,
+payloads, SQL text, headers, or raw error messages to logs or spans; see
+[Tracing](tracing.md).
+
+Audit events carry the same request ID and the resolved tenant ID. Mutations
+are audited in two tiers:
+
+- **Tier 1** services write a terminal event with `RecordTx` inside the
+  mutation transaction. If the insert fails, the transaction rolls back and the
+  API returns `503 system.audit_unavailable`. These are the identity
+  registration/profile/password/delete operations, admin role/ban/unban, and
+  admin file delete/restore.
+- **Tier 2** routes run `audit.Guard` after idempotency. The guard inserts an
+  `outcome=started`, `source=http` intent row before the handler and completes
+  it as `succeeded`, `failed`, or `denied` with the HTTP status/error code. A
+  required guard returns the same 503 when the intent cannot be stored, so the
+  handler never runs unaudited. Completion failures are counted and leave a
+  stale `started` row for reconciliation; they cannot roll back a committed
+  mutation.
+
+Idempotent replays are skipped so a replay does not duplicate the trail, and
+audit rows are never cached with the idempotency response. When no tenant
+middleware ran (for example an internal call or a pre-tenant test), the event
+uses the compatibility tenant id 1. `audit_events` is append-only: only a
+started HTTP intent can transition to a terminal outcome, and only completion
+fields may change. Alert on `audit_intent_failures_total`,
+`audit_completion_failures_total`, `audit_tx_missing_total`, and
+`audit_domain_missing_total`; investigate rows where
+`outcome = 'started' AND created_at < NOW() - INTERVAL '10 minutes'`. See
+[Module Template](module-template.md#5-audit) for explicit domain events; set
+`Event.TenantID` there or let the recorder resolve it from the context.
 
 ## 4. Background jobs
 
 `internal/platform/jobs` is a PostgreSQL-backed durable queue. The API hosts
 the worker in-process; every replica runs a worker with concurrency 4. Claims
 use `FOR UPDATE SKIP LOCKED`, so multiple replicas are safe.
+
+Every job is tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` resolve
+`jobs.tenant_id` from the context with `tenant.EffectiveID` (default tenant 1);
+an explicit positive `Job.TenantID` is kept. The claim query returns the column
+and the worker installs `tenant.WithID(ctx, job.TenantID)` before invoking the
+handler, so email and audit handlers run with the tenant that enqueued the job.
+A claimed row with no tenant falls back to tenant 1 for compatibility. The
+`(tenant_id, status, run_at)` and `(tenant_id, kind, status)` indexes support
+tenant-first inspection. Retention and Prometheus labels are deliberately
+global: terminal jobs are purged by age regardless of tenant, and the metric
+labels stay `kind` only to avoid cardinality growth.
+
+Enqueue captures the active W3C `traceparent` in `jobs.trace_parent` when the
+caller has a recording span. Each attempt runs as a new-root `job.process`
+span with a link to the enqueue span, plus `job.id`, `job.kind`, tenant,
+attempt, and outcome attributes. The handler context carries the span, so
+sanitized database spans nest under the job. `NULL`/malformed traceparents are
+ignored. See [Tracing](tracing.md) and the schema note in section 6.
+
+`Queue.EnqueueOnce`/`EnqueueOnceTx` use the nullable
+`jobs.idempotency_key` and a partial unique `(tenant_id, idempotency_key)`
+index. A duplicate returns the existing id and inserts nothing, so a producer
+retry (or an event fan-out retry) cannot create a second row. Plain
+`Enqueue`/`EnqueueTx` do not suppress duplicates. Terminal rows keep their key
+until retention removes the row.
 
 ### Lifecycle and retries
 
@@ -195,6 +295,41 @@ use `FOR UPDATE SKIP LOCKED`, so multiple replicas are safe.
 
 Delivery is **at-least-once**, never exactly-once. Duplicate emails and
 duplicate side effects must be expected.
+
+### Notification email
+
+Notifications use the same queue and `email.send`/`email.send.encrypted` kinds
+as identity email. The notifications service resolves the recipient through
+identity's `contracts.NotificationRecipientLookup`; it never reads `users`
+directly. When the `email` channel is enabled, it inserts the in-app row and
+enqueues the email job in one transaction, so a queue outage returns `500` and
+rolls the in-app row back. Channel preferences are applied before any write: an
+explicit `enabled=false` row skips that channel, while a missing row means the
+channel is enabled.
+
+Inspect the feed and preferences:
+
+```sql
+-- Unread backlog per tenant/user
+SELECT tenant_id, user_id, count(*) AS unread,
+       max(created_at) AS newest
+FROM notifications
+WHERE read_at IS NULL
+GROUP BY tenant_id, user_id
+ORDER BY unread DESC;
+
+-- Explicit channel opt-outs
+SELECT tenant_id, user_id, type, channel, enabled, updated_at
+FROM notification_preferences
+WHERE enabled = false
+ORDER BY updated_at DESC;
+```
+
+Notification emails have no links or secrets, so dead-lettered rows only need a
+re-send through the admin endpoint or the producing module. The generic audit
+trail records successful `POST /notifications/:id/read`,
+`POST /notifications/read-all`, `PUT /notification-preferences`, and
+`POST /notifications/send` requests; replays are skipped.
 
 ### Retention and payload clearing
 
@@ -243,15 +378,16 @@ the user flow, not requeueing the old row. See
 ### Inspecting jobs
 
 ```sql
--- Backlog by kind and state
-SELECT kind, status, count(*), min(run_at), max(updated_at)
+-- Backlog by tenant, kind, and state
+SELECT tenant_id, kind, status, count(*), min(run_at), max(updated_at)
 FROM jobs
 WHERE status IN ('queued', 'running')
-GROUP BY kind, status
+GROUP BY tenant_id, kind, status
 ORDER BY count(*) DESC;
 
 -- Recent failures and dead letters
-SELECT id, kind, status, attempts, max_attempts, last_error, updated_at
+SELECT id, tenant_id, kind, status, attempts, max_attempts,
+       idempotency_key, last_error, updated_at
 FROM jobs
 WHERE status IN ('running', 'dead')
 ORDER BY updated_at DESC
@@ -284,19 +420,194 @@ WHERE id = <id>
 
 Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
 
-## 5. Idempotency and Redis
+### Durable events
+
+`internal/platform/events` publishes metadata-rich events locally and/or as
+jobs. A durable subscription adds one job per event and handler, with
+`jobs.idempotency_key = event:<eventId>:<handler>:<tenantId>`. The job payload
+is the event JSON, so `jobs.payload` contains the event data. Delivery is
+at-least-once; handlers must be idempotent. Local handler panics are recovered
+and combined with `errors.Join`; check `events_handled_total{outcome="panic"}`
+and `events_enqueue_errors_total` during an incident. Durable event handlers
+must be registered before `worker.Run`; the app does this after all
+`EventProvider` modules register.
+
+### Scheduler
+
+`internal/platform/scheduler` is enabled with `SCHEDULER_ENABLED=true` and runs
+in-process in every API replica. Only the holder of the single
+`scheduler_leases` row evaluates schedules. `scheduler_runs` is the unique
+`(schedule, scheduled_for)` ledger: the ledger row and the job enqueue share a
+transaction, so a leader restart or overlapping election cannot double-enqueue
+a slot. The lease is renewed every `SCHEDULER_HEARTBEAT_SECS`; a failed renewal
+cancels the current pass and steps down.
+
+- `SCHEDULER_CATCHUP`: `none` skips slots missed while no leader ran, `latest`
+  runs only the newest, `all` replays in order up to
+  `SCHEDULER_CATCHUP_LIMIT` per poll. A slow poll during continuous leadership
+  still runs the latest slot under `none`, so short schedules are not starved.
+- `SCHEDULER_RETENTION_DAYS` bounds `scheduler_runs`. Purging the ledger does
+  not replay old slots; the next evaluation starts from the current slot.
+- A schedule's job payload is `{"schedule","scheduledFor","data"}` and its key
+  is `scheduler:<name>:<slot>`. The job kind must have a worker handler; a
+  missing handler follows the normal retry/dead-letter path.
+- Scheduler logs include `holder`, `schedule`, `slot`, and the underlying
+  error. `scheduler_leader` should sum to 1 across replicas; if it is 0, check
+  database reachability and lease expiry. If it is greater than 1, check clock
+  skew and whether a process is running with an extremely short lease TTL.
+
+```sql
+-- Current leader and lease age
+SELECT name, holder, expires_at, now() - heartbeat_at AS since_heartbeat
+FROM scheduler_leases;
+
+-- Recent slots and whether they enqueued or were skipped
+SELECT schedule, scheduled_for, status, job_id, error, created_at
+FROM scheduler_runs
+ORDER BY scheduled_for DESC
+LIMIT 50;
+
+-- Per-schedule backlog of due but unledgered work (manual check)
+SELECT kind, count(*), min(run_at)
+FROM jobs
+WHERE status = 'queued'
+GROUP BY kind
+ORDER BY count(*) DESC;
+```
+
+## 5. Webhooks
+
+Outbound deliveries reuse the durable jobs queue under the
+`webhook.delivery` kind. Dispatch commits a `webhook_deliveries` row and its
+first job atomically; the worker sends one signed attempt and schedules the next
+attempt as a new job. Delivery is at-least-once, so receivers must deduplicate
+on `X-Webhook-Delivery`.
+
+### Delivery state and retries
+
+- `pending` is queued or awaiting the next attempt; `next_attempt_at` doubles as
+  the claim lease while an attempt is in flight.
+- `succeeded` means a 2xx response. `dead` is terminal after a permanent
+  failure or an exhausted attempt budget.
+- `2xx` succeeds; `3xx` is permanent (redirects are not followed); `4xx` is
+  permanent except `408`, `425`, `429`; `5xx` and transport errors retry.
+- Backoff is exponential from `WEBHOOK_RETRY_BASE_SECS` to
+  `WEBHOOK_RETRY_MAX_SECS`. A valid `Retry-After` (seconds or HTTP date) wins
+  and is capped at the same maximum.
+- Every attempt is recorded with status code, duration, and a bounded error.
+  Response bodies are not stored.
+- Endpoint edits/rotation do not change queued deliveries: URL, payload, event
+  timestamp, attempt budget, and the sealed secret are snapshotted at dispatch.
+  Replay creates a new delivery with the endpoint's current URL and active
+  secret.
+
+### Inspecting deliveries
+
+```sql
+-- Backlog by tenant/status
+SELECT tenant_id, status, count(*), min(next_attempt_at), max(updated_at)
+FROM webhook_deliveries
+GROUP BY tenant_id, status
+ORDER BY count(*) DESC;
+
+-- Dead deliveries
+SELECT id, tenant_id, endpoint_id, event_type, attempts, max_attempts,
+       last_status_code, last_error, updated_at
+FROM webhook_deliveries
+WHERE status = 'dead'
+ORDER BY updated_at DESC
+LIMIT 50;
+
+-- Attempt timeline
+SELECT attempt, status_code, duration_ms, error, created_at
+FROM webhook_delivery_attempts
+WHERE delivery_id = $1
+ORDER BY attempt;
+
+-- Pending work and its jobs
+SELECT d.id, d.tenant_id, d.next_attempt_at, j.id AS job_id, j.status, j.run_at
+FROM webhook_deliveries d
+LEFT JOIN jobs j
+  ON j.kind = 'webhook.delivery'
+ AND j.payload->>'deliveryId' = d.id::text
+WHERE d.status = 'pending'
+ORDER BY d.next_attempt_at
+LIMIT 50;
+```
+
+A pending delivery with a future `next_attempt_at` and no live job can happen
+after a crash in the narrow window between the HTTP attempt and bookkeeping.
+The original job lease normally retries it. Otherwise replay the delivery
+instead of bulk-editing state.
+
+### Secrets and key rotation
+
+Outbound endpoint secrets (`whsec_...`) and inbound source secrets
+(`whin_...`) are sealed with AES-256-GCM. The key comes from
+`WEBHOOK_SECRET_ENCRYPTION_KEY`; local/test fall back to `JWT_SECRET`, while
+production **requires** a dedicated key of at least 32 characters.
+
+Rotating `WEBHOOK_SECRET_ENCRYPTION_KEY` makes every stored webhook secret
+unreadable. Plan it as a secret reset, not a transparent key roll:
+
+1. Announce a receiver maintenance window.
+2. Deploy the new encryption key.
+3. Rotate every endpoint secret and inbound source secret; deliver the new
+   plaintext values to the owners.
+4. Expect in-flight outbound deliveries encrypted under the old key to become
+   `dead` with a decryption error; replay them after rotation if needed.
+5. Inbound requests fail `401` until their senders use the new secrets.
+
+Endpoint secret rotation itself is safe for in-flight work because queued
+deliveries keep their snapshot. Inbound rotation is immediate: the old secret
+stops verifying on the next request.
+
+### SSRF allowlist
+
+`WEBHOOK_SSRF_ALLOWLIST` lets trusted private receivers through. Entries are
+comma-separated IPs, CIDRs, or exact hostnames. The default (empty) blocks
+private, loopback, link-local, multicast, CGNAT, and reserved targets, pins DNS
+results to vetted IPs, disables environment proxies, and never follows
+redirects. Do not add broad ranges to make one receiver work; add the exact
+host/IP/CIDR and keep the list audited.
+
+### Retention
+
+An hourly loop (first pass at startup) deletes only terminal deliveries
+(`succeeded`/`dead`) and inbound events older than
+`WEBHOOK_RETENTION_DAYS`. Pending deliveries and endpoint/source
+configuration are never purged. Attempts and inbound events cascade with their
+parent row.
+
+### Receiver troubleshooting
+
+- `404`: source ID unknown, disabled, or soft-deleted; verify the configured
+  `receiverUrl`.
+- `401` with `webhook signature is required`: missing timestamp/signature.
+- `401` with stale/invalid timestamp: check clock skew against
+  `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`.
+- `401` with invalid signature: confirm the sender signs
+  `<timestamp>.<exact raw body>` with the active source secret, not a rotated
+  one.
+- `200` with `duplicate: true`: the event was already stored for
+  `(source, X-Webhook-Id)`; this is success.
+- Inbound events are stored under the source tenant and audited as
+  `webhook.inbound.received`; `X-Tenant-Slug` is ignored on the public route.
+
+## 6. Idempotency and Redis
 
 Idempotent mutations are opt-in with `Idempotency-Key` (1–128 chars of
 `[A-Za-z0-9._:-]`). The cache stores:
 
 | Key | TTL | Purpose |
 | --- | --- | --- |
-| `idempotency:<method>:<path>:<identity>:<key>:lock` | 2 minutes | Owner-token lock for the in-flight request. |
-| `idempotency:<method>:<path>:<identity>:<key>:response` | 24 hours | Cached 2xx status, body, and selected headers for replay. |
+| `idempotency:<method>:<path>:tenant=<id>:<slug>:<identity>:<key>:lock` | 2 minutes | Owner-token lock for the in-flight request. |
+| `idempotency:<method>:<path>:tenant=<id>:<slug>:<identity>:<key>:response` | 24 hours | Cached 2xx status, body, and selected headers for replay. |
 
 `identity` is the authenticated user ID, or the client IP for public routes.
-Keys are scoped by method, path, and identity, so the same client key on
-another endpoint or user does not collide.
+Keys are scoped by method, path, tenant ID/slug, and identity, so the same
+client key/body/IP in another tenant cannot replay a cross-tenant `201`.
+Existing keys from before tenant scoping stop matching and expire within 24h.
 
 Behavior to remember:
 
@@ -353,7 +664,7 @@ During a Redis outage:
   Moving to memory is an emergency, single-replica-only degradation and loses
   shared state. Revert as soon as Redis is healthy.
 
-## 6. Migrations and legacy upgrade
+## 7. Migrations and legacy upgrade
 
 Only `cmd/migrate` applies DDL. `cmd/api` and `cmd/seed` assume the schema
 exists, so replicas do not race. `cmd/migrate` loads only `DB_*` plus
@@ -388,10 +699,75 @@ uses a separate Job and ordered flow (see below).
   verify the objects and baseline the version (for example `force 1`) instead
   of applying the file over populated tables.
 
+### Multi-tenant foundation upgrade
+
+The baseline now creates `tenants`, seeds tenant id 1 (`default`), adds
+`tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to users, files,
+notifications, notification preferences, refresh/reset/verification tokens,
+jobs, and audit events, adds tenant-leading indexes, and scopes the last-admin
+trigger per tenant. A database deployed before this change does **not** receive
+those objects from the edited baseline. Create the next numbered migration
+above its recorded version (or apply reviewed DDL manually) that:
+
+1. creates `tenants` and inserts `('default','Default')` first so it gets id 1;
+2. adds/backfills the `tenant_id` columns (default 1) and foreign keys;
+3. rebuilds user uniqueness as `(tenant_id, lower(email))` and
+   `(tenant_id, google_id)` for active rows, and adds the tenant-leading
+   indexes;
+4. replaces `protect_last_admin()` with the per-tenant body;
+5. adds `feature_flags`, `feature_flag_targets`, their partial unique indexes,
+   and a unique index on `users(tenant_id, id)` for tenant-safe user targets.
+
+Keep tenant id 1 as the compatibility anchor unless you also change the column
+defaults and backfill every row. The notifications schema is additive:
+create `notifications` and `notification_preferences` with tenant/user
+columns, the feed/unread indexes, and the unique preference index. After the
+upgrade, run `cmd/migrate`; it verifies the tenant table/columns/indexes,
+`tenant_id` on `jobs`, `audit_events`, and `feature_flag_targets`, the
+feature-flag tables/indexes, the notification tables and unique preference
+index, and the default tenant row.
+
+`TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
+requests resolve to in local/test compatibility mode; `TENANT_REQUIRE_HEADER=true`
+rejects requests that omit `X-Tenant-Slug`. **Production requires it**, and the
+Kubernetes ConfigMap sets it, so no HTTP write can silently land in tenant 1.
+Roll it out in lower environments only after all clients send the header.
+Startup checks existence separately from request resolution: a suspended
+configured/default tenant does not fail `cmd/api` or `cmd/seed`, but its
+requests return 404 until an operator reactivates it. Browser OAuth start and
+reset/verify links may select the tenant with `?tenant=<slug>` because a header
+cannot be sent on navigation; the header still wins when both are present.
+`cmd/migrate` verifies `tenants.slug/status`, the tenant slug uniqueness, and
+that every tenant-owned query index leads with `tenant_id`.
+Identity, files, jobs, and audit now carry/propagate `tenant_id`; identity and
+files queries are tenant-scoped. Existing rows default to tenant 1 and their old
+`<userID>/<uuid>.<ext>` storage keys remain valid because downloads read
+`files.storage_path`. New uploads use
+`<tenantID>/<userID>/<uuid>.<ext>`; if you migrate existing blobs, copy first and
+update `files.storage_path` in the same operation. RLS and per-tenant limits are
+future work; see the README scope note.
+
 `cmd/migrate` checks for a dirty migration state before running, and after
-migrating verifies required tables, columns, and unique indexes. A legacy
-partial schema fails with an actionable error instead of silently serving a
-broken database.
+migrating verifies required tables, columns, unique indexes, `tenants.slug`/
+`status`, and that each tenant-owned query index starts with `tenant_id`. A
+legacy partial schema or a same-named global index fails with an actionable
+error instead of silently serving a broken database.
+
+### Jobs `trace_parent`
+
+The consolidated baseline includes `jobs.trace_parent TEXT`. This boilerplate
+has no deployed database, so no numbered migration was added. If a database
+already applied version 1, run the additive statement once before deploying
+this build:
+
+```sql
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT;
+```
+
+`cmd/migrate` verifies the column and fails with an actionable error if it is
+missing. Existing rows keep `NULL`, which produces a root `job.process` span
+without an enqueue link. The column stores only a W3C `traceparent` header; it
+does not contain the job payload or tenant data.
 
 ### Failure and backup/restore
 
@@ -420,7 +796,7 @@ kubectl -n <namespace> logs job/<migration-job>
   expand/contract for incompatible columns so old and new pods can coexist
   during a rolling update.
 
-## 7. Kubernetes deployment notes
+## 8. Kubernetes deployment notes
 
 Follow [deploy/k8s/README.md](../deploy/k8s/README.md) for the full commands.
 The operational invariants:
@@ -473,7 +849,9 @@ Other caveats:
   credentials prevents startup. After startup, object reads/writes/deletes fail
   on use and are not covered by `/readyz`. Local storage needs a shared
   ReadWriteMany volume; `emptyDir` is node-local and unsuitable for multiple
-  replicas.
+  replicas. Blob keys start with `<tenantID>/<userID>/`; preserve that prefix in
+  backup/restore tooling and never serve the backing directory or bucket
+  publicly.
 - **Redis:** `CACHE_DRIVER=redis` and `REDIS_URL` (use `rediss://` when
   available) are required for shared rate limits, session invalidation, and
   idempotency across replicas. Memory cache is single-replica only.
@@ -528,15 +906,52 @@ The migration Job is not rolled back. If a release applied an incompatible
 migration, restore from a verified backup/PITR snapshot or ship a forward fix;
 do not blindly roll the image back onto a newer schema.
 
-## 8. Incident checklist
+## 9. Distributed tracing
+
+Tracing is off unless `OTEL_ENABLED=true`. When disabled, `app.Deps.Tracing`
+returns a no-op provider and no collector connection is opened. Configuration,
+sampling details, and privacy rules are in [Tracing](tracing.md).
+
+What exists when enabled:
+
+- an HTTP server span per request, excluding `/healthz`, `/readyz`, `/health`,
+  and `/metrics`; the span name/route uses the Fiber route template, not the
+  raw path;
+- sanitized pgx client spans for queries that run under a recording parent,
+  with SQLSTATE on failure and no SQL text, arguments, or error messages;
+- a `job.process` consumer span per attempt, as a new root with a link to the
+  enqueue trace and `job.outcome` (`succeeded`/`retried`/`dead`);
+- `trace_id`/`span_id` on request logs.
+
+Operational rules:
+
+- The collector is never part of readiness. If it is down, batches fill the
+  bounded SDK queue and are then dropped. The API stays ready. Check the
+  endpoint, DNS, NetworkPolicy egress 4317, and collector health; do not
+  restart the app to "recover" spans.
+- Shutdown flushes spans last with `OTEL_SHUTDOWN_TIMEOUT_SECS`. A flush
+  failure is logged as a warning and never changes the exit code.
+- Sampling is parent-based: an upstream `traceparent` with the sampled flag
+  off stays unsampled regardless of the local ratio. Use
+  `OTEL_TRACES_SAMPLER_ARG` to control root sampling.
+- Never add attributes containing emails, tokens, headers, query strings,
+  payloads, SQL, file names, or raw error text. Use `tracing.MarkError` for
+  failures; it records only a bounded `error.type`.
+- An unreachable collector at startup is normal and non-fatal. The OTLP/gRPC
+  client connects lazily.
+
+## 10. Incident checklist
 
 ### First 5 minutes
 
 1. Confirm scope: `/readyz`, pod status, recent rollout/migration, and the
    affected route or job kind.
-2. Correlate with `X-Request-Id` in logs, problem responses, and audit rows.
+2. Correlate with `X-Request-Id` (and `trace_id` when tracing is enabled) in
+   logs, problem responses, audit rows, and traces.
 3. Check the four golden signals plus `jobs_dead_total`,
-   `jobs_claim_errors_total`, and `audit_write_failures_total`.
+   `jobs_claim_errors_total`, `scheduler_leader`,
+   `scheduler_enqueue_errors_total`, `events_enqueue_errors_total`, and
+   `audit_write_failures_total`.
 4. Prefer reversible mitigations: roll back the Deployment, restore a
    dependency, or scale capacity. Do not flush Redis, rotate `JWT_SECRET`,
    delete jobs, or force a migration version as a first response.
@@ -613,6 +1028,31 @@ Actions:
    and accepts duplicate execution.
 6. Do not bulk-requeue `dead` rows: payloads are cleared. Fix the handler and
    re-trigger the business flow.
+
+### Webhook deliveries are failing or delayed
+
+Symptoms: `webhook_deliveries` pending/dead counts rising, `last_error`
+showing timeouts/5xx, receiver reports duplicate or missing events.
+
+Actions:
+
+1. Check the endpoint status, URL, event filters, and attempt budget. Disabled
+   or soft-deleted endpoints are not matched for new events.
+2. Inspect `webhook_delivery_attempts` for the status code and duration. A
+   timeout usually means the receiver is slow or unreachable; confirm the
+   configured `timeoutMs`.
+3. Remember `3xx` is permanent by design and redirects are never followed.
+   Fix the endpoint URL rather than expecting a retry.
+4. `408`, `425`, `429`, and `5xx` retry with backoff/`Retry-After`; a sustained
+   `429` means the receiver is throttling and the delivery may eventually die.
+5. Check that the worker is running (it is in-process with the API) and that
+   `jobs` has `webhook.delivery` rows. The delivery claim lease recovers a
+   crashed attempt; if no job remains, replay the delivery.
+6. A dead delivery retains its payload and secret snapshot, so replay is
+   possible after fixing the receiver. Replay uses the current URL/secret.
+7. For inbound failures, use the receiver troubleshooting checklist in
+   [Webhooks](webhooks.md) or section 5 above; check clock skew and signature
+   canonicalization before rotating secrets.
 
 ### Migration failed or schema is dirty
 

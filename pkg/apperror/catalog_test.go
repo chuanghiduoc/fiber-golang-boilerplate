@@ -20,9 +20,11 @@ var requiredCodes = []Code{
 	CodeFileNotDeleted,
 	CodePermissionDenied,
 	CodeRateLimitExceeded,
+	CodeAPIVersionUnsupported,
 	CodeSystemInternal,
 	CodeSystemTimeout,
 	CodeSystemUnavailable,
+	CodeSystemAuditUnavailable,
 }
 
 func TestCatalogSpecs(t *testing.T) {

@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 )
@@ -76,10 +77,45 @@ func TestCORSConfig_DefaultsIncludeIdempotencyHeaders(t *testing.T) {
 	if !contains(c.Headers(), "Idempotency-Key") {
 		t.Errorf("default CORS allowed headers = %v, want Idempotency-Key", c.Headers())
 	}
-	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed"} {
+	for _, header := range []string{"Accept-Language", "Accept-Version"} {
+		if !contains(c.Headers(), header) {
+			t.Errorf("default CORS allowed headers = %v, want %s", c.Headers(), header)
+		}
+	}
+	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed", "Content-Language", "API-Version", "Deprecation", "Sunset", "Link"} {
 		if !contains(c.ExposedHeaders(), header) {
 			t.Errorf("default CORS exposed headers = %v, want %s", c.ExposedHeaders(), header)
 		}
+	}
+}
+
+func TestLoad_I18NDefaultLocale(t *testing.T) {
+	t.Setenv("I18N_DEFAULT_LOCALE", "vi")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.I18N.DefaultLocale != "vi" {
+		t.Errorf("I18N_DEFAULT_LOCALE = %q, want vi", cfg.I18N.DefaultLocale)
+	}
+}
+
+func TestI18NConfigDefaultLocale(t *testing.T) {
+	t.Setenv("I18N_DEFAULT_LOCALE", "")
+	var cfg I18NConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("parse I18N defaults: %v", err)
+	}
+	if cfg.DefaultLocale != "en" {
+		t.Errorf("I18N_DEFAULT_LOCALE = %q, want en", cfg.DefaultLocale)
+	}
+
+	cfg.DefaultLocale = " VI "
+	if got := cfg.Locale(); got != "vi" {
+		t.Errorf("Locale() = %q, want vi", got)
+	}
+	if got := (I18NConfig{}).Locale(); got != "en" {
+		t.Errorf("zero Locale() = %q, want en", got)
 	}
 }
 
@@ -98,6 +134,119 @@ func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
 	cfg.App.TrustedProxies = "0.0.0.0/0"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() should reject a wildcard trusted proxy")
+	}
+}
+
+func TestValidate_WebhookSettings(t *testing.T) {
+	t.Run("dedicated key", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = strings.Repeat("k", 32)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() rejected a valid webhook key: %v", err)
+		}
+		if got := cfg.Webhook.ResolvedSecretKey("jwt"); got != strings.Repeat("k", 32) {
+			t.Errorf("ResolvedSecretKey() = %q, want the dedicated key", got)
+		}
+	})
+
+	t.Run("fallback to JWT secret", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if got := cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret); got != cfg.JWT.Secret {
+			t.Errorf("ResolvedSecretKey() = %q, want JWT fallback", got)
+		}
+	})
+
+	t.Run("short key", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = "too-short"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject a short webhook key")
+		}
+	})
+
+	t.Run("production requires dedicated key", func(t *testing.T) {
+		cfg := productionValidConfig()
+		cfg.Webhook.SecretEncryptionKey = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should require a dedicated key in production")
+		}
+	})
+
+	t.Run("timeout bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.ConnectTimeoutSeconds = 20
+		cfg.Webhook.RequestTimeoutSeconds = 10
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject connect timeout above request timeout")
+		}
+	})
+
+	t.Run("retry bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.RetryMaxSeconds = 1
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject retry max below retry base")
+		}
+	})
+
+	t.Run("attempt cap", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.MaxAttempts = 51
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject more than 50 attempts")
+		}
+	})
+
+	t.Run("retention bounds", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.RetentionDays = 0
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject zero retention")
+		}
+	})
+
+	t.Run("timestamp tolerance", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.TimestampToleranceSeconds = 5
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject a 5s timestamp tolerance")
+		}
+	})
+
+	t.Run("invalid SSRF allowlist", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SSRFAllowlist = "10.0.0.0/99"
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() should reject an invalid allowlist CIDR")
+		}
+	})
+}
+
+func TestLoad_WebhookDefaults(t *testing.T) {
+	t.Setenv("WEBHOOK_CONNECT_TIMEOUT_SECS", "")
+	t.Setenv("WEBHOOK_REQUEST_TIMEOUT_SECS", "")
+	t.Setenv("WEBHOOK_RETRY_BASE_SECS", "")
+	t.Setenv("WEBHOOK_RETRY_MAX_SECS", "")
+	t.Setenv("WEBHOOK_MAX_ATTEMPTS", "")
+	t.Setenv("WEBHOOK_RETENTION_DAYS", "")
+	t.Setenv("WEBHOOK_TIMESTAMP_TOLERANCE_SECS", "")
+	t.Setenv("WEBHOOK_SECRET_ENCRYPTION_KEY", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Webhook.ConnectTimeoutSeconds != 5 || cfg.Webhook.RequestTimeoutSeconds != 10 {
+		t.Errorf("unexpected timeout defaults: %+v", cfg.Webhook)
+	}
+	if cfg.Webhook.MaxAttempts != 8 || cfg.Webhook.RetentionDays != 30 {
+		t.Errorf("unexpected attempt/retention defaults: %+v", cfg.Webhook)
+	}
+	if cfg.Webhook.TimestampTolerance().Seconds() != 300 {
+		t.Errorf("timestamp tolerance = %s, want 5m", cfg.Webhook.TimestampTolerance())
+	}
+	if cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret) == "" {
+		t.Error("local webhook key must fall back to JWT_SECRET")
 	}
 }
 
@@ -142,6 +291,12 @@ func baseValidConfig() Config {
 		CORS:      CORSConfig{AllowOrigins: "*"},
 		Cache:     CacheConfig{Driver: "memory"},
 		Email:     EmailConfig{Driver: "console"},
+		Tenant:    TenantConfig{DefaultSlug: "default"},
+		Webhook: WebhookConfig{
+			ConnectTimeoutSeconds: 5, RequestTimeoutSeconds: 10,
+			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
+			RetentionDays: 30, TimestampToleranceSeconds: 300,
+		},
 	}
 }
 
@@ -149,6 +304,72 @@ func TestValidate_ValidLocalConfig(t *testing.T) {
 	cfg := baseValidConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() returned error for valid config: %v", err)
+	}
+}
+
+func TestSchedulerConfig_Defaults(t *testing.T) {
+	var cfg SchedulerConfig
+	if err := env.Parse(&cfg); err != nil {
+		t.Fatalf("parse scheduler defaults: %v", err)
+	}
+	if cfg.Enabled {
+		t.Error("scheduler must default to disabled")
+	}
+	if cfg.LeaseTTL() != 30*time.Second {
+		t.Errorf("LeaseTTL() = %v, want 30s", cfg.LeaseTTL())
+	}
+	if cfg.HeartbeatInterval() != 10*time.Second {
+		t.Errorf("HeartbeatInterval() = %v, want 10s", cfg.HeartbeatInterval())
+	}
+	if cfg.PollInterval() != 15*time.Second {
+		t.Errorf("PollInterval() = %v, want 15s", cfg.PollInterval())
+	}
+	if cfg.Catchup != "latest" {
+		t.Errorf("Catchup = %q, want latest", cfg.Catchup)
+	}
+	if cfg.Retention() != 30*24*time.Hour {
+		t.Errorf("Retention() = %v, want 720h", cfg.Retention())
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("default scheduler config must validate: %v", err)
+	}
+}
+
+func TestSchedulerConfig_Validate(t *testing.T) {
+	valid := SchedulerConfig{
+		Enabled: true, LeaseTTLSecs: 30, HeartbeatSecs: 10, PollSecs: 15,
+		Catchup: "all", CatchupLimit: 10, RetentionDays: 7,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid scheduler config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		cfg  SchedulerConfig
+	}{
+		{"zero config", SchedulerConfig{}},
+		{"lease ttl", SchedulerConfig{LeaseTTLSecs: 0, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"heartbeat", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 10, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"poll", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 0, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
+		{"catchup", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "sometimes", CatchupLimit: 1, RetentionDays: 1}},
+		{"catchup limit", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 0, RetentionDays: 1}},
+		{"retention", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 0}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Zero config is valid by design (unset optional block), all other
+			// cases must fail their respective rule.
+			if tt.name == "zero config" {
+				if err := tt.cfg.Validate(); err != nil {
+					t.Fatalf("zero scheduler config must validate: %v", err)
+				}
+				return
+			}
+			if err := tt.cfg.Validate(); err == nil {
+				t.Error("Validate() should fail")
+			}
+		})
 	}
 }
 
@@ -181,6 +402,54 @@ func TestValidate_InvalidExpireHour(t *testing.T) {
 	cfg.JWT.ExpireHour = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for ExpireHour < 1")
+	}
+}
+
+func TestValidate_TenantSlug(t *testing.T) {
+	t.Run("valid custom slug", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Tenant.DefaultSlug = "acme-corp"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() rejected a valid tenant slug: %v", err)
+		}
+	})
+
+	for _, slug := range []string{"", "Acme", "has space", "under_score", strings.Repeat("a", 64)} {
+		t.Run("invalid "+slug, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.Tenant.DefaultSlug = slug
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate() should reject tenant slug %q", slug)
+			}
+		})
+	}
+}
+
+func TestLoad_TenantDefaults(t *testing.T) {
+	t.Setenv("TENANT_DEFAULT_SLUG", "")
+	t.Setenv("TENANT_REQUIRE_HEADER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Tenant.DefaultSlug != "default" {
+		t.Errorf("TENANT_DEFAULT_SLUG = %q, want default", cfg.Tenant.DefaultSlug)
+	}
+	if cfg.Tenant.RequireHeader {
+		t.Error("TENANT_REQUIRE_HEADER should default to false")
+	}
+}
+
+func TestLoad_TenantRequireHeader(t *testing.T) {
+	t.Setenv("TENANT_REQUIRE_HEADER", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if !cfg.Tenant.RequireHeader {
+		t.Error("TENANT_REQUIRE_HEADER=true was not parsed")
 	}
 }
 
@@ -424,11 +693,13 @@ func productionValidConfig() Config {
 	cfg.App.Env = "production"
 	cfg.App.FrontendURL = "https://app.example.com"
 	cfg.JWT.Secret = strings.Repeat("a", 32)
+	cfg.Webhook.SecretEncryptionKey = strings.Repeat("w", 32)
 	cfg.Storage.AllowedMIMETypes = "image/png,application/pdf"
 	cfg.CORS.AllowOrigins = "https://app.example.com"
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "require"
+	cfg.Tenant.RequireHeader = true
 	return cfg
 }
 
@@ -453,6 +724,7 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshExpireDays = 0 }},
 		{"invalid env", func(c *Config) { c.App.Env = "prod" }},
 		{"missing metrics token", func(c *Config) { c.App.MetricsAuthToken = "" }},
+		{"tenant header not required", func(c *Config) { c.Tenant.RequireHeader = false }},
 		{"weak admin password", func(c *Config) {
 			c.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
 		}},
@@ -487,5 +759,77 @@ func TestValidate_StagingRejectsKnownDefaults(t *testing.T) {
 	cfg.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("staging must reject the default admin password")
+	}
+}
+
+func TestFeatureFlagsConfigDefaults(t *testing.T) {
+	var c FeatureFlagsConfig
+	if err := env.Parse(&c); err != nil {
+		t.Fatalf("parse feature flag defaults: %v", err)
+	}
+	if c.CacheTTL() != time.Duration(c.CacheTTLSeconds)*time.Second {
+		t.Fatalf("CacheTTL() = %v, want %d seconds", c.CacheTTL(), c.CacheTTLSeconds)
+	}
+	if c.MaxStaleness() < c.CacheTTL() {
+		t.Fatalf("MaxStaleness() = %v, must be >= CacheTTL() %v", c.MaxStaleness(), c.CacheTTL())
+	}
+}
+
+func TestFeatureFlagsConfigParsedValues(t *testing.T) {
+	c := FeatureFlagsConfig{Flags: "user_registration=false,google_oauth=true", ForceOff: "file_uploads"}
+	values := c.EnvValues()
+	if values["user_registration"] || !values["google_oauth"] {
+		t.Fatalf("EnvValues() = %+v", values)
+	}
+	forceOff := c.ForceOffValues()
+	if _, ok := forceOff["file_uploads"]; !ok {
+		t.Fatalf("ForceOffValues() = %+v", forceOff)
+	}
+}
+
+func TestValidate_FeatureFlags(t *testing.T) {
+	t.Run("valid flags", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.FeatureFlags = FeatureFlagsConfig{
+			Flags:               "user_registration=false,email_verification=true",
+			ForceOff:            "google_oauth",
+			CacheTTLSeconds:     30,
+			MaxStalenessSeconds: 300,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid feature flags rejected: %v", err)
+		}
+	})
+
+	t.Run("zero timings use defaults", func(t *testing.T) {
+		cfg := baseValidConfig()
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("zero feature flag timings should be valid: %v", err)
+		}
+	})
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"unknown flag", func(c *Config) { c.FeatureFlags.Flags = "typo=true" }},
+		{"malformed flag", func(c *Config) { c.FeatureFlags.Flags = "user_registration=" }},
+		{"duplicate flag", func(c *Config) { c.FeatureFlags.Flags = "file_uploads=true,file_uploads=false" }},
+		{"unknown force-off", func(c *Config) { c.FeatureFlags.ForceOff = "typo" }},
+		{"negative TTL", func(c *Config) { c.FeatureFlags.CacheTTLSeconds = -1 }},
+		{"negative staleness", func(c *Config) { c.FeatureFlags.MaxStalenessSeconds = -1 }},
+		{"staleness below TTL", func(c *Config) {
+			c.FeatureFlags.CacheTTLSeconds = 60
+			c.FeatureFlags.MaxStalenessSeconds = 30
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Error("Validate() should reject this feature flag config")
+			}
+		})
 	}
 }

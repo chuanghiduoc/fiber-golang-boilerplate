@@ -1,16 +1,23 @@
 # Documentation
 
 - [Architecture](architecture.md) — module map, dependency rules, request flow,
-  data ownership, jobs/outbox, migration policy.
-- [API Design System](api-design.md) — URL/versioning, JSON conventions,
-  success/error shapes, pagination, auth, idempotency, rate limits, status
-  codes, compatibility rules.
+  tenant model, i18n/versioning mechanics, data ownership, jobs/outbox,
+  migration policy.
+- [API Design System](api-design.md) — URL/versioning, Accept-Version,
+  localization, JSON conventions, success/error shapes, pagination, auth,
+  idempotency, rate limits, status codes, compatibility rules.
 - [Module Template](module-template.md) — canonical module layout, copy-paste
   skeleton, route/permission/audit/idempotency wiring, table ownership,
   cross-module contracts, migrations, tests, and the add-a-module checklist.
 - [Operations](operations.md) — health/readiness, metrics, logs and request
   IDs, jobs, idempotency and Redis, migrations, Kubernetes caveats, and
   incident checklists.
+- [Feature Flags](feature-flags.md) — compile-time catalog, precedence,
+  environment force-off, database defaults and tenant/user targets, cache
+  staleness, admin API, audit metadata, and metrics.
+- [Webhooks](webhooks.md) — outbound event dispatch, HMAC signing and
+  verification, SSRF-safe delivery, retries, replay, inbound sources, secrets,
+  configuration, and operations.
 - [Swagger UI](../docs/swagger.json) — generated OpenAPI (served at `/swagger`
   outside production).
 

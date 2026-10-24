@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -36,6 +38,7 @@ type adminUserService struct {
 	userRepo         repository.UserRepository
 	refreshTokenRepo repository.RefreshTokenRepository
 	txManager        *database.TxManager
+	audit            audit.TxRecorder
 	sessions         session.Store
 }
 
@@ -43,6 +46,7 @@ func NewAdminUserService(
 	userRepo repository.UserRepository,
 	refreshTokenRepo repository.RefreshTokenRepository,
 	txManager *database.TxManager,
+	auditRecorder audit.TxRecorder,
 	sessions ...session.Store,
 ) AdminUserService {
 	var sessionStore session.Store
@@ -53,6 +57,7 @@ func NewAdminUserService(
 		userRepo:         userRepo,
 		refreshTokenRepo: refreshTokenRepo,
 		txManager:        txManager,
+		audit:            auditRecorder,
 		sessions:         sessionStore,
 	}
 }
@@ -86,39 +91,78 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 		return nil, apperror.NewBadRequest("role must be one of: user, admin")
 	}
 
-	existing, err := s.userRepo.GetByID(ctx, id)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("user not found")
-		}
-		return nil, apperror.NewInternal("failed to get user")
-	}
-
-	// Do not allow the final admin to be demoted; that would lock every
-	// administrator out of the system.
-	if existing.Role == dto.RoleAdmin && role != dto.RoleAdmin {
-		admins, err := s.userRepo.CountActiveAdmins(ctx)
+	previousRole := ""
+	update := func(userRepo repository.UserRepository) (*identitysqlc.User, error) {
+		existing, err := userRepo.GetByID(ctx, id)
 		if err != nil {
-			return nil, apperror.NewInternal("failed to count admins")
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil, apperror.NewNotFound("user not found")
+			}
+			return nil, apperror.NewInternal("failed to get user")
 		}
-		if admins <= 1 {
-			return nil, apperror.NewCode(apperror.CodeUserLastAdmin, "cannot demote the last active admin")
+		previousRole = existing.Role
+
+		// Do not allow the final admin to be demoted; that would lock every
+		// administrator out of the system. This check runs inside the same
+		// transaction as the update so two concurrent demotions cannot both
+		// observe two admins.
+		if existing.Role == dto.RoleAdmin && role != dto.RoleAdmin {
+			admins, err := userRepo.CountActiveAdmins(ctx)
+			if err != nil {
+				return nil, apperror.NewInternal("failed to count admins")
+			}
+			if admins <= 1 {
+				return nil, apperror.NewCode(apperror.CodeUserLastAdmin, "cannot demote the last active admin")
+			}
 		}
+
+		user, err := userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
+			ID:   id,
+			Role: role,
+		})
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil, apperror.NewNotFound("user not found")
+			}
+			var appErr *apperror.AppError
+			if errors.As(err, &appErr) {
+				return nil, err
+			}
+			return nil, apperror.NewInternal("failed to update user role")
+		}
+		return user, nil
 	}
 
-	user, err := s.userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
-		ID:   id,
-		Role: role,
-	})
+	var user *identitysqlc.User
+	var err error
+	if s.txManager != nil {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			updated, updateErr := update(repository.NewUserRepository(tx))
+			if updateErr != nil {
+				return updateErr
+			}
+			event := audit.NewServiceEvent(ctx, "admin.user.role_changed", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			event.Metadata = map[string]any{"from_role": previousRole, "to_role": role}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			user = updated
+			return nil
+		})
+	} else {
+		user, err = update(s.userRepo)
+		if err == nil {
+			event := audit.NewServiceEvent(ctx, "admin.user.role_changed", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			event.Metadata = map[string]any{"to_role": role}
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
+				return nil, auditWriteError(auditErr)
+			}
+		}
+	}
 	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("user not found")
-		}
-		var appErr *apperror.AppError
-		if errors.As(err, &appErr) {
-			return nil, err
-		}
-		return nil, apperror.NewInternal("failed to update user role")
+		return nil, err
 	}
 
 	if s.sessions != nil {
@@ -128,26 +172,25 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 }
 
 func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
-	existing, err := s.userRepo.GetByID(ctx, id)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewNotFound("user not found or already banned")
-		}
-		return apperror.NewInternal("failed to get user")
-	}
-	if existing.Role == dto.RoleAdmin {
-		admins, err := s.userRepo.CountActiveAdmins(ctx)
+	ban := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		existing, err := userRepo.GetByID(ctx, id)
 		if err != nil {
-			return apperror.NewInternal("failed to count admins")
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found or already banned")
+			}
+			return apperror.NewInternal("failed to get user")
 		}
-		if admins <= 1 {
-			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot ban the last active admin")
+		if existing.Role == dto.RoleAdmin {
+			admins, err := userRepo.CountActiveAdmins(ctx)
+			if err != nil {
+				return apperror.NewInternal("failed to count admins")
+			}
+			if admins <= 1 {
+				return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot ban the last active admin")
+			}
 		}
-	}
 
-	doBan := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		_, err := userRepo.Ban(ctx, id)
-		if err != nil {
+		if _, err := userRepo.Ban(ctx, id); err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("user not found or already banned")
 			}
@@ -164,12 +207,28 @@ func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
 		return nil
 	}
 
+	var err error
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doBan(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			if banErr := ban(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); banErr != nil {
+				return banErr
+			}
+			event := audit.NewServiceEvent(ctx, "admin.user.banned", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
-		err = doBan(s.userRepo, s.refreshTokenRepo)
+		err = ban(s.userRepo, s.refreshTokenRepo)
+		if err == nil {
+			event := audit.NewServiceEvent(ctx, "admin.user.banned", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -181,15 +240,48 @@ func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
 }
 
 func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error) {
-	user, err := s.userRepo.Restore(ctx, id)
+	restore := func(userRepo repository.UserRepository) (*identitysqlc.User, error) {
+		user, err := userRepo.Restore(ctx, id)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil, apperror.NewNotFound("user not found or not banned")
+			}
+			if database.IsUniqueViolation(err) {
+				return nil, apperror.NewConflict("the original email is already in use by another account")
+			}
+			return nil, apperror.NewInternal("failed to unban user")
+		}
+		return user, nil
+	}
+
+	var user *identitysqlc.User
+	var err error
+	if s.txManager != nil {
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			restored, restoreErr := restore(repository.NewUserRepository(tx))
+			if restoreErr != nil {
+				return restoreErr
+			}
+			event := audit.NewServiceEvent(ctx, "admin.user.unbanned", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			user = restored
+			return nil
+		})
+	} else {
+		user, err = restore(s.userRepo)
+		if err == nil {
+			event := audit.NewServiceEvent(ctx, "admin.user.unbanned", "user")
+			event.ResourceID = strconv.FormatInt(id, 10)
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
+				return nil, auditWriteError(auditErr)
+			}
+		}
+	}
 	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("user not found or not banned")
-		}
-		if database.IsUniqueViolation(err) {
-			return nil, apperror.NewConflict("the original email is already in use by another account")
-		}
-		return nil, apperror.NewInternal("failed to unban user")
+		return nil, err
 	}
 
 	if err := s.refreshTokenRepo.DeleteByUserID(ctx, id); err != nil {

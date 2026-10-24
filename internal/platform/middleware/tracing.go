@@ -1,0 +1,126 @@
+package middleware
+
+import (
+	"errors"
+	"strconv"
+
+	"github.com/gofiber/fiber/v3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+)
+
+const httpInstrumentationName = "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+
+// Tracing starts a server span for every request except excluded probe paths.
+// It must run after RequestID so app.request_id is populated, and before
+// Recovery/Logger/Metrics so the span covers the whole handler stack.
+//
+// Only low-cardinality, non-sensitive attributes are recorded: the matched
+// route template (never the raw path or query), method, status, request ID,
+// user ID, tenant ID, and an application error code. Error messages, request
+// bodies, headers, and payloads are never attached.
+func Tracing(tp trace.TracerProvider, excludePaths []string) fiber.Handler {
+	excluded := make(map[string]struct{}, len(excludePaths))
+	for _, path := range excludePaths {
+		if path != "" {
+			excluded[path] = struct{}{}
+		}
+	}
+	if tp == nil {
+		tp = noop.NewTracerProvider()
+	}
+	tracer := tp.Tracer(httpInstrumentationName)
+
+	return func(c fiber.Ctx) error {
+		if _, skip := excluded[c.Path()]; skip {
+			return c.Next()
+		}
+
+		// W3C trace context from an upstream service or load balancer is
+		// parsed by the OpenTelemetry propagator; malformed values are ignored.
+		ctx := tracing.ExtractRemoteContext(c.Context(), c.Get(tracing.TraceParentHeader))
+		route := routeTemplate(c)
+		ctx, span := tracer.Start(ctx, httpSpanName(c.Method(), route),
+			trace.WithSpanKind(trace.SpanKindServer),
+			trace.WithAttributes(semconv.HTTPRequestMethodKey.String(c.Method())),
+		)
+		defer span.End()
+		c.SetContext(ctx)
+
+		err := c.Next()
+		status := effectiveStatus(c, err)
+
+		// Fiber resolves the route before middleware runs, but refresh after
+		// the handler so mounted/sub-router templates are never missed.
+		route = routeTemplate(c)
+		if route != "" {
+			span.SetName(httpSpanName(c.Method(), route))
+			span.SetAttributes(semconv.HTTPRouteKey.String(route))
+		}
+		span.SetAttributes(semconv.HTTPResponseStatusCodeKey.Int(status))
+
+		if requestID := fiber.Locals[string](c, "request_id"); requestID != "" {
+			span.SetAttributes(attribute.String("app.request_id", requestID))
+		}
+		if userID := fiber.Locals[int64](c, "user_id"); userID != 0 {
+			span.SetAttributes(semconv.EnduserIDKey.String(strconv.FormatInt(userID, 10)))
+		}
+		if tenantID := requestTenantID(c); tenantID != 0 {
+			span.SetAttributes(attribute.Int64("tenant.id", tenantID))
+		}
+
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) && appErr.Code != "" {
+			span.SetAttributes(attribute.String("app.error_code", appErr.Code))
+		}
+
+		// 4xx responses are expected client outcomes and stay Unset. Only 5xx
+		// marks the span failed, using a bounded error type rather than the
+		// error message.
+		if status >= fiber.StatusInternalServerError {
+			if err != nil {
+				tracing.MarkError(span, err)
+			} else {
+				span.SetStatus(codes.Error, "")
+				span.SetAttributes(semconv.ErrorTypeKey.String("http_" + strconv.Itoa(status)))
+			}
+		}
+
+		return err
+	}
+}
+
+// routeTemplate returns the registered route pattern. An unmatched request
+// falls back to "/" in Fiber; it is reported as no route so the raw URL cannot
+// leak into a span.
+func routeTemplate(c fiber.Ctx) string {
+	route := c.Route().Path
+	if route == "" {
+		return ""
+	}
+	if route == "/" && c.Path() != "/" {
+		return ""
+	}
+	return route
+}
+
+func httpSpanName(method, route string) string {
+	if route == "" {
+		return method
+	}
+	return method + " " + route
+}
+
+func requestTenantID(c fiber.Ctx) int64 {
+	if id := tenant.ID(c); id != 0 {
+		return id
+	}
+	return tenant.IDFromContext(c.Context())
+}

@@ -132,7 +132,7 @@ func setupAdminApp() *fiber.App {
 func adminToken() string {
 	// Use an ID distinct from the users under test so self-protection guards
 	// do not turn legitimate admin actions into 400s.
-	t, _ := token.Generate(99, "admin@example.com", "admin", "test-secret", 24)
+	t, _ := token.GenerateWithTenant(99, 1, "admin@example.com", "admin", "test-secret", 24)
 	return t
 }
 
@@ -150,7 +150,7 @@ func TestAdminGetStats(t *testing.T) {
 func TestAdminGetStats_Forbidden(t *testing.T) {
 	app := setupAdminApp()
 
-	userToken, _ := token.Generate(1, "user@example.com", "user", "test-secret", 24)
+	userToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", "test-secret", 24)
 	req, _ := http.NewRequest("GET", "/admin/stats", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+userToken)
 

@@ -46,7 +46,7 @@ func TestRegister_NormalizesAndDeduplicatesEmail(t *testing.T) {
 func TestRegister_BannedEmailRejected(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "banned@example.com", Name: "Banned", Role: "user",
 		DeletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		BannedAt:  pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -63,7 +63,7 @@ func TestRegister_BannedEmailRejected(t *testing.T) {
 func TestUpdate_EmailChangeResetsVerification(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "old@example.com", Name: "User", Role: "user",
 		EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
@@ -87,14 +87,14 @@ func TestUpdate_EmailChangeResetsVerification(t *testing.T) {
 func TestChangePassword_RevokesSessionsAndBumpsVersion(t *testing.T) {
 	repo := newMockUserRepo()
 	refreshRepo := newMockRefreshTokenRepo()
-	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil)
+	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil, nil)
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "user@example.com", Name: "User", Role: "user",
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 	}
-	refreshRepo.tokens["hash"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash"}
+	refreshRepo.tokens["hash"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash"}
 
 	if err := svc.ChangePassword(context.Background(), 1, dto.ChangePasswordRequest{
 		CurrentPassword: "Password1!", NewPassword: "Password2@",
@@ -112,9 +112,9 @@ func TestChangePassword_RevokesSessionsAndBumpsVersion(t *testing.T) {
 func TestRevokeSessions_InvalidatesAccessAndRefreshTokens(t *testing.T) {
 	repo := newMockUserRepo()
 	refreshRepo := newMockRefreshTokenRepo()
-	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil)
-	repo.users[1] = &identitysqlc.User{ID: 1, Email: "user@example.com", Name: "User", Role: "user"}
-	refreshRepo.tokens["hash"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash"}
+	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil, nil)
+	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "user@example.com", Name: "User", Role: "user"}
+	refreshRepo.tokens["hash"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash"}
 
 	if err := svc.RevokeSessions(context.Background(), 1); err != nil {
 		t.Fatalf("revoke sessions: %v", err)
@@ -130,7 +130,7 @@ func TestRevokeSessions_InvalidatesAccessAndRefreshTokens(t *testing.T) {
 func TestDelete_CannotDeleteLastAdmin(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "admin@example.com", Name: "Admin", Role: dto.RoleAdmin,
 	}
 
@@ -147,7 +147,7 @@ func TestForgotPassword_NoEnumerationOracle(t *testing.T) {
 	svc := newTestPasswordResetService(userRepo, resetRepo, newMockRefreshTokenRepo(), emailSender, cache)
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-	userRepo.users[1] = &identitysqlc.User{
+	userRepo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "known@example.com", Name: "Known", Role: "user",
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 	}
@@ -181,23 +181,23 @@ func TestRefreshToken_ConsumeIsSingleUse(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	userID, _, err := svc.Consume(context.Background(), plain)
-	if err != nil || userID != 7 {
-		t.Fatalf("first consume = (%d, %v), want (7, nil)", userID, err)
+	userID, tenantID, _, err := svc.Consume(context.Background(), plain)
+	if err != nil || userID != 7 || tenantID != 1 {
+		t.Fatalf("first consume = (%d, %d, %v), want (7, 1, nil)", userID, tenantID, err)
 	}
-	if _, _, err := svc.Consume(context.Background(), plain); err == nil {
+	if _, _, _, err := svc.Consume(context.Background(), plain); err == nil {
 		t.Fatal("replayed refresh token must be rejected")
 	}
 }
 
 func TestEmailVerification_ConsumeIsSingleUse(t *testing.T) {
 	svc, ur, vr, _, _ := newEmailVerifServiceForTest()
-	ur.users[1] = &identitysqlc.User{
+	ur.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "user@example.com", Name: "User", Role: "user",
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
-	vr.tokens[hashToken("token")] = &identitysqlc.EmailVerificationToken{
+	vr.tokens[hashToken("token")] = &identitysqlc.EmailVerificationToken{TenantID: 1,
 		ID: 1, UserID: 1, Email: "user@example.com", Token: hashToken("token"),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	}
@@ -215,12 +215,12 @@ func TestRefreshConsumeExpiredTokenIsRejected(t *testing.T) {
 	svc := NewRefreshTokenService(repo, 30)
 
 	// The service hashes the plaintext before looking it up.
-	repo.tokens[hashToken("expired")] = &identitysqlc.RefreshToken{
+	repo.tokens[hashToken("expired")] = &identitysqlc.RefreshToken{TenantID: 1,
 		UserID: 1, Token: hashToken("expired"),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
 	}
 
-	if _, _, err := svc.Consume(context.Background(), "expired"); err == nil {
+	if _, _, _, err := svc.Consume(context.Background(), "expired"); err == nil {
 		t.Fatal("expired token must be rejected")
 	}
 }
@@ -233,12 +233,12 @@ func TestResetPassword_RejectsTokenIssuedBeforePasswordChange(t *testing.T) {
 	svc := newTestPasswordResetService(userRepo, resetRepo, newMockRefreshTokenRepo(), emailSender, cache)
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-	userRepo.users[1] = &identitysqlc.User{
+	userRepo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "user@example.com", Name: "User", Role: "user",
 		PasswordHash:      pgtype.Text{String: string(hash), Valid: true},
 		PasswordChangedAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
 	}
-	resetRepo.tokens[hashToken("old-token")] = &identitysqlc.PasswordResetToken{
+	resetRepo.tokens[hashToken("old-token")] = &identitysqlc.PasswordResetToken{TenantID: 1,
 		ID: 1, UserID: 1, Token: hashToken("old-token"),
 		CreatedAt: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Hour), Valid: true},
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
@@ -255,7 +255,7 @@ func TestResetPassword_RejectsTokenIssuedBeforePasswordChange(t *testing.T) {
 func TestUpdate_NameOnlyPreservesEmailAndVerification(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "same@example.com", Name: "Old", Role: "user",
 		EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}
@@ -278,9 +278,9 @@ func TestUpdate_NameOnlyPreservesEmailAndVerification(t *testing.T) {
 
 func TestVerifyPassword_UsesLoginLockout(t *testing.T) {
 	repo := newMockUserRepo()
-	svc := NewUserService(repo, newMockRefreshTokenRepo(), false, newMockCache(), nil)
+	svc := NewUserService(repo, newMockRefreshTokenRepo(), false, newMockCache(), nil, nil)
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "user@example.com", Name: "User", Role: "user",
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 	}
@@ -298,7 +298,7 @@ func TestUserListCursor_TieBreakerPagesWithoutDuplicates(t *testing.T) {
 	svc := newTestUserService(repo, false)
 	now := time.Now()
 	for i := int64(1); i <= 3; i++ {
-		repo.users[i] = &identitysqlc.User{
+		repo.users[i] = &identitysqlc.User{TenantID: 1,
 			ID: i, Email: fmt.Sprintf("u%d@example.com", i), Name: "User", Role: "user",
 			CreatedAt: pgtype.Timestamptz{Time: now, Valid: true},
 			UpdatedAt: pgtype.Timestamptz{Time: now, Valid: true},

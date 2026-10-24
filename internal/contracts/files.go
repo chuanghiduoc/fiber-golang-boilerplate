@@ -10,6 +10,7 @@ import (
 // paths stay private to the owning module.
 type File struct {
 	ID           int64
+	TenantID     int64
 	UserID       int64
 	OriginalName string
 	MimeType     string

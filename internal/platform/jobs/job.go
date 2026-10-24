@@ -43,10 +43,26 @@ var (
 	ErrLeaseLost = errors.New("jobs: worker lease lost")
 	// ErrInvalidRetention is returned when a retention window is not positive.
 	ErrInvalidRetention = errors.New("jobs: retention must be positive")
+	// ErrInvalidTenant is returned when a job cannot be associated with a
+	// tenant. Enqueue resolves a zero TenantID from the context, so this
+	// indicates a non-positive explicit value.
+	ErrInvalidTenant = errors.New("jobs: tenant id must be positive")
+	// ErrEmptyIdempotencyKey is returned by EnqueueOnce when no key is given.
+	// A deterministic key is required to deduplicate producer retries.
+	ErrEmptyIdempotencyKey = errors.New("jobs: idempotency key is required")
+	// ErrInvalidIdempotencyKey is returned when a key exceeds the index limit.
+	ErrInvalidIdempotencyKey = errors.New("jobs: invalid idempotency key")
 )
+
+// maxIdempotencyKeyLength bounds a key so producer bugs cannot create
+// unbounded index entries. Event fan-out keys stay well below this limit.
+const maxIdempotencyKeyLength = 512
 
 // Job describes a unit of work to enqueue.
 type Job struct {
+	// TenantID owns the job. Enqueue and EnqueueTx resolve a zero value from
+	// the context via tenant.EffectiveID; a positive explicit value is kept.
+	TenantID int64
 	// Kind selects the registered handler that processes the job.
 	Kind string
 	// Payload is passed verbatim to the handler. Nil or empty payloads are
@@ -57,6 +73,11 @@ type Job struct {
 	// MaxAttempts caps how many times the job may be claimed. Zero means
 	// DefaultMaxAttempts.
 	MaxAttempts int
+	// IdempotencyKey, when set on EnqueueOnce or EnqueueOnceTx, suppresses a
+	// duplicate insert for the same tenant and key. Enqueue and EnqueueTx keep
+	// the key on the row but do not suppress conflicts, so concurrent callers
+	// receive the normal unique-violation error.
+	IdempotencyKey string
 }
 
 // normalize applies documented defaults and validates the job. now is passed
@@ -78,6 +99,11 @@ func (j Job) normalize(now time.Time) (Job, error) {
 	}
 	if j.MaxAttempts == 0 {
 		j.MaxAttempts = DefaultMaxAttempts
+	}
+
+	j.IdempotencyKey = strings.TrimSpace(j.IdempotencyKey)
+	if len(j.IdempotencyKey) > maxIdempotencyKeyLength {
+		return Job{}, fmt.Errorf("%w: key exceeds %d bytes", ErrInvalidIdempotencyKey, maxIdempotencyKeyLength)
 	}
 
 	if j.RunAt.IsZero() {

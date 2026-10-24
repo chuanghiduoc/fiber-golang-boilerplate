@@ -14,6 +14,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -88,7 +89,7 @@ func (s *emailVerificationService) SupportsTransactionalEnqueue() bool {
 
 func (s *emailVerificationService) SendVerification(ctx context.Context, userID int64, userEmail string) error {
 	userEmail = normalizeEmail(userEmail)
-	msg, tokenHash, err := s.buildVerificationMessage(userEmail)
+	msg, tokenHash, err := s.buildVerificationMessage(ctx, userEmail)
 	if err != nil {
 		return err
 	}
@@ -142,7 +143,7 @@ func (s *emailVerificationService) SendVerificationTx(ctx context.Context, tx pg
 	}
 
 	userEmail = normalizeEmail(userEmail)
-	msg, tokenHash, err := s.buildVerificationMessage(userEmail)
+	msg, tokenHash, err := s.buildVerificationMessage(ctx, userEmail)
 	if err != nil {
 		return err
 	}
@@ -154,7 +155,7 @@ func (s *emailVerificationService) SendVerificationTx(ctx context.Context, tx pg
 
 // buildVerificationMessage generates a fresh verification token and the email
 // that delivers it. Only the returned hash is ever persisted.
-func (s *emailVerificationService) buildVerificationMessage(userEmail string) (email.Message, string, error) {
+func (s *emailVerificationService) buildVerificationMessage(ctx context.Context, userEmail string) (email.Message, string, error) {
 	// Generate token
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -162,7 +163,7 @@ func (s *emailVerificationService) buildVerificationMessage(userEmail string) (e
 	}
 	token := hex.EncodeToString(b)
 
-	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", s.frontURL, token)
+	verifyURL := tokenLink(ctx, s.frontURL, "verify-email", token)
 	msg := email.Message{
 		To:      []string{userEmail},
 		Subject: "Verify Your Email Address",
@@ -191,6 +192,7 @@ func (s *emailVerificationService) persistVerification(
 	// Create with 24 hour expiry. Store only the hash; the plaintext token
 	// is delivered to the user via email so a DB leak cannot be replayed.
 	_, err := verifRepo.Create(ctx, identitysqlc.CreateEmailVerificationTokenParams{
+		TenantID:  tenant.EffectiveID(ctx),
 		UserID:    userID,
 		Email:     userEmail,
 		Token:     tokenHash,
@@ -228,6 +230,9 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 		}
 		return apperror.NewInternal("failed to verify token")
 	}
+	if vt.TenantID != tenant.EffectiveID(ctx) {
+		return apperror.NewBadRequest("invalid or expired verification token")
+	}
 
 	if vt.ExpiresAt.Time.Before(time.Now()) {
 		return apperror.NewBadRequest("verification token has expired")
@@ -262,7 +267,7 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 
 	// Rate limit before user lookup so the response cannot reveal whether the
 	// address exists. Increment is atomic and sets the TTL on first use.
-	cacheKey := "email_verification:" + emailAddr
+	cacheKey := scopedKey(ctx, "email_verification:", emailAddr)
 	if s.cache != nil {
 		if n, err := s.cache.Increment(ctx, cacheKey, 1*time.Minute); err == nil && n > 1 {
 			return nil
@@ -284,8 +289,13 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 
 	// Send asynchronously so response timing does not reveal whether the
 	// address exists or whether a message was actually delivered.
+	tenantSlug := tenant.SlugFromContext(ctx)
 	async.Go(func() {
-		if err := s.SendVerification(context.Background(), user.ID, user.Email); err != nil {
+		// The fire-and-forget goroutine does not inherit the request context.
+		// Carry the user's tenant (and resolved slug for the email link) so
+		// token writes and browser navigation stay scoped.
+		sendCtx := tenant.WithIdentity(context.Background(), user.TenantID, tenantSlug)
+		if err := s.SendVerification(sendCtx, user.ID, user.Email); err != nil {
 			slog.Error("failed to resend verification email",
 				slog.Int64("user_id", user.ID),
 				slog.String("email", user.Email),

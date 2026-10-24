@@ -42,12 +42,25 @@ func run() error {
 
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
 	userRepo := repository.NewUserRepository(pool)
+	tenantRepo := repository.NewTenantRepository(pool)
+	// Seeding checks existence, not request eligibility: an operator may need
+	// to seed an admin before reactivating a suspended default tenant.
+	_, defaultTenant, err := repository.StartupTenants(ctx, tenantRepo, cfg.Tenant.DefaultSlug)
+	if err != nil {
+		return err
+	}
+	if defaultTenant.Status != "active" {
+		slog.Warn("configured default tenant is suspended; seeding anyway",
+			slog.String("tenant", defaultTenant.Slug),
+			slog.Int64("tenant_id", defaultTenant.ID),
+		)
+	}
 
 	if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
 		return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set for seeding")
 	}
 
-	if err := seed.Admin(ctx, cfg.Admin, userRepo); err != nil {
+	if err := seed.Admin(ctx, cfg.Admin, userRepo, defaultTenant.ID); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
 

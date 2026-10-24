@@ -40,22 +40,26 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
-internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, jobs, session, and future shared mechanics
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
+internal/contracts/         narrow cross-module identity/files admin, notification, and principal-reader interfaces plus stdlib-only webhook event/dispatcher types
+internal/platform/          authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 ```
 
-**Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
+**Request flow:** `Client → app middleware (request ID, i18n) → /api/vN guard → tenant middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
-idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts), and
-`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents). Keep them current when routes/contracts change.
+idempotency, notifications, compatibility), `docs/module-template.md` (canonical
+module layout, scaffold, routes/permissions/tables/contracts),
+`docs/operations.md` (health, metrics, logs, jobs, notification email,
+idempotency, migrations, Kubernetes, incidents), `docs/tracing.md`
+(OpenTelemetry configuration, span privacy rules, collector, job trace links),
+`docs/feature-flags.md` (catalog, precedence, cache, admin API, metrics), and
+`docs/webhooks.md` (outbound dispatch/signing/SSRF/retries, inbound receiver,
+secrets). Keep them current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -74,14 +78,56 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   migration above the current version (a fully migrated old deployment is at 3,
   so `000004`+) with only the missing objects. Never point an old database at
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
+  The `jobs.trace_parent` column is folded into the baseline because this
+  boilerplate has no deployed database; a database already at version 1 needs
+  the `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT` upgrade in
+  `docs/tracing.md` before running this build.
+- Every tenant-owned table (`users`, `files`, `notifications`,
+  `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
+  `email_verification_tokens`, `jobs`, `audit_events`,
+  `feature_flag_targets`, `webhook_*`) has
+  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
+  New tenant-owned tables must do the same and lead their query indexes with
+  `tenant_id`. `feature_flags` is process-wide configuration and is the
+  deliberate exception.
+- `jobs.idempotency_key` is nullable with a partial unique
+  `(tenant_id, idempotency_key)` index; `EnqueueOnce`/`EnqueueOnceTx` use it.
+- `scheduler_leases` (one named leader row) and `scheduler_runs` (unique
+  `(schedule, scheduled_for)` ledger) are platform coordination tables. They
+  have no tenant column and no cross-module/jobs foreign keys; do not add them.
+- The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
+  tenant; the `users` last-admin trigger is scoped per tenant.
+- Identity and files are tenant-isolated: identity queries scope users/admin
+  lists/stats/refresh/reset/verification tokens; files scope every metadata
+  read/write and admin operation. Public auth flows resolve the request tenant;
+  Google OAuth binds the tenant into `state`; the session validator rejects
+  tenant mismatches and suspended tenants.
+- Startup checks tenant *existence* (`StartupTenants`, lookups ignoring status)
+  separately from active request resolution. A suspended configured/default
+  tenant must not crash `cmd/api`/`cmd/seed`; requests for it return 404.
+- Reset/verification links carry `?tenant=<slug>`, and the tenant middleware
+  accepts that validated query fallback only on the browser-facing auth paths
+  (`/auth/google`, `/auth/reset-password`, `/auth/verify-email`); the header
+  wins. The OAuth callback is exempt from middleware resolution and uses the
+  tenant in signed `state`.
+- Tokens without a `tenant_id` claim (or with a zero/negative claim) are
+  rejected fail-closed; rotate legacy tokens after upgrading. Keep `tenant_id`
+  predicates in every new query and index tenant-owned tables with `tenant_id`
+  first. RLS and per-tenant limits remain future work; do not claim
+  whole-application isolation.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant isolation, distributed tracing, and environment promotion/rollout
-automation remain future work. `identity`, `files`, and `admin` own all of
+Row-level security, per-tenant limits/quotas, and environment
+promotion/rollout automation remain future work. OpenTelemetry tracing exists
+for HTTP, sanitized pgx queries, and durable jobs but is disabled by default
+(`OTEL_ENABLED=false`); see `docs/tracing.md`.
+`identity`, `files`, `webhooks`, `notifications`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
-never imports those modules. Each module with SQL owns its `queries/` and
+never imports those modules. Notifications exposes `contracts.Notifier` and
+consumes `contracts.NotificationRecipientLookup`, implemented by identity, so
+it never reads the users table. Each module with SQL owns its `queries/` and
 generated `sqlc/` package (`admin` is contract-only); there is no shared
 generated package and no cross-module sqlc imports, and no legacy
 handler/service/DTO/repository packages remain.
@@ -98,6 +144,11 @@ complete CD platform.
   and optional `errors[]`.
 - `detail` must be public text; never serialize internal causes, SQL, or stack
   traces. Sentinels: `apperror.ErrNotFound`.
+- `Deps.I18n` localizes catalog titles and validation messages for
+  `Accept-Language`. To localize a detail, attach
+  `WithDetailKey("errors.<code>.detail", params)`. A nil bundle/localizer keeps
+  the existing English output, and `code`/`type`/`status`/`instance` never
+  change.
 - Permission failures should use `authz.Require`; it returns
   `permission.denied`.
 
@@ -114,9 +165,36 @@ Offset helpers are for small admin/export tables only.
 
 ## Key Patterns
 
-- **Auth/session:** JWT carries `token_version`; `session.Store` validates it
-  with generation-keyed invalidation. Refresh tokens are atomic single-use and
-  version-bound. `pkg/token` pins HS256 and requires `exp`.
+- **i18n:** `internal/platform/i18n` embeds `en`/`vi` catalogs and runs right
+  after request ID. It negotiates q-values, truncation, and wildcards; sets
+  `Content-Language` and `Vary: Accept-Language`; and localizes error titles
+  and validation messages through `pkg/apperror`. Keep `en.json`/`vi.json` keys
+  and `{placeholders}` in parity (startup fails otherwise).
+- **API versions:** `/api/v1` is always mounted. Implement `app.V2Module`
+  (`RegisterV2Routes`) to opt into `/api/v2`. `Accept-Version: 1|v1|2|v2` must
+  match the path, otherwise 406 `api.version_unsupported`. Version middleware
+  sets `API-Version`, `Vary: Accept-Version`, and optional
+  `Deprecation`/`Sunset`/`Link`; `versioning.Guard` returns 406 for unknown
+  `/api/vN`. Keep Swagger's base path at `/api/v1`.
+- **Auth/session:** JWT carries `token_version` and `tenant_id`;
+  `session.Store` validates the version, tenant, and tenant status with
+  generation-keyed invalidation. `tenant.Middleware` resolves `X-Tenant-Slug`
+  (empty -> `TENANT_DEFAULT_SLUG`; production requires the header), accepts a
+  validated `?tenant=` fallback on browser-facing auth paths, and skips the
+  OAuth callback so the signed `state` tenant wins. `JWTAuth` rejects tokens
+  without a positive tenant and an explicit header that conflicts with the
+  claim, and clears `tenant_slug` when the claim overrides an unresolved
+  default. Identity repositories scope every query with
+  `tenant.EffectiveID(ctx)`; the tenant-1 fallback is for jobs/internal/tests
+  only, not HTTP request handling. Refresh tokens are atomic single-use,
+  tenant-scoped, and version-bound; logout deletes by token possession.
+  `pkg/token` pins HS256 and requires `exp`.
+- **Files/tenant isolation:** repository methods always add
+  `tenant.EffectiveID(ctx)` to the SQL parameters; service methods also compare
+  the returned row's `TenantID`/`UserID` before exposing it. Uploads reject an
+  invalid tenant and store blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+  Cross-tenant ids must behave as not found (`404`), never forbidden, so file
+  existence is not disclosed.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their
@@ -156,10 +234,76 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
-- **Audit:** `platform/audit.Middleware` records successful mutating requests;
-  use `audit.Recorder` for explicit domain events.
+- **Webhooks:** identity registration and file upload/delete emit through
+  `internal/contracts/webhooks.Dispatcher` (`app.Deps.Webhooks`), so producers
+  never import the module. Dispatch inserts
+  a tenant-scoped `webhook_deliveries` row plus a `webhook.delivery` job in one
+  transaction and snapshots URL/payload/secret ciphertext. The worker signs
+  `<timestamp>.<raw-body>` with HMAC-SHA256, sends through `pkg/webhook.Client`
+  (private/loopback/link-local blocked unless allowlisted, no redirects, no
+  proxy, DNS pinned to vetted IPs), records every attempt, and retries 408/425/
+  429/5xx with exponential backoff or `Retry-After`; other 3xx/4xx are dead.
+  Receivers deduplicate on `X-Webhook-Delivery`. Secrets are AES-256-GCM sealed
+  with `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key
+  required in production) and returned only on create/rotate. The public
+  `POST /webhooks/inbound/:id` receiver uses the source tenant and HMAC, and
+  deduplicates `(source, X-Webhook-Id)`. See `docs/webhooks.md`.
+- **Events:** `internal/platform/events` is a typed in-process bus. `Event`
+  carries id/name/tenant/request/actor/timestamp/data; missing tenant, request,
+  and actor metadata is resolved from the context. `Subscribe` is synchronous
+  local delivery; `SubscribeDurable` enqueues one job per event and handler
+  with key `event:<id>:<handler>:<tenantId>`; `PublishTx` keeps the job and the
+  business transaction atomic. Panics are recovered per handler and errors are
+  combined with `errors.Join`. Durable handlers are at-least-once, so they must
+  be idempotent. `RegisterJobs` wires subscriptions into the worker.
+- **Scheduler:** `internal/platform/scheduler` is optional
+  (`SCHEDULER_ENABLED`, default false) and global, not tenant-scoped. One
+  process holds `scheduler_leases`; a unique `scheduler_runs` row plus the job
+  enqueue share a transaction. Interval schedules align to epoch boundaries;
+  cron is 5-field UTC with lists/ranges/steps and `@hourly`/`@daily`/etc.
+  `SCHEDULER_CATCHUP` is `none|latest|all` (bounded by
+  `SCHEDULER_CATCHUP_LIMIT`); a lost heartbeat cancels the current pass. Job
+  payloads include `schedule`/`scheduledFor`/`data` and keys are
+  `scheduler:<name>:<slot>`.
+- **Optional module hooks:** implement `app.EventProvider`,
+  `app.JobProvider`, or `app.ScheduleProvider` to register events, jobs, or
+  schedules. `app.Register` invokes them only when the corresponding dependency
+  is non-nil, then registers durable event job handlers.
+- **Audit:** privileged mutations are fail-closed. Tier 1 services call
+  `audit.TxRecorder.RecordTx` in the mutation transaction (failure rolls back
+  and returns `503 system.audit_unavailable`); Tier 2 routes use
+  `audit.Guard` after idempotency to write a started intent row and complete it
+  as succeeded/failed/denied. `platform/audit.Middleware` remains a fallback
+  and skips routes that set `audit_guarded`. Use `audit.NewServiceEvent` for
+  domain events; never place secrets or PII in metadata.
+- **Tracing:** `internal/platform/tracing` owns the provider; `app.Deps.Tracing`
+  is nil-safe and disabled means a no-op provider. Install the middleware after
+  `RequestID` and before `Metrics`/`Logger`; record only route templates and
+  bounded `error.type`, never raw paths, payloads, SQL, headers, or error text.
+  `pkg/database.WithTracerProvider` instruments pgx only under a recording
+  parent. Jobs persist `trace_parent` on enqueue and start each attempt as a
+  new-root `job.process` span linked to the enqueue span. See
+  `docs/tracing.md` before adding attributes.
+- **Notifications:** `internal/modules/notifications` owns the in-app feed,
+  per-type `in_app`/`email` preferences, and the email channel. Read/list/
+  unread/read-all and preference queries filter both `tenant_id` and `user_id`;
+  cross-tenant or other-user ids return `404`. Missing preferences mean both
+  channels are enabled. `contracts.Notifier` is the cross-module create API;
+  `contracts.NotificationRecipientLookup` lets identity supply the email
+  address without a module import. When email is enabled, the in-app row and
+  `email.send` job commit in one transaction (a queue failure rolls the row
+  back); the job inherits `jobs.tenant_id`. A suppressed notification (both
+  channels disabled) is a successful no-op. Routes are under
+  `/notifications` and `/notification-preferences`; writes use
+  `Idempotency-Key`, and admin sends require `notifications:send`.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
   Protect routes with `authz.Require(authz.PermissionX)`.
+- **Feature flags:** the compile-time catalog and evaluator live in
+  `platform/features`; modules read `deps.Flags` (never nil after `app.New`).
+  Precedence is force-off > kill switch > user > tenant > database default >
+  environment > compiled default. The `features` module owns the admin API,
+  scopes targets to `tenant.EffectiveID(ctx)`, and invalidates the local
+  snapshot after writes. See `docs/feature-flags.md`.
 - **Transactions:** `database.TxManager.WithTx` scopes a transaction to one
   module/aggregate. Do not span modules; use jobs/events.
 - **Drivers:** storage (`local|s3|minio`), cache (`memory|redis`), email
@@ -167,7 +311,8 @@ Offset helpers are for small admin/export tables only.
 - **Rate limits:** tiered, cache-backed in `internal/app`; authenticated
   requests are keyed per user, unauthenticated per IP.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes via
-  `deps.Idempotency`; scoped by method/path/user (IP for public routes). 2xx
+  `deps.Idempotency`; scoped by method/path/tenant ID+slug/caller (user, or IP
+  for public routes). 2xx
   responses replay for 24h; non-multipart bodies up to 1 MiB are body-bound, so
   reuse with a different body gets 409. An owner-token lock is held for 2m
   (compare-and-delete when the cache supports it), concurrent duplicates get
@@ -180,7 +325,8 @@ Offset helpers are for small admin/export tables only.
 
 Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
 
-1. Create `internal/modules/<name>/module.go` implementing `app.Module`.
+1. Create `internal/modules/<name>/module.go` implementing `app.Module`;
+   add `RegisterV2Routes` (`app.V2Module`) only for a breaking v2 surface.
 2. Keep handler/service/repository/DTO inside the module.
 3. Add permissions and protect every route (legacy exceptions are documented
    in `docs/module-template.md`).
@@ -188,7 +334,8 @@ Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
    sqlc block to `sqlc.yaml`, and run `make sqlc-generate`.
 5. Add a migration only for a deployed DB; otherwise update the single init
    schema.
-6. Register the module in `cmd/api/main.go`.
+6. Register the module in `cmd/api/main.go`; use the optional
+   `EventProvider`/`JobProvider`/`ScheduleProvider` hooks for durable work.
 7. Add unit + integration tests; `test/arch` must stay green.
 8. Run `make swagger` and `make check`.
 

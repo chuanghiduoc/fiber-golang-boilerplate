@@ -13,6 +13,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
@@ -43,8 +44,9 @@ type cachedResponse struct {
 // Idempotency-Key header. The first request claims an atomic cache lock,
 // executes the handler, and stores any 2xx response for 24 hours. Retries with
 // the same key replay that response; concurrent retries while the first is
-// still running get 409. Requests without the header, and GET/HEAD/OPTIONS
-// requests, are untouched.
+// still running get 409. The scope includes the resolved tenant so identical
+// keys from two tenants never share a replay. Requests without the header, and
+// GET/HEAD/OPTIONS requests, are untouched.
 //
 // Cache failures fail open: the handler still runs and the client gets the
 // normal response, so a cache outage cannot take down the API.
@@ -68,7 +70,9 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 		}
 
 		bodyHash := idempotencyBodyHash(c)
-		scope := idempotencyScope(c.Method(), c.Path(), idempotencyIdentity(c), key)
+		scope := idempotencyScope(
+			c.Method(), c.Path(), tenant.ID(c), tenant.Slug(c), idempotencyIdentity(c), key,
+		)
 		responseKey := idempotencyResponseKey(scope)
 		if cached, ok := loadCachedResponse(c, appCache, responseKey); ok {
 			return writeCachedResponse(c, cached, bodyHash)
@@ -174,12 +178,16 @@ func idempotencyBodyHash(c fiber.Ctx) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// idempotencyScope isolates keys by method, path, and caller so two users (or
-// two endpoints, or two verbs) reusing the same client-generated key cannot
-// replay each other's responses. Authenticated routes are scoped by user ID;
-// public routes fall back to the client IP.
-func idempotencyScope(method, path, identity, key string) string {
-	return "idempotency:" + method + ":" + path + ":" + identity + ":" + key
+// idempotencyScope isolates keys by method, path, tenant, and caller so two
+// users (or two endpoints, two verbs, or two tenants sharing an IP) reusing the
+// same client-generated key cannot replay each other's responses. The tenant ID
+// is the security boundary; the slug is included for operator readability.
+// Authenticated routes are scoped by user ID; public routes fall back to the
+// client IP.
+func idempotencyScope(method, path string, tenantID int64, tenantSlug, identity, key string) string {
+	return "idempotency:" + method + ":" + path +
+		":tenant=" + strconv.FormatInt(tenantID, 10) + ":" + tenantSlug +
+		":" + identity + ":" + key
 }
 
 func idempotencyIdentity(c fiber.Ctx) string {

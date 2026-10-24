@@ -17,7 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
-func NewPool(ctx context.Context, dbCfg config.DBConfig) (*pgxpool.Pool, error) {
+func NewPool(ctx context.Context, dbCfg config.DBConfig, opts ...PoolOption) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(dbCfg.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pool config: %w", err)
@@ -29,6 +29,11 @@ func NewPool(ctx context.Context, dbCfg config.DBConfig) (*pgxpool.Pool, error) 
 	poolCfg.MaxConnIdleTime = time.Duration(dbCfg.MaxConnIdleTime) * time.Second
 	if dbCfg.ConnectTimeout > 0 {
 		poolCfg.ConnConfig.ConnectTimeout = time.Duration(dbCfg.ConnectTimeout) * time.Second
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(poolCfg)
+		}
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)

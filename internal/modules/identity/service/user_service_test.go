@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -18,7 +19,7 @@ import (
 )
 
 func newTestUserService(repo *mockUserRepo, requireEmailVerification bool) UserService {
-	return NewUserService(repo, newMockRefreshTokenRepo(), requireEmailVerification, newMockCache(), nil)
+	return NewUserService(repo, newMockRefreshTokenRepo(), requireEmailVerification, newMockCache(), nil, nil)
 }
 
 type mockVerificationProvisioner struct {
@@ -36,7 +37,7 @@ func (m *mockVerificationProvisioner) SupportsTransactionalEnqueue() bool {
 func TestRegistrationEmailsTransactional(t *testing.T) {
 	t.Run("false without a provisioner", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		if svc.RegistrationEmailsTransactional() {
 			t.Error("registration emails cannot be transactional without a provisioner")
@@ -44,7 +45,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 	})
 
 	t.Run("false with a provisioner but no tx manager", func(t *testing.T) {
-		svc := NewUserService(newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), nil)
+		svc := NewUserService(newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), nil, nil)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: true})
 		if svc.RegistrationEmailsTransactional() {
 			t.Error("registration emails cannot be transactional without a tx manager")
@@ -53,7 +54,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 
 	t.Run("false when the provisioner cannot enqueue transactionally", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: false})
 		if svc.RegistrationEmailsTransactional() {
@@ -63,7 +64,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 
 	t.Run("true with capability and a tx manager", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: true})
 		if !svc.RegistrationEmailsTransactional() {
@@ -121,6 +122,42 @@ func TestRegister(t *testing.T) {
 			t.Errorf("expected 'email already registered', got %q", err.Error())
 		}
 	})
+}
+
+func TestRegisterDispatchesUserRegistered(t *testing.T) {
+	dispatcher := &recordUserWebhookDispatcher{}
+	svc := newTestUserService(newMockUserRepo(), false)
+	AttachWebhookDispatcher(svc, dispatcher)
+
+	if _, err := svc.Register(context.Background(), dto.RegisterRequest{
+		Email:    "webhook@example.com",
+		Password: "Password1!",
+		Name:     "Webhook User",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if len(dispatcher.events) != 1 {
+		t.Fatalf("events = %d, want 1", len(dispatcher.events))
+	}
+	event := dispatcher.events[0]
+	if event.Type != webhookcontracts.EventUserRegistered {
+		t.Errorf("event type = %q, want %q", event.Type, webhookcontracts.EventUserRegistered)
+	}
+	if event.TenantID != 1 {
+		t.Errorf("tenant = %d, want 1", event.TenantID)
+	}
+	if !strings.Contains(string(event.Data), `"email":"webhook@example.com"`) {
+		t.Errorf("payload = %s, want registered email", event.Data)
+	}
+}
+
+type recordUserWebhookDispatcher struct {
+	events []webhookcontracts.Event
+}
+
+func (r *recordUserWebhookDispatcher) Dispatch(_ context.Context, events ...webhookcontracts.Event) (int, error) {
+	r.events = append(r.events, events...)
+	return len(events), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -187,7 +224,7 @@ func TestAuthenticate(t *testing.T) {
 	t.Run("account locked after max attempts", func(t *testing.T) {
 		repo := newMockUserRepo()
 		cache := newMockCache()
-		svc := NewUserService(repo, newMockRefreshTokenRepo(), false, cache, nil)
+		svc := NewUserService(repo, newMockRefreshTokenRepo(), false, cache, nil, nil)
 
 		_, _ = svc.Register(context.Background(), dto.RegisterRequest{
 			Email: "test@example.com", Password: "Password1!", Name: "Test User",
@@ -235,7 +272,7 @@ func TestAuthenticate(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		// User created via OAuth — no password hash
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID:           1,
 			Email:        "oauth@example.com",
 			Name:         "OAuth User",
@@ -266,7 +303,7 @@ func TestGetByID(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("p"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			Role:         "user",
@@ -307,8 +344,8 @@ func TestList(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
 		repo.nextID = 3
 
 		users, hasMore, err := svc.List(context.Background(), 10, "")
@@ -327,8 +364,8 @@ func TestList(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
 		repo.nextID = 3
 
 		// Request a page smaller than the dataset.
@@ -354,7 +391,7 @@ func TestUpdate(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "old@example.com", Name: "Old Name", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "old@example.com", Name: "Old Name", Role: "user"}
 		repo.nextID = 2
 
 		newName := "New Name"
@@ -371,8 +408,8 @@ func TestUpdate(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "user1@example.com", Name: "User 1", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "user2@example.com", Name: "User 2", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "user1@example.com", Name: "User 1", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "user2@example.com", Name: "User 2", Role: "user"}
 		repo.nextID = 3
 
 		taken := "user2@example.com"
@@ -413,7 +450,7 @@ func TestDelete(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
 
 		err := svc.Delete(context.Background(), 1)
 		if err != nil {
@@ -448,7 +485,7 @@ func TestChangePassword(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test", Role: "user",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		}
@@ -473,7 +510,7 @@ func TestChangePassword(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test", Role: "user",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		}
@@ -494,7 +531,7 @@ func TestChangePassword(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "oauth@example.com", Name: "OAuth", Role: "user",
 			PasswordHash: pgtype.Text{Valid: false}, // No password (OAuth)
 			AuthProvider: "google",
@@ -537,7 +574,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "google@example.com", Name: "Google User",
 			GoogleID:     pgtype.Text{String: "google-123", Valid: true},
 			AuthProvider: "google", Role: "user",
@@ -557,7 +594,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "existing@example.com", Name: "Existing",
 			AuthProvider: "local", Role: "user",
 			EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -610,7 +647,7 @@ func TestUpdate_EmailChangeSuccess(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
 
-	repo.users[1] = &identitysqlc.User{ID: 1, Email: "old@example.com", Name: "User", Role: "user"}
+	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "old@example.com", Name: "User", Role: "user"}
 	repo.nextID = 2
 
 	newEmail := "new@example.com"
@@ -627,7 +664,7 @@ func TestUpdate_SameEmail(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
 
-	repo.users[1] = &identitysqlc.User{ID: 1, Email: "same@example.com", Name: "User", Role: "user"}
+	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "same@example.com", Name: "User", Role: "user"}
 	repo.nextID = 2
 
 	sameEmail := "same@example.com"

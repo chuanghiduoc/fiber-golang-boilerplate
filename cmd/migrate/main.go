@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/joho/godotenv/autoload"
 
@@ -20,30 +22,150 @@ import (
 // check catches a legacy database that reports migration version 1 but predates
 // the consolidated baseline, which golang-migrate alone would treat as current.
 var requiredTables = []string{
+	"tenants",
 	"users",
 	"refresh_tokens",
 	"password_reset_tokens",
 	"email_verification_tokens",
+	"api_keys",
 	"files",
+	"feature_flags",
+	"feature_flag_targets",
+	"notifications",
+	"notification_preferences",
 	"jobs",
+	"scheduler_leases",
+	"scheduler_runs",
 	"audit_events",
+	"webhook_endpoints",
+	"webhook_endpoint_secrets",
+	"webhook_deliveries",
+	"webhook_delivery_attempts",
+	"webhook_inbound_sources",
+	"webhook_inbound_events",
 }
 
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the consolidated baseline.
 var requiredColumns = map[string][]string{
-	"users":                     {"token_version", "password_changed_at", "banned_at"},
-	"refresh_tokens":            {"token_version"},
-	"email_verification_tokens": {"email"},
+	"tenants":                   {"slug", "status"},
+	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at"},
+	"refresh_tokens":            {"tenant_id", "token_version"},
+	"password_reset_tokens":     {"tenant_id"},
+	"email_verification_tokens": {"tenant_id", "email"},
+	"files":                     {"tenant_id"},
+	"api_keys": {
+		"tenant_id", "user_id", "key_hash", "scopes", "expires_at",
+		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",
+	},
+	"feature_flags":            {"flag_key", "enabled", "kill_switch", "description"},
+	"feature_flag_targets":     {"flag_key", "tenant_id", "user_id", "enabled"},
+	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at"},
+	"notification_preferences": {"tenant_id", "user_id", "type", "channel", "enabled"},
+	"jobs":                     {"tenant_id", "trace_parent", "idempotency_key"},
+	"scheduler_leases":         {"name", "holder", "expires_at", "heartbeat_at"},
+	"scheduler_runs":           {"schedule", "scheduled_for", "status", "job_id"},
+	"audit_events": {
+		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
+		"status_code", "error_code", "idempotency_key_hash", "completed_at",
+	},
+	"webhook_endpoints":        {"tenant_id", "url", "event_types", "status", "max_attempts", "timeout_ms", "deleted_at"},
+	"webhook_endpoint_secrets": {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active"},
+	"webhook_deliveries": {
+		"tenant_id", "endpoint_id", "event_id", "event_type", "url", "payload",
+		"secret_ciphertext", "status", "attempts", "max_attempts", "next_attempt_at",
+	},
+	"webhook_delivery_attempts": {"tenant_id", "delivery_id", "attempt", "status_code", "duration_ms"},
+	"webhook_inbound_sources":   {"tenant_id", "name", "slug", "secret_ciphertext", "status", "deleted_at"},
+	"webhook_inbound_events":    {"tenant_id", "source_id", "external_event_id", "signature", "payload"},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens and case-insensitive duplicate active emails.
+// and verification tokens, duplicate active emails per tenant, duplicate
+// tenant slugs, and duplicate API-key hashes.
 var requiredUniqueIndexes = []string{
-	"idx_users_email_lower_active",
-	"idx_users_google_id_active",
+	"tenants_slug_key",
+	"idx_users_tenant_email_lower_active",
+	"idx_users_tenant_google_id_active",
+	"idx_users_tenant_id_id",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+	"idx_webhook_inbound_sources_tenant_slug_active",
+	"idx_webhook_inbound_events_source_event",
+	"idx_api_keys_key_hash",
+	"idx_notification_preferences_unique",
+}
+
+// requiredTenantLeadingIndexes are the query indexes that must start with
+// tenant_id. Checking the first key column (not just the index name) catches a
+// legacy global index that kept its name after the tenant rewrite.
+var requiredTenantLeadingIndexes = map[string][]string{
+	"users": {
+		"idx_users_tenant_email_lower_active",
+		"idx_users_tenant_google_id_active",
+		"idx_users_tenant_role_active",
+		"idx_users_tenant_created_at_id",
+	},
+	"refresh_tokens": {
+		"idx_refresh_tokens_tenant_user_id",
+	},
+	"password_reset_tokens": {
+		"idx_password_reset_tokens_tenant_user_id",
+	},
+	"email_verification_tokens": {
+		"idx_email_verification_tokens_tenant_user_id",
+	},
+	"files": {
+		"idx_files_tenant_user_id_deleted_at",
+		"idx_files_tenant_user_created",
+		"idx_files_tenant_created_at_id",
+	},
+	"jobs": {
+		"idx_jobs_tenant_status_run_at",
+		"idx_jobs_tenant_kind_status",
+	},
+	"audit_events": {
+		"idx_audit_events_tenant_created",
+		"idx_audit_events_tenant_actor_created",
+		"idx_audit_events_tenant_action_created",
+	},
+	"notifications": {
+		"idx_notifications_tenant_user_created_at_id",
+		"idx_notifications_tenant_user_unread",
+	},
+	"notification_preferences": {
+		"idx_notification_preferences_unique",
+	},
+	"api_keys": {
+		"idx_api_keys_tenant_user",
+		"idx_api_keys_tenant_created_at_id",
+	},
+	"feature_flag_targets": {
+		"idx_feature_flag_targets_tenant_flag_user",
+	},
+	"webhook_endpoints": {
+		"idx_webhook_endpoints_tenant_created_at_id",
+		"idx_webhook_endpoints_tenant_status",
+	},
+	"webhook_endpoint_secrets": {
+		"idx_webhook_endpoint_secrets_tenant_endpoint",
+	},
+	"webhook_deliveries": {
+		"idx_webhook_deliveries_tenant_created_at_id",
+		"idx_webhook_deliveries_tenant_endpoint_created",
+		"idx_webhook_deliveries_tenant_status_next",
+	},
+	"webhook_delivery_attempts": {
+		"idx_webhook_delivery_attempts_tenant_delivery",
+		"idx_webhook_delivery_attempts_tenant_created",
+	},
+	"webhook_inbound_sources": {
+		"idx_webhook_inbound_sources_tenant_created",
+	},
+	"webhook_inbound_events": {
+		"idx_webhook_inbound_events_tenant_source_received",
+		"idx_webhook_inbound_events_tenant_received",
+	},
 }
 
 func main() {
@@ -214,6 +336,68 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 	for _, index := range requiredUniqueIndexes {
 		if _, ok := foundIndexes[index]; !ok {
 			missing = append(missing, "unique index "+index)
+		}
+	}
+
+	// Tenant-owned query indexes must lead with tenant_id, not merely exist.
+	// A legacy global index with the same name would otherwise pass.
+	tenantIndexNames := make([]string, 0, len(requiredTenantLeadingIndexes))
+	for _, indexes := range requiredTenantLeadingIndexes {
+		tenantIndexNames = append(tenantIndexNames, indexes...)
+	}
+	leadingRows, err := pool.Query(ctx,
+		`SELECT c.relname, a.attname
+		 FROM pg_index i
+		 JOIN pg_class c ON c.oid = i.indexrelid
+		 JOIN pg_class t ON t.oid = i.indrelid
+		 JOIN pg_namespace n ON n.oid = t.relnamespace
+		 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+		schema, tenantIndexNames,
+	)
+	if err != nil {
+		return fmt.Errorf("verify tenant-leading indexes: %w", err)
+	}
+	defer leadingRows.Close()
+
+	foundLeading := make(map[string]string, len(tenantIndexNames))
+	for leadingRows.Next() {
+		var index, firstColumn string
+		if err := leadingRows.Scan(&index, &firstColumn); err != nil {
+			return fmt.Errorf("verify schema: scan tenant-leading index: %w", err)
+		}
+		foundLeading[index] = firstColumn
+	}
+	if err := leadingRows.Err(); err != nil {
+		return fmt.Errorf("verify tenant-leading indexes: %w", err)
+	}
+	for table, indexes := range requiredTenantLeadingIndexes {
+		for _, index := range indexes {
+			firstColumn, ok := foundLeading[index]
+			switch {
+			case !ok:
+				missing = append(missing, "tenant-leading index "+table+"."+index)
+			case firstColumn != "tenant_id":
+				missing = append(missing, "tenant-leading index "+table+"."+index+
+					" starts with "+firstColumn+", want tenant_id")
+			}
+		}
+	}
+
+	// The default tenant is the backward-compatibility anchor: rows without an
+	// explicit tenant (and legacy requests without X-Tenant-Slug) resolve to it.
+	if _, ok := foundTables["tenants"]; ok {
+		var tenantID int64
+		err := pool.QueryRow(ctx,
+			`SELECT id FROM tenants WHERE slug = 'default'`,
+		).Scan(&tenantID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			missing = append(missing, "default tenant row (slug default)")
+		case err != nil:
+			return fmt.Errorf("verify default tenant: %w", err)
+		case tenantID != 1:
+			missing = append(missing, "default tenant id 1")
 		}
 	}
 

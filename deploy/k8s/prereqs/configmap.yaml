@@ -21,6 +21,14 @@ data:
   # Replace with the public frontend origin (https is enforced in production).
   APP_FRONTEND_URL: "https://app.example.com"
   REQUIRE_EMAIL_VERIFICATION: "true"
+  # Production requires explicit tenant selection: header-less requests must
+  # not silently write to the compatibility tenant. Every API client (and the
+  # frontend forwarding reset/verification `?tenant=` links) must send
+  # X-Tenant-Slug. Production startup rejects TENANT_REQUIRE_HEADER=false.
+  TENANT_DEFAULT_SLUG: "default"
+  TENANT_REQUIRE_HEADER: "true"
+  # Supported embedded catalogs: en, vi. Unsupported values fail startup.
+  I18N_DEFAULT_LOCALE: "en"
 
   # The app runs behind ingress-nginx, so client IPs arrive in X-Forwarded-For.
   # Trust only the cluster's pod/service CIDR that contains ingress-nginx;
@@ -34,8 +42,8 @@ data:
   # Explicit origins only; "*" is rejected when APP_ENV=production.
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
-  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization,Idempotency-Key"
-  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"
+  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link"
   CORS_ALLOW_CREDENTIALS: "false"
 
   # ---------------------------------------------------------------------------
@@ -104,6 +112,32 @@ data:
   EMAIL_FROM_ADDRESS: "noreply@example.com"
   EMAIL_FROM_NAME: "Fiber App"
   # SMTP_USERNAME / SMTP_PASSWORD live in the Secret.
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry tracing (optional; disabled by default)
+  #
+  # Enable per environment after a collector is reachable. The app never waits
+  # for the collector at startup and readiness does not include it. Set
+  # OTEL_SERVICE_VERSION from the release tag in your CD overlay.
+  # ---------------------------------------------------------------------------
+  OTEL_ENABLED: "false"
+  OTEL_TRACES_EXPORTER: "otlp"
+  OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector.observability.svc.cluster.local:4317"
+  OTEL_EXPORTER_OTLP_INSECURE: "true"
+  OTEL_SERVICE_NAME: "fiber-boilerplate"
+  OTEL_SERVICE_NAMESPACE: "fiber-boilerplate"
+  OTEL_SERVICE_VERSION: "dev"
+  OTEL_DEPLOYMENT_ENVIRONMENT: "production"
+  OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  OTEL_TRACES_SAMPLER_ARG: "0.1"
+  OTEL_TRACING_EXCLUDE_PATHS: "/healthz,/readyz,/health,/metrics"
+  OTEL_INSTRUMENT_DB: "true"
+  OTEL_BATCH_TIMEOUT_SECS: "5"
+  OTEL_EXPORT_TIMEOUT_SECS: "30"
+  OTEL_SHUTDOWN_TIMEOUT_SECS: "10"
+  OTEL_BATCH_MAX_QUEUE_SIZE: "2048"
+  OTEL_BATCH_MAX_EXPORT_BATCH_SIZE: "512"
 
   # ---------------------------------------------------------------------------
   # Optional: Google OAuth (disabled by default)

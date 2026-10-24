@@ -91,11 +91,17 @@ At minimum, replace:
 - `overlays/components/staging-config/configmap-patch.yaml` and
   `overlays/components/production-config/configmap-patch.yaml`:
   `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`, `SMTP_HOST`,
-  `EMAIL_FROM_ADDRESS`, and `STORAGE_S3_BUCKET`. Keep `Idempotency-Key` in
-  `CORS_ALLOW_HEADERS` and `Idempotent-Replayed` in `CORS_EXPOSE_HEADERS` for
-  browser clients that use idempotent mutations.
-- `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES` and
-  the S3 endpoint. Keep environment-specific values in the overlay components.
+  `EMAIL_FROM_ADDRESS`, and `STORAGE_S3_BUCKET`. Keep `Idempotency-Key`,
+  `X-Tenant-Slug`, `Accept-Language`, and `Accept-Version` in
+  `CORS_ALLOW_HEADERS`, and keep `Idempotent-Replayed`, `Content-Language`, and
+  the version/deprecation headers in `CORS_EXPOSE_HEADERS` so browser clients
+  can read replay, locale, and version metadata.
+- `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES`,
+  `TENANT_REQUIRE_HEADER=true` (required in production so header-less writes
+  never fall back to tenant 1), and the S3 endpoint. Keep environment-specific
+  values in the overlay components. Every API client must send
+  `X-Tenant-Slug`; the frontend forwards the `?tenant=<slug>` from
+  reset/verification links to the API.
 - `base/networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
   managed services are not in `10.0.0.0/8` or use different ports.
 - The two overlay `namespace:` values and their Namespace rename patches, plus
@@ -153,10 +159,10 @@ Never commit the rendered Secret. For GitOps, use External Secrets, Sealed
 Secrets, SOPS, or your cloud secret manager; `secret.example.yaml` is
 deliberately not part of `base/kustomization.yaml` or any overlay.
 
-`JWT_SECRET`, `METRICS_AUTH_TOKEN`, and `ADMIN_PASSWORD` use short
-`REPLACE_ME` placeholders on purpose. The API's production validation rejects
-them, so an unedited template fails closed instead of starting with a known
-secret.
+`JWT_SECRET`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `METRICS_AUTH_TOKEN`, and
+`ADMIN_PASSWORD` use short `REPLACE_ME` placeholders on purpose. The API's
+production validation rejects them, so an unedited template fails closed
+instead of starting with a known secret.
 
 The template leaves `ADMIN_EMAIL`/`ADMIN_PASSWORD` commented out, so no admin
 user is bootstrapped. To create one on API startup, uncomment both values (and
@@ -448,6 +454,25 @@ Secret, and scale back up. A normal rolling update briefly mixes old and new
 secrets, so a new replica's queued job can be claimed by an old replica that
 cannot decrypt it. If draining is not possible, expect failed jobs and inspect
 the dead-letter/failed rows after the rotation.
+
+### WEBHOOK_SECRET_ENCRYPTION_KEY rotation
+
+`WEBHOOK_SECRET_ENCRYPTION_KEY` seals outbound endpoint and inbound source
+signing secrets with AES-256-GCM. It is required in production and must be at
+least 32 characters. Rotating it does **not** re-encrypt existing rows: every
+stored webhook secret becomes unreadable.
+
+1. Announce a receiver maintenance window.
+2. Update the Secret and restart all replicas with the new key.
+3. Rotate every endpoint and inbound source secret through the API; deliver the
+   new plaintext values to the receivers.
+4. In-flight outbound deliveries sealed with the old key become `dead`; replay
+   them after rotation. Inbound senders receive `401` until they use the new
+   secret.
+
+Unlike `JWT_SECRET`, this key does not sign access tokens and does not affect
+the email job queue. Keep it distinct from `JWT_SECRET` so the two rotations
+cannot interfere.
 
 ### Configuration changes
 

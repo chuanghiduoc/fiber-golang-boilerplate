@@ -29,6 +29,7 @@ import (
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -52,10 +53,11 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 	refreshRepo := identityrepo.NewRefreshTokenRepository(pool)
 	appCache := cache.NewMemoryCache()
 	txManager := database.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(pool)
 
 	userRepo := identityrepo.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, auditRecorder, sessionStore)
 	userHandler := identityhandler.NewUserHandler(userSvc)
 
 	fileRepo := filesrepo.NewFileRepository(pool)
@@ -63,9 +65,9 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 	require.NoError(t, err)
 
 	identityAdmin := identityadapter.NewAdminIdentity(
-		identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, sessionStore),
+		identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, auditRecorder, sessionStore),
 	)
-	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, store))
+	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, txManager, auditRecorder, store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
 	app := fiber.New(fiber.Config{
@@ -118,7 +120,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	respBody, _ := io.ReadAll(resp.Body)
 	var regular identitydto.UserResponse
 	require.NoError(t, json.Unmarshal(respBody, &regular))
-	regularToken, err := token.GenerateWithVersion(regular.ID, regular.Email, regular.Role, regular.TokenVersion, "integration-secret", 24)
+	regularToken, err := token.GenerateWithVersionAndTenant(regular.ID, 1, regular.Email, regular.Role, regular.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	// Create a real admin so the session validator has a current role/version
@@ -136,7 +138,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 		Role: identitydto.RoleAdmin,
 	})
 	require.NoError(t, err)
-	adminToken, err := token.GenerateWithVersion(admin.ID, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
+	adminToken, err := token.GenerateWithVersionAndTenant(admin.ID, 1, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	// Get stats.
@@ -184,7 +186,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	// A token issued for the restored version works.
 	restored, err := userRepo.GetByID(context.Background(), regular.ID)
 	require.NoError(t, err)
-	restoredToken, err := token.GenerateWithVersion(restored.ID, restored.Email, restored.Role, restored.TokenVersion, "integration-secret", 24)
+	restoredToken, err := token.GenerateWithVersionAndTenant(restored.ID, 1, restored.Email, restored.Role, restored.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 	req, _ = http.NewRequest("GET", "/users/me", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+restoredToken)
@@ -218,7 +220,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	var other identitydto.UserResponse
 	respBody, _ = io.ReadAll(resp.Body)
 	require.NoError(t, json.Unmarshal(respBody, &other))
-	userToken, err := token.GenerateWithVersion(other.ID, other.Email, other.Role, other.TokenVersion, "integration-secret", 24)
+	userToken, err := token.GenerateWithVersionAndTenant(other.ID, 1, other.Email, other.Role, other.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	req, _ = http.NewRequest("GET", "/admin/stats", http.NoBody)

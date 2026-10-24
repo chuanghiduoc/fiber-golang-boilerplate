@@ -12,7 +12,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -27,11 +32,21 @@ const (
 	bookkeepingTimeout       = 5 * time.Second
 	purgeTimeout             = 5 * time.Second
 	maxClaimBackoff          = 30 * time.Second
+	jobsInstrumentationName  = "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 )
 
 // Handler processes a claimed job. Returning an error schedules a retry (or
 // marks the job dead once attempts are exhausted).
 type Handler func(context.Context, json.RawMessage) error
+
+// Registrar accepts job handlers. *Worker implements it, and the narrow
+// interface keeps modules and the event bus independent of the worker's
+// configuration surface.
+type Registrar interface {
+	Register(kind string, handler Handler)
+}
+
+var _ Registrar = (*Worker)(nil)
 
 // store is the persistence surface used by Worker. It is an interface so the
 // worker's retry, panic, and success paths can be unit tested without a
@@ -46,10 +61,12 @@ type store interface {
 
 type claimedJob struct {
 	ID          int64
+	TenantID    int64
 	Kind        string
 	Payload     json.RawMessage
 	Attempts    int
 	MaxAttempts int
+	TraceParent string
 }
 
 // Option configures a Worker.
@@ -135,6 +152,18 @@ func WithPurgeInterval(d time.Duration) Option {
 	}
 }
 
+// WithTracerProvider enables a job.process consumer span per claimed job. Each
+// span is a new root with a link to the enqueue-time traceparent, so retries do
+// not masquerade as children of the original request. Nil disables tracing.
+func WithTracerProvider(tp trace.TracerProvider) Option {
+	return func(w *Worker) {
+		if tp == nil {
+			return
+		}
+		w.tracer = tp.Tracer(jobsInstrumentationName)
+	}
+}
+
 // Worker claims due jobs and dispatches them to registered handlers.
 type Worker struct {
 	pool              *pgxpool.Pool
@@ -151,6 +180,8 @@ type Worker struct {
 
 	mu       sync.RWMutex
 	handlers map[string]Handler
+
+	tracer trace.Tracer
 
 	store store
 }
@@ -175,6 +206,7 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		retention:         defaultRetention,
 		purgeInterval:     defaultPurgeInterval,
 		handlers:          make(map[string]Handler),
+		tracer:            noop.NewTracerProvider().Tracer(jobsInstrumentationName),
 		store:             newPGStore(pool),
 	}
 	for _, opt := range opts {
@@ -335,18 +367,29 @@ func (w *Worker) Run(ctx context.Context) error {
 // another worker reclaimed the job, attempts has advanced and the stale owner's
 // write affects no row, returning ErrLeaseLost.
 func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
+	processCtx, span := w.startJobSpan(ctx, job)
+	defer span.End()
+
 	handler, ok := w.handler(job.Kind)
 	var handlerErr error
 	if !ok {
 		handlerErr = fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	} else {
-		handlerCtx := ctx
+		// Restore the tenant that owns the job so handlers (email, audit, and
+		// future work) see the same context they would inside a request. Rows
+		// written before multi-tenancy, and test doubles, may omit the column;
+		// those jobs run under the compatibility tenant.
+		tenantID := job.TenantID
+		if tenantID == 0 {
+			tenantID = tenant.DefaultID
+		}
+		handlerCtx := tenant.WithID(processCtx, tenantID)
 		var cancel context.CancelFunc
 		if w.jobTimeout > 0 {
-			handlerCtx, cancel = context.WithTimeout(ctx, w.jobTimeout)
+			handlerCtx, cancel = context.WithTimeout(handlerCtx, w.jobTimeout)
 		}
 
-		stopHeartbeat := w.startHeartbeat(ctx, job.ID, job.Attempts)
+		stopHeartbeat := w.startHeartbeat(processCtx, job.ID, job.Attempts)
 		handlerErr = callHandler(handlerCtx, handler, job.Payload)
 		// Capture the deadline result immediately: stopHeartbeat can take time,
 		// and a disabled timeout must never classify a parent cancellation as a
@@ -365,13 +408,15 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 
 	// The job has already been claimed in the database, so bookkeeping must
 	// still run when the caller's context was canceled during shutdown.
-	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(processCtx), bookkeepingTimeout)
 	defer cancel()
 
 	if handlerErr == nil {
 		if err := w.store.Succeed(writeCtx, job.ID, w.id, job.Attempts); err != nil {
+			tracing.MarkError(span, err)
 			return fmt.Errorf("jobs: mark job %d succeeded: %w", job.ID, err)
 		}
+		span.SetAttributes(jobOutcomeAttributes("succeeded", nil)...)
 		metrics.JobsSucceededTotal.WithLabelValues(job.Kind).Inc()
 		return nil
 	}
@@ -387,14 +432,63 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	}
 
 	if err := w.store.Fail(writeCtx, job.ID, w.id, job.Attempts, reason, retryAt); err != nil {
+		tracing.MarkError(span, err)
 		return fmt.Errorf("jobs: mark job %d failed: %w", job.ID, err)
 	}
+
+	outcome := "dead"
 	if retryAt != nil {
+		outcome = "retried"
 		metrics.JobsRetriedTotal.WithLabelValues(job.Kind).Inc()
 	} else {
 		metrics.JobsDeadTotal.WithLabelValues(job.Kind).Inc()
 	}
+	// Record only the bounded class of failure. handlerErr.Error() is already
+	// persisted in jobs.last_error by the store and must not enter telemetry.
+	tracing.MarkError(span, handlerErr)
+	span.SetAttributes(jobOutcomeAttributes(outcome, retryAt)...)
 	return nil
+}
+
+// startJobSpan creates the per-attempt consumer span. It is always a new root:
+// a retry is not a child of the previous attempt. When the enqueue context
+// carried a W3C traceparent, a link preserves causality without forcing the
+// request's sampling or parentage. A no-op tracer is used when tracing is
+// disabled, so the returned span is safe to annotate.
+func (w *Worker) startJobSpan(ctx context.Context, job claimedJob) (context.Context, trace.Span) {
+	tenantID := job.TenantID
+	if tenantID == 0 {
+		tenantID = tenant.DefaultID
+	}
+	opts := []trace.SpanStartOption{
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithNewRoot(),
+		trace.WithAttributes(
+			attribute.Int64("job.id", job.ID),
+			attribute.String("job.kind", job.Kind),
+			attribute.Int64("job.tenant_id", tenantID),
+			attribute.Int("job.attempt", job.Attempts),
+			attribute.Int("job.max_attempts", job.MaxAttempts),
+		),
+	}
+	if job.TraceParent != "" {
+		remote := trace.SpanContextFromContext(tracing.ExtractRemoteContext(context.Background(), job.TraceParent))
+		if remote.IsValid() {
+			opts = append(opts, trace.WithLinks(trace.Link{SpanContext: remote}))
+		}
+	}
+	return w.tracer.Start(ctx, "job.process", opts...)
+}
+
+func jobOutcomeAttributes(outcome string, retryAt *time.Time) []attribute.KeyValue {
+	attrs := []attribute.KeyValue{
+		attribute.String("job.outcome", outcome),
+		attribute.Bool("job.dead_letter", outcome == "dead"),
+	}
+	if retryAt != nil {
+		attrs = append(attrs, attribute.String("job.retry_at", retryAt.UTC().Format(time.RFC3339)))
+	}
+	return attrs
 }
 
 // purgeTerminal runs one retention pass. It uses a detached context bounded by

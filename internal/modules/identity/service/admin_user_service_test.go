@@ -13,7 +13,7 @@ import (
 
 func seedAdminUsers(repo *mockUserRepo, n int) {
 	for i := 0; i < n; i++ {
-		repo.users[repo.nextID] = &identitysqlc.User{
+		repo.users[repo.nextID] = &identitysqlc.User{TenantID: 1,
 			ID:        repo.nextID,
 			Email:     "user@example.com",
 			Name:      "User",
@@ -28,7 +28,7 @@ func seedAdminUsers(repo *mockUserRepo, n int) {
 func newAdminUserServiceForTest() (*adminUserService, *mockUserRepo, *mockRefreshTokenRepo) {
 	ur := newMockUserRepo()
 	rtr := newMockRefreshTokenRepo()
-	svc := NewAdminUserService(ur, rtr, nil).(*adminUserService)
+	svc := NewAdminUserService(ur, rtr, nil, nil).(*adminUserService)
 	return svc, ur, rtr
 }
 
@@ -113,7 +113,7 @@ func TestAdminBanUser(t *testing.T) {
 		seedAdminUsers(ur, 1)
 
 		// Create a refresh token for the user.
-		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash1"}
+		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash1"}
 
 		err := svc.BanUser(context.Background(), 1)
 		if err != nil {
@@ -146,7 +146,7 @@ func TestAdminUnbanUser(t *testing.T) {
 		svc, ur, rtr := newAdminUserServiceForTest()
 		seedAdminUsers(ur, 1)
 		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
-		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash1"}
+		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash1"}
 
 		user, err := svc.UnbanUser(context.Background(), 1)
 		if err != nil {
@@ -184,7 +184,7 @@ func TestAdminUnbanUser(t *testing.T) {
 
 func TestAdmin_CannotRemoveLastAdmin(t *testing.T) {
 	svc, repo, _ := newAdminUserServiceForTest()
-	repo.users[1] = &identitysqlc.User{
+	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "admin@example.com", Name: "Admin", Role: dto.RoleAdmin,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},

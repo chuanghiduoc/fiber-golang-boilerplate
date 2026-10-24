@@ -22,8 +22,8 @@ func NewHandler(svc adminsvc.Service) *Handler {
 }
 
 // GetStats godoc
-// @Summary Get system statistics
-// @Description Get system-wide statistics (admin only)
+// @Summary Get tenant statistics
+// @Description Get statistics for the caller's tenant only (admin only)
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -41,8 +41,8 @@ func (h *Handler) GetStats(c fiber.Ctx) error {
 }
 
 // ListUsers godoc
-// @Summary List all users (admin)
-// @Description Get a paginated list of all users including soft-deleted
+// @Summary List tenant users (admin)
+// @Description Get a paginated list of users in the caller's tenant, including soft-deleted
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -163,8 +163,8 @@ func (h *Handler) UnbanUser(c fiber.Ctx) error {
 }
 
 // ListFiles godoc
-// @Summary List all files (admin)
-// @Description Get a paginated list of all files
+// @Summary List tenant files (admin)
+// @Description Get a paginated list of files in the caller's tenant
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -189,8 +189,8 @@ func (h *Handler) ListFiles(c fiber.Ctx) error {
 }
 
 // DownloadFile godoc
-// @Summary Download any file (admin)
-// @Description Download an active file by ID
+// @Summary Download a tenant file (admin)
+// @Description Download an active file in the caller's tenant by ID
 // @Tags Admin
 // @Produce octet-stream
 // @Security BearerAuth
@@ -218,8 +218,8 @@ func (h *Handler) DownloadFile(c fiber.Ctx) error {
 }
 
 // DeleteFile godoc
-// @Summary Soft-delete any file (admin)
-// @Description Soft-delete a file by ID regardless of owner
+// @Summary Soft-delete a tenant file (admin)
+// @Description Soft-delete a file in the caller's tenant by ID regardless of owner
 // @Tags Admin
 // @Security BearerAuth
 // @Param id path int true "File ID"
@@ -241,8 +241,8 @@ func (h *Handler) DeleteFile(c fiber.Ctx) error {
 }
 
 // RestoreFile godoc
-// @Summary Restore a soft-deleted file (admin)
-// @Description Restore any file by ID
+// @Summary Restore a tenant file (admin)
+// @Description Restore any soft-deleted file in the caller's tenant by ID
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth

@@ -43,7 +43,7 @@ func setupIntegrationApp(t *testing.T) *fiber.App {
 
 	userRepo := identityrepo.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, nil, sessionStore)
 	userHandler := NewUserHandler(userSvc)
 
 	app := fiber.New(fiber.Config{
@@ -93,7 +93,7 @@ func TestIntegration_FullUserFlow(t *testing.T) {
 	userID := userResp.ID
 
 	// 2. Get user (with JWT)
-	accessToken, _ := token.Generate(userID, "integration@test.com", "user", "integration-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(userID, 1, "integration@test.com", "user", "integration-secret", 24)
 
 	req, _ = http.NewRequest("GET", "/users/me", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)

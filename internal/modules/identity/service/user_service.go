@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,10 +14,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -64,8 +68,10 @@ type userService struct {
 	requireEmailVerification bool
 	cache                    cache.Cache
 	txManager                *database.TxManager
+	audit                    audit.TxRecorder
 	sessions                 session.Store
 	verificationProvisioner  VerificationProvisioner
+	webhooks                 webhookcontracts.Dispatcher
 }
 
 func NewUserService(
@@ -74,6 +80,7 @@ func NewUserService(
 	requireEmailVerification bool,
 	appCache cache.Cache,
 	txManager *database.TxManager,
+	auditRecorder audit.TxRecorder,
 	sessions ...session.Store,
 ) UserService {
 	var sessionStore session.Store
@@ -86,6 +93,7 @@ func NewUserService(
 		requireEmailVerification: requireEmailVerification,
 		cache:                    appCache,
 		txManager:                txManager,
+		audit:                    auditRecorder,
 		sessions:                 sessionStore,
 	}
 }
@@ -113,26 +121,36 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	var user *identitysqlc.User
-	if s.verificationProvisioner != nil &&
-		s.txManager != nil &&
-		s.verificationProvisioner.SupportsTransactionalEnqueue() {
-		// Create the user, verification token, and email job in one transaction.
-		// A provisioning failure rolls the user back: registration fails closed
-		// rather than committing an account that cannot receive its link.
+	if s.txManager != nil {
+		// Create the user, optional verification provisioning, and the audit
+		// row in one transaction. Any failure rolls the account back: a
+		// successful registration must never exist without its audit record.
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, hash)
 			if createErr != nil {
 				return createErr
 			}
-			if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
-				slog.Error("failed to provision registration verification email",
-					slog.Int64("user_id", created.ID),
-					slog.String("email", created.Email),
-					slog.Any("error", provErr),
-				)
-				// Provisioning details (including context deadlines) are for the
-				// logs only. Keep the public registration contract at 500.
-				return apperror.NewInternal("failed to create user")
+			if s.verificationProvisioner != nil && s.verificationProvisioner.SupportsTransactionalEnqueue() {
+				if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
+					slog.Error("failed to provision registration verification email",
+						slog.Int64("user_id", created.ID),
+						slog.String("email", created.Email),
+						slog.Any("error", provErr),
+					)
+					// Provisioning details (including context deadlines) are for
+					// the logs only. Keep the public registration contract at 500.
+					return apperror.NewInternal("failed to create user")
+				}
+			}
+			event := audit.NewServiceEvent(ctx, "auth.registered", "user")
+			event.ResourceID = strconv.FormatInt(created.ID, 10)
+			event.ActorID = created.ID
+			event.ActorType = audit.ActorTypeUser
+			event.Metadata = map[string]any{
+				"email_verification_required": s.requireEmailVerification,
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
+				return auditWriteError(auditErr)
 			}
 			user = created
 			return nil
@@ -145,12 +163,57 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		if err != nil {
 			return nil, err
 		}
+		event := audit.NewServiceEvent(ctx, "auth.registered", "user")
+		event.ResourceID = strconv.FormatInt(user.ID, 10)
+		event.ActorID = user.ID
+		event.ActorType = audit.ActorTypeUser
+		event.Metadata = map[string]any{
+			"email_verification_required": s.requireEmailVerification,
+		}
+		if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
+			return nil, auditWriteError(auditErr)
+		}
 	}
 
 	// A previous failed-login lockout must not survive registration.
-	_ = s.cache.Delete(ctx, loginAttemptPrefix+email)
+	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, email))
 
-	return ToUserResponse(user), nil
+	response := ToUserResponse(user)
+	s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
+	return response, nil
+}
+
+// SetWebhookDispatcher wires outbound domain events.
+func (s *userService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
+	s.webhooks = dispatcher
+}
+
+// AttachWebhookDispatcher wires the production dispatcher without widening the
+// UserService interface, so handler fakes remain small.
+func AttachWebhookDispatcher(svc UserService, dispatcher webhookcontracts.Dispatcher) {
+	if s, ok := svc.(*userService); ok {
+		s.webhooks = dispatcher
+	}
+}
+
+// dispatchWebhook emits one best-effort domain event. Delivery failures are
+// logged; they must not turn a committed registration into an API error.
+func (s *userService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
+	if s.webhooks == nil {
+		return
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
+		return
+	}
+	if _, err := s.webhooks.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
+		Type:     eventType,
+		TenantID: tenantID,
+		Data:     payload,
+	}); err != nil {
+		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
+	}
 }
 
 // createUser creates a local account with a precomputed password hash through
@@ -162,6 +225,7 @@ func (s *userService) createUser(
 	hash []byte,
 ) (*identitysqlc.User, error) {
 	user, err := repo.Create(ctx, identitysqlc.CreateUserParams{
+		TenantID:     tenant.EffectiveID(ctx),
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -204,7 +268,7 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	}
 
 	// Check lockout (fail-closed: deny login if cache is unavailable)
-	cacheKey := loginAttemptPrefix + email
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, email)
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
 		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
@@ -306,6 +370,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		}
 
 		newUser, err := repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
+			TenantID:     tenant.EffectiveID(ctx),
 			Email:        email,
 			Name:         name,
 			GoogleID:     pgtype.Text{String: googleID, Valid: true},
@@ -442,6 +507,7 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 	}
 
 	emailChanged := normalizeEmail(existing.Email) != normalizeEmail(email)
+	nameChanged := req.Name != nil && strings.TrimSpace(*req.Name) != existing.Name
 
 	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*identitysqlc.User, error) {
 		user, err := userRepo.Update(ctx, identitysqlc.UpdateUserParams{
@@ -465,15 +531,36 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		return user, nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.profile_updated", "user")
+		event.ResourceID = strconv.FormatInt(id, 10)
+		event.Metadata = map[string]any{
+			"email_changed": emailChanged,
+			"name_changed":  nameChanged,
+		}
+		return event
+	}
+
 	var user *identitysqlc.User
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			var updateErr error
 			user, updateErr = doUpdate(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
-			return updateErr
+			if updateErr != nil {
+				return updateErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		user, err = doUpdate(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return nil, auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -511,7 +598,7 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 		return apperror.NewBadRequest("current password is incorrect")
 	}
 
-	cacheKey := loginAttemptPrefix + normalizeEmail(user.Email)
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, user.Email)
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
 		return apperror.NewInternal("unable to verify login attempts, please try again later")
@@ -565,12 +652,29 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 		return nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.deleted", "user")
+		event.ResourceID = strconv.FormatInt(id, 10)
+		return event
+	}
+
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			if deleteErr := doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); deleteErr != nil {
+				return deleteErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		err = doDelete(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -654,12 +758,29 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 		return nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.password_changed", "user")
+		event.ResourceID = strconv.FormatInt(userID, 10)
+		return event
+	}
+
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			if changeErr := doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); changeErr != nil {
+				return changeErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		err = doChange(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -668,7 +789,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, userID)
 	}
-	_ = s.cache.Delete(ctx, loginAttemptPrefix+normalizeEmail(user.Email))
+	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, user.Email))
 
 	return nil
 }
@@ -684,6 +805,7 @@ func ToUserResponse(user *identitysqlc.User) *dto.UserResponse {
 		CreatedAt:     user.CreatedAt.Time,
 		UpdatedAt:     user.UpdatedAt.Time,
 		TokenVersion:  user.TokenVersion,
+		TenantID:      user.TenantID,
 	}
 	if user.DeletedAt.Valid {
 		deletedAt := user.DeletedAt.Time

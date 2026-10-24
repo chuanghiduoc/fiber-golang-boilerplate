@@ -9,6 +9,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
@@ -218,8 +219,10 @@ func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, user
 	if err := h.emailVerifSvc.Invalidate(ctx, user.ID); err != nil {
 		return
 	}
+	tenantSlug := tenant.SlugFromContext(ctx)
 	async.Go(func() {
-		_ = h.emailVerifSvc.SendVerification(context.Background(), user.ID, user.Email)
+		sendCtx := tenant.WithIdentity(context.Background(), user.TenantID, tenantSlug)
+		_ = h.emailVerifSvc.SendVerification(sendCtx, user.ID, user.Email)
 	})
 }
 

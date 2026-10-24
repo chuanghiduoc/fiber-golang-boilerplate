@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/golang-jwt/jwt/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -100,7 +102,7 @@ func TestJWTAuth_ValidToken(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -120,7 +122,7 @@ func TestJWTAuth_WrongSecret(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "wrong-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "wrong-secret", 24)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -131,6 +133,150 @@ func TestJWTAuth_WrongSecret(t *testing.T) {
 	}
 	if resp.StatusCode != 401 {
 		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// tenantLocal simulates the global tenant middleware's resolution so JWT
+// behavior can be tested without a resolver/database.
+func tenantLocal(id int64, slug string) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		fiber.Locals[int64](c, "tenant_id", id)
+		fiber.Locals[string](c, "tenant_slug", slug)
+		return c.Next()
+	}
+}
+
+func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"tenant_id":   fiber.Locals[int64](c, "tenant_id"),
+			"tenant_slug": fiber.Locals[string](c, "tenant_slug"),
+		})
+	})
+
+	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"tenant_id":2`) {
+		t.Fatalf("body = %s, want tenant_id 2", body)
+	}
+	// The request resolved the default tenant before JWTAuth. Once the claim
+	// overrides tenant_id, the old slug would be misleading, so it is cleared.
+	if !strings.Contains(string(body), `"tenant_slug":""`) {
+		t.Fatalf("body = %s, want tenant_slug cleared when the claim overrides it", body)
+	}
+}
+
+func TestJWTAuth_NegativeTenantRejected(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
+	claims := token.Claims{
+		UserID:   1,
+		TenantID: -1,
+		Email:    "user@example.com",
+		Role:     "user",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "fiber-golang-boilerplate",
+			Audience:  jwt.ClaimStrings{"fiber-golang-boilerplate-api"},
+		},
+	}
+	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a negative tenant_id", resp.StatusCode)
+	}
+}
+
+func TestJWTAuth_TenantHeaderMismatchRejected(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(3, "other"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
+	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set(tenant.Header, "other")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "tenant mismatch") {
+		t.Fatalf("body = %s, want tenant mismatch detail", body)
+	}
+}
+
+func TestJWTAuth_TenantHeaderMatchAccepted(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(2, "acme"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
+	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set(tenant.Header, "acme")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestJWTAuth_LegacyTokenWithoutTenantRejected(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(3, "other"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"tenant_id": fiber.Locals[int64](c, "tenant_id")})
+	})
+
+	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set(tenant.Header, "other")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a token without tenant_id", resp.StatusCode)
 	}
 }
 
@@ -145,7 +291,7 @@ func TestRequireRole_Allowed(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "admin@example.com", "admin", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "admin@example.com", "admin", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -166,7 +312,7 @@ func TestRequireRole_Forbidden(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -187,7 +333,7 @@ func TestRequireRole_MultipleRoles(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/shared", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)

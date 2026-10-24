@@ -26,6 +26,9 @@ func TestGenerateAndParse(t *testing.T) {
 	if claims.UserID != 42 {
 		t.Errorf("UserID = %d, want 42", claims.UserID)
 	}
+	if claims.TenantID != 0 {
+		t.Errorf("TenantID = %d, want 0 (legacy Generate)", claims.TenantID)
+	}
 	if claims.Email != "user@test.com" {
 		t.Errorf("Email = %q, want %q", claims.Email, "user@test.com")
 	}
@@ -38,6 +41,63 @@ func TestGenerateAndParse(t *testing.T) {
 	aud := claims.Audience
 	if len(aud) != 1 || aud[0] != jwtAudience {
 		t.Errorf("Audience = %v, want [%q]", aud, jwtAudience)
+	}
+}
+
+func TestGenerateWithTenant(t *testing.T) {
+	tok, err := GenerateWithTenant(42, 7, "user@test.com", "user", testSecret, 1)
+	if err != nil {
+		t.Fatalf("GenerateWithTenant: %v", err)
+	}
+	claims, err := Parse(tok, testSecret)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if claims.TenantID != 7 {
+		t.Errorf("TenantID = %d, want 7", claims.TenantID)
+	}
+	if claims.TokenVersion != 0 {
+		t.Errorf("TokenVersion = %d, want 0", claims.TokenVersion)
+	}
+}
+
+func TestGenerateWithVersionAndTenant(t *testing.T) {
+	tok, err := GenerateWithVersionAndTenant(42, 7, "user@test.com", "user", 3, testSecret, 1)
+	if err != nil {
+		t.Fatalf("GenerateWithVersionAndTenant: %v", err)
+	}
+	claims, err := Parse(tok, testSecret)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if claims.TenantID != 7 {
+		t.Errorf("TenantID = %d, want 7", claims.TenantID)
+	}
+	if claims.TokenVersion != 3 {
+		t.Errorf("TokenVersion = %d, want 3", claims.TokenVersion)
+	}
+}
+
+func TestGenerateWithVersion_LegacyOmitsTenant(t *testing.T) {
+	tok, err := GenerateWithVersion(42, "user@test.com", "user", 2, testSecret, 1)
+	if err != nil {
+		t.Fatalf("GenerateWithVersion: %v", err)
+	}
+	claims, err := Parse(tok, testSecret)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if claims.TenantID != 0 {
+		t.Errorf("TenantID = %d, want 0", claims.TenantID)
+	}
+	if claims.TokenVersion != 2 {
+		t.Errorf("TokenVersion = %d, want 2", claims.TokenVersion)
+	}
+}
+
+func TestGenerateWithVersionAndTenant_RejectsNegativeTenant(t *testing.T) {
+	if _, err := GenerateWithVersionAndTenant(42, -1, "user@test.com", "user", 0, testSecret, 1); err == nil {
+		t.Fatal("negative tenant ID must be rejected")
 	}
 }
 

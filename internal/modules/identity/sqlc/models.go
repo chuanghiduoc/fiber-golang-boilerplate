@@ -10,6 +10,7 @@ import (
 
 type EmailVerificationToken struct {
 	ID        int64              `json:"id"`
+	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
 	Email     string             `json:"email"`
 	Token     string             `json:"token"`
@@ -19,6 +20,7 @@ type EmailVerificationToken struct {
 
 type PasswordResetToken struct {
 	ID        int64              `json:"id"`
+	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
 	Token     string             `json:"token"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
@@ -27,6 +29,7 @@ type PasswordResetToken struct {
 
 type RefreshToken struct {
 	ID           int64              `json:"id"`
+	TenantID     int64              `json:"tenant_id"`
 	UserID       int64              `json:"user_id"`
 	Token        string             `json:"token"`
 	TokenVersion int32              `json:"token_version"`
@@ -34,8 +37,18 @@ type RefreshToken struct {
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
+type Tenant struct {
+	ID        int64              `json:"id"`
+	Slug      string             `json:"slug"`
+	Name      string             `json:"name"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type User struct {
 	ID                int64              `json:"id"`
+	TenantID          int64              `json:"tenant_id"`
 	Email             string             `json:"email"`
 	PasswordHash      pgtype.Text        `json:"password_hash"`
 	Name              string             `json:"name"`

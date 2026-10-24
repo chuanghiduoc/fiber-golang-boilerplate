@@ -12,14 +12,22 @@ import (
 )
 
 const consumePasswordResetToken = `-- name: ConsumePasswordResetToken :one
-DELETE FROM password_reset_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at
+DELETE FROM password_reset_tokens
+WHERE token = $1 AND tenant_id = $2
+RETURNING id, tenant_id, user_id, token, expires_at, created_at
 `
 
-func (q *Queries) ConsumePasswordResetToken(ctx context.Context, token string) (PasswordResetToken, error) {
-	row := q.db.QueryRow(ctx, consumePasswordResetToken, token)
+type ConsumePasswordResetTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) ConsumePasswordResetToken(ctx context.Context, arg ConsumePasswordResetTokenParams) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, consumePasswordResetToken, arg.Token, arg.TenantID)
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -29,26 +37,36 @@ func (q *Queries) ConsumePasswordResetToken(ctx context.Context, token string) (
 }
 
 const createPasswordResetToken = `-- name: CreatePasswordResetToken :one
-INSERT INTO password_reset_tokens (user_id, token, expires_at)
-VALUES ($1, $2, $3)
+INSERT INTO password_reset_tokens (tenant_id, user_id, token, expires_at)
+SELECT u.tenant_id, $1, $2, $3
+FROM users u
+WHERE u.id = $1 AND u.tenant_id = $4 AND u.deleted_at IS NULL
 ON CONFLICT (user_id) DO UPDATE
-SET token = EXCLUDED.token,
+SET tenant_id = EXCLUDED.tenant_id,
+    token = EXCLUDED.token,
     expires_at = EXCLUDED.expires_at,
     created_at = NOW()
-RETURNING id, user_id, token, expires_at, created_at
+RETURNING id, tenant_id, user_id, token, expires_at, created_at
 `
 
 type CreatePasswordResetTokenParams struct {
 	UserID    int64              `json:"user_id"`
 	Token     string             `json:"token"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	TenantID  int64              `json:"tenant_id"`
 }
 
 func (q *Queries) CreatePasswordResetToken(ctx context.Context, arg CreatePasswordResetTokenParams) (PasswordResetToken, error) {
-	row := q.db.QueryRow(ctx, createPasswordResetToken, arg.UserID, arg.Token, arg.ExpiresAt)
+	row := q.db.QueryRow(ctx, createPasswordResetToken,
+		arg.UserID,
+		arg.Token,
+		arg.ExpiresAt,
+		arg.TenantID,
+	)
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -58,32 +76,51 @@ func (q *Queries) CreatePasswordResetToken(ctx context.Context, arg CreatePasswo
 }
 
 const deletePasswordResetToken = `-- name: DeletePasswordResetToken :exec
-DELETE FROM password_reset_tokens WHERE token = $1
+DELETE FROM password_reset_tokens
+WHERE token = $1 AND tenant_id = $2
 `
 
-func (q *Queries) DeletePasswordResetToken(ctx context.Context, token string) error {
-	_, err := q.db.Exec(ctx, deletePasswordResetToken, token)
+type DeletePasswordResetTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) DeletePasswordResetToken(ctx context.Context, arg DeletePasswordResetTokenParams) error {
+	_, err := q.db.Exec(ctx, deletePasswordResetToken, arg.Token, arg.TenantID)
 	return err
 }
 
 const deletePasswordResetTokensByUserID = `-- name: DeletePasswordResetTokensByUserID :exec
-DELETE FROM password_reset_tokens WHERE user_id = $1
+DELETE FROM password_reset_tokens
+WHERE user_id = $1 AND tenant_id = $2
 `
 
-func (q *Queries) DeletePasswordResetTokensByUserID(ctx context.Context, userID int64) error {
-	_, err := q.db.Exec(ctx, deletePasswordResetTokensByUserID, userID)
+type DeletePasswordResetTokensByUserIDParams struct {
+	UserID   int64 `json:"user_id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) DeletePasswordResetTokensByUserID(ctx context.Context, arg DeletePasswordResetTokensByUserIDParams) error {
+	_, err := q.db.Exec(ctx, deletePasswordResetTokensByUserID, arg.UserID, arg.TenantID)
 	return err
 }
 
 const getPasswordResetTokenByToken = `-- name: GetPasswordResetTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1
+SELECT id, tenant_id, user_id, token, expires_at, created_at FROM password_reset_tokens
+WHERE token = $1 AND tenant_id = $2
 `
 
-func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, token string) (PasswordResetToken, error) {
-	row := q.db.QueryRow(ctx, getPasswordResetTokenByToken, token)
+type GetPasswordResetTokenByTokenParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, arg GetPasswordResetTokenByTokenParams) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, getPasswordResetTokenByToken, arg.Token, arg.TenantID)
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -93,14 +130,22 @@ func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, token string
 }
 
 const getPasswordResetTokenByTokenForUpdate = `-- name: GetPasswordResetTokenByTokenForUpdate :one
-SELECT id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1 FOR UPDATE
+SELECT id, tenant_id, user_id, token, expires_at, created_at FROM password_reset_tokens
+WHERE token = $1 AND tenant_id = $2
+FOR UPDATE
 `
 
-func (q *Queries) GetPasswordResetTokenByTokenForUpdate(ctx context.Context, token string) (PasswordResetToken, error) {
-	row := q.db.QueryRow(ctx, getPasswordResetTokenByTokenForUpdate, token)
+type GetPasswordResetTokenByTokenForUpdateParams struct {
+	Token    string `json:"token"`
+	TenantID int64  `json:"tenant_id"`
+}
+
+func (q *Queries) GetPasswordResetTokenByTokenForUpdate(ctx context.Context, arg GetPasswordResetTokenByTokenForUpdateParams) (PasswordResetToken, error) {
+	row := q.db.QueryRow(ctx, getPasswordResetTokenByTokenForUpdate, arg.Token, arg.TenantID)
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,

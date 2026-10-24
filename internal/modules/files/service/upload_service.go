@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,9 +13,12 @@ import (
 
 	"github.com/google/uuid"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -41,8 +45,9 @@ type UploadService interface {
 }
 
 type uploadService struct {
-	repo    filesrepo.FileRepository
-	storage storage.Storage
+	repo     filesrepo.FileRepository
+	storage  storage.Storage
+	webhooks webhookcontracts.Dispatcher
 }
 
 func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
@@ -50,17 +55,30 @@ func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) Uplo
 }
 
 func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*dto.FileResponse, error) {
+	tenantID := tenant.EffectiveID(ctx)
+	if tenantID <= 0 {
+		return nil, apperror.NewInternal("tenant context is required")
+	}
+	if err := authorizeUserResource(ctx, authz.PermissionFilesWrite, tenantID, userID); err != nil {
+		return nil, err
+	}
+
 	originalName := cleanOriginalName(filename)
 	// Never derive the stored extension from the client-supplied filename: a
 	// content-type allowlist must not leave an .html/.svg path that a browser
 	// could later render as executable markup.
-	storagePath := fmt.Sprintf("%d/%s%s", userID, uuid.New().String(), extensionForMIME(contentType))
+	//
+	// The tenant prefix keeps identically named blobs from different tenants
+	// in separate key spaces and makes the owning tenant visible during
+	// storage/backup operations.
+	storagePath := fmt.Sprintf("%d/%d/%s%s", tenantID, userID, uuid.New().String(), extensionForMIME(contentType))
 
 	if err := s.storage.Put(ctx, storagePath, reader, size, contentType); err != nil {
 		return nil, apperror.NewInternal("failed to store file")
 	}
 
 	file, err := s.repo.Create(ctx, filesqlc.CreateFileParams{
+		TenantID:     tenantID,
 		UserID:       userID,
 		OriginalName: originalName,
 		StoragePath:  storagePath,
@@ -82,7 +100,42 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		return nil, apperror.NewInternal("failed to save file metadata")
 	}
 
-	return s.toFileResponse(file), nil
+	response := s.toFileResponse(file)
+	s.dispatchWebhook(ctx, webhookcontracts.EventFileUploaded, tenantID, response)
+	return response, nil
+}
+
+// SetWebhookDispatcher wires outbound domain events.
+func (s *uploadService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
+	s.webhooks = dispatcher
+}
+
+// AttachWebhookDispatcher wires the production dispatcher without widening the
+// UploadService interface, so handler fakes remain small.
+func AttachWebhookDispatcher(svc UploadService, dispatcher webhookcontracts.Dispatcher) {
+	if s, ok := svc.(*uploadService); ok {
+		s.webhooks = dispatcher
+	}
+}
+
+// dispatchWebhook emits one best-effort domain event. Delivery failures are
+// logged; they must not turn a committed file mutation into an API error.
+func (s *uploadService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
+	if s.webhooks == nil {
+		return
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
+		return
+	}
+	if _, err := s.webhooks.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
+		Type:     eventType,
+		TenantID: tenantID,
+		Data:     payload,
+	}); err != nil {
+		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
+	}
 }
 
 func cleanOriginalName(name string) string {
@@ -121,8 +174,11 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 		}
 		return nil, apperror.NewInternal("failed to get file")
 	}
+	if err := authorizeFile(ctx, authz.PermissionFilesRead, file); err != nil {
+		return nil, err
+	}
 
-	if file.UserID != userID {
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		// Do not reveal that another tenant's file ID exists.
 		return nil, apperror.NewNotFound("file not found")
 	}
@@ -139,7 +195,10 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 		return nil, nil, apperror.NewInternal("failed to get file")
 	}
 
-	if file.UserID != userID {
+	if err := authorizeFile(ctx, authz.PermissionFilesRead, file); err != nil {
+		return nil, nil, err
+	}
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
 
@@ -158,6 +217,9 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]dto.FileResponse, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := authorizeUserResource(ctx, authz.PermissionFilesRead, tenant.EffectiveID(ctx), userID); err != nil {
 		return nil, false, err
 	}
 
@@ -188,7 +250,10 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		return apperror.NewInternal("failed to get file")
 	}
 
-	if file.UserID != userID {
+	if err := authorizeFile(ctx, authz.PermissionFilesDelete, file); err != nil {
+		return err
+	}
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return apperror.NewNotFound("file not found")
 	}
 
@@ -204,6 +269,12 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		slog.Int64("file_id", id),
 		slog.String("path", file.StoragePath),
 	)
+	s.dispatchWebhook(ctx, webhookcontracts.EventFileDeleted, file.TenantID, map[string]any{
+		"id":           file.ID,
+		"tenantId":     file.TenantID,
+		"userId":       file.UserID,
+		"originalName": file.OriginalName,
+	})
 
 	return nil
 }
@@ -216,7 +287,10 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 		}
 		return nil, apperror.NewInternal("failed to get file")
 	}
-	if file.UserID != userID {
+	if err := authorizeFile(ctx, authz.PermissionFilesRestore, file); err != nil {
+		return nil, err
+	}
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, apperror.NewNotFound("file not found")
 	}
 	if !file.DeletedAt.Valid {
@@ -236,6 +310,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 func (s *uploadService) toFileResponse(file *filesqlc.File) *dto.FileResponse {
 	resp := &dto.FileResponse{
 		ID:           file.ID,
+		TenantID:     file.TenantID,
 		UserID:       file.UserID,
 		OriginalName: file.OriginalName,
 		MimeType:     file.MimeType,

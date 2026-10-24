@@ -1,0 +1,238 @@
+package handler
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+	"testing"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
+)
+
+type fakeTenantRepository struct {
+	tenant identitysqlc.Tenant
+	err    error
+}
+
+var _ identityrepo.TenantRepository = (*fakeTenantRepository)(nil)
+
+func (f *fakeTenantRepository) ResolveBySlug(_ context.Context, slug string) (identitysqlc.Tenant, error) {
+	if f.err != nil {
+		return identitysqlc.Tenant{}, f.err
+	}
+	if f.tenant.Slug != slug {
+		return identitysqlc.Tenant{}, apperror.ErrNotFound
+	}
+	return f.tenant, nil
+}
+
+func (f *fakeTenantRepository) GetByID(_ context.Context, id int64) (identitysqlc.Tenant, error) {
+	if f.err != nil {
+		return identitysqlc.Tenant{}, f.err
+	}
+	if f.tenant.ID != id || f.tenant.Status != "active" {
+		return identitysqlc.Tenant{}, apperror.ErrNotFound
+	}
+	return f.tenant, nil
+}
+
+func (f *fakeTenantRepository) GetBySlugIncludingSuspended(_ context.Context, slug string) (identitysqlc.Tenant, error) {
+	if f.err != nil {
+		return identitysqlc.Tenant{}, f.err
+	}
+	if f.tenant.Slug != slug {
+		return identitysqlc.Tenant{}, apperror.ErrNotFound
+	}
+	return f.tenant, nil
+}
+
+func (f *fakeTenantRepository) GetByIDIncludingSuspended(_ context.Context, id int64) (identitysqlc.Tenant, error) {
+	if f.err != nil {
+		return identitysqlc.Tenant{}, f.err
+	}
+	if f.tenant.ID != id {
+		return identitysqlc.Tenant{}, apperror.ErrNotFound
+	}
+	return f.tenant, nil
+}
+
+func TestOAuthState_RoundTrip(t *testing.T) {
+	state := encodeOAuthState("abc123", 7)
+	nonce, tenantID, ok := decodeOAuthState(state)
+	require.True(t, ok)
+	require.Equal(t, "abc123", nonce)
+	require.Equal(t, int64(7), tenantID)
+
+	for _, invalid := range []string{"", "nodot", ".7", "abc.", "abc.0", "abc.-1", "abc.notanumber"} {
+		_, _, ok := decodeOAuthState(invalid)
+		require.False(t, ok, "state %q must be rejected", invalid)
+	}
+}
+
+func TestGoogleRedirect_BindsTenantToState(t *testing.T) {
+	googleOAuth := oauth.NewGoogleOAuth(config.OAuthConfig{
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "client-secret",
+		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
+		FrontendURL:        "http://localhost:3000",
+	})
+	authHandler := NewAuthHandler(
+		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth,
+	)
+
+	app := fiber.New()
+	app.Get("/auth/google", func(c fiber.Ctx) error {
+		c.SetContext(tenant.WithID(c.Context(), 7))
+		return authHandler.GoogleRedirect(c)
+	})
+
+	req, _ := http.NewRequest(http.MethodGet, "/auth/google", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusSeeOther, resp.StatusCode)
+
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	_, tenantID, ok := decodeOAuthState(location.Query().Get("state"))
+	require.True(t, ok)
+	require.Equal(t, int64(7), tenantID)
+}
+
+func TestGoogleRedirect_AcceptsTenantQueryWhenMiddlewareIsAbsent(t *testing.T) {
+	googleOAuth := oauth.NewGoogleOAuth(config.OAuthConfig{
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "client-secret",
+		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
+		FrontendURL:        "http://localhost:3000",
+	})
+	tenants := &fakeTenantRepository{
+		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
+	}
+	authHandler := NewAuthHandler(
+		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
+	)
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Get("/auth/google", authHandler.GoogleRedirect)
+
+	resp, err := app.Test(oauthTestRequest(t, http.MethodGet, "/auth/google?tenant=acme"))
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusSeeOther, resp.StatusCode)
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	_, tenantID, ok := decodeOAuthState(location.Query().Get("state"))
+	require.True(t, ok)
+	require.Equal(t, int64(2), tenantID)
+
+	// Invalid slugs and unknown tenants are rejected, not defaulted.
+	resp, err = app.Test(oauthTestRequest(t, http.MethodGet, "/auth/google?tenant=Bad_Slug"))
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+	resp, err = app.Test(oauthTestRequest(t, http.MethodGet, "/auth/google?tenant=missing"))
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+}
+
+func TestGoogleRedirect_HeaderResolvedTenantWinsOverQuery(t *testing.T) {
+	googleOAuth := oauth.NewGoogleOAuth(config.OAuthConfig{
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "client-secret",
+		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
+		FrontendURL:        "http://localhost:3000",
+	})
+	authHandler := NewAuthHandler(
+		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth,
+	)
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Get("/auth/google", func(c fiber.Ctx) error {
+		fiber.Locals[int64](c, "tenant_id", 1)
+		fiber.Locals[string](c, "tenant_slug", "default")
+		c.SetContext(tenant.WithIdentity(c.Context(), 1, "default"))
+		return authHandler.GoogleRedirect(c)
+	})
+
+	resp, err := app.Test(oauthTestRequest(t, http.MethodGet, "/auth/google?tenant=acme"))
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusSeeOther, resp.StatusCode)
+	location, err := url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	_, tenantID, ok := decodeOAuthState(location.Query().Get("state"))
+	require.True(t, ok)
+	require.Equal(t, int64(1), tenantID, "header-resolved tenant must take precedence")
+}
+
+func oauthTestRequest(t *testing.T, method, path string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, path, http.NoBody)
+	require.NoError(t, err)
+	return req
+}
+
+func TestGoogleCallback_UsesStateTenantAndRejectsUnknown(t *testing.T) {
+	googleOAuth := oauth.NewGoogleOAuth(config.OAuthConfig{
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "client-secret",
+		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
+		FrontendURL:        "http://localhost:3000",
+	})
+	tenants := &fakeTenantRepository{
+		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
+	}
+	authHandler := NewAuthHandler(
+		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
+	)
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Get("/auth/google/callback", authHandler.GoogleCallback)
+
+	// The state names a different tenant than the cookie/state's active tenant.
+	state := encodeOAuthState("nonce", 9)
+	req, _ := http.NewRequest(http.MethodGet, "/auth/google/callback?state="+state+"&code=x", http.NoBody)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
+
+	// A mismatched state and cookie is rejected before tenant resolution.
+	otherState := encodeOAuthState("other", 2)
+	req, _ = http.NewRequest(http.MethodGet, "/auth/google/callback?state="+otherState+"&code=x", http.NoBody)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})
+	resp, err = app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
+}
+
+func TestGoogleCallback_RejectsSuspendedTenant(t *testing.T) {
+	googleOAuth := oauth.NewGoogleOAuth(config.OAuthConfig{
+		GoogleClientID:     "client-id",
+		GoogleClientSecret: "client-secret",
+		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
+		FrontendURL:        "http://localhost:3000",
+	})
+	tenants := &fakeTenantRepository{
+		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "suspended"},
+	}
+	authHandler := NewAuthHandler(
+		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
+	)
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Get("/auth/google/callback", authHandler.GoogleCallback)
+
+	state := encodeOAuthState("nonce", 2)
+	req, _ := http.NewRequest(http.MethodGet, "/auth/google/callback?state="+state+"&code=x", http.NoBody)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
+}

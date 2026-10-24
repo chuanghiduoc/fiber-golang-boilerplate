@@ -13,10 +13,11 @@ import (
 
 const adminCountFiles = `-- name: AdminCountFiles :one
 SELECT count(*) FROM files
+WHERE tenant_id = $1
 `
 
-func (q *Queries) AdminCountFiles(ctx context.Context) (int64, error) {
-	row := q.db.QueryRow(ctx, adminCountFiles)
+func (q *Queries) AdminCountFiles(ctx context.Context, tenantID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, adminCountFiles, tenantID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -27,6 +28,7 @@ SELECT
     count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS total_files,
     COALESCE(SUM(size) FILTER (WHERE deleted_at IS NULL), 0)::bigint AS total_file_size
 FROM files
+WHERE tenant_id = $1
 `
 
 type AdminFileStatsRow struct {
@@ -34,24 +36,28 @@ type AdminFileStatsRow struct {
 	TotalFileSize int64 `json:"total_file_size"`
 }
 
-func (q *Queries) AdminFileStats(ctx context.Context) (AdminFileStatsRow, error) {
-	row := q.db.QueryRow(ctx, adminFileStats)
+func (q *Queries) AdminFileStats(ctx context.Context, tenantID int64) (AdminFileStatsRow, error) {
+	row := q.db.QueryRow(ctx, adminFileStats, tenantID)
 	var i AdminFileStatsRow
 	err := row.Scan(&i.TotalFiles, &i.TotalFileSize)
 	return i, err
 }
 
 const adminListFiles = `-- name: AdminListFiles :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files ORDER BY id DESC LIMIT $1 OFFSET $2
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE tenant_id = $1
+ORDER BY id DESC
+LIMIT $2 OFFSET $3
 `
 
 type AdminListFilesParams struct {
-	Limit  int32 `json:"limit"`
-	Offset int32 `json:"offset"`
+	TenantID int64 `json:"tenant_id"`
+	Limit    int32 `json:"limit"`
+	Offset   int32 `json:"offset"`
 }
 
 func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) ([]File, error) {
-	rows, err := q.db.Query(ctx, adminListFiles, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, adminListFiles, arg.TenantID, arg.Limit, arg.Offset)
 	if err != nil {
 		return nil, err
 	}
@@ -61,6 +67,7 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -80,13 +87,15 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 }
 
 const adminListFilesCursor = `-- name: AdminListFilesCursor :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
-WHERE (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE tenant_id = $1::bigint
+  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
 ORDER BY created_at DESC, id DESC
-LIMIT $4::int
+LIMIT $5::int
 `
 
 type AdminListFilesCursorParams struct {
+	TenantID        int64              `json:"tenant_id"`
 	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
@@ -95,6 +104,7 @@ type AdminListFilesCursorParams struct {
 
 func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCursorParams) ([]File, error) {
 	rows, err := q.db.Query(ctx, adminListFilesCursor,
+		arg.TenantID,
 		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
@@ -109,6 +119,7 @@ func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCu
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -128,23 +139,30 @@ func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCu
 }
 
 const countFilesByUserID = `-- name: CountFilesByUserID :one
-SELECT count(*) FROM files WHERE user_id = $1 AND deleted_at IS NULL
+SELECT count(*) FROM files
+WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
 `
 
-func (q *Queries) CountFilesByUserID(ctx context.Context, userID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countFilesByUserID, userID)
+type CountFilesByUserIDParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+func (q *Queries) CountFilesByUserID(ctx context.Context, arg CountFilesByUserIDParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countFilesByUserID, arg.TenantID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
 }
 
 const createFile = `-- name: CreateFile :one
-INSERT INTO files (user_id, original_name, storage_path, mime_type, size)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
 type CreateFileParams struct {
+	TenantID     int64  `json:"tenant_id"`
 	UserID       int64  `json:"user_id"`
 	OriginalName string `json:"original_name"`
 	StoragePath  string `json:"storage_path"`
@@ -154,6 +172,7 @@ type CreateFileParams struct {
 
 func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, error) {
 	row := q.db.QueryRow(ctx, createFile,
+		arg.TenantID,
 		arg.UserID,
 		arg.OriginalName,
 		arg.StoragePath,
@@ -163,6 +182,7 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -176,15 +196,21 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 
 const deleteFile = `-- name: DeleteFile :one
 UPDATE files SET deleted_at = NOW()
-WHERE id = $1 AND deleted_at IS NULL
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
-func (q *Queries) DeleteFile(ctx context.Context, id int64) (File, error) {
-	row := q.db.QueryRow(ctx, deleteFile, id)
+type DeleteFileParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) DeleteFile(ctx context.Context, arg DeleteFileParams) (File, error) {
+	row := q.db.QueryRow(ctx, deleteFile, arg.ID, arg.TenantID)
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -197,14 +223,21 @@ func (q *Queries) DeleteFile(ctx context.Context, id int64) (File, error) {
 }
 
 const getFileByID = `-- name: GetFileByID :one
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1 AND deleted_at IS NULL
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 `
 
-func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
-	row := q.db.QueryRow(ctx, getFileByID, id)
+type GetFileByIDParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) GetFileByID(ctx context.Context, arg GetFileByIDParams) (File, error) {
+	row := q.db.QueryRow(ctx, getFileByID, arg.ID, arg.TenantID)
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -217,14 +250,21 @@ func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
 }
 
 const getFileByIDIncludingDeleted = `-- name: GetFileByIDIncludingDeleted :one
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE id = $1 AND tenant_id = $2
 `
 
-func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (File, error) {
-	row := q.db.QueryRow(ctx, getFileByIDIncludingDeleted, id)
+type GetFileByIDIncludingDeletedParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, arg GetFileByIDIncludingDeletedParams) (File, error) {
+	row := q.db.QueryRow(ctx, getFileByIDIncludingDeleted, arg.ID, arg.TenantID)
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -237,15 +277,17 @@ func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (Fi
 }
 
 const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
-WHERE user_id = $1::bigint
-  AND (deleted_at IS NULL OR $2::boolean)
-  AND (NOT $3::boolean OR (created_at, id) < ($4::timestamptz, $5::bigint))
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE tenant_id = $1::bigint
+  AND user_id = $2::bigint
+  AND (deleted_at IS NULL OR $3::boolean)
+  AND (NOT $4::boolean OR (created_at, id) < ($5::timestamptz, $6::bigint))
 ORDER BY created_at DESC, id DESC
-LIMIT $6::int
+LIMIT $7::int
 `
 
 type ListFilesByUserCursorParams struct {
+	TenantID        int64              `json:"tenant_id"`
 	UserID          int64              `json:"user_id"`
 	IncludeDeleted  bool               `json:"include_deleted"`
 	HasCursor       bool               `json:"has_cursor"`
@@ -256,6 +298,7 @@ type ListFilesByUserCursorParams struct {
 
 func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUserCursorParams) ([]File, error) {
 	rows, err := q.db.Query(ctx, listFilesByUserCursor,
+		arg.TenantID,
 		arg.UserID,
 		arg.IncludeDeleted,
 		arg.HasCursor,
@@ -272,6 +315,7 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -291,17 +335,26 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 }
 
 const listFilesByUserID = `-- name: ListFilesByUserID :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2 OFFSET $3
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+WHERE tenant_id = $1 AND user_id = $2 AND deleted_at IS NULL
+ORDER BY id DESC
+LIMIT $3 OFFSET $4
 `
 
 type ListFilesByUserIDParams struct {
-	UserID int64 `json:"user_id"`
-	Limit  int32 `json:"limit"`
-	Offset int32 `json:"offset"`
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+	Limit    int32 `json:"limit"`
+	Offset   int32 `json:"offset"`
 }
 
 func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDParams) ([]File, error) {
-	rows, err := q.db.Query(ctx, listFilesByUserID, arg.UserID, arg.Limit, arg.Offset)
+	rows, err := q.db.Query(ctx, listFilesByUserID,
+		arg.TenantID,
+		arg.UserID,
+		arg.Limit,
+		arg.Offset,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -311,6 +364,7 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -331,15 +385,21 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 
 const restoreFile = `-- name: RestoreFile :one
 UPDATE files SET deleted_at = NULL
-WHERE id = $1 AND deleted_at IS NOT NULL
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
-func (q *Queries) RestoreFile(ctx context.Context, id int64) (File, error) {
-	row := q.db.QueryRow(ctx, restoreFile, id)
+type RestoreFileParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+func (q *Queries) RestoreFile(ctx context.Context, arg RestoreFileParams) (File, error) {
+	row := q.db.QueryRow(ctx, restoreFile, arg.ID, arg.TenantID)
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,

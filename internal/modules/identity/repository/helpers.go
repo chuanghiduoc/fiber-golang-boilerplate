@@ -1,14 +1,24 @@
 package repository
 
 import (
+	"context"
 	"errors"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
+
+// tenantID returns the request tenant every repository query must scope to.
+// EffectiveID falls back to the default tenant only for background jobs,
+// internal callers, and tests; HTTP requests resolve an explicit tenant (and
+// production requires X-Tenant-Slug).
+func tenantID(ctx context.Context) int64 {
+	return tenant.EffectiveID(ctx)
+}
 
 // wrapErr translates pgx errors to app-level sentinel errors.
 // Repository is the only layer that should know about database driver errors.

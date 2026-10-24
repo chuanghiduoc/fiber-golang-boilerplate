@@ -101,6 +101,22 @@ When releasing, move `[Unreleased]` entries under a version header:
   numbered migration instead (`make migrate-create name=...`).
 - One module owns each table. Cross-module access goes through a contract or
   read model, not another module's repository.
+- Every tenant-owned table carries
+  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`, and its indexes
+  lead with `tenant_id`. The `default` tenant (id 1) preserves compatibility for
+  header-less local/test requests; production requires `X-Tenant-Slug`
+  (`TENANT_REQUIRE_HEADER=true`), and emails/Google IDs are unique per tenant.
+- The `users` last-admin trigger is per tenant. Application checks must use the
+  same tenant scope as the trigger.
+- Identity and files are tenant-scoped: their queries filter `tenant_id`,
+  repositories derive it from `tenant.EffectiveID(ctx)` (tenant-1 fallback is
+  for jobs/internal/tests only, never a substitute for HTTP tenant resolution),
+  public auth flows resolve the tenant, and Google state carries it. Reset and
+  verification links carry `?tenant=<slug>`; browser-facing auth paths accept
+  that validated query fallback. Uploads use `<tenantID>/<userID>/<uuid>.<ext>`.
+  Idempotency keys include the tenant; logout revokes refresh tokens by
+  possession. RLS and per-tenant limits remain future work, so do not describe
+  the whole application as fully isolated.
 
 ### Upgrading an existing database
 
@@ -115,6 +131,17 @@ database's current version (a fully migrated old deployment is at 3, so
 set or rename it explicitly. A fresh schema created out-of-band that already
 matches `000001` can be baselined manually after verification (for example, the
 golang-migrate CLI's `force 1`) instead of re-running the file.
+
+The multi-tenant foundation also changes `000001` (tenants table, `tenant_id`
+columns, per-tenant indexes and last-admin trigger). Existing databases need a
+new numbered migration or reviewed manual DDL; see the README's "Upgrading an
+existing database" section. Do not assume the baseline created the tenant
+objects on an already-deployed database. Identity/files isolation needs no
+further schema, but legacy access tokens without `tenant_id` are rejected after
+the upgrade (users must log in again); old token rows remain on tenant 1.
+Existing files keep their old `<user>/<uuid>` storage keys; only new uploads use
+the `<tenantID>/<userID>/<uuid>` layout. If you copy blobs, update
+`files.storage_path` atomically.
 
 ## Adding a New Module
 

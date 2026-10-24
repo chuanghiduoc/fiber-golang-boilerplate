@@ -21,22 +21,26 @@ const (
 	generationTTL = 24 * time.Hour
 )
 
-// Store validates a token against the user's current role/token version.
+// Store validates a token against the user's current role/token version and
+// tenant. Suspended tenants and tokens whose tenant claim does not match the
+// stored user row are rejected.
 type Store interface {
-	Validate(ctx context.Context, userID int64, role string, tokenVersion int32) error
+	Validate(ctx context.Context, userID, tenantID int64, role string, tokenVersion int32) error
 	Invalidate(ctx context.Context, userID int64) error
 }
 
 type snapshot struct {
 	Role         string `json:"role"`
 	TokenVersion int32  `json:"tokenVersion"`
+	TenantID     int64  `json:"tenantId"`
+	TenantStatus string `json:"tenantStatus"`
 }
 
 // userStore is the narrow read contract the session validator needs. Keeping
 // it local prevents platform code from depending on a business module or its
 // generated SQL types.
 type userStore interface {
-	GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, err error)
+	GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, tenantID int64, tenantStatus string, err error)
 }
 
 type store struct {
@@ -77,7 +81,7 @@ func (s *store) currentGeneration(ctx context.Context, userID int64) int64 {
 	return n
 }
 
-func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVersion int32) error {
+func (s *store) Validate(ctx context.Context, userID, tenantID int64, role string, tokenVersion int32) error {
 	generation := s.currentGeneration(ctx, userID)
 	key := snapshotKey(userID, generation)
 
@@ -85,12 +89,12 @@ func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVe
 		if data, err := s.cache.Get(ctx, key); err == nil && data != nil {
 			var snap snapshot
 			if json.Unmarshal(data, &snap) == nil {
-				return validateSnapshot(snap, role, tokenVersion)
+				return validateSnapshot(snap, tenantID, role, tokenVersion)
 			}
 		}
 	}
 
-	currentRole, currentTokenVersion, err := s.users.GetSessionState(ctx, userID)
+	currentRole, currentTokenVersion, currentTenantID, tenantStatus, err := s.users.GetSessionState(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewUnauthorized("account is not active")
@@ -98,7 +102,12 @@ func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVe
 		return apperror.NewInternal("failed to validate session")
 	}
 
-	snap := snapshot{Role: currentRole, TokenVersion: currentTokenVersion}
+	snap := snapshot{
+		Role:         currentRole,
+		TokenVersion: currentTokenVersion,
+		TenantID:     currentTenantID,
+		TenantStatus: tenantStatus,
+	}
 	if s.cache != nil {
 		if data, err := json.Marshal(snap); err == nil {
 			if err := s.cache.Set(ctx, key, data, cacheTTL); err != nil {
@@ -110,10 +119,19 @@ func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVe
 		}
 	}
 
-	return validateSnapshot(snap, role, tokenVersion)
+	return validateSnapshot(snap, tenantID, role, tokenVersion)
 }
 
-func validateSnapshot(snap snapshot, role string, tokenVersion int32) error {
+func validateSnapshot(snap snapshot, tenantID int64, role string, tokenVersion int32) error {
+	if tenantID <= 0 {
+		return apperror.NewUnauthorized("token is missing tenant")
+	}
+	if snap.TenantStatus != "active" {
+		return apperror.NewUnauthorized("tenant is not active")
+	}
+	if snap.TenantID != tenantID {
+		return apperror.NewUnauthorized("session is no longer valid")
+	}
 	if snap.Role != role || snap.TokenVersion != tokenVersion {
 		return apperror.NewUnauthorized("session is no longer valid")
 	}

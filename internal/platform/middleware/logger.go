@@ -1,12 +1,14 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // sensitiveQueryKeys are redacted before a request URL is written to logs.
@@ -48,7 +50,8 @@ func Logger() fiber.Handler {
 			userID = v
 		}
 
-		attrs := []slog.Attr{
+		attrs := make([]slog.Attr, 0, 13)
+		attrs = append(attrs,
 			slog.String("method", c.Method()),
 			slog.String("path", c.Path()),
 			slog.Int("status", status),
@@ -59,7 +62,8 @@ func Logger() fiber.Handler {
 			slog.Int("content_length", c.Request().Header.ContentLength()),
 			slog.String("user_agent", c.Get("User-Agent")),
 			slog.String("query", redactQuery(string(c.Request().URI().QueryString()))),
-		}
+		)
+		attrs = append(attrs, traceAttrs(c.Context())...)
 
 		switch {
 		case status >= 500:
@@ -71,5 +75,19 @@ func Logger() fiber.Handler {
 		}
 
 		return err
+	}
+}
+
+// traceAttrs exposes the active span identifiers on request logs so a log
+// line, trace, and audit event can be correlated. Trace IDs are omitted when
+// tracing is disabled or the span is not recording.
+func traceAttrs(ctx context.Context) []slog.Attr {
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		return nil
+	}
+	return []slog.Attr{
+		slog.String("trace_id", spanCtx.TraceID().String()),
+		slog.String("span_id", spanCtx.SpanID().String()),
 	}
 }

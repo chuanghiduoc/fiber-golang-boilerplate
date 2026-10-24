@@ -12,6 +12,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -41,6 +42,7 @@ func newRegistrationServices(t *testing.T, pool *pgxpool.Pool) UserService {
 		true,
 		appCache,
 		txManager,
+		audit.NewPostgresRecorder(pool),
 	)
 	userSvc.SetVerificationProvisioner(verifSvc)
 	require.True(t, userSvc.RegistrationEmailsTransactional(),

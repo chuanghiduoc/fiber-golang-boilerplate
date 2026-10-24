@@ -59,6 +59,8 @@ type UserResponse struct {
 	BannedAt      *time.Time `json:"bannedAt,omitempty"`
 	// TokenVersion is internal and must never be serialized to clients.
 	TokenVersion int32 `json:"-"`
+	// TenantID identifies the owning tenant. It is additive and read-only.
+	TenantID int64 `json:"tenantId"`
 }
 
 type LoginResponse struct {

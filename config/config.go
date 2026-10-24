@@ -4,24 +4,372 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
 type Config struct {
-	App       AppConfig
-	DB        DBConfig
-	JWT       JWTConfig
-	Storage   StorageConfig
-	OAuth     OAuthConfig
-	CORS      CORSConfig
-	RateLimit RateLimitConfig
-	Cache     CacheConfig
-	Email     EmailConfig
-	Admin     AdminConfig
+	App          AppConfig
+	DB           DBConfig
+	JWT          JWTConfig
+	Storage      StorageConfig
+	OAuth        OAuthConfig
+	CORS         CORSConfig
+	RateLimit    RateLimitConfig
+	Cache        CacheConfig
+	Email        EmailConfig
+	Admin        AdminConfig
+	Tenant       TenantConfig
+	Tracing      TracingConfig
+	I18N         I18NConfig
+	FeatureFlags FeatureFlagsConfig
+	Scheduler    SchedulerConfig
+	Webhook      WebhookConfig
 }
+
+// I18NConfig controls request locale negotiation. Locale tags are matched
+// against the embedded catalogs; unsupported values fail at startup.
+type I18NConfig struct {
+	DefaultLocale string `env:"I18N_DEFAULT_LOCALE" envDefault:"en"`
+}
+
+// Locale returns the normalized configured default locale, or "en".
+func (c I18NConfig) Locale() string {
+	locale := strings.ToLower(strings.TrimSpace(c.DefaultLocale))
+	if locale == "" {
+		return "en"
+	}
+	return locale
+}
+
+// TracingConfig controls OpenTelemetry trace generation and export. Tracing is
+// disabled by default; when disabled, the application uses a no-op provider
+// and never opens a collector connection.
+type TracingConfig struct {
+	Enabled          bool   `env:"OTEL_ENABLED" envDefault:"false"`
+	Exporter         string `env:"OTEL_TRACES_EXPORTER" envDefault:"otlp"` // otlp|none
+	Protocol         string `env:"OTEL_EXPORTER_OTLP_PROTOCOL" envDefault:"grpc"`
+	Endpoint         string `env:"OTEL_EXPORTER_OTLP_ENDPOINT" envDefault:"localhost:4317"`
+	Insecure         bool   `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"true"`
+	ServiceName      string `env:"OTEL_SERVICE_NAME" envDefault:"fiber-golang-boilerplate"`
+	ServiceNamespace string `env:"OTEL_SERVICE_NAMESPACE"`
+	ServiceVersion   string `env:"OTEL_SERVICE_VERSION" envDefault:"dev"`
+	// DeploymentEnvironment is the logical environment (local, staging,
+	// production) reported on every span resource.
+	DeploymentEnvironment string `env:"OTEL_DEPLOYMENT_ENVIRONMENT" envDefault:"local"`
+	// InstanceID identifies one process. Empty means the hostname is used.
+	InstanceID string `env:"OTEL_SERVICE_INSTANCE_ID"`
+	// Sampler accepts the standard OTel names. The default samples every
+	// trace at the root, but always follows a parent's sampling decision.
+	Sampler    string  `env:"OTEL_TRACES_SAMPLER" envDefault:"parentbased_traceidratio"`
+	SamplerArg float64 `env:"OTEL_TRACES_SAMPLER_ARG" envDefault:"1.0"`
+	// ExcludePaths is a comma-separated list of exact request paths (for
+	// example health and metrics probes) that must not create spans.
+	ExcludePaths string `env:"OTEL_TRACING_EXCLUDE_PATHS" envDefault:"/healthz,/readyz,/health,/metrics"`
+	// InstrumentDB adds sanitized client spans for pgx queries that run under
+	// a recording parent span.
+	InstrumentDB bool `env:"OTEL_INSTRUMENT_DB" envDefault:"true"`
+
+	BatchTimeout       int `env:"OTEL_BATCH_TIMEOUT_SECS" envDefault:"5"`
+	ExportTimeout      int `env:"OTEL_EXPORT_TIMEOUT_SECS" envDefault:"30"`
+	ShutdownTimeout    int `env:"OTEL_SHUTDOWN_TIMEOUT_SECS" envDefault:"10"`
+	MaxQueueSize       int `env:"OTEL_BATCH_MAX_QUEUE_SIZE" envDefault:"2048"`
+	MaxExportBatchSize int `env:"OTEL_BATCH_MAX_EXPORT_BATCH_SIZE" envDefault:"512"`
+}
+
+// ExcludedPaths returns the parsed list of paths that are not traced.
+func (t TracingConfig) ExcludedPaths() []string {
+	return splitCSV(t.ExcludePaths)
+}
+
+// Validate checks tracing settings only when tracing is enabled. A disabled
+// configuration is inert, so stale or partial OTEL_* values cannot break a
+// deployment that does not use tracing.
+func (t TracingConfig) Validate() error {
+	if !t.Enabled {
+		return nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(t.Exporter)) {
+	case "otlp", "none":
+	default:
+		return fmt.Errorf("OTEL_TRACES_EXPORTER must be one of: otlp, none (got %q)", t.Exporter)
+	}
+	if proto := strings.ToLower(strings.TrimSpace(t.Protocol)); proto != "grpc" {
+		return fmt.Errorf("OTEL_EXPORTER_OTLP_PROTOCOL must be grpc (got %q)", t.Protocol)
+	}
+	if strings.TrimSpace(t.ServiceName) == "" {
+		return fmt.Errorf("OTEL_SERVICE_NAME must not be empty")
+	}
+	if strings.TrimSpace(t.DeploymentEnvironment) == "" {
+		return fmt.Errorf("OTEL_DEPLOYMENT_ENVIRONMENT must not be empty")
+	}
+	if strings.TrimSpace(t.Sampler) == "" {
+		return fmt.Errorf("OTEL_TRACES_SAMPLER must not be empty")
+	}
+	switch strings.ToLower(strings.TrimSpace(t.Sampler)) {
+	case "parentbased_traceidratio", "parentbased_always_on", "parentbased_always_off",
+		"traceidratio", "always_on", "always_off":
+	default:
+		return fmt.Errorf("OTEL_TRACES_SAMPLER %q is not supported", t.Sampler)
+	}
+	if t.SamplerArg < 0 || t.SamplerArg > 1 {
+		return fmt.Errorf("OTEL_TRACES_SAMPLER_ARG must be between 0 and 1 (got %v)", t.SamplerArg)
+	}
+	if strings.EqualFold(strings.TrimSpace(t.Exporter), "otlp") {
+		if err := validateOTLPEndpoint(t.Endpoint); err != nil {
+			return err
+		}
+	}
+	if t.BatchTimeout < 1 {
+		return fmt.Errorf("OTEL_BATCH_TIMEOUT_SECS must be at least 1 second")
+	}
+	if t.ExportTimeout < 1 {
+		return fmt.Errorf("OTEL_EXPORT_TIMEOUT_SECS must be at least 1 second")
+	}
+	if t.ShutdownTimeout < 1 {
+		return fmt.Errorf("OTEL_SHUTDOWN_TIMEOUT_SECS must be at least 1 second")
+	}
+	if t.MaxQueueSize < 1 {
+		return fmt.Errorf("OTEL_BATCH_MAX_QUEUE_SIZE must be at least 1")
+	}
+	if t.MaxExportBatchSize < 1 {
+		return fmt.Errorf("OTEL_BATCH_MAX_EXPORT_BATCH_SIZE must be at least 1")
+	}
+	if t.MaxExportBatchSize > t.MaxQueueSize {
+		return fmt.Errorf("OTEL_BATCH_MAX_EXPORT_BATCH_SIZE (%d) must not exceed OTEL_BATCH_MAX_QUEUE_SIZE (%d)",
+			t.MaxExportBatchSize, t.MaxQueueSize)
+	}
+	for _, path := range t.ExcludedPaths() {
+		if !strings.HasPrefix(path, "/") {
+			return fmt.Errorf("OTEL_TRACING_EXCLUDE_PATHS entries must start with '/' (got %q)", path)
+		}
+	}
+	return nil
+}
+
+// validateOTLPEndpoint rejects URLs and empty values so a typo fails at
+// startup instead of silently exporting nowhere.
+func validateOTLPEndpoint(endpoint string) error {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		return fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must not be empty when OTEL_TRACES_EXPORTER=otlp")
+	}
+	if strings.Contains(endpoint, "://") {
+		return fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must be host:port without a scheme (got %q)", endpoint)
+	}
+	if _, _, err := net.SplitHostPort(endpoint); err != nil {
+		return fmt.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT must be host:port (got %q)", endpoint)
+	}
+	return nil
+}
+
+// FeatureFlagsConfig controls environment overrides, emergency force-off, and
+// the in-process snapshot cache used by internal/platform/features.
+type FeatureFlagsConfig struct {
+	// Flags is a comma-separated key=true|false list; a bare key means true,
+	// e.g. "user_registration,email_verification=false".
+	Flags string `env:"FEATURE_FLAGS"`
+	// ForceOff is a comma-separated list of keys that always evaluate false,
+	// even when a database default or user/tenant target enables them.
+	ForceOff string `env:"FEATURE_FLAGS_FORCE_OFF"`
+	// CacheTTLSeconds is how long a loaded snapshot is considered fresh.
+	CacheTTLSeconds int `env:"FEATURE_FLAGS_CACHE_TTL_SECONDS" envDefault:"30"`
+	// MaxStalenessSeconds bounds how long the last good snapshot may be used
+	// while the database is unavailable.
+	MaxStalenessSeconds int `env:"FEATURE_FLAGS_MAX_STALENESS_SECONDS" envDefault:"300"`
+}
+
+// CacheTTL returns the configured snapshot TTL, applying the package default
+// for zero values.
+func (f FeatureFlagsConfig) CacheTTL() time.Duration {
+	if f.CacheTTLSeconds <= 0 {
+		return features.DefaultCacheTTL
+	}
+	return time.Duration(f.CacheTTLSeconds) * time.Second
+}
+
+// MaxStaleness returns the configured stale-snapshot bound. It is never lower
+// than the cache TTL.
+func (f FeatureFlagsConfig) MaxStaleness() time.Duration {
+	maxStaleness := features.DefaultMaxStaleness
+	if f.MaxStalenessSeconds > 0 {
+		maxStaleness = time.Duration(f.MaxStalenessSeconds) * time.Second
+	}
+	if ttl := f.CacheTTL(); maxStaleness < ttl {
+		maxStaleness = ttl
+	}
+	return maxStaleness
+}
+
+// EnvValues parses FEATURE_FLAGS. Config validation has already rejected
+// malformed input in the normal Load path; invalid values here degrade to an
+// empty map so a partially built Config in tests cannot panic.
+func (f FeatureFlagsConfig) EnvValues() map[features.Key]bool {
+	values, err := features.ParseFlags(f.Flags)
+	if err != nil {
+		return map[features.Key]bool{}
+	}
+	return values
+}
+
+// ForceOffValues parses FEATURE_FLAGS_FORCE_OFF.
+func (f FeatureFlagsConfig) ForceOffValues() map[features.Key]struct{} {
+	values, err := features.ParseForceOff(f.ForceOff)
+	if err != nil {
+		return map[features.Key]struct{}{}
+	}
+	return values
+}
+
+// SchedulerConfig controls the optional PostgreSQL-leader scheduler. Interval
+// and cron schedules execute in UTC; the default is disabled so a deployment
+// only runs schedules after an explicit opt-in.
+type SchedulerConfig struct {
+	Enabled       bool   `env:"SCHEDULER_ENABLED" envDefault:"false"`
+	LeaseTTLSecs  int    `env:"SCHEDULER_LEASE_TTL_SECS" envDefault:"30"`
+	HeartbeatSecs int    `env:"SCHEDULER_HEARTBEAT_SECS" envDefault:"10"`
+	PollSecs      int    `env:"SCHEDULER_POLL_SECS" envDefault:"15"`
+	Catchup       string `env:"SCHEDULER_CATCHUP" envDefault:"latest"`
+	CatchupLimit  int    `env:"SCHEDULER_CATCHUP_LIMIT" envDefault:"100"`
+	RetentionDays int    `env:"SCHEDULER_RETENTION_DAYS" envDefault:"30"`
+}
+
+// LeaseTTL returns the configured lease duration.
+func (s SchedulerConfig) LeaseTTL() time.Duration {
+	return time.Duration(s.LeaseTTLSecs) * time.Second
+}
+
+// HeartbeatInterval returns the configured lease heartbeat interval.
+func (s SchedulerConfig) HeartbeatInterval() time.Duration {
+	return time.Duration(s.HeartbeatSecs) * time.Second
+}
+
+// PollInterval returns the configured schedule evaluation interval.
+func (s SchedulerConfig) PollInterval() time.Duration {
+	return time.Duration(s.PollSecs) * time.Second
+}
+
+// Retention returns the configured scheduler_runs retention window.
+func (s SchedulerConfig) Retention() time.Duration {
+	return time.Duration(s.RetentionDays) * 24 * time.Hour
+}
+
+// Validate checks scheduler timing and catch-up settings. The defaults are
+// valid even when the scheduler is disabled; enabling it never requires a
+// second config pass.
+func (s SchedulerConfig) Validate() error {
+	// Programmatic configs in tests and embedders may leave the optional
+	// scheduler block unset; env.Load fills it with defaults.
+	if s == (SchedulerConfig{}) {
+		return nil
+	}
+	if s.LeaseTTLSecs < 1 {
+		return fmt.Errorf("SCHEDULER_LEASE_TTL_SECS must be at least 1")
+	}
+	if s.HeartbeatSecs < 1 {
+		return fmt.Errorf("SCHEDULER_HEARTBEAT_SECS must be at least 1")
+	}
+	if s.HeartbeatSecs >= s.LeaseTTLSecs {
+		return fmt.Errorf("SCHEDULER_HEARTBEAT_SECS (%d) must be less than SCHEDULER_LEASE_TTL_SECS (%d)", s.HeartbeatSecs, s.LeaseTTLSecs)
+	}
+	if s.PollSecs < 1 {
+		return fmt.Errorf("SCHEDULER_POLL_SECS must be at least 1")
+	}
+	switch strings.ToLower(strings.TrimSpace(s.Catchup)) {
+	case "none", "latest", "all":
+	default:
+		return fmt.Errorf("SCHEDULER_CATCHUP must be one of: none, latest, all (got %q)", s.Catchup)
+	}
+	if s.CatchupLimit < 1 {
+		return fmt.Errorf("SCHEDULER_CATCHUP_LIMIT must be at least 1")
+	}
+	if s.RetentionDays < 1 {
+		return fmt.Errorf("SCHEDULER_RETENTION_DAYS must be at least 1")
+	}
+	return nil
+}
+
+// WebhookConfig controls outbound delivery, inbound verification, and secret
+// encryption at rest. The signing key is sealed with a key derived from
+// SecretEncryptionKey; when that is empty the JWT secret is used as a
+// compatibility fallback (never in production).
+type WebhookConfig struct {
+	SecretEncryptionKey       string `env:"WEBHOOK_SECRET_ENCRYPTION_KEY"`
+	ConnectTimeoutSeconds     int    `env:"WEBHOOK_CONNECT_TIMEOUT_SECS" envDefault:"5"`
+	RequestTimeoutSeconds     int    `env:"WEBHOOK_REQUEST_TIMEOUT_SECS" envDefault:"10"`
+	RetryBaseSeconds          int    `env:"WEBHOOK_RETRY_BASE_SECS" envDefault:"5"`
+	RetryMaxSeconds           int    `env:"WEBHOOK_RETRY_MAX_SECS" envDefault:"3600"`
+	MaxAttempts               int    `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"8"`
+	RetentionDays             int    `env:"WEBHOOK_RETENTION_DAYS" envDefault:"30"`
+	TimestampToleranceSeconds int    `env:"WEBHOOK_TIMESTAMP_TOLERANCE_SECS" envDefault:"300"`
+	// SSRFAllowlist permits private/loopback targets for trusted receivers.
+	// Entries are comma-separated IPs, CIDRs, or exact hostnames. Empty keeps
+	// the default deny for every non-public address.
+	SSRFAllowlist string `env:"WEBHOOK_SSRF_ALLOWLIST"`
+}
+
+// ResolvedSecretKey returns the dedicated webhook encryption key, or the JWT
+// secret as the documented compatibility fallback.
+func (w WebhookConfig) ResolvedSecretKey(jwtSecret string) string {
+	if key := strings.TrimSpace(w.SecretEncryptionKey); key != "" {
+		return key
+	}
+	return jwtSecret
+}
+
+// SSRFAllowlistEntries returns the parsed allowlist entries.
+func (w WebhookConfig) SSRFAllowlistEntries() []string {
+	return splitCSV(w.SSRFAllowlist)
+}
+
+// RequestTimeout returns the per-delivery HTTP timeout.
+func (w WebhookConfig) RequestTimeout() time.Duration {
+	return time.Duration(w.RequestTimeoutSeconds) * time.Second
+}
+
+// ConnectTimeout returns the TCP/TLS connect timeout.
+func (w WebhookConfig) ConnectTimeout() time.Duration {
+	return time.Duration(w.ConnectTimeoutSeconds) * time.Second
+}
+
+// RetryBase returns the first retry backoff delay.
+func (w WebhookConfig) RetryBase() time.Duration {
+	return time.Duration(w.RetryBaseSeconds) * time.Second
+}
+
+// RetryMax returns the maximum retry backoff delay.
+func (w WebhookConfig) RetryMax() time.Duration {
+	return time.Duration(w.RetryMaxSeconds) * time.Second
+}
+
+// Retention returns how long delivery and inbound-event history is retained.
+func (w WebhookConfig) Retention() time.Duration {
+	return time.Duration(w.RetentionDays) * 24 * time.Hour
+}
+
+// TimestampTolerance returns the accepted inbound signature clock skew.
+func (w WebhookConfig) TimestampTolerance() time.Duration {
+	return time.Duration(w.TimestampToleranceSeconds) * time.Second
+}
+
+// TenantConfig controls request-tenant resolution. The default slug preserves
+// compatibility for requests that do not send X-Tenant-Slug in local/test.
+// Production validation requires RequireHeader so HTTP writes cannot silently
+// fall back to the compatibility tenant.
+type TenantConfig struct {
+	DefaultSlug   string `env:"TENANT_DEFAULT_SLUG" envDefault:"default"`
+	RequireHeader bool   `env:"TENANT_REQUIRE_HEADER" envDefault:"false"`
+}
+
+var tenantSlugPattern = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
 
 type AdminConfig struct {
 	Email    string `env:"ADMIN_EMAIL"`
@@ -60,8 +408,8 @@ func (a AppConfig) TrustedProxiesList() []string {
 type CORSConfig struct {
 	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
 	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
-	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization,Idempotency-Key"`
-	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed"`
+	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"`
+	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link"`
 	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }
 
@@ -295,6 +643,89 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("JWT_REFRESH_EXPIRE_DAYS must be at least 1")
 	}
 
+	// Tenant slugs are used as external identifiers and must stay DNS-safe.
+	if !tenantSlugPattern.MatchString(cfg.Tenant.DefaultSlug) {
+		return fmt.Errorf("TENANT_DEFAULT_SLUG must match [a-z0-9-]{1,63} (got %q)", cfg.Tenant.DefaultSlug)
+	}
+
+	// Feature flags: reject unknown/malformed keys so a typo cannot silently
+	// disable a feature. Zero cache values mean "use the package defaults";
+	// negative values are configuration errors.
+	parsedFlags, err := features.ParseFlags(cfg.FeatureFlags.Flags)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	if err := features.KnownKeysError(parsedFlags); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS: %w", err)
+	}
+	forceOff, err := features.ParseForceOff(cfg.FeatureFlags.ForceOff)
+	if err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	if err := features.KnownForceOffError(forceOff); err != nil {
+		return fmt.Errorf("FEATURE_FLAGS_FORCE_OFF: %w", err)
+	}
+	if cfg.FeatureFlags.CacheTTLSeconds < 0 {
+		return fmt.Errorf("FEATURE_FLAGS_CACHE_TTL_SECONDS must not be negative")
+	}
+	if cfg.FeatureFlags.MaxStalenessSeconds < 0 {
+		return fmt.Errorf("FEATURE_FLAGS_MAX_STALENESS_SECONDS must not be negative")
+	}
+	if cfg.FeatureFlags.CacheTTLSeconds > 0 && cfg.FeatureFlags.MaxStalenessSeconds > 0 &&
+		cfg.FeatureFlags.MaxStalenessSeconds < cfg.FeatureFlags.CacheTTLSeconds {
+		return fmt.Errorf(
+			"FEATURE_FLAGS_MAX_STALENESS_SECONDS (%d) must be at least FEATURE_FLAGS_CACHE_TTL_SECONDS (%d)",
+			cfg.FeatureFlags.MaxStalenessSeconds, cfg.FeatureFlags.CacheTTLSeconds,
+		)
+	}
+
+	// Webhook delivery bounds and secret encryption. The dedicated key must be
+	// strong and is mandatory in production; outside production the JWT secret
+	// is the documented fallback so local installs work without extra setup.
+	wh := cfg.Webhook
+	if wh.ConnectTimeoutSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_CONNECT_TIMEOUT_SECS must be at least 1")
+	}
+	if wh.RequestTimeoutSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_REQUEST_TIMEOUT_SECS must be at least 1")
+	}
+	if wh.RequestTimeoutSeconds > 120 {
+		return fmt.Errorf("WEBHOOK_REQUEST_TIMEOUT_SECS must be at most 120")
+	}
+	if wh.ConnectTimeoutSeconds > wh.RequestTimeoutSeconds {
+		return fmt.Errorf("WEBHOOK_CONNECT_TIMEOUT_SECS must not exceed WEBHOOK_REQUEST_TIMEOUT_SECS")
+	}
+	if wh.RetryBaseSeconds < 1 {
+		return fmt.Errorf("WEBHOOK_RETRY_BASE_SECS must be at least 1")
+	}
+	if wh.RetryMaxSeconds < wh.RetryBaseSeconds {
+		return fmt.Errorf("WEBHOOK_RETRY_MAX_SECS must be at least WEBHOOK_RETRY_BASE_SECS")
+	}
+	if wh.RetryMaxSeconds > 604800 {
+		return fmt.Errorf("WEBHOOK_RETRY_MAX_SECS must be at most 604800")
+	}
+	if wh.MaxAttempts < 1 || wh.MaxAttempts > 50 {
+		return fmt.Errorf("WEBHOOK_MAX_ATTEMPTS must be between 1 and 50")
+	}
+	if wh.RetentionDays < 1 || wh.RetentionDays > 3650 {
+		return fmt.Errorf("WEBHOOK_RETENTION_DAYS must be between 1 and 3650")
+	}
+	if wh.TimestampToleranceSeconds < 30 || wh.TimestampToleranceSeconds > 3600 {
+		return fmt.Errorf("WEBHOOK_TIMESTAMP_TOLERANCE_SECS must be between 30 and 3600")
+	}
+	if key := strings.TrimSpace(wh.SecretEncryptionKey); key != "" && len(key) < 32 {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY must be at least 32 characters")
+	}
+	if cfg.App.Env == "production" && strings.TrimSpace(wh.SecretEncryptionKey) == "" {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY must be set in production")
+	}
+	if strings.TrimSpace(wh.ResolvedSecretKey(cfg.JWT.Secret)) == "" {
+		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY or JWT_SECRET must be set")
+	}
+	if _, err := webhook.NewGuard(wh.SSRFAllowlistEntries()); err != nil {
+		return fmt.Errorf("invalid WEBHOOK_SSRF_ALLOWLIST: %w", err)
+	}
+
 	if cfg.App.BodyLimit < 1 {
 		return fmt.Errorf("APP_BODY_LIMIT must be at least 1 byte")
 	}
@@ -310,6 +741,14 @@ func (cfg *Config) Validate() error {
 
 	// Database pool validation
 	if err := cfg.DB.Validate(); err != nil {
+		return err
+	}
+
+	// Observability: tracing is inert unless explicitly enabled.
+	if err := cfg.Tracing.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.Scheduler.Validate(); err != nil {
 		return err
 	}
 
@@ -398,6 +837,12 @@ func (cfg *Config) Validate() error {
 	// Production-only safety rails. These would break local development
 	// defaults, so they are enforced only for the production environment.
 	if cfg.App.Env == "production" {
+		// Header-less requests must not silently fall back to the compatibility
+		// tenant in production. Requiring the header makes tenant selection
+		// explicit for every HTTP write and lets links carry a known slug.
+		if !cfg.Tenant.RequireHeader {
+			return fmt.Errorf("TENANT_REQUIRE_HEADER must be true in production so header-less writes cannot fall back to the default tenant")
+		}
 		if cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
 			return fmt.Errorf("APP_BODY_LIMIT (%d) must be greater than STORAGE_MAX_FILE_SIZE (%d) to allow multipart framing", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
 		}

@@ -14,17 +14,28 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Admin creates an admin user if ADMIN_EMAIL and ADMIN_PASSWORD are set
 // and the user does not already exist. It is safe to call on every startup (idempotent).
-func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.UserRepository) error {
+//
+// The optional tenant ID selects the tenant that owns the seeded admin. Callers
+// pass the configured default tenant; when omitted, the compatibility tenant
+// (id 1, slug "default") is used.
+func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.UserRepository, tenantIDs ...int64) error {
 	if cfg.Email == "" || cfg.Password == "" {
 		slog.Debug("ADMIN_EMAIL or ADMIN_PASSWORD not set, skipping admin seed")
 		return nil
 	}
+
+	tenantID := tenant.DefaultID
+	if len(tenantIDs) > 0 && tenantIDs[0] > 0 {
+		tenantID = tenantIDs[0]
+	}
+	ctx = tenant.WithID(ctx, tenantID)
 
 	email := strings.ToLower(strings.TrimSpace(cfg.Email))
 	name := strings.TrimSpace(cfg.Name)
@@ -57,8 +68,9 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 			return fmt.Errorf("ADMIN_EMAIL %q already belongs to a non-admin account with a different password", email)
 		}
 		promoted, err := userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
-			ID:   existing.ID,
-			Role: dto.RoleAdmin,
+			TenantID: tenantID,
+			ID:       existing.ID,
+			Role:     dto.RoleAdmin,
 		})
 		if err != nil {
 			return fmt.Errorf("promote existing admin user: %w", err)
@@ -89,6 +101,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 	}
 
 	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
+		TenantID:     tenantID,
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -105,8 +118,9 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 	}
 
 	adminUser, err := userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
-		ID:   user.ID,
-		Role: dto.RoleAdmin,
+		TenantID: tenantID,
+		ID:       user.ID,
+		Role:     dto.RoleAdmin,
 	})
 	if err != nil {
 		return fmt.Errorf("set admin role: %w", err)

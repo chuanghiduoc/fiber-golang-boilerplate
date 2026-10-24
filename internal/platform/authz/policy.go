@@ -1,0 +1,152 @@
+package authz
+
+import (
+	"context"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+)
+
+// Decision is the outcome of a policy evaluation.
+type Decision uint8
+
+const (
+	// Allow grants access.
+	Allow Decision = iota
+	// Deny rejects access with 403 (permission.denied).
+	Deny
+	// Conceal rejects access with 404 so the caller cannot learn whether the
+	// resource exists in another tenant or belongs to another user.
+	Conceal
+)
+
+// DecisionAllow, DecisionDeny, and DecisionConceal are aliases for callers
+// that prefer the prefixed spelling.
+const (
+	DecisionAllow   = Allow
+	DecisionDeny    = Deny
+	DecisionConceal = Conceal
+)
+
+// String renders a decision for logs and tests.
+func (d Decision) String() string {
+	switch d {
+	case Allow:
+		return "allow"
+	case Deny:
+		return "deny"
+	case Conceal:
+		return "conceal"
+	default:
+		return "unknown"
+	}
+}
+
+// Resource is the object a policy evaluates. TenantID and OwnerID are the
+// only facts the built-in policies need; modules may use additional subject
+// attributes for their own policies.
+type Resource struct {
+	TenantID int64
+	OwnerID  int64
+}
+
+// Policy evaluates a subject against a resource.
+type Policy interface {
+	Evaluate(subject Subject, resource Resource) Decision
+}
+
+// PolicyFunc adapts a function to Policy.
+type PolicyFunc func(subject Subject, resource Resource) Decision
+
+// Evaluate implements Policy.
+func (f PolicyFunc) Evaluate(subject Subject, resource Resource) Decision {
+	return f(subject, resource)
+}
+
+// PolicySet combines policies. Evaluation is deny-overrides: any Deny makes
+// the set deny even if another policy allows. Conceal is preserved when no
+// policy denies, so cross-tenant/owner checks map to 404. An empty set denies
+// (fail closed).
+type PolicySet []Policy
+
+// NewPolicySet builds a PolicySet from the supplied policies.
+func NewPolicySet(policies ...Policy) PolicySet {
+	return PolicySet(policies)
+}
+
+// Evaluate implements Policy.
+func (p PolicySet) Evaluate(subject Subject, resource Resource) Decision {
+	if len(p) == 0 {
+		return Deny
+	}
+	decision := Allow
+	for _, policy := range p {
+		if policy == nil {
+			return Deny
+		}
+		switch policy.Evaluate(subject, resource) {
+		case Deny:
+			// Deny overrides every other outcome, including a later conceal.
+			return Deny
+		case Conceal:
+			decision = Conceal
+		}
+	}
+	return decision
+}
+
+// TenantPolicy allows access only within the subject's tenant. A
+// platform-level subject with CrossTenant set may pass. A mismatch is concealed
+// (404) so cross-tenant resource ids do not reveal existence.
+type TenantPolicy struct{}
+
+// Evaluate implements Policy.
+func (TenantPolicy) Evaluate(subject Subject, resource Resource) Decision {
+	if subject.CrossTenant || subject.TenantID == resource.TenantID {
+		return Allow
+	}
+	return Conceal
+}
+
+// OwnerPolicy allows access only to the resource owner. A mismatch is
+// concealed (404). Callers normally combine it with TenantPolicy so both
+// boundaries are checked.
+type OwnerPolicy struct{}
+
+// Evaluate implements Policy.
+func (OwnerPolicy) Evaluate(subject Subject, resource Resource) Decision {
+	if subject.UserID == resource.OwnerID {
+		return Allow
+	}
+	return Conceal
+}
+
+// Authorize performs an RBAC pre-check followed by policy evaluation using the
+// subject stored in ctx by WithSubject (normally installed by JWTAuth or the
+// API-key middleware). Deny maps to 403 permission.denied; Conceal maps to 404
+// not found. A missing subject fails closed with 403.
+func Authorize(ctx context.Context, permission Permission, resource Resource, policies ...Policy) error {
+	subject, ok := SubjectFromContext(ctx)
+	if !ok {
+		return permissionDenied()
+	}
+	return AuthorizeSubject(subject, permission, resource, policies...)
+}
+
+// AuthorizeSubject is Authorize for callers that already hold a Subject.
+func AuthorizeSubject(subject Subject, permission Permission, resource Resource, policies ...Policy) error {
+	if !subject.Has(permission) {
+		return permissionDenied()
+	}
+	switch PolicySet(policies).Evaluate(subject, resource) {
+	case Allow:
+		return nil
+	case Conceal:
+		return apperror.NewNotFound("resource not found")
+	default:
+		return permissionDenied()
+	}
+}
+
+func permissionDenied() error {
+	return apperror.NewCode(apperror.CodePermissionDenied, "insufficient permissions")
+}

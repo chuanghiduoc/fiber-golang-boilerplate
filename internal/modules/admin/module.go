@@ -5,6 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
@@ -23,8 +24,9 @@ func (m *Module) Name() string { return "admin" }
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	cfg := deps.Config
+	auth := apikey.Authenticate(middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions), deps.APIKeyVerifier)
 	adminGroup := v1.Group("/admin",
-		middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions),
+		auth,
 		deps.Limiters.Normal,
 	)
 	adminGroup.Get("/stats", authz.Require(authz.PermissionAdminStatsRead), m.admin.GetStats)

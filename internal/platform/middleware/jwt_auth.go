@@ -5,7 +5,12 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -14,6 +19,13 @@ import (
 // confirms that the account still exists and that its role/token version match
 // the claims. The optional variadic form keeps tests and simple deployments
 // working without a session store.
+//
+// The global tenant middleware runs first and resolves X-Tenant-Slug (or the
+// configured default) into the tenant_id local. A token's positive tenant_id
+// claim is authoritative for authenticated requests; an explicitly supplied
+// header that resolves to a different tenant is rejected with 403. Tokens
+// minted before multi-tenancy carry no tenant claim and are rejected
+// fail-closed: deployments must rotate those tokens after upgrading.
 func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 	var store session.Store
 	if len(stores) > 0 {
@@ -36,8 +48,30 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 			return apperror.NewUnauthorized("invalid or expired token")
 		}
 
+		if claims.TenantID <= 0 {
+			return apperror.NewUnauthorized("token is missing tenant")
+		}
+
+		// Only an explicit header can conflict. The tenant middleware also
+		// resolves an absent header to the default tenant, which must not make
+		// every non-default JWT fail with 403. tenant_id is authoritative for
+		// scoping; tenant_slug must describe that same tenant. When the claim
+		// overrides a header-less default resolution we do not know the slug,
+		// so clear it instead of leaving a misleading "default".
+		headerSlug := strings.TrimSpace(c.Get(tenant.Header))
+		resolvedTenantID := fiber.Locals[int64](c, "tenant_id")
+		if headerSlug != "" && resolvedTenantID != claims.TenantID {
+			return apperror.NewCode(apperror.CodePermissionDenied, "tenant mismatch")
+		}
+		if headerSlug == "" && resolvedTenantID != 0 && resolvedTenantID != claims.TenantID {
+			fiber.Locals[string](c, "tenant_slug", "")
+			c.SetContext(tenant.WithSlug(c.Context(), ""))
+		}
+		fiber.Locals[int64](c, "tenant_id", claims.TenantID)
+		c.SetContext(tenant.WithID(c.Context(), claims.TenantID))
+
 		if store != nil {
-			if err := store.Validate(c.Context(), claims.UserID, claims.Role, claims.TokenVersion); err != nil {
+			if err := store.Validate(c.Context(), claims.UserID, claims.TenantID, claims.Role, claims.TokenVersion); err != nil {
 				return err
 			}
 		}
@@ -45,6 +79,20 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 		fiber.Locals[int64](c, "user_id", claims.UserID)
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
+		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
+		authz.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role))
+
+		// Services publish events with the request context, so the actor must
+		// be available there too, not only in Fiber locals.
+		c.SetContext(requestctx.WithActorID(c.Context(), claims.UserID))
+
+		// Tier 1 services write their audit rows inside the mutation
+		// transaction; they need the actor and request metadata in the
+		// context passed to the service.
+		ctx := audit.WithActor(c.Context(), claims.UserID, claims.Role)
+		ctx = audit.WithRequestMeta(ctx,
+			fiber.Locals[string](c, "request_id"), c.IP(), c.Get("User-Agent"))
+		c.SetContext(ctx)
 
 		return c.Next()
 	}

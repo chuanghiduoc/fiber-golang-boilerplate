@@ -6,6 +6,7 @@ package app
 import (
 	"context"
 	"crypto/subtle"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/contrib/v3/swagger"
@@ -15,9 +16,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/versioning"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -28,6 +39,35 @@ import (
 type Module interface {
 	Name() string
 	RegisterRoutes(v1 fiber.Router, deps Deps)
+}
+
+// V2Module is optionally implemented by modules with a second API surface.
+// Modules that do not implement it are mounted only under /api/v1, and the
+// /api/v2 group is not created unless at least one module opts in.
+type V2Module interface {
+	Module
+	RegisterV2Routes(v2 fiber.Router, deps Deps)
+}
+
+// EventProvider is an optional module capability. RegisterEvents runs after
+// the module's routes are mounted and before the bus registers durable job
+// handlers, so modules may subscribe immediately or durably. A module without
+// events simply does not implement it.
+type EventProvider interface {
+	RegisterEvents(bus *events.Bus)
+}
+
+// JobProvider is an optional module capability for durable job handlers. The
+// scheduler and event bus use the same worker, so registration is additive.
+type JobProvider interface {
+	RegisterJobs(registrar jobs.Registrar)
+}
+
+// ScheduleProvider is an optional module capability for registering periodic
+// schedules. It is only invoked when the scheduler is enabled in the
+// composition root; a nil registry is skipped.
+type ScheduleProvider interface {
+	RegisterSchedules(registry *scheduler.Registry)
 }
 
 // Limiters carries the tiered rate limiters so modules do not rebuild them.
@@ -47,6 +87,39 @@ type Deps struct {
 	Limiters    Limiters
 	Audit       audit.Recorder
 	Idempotency fiber.Handler
+	// Tracing is the process tracer provider. Nil means tracing is disabled.
+	Tracing *tracing.Provider
+	// TenantResolver resolves X-Tenant-Slug (plus the browser auth query
+	// fallback) for public routes. A nil resolver is a pass-through for tests
+	// and minimal deployments.
+	TenantResolver tenant.Resolver
+	// I18n negotiates Accept-Language and localizes error responses. Nil
+	// disables negotiation and preserves the default English behavior.
+	I18n *i18n.Bundle
+	// Versioning configures deprecation/sunset metadata for API groups. Nil is
+	// equivalent to v1, current, with no deprecation headers.
+	Versioning *versioning.Config
+	// Flags evaluates compile-time feature flags. It is optional for minimal
+	// deployments and tests; New replaces nil with an evaluator backed by
+	// FEATURE_FLAGS/FEATURE_FLAGS_FORCE_OFF and compiled defaults, so modules
+	// never need a nil check.
+	Flags features.Evaluator
+	// Events is the optional in-process/durable event bus. Nil disables
+	// EventProvider registration.
+	Events *events.Bus
+	// Jobs receives module job handlers when a module implements JobProvider.
+	// *jobs.Worker implements it; nil disables JobProvider registration.
+	Jobs jobs.Registrar
+	// Schedules receives module periodic schedules when the scheduler is
+	// enabled. Nil disables ScheduleProvider registration.
+	Schedules *scheduler.Registry
+	// Webhooks publishes domain events to tenant-configured webhook endpoints.
+	// Modules depend on the stdlib-only contracts interface; a nil value is
+	// replaced with a no-op dispatcher.
+	Webhooks webhookcontracts.Dispatcher
+	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
+	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
+	APIKeyVerifier *apikey.Verifier
 }
 
 type App struct {
@@ -60,12 +133,23 @@ type App struct {
 // through Register so the composition root can decide which modules are active.
 func New(cfg *config.Config, deps Deps) *App {
 	deps.Config = cfg
+	if deps.Flags == nil {
+		deps.Flags = features.NewEvaluator(features.Options{
+			Env:          cfg.FeatureFlags.EnvValues(),
+			ForceOff:     cfg.FeatureFlags.ForceOffValues(),
+			CacheTTL:     cfg.FeatureFlags.CacheTTL(),
+			MaxStaleness: cfg.FeatureFlags.MaxStaleness(),
+		})
+	}
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
 	deps.Idempotency = middleware.Idempotency(deps.Cache)
+	if deps.Webhooks == nil {
+		deps.Webhooks = webhookcontracts.Noop{}
+	}
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperror.FiberErrorHandlerWithLocalizer(deps.I18n),
 		BodyLimit:    cfg.App.BodyLimit,
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -110,6 +194,8 @@ func (a *App) setupGlobalMiddleware() {
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(middleware.RequestID())
+	a.fiber.Use(i18n.Middleware(a.deps.I18n))
+	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths()))
 	a.fiber.Use(middleware.Metrics())
 	a.fiber.Use(middleware.Logger())
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
@@ -161,14 +247,78 @@ func (a *App) setupInfrastructureRoutes() {
 	}
 }
 
-// Register mounts every module under /api/v1. It is idempotent only in the
-// sense that the caller must register before Listen; duplicate paths are a
-// programming error caught by Fiber's router.
+// Register mounts every module under /api/v1. Modules that implement V2Module
+// are also mounted under /api/v2; the v2 group is created only when at least
+// one module opts in. Callers must register before Listen; duplicate paths are
+// a programming error caught by Fiber's router.
 func (a *App) Register(modules ...Module) {
-	v1 := a.fiber.Group("/api/v1")
+	supported := []versioning.Version{versioning.V1}
+	hasV2 := false
+	for _, m := range modules {
+		if _, ok := m.(V2Module); ok {
+			hasV2 = true
+			break
+		}
+	}
+	if hasV2 {
+		supported = append(supported, versioning.V2)
+	}
+	// Reject /api/v3/... before routing so an unknown version is a 406
+	// contract error rather than a generic 404.
+	a.fiber.Use("/api", versioning.Guard(supported...))
+
+	// Tenant resolution is API-only: health and metrics probes must not depend
+	// on the tenants table. It runs before every module's JWT middleware so a
+	// conflicting X-Tenant-Slug can be rejected after the token is parsed. The
+	// middleware itself exempts the OAuth callback, whose signed state is the
+	// tenant source.
+	defaultSlug := a.cfg.Tenant.DefaultSlug
+	if a.cfg.Tenant.RequireHeader {
+		defaultSlug = ""
+	}
+	tenantMiddleware := tenant.Middleware(a.deps.TenantResolver, defaultSlug)
+
+	v1 := a.fiber.Group("/api/v1",
+		versioning.Middleware(versioning.V1, a.deps.Versioning),
+		tenantMiddleware,
+	)
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		m.RegisterRoutes(v1, a.deps)
+
+		// Optional capabilities are type assertions: a module that only serves
+		// routes does not need any event/job/schedule plumbing. Nil deps make
+		// each hook a no-op for tests and minimal deployments.
+		if provider, ok := m.(ScheduleProvider); ok && a.deps.Schedules != nil {
+			provider.RegisterSchedules(a.deps.Schedules)
+		}
+		if provider, ok := m.(EventProvider); ok && a.deps.Events != nil {
+			provider.RegisterEvents(a.deps.Events)
+		}
+		if provider, ok := m.(JobProvider); ok && a.deps.Jobs != nil {
+			provider.RegisterJobs(a.deps.Jobs)
+		}
+	}
+
+	// Durable event subscriptions become worker handlers only after every
+	// module has had a chance to subscribe. RegisterJobs is idempotent.
+	if a.deps.Events != nil && a.deps.Jobs != nil {
+		if err := a.deps.Events.RegisterJobs(a.deps.Jobs); err != nil {
+			slog.Warn("failed to register durable event job handlers", slog.Any("error", err))
+		}
+	}
+
+	if !hasV2 {
+		return
+	}
+	v2 := a.fiber.Group("/api/v2",
+		versioning.Middleware(versioning.V2, a.deps.Versioning),
+		tenantMiddleware,
+	)
+	for _, m := range modules {
+		if v2Module, ok := m.(V2Module); ok {
+			v2Module.RegisterV2Routes(v2, a.deps)
+		}
 	}
 }
 

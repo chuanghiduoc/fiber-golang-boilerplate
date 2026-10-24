@@ -15,7 +15,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -490,6 +494,184 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	assert.JSONEq(t, `{"ok":true}`, string(payload))
 }
 
+// TestQueueIntegrationEnqueueOnceDeduplicates covers the producer-retry path:
+// the same tenant/key returns the original row, a different tenant gets its
+// own row, and a rolled-back transactional enqueue leaves nothing behind.
+func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const tenantTwo int64 = 2
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-once-tenant-2', 'Jobs Once Tenant 2')`,
+		tenantTwo,
+	)
+	require.NoError(t, err)
+
+	queue := NewQueue(pool)
+	key := "event:evt-1:handler:1"
+	firstID, created, err := queue.EnqueueOnce(ctx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"first":true}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+
+	secondID, created, err := queue.EnqueueOnce(ctx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"second":true}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, firstID, secondID)
+
+	var (
+		count    int
+		payload  []byte
+		storedID int64
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*), min(id) FROM jobs WHERE tenant_id = 1 AND idempotency_key = $1`, key,
+	).Scan(&count, &storedID))
+	assert.Equal(t, 1, count)
+	assert.Equal(t, firstID, storedID)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT payload FROM jobs WHERE id = $1`, firstID).Scan(&payload))
+	assert.JSONEq(t, `{"first":true}`, string(payload), "deduplication must keep the original payload")
+
+	// The same key in another tenant is independent.
+	otherID, created, err := queue.EnqueueOnce(tenant.WithID(ctx, tenantTwo), Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{"tenant":2}`),
+		IdempotencyKey: key,
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.NotEqual(t, firstID, otherID)
+
+	// A transactional enqueue that rolls back leaves neither job nor dedupe
+	// state behind.
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, _, err = queue.EnqueueOnceTx(ctx, tx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:rolled-back",
+	})
+	require.NoError(t, err)
+	require.NoError(t, tx.Rollback(ctx))
+
+	var exists bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_key = 'event:rolled-back')`,
+	).Scan(&exists))
+	assert.False(t, exists)
+
+	// The transactional commit path deduplicates exactly like the pool path.
+	tx, err = pool.Begin(ctx)
+	require.NoError(t, err)
+	txID, created, err := queue.EnqueueOnceTx(ctx, tx, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:tx",
+	})
+	require.NoError(t, err)
+	assert.True(t, created)
+	require.NoError(t, tx.Commit(ctx))
+
+	tx2, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	againID, created, err := queue.EnqueueOnceTx(ctx, tx2, Job{
+		Kind:           "events.test",
+		Payload:        json.RawMessage(`{}`),
+		IdempotencyKey: "event:tx",
+	})
+	require.NoError(t, err)
+	require.NoError(t, tx2.Commit(ctx))
+	assert.False(t, created)
+	assert.Equal(t, txID, againID)
+}
+
+// TestQueueIntegrationPropagatesTenant covers tenant resolution at enqueue,
+// claim, and handler time: an explicit context tenant is stored on the row and
+// restored by the worker, while an empty context falls back to the default
+// tenant.
+func TestQueueIntegrationPropagatesTenant(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const tenantTwo int64 = 2
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-tenant-2', 'Jobs Tenant 2')`,
+		tenantTwo,
+	)
+	require.NoError(t, err)
+
+	tenantCtx := tenant.WithID(ctx, tenantTwo)
+	queue := NewQueue(pool)
+	store := newPGStore(pool)
+
+	// Transactional enqueue inherits the context tenant.
+	tx, err := pool.Begin(tenantCtx)
+	require.NoError(t, err)
+	txID, err := queue.EnqueueTx(tenantCtx, tx, Job{Kind: "jobs.integration.tenant.tx"})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(tenantCtx))
+
+	var storedTenant int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT tenant_id FROM jobs WHERE id = $1`, txID).Scan(&storedTenant))
+	assert.Equal(t, tenantTwo, storedTenant)
+
+	// Claim returns the tenant so the worker can restore it.
+	claimed, err := store.Claim(tenantCtx, "tenant-claim-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, txID, claimed[0].ID)
+	assert.Equal(t, tenantTwo, claimed[0].TenantID)
+	require.NoError(t, store.Succeed(tenantCtx, txID, "tenant-claim-worker", claimed[0].Attempts))
+
+	// An empty context falls back to the compatibility tenant.
+	defaultID, err := queue.Enqueue(ctx, Job{Kind: "jobs.integration.tenant.default"})
+	require.NoError(t, err)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT tenant_id FROM jobs WHERE id = $1`, defaultID).Scan(&storedTenant))
+	assert.Equal(t, tenant.DefaultID, storedTenant)
+
+	claimed, err = store.Claim(ctx, "default-claim-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, defaultID, claimed[0].ID)
+	assert.Equal(t, tenant.DefaultID, claimed[0].TenantID)
+	require.NoError(t, store.Succeed(ctx, defaultID, "default-claim-worker", claimed[0].Attempts))
+
+	// The worker runs the handler with the job's tenant in context.
+	const kind = "jobs.integration.tenant.handler"
+	received := make(chan int64, 1)
+	worker := NewWorker(pool, "tenant-integration-worker", WithPollInterval(20*time.Millisecond))
+	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
+		received <- tenant.IDFromContext(ctx)
+		return nil
+	})
+	runIntegrationWorker(t, worker)
+
+	_, err = queue.Enqueue(tenantCtx, Job{Kind: kind, MaxAttempts: 3})
+	require.NoError(t, err)
+
+	select {
+	case got := <-received:
+		assert.Equal(t, tenantTwo, got, "handler must see the claimed job tenant")
+	case <-ctx.Done():
+		t.Fatal("handler was not invoked")
+	}
+}
+
 // TestPurgeTerminalIntegration covers the retention delete: only succeeded and
 // dead rows older than the window are removed; recent terminal rows and old
 // queued/running rows are retained.
@@ -762,4 +944,76 @@ func runIntegrationWorker(t *testing.T, worker *Worker) {
 			t.Error("worker did not stop after cancellation")
 		}
 	})
+}
+
+// TestWorkerIntegrationPropagatesTraceParent verifies that the queue persists
+// the enqueue-time W3C traceparent and that the worker starts a new root job
+// span linked to it. The link, rather than parentage, keeps retries independent
+// while preserving causality in the trace UI.
+func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(recorder),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
+
+	enqueueCtx, enqueueSpan := provider.Tracer("test").Start(ctx, "enqueue")
+	enqueueSnapshot := enqueueSpan.SpanContext()
+	traceparent := tracing.CaptureRemoteContext(enqueueCtx)
+	require.NotEmpty(t, traceparent)
+
+	queue := NewQueue(pool)
+	id, err := queue.Enqueue(enqueueCtx, Job{
+		Kind:        "jobs.integration.traced",
+		Payload:     json.RawMessage(`{"value":1}`),
+		MaxAttempts: 2,
+	})
+	require.NoError(t, err)
+	enqueueSpan.End()
+
+	var stored *string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT trace_parent FROM jobs WHERE id = $1`, id).Scan(&stored))
+	require.NotNil(t, stored)
+	assert.Equal(t, traceparent, *stored)
+
+	worker := NewWorker(pool, "trace-integration-worker",
+		WithPollInterval(20*time.Millisecond),
+		WithTracerProvider(provider),
+	)
+	worker.Register("jobs.integration.traced", func(context.Context, json.RawMessage) error { return nil })
+	runIntegrationWorker(t, worker)
+
+	require.Eventually(t, func() bool {
+		var status string
+		err := pool.QueryRow(ctx, `SELECT status FROM jobs WHERE id = $1`, id).Scan(&status)
+		return err == nil && status == "succeeded"
+	}, 5*time.Second, 20*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		for _, span := range recorder.Ended() {
+			if span.Name() == "job.process" {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 20*time.Millisecond)
+
+	var jobSpan sdktrace.ReadOnlySpan
+	for _, span := range recorder.Ended() {
+		if span.Name() == "job.process" {
+			jobSpan = span
+			break
+		}
+	}
+	require.NotNil(t, jobSpan)
+	assert.False(t, jobSpan.Parent().IsValid(), "job.process must be a new root")
+	require.Len(t, jobSpan.Links(), 1)
+	assert.Equal(t, enqueueSnapshot.TraceID(), jobSpan.Links()[0].SpanContext.TraceID())
+	assert.Equal(t, enqueueSnapshot.SpanID(), jobSpan.Links()[0].SpanContext.SpanID())
 }
