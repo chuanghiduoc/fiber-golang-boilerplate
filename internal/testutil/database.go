@@ -32,7 +32,7 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 	}
 
 	pgContainer, err := postgres.Run(ctx,
-		"postgres:17-alpine",
+		"postgres:18-alpine",
 		postgres.WithDatabase("testdb"),
 		postgres.WithUsername("testuser"),
 		postgres.WithPassword("testpass"),

@@ -4,27 +4,24 @@ package integration_test
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
-// pgForeignKeyViolation is the SQLSTATE PostgreSQL returns for FK failures.
-const pgForeignKeyViolation = "23503"
-
+// requireFKViolation accepts both SQLSTATEs PostgreSQL uses for FK failures:
+// 23503, and 23001 for ON DELETE RESTRICT on PostgreSQL 18+.
 func requireFKViolation(t *testing.T, err error, constraint string) {
 	t.Helper()
-	var pgErr *pgconn.PgError
-	require.True(t, errors.As(err, &pgErr), "expected a PostgreSQL error, got %v", err)
-	assert.Equal(t, pgForeignKeyViolation, pgErr.Code)
-	assert.Equal(t, constraint, pgErr.ConstraintName)
+	got, ok := database.ForeignKeyViolation(err)
+	require.True(t, ok, "expected a foreign key violation, got %v", err)
+	assert.Equal(t, constraint, got)
 }
 
 func schemaInsertID(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int64 {

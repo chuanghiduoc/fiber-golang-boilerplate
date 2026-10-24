@@ -7,10 +7,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Fixed
+- PostgreSQL 18 reports a delete blocked by `ON DELETE RESTRICT` as `23001 restrict_violation` (not `23503`); `database.ForeignKeyViolation` accepts both, so deleting a feature flag that still has targets returns `409` instead of `500`.
 - Cursor pagination no longer degrades on deep pages: every cursor query uses a plain `(created_at, id) < (...)` row comparison (first page binds `('infinity', MaxInt64)` via `DBCursor.CreatedAtParam`/`IDParam`) instead of `NOT has_cursor OR ...`, so the bound is an index condition under generic plans.
 - Google OAuth honors `user_registration` for new accounts: existing and linkable accounts still sign in, but creating an account returns `404 feature.disabled` when registration is off for the tenant.
 
 ### Changed
+- PostgreSQL 18 is the supported server: Compose (`postgres:18-alpine`, data volume renamed to `postgres18_data` and mounted at `/var/lib/postgresql` per the 18+ image layout), CI, and testcontainers. See `docs/operations.md` for moving a local 17 volume.
 - **Breaking:** MinIO replaced by SeaweedFS. `STORAGE_DRIVER` accepts `local | s3 | seaweedfs`; `minio` now fails startup. The S3 client moved from minio-go to the official aws-sdk-go-v2 (`service/s3`); non-AWS endpoints use path-style addressing and request/response checksums only when required. `docker-compose.yml`'s `s3` profile runs `chrislusf/seaweedfs:4.48` (`weed server -s3`, port 8333) with the `STORAGE_S3_*` credentials; the default endpoint is `seaweedfs:8333`.
 - Module self-registration for 100+ modules: `app.PermissionProvider`, `app.ErrorProvider`, `app.LocaleProvider`, and `app.FlagProvider` with `authz.Register`, `apperror.Register`, `features.Register`, and `i18n.New(locale, sources...)` (fail on duplicate/conflicting keys, invalid identifiers, unknown roles, and en/vi parity). Module permissions, error codes, flags, and strings moved to `internal/modules/<m>/catalog/` with unchanged string values; only cross-module/platform entries stay central. `internal/bootstrap` holds the single ordered module list built from `app.Infra` via each module's `Build`; `cmd/api` registers catalogs before validating `FEATURE_FLAGS` (now syntax-only in `config.Load`), building i18n, and serving. Webhook delivery/dispatch jobs register through `app.JobProvider`.
 - Contracts split per provider: `internal/contracts/{identity,files,notifications,webhooks}`.

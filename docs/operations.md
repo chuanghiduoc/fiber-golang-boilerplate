@@ -883,6 +883,28 @@ kubectl -n <namespace> logs job/<migration-job>
   expand/contract for incompatible columns so old and new pods can coexist
   during a rolling update.
 
+### PostgreSQL major version (17 -> 18)
+
+The supported server is PostgreSQL 18 (Compose, CI, and testcontainers use
+`postgres:18`). A major upgrade cannot reuse a 17 data directory as-is:
+
+- **Managed databases:** use the provider's in-place major upgrade (it runs
+  `pg_upgrade`), after a snapshot.
+- **Docker Compose (local):** the 18 service mounts a new `postgres18_data`
+  volume at `/var/lib/postgresql` (the 18+ image keeps `PGDATA` in
+  `/var/lib/postgresql/18/docker`), so the old `postgres_data` volume is left
+  untouched. To keep local data, dump it with the 17 image first, then
+  restore into 18:
+
+  ```bash
+  docker run --rm -v <project>_postgres_data:/var/lib/postgresql/data postgres:17-alpine \
+    sh -c 'pg_ctl -D /var/lib/postgresql/data -w start >/dev/null && pg_dumpall -U postgres' > dump.sql
+  docker compose up -d postgres
+  docker compose exec -T postgres psql -U postgres < dump.sql
+  ```
+
+  Remove `postgres_data` only after the restore is verified.
+
 ## 8. Kubernetes deployment notes
 
 Follow [deploy/k8s/README.md](../deploy/k8s/README.md) for the full commands.
