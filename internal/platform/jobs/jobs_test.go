@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -75,6 +76,58 @@ func TestJobNormalize(t *testing.T) {
 	})
 }
 
+func TestPrepareJobTenant(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		job     Job
+		want    int64
+		wantErr error
+	}{
+		{
+			name: "empty context falls back to default tenant",
+			ctx:  context.Background(),
+			job:  Job{Kind: "email.send"},
+			want: tenant.DefaultID,
+		},
+		{
+			name: "context tenant is inherited",
+			ctx:  tenant.WithID(context.Background(), 2),
+			job:  Job{Kind: "email.send"},
+			want: 2,
+		},
+		{
+			name: "explicit tenant is preserved",
+			ctx:  tenant.WithID(context.Background(), 2),
+			job:  Job{Kind: "email.send", TenantID: 3},
+			want: 3,
+		},
+		{
+			name:    "non-positive tenant is rejected",
+			ctx:     context.Background(),
+			job:     Job{Kind: "email.send", TenantID: -1},
+			wantErr: ErrInvalidTenant,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			job, err := prepareJob(tt.ctx, tt.job, now)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, job.TenantID)
+		})
+	}
+}
+
 func TestScaledBackoff(t *testing.T) {
 	t.Parallel()
 
@@ -125,6 +178,57 @@ func TestProcessJobSucceeds(t *testing.T) {
 
 	assert.Equal(t, []int64{7}, fake.succeededIDs())
 	assert.Empty(t, fake.failures)
+}
+
+func TestProcessJobPropagatesTenantToHandler(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeStore{}
+	worker := NewWorker(nil, "test-worker")
+	worker.store = fake
+
+	var seen int64
+	worker.Register("tenant", func(ctx context.Context, _ json.RawMessage) error {
+		seen = tenant.IDFromContext(ctx)
+		return nil
+	})
+
+	require.NoError(t, worker.processJob(context.Background(), claimedJob{
+		ID:          21,
+		TenantID:    2,
+		Kind:        "tenant",
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    1,
+		MaxAttempts: 3,
+	}))
+
+	assert.Equal(t, int64(2), seen, "handler must run under the job tenant")
+	assert.Equal(t, []int64{21}, fake.succeededIDs())
+}
+
+func TestProcessJobDefaultsMissingTenantToDefault(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeStore{}
+	worker := NewWorker(nil, "test-worker")
+	worker.store = fake
+
+	var seen int64
+	worker.Register("tenant", func(ctx context.Context, _ json.RawMessage) error {
+		seen = tenant.IDFromContext(ctx)
+		return nil
+	})
+
+	require.NoError(t, worker.processJob(context.Background(), claimedJob{
+		ID:          22,
+		Kind:        "tenant",
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    1,
+		MaxAttempts: 3,
+	}))
+
+	assert.Equal(t, tenant.DefaultID, seen,
+		"a claimed job without a tenant must run under the compatibility tenant")
 }
 
 func TestProcessJobRetriesWithBackoff(t *testing.T) {

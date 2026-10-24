@@ -7,6 +7,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -38,7 +39,12 @@ func Middleware(recorder Recorder) fiber.Handler {
 		}
 
 		actorID := fiber.Locals[int64](c, "user_id")
+		tenantID := tenant.ID(c)
+		if tenantID == 0 {
+			tenantID = tenant.EffectiveID(c.Context())
+		}
 		event := Event{
+			TenantID:   tenantID,
 			ActorID:    actorID,
 			Action:     c.Method() + " " + c.Route().Path,
 			Resource:   c.Route().Path,

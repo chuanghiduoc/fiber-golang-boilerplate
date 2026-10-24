@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 // insertEventSQL inserts one audit row. Empty optional values are stored as
 // NULL so "absent" and "empty string" stay distinguishable in the trail.
 const insertEventSQL = `
 INSERT INTO audit_events (
+    tenant_id,
     actor_id,
     action,
     resource,
@@ -23,7 +26,7 @@ INSERT INTO audit_events (
     user_agent,
     request_id,
     created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 // PostgresRecorder writes audit events to the audit_events table.
 type PostgresRecorder struct {
@@ -56,7 +59,16 @@ func (r *PostgresRecorder) Record(ctx context.Context, event Event) error {
 		createdAt = time.Now().UTC()
 	}
 
+	tenantID := event.TenantID
+	if tenantID == 0 {
+		tenantID = tenant.EffectiveID(ctx)
+	}
+	if tenantID <= 0 {
+		tenantID = tenant.DefaultID
+	}
+
 	_, err = r.pool.Exec(ctx, insertEventSQL,
+		tenantID,
 		nullableInt64(event.ActorID),
 		event.Action,
 		event.Resource,

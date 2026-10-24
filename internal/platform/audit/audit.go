@@ -16,10 +16,13 @@ var ErrInvalidEvent = errors.New("audit: invalid event")
 
 // Event describes a single auditable action.
 //
-// ActorID is the acting user, or 0 for anonymous/system actions. Metadata must
-// be JSON-marshalable and should never contain secrets. CreatedAt defaults to
+// TenantID is the owning tenant. A zero value is resolved from the recording
+// context (falling back to the compatibility default tenant). ActorID is the
+// acting user, or 0 for anonymous/system actions. Metadata must be
+// JSON-marshalable and should never contain secrets. CreatedAt defaults to
 // the time the event is recorded when left zero.
 type Event struct {
+	TenantID   int64
 	ActorID    int64
 	Action     string
 	Resource   string

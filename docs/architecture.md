@@ -57,9 +57,14 @@ they never depend on the `tenants` table.
   job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
-- **The foundation does not scope existing queries.** Repositories still read
-  across tenants; the isolation milestone adds `WHERE tenant_id = ...` (or RLS)
-  and tenant-aware registration/login. Do not treat this as data isolation.
+- Durable jobs and audit events propagate the resolved tenant: enqueue writes
+  `jobs.tenant_id` from the context, the worker restores it with
+  `tenant.WithID` before calling a handler, and the audit middleware records
+  the request tenant. Job retention and job metrics stay global.
+- **The foundation does not scope module queries yet.** Identity, files, and
+  admin repositories still read across tenants; the isolation milestone adds
+  `WHERE tenant_id = ...` (or RLS) and tenant-aware registration/login. Do not
+  treat it as data isolation.
 - Google OAuth start/callback does not carry the tenant header yet; Google
   users use the existing lookup path and the stored user tenant.
 
@@ -87,9 +92,13 @@ they never depend on the `tenants` table.
 - One transaction scopes one module/aggregate. Do not span modules in a
   transaction; use jobs/events instead.
 - The `jobs` table is the durable outbox. Enqueue with `Queue.EnqueueTx` so the
-  job commits atomically with the business row.
+  job commits atomically with the business row. Enqueue stores the request
+  tenant in `jobs.tenant_id`; claims return it and the worker restores it in
+  the handler context, so tenant-scoped side effects are possible after the
+  request ends.
 - Email delivery is at-least-once. Handlers must be idempotent. Terminal jobs
-  clear their payload and are purged after retention.
+  clear their payload and are purged after retention; retention is global and
+  ignores tenant boundaries.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
 
@@ -113,7 +122,9 @@ they never depend on the `tenants` table.
   matrix. Current legacy exceptions (`files` routes, some identity handler
   checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** successful mutating requests are recorded with actor, request ID,
-  IP, and route. Explicit domain events use `audit.Recorder`.
+  IP, route, and the resolved tenant (`audit_events.tenant_id`, default 1).
+  Explicit domain events use `audit.Recorder`; a zero `Event.TenantID` is
+  resolved from the recording context.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
   HTTP renders RFC 9457 `application/problem+json`.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,

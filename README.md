@@ -102,10 +102,14 @@ one tenant.
   request fails with `403 permission.denied` (`tenant mismatch`).
 - Emails and Google IDs are unique per tenant. The last-admin database trigger
   protects each tenant independently.
-- **Current limitation:** existing SQL is not tenant-scoped yet. This branch is
-  the foundation (schema, resolution, JWT claim, config); query scoping,
-  tenant-aware registration/login, and per-tenant limits are the next
-  milestone. Do not treat it as data isolation.
+- Audit rows carry the resolved `tenant_id`: the generic middleware records the
+  tenant from the request/JWT context and falls back to tenant 1 when no tenant
+  middleware ran.
+- **Current limitation:** identity, files, and admin SQL are not tenant-scoped
+  yet. Jobs and audit events already propagate `tenant_id`, but module queries
+  still read across tenants; query scoping, tenant-aware registration/login,
+  and per-tenant limits are the next milestone. Do not treat it as data
+  isolation.
 - Google OAuth start/callback does not propagate `X-Tenant-Slug` yet. Google
   users follow the existing lookup/creation path and their JWT uses the stored
   user tenant (currently the default tenant).
@@ -372,6 +376,15 @@ post-commit verification email. Resend-verification and email-change flows
 still create their token and email in a separate transaction after the account
 already exists.
 
+- Jobs are tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` write
+  `jobs.tenant_id` resolved from the context (`tenant.EffectiveID`, default
+  tenant 1); an explicit positive `Job.TenantID` is kept. The claim query
+  returns the column and the worker installs `tenant.WithID(ctx, tenantID)`
+  before calling the handler, so email and audit handlers see the same tenant
+  as the request that enqueued the work. Rows written before multi-tenancy
+  default to tenant 1. Retention and Prometheus labels stay global
+  (tenant-agnostic); use the `(tenant_id, status, run_at)` and
+  `(tenant_id, kind, status)` indexes when inspecting per-tenant work.
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
   `max_attempts` (default 10), then move to `dead`. An unregistered job kind is

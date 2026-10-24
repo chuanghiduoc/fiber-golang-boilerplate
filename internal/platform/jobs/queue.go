@@ -8,14 +8,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // insertJobSQL inserts one queued job and returns its id. The cast makes the
 // parameter type explicit so a JSON document is never mistaken for bytea.
 const insertJobSQL = `
-INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
-VALUES ($1, $2::jsonb, 'queued', $3, $4, now(), now())
+INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts, created_at, updated_at)
+VALUES ($1, $2, $3::jsonb, 'queued', $4, $5, now(), now())
 RETURNING id`
 
 // queryRower is implemented by both *pgxpool.Pool and pgx.Tx.
@@ -35,9 +36,10 @@ func NewQueue(pool *pgxpool.Pool) *Queue {
 
 // Enqueue inserts job as queued work and returns its id. A zero RunAt means
 // now, a zero MaxAttempts means DefaultMaxAttempts, and a nil Payload means an
-// empty JSON object.
+// empty JSON object. A zero TenantID is resolved from the context, falling back
+// to tenant.DefaultID.
 func (q *Queue) Enqueue(ctx context.Context, job Job) (int64, error) {
-	normalized, err := job.normalize(time.Now())
+	normalized, err := prepareJob(ctx, job, time.Now())
 	if err != nil {
 		return 0, err
 	}
@@ -48,9 +50,9 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) (int64, error) {
 }
 
 // EnqueueTx inserts job using tx, so the job is committed atomically with the
-// caller's transaction.
+// caller's transaction. Tenant resolution matches Enqueue.
 func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, job Job) (int64, error) {
-	normalized, err := job.normalize(time.Now())
+	normalized, err := prepareJob(ctx, job, time.Now())
 	if err != nil {
 		return 0, err
 	}
@@ -60,9 +62,23 @@ func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, job Job) (int64, error
 	return insertJob(ctx, tx, normalized)
 }
 
+// prepareJob resolves the tenant before applying the usual defaults. The
+// context is authoritative when the caller did not set a tenant explicitly, so
+// request-scoped producers inherit tenant isolation without extra plumbing.
+func prepareJob(ctx context.Context, job Job, now time.Time) (Job, error) {
+	if job.TenantID == 0 {
+		job.TenantID = tenant.EffectiveID(ctx)
+	}
+	if job.TenantID <= 0 {
+		return Job{}, ErrInvalidTenant
+	}
+	return job.normalize(now)
+}
+
 func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
 	var id int64
 	err := db.QueryRow(ctx, insertJobSQL,
+		job.TenantID,
 		job.Kind,
 		string(job.Payload),
 		job.RunAt,

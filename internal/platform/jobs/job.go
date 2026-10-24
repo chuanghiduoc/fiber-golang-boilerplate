@@ -43,10 +43,17 @@ var (
 	ErrLeaseLost = errors.New("jobs: worker lease lost")
 	// ErrInvalidRetention is returned when a retention window is not positive.
 	ErrInvalidRetention = errors.New("jobs: retention must be positive")
+	// ErrInvalidTenant is returned when a job cannot be associated with a
+	// tenant. Enqueue resolves a zero TenantID from the context, so this
+	// indicates a non-positive explicit value.
+	ErrInvalidTenant = errors.New("jobs: tenant id must be positive")
 )
 
 // Job describes a unit of work to enqueue.
 type Job struct {
+	// TenantID owns the job. Enqueue and EnqueueTx resolve a zero value from
+	// the context via tenant.EffectiveID; a positive explicit value is kept.
+	TenantID int64
 	// Kind selects the registered handler that processes the job.
 	Kind string
 	// Payload is passed verbatim to the handler. Nil or empty payloads are
