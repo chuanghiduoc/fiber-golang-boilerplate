@@ -52,7 +52,10 @@ At minimum, replace:
 - `ingress.yaml`: `api.example.com` and `fiber-boilerplate-tls`.
 - `configmap.yaml`: `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`,
   `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET`, and the
-  `APP_TRUSTED_PROXIES`/S3 endpoint values for your platform.
+  `APP_TRUSTED_PROXIES`/S3 endpoint values for your platform. Keep
+  `Idempotency-Key` in `CORS_ALLOW_HEADERS` and
+  `Idempotent-Replayed` in `CORS_EXPOSE_HEADERS` for browser clients that use
+  idempotent mutations.
 - `secret.example.yaml` (copied outside the repo): every `REPLACE_*` value.
 - `networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
   managed services are not in `10.0.0.0/8` or use different ports.
@@ -200,9 +203,11 @@ curl -fsS https://api.example.com/readyz
 
 `/healthz` is a process liveness check. `/readyz` also checks dependencies
 such as PostgreSQL and Redis. The startup probe deliberately uses `/healthz`
-(not `/readyz`) so a dependency outage during boot does not restartloop the pod;
-once startup succeeds, `/readyz` gates traffic. If `kubectl get hpa` shows
-`<unknown>` targets, install/fix metrics-server.
+(not `/readyz`), but it only covers slow-but-reachable startup: the API exits
+during startup if PostgreSQL, storage (including the S3 bucket check), or cache
+initialization fails. The startup probe cannot mask that dependency outage; the
+container exits and restarts. Once startup succeeds, `/readyz` gates traffic. If
+`kubectl get hpa` shows `<unknown>` targets, install/fix metrics-server.
 
 ## 6. Rollback
 
@@ -240,7 +245,9 @@ TLS, automated backups/point-in-time recovery, and private networking.
 The template uses `STORAGE_DRIVER=s3` and `readOnlyRootFilesystem: true`. This
 is the recommended multi-replica setup. Create the bucket before rollout: each
 replica checks bucket existence at startup (and tries to create a missing
-bucket, which can race across replicas).
+bucket, which can race across replicas). An unreachable S3 endpoint or bad
+credentials prevents startup; after startup, object reads/writes/deletes fail
+on use and are not covered by `/readyz`.
 
 The Deployment mounts a small bounded `emptyDir` at `/tmp` as scratch space so
 the image root can stay read-only even if a dependency needs temp files. It is

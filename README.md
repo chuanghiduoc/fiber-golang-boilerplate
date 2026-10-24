@@ -408,8 +408,10 @@ checklist.
 2. Keep the module's handler/service/repository/DTO inside its directory.
    Do not import another module's internals; use `internal/contracts` or a
    narrow exported interface.
-3. Add permissions to `internal/platform/authz` and protect mutation routes
-   with `authz.Require(...)`.
+3. Add permissions to `internal/platform/authz` and protect every route with
+   `authz.Require(...)`. The legacy exceptions are documented in the
+   [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
+   do not copy them.
 4. Write queries in a module-scoped `queries/<name>.sql` file and run
    `make sqlc-generate`.
 5. For a deployed database, add a numbered migration. For this boilerplate's

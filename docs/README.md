@@ -19,4 +19,5 @@ Operational deployment and tooling:
 - [Kubernetes](../deploy/k8s/README.md) — manifests, migration Job, release
   workflow, external DB/Redis, storage choices.
 - [New module scaffold](../scripts/new-module.sh) — `scripts/new-module.sh
-  <name>` creates the module layout described in the module template.
+  <name>` creates the module layout described in the module template and
+  verifies the generated package with `go build`.

@@ -45,16 +45,20 @@ kubectl -n <namespace> describe pod <pod>
 
 Probe behavior:
 
-- The startup probe uses `/healthz`, so a dependency outage during boot does
-  not restart-loop the pod.
+- The startup probe uses `/healthz`, but it only covers slow-but-reachable
+  startup. The API exits during startup if PostgreSQL, storage (including the
+  S3 bucket check), or cache initialization fails, so the probe cannot mask a
+  dependency outage; the container exits and restarts instead.
 - Readiness uses `/readyz`; a failed readiness check removes the pod from the
   Service but does not restart it.
 - Liveness uses `/healthz`; do not point liveness at `/readyz` or a Redis blip
   will restart every pod.
-- Readiness does **not** check SMTP, S3, the job queue, or whether migrations
-  ran. SMTP/S3 failures surface on use, migrations are a separate Job, and
-  queue health is visible in job metrics and the `jobs` table. Do not assume a
-  green `/readyz` means email is working.
+- Readiness does **not** check SMTP, S3 object operations, the job queue, or
+  whether migrations ran. The S3 bucket check happens at startup; after
+  startup, object reads/writes fail on use. SMTP failures surface through
+  queued jobs, migrations are a separate Job, and queue health is visible in
+  job metrics and the `jobs` table. Do not assume a green `/readyz` means email
+  or uploads are working.
 
 Important trade-off: because `/readyz` includes the cache, a Redis outage marks
 every replica unready even if PostgreSQL is healthy. If the product must serve
@@ -352,8 +356,10 @@ During a Redis outage:
 ## 6. Migrations and legacy upgrade
 
 Only `cmd/migrate` applies DDL. `cmd/api` and `cmd/seed` assume the schema
-exists, so replicas do not race. `cmd/migrate` loads only `DB_*` configuration
-and rejects plaintext `DB_SSLMODE` values in production.
+exists, so replicas do not race. `cmd/migrate` loads only `DB_*` plus
+`APP_ENV`/`LOG_LEVEL` for validation and logging; it needs no JWT, admin, SMTP,
+storage, or other application secrets, and it rejects plaintext `DB_SSLMODE`
+values in production.
 
 ### Normal flow
 
@@ -450,7 +456,9 @@ Other caveats:
 - **S3/MinIO:** set `STORAGE_DRIVER=s3` (or `minio`), endpoint, region, bucket,
   access key, and secret key; enable `STORAGE_S3_USE_SSL` in production. Every
   replica checks bucket existence at startup and may try to create a missing
-  bucket, so pre-create it to avoid races. Local storage needs a shared
+  bucket, so pre-create it to avoid races; an unreachable endpoint or bad
+  credentials prevents startup. After startup, object reads/writes/deletes fail
+  on use and are not covered by `/readyz`. Local storage needs a shared
   ReadWriteMany volume; `emptyDir` is node-local and unsuitable for multiple
   replicas.
 - **Redis:** `CACHE_DRIVER=redis` and `REDIS_URL` (use `rediss://` when

@@ -11,9 +11,12 @@ scripts/new-module.sh widgets
 scripts/new-module.sh --dry-run widgets   # print paths, write nothing
 ```
 
-The scaffold creates a compile-safe vertical slice. It deliberately registers
-no routes; add them once the handler methods exist. Do not commit a probe
-module created only to test the script.
+The scaffold creates a compile-safe vertical slice and runs
+`go build ./internal/modules/<name>/...` before reporting success. It
+deliberately registers no routes; add them once the handler methods exist.
+`<name>` must be lower_snake_case; the script rejects Go keywords, reserved
+package names, and Go-reserved directories such as `vendor` and `testdata`. Do
+not commit a probe module created only to test the script.
 
 ## 1. Canonical layout
 
@@ -103,7 +106,9 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
+	widgetsdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/widgets/dto"
 	widgetsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/widgets/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
 // Handler binds requests, validates input, and calls the service.
@@ -121,7 +126,10 @@ func (h *Handler) Health(c fiber.Ctx) error {
 	if err := h.service.Ping(c.Context()); err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"module": "widgets", "status": "ok"})
+	return response.Success(c, widgetsdto.HealthResponse{
+		Module: "widgets",
+		Status: "ok",
+	})
 }
 ```
 
@@ -193,6 +201,12 @@ type Item struct {
 // CreateItemRequest is a placeholder request with validation.
 type CreateItemRequest struct {
 	Name string `json:"name" validate:"required,max=255"`
+}
+
+// HealthResponse is the scaffold's placeholder health response.
+type HealthResponse struct {
+	Module string `json:"module"`
+	Status string `json:"status"`
 }
 ```
 
@@ -270,6 +284,28 @@ involved. For an admin-only sub-surface, mount it under the existing admin
 group only after the owner agrees; otherwise expose a dedicated permission and
 keep the module's routes together.
 
+### Legacy exceptions (do not copy)
+
+The current tree predates the target rules. These are documented exceptions,
+not the convention for new modules:
+
+- **`files` authorization:** its routes use JWT and rate limits but do not call
+  `authz.Require`. Target: every route has a permission, including reads.
+- **`identity` user reads/updates:** `GET /users/:id` and some update paths use
+  owner/admin checks in the handler (`authRole`/`authUserID`) rather than route
+  permissions. Target: permission middleware, with ownership checks in the
+  service only for row-level access.
+- **`admin` cross-module facade:** its stats/read paths reach `users` and
+  `files`; `GetSystemStats` is a single query in the identity-owned user
+  repository that reads both tables (subqueries today, effectively a
+  cross-module read). Target: a contract or read model, not another module's
+  repository/query.
+- **`files.user_id`:** the existing foreign key uses `ON DELETE CASCADE` to
+  `users`, so a hard delete of a user removes file metadata across a module
+  boundary. Target: no cross-module foreign key or cascade; core identity
+  references require explicit owner approval. Keep the existing behavior until
+  a reviewed migration changes it.
+
 ## 4. Permissions
 
 Permissions live in `internal/platform/authz/permissions.go`. One permission
@@ -301,10 +337,14 @@ Permission checklist:
 
 The global `platform/audit.Middleware` already records every successful
 mutating request (POST/PUT/PATCH/DELETE) with actor, route template, request
-ID, IP, user agent, and status. Idempotent replays are not recorded twice.
+ID, IP, user agent, and status. Its `Action` is the generic
+`<METHOD> <route template>` value, for example `POST /api/v1/widgets/`;
+idempotent replays are not recorded twice.
 
 Use an explicit domain event only when the generic request record is not enough
-(for example an asynchronous side effect or a privileged cross-resource action):
+(for example an asynchronous side effect or a privileged cross-resource action).
+Explicit events use `<module>.<resource>.<verb>` actions such as
+`widgets.widget.published`:
 
 ```go
 event := audit.Event{
@@ -316,17 +356,21 @@ event := audit.Event{
 ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 defer cancel()
 if err := recorder.Record(ctx, event); err != nil {
+	metrics.AuditWriteFailuresTotal.Inc()
 	slog.Warn("audit write failed", "action", event.Action, "error", err)
 }
 ```
 
 `recorder` is the `audit.Recorder` injected into the service (use
-`audit.Noop{}` in tests). The generic middleware logs failures and increments
-`audit_write_failures_total`; an explicit caller should do the same.
+`audit.Noop{}` in tests). `Recorder.Record` only persists the event; it does
+not increment the metric or log. The generic middleware does both, so an
+explicit caller must increment `metrics.AuditWriteFailuresTotal` and log its
+own failure as shown.
 
 Rules:
 
-- Use a stable action prefix (`<module>.<resource>.<verb>`), not prose.
+- The generic middleware action format is fixed as `<METHOD> <route template>`.
+  Explicit domain events use `<module>.<resource>.<verb>`, not prose.
 - Metadata must be JSON-marshalable and must never contain passwords, tokens,
   email bodies, reset links, or full request bodies.
 - Audit is best-effort at the request boundary: a write failure is logged (and
@@ -386,7 +430,8 @@ contract/read model or a job.
 - Cursor pagination uses a `(created_at DESC, id DESC)` index.
 - Foreign keys inside the module are fine. Avoid cross-module foreign keys; if
   a core reference (for example `user_id`) is unavoidable, get the owner's
-  agreement, document it, and never cascade across the boundary.
+  agreement, document it, and never cascade across the boundary. The existing
+  `files.user_id ... ON DELETE CASCADE` is a legacy exception, not a template.
 - Index every ownership and lookup path used by list/detail endpoints. Add
   indexes in the same migration as the table for a new module.
 
@@ -564,7 +609,7 @@ make swagger   # if route annotations changed
 Construct dependencies in `cmd/api/main.go`, then register the module once:
 
 ```go
-widgetRepo := widgetsrepository.New(pool)
+widgetRepo := widgetsrepository.New()
 widgetService := widgetsservice.New(widgetRepo)
 widgetHandler := widgetshandler.New(widgetService)
 
@@ -584,6 +629,9 @@ application.Register(
 
 Rules:
 
+- The scaffold's generated `repository.New()` takes no arguments. When you
+  replace its empty struct with the pgx pool, change it to `New(pool)` and
+  update this call; keep construction in the composition root.
 - Keep module-specific dependencies in the module constructor; do not grow
   `app.Deps` for one module.
 - Register before `Listen`. Duplicate paths are a startup/programming error.

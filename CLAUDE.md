@@ -177,7 +177,8 @@ Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
 
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`.
 2. Keep handler/service/repository/DTO inside the module.
-3. Add permissions and protect mutation routes.
+3. Add permissions and protect every route (legacy exceptions are documented
+   in `docs/module-template.md`).
 4. Add queries and run `make sqlc-generate`.
 5. Add a migration only for a deployed DB; otherwise update the single init
    schema.

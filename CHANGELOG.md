@@ -7,7 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
-- Canonical module template (`docs/module-template.md`) and POSIX scaffold (`scripts/new-module.sh`): compile-safe `module.go`, handler/service/repository/DTO layout, route/permission/audit/idempotency conventions, table ownership and migration rules, cross-module contracts, tests, and an add-a-module checklist; the script validates lower_snake_case, supports `--dry-run`, refuses overwrites, and runs `gofmt` when available
+- Canonical module template (`docs/module-template.md`) and Bash scaffold (`scripts/new-module.sh`): compile-safe `module.go`, handler/service/repository/DTO layout, route/permission/audit/idempotency conventions, table ownership and migration rules, cross-module contracts, tests, and an add-a-module checklist; the script validates lower_snake_case, rejects Go keywords/reserved directories, supports `--dry-run`, refuses overwrites, runs `gofmt` when available, and verifies the generated package with `go build`
 - Operations runbook (`docs/operations.md`): health/readiness, Prometheus metrics, structured logs and request IDs, job retry/dead-letter/retention/heartbeat/drain behavior with the JWT rotation caveat, idempotency/Redis TTLs and fail-open behavior, migration and legacy-upgrade guidance with backup/restore notes, Kubernetes ordering/HPA/NetworkPolicy/SMTP/S3/Redis caveats, and incident checklists for DB/Redis/SMTP/job backlog
 - Kubernetes production foundation under `deploy/k8s` (namespace, ConfigMap, Secret template, one-shot migration Job, Deployment, Service, HPA, PDB, NetworkPolicy, Ingress) and a GHCR multi-arch release workflow with semver/SHA tags, provenance/SBOM, and CI manifest validation
 - Modular-monolith composition root (`internal/app`) with module-owned route tables (`internal/modules/identity`, `files`, `admin`); platform packages for cross-cutting mechanics
@@ -33,6 +33,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Moved the files upload service and HTTP handler into `internal/modules/files/{service,handler}`; `internal/service` and `internal/handler` keep deprecated aliases/wrappers so existing call sites compile, while the files repository and DTOs remain in the legacy layer
 
 ### Fixed
+- Kubernetes ConfigMap CORS now allows the `Idempotency-Key` request header and exposes `Idempotent-Replayed`, so browser idempotency works behind the template policy
 - `MemoryCache.Increment` now rejects non-integer values like Redis `INCR`, so an idempotency owner token is never mistaken for a free claim counter
 - Worker claim errors are retried with exponential backoff capped at 30s instead of terminating the worker (and the API process that hosts it)
 - Job heartbeat, success, and failure writes are fenced by `attempts`, so a worker whose lease was reclaimed cannot finish the job under its new owner

@@ -23,8 +23,9 @@ Options:
   --dry-run    Print the paths that would be created; write nothing.
   -h, --help   Show this help.
 
-<name> must match [a-z][a-z0-9]*(_[a-z0-9]+)* and must not be a Go keyword
-or a reserved package name. Existing modules are never overwritten.
+<name> must match [a-z][a-z0-9]*(_[a-z0-9]+)* and must not be a Go keyword,
+a reserved package name, or a Go-reserved directory (vendor/testdata).
+Existing modules are never overwritten.
 EOF
 }
 
@@ -90,6 +91,10 @@ case "$name" in
     echo "error: '$name' is a Go keyword" >&2
     exit 2
     ;;
+  vendor|testdata)
+    echo "error: '$name' is a Go-reserved directory and would be ignored or mis-handled by the go tool" >&2
+    exit 2
+    ;;
   app|main|internal|modules|platform|pkg|handler|service|repository|dto|sqlc|config|testutil|middleware|authz|audit|jobs|session)
     echo "error: '$name' is reserved by the repository layout" >&2
     exit 2
@@ -145,10 +150,16 @@ fi
 
 mkdir -p "$repo_root/internal/modules"
 tmp_dir="$repo_root/internal/modules/.${name}.tmp.$$"
+published=0
 
 cleanup() {
   if [ -n "${tmp_dir:-}" ] && [ -d "$tmp_dir" ]; then
     rm -rf "$tmp_dir"
+  fi
+  # If publication succeeded but the compile check fails, do not leave a
+  # broken module behind.
+  if [ "$published" -eq 1 ] && [ -d "$target" ]; then
+    rm -rf "$target"
   fi
 }
 trap cleanup EXIT
@@ -211,7 +222,9 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
+	__MODULE__dto "__MODULE_PATH__/internal/modules/__MODULE__/dto"
 	__MODULE__service "__MODULE_PATH__/internal/modules/__MODULE__/service"
+	"__MODULE_PATH__/pkg/response"
 )
 
 // Handler binds requests, validates input, and calls the service.
@@ -229,7 +242,10 @@ func (h *Handler) Health(c fiber.Ctx) error {
 	if err := h.service.Ping(c.Context()); err != nil {
 		return err
 	}
-	return c.JSON(fiber.Map{"module": "__MODULE__", "status": "ok"})
+	return response.Success(c, __MODULE__dto.HealthResponse{
+		Module: "__MODULE__",
+		Status: "ok",
+	})
 }
 EOF
 
@@ -296,6 +312,12 @@ type Item struct {
 type CreateItemRequest struct {
 	Name string `json:"name" validate:"required,max=255"`
 }
+
+// HealthResponse is the scaffold's placeholder health response.
+type HealthResponse struct {
+	Module string `json:"module"`
+	Status string `json:"status"`
+}
 EOF
 
 cat <<'EOF' | render > "$tmp_dir/README.md"
@@ -355,6 +377,21 @@ if [ -e "$target" ]; then
 fi
 
 mv "$tmp_dir" "$target"
+published=1
+
+# Fail closed on a broken scaffold. A dependency/build failure elsewhere in the
+# repository is reported verbatim; the partially published module is removed.
+if command -v go >/dev/null 2>&1; then
+  if ! (cd "$repo_root" && go build "./internal/modules/$name/..."); then
+    echo "error: generated module failed to compile: go build ./$target_rel/..." >&2
+    echo "Removing $target_rel; no partial module left behind." >&2
+    exit 1
+  fi
+  echo "Compile check passed: go build ./$target_rel/..."
+else
+  echo "warning: go not found; skipped the compile check for $target_rel" >&2
+fi
+published=0
 
 echo "Created module '$name'"
 for rel in "${files[@]}"; do

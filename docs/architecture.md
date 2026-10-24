@@ -67,8 +67,10 @@ client
 
 ## Cross-cutting conventions
 
-- **Authorization:** permissions live in `internal/platform/authz`; routes use
-  `authz.Require`. Roles are an implementation detail of the permission matrix.
+- **Authorization:** permissions live in `internal/platform/authz`; every route
+  uses `authz.Require`. Roles are an implementation detail of the permission
+  matrix. Current legacy exceptions (`files` routes, some identity handler
+  checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** successful mutating requests are recorded with actor, request ID,
   IP, and route. Explicit domain events use `audit.Recorder`.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.

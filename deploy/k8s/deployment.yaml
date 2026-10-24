@@ -105,8 +105,9 @@ spec:
               drop:
                 - ALL
           startupProbe:
-            # Liveness, not readiness: a dependency outage should not
-            # restartloop the pod before it has had a chance to become ready.
+            # /healthz, not /readyz: allows slow-but-reachable startup. The API
+            # exits on DB/storage/cache init failure, so this does not mask a
+            # dependency outage.
             httpGet:
               path: /healthz
               port: http
