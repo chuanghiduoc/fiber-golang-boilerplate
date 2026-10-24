@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -41,11 +41,11 @@ type UploadService interface {
 }
 
 type uploadService struct {
-	repo    repository.FileRepository
+	repo    filesrepo.FileRepository
 	storage storage.Storage
 }
 
-func NewUploadService(repo repository.FileRepository, store storage.Storage) UploadService {
+func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
 	return &uploadService{repo: repo, storage: store}
 }
 

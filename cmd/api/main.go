@@ -25,6 +25,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
@@ -34,7 +35,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -187,7 +187,7 @@ func main() {
 	)
 	userHandler := identityhandler.NewUserHandler(userSvc, emailVerifSvc)
 
-	fileRepo := repository.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(pool)
 	uploadSvc := filesvc.NewUploadService(fileRepo, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
 

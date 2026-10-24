@@ -118,11 +118,17 @@ golang-migrate CLI's `force 1`) instead of re-running the file.
 
 ## Adding a New Module
 
+Run `scripts/new-module.sh <name>` and follow
+[`docs/module-template.md`](docs/module-template.md). The runtime behavior of
+the resulting module is covered by [`docs/operations.md`](docs/operations.md).
+
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`
    (`Name`, `RegisterRoutes`). Keep the module's handler/service/repository/DTO
    inside that directory.
-2. Add permissions to `internal/platform/authz` and protect mutation routes
-   with `authz.Require(...)`.
+2. Add permissions to `internal/platform/authz` and protect every route with
+   `authz.Require(...)`. The legacy exceptions are documented in the
+   [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
+   do not copy them.
 3. Add queries in `queries/<name>.sql` and run `make sqlc-generate`.
 4. For a deployed DB, add a numbered migration; for this boilerplate's fresh
    installs, update the single init schema.
@@ -133,9 +139,9 @@ golang-migrate CLI's `force 1`) instead of re-running the file.
 8. Update `CHANGELOG.md`.
 
 > `identity` owns its DTOs, repositories, services, and handlers under
-> `internal/modules/identity`. `files` owns its upload handler/service in the
-> module but still uses the legacy repository/DTO layer. `admin` still wraps
-> the global handler/service packages. Moving the remaining internals is the
+> `internal/modules/identity`. `files` owns its upload handler/service/repository
+> in the module but still uses the legacy DTO layer. `admin` still wraps the
+> global handler/service packages. Moving the remaining internals is the
 > next strangler phase; new modules should start in the module layout.
 
 ## Code Style

@@ -40,9 +40,9 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed), files (handler/service), admin
+internal/modules/           identity (full vertical slice + admin seed), files (handler/service/repository), admin
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
-internal/handler|service|repository|dto|sqlc   remaining legacy internals (strangler phase)
+internal/handler|service|dto|sqlc   remaining legacy internals (strangler phase)
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -51,8 +51,11 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 **Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
-status) and `docs/api-design.md` (API conventions, errors, pagination,
-idempotency, compatibility). Keep both current when routes/contracts change.
+status), `docs/api-design.md` (API conventions, errors, pagination,
+idempotency, compatibility), `docs/module-template.md` (canonical module
+layout, scaffold, routes/permissions/tables/contracts), and
+`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
+Kubernetes, incidents). Keep them current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -172,9 +175,12 @@ Offset helpers are for small admin/export tables only.
 
 ## Adding a Module
 
+Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
+
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`.
 2. Keep handler/service/repository/DTO inside the module.
-3. Add permissions and protect mutation routes.
+3. Add permissions and protect every route (legacy exceptions are documented
+   in `docs/module-template.md`).
 4. Add queries and run `make sqlc-generate`.
 5. Add a migration only for a deployed DB; otherwise update the single init
    schema.

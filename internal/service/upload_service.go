@@ -1,8 +1,8 @@
 package service
 
 import (
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -10,6 +10,6 @@ import (
 type UploadService = filesvc.UploadService
 
 // Deprecated: use internal/modules/files/service.NewUploadService for new code.
-func NewUploadService(repo repository.FileRepository, store storage.Storage) UploadService {
+func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
 	return filesvc.NewUploadService(repo, store)
 }

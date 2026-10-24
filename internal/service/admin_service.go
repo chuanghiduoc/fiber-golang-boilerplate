@@ -10,11 +10,11 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	filerepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -35,7 +35,7 @@ type AdminService interface {
 
 type adminService struct {
 	userRepo         identityrepo.UserRepository
-	fileRepo         filerepo.FileRepository
+	fileRepo         filesrepo.FileRepository
 	refreshTokenRepo identityrepo.RefreshTokenRepository
 	storage          storage.Storage
 	txManager        *database.TxManager
@@ -44,7 +44,7 @@ type adminService struct {
 
 func NewAdminService(
 	userRepo identityrepo.UserRepository,
-	fileRepo filerepo.FileRepository,
+	fileRepo filesrepo.FileRepository,
 	refreshTokenRepo identityrepo.RefreshTokenRepository,
 	store storage.Storage,
 	txManager *database.TxManager,

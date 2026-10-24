@@ -2,11 +2,18 @@ package repository
 
 import (
 	"context"
+	"errors"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
+// FileRepository is the files module's data access contract.
 type FileRepository interface {
 	Create(ctx context.Context, params sqlc.CreateFileParams) (*sqlc.File, error)
 	GetByID(ctx context.Context, id int64) (*sqlc.File, error)
@@ -112,4 +119,18 @@ func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBC
 
 func (r *fileRepository) AdminCount(ctx context.Context) (int64, error) {
 	return r.q.AdminCountFiles(ctx)
+}
+
+// wrapErr translates pgx errors to app-level sentinel errors. Keeping it local
+// avoids the module depending on the legacy internal/repository package.
+func wrapErr(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apperror.ErrNotFound
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "P0001" &&
+		strings.Contains(pgErr.Message, "last active admin") {
+		return apperror.NewConflict("cannot remove the last active admin")
+	}
+	return err
 }

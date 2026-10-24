@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -25,7 +26,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -54,7 +54,7 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
 	userHandler := identityhandler.NewUserHandler(userSvc)
 
-	fileRepo := repository.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(pool)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshRepo, store, txManager, sessionStore)

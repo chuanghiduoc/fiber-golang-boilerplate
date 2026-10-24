@@ -22,7 +22,7 @@ internal/platform
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-internal/handler|service|repository|dto|sqlc   remaining legacy strangler layer
+internal/handler|service|dto|sqlc   remaining legacy strangler layer
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
 
@@ -67,8 +67,10 @@ client
 
 ## Cross-cutting conventions
 
-- **Authorization:** permissions live in `internal/platform/authz`; routes use
-  `authz.Require`. Roles are an implementation detail of the permission matrix.
+- **Authorization:** permissions live in `internal/platform/authz`; every route
+  uses `authz.Require`. Roles are an implementation detail of the permission
+  matrix. Current legacy exceptions (`files` routes, some identity handler
+  checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** successful mutating requests are recorded with actor, request ID,
   IP, and route. Explicit domain events use `audit.Recorder`.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
@@ -80,14 +82,15 @@ client
 
 ## Strangler status
 
-The module wrappers own route tables. The `identity` module now owns its DTOs,
+The module wrappers own route tables. The `identity` module owns its DTOs,
 repositories, services, and HTTP handlers under `internal/modules/identity`;
 legacy identity code has been deleted rather than aliased. The `files` module
-owns its upload service and HTTP handler under `internal/modules/files/service`
-and `internal/modules/files/handler`; `internal/service` and `internal/handler`
-keep thin deprecated aliases and constructors so legacy call sites continue to
-compile. The files repository and DTOs still live in the legacy global
-packages.
+owns its upload service, HTTP handler, and repository under
+`internal/modules/files/{service,handler,repository}`; `internal/service` and
+`internal/handler` keep thin deprecated aliases and constructors so legacy
+call sites continue to compile. The files DTOs still live in the legacy
+`internal/dto` package. `admin` still keeps its handler/service in the legacy
+layer while consuming the identity/files module packages.
 
 `admin` still keeps its handler/service in the legacy layer while using the
 identity module's repository/DTO/service contracts. Moving the remaining
@@ -95,6 +98,10 @@ internals one module at a time remains the next phase; new code should start in
 `internal/modules/<name>/` and use contracts for cross-module reads.
 
 ## Extension checklist
+
+Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the canonical
+[Module Template](module-template.md) for the full layout, skeleton, and
+ownership rules. Short form:
 
 1. Create the module, tables, and queries; update the baseline for fresh
    installs (or add a numbered migration for deployed DBs).

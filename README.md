@@ -69,13 +69,16 @@ pkg/
   validator/ token/ cache/ storage/ email/ pagination/ logger/ health/ oauth/ metrics/ async/
 migrations/000001_init_schema.*     Single consolidated init schema (up/down)
 queries/                            sqlc query files
-docs/                               Swagger + architecture/API design docs
+docs/                               Swagger + architecture/API/module/ops docs
 deploy/k8s/                         Kubernetes production manifests (see deploy/k8s/README.md)
 ```
 
 See [docs/architecture.md](docs/architecture.md) for dependency rules and the
-strangler status, and [docs/api-design.md](docs/api-design.md) for the API
-design system (errors, pagination, idempotency, status codes).
+strangler status, [docs/api-design.md](docs/api-design.md) for the API design
+system (errors, pagination, idempotency, status codes),
+[docs/module-template.md](docs/module-template.md) for the canonical module
+layout and scaffold, and [docs/operations.md](docs/operations.md) for the
+operations runbook.
 
 Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
@@ -396,13 +399,20 @@ already exists.
 
 ## Adding a New Module
 
+Use `scripts/new-module.sh <name>` to create the compile-safe layout, then
+follow [docs/module-template.md](docs/module-template.md) for route wiring,
+permissions, audit, idempotency, tables, contracts, tests, and the full
+checklist.
+
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`
    (`Name`, `RegisterRoutes`).
 2. Keep the module's handler/service/repository/DTO inside its directory.
    Do not import another module's internals; use `internal/contracts` or a
    narrow exported interface.
-3. Add permissions to `internal/platform/authz` and protect mutation routes
-   with `authz.Require(...)`.
+3. Add permissions to `internal/platform/authz` and protect every route with
+   `authz.Require(...)`. The legacy exceptions are documented in the
+   [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
+   do not copy them.
 4. Write queries in a module-scoped `queries/<name>.sql` file and run
    `make sqlc-generate`.
 5. For a deployed database, add a numbered migration. For this boilerplate's
@@ -413,10 +423,11 @@ already exists.
 8. Run `make swagger` and `make check` before opening a PR.
 
 > `identity` owns its DTOs, repositories, services, and handlers under
-> `internal/modules/identity`. `files` owns its upload handler and service but
-> still uses the legacy repository/DTO layer. `admin` still wraps the global
-> handler/service packages. Moving the remaining internals is the next
-> strangler phase; new modules should start directly in the module layout.
+> `internal/modules/identity`. `files` owns its upload handler, service, and
+> repository inside the module, while still using the legacy DTO layer.
+> `admin` still wraps the global handler/service packages. Moving the remaining
+> internals is the next strangler phase; new modules should start directly in
+> the module layout.
 
 ## Environment Variables
 
@@ -468,9 +479,9 @@ migration entrypoint exist. Remaining work:
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
 - Moving `internal/handler|service|repository|dto` internals into the module
-  directories (the strangler phase noted above). `identity` has fully moved;
-  the files service/handler and admin handler/service remain legacy, and the
-  files repository/DTOs still live in the global layer.
+  directories (the strangler phase noted above). `identity` and the files
+  service/handler/repository have moved; `admin` handler/service and the files
+  DTO still live in the legacy layer.
 
 ## Security notes
 
