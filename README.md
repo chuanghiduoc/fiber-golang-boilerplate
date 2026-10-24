@@ -33,6 +33,7 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 - **Storage**: Local filesystem or S3/MinIO
 - **Email**: SMTP or console (dev)
 - **Metrics**: Prometheus
+- **Tracing**: OpenTelemetry (OTLP/gRPC, disabled by default; see [docs/tracing.md](docs/tracing.md))
 - **Container**: Docker + Docker Compose
 
 ## Architecture
@@ -77,7 +78,8 @@ strangler status, [docs/api-design.md](docs/api-design.md) for the API design
 system (errors, pagination, idempotency, status codes),
 [docs/module-template.md](docs/module-template.md) for the canonical module
 layout and scaffold, and [docs/operations.md](docs/operations.md) for the
-operations runbook.
+operations runbook. Tracing configuration, privacy rules, and the local
+collector live in [docs/tracing.md](docs/tracing.md).
 
 Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
@@ -418,6 +420,10 @@ already exists.
   default to tenant 1. Retention and Prometheus labels stay global
   (tenant-agnostic); use the `(tenant_id, status, run_at)` and
   `(tenant_id, kind, status)` indexes when inspecting per-tenant work.
+- Enqueue also captures the active W3C `traceparent` in `jobs.trace_parent`.
+  Each worker attempt starts a new-root `job.process` span with a link to that
+  enqueue span, so `succeeded`, `retried`, and `dead` outcomes are independently
+  inspectable. See [docs/tracing.md](docs/tracing.md).
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
   `max_attempts` (default 10), then move to `dead`. An unregistered job kind is
@@ -537,6 +543,7 @@ Key settings:
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
 - `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
+- `OTEL_ENABLED` — enable OpenTelemetry tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`, and `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317`
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on API startup (also available via `make seed`; password must be 12+ chars in production)
 
 ## Pagination
@@ -571,9 +578,11 @@ config) exist. Remaining work:
   tenant-scoped SQL, admin lists/stats, tenant-bound Google OAuth state,
   tenant-aware sessions, and tenant-prefixed storage keys. Row-level security
   and per-tenant limits remain future work.
-- Distributed tracing, plus environment promotion/rollout automation: metrics,
-  Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
-  tracing and a full CD platform do not.
+- Distributed tracing is available (HTTP, sanitized pgx queries, and durable
+  jobs) but disabled by default; enable it per environment with
+  `OTEL_ENABLED=true` and a collector endpoint. Environment promotion/rollout
+  automation: metrics, Kubernetes manifests (`deploy/k8s`), and the GHCR
+  release workflow exist, as does an optional gated CD workflow.
 
 All bounded-context internals are module-owned under `internal/modules`;
 identity and files own their `queries/` and generated `sqlc/` packages, and

@@ -139,7 +139,8 @@ Logs go to stdout; collect them with the platform's normal log pipeline.
 The request logger emits one record per request with:
 
 `method`, `path`, `status`, `latency`, `ip`, `request_id`, `user_id`,
-`content_length`, `user_agent`, and `query`.
+`content_length`, `user_agent`, and `query`. When tracing is enabled and the
+request is sampled, records also include `trace_id` and `span_id`.
 
 - `status` is the effective status after the Fiber error handler; a handler
   returning an error is not logged as `200`.
@@ -161,6 +162,13 @@ is echoed on the response and included in RFC 9457 problem responses as
 # Plain logs
 grep 'request_id=<id>' app.log
 ```
+
+When OpenTelemetry tracing is enabled, sampled request records also carry
+`trace_id` and `span_id`. Search by `request_id` first, then use `trace_id` in
+the tracing backend to inspect the HTTP span, its sanitized PostgreSQL spans,
+and any job spans linked to the request. Tracing never adds emails, tokens,
+payloads, SQL text, headers, or raw error messages to logs or spans; see
+[Tracing](tracing.md).
 
 Audit events carry the same request ID and the resolved tenant ID. The generic
 audit middleware records successful mutating requests; idempotent replays are
@@ -186,6 +194,13 @@ A claimed row with no tenant falls back to tenant 1 for compatibility. The
 tenant-first inspection. Retention and Prometheus labels are deliberately
 global: terminal jobs are purged by age regardless of tenant, and the metric
 labels stay `kind` only to avoid cardinality growth.
+
+Enqueue captures the active W3C `traceparent` in `jobs.trace_parent` when the
+caller has a recording span. Each attempt runs as a new-root `job.process`
+span with a link to the enqueue span, plus `job.id`, `job.kind`, tenant,
+attempt, and outcome attributes. The handler context carries the span, so
+sanitized database spans nest under the job. `NULL`/malformed traceparents are
+ignored. See [Tracing](tracing.md) and the schema note in section 6.
 
 ### Lifecycle and retries
 
@@ -440,6 +455,22 @@ migrating verifies required tables, columns, and unique indexes. A legacy
 partial schema fails with an actionable error instead of silently serving a
 broken database.
 
+### Jobs `trace_parent`
+
+The consolidated baseline includes `jobs.trace_parent TEXT`. This boilerplate
+has no deployed database, so no numbered migration was added. If a database
+already applied version 1, run the additive statement once before deploying
+this build:
+
+```sql
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT;
+```
+
+`cmd/migrate` verifies the column and fails with an actionable error if it is
+missing. Existing rows keep `NULL`, which produces a root `job.process` span
+without an enqueue link. The column stores only a W3C `traceparent` header; it
+does not contain the job payload or tenant data.
+
 ### Failure and backup/restore
 
 ```bash
@@ -577,13 +608,48 @@ The migration Job is not rolled back. If a release applied an incompatible
 migration, restore from a verified backup/PITR snapshot or ship a forward fix;
 do not blindly roll the image back onto a newer schema.
 
-## 8. Incident checklist
+## 8. Distributed tracing
+
+Tracing is off unless `OTEL_ENABLED=true`. When disabled, `app.Deps.Tracing`
+returns a no-op provider and no collector connection is opened. Configuration,
+sampling details, and privacy rules are in [Tracing](tracing.md).
+
+What exists when enabled:
+
+- an HTTP server span per request, excluding `/healthz`, `/readyz`, `/health`,
+  and `/metrics`; the span name/route uses the Fiber route template, not the
+  raw path;
+- sanitized pgx client spans for queries that run under a recording parent,
+  with SQLSTATE on failure and no SQL text, arguments, or error messages;
+- a `job.process` consumer span per attempt, as a new root with a link to the
+  enqueue trace and `job.outcome` (`succeeded`/`retried`/`dead`);
+- `trace_id`/`span_id` on request logs.
+
+Operational rules:
+
+- The collector is never part of readiness. If it is down, batches fill the
+  bounded SDK queue and are then dropped. The API stays ready. Check the
+  endpoint, DNS, NetworkPolicy egress 4317, and collector health; do not
+  restart the app to "recover" spans.
+- Shutdown flushes spans last with `OTEL_SHUTDOWN_TIMEOUT_SECS`. A flush
+  failure is logged as a warning and never changes the exit code.
+- Sampling is parent-based: an upstream `traceparent` with the sampled flag
+  off stays unsampled regardless of the local ratio. Use
+  `OTEL_TRACES_SAMPLER_ARG` to control root sampling.
+- Never add attributes containing emails, tokens, headers, query strings,
+  payloads, SQL, file names, or raw error text. Use `tracing.MarkError` for
+  failures; it records only a bounded `error.type`.
+- An unreachable collector at startup is normal and non-fatal. The OTLP/gRPC
+  client connects lazily.
+
+## 9. Incident checklist
 
 ### First 5 minutes
 
 1. Confirm scope: `/readyz`, pod status, recent rollout/migration, and the
    affected route or job kind.
-2. Correlate with `X-Request-Id` in logs, problem responses, and audit rows.
+2. Correlate with `X-Request-Id` (and `trace_id` when tracing is enabled) in
+   logs, problem responses, audit rows, and traces.
 3. Check the four golden signals plus `jobs_dead_total`,
    `jobs_claim_errors_total`, and `audit_write_failures_total`.
 4. Prefer reversible mitigations: roll back the Deployment, restore a

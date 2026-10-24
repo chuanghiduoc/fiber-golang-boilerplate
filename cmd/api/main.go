@@ -38,6 +38,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -88,6 +89,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Tracing is created before the database so pgx can emit sanitized client
+	// spans from the first query. The OTLP exporter connects lazily: an
+	// unreachable collector does not block or fail startup.
+	traceProvider, err := tracing.New(startupCtx, cfg.Tracing)
+	if err != nil {
+		fail("failed to initialize tracing", err)
+	}
+	if traceProvider.Enabled() {
+		slog.Info("tracing enabled",
+			slog.String("exporter", cfg.Tracing.Exporter),
+			slog.String("endpoint", cfg.Tracing.Endpoint),
+			slog.String("sampler", traceProvider.Sampler()),
+		)
+	}
+
 	// Email job payloads are encrypted at rest with a key derived from
 	// JWT_SECRET. Rotating that secret invalidates already-queued encrypted
 	// jobs, so drain the queue before rotating it.
@@ -97,7 +113,11 @@ func main() {
 	}
 
 	// Create database pool
-	pool, err := database.NewPool(startupCtx, cfg.DB)
+	poolOpts := make([]database.PoolOption, 0, 1)
+	if cfg.Tracing.Enabled && cfg.Tracing.InstrumentDB {
+		poolOpts = append(poolOpts, database.WithTracerProvider(traceProvider.TracerProvider()))
+	}
+	pool, err := database.NewPool(startupCtx, cfg.DB, poolOpts...)
 	if err != nil {
 		fail("failed to connect to database", err)
 	}
@@ -228,6 +248,7 @@ func main() {
 		Health:         healthChecker,
 		Audit:          audit.NewPostgresRecorder(pool),
 		TenantResolver: tenantResolver,
+		Tracing:        traceProvider,
 	})
 	application.Register(
 		identity.New(authHandler, userHandler),
@@ -239,7 +260,11 @@ func main() {
 	// path, so SMTP outages retry instead of failing a registration request.
 	hostname, _ := os.Hostname()
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	worker := jobs.NewWorker(pool, hostname, jobs.WithConcurrency(4))
+	workerOpts := []jobs.Option{jobs.WithConcurrency(4)}
+	if traceProvider.Enabled() {
+		workerOpts = append(workerOpts, jobs.WithTracerProvider(traceProvider.TracerProvider()))
+	}
+	worker := jobs.NewWorker(pool, hostname, workerOpts...)
 	emailHandler := jobs.EmailHandler(emailSender, jobs.WithEmailPayloadCodec(payloadCodec))
 	// New workers consume both legacy plaintext jobs and encrypted jobs so a
 	// rolling deployment can drain the old queue without losing messages.
@@ -298,6 +323,19 @@ func main() {
 		slog.Error("failed to close cache", slog.Any("error", err))
 	}
 	pool.Close()
+
+	// Flush spans last, after HTTP and the worker have stopped. Export failures
+	// (for example a collector outage) are logged but never change the exit
+	// code; losing telemetry must not turn a clean shutdown into a failure.
+	traceShutdownTimeout := time.Duration(cfg.Tracing.ShutdownTimeout) * time.Second
+	if traceShutdownTimeout <= 0 {
+		traceShutdownTimeout = 5 * time.Second
+	}
+	traceShutdownCtx, cancelTrace := context.WithTimeout(context.Background(), traceShutdownTimeout)
+	if err := traceProvider.Shutdown(traceShutdownCtx); err != nil {
+		slog.Warn("tracing shutdown incomplete; remaining spans were dropped", slog.Any("error", err))
+	}
+	cancelTrace()
 
 	slog.Info("server exited")
 	if exitCode != 0 {

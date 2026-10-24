@@ -19,6 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -48,6 +49,8 @@ type Deps struct {
 	Limiters    Limiters
 	Audit       audit.Recorder
 	Idempotency fiber.Handler
+	// Tracing is the process tracer provider. Nil means tracing is disabled.
+	Tracing *tracing.Provider
 	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
 	// is a pass-through for tests and minimal deployments.
 	TenantResolver tenant.Resolver
@@ -114,6 +117,7 @@ func (a *App) setupGlobalMiddleware() {
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(middleware.RequestID())
+	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths()))
 	a.fiber.Use(middleware.Metrics())
 	a.fiber.Use(middleware.Logger())
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
