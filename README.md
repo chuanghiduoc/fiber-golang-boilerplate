@@ -137,6 +137,13 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
 - Idempotency keys are scoped by method, path, tenant ID/slug, and caller
   (user ID, or IP for public routes), so the same key/body/IP in two tenants
   cannot replay one tenant's `201` into another.
+- Audit is fail-closed for privileged mutations. Tier 1 services write the
+  audit row in the mutation transaction (audit failure rolls back); Tier 2
+  routes write a pre-write intent row through `audit.Guard` and complete it
+  with the observed outcome. A required intent that cannot be stored returns
+  `503 system.audit_unavailable` before the handler runs. Intent, completion,
+  transaction-missing, and domain-missing failures are exported as Prometheus
+  counters.
 - `POST /auth/logout` revokes by possession of the opaque refresh token. A
   tenant-B token sent without `X-Tenant-Slug` is still deleted; logout returns
   `204` even when the token is already absent.
@@ -510,8 +517,10 @@ already exists.
 - Prometheus counters expose job lifecycle and audit health:
   `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
   `jobs_retried_total{kind}`, `jobs_dead_total{kind}`,
-  `jobs_claim_errors_total`, `jobs_purged_total`, and
-  `audit_write_failures_total`. Outcome counters advance only after the
+  `jobs_claim_errors_total`, `jobs_purged_total`,
+  `audit_write_failures_total`, `audit_intent_failures_total`,
+  `audit_completion_failures_total`, `audit_tx_missing_total`, and
+  `audit_domain_missing_total`. Outcome counters advance only after the
   corresponding database write succeeds. `jobs_dead_total` counts handler
   failures that exhaust their attempts; a job dead-lettered by lease expiry is
   visible as `status = 'dead'` in the table but is not counted by that

@@ -87,7 +87,11 @@ Application metrics:
 | `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
-| `audit_write_failures_total` | — | Audit events that could not be recorded. |
+| `audit_write_failures_total` | — | Best-effort audit events that could not be recorded. |
+| `audit_intent_failures_total` | — | Pre-write intent rows that could not be recorded (required guards returned 503). |
+| `audit_completion_failures_total` | — | Intent rows that could not be completed; inspect stale `started` rows. |
+| `audit_tx_missing_total` | — | Tier 1 audit writes attempted without a transaction (misconfiguration). |
+| `audit_domain_missing_total` | — | Guarded successes without the required domain event. |
 
 The default Prometheus registry also exposes Go runtime and process metrics
 (for example `go_goroutines`, `process_resident_memory_bytes`).
@@ -170,13 +174,33 @@ and any job spans linked to the request. Tracing never adds emails, tokens,
 payloads, SQL text, headers, or raw error messages to logs or spans; see
 [Tracing](tracing.md).
 
-Audit events carry the same request ID and the resolved tenant ID. The generic
-audit middleware records successful mutating requests; idempotent replays are
-skipped so a replay does not duplicate the trail. When no tenant middleware ran
-(for example an internal call or a pre-tenant test), the event uses the
-compatibility tenant id 1. See [Module Template](module-template.md#5-audit)
-for explicit domain events; set `Event.TenantID` there or let the recorder
-resolve it from the context.
+Audit events carry the same request ID and the resolved tenant ID. Mutations
+are audited in two tiers:
+
+- **Tier 1** services write a terminal event with `RecordTx` inside the
+  mutation transaction. If the insert fails, the transaction rolls back and the
+  API returns `503 system.audit_unavailable`. These are the identity
+  registration/profile/password/delete operations, admin role/ban/unban, and
+  admin file delete/restore.
+- **Tier 2** routes run `audit.Guard` after idempotency. The guard inserts an
+  `outcome=started`, `source=http` intent row before the handler and completes
+  it as `succeeded`, `failed`, or `denied` with the HTTP status/error code. A
+  required guard returns the same 503 when the intent cannot be stored, so the
+  handler never runs unaudited. Completion failures are counted and leave a
+  stale `started` row for reconciliation; they cannot roll back a committed
+  mutation.
+
+Idempotent replays are skipped so a replay does not duplicate the trail, and
+audit rows are never cached with the idempotency response. When no tenant
+middleware ran (for example an internal call or a pre-tenant test), the event
+uses the compatibility tenant id 1. `audit_events` is append-only: only a
+started HTTP intent can transition to a terminal outcome, and only completion
+fields may change. Alert on `audit_intent_failures_total`,
+`audit_completion_failures_total`, `audit_tx_missing_total`, and
+`audit_domain_missing_total`; investigate rows where
+`outcome = 'started' AND created_at < NOW() - INTERVAL '10 minutes'`. See
+[Module Template](module-template.md#5-audit) for explicit domain events; set
+`Event.TenantID` there or let the recorder resolve it from the context.
 
 ## 4. Background jobs
 

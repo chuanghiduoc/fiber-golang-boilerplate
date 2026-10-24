@@ -98,6 +98,30 @@ func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {
 	assert.Empty(t, recorder.events)
 }
 
+func TestMiddleware_SkipsGuardedRoute(t *testing.T) {
+	recorder := &recordingRecorder{}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Post("/guarded", func(c fiber.Ctx) error {
+		fiber.Locals[bool](c, "audit_guarded", true)
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	req, _ := http.NewRequest("POST", "/guarded", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	assert.Empty(t, recorder.events, "a Guard-owned route must not also use the global fallback")
+}
+
+func TestNoopIsNotAnIntentRecorder(t *testing.T) {
+	var recorder any = Noop{}
+	_, implementsID := recorder.(IDRecorder)
+	_, implementsCompletion := recorder.(CompletionRecorder)
+	assert.False(t, implementsID)
+	assert.False(t, implementsCompletion)
+}
+
 func TestMiddleware_SkipsIdempotentReplay(t *testing.T) {
 	recorder := &recordingRecorder{}
 	app := fiber.New()

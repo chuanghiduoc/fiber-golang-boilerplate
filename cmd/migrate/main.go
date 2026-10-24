@@ -42,7 +42,10 @@ var requiredColumns = map[string][]string{
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id"},
 	"jobs":                      {"tenant_id", "trace_parent"},
-	"audit_events":              {"tenant_id"},
+	"audit_events": {
+		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
+		"status_code", "error_code", "idempotency_key_hash", "completed_at",
+	},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset

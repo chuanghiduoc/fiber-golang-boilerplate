@@ -18,7 +18,7 @@ import (
 )
 
 func newTestUserService(repo *mockUserRepo, requireEmailVerification bool) UserService {
-	return NewUserService(repo, newMockRefreshTokenRepo(), requireEmailVerification, newMockCache(), nil)
+	return NewUserService(repo, newMockRefreshTokenRepo(), requireEmailVerification, newMockCache(), nil, nil)
 }
 
 type mockVerificationProvisioner struct {
@@ -36,7 +36,7 @@ func (m *mockVerificationProvisioner) SupportsTransactionalEnqueue() bool {
 func TestRegistrationEmailsTransactional(t *testing.T) {
 	t.Run("false without a provisioner", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		if svc.RegistrationEmailsTransactional() {
 			t.Error("registration emails cannot be transactional without a provisioner")
@@ -44,7 +44,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 	})
 
 	t.Run("false with a provisioner but no tx manager", func(t *testing.T) {
-		svc := NewUserService(newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), nil)
+		svc := NewUserService(newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), nil, nil)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: true})
 		if svc.RegistrationEmailsTransactional() {
 			t.Error("registration emails cannot be transactional without a tx manager")
@@ -53,7 +53,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 
 	t.Run("false when the provisioner cannot enqueue transactionally", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: false})
 		if svc.RegistrationEmailsTransactional() {
@@ -63,7 +63,7 @@ func TestRegistrationEmailsTransactional(t *testing.T) {
 
 	t.Run("true with capability and a tx manager", func(t *testing.T) {
 		svc := NewUserService(
-			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil),
+			newMockUserRepo(), newMockRefreshTokenRepo(), false, newMockCache(), database.NewTxManager(nil), nil,
 		)
 		svc.SetVerificationProvisioner(&mockVerificationProvisioner{supportsTransactional: true})
 		if !svc.RegistrationEmailsTransactional() {
@@ -187,7 +187,7 @@ func TestAuthenticate(t *testing.T) {
 	t.Run("account locked after max attempts", func(t *testing.T) {
 		repo := newMockUserRepo()
 		cache := newMockCache()
-		svc := NewUserService(repo, newMockRefreshTokenRepo(), false, cache, nil)
+		svc := NewUserService(repo, newMockRefreshTokenRepo(), false, cache, nil, nil)
 
 		_, _ = svc.Register(context.Background(), dto.RegisterRequest{
 			Email: "test@example.com", Password: "Password1!", Name: "Test User",

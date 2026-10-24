@@ -85,7 +85,7 @@ Rules:
 | 422 | Validation failed |
 | 429 | Rate limited |
 | 500 | Internal error |
-| 503 | Dependency degraded / not ready |
+| 503 | Dependency degraded / not ready, or required audit intent unavailable |
 | 504 | Request timeout |
 
 ## Authentication and authorization
@@ -171,6 +171,21 @@ Rules:
 - The scope includes the tenant ID and slug (plus user ID, or IP for public
   routes), so one key cannot replay a `201` across tenants.
 - Auth token-minting endpoints are excluded by design.
+
+## Audit and fail-closed behavior
+
+- Privileged mutations are audited before or atomically with the write. A
+  Tier 1 mutation whose audit row cannot be committed rolls back and returns
+  `503` with code `system.audit_unavailable` (retryable). A Tier 2 route whose
+  required pre-write intent cannot be stored returns the same 503 before the
+  handler runs; the mutation does not execute.
+- Retrying after 503 is safe when using the same `Idempotency-Key` where the
+  route supports it. Replayed responses are not re-audited.
+- Audit metadata is sanitized: passwords, tokens, emails, and URLs are
+  redacted, and size/depth are bounded. Do not design clients that depend on
+  request values being echoed back through audit endpoints (none are public).
+- A completion failure after a Tier 2 mutation cannot undo the write; operators
+  should alert on `audit_completion_failures_total` and stale `started` rows.
 
 ## Files
 

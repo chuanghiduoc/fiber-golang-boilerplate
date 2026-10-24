@@ -153,10 +153,17 @@ the `tenants` table.
   uses `authz.Require`. Roles are an implementation detail of the permission
   matrix. Current legacy exceptions (`files` routes, some identity handler
   checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
-- **Audit:** successful mutating requests are recorded with actor, request ID,
-  IP, route, and the resolved tenant (`audit_events.tenant_id`, default 1).
-  Explicit domain events use `audit.Recorder`; a zero `Event.TenantID` is
-  resolved from the recording context.
+- **Audit:** every privileged mutation is audited fail-closed. Tier 1 services
+  (identity registration/profile/password/delete, admin role/ban/unban, admin
+  file delete/restore) call `audit.TxRecorder.RecordTx` inside the same
+  transaction as the mutation; the mutation rolls back when the audit insert
+  fails. Tier 2 routes use `audit.Guard`, which writes an `outcome=started`
+  intent row before the handler and completes it as succeeded/failed/denied
+  afterwards; required guards return `503 system.audit_unavailable` when the
+  intent cannot be stored. Rows carry actor type/role, source, request ID, IP,
+  route, and the resolved tenant (`audit_events.tenant_id`, default 1).
+  `audit.NewServiceEvent` enriches explicit domain events from the request
+  context; a zero `Event.TenantID` is resolved from the recording context.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
   HTTP renders RFC 9457 `application/problem+json`.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,

@@ -75,4 +75,32 @@ var (
 			Help: "Total number of audit events that could not be recorded.",
 		},
 	)
+
+	AuditIntentFailuresTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "audit_intent_failures_total",
+			Help: "Total number of pre-write audit intent rows that could not be recorded.",
+		},
+	)
+
+	AuditCompletionFailuresTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "audit_completion_failures_total",
+			Help: "Total number of audit intent rows that could not be completed.",
+		},
+	)
+
+	AuditTxMissingTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "audit_tx_missing_total",
+			Help: "Total number of Tier 1 audit writes attempted without a database transaction.",
+		},
+	)
+
+	AuditDomainMissingTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "audit_domain_missing_total",
+			Help: "Total number of guarded mutations that succeeded without a domain audit event.",
+		},
+	)
 )

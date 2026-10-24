@@ -29,10 +29,12 @@ import (
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -112,7 +114,9 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 
 	uploadSvc := filesvc.NewUploadService(fileRepo, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
-	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, store))
+	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(
+		fileRepo, database.NewTxManager(pool), audit.NewPostgresRecorder(pool), store,
+	))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
@@ -341,7 +345,9 @@ func TestTenantFiles_Isolation(t *testing.T) {
 	assert.Equal(t, int64(len("%PDF-1.4 tenant one")), repoStatsA.TotalFileSize)
 
 	// The admin adapter must carry the tenant id into contract types.
-	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(h.fileRepo, h.store)).ListFiles(ctxA, 10, "")
+	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(
+		h.fileRepo, database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), h.store,
+	)).ListFiles(ctxA, 10, "")
 	require.NoError(t, err)
 	require.Len(t, adminPage.Items, 1)
 	assert.Equal(t, h.tenantA, adminPage.Items[0].TenantID)

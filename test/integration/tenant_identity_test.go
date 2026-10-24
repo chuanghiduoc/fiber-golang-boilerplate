@@ -23,6 +23,7 @@ import (
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -64,16 +65,17 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	txManager := database.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
 
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, auditRecorder, sessionStore)
 	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
 	authHandler := identityhandler.NewAuthHandler(
 		userSvc, refreshSvc, nil, nil,
 		integrationTenantSecret, 24, false, nil, tenantRepo,
 	)
 	userHandler := identityhandler.NewUserHandler(userSvc)
-	adminSvc := identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, sessionStore)
+	adminSvc := identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, auditRecorder, sessionStore)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	api := app.Group("/api/v1", tenant.Middleware(resolver, "default"))

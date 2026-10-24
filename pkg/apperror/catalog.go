@@ -28,9 +28,10 @@ const (
 	CodePermissionDenied  Code = "permission.denied"
 	CodeRateLimitExceeded Code = "rate_limit.exceeded"
 
-	CodeSystemInternal    Code = "system.internal"
-	CodeSystemTimeout     Code = "system.timeout"
-	CodeSystemUnavailable Code = "system.unavailable"
+	CodeSystemInternal         Code = "system.internal"
+	CodeSystemTimeout          Code = "system.timeout"
+	CodeSystemUnavailable      Code = "system.unavailable"
+	CodeSystemAuditUnavailable Code = "system.audit_unavailable"
 )
 
 // Spec describes the stable, non-changing presentation of a Code.
@@ -127,6 +128,12 @@ var catalog = map[Code]Spec{
 		Title:     "Service unavailable",
 		Retryable: true,
 		DocPath:   "/errors/system-unavailable",
+	},
+	CodeSystemAuditUnavailable: {
+		Status:    http.StatusServiceUnavailable,
+		Title:     "Audit service unavailable",
+		Retryable: true,
+		DocPath:   "/errors/system-audit-unavailable",
 	},
 }
 

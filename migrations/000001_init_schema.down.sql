@@ -7,8 +7,12 @@ BEGIN
     IF to_regclass('tenants') IS NOT NULL THEN
         DROP TRIGGER IF EXISTS trigger_tenants_updated_at ON tenants;
     END IF;
+    IF to_regclass('audit_events') IS NOT NULL THEN
+        DROP TRIGGER IF EXISTS trigger_audit_events_completion ON audit_events;
+    END IF;
 END $$;
 
+DROP FUNCTION IF EXISTS audit_events_completion_guard();
 DROP FUNCTION IF EXISTS protect_last_admin();
 
 DROP TABLE IF EXISTS audit_events;

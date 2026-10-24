@@ -87,7 +87,7 @@ func TestUpdate_EmailChangeResetsVerification(t *testing.T) {
 func TestChangePassword_RevokesSessionsAndBumpsVersion(t *testing.T) {
 	repo := newMockUserRepo()
 	refreshRepo := newMockRefreshTokenRepo()
-	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil)
+	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil, nil)
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
 	repo.users[1] = &identitysqlc.User{TenantID: 1,
@@ -112,7 +112,7 @@ func TestChangePassword_RevokesSessionsAndBumpsVersion(t *testing.T) {
 func TestRevokeSessions_InvalidatesAccessAndRefreshTokens(t *testing.T) {
 	repo := newMockUserRepo()
 	refreshRepo := newMockRefreshTokenRepo()
-	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil)
+	svc := NewUserService(repo, refreshRepo, false, newMockCache(), nil, nil)
 	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "user@example.com", Name: "User", Role: "user"}
 	refreshRepo.tokens["hash"] = &identitysqlc.RefreshToken{TenantID: 1, UserID: 1, Token: "hash"}
 
@@ -278,7 +278,7 @@ func TestUpdate_NameOnlyPreservesEmailAndVerification(t *testing.T) {
 
 func TestVerifyPassword_UsesLoginLockout(t *testing.T) {
 	repo := newMockUserRepo()
-	svc := NewUserService(repo, newMockRefreshTokenRepo(), false, newMockCache(), nil)
+	svc := NewUserService(repo, newMockRefreshTokenRepo(), false, newMockCache(), nil, nil)
 	hash, _ := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
 	repo.users[1] = &identitysqlc.User{TenantID: 1,
 		ID: 1, Email: "user@example.com", Name: "User", Role: "user",
