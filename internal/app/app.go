@@ -16,9 +16,11 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/versioning"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -29,6 +31,14 @@ import (
 type Module interface {
 	Name() string
 	RegisterRoutes(v1 fiber.Router, deps Deps)
+}
+
+// V2Module is optionally implemented by modules with a second API surface.
+// Modules that do not implement it are mounted only under /api/v1, and the
+// /api/v2 group is not created unless at least one module opts in.
+type V2Module interface {
+	Module
+	RegisterV2Routes(v2 fiber.Router, deps Deps)
 }
 
 // Limiters carries the tiered rate limiters so modules do not rebuild them.
@@ -51,6 +61,12 @@ type Deps struct {
 	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
 	// is a pass-through for tests and minimal deployments.
 	TenantResolver tenant.Resolver
+	// I18n negotiates Accept-Language and localizes error responses. Nil
+	// disables negotiation and preserves the default English behavior.
+	I18n *i18n.Bundle
+	// Versioning configures deprecation/sunset metadata for API groups. Nil is
+	// equivalent to v1, current, with no deprecation headers.
+	Versioning *versioning.Config
 }
 
 type App struct {
@@ -69,7 +85,7 @@ func New(cfg *config.Config, deps Deps) *App {
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperror.FiberErrorHandlerWithLocalizer(deps.I18n),
 		BodyLimit:    cfg.App.BodyLimit,
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -114,6 +130,7 @@ func (a *App) setupGlobalMiddleware() {
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(middleware.RequestID())
+	a.fiber.Use(i18n.Middleware(a.deps.I18n))
 	a.fiber.Use(middleware.Metrics())
 	a.fiber.Use(middleware.Logger())
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
@@ -165,10 +182,26 @@ func (a *App) setupInfrastructureRoutes() {
 	}
 }
 
-// Register mounts every module under /api/v1. It is idempotent only in the
-// sense that the caller must register before Listen; duplicate paths are a
-// programming error caught by Fiber's router.
+// Register mounts every module under /api/v1. Modules that implement V2Module
+// are also mounted under /api/v2; the v2 group is created only when at least
+// one module opts in. Callers must register before Listen; duplicate paths are
+// a programming error caught by Fiber's router.
 func (a *App) Register(modules ...Module) {
+	supported := []versioning.Version{versioning.V1}
+	hasV2 := false
+	for _, m := range modules {
+		if _, ok := m.(V2Module); ok {
+			hasV2 = true
+			break
+		}
+	}
+	if hasV2 {
+		supported = append(supported, versioning.V2)
+	}
+	// Reject /api/v3/... before routing so an unknown version is a 406
+	// contract error rather than a generic 404.
+	a.fiber.Use("/api", versioning.Guard(supported...))
+
 	// Tenant resolution is API-only: health and metrics probes must not depend
 	// on the tenants table. It runs before every module's JWT middleware so a
 	// conflicting X-Tenant-Slug can be rejected after the token is parsed.
@@ -176,10 +209,28 @@ func (a *App) Register(modules ...Module) {
 	if a.cfg.Tenant.RequireHeader {
 		defaultSlug = ""
 	}
-	v1 := a.fiber.Group("/api/v1", tenant.Middleware(a.deps.TenantResolver, defaultSlug))
+	tenantMiddleware := tenant.Middleware(a.deps.TenantResolver, defaultSlug)
+
+	v1 := a.fiber.Group("/api/v1",
+		versioning.Middleware(versioning.V1, a.deps.Versioning),
+		tenantMiddleware,
+	)
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		m.RegisterRoutes(v1, a.deps)
+	}
+
+	if !hasV2 {
+		return
+	}
+	v2 := a.fiber.Group("/api/v2",
+		versioning.Middleware(versioning.V2, a.deps.Versioning),
+		tenantMiddleware,
+	)
+	for _, m := range modules {
+		if v2Module, ok := m.(V2Module); ok {
+			v2Module.RegisterV2Routes(v2, a.deps)
+		}
 	}
 }
 

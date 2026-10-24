@@ -1,10 +1,11 @@
 # Documentation
 
 - [Architecture](architecture.md) — module map, dependency rules, request flow,
-  tenant model, data ownership, jobs/outbox, migration policy.
-- [API Design System](api-design.md) — URL/versioning, JSON conventions,
-  success/error shapes, pagination, auth, idempotency, rate limits, status
-  codes, compatibility rules.
+  tenant model, i18n/versioning mechanics, data ownership, jobs/outbox,
+  migration policy.
+- [API Design System](api-design.md) — URL/versioning, Accept-Version,
+  localization, JSON conventions, success/error shapes, pagination, auth,
+  idempotency, rate limits, status codes, compatibility rules.
 - [Module Template](module-template.md) — canonical module layout, copy-paste
   skeleton, route/permission/audit/idempotency wiring, table ownership,
   cross-module contracts, migrations, tests, and the add-a-module checklist.

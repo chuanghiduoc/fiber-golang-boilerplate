@@ -76,6 +76,7 @@ func ValidateStruct(s interface{}) error {
 			Path:    fe.Field(),
 			Code:    codeForTag(fe.Tag()),
 			Message: formatError(fe),
+			Params:  paramsForError(fe),
 		})
 	}
 
@@ -101,6 +102,19 @@ func codeForTag(tag string) string {
 		return "required"
 	default:
 		return "invalid"
+	}
+}
+
+// paramsForError exposes interpolation values for localized validation
+// messages. Only bounds carry parameters today; other codes use {path} only.
+func paramsForError(fe validator.FieldError) map[string]string {
+	switch fe.Tag() {
+	case "min":
+		return map[string]string{"min": fe.Param()}
+	case "max":
+		return map[string]string{"max": fe.Param()}
+	default:
+		return nil
 	}
 }
 

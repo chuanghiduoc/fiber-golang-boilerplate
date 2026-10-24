@@ -91,10 +91,11 @@ At minimum, replace:
 - `overlays/components/staging-config/configmap-patch.yaml` and
   `overlays/components/production-config/configmap-patch.yaml`:
   `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`, `SMTP_HOST`,
-  `EMAIL_FROM_ADDRESS`, and `STORAGE_S3_BUCKET`. Keep `Idempotency-Key` and
-  `X-Tenant-Slug` in `CORS_ALLOW_HEADERS` and `Idempotent-Replayed` in
-  `CORS_EXPOSE_HEADERS` for browser clients that use idempotent mutations or
-  tenant selection.
+  `EMAIL_FROM_ADDRESS`, and `STORAGE_S3_BUCKET`. Keep `Idempotency-Key`,
+  `X-Tenant-Slug`, `Accept-Language`, and `Accept-Version` in
+  `CORS_ALLOW_HEADERS`, and keep `Idempotent-Replayed`, `Content-Language`, and
+  the version/deprecation headers in `CORS_EXPOSE_HEADERS` so browser clients
+  can read replay, locale, and version metadata.
 - `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES` and
   the S3 endpoint. Keep environment-specific values in the overlay components.
 - `base/networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your

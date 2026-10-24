@@ -24,20 +24,44 @@ var DocsBaseURL = ""
 const problemContentType = "application/problem+json"
 
 // FieldError is one entry in the flat errors[] list (validation / business rule).
+// Params carries interpolation values (for example min/max) for localizers; it
+// is intentionally excluded from the wire contract.
 type FieldError struct {
-	Path    string `json:"path"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Path    string            `json:"path"`
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Params  map[string]string `json:"-"`
 }
 
 // AppError is a domain error that renders as an RFC 9457 problem document.
 // Code is a stable snake_case string usable as an i18n key on the client.
+//
+// DetailKey optionally names a catalog message used to localize Detail. When
+// no Localizer is configured, or the key is absent, the literal Detail is
+// preserved, so existing callers keep their current behavior.
 type AppError struct {
-	Status int
-	Code   string
-	Title  string
-	Detail string
-	Errors []FieldError
+	Status       int
+	Code         string
+	Title        string
+	Detail       string
+	DetailKey    string
+	DetailParams map[string]any
+	Errors       []FieldError
+}
+
+// Localizer translates a message key for one request. Localize returns "" when
+// the key is unknown, allowing the error handler to keep its English fallback.
+// The i18n bundle implements this interface; tests may provide a fake.
+type Localizer interface {
+	Localize(c fiber.Ctx, key string, params map[string]any) string
+}
+
+// WithDetailKey marks Detail as a catalog message. The key and params are used
+// only when a Localizer is installed; otherwise the literal Detail remains.
+func (e *AppError) WithDetailKey(key string, params map[string]any) *AppError {
+	e.DetailKey = key
+	e.DetailParams = params
+	return e
 }
 
 func (e *AppError) Error() string { return e.Detail }
@@ -107,19 +131,35 @@ type ProblemDetails struct {
 }
 
 // FiberErrorHandler renders any error as an application/problem+json document.
+// It is the nil-localizer path: titles/details and validation messages are
+// emitted exactly as callers supplied them.
 func FiberErrorHandler(c fiber.Ctx, err error) error {
+	return handleError(c, err, nil)
+}
+
+// FiberErrorHandlerWithLocalizer returns an error handler that localizes
+// catalog titles and opted-in details. Code, type, status, instance, and the
+// errors[] shape are unchanged; a nil localizer is equivalent to
+// FiberErrorHandler.
+func FiberErrorHandlerWithLocalizer(localizer Localizer) fiber.ErrorHandler {
+	return func(c fiber.Ctx, err error) error {
+		return handleError(c, err, localizer)
+	}
+}
+
+func handleError(c fiber.Ctx, err error, localizer Localizer) error {
 	var appErr *AppError
 	if errors.As(err, &appErr) {
-		return writeProblem(c, appErr)
+		return writeProblem(c, appErr, localizer)
 	}
 
 	if errors.Is(err, context.DeadlineExceeded) {
-		return writeProblem(c, newError(fiber.StatusGatewayTimeout, "gateway_timeout", "Gateway Timeout", "request timed out"))
+		return writeProblem(c, newError(fiber.StatusGatewayTimeout, "gateway_timeout", "Gateway Timeout", "request timed out"), localizer)
 	}
 
 	var fiberErr *fiber.Error
 	if errors.As(err, &fiberErr) {
-		return writeProblem(c, fromStatus(fiberErr.Code, fiberErr.Message))
+		return writeProblem(c, fromStatus(fiberErr.Code, fiberErr.Message), localizer)
 	}
 
 	slog.Error("unhandled error in error handler",
@@ -127,24 +167,53 @@ func FiberErrorHandler(c fiber.Ctx, err error) error {
 		slog.String("type", fmt.Sprintf("%T", err)),
 		slog.String("path", c.Path()),
 	)
-	return writeProblem(c, NewInternal("Internal Server Error"))
+	return writeProblem(c, NewInternal("Internal Server Error"), localizer)
 }
 
-func writeProblem(c fiber.Ctx, e *AppError) error {
+func writeProblem(c fiber.Ctx, e *AppError, localizer Localizer) error {
 	docPath := "/errors/" + strings.ReplaceAll(e.Code, "_", "-")
 	if spec, ok := SpecFor(Code(e.Code)); ok {
 		docPath = spec.DocPath
 	}
+
+	title := e.Title
+	detail := e.Detail
+	fields := e.Errors
+	if localizer != nil {
+		if localized := localizer.Localize(c, "errors."+e.Code+".title", nil); localized != "" {
+			title = localized
+		}
+		if e.DetailKey != "" {
+			if localized := localizer.Localize(c, e.DetailKey, e.DetailParams); localized != "" {
+				detail = localized
+			}
+		}
+		if len(e.Errors) > 0 {
+			fields = make([]FieldError, len(e.Errors))
+			for i, field := range e.Errors {
+				params := make(map[string]any, len(field.Params)+1)
+				params["path"] = field.Path
+				for key, value := range field.Params {
+					params[key] = value
+				}
+				if localized := localizer.Localize(c, "validation."+field.Code, params); localized != "" {
+					field.Message = localized
+				}
+				fields[i] = field
+			}
+		}
+	}
+
 	doc := ProblemDetails{
 		Type:      DocsBaseURL + docPath,
-		Title:     e.Title,
+		Title:     title,
 		Status:    e.Status,
 		Code:      e.Code,
-		Detail:    e.Detail,
+		Detail:    detail,
 		Instance:  c.Path(),
 		RequestID: requestID(c),
 		Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00"),
-		Errors:    e.Errors,
+		Errors:    fields,
 	}
 	return c.Status(e.Status).JSON(doc, problemContentType)
 }

@@ -5,8 +5,17 @@ contract changes; treat them as breaking unless additive.
 
 ## Base and versioning
 
-- Base path: `/api/v1`.
-- Version in the path, never in a header.
+- Base path: `/api/v1`. `/api/v2` exists only when at least one module
+  implements `app.V2Module`; Swagger documents v1.
+- The path selects the surface. `Accept-Version` is an optional assertion
+  (`1`, `v1`, `2`, or `v2`); when present it must match the path. A mismatch
+  returns `406 api.version_unsupported`.
+- Version-shaped paths that are not mounted (for example `/api/v3`) also return
+  `406 api.version_unsupported`, never a generic 404.
+- Every versioned response carries `API-Version` (the serving version) and
+  `Vary: Accept-Version`. Deprecated versions add `Deprecation` (RFC 9745
+  `@<unix-seconds>`), `Sunset` (HTTP-date), and `Link` (`rel="deprecation"` to
+  `DocsURL`, `rel="successor-version"` to the successor path).
 - Additive fields are non-breaking. Removing/renaming fields, changing types,
   status codes, or error codes requires a new major version or a documented
   deprecation window.
@@ -65,6 +74,10 @@ Rules:
 - `detail` is public text and never contains SQL, stack traces, or internals.
 - `type` is `ERROR_DOCS_BASE_URL` + the catalog `DocPath`.
 - Validation failures use `422` with a flat `errors[]`.
+- `title` and `errors[].message` are localized from `Accept-Language` (`en` /
+  `vi`) when i18n is enabled. `detail` is localized only when the handler
+  attaches `AppError.DetailKey`; otherwise the supplied text is preserved.
+  Localization never changes `code`, `type`, `status`, `instance`, or paths.
 - Authorization failures use `403 permission.denied`.
 - Do not expose whether another user's resource exists; return `404`.
 
@@ -79,6 +92,7 @@ Rules:
 | 401 | Missing/invalid authentication |
 | 403 | Authenticated but not permitted |
 | 404 | Not found (including non-owned resources) |
+| 406 | Accept-Version mismatch or unsupported `/api/vN` |
 | 409 | Conflict, duplicate, last-admin, idempotency body mismatch |
 | 413 | Upload too large |
 | 415 | Unsupported media type |
@@ -129,7 +143,12 @@ Rules:
 - `X-Tenant-Slug` selects the tenant; it is in the default CORS allow list.
 - `Idempotency-Key` is opt-in on mutating routes; 1-128 chars of
   `[A-Za-z0-9._:-]`. Replays return `Idempotent-Replayed: true`.
-- `Location`, `ETag` are returned where applicable and exposed through CORS.
+- `Accept-Language` negotiates `en`/`vi` with q-values, case-insensitive tags,
+  region truncation (`vi-VN` → `vi`), wildcards, and `I18N_DEFAULT_LOCALE`
+  fallback. Responses set `Content-Language` and `Vary: Accept-Language`.
+- `Accept-Version` asserts the path version; responses set `API-Version` and
+  `Vary: Accept-Version`, plus deprecation headers when applicable.
+- `Location`, `ETag`, locale, and version metadata are exposed through CORS.
 - Rate limits are tiered (strict/normal/relaxed) and keyed per user when
   authenticated, otherwise per IP. `429` is retryable.
 

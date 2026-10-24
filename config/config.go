@@ -23,6 +23,22 @@ type Config struct {
 	Email     EmailConfig
 	Admin     AdminConfig
 	Tenant    TenantConfig
+	I18N      I18NConfig
+}
+
+// I18NConfig controls request locale negotiation. Locale tags are matched
+// against the embedded catalogs; unsupported values fail at startup.
+type I18NConfig struct {
+	DefaultLocale string `env:"I18N_DEFAULT_LOCALE" envDefault:"en"`
+}
+
+// Locale returns the normalized configured default locale, or "en".
+func (c I18NConfig) Locale() string {
+	locale := strings.ToLower(strings.TrimSpace(c.DefaultLocale))
+	if locale == "" {
+		return "en"
+	}
+	return locale
 }
 
 // TenantConfig controls request-tenant resolution. The default slug preserves
@@ -71,8 +87,8 @@ func (a AppConfig) TrustedProxiesList() []string {
 type CORSConfig struct {
 	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
 	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
-	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization,Idempotency-Key,X-Tenant-Slug"`
-	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed"`
+	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"`
+	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link"`
 	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }
 

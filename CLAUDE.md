@@ -42,13 +42,13 @@ cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
 internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
+internal/platform/          authz, audit, i18n, jobs, session, tenant, versioning, and future shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 ```
 
-**Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
+**Request flow:** `Client → app middleware (request ID, i18n) → /api/vN guard → tenant middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
@@ -115,6 +115,11 @@ complete CD platform.
   and optional `errors[]`.
 - `detail` must be public text; never serialize internal causes, SQL, or stack
   traces. Sentinels: `apperror.ErrNotFound`.
+- `Deps.I18n` localizes catalog titles and validation messages for
+  `Accept-Language`. To localize a detail, attach
+  `WithDetailKey("errors.<code>.detail", params)`. A nil bundle/localizer keeps
+  the existing English output, and `code`/`type`/`status`/`instance` never
+  change.
 - Permission failures should use `authz.Require`; it returns
   `permission.denied`.
 
@@ -131,6 +136,17 @@ Offset helpers are for small admin/export tables only.
 
 ## Key Patterns
 
+- **i18n:** `internal/platform/i18n` embeds `en`/`vi` catalogs and runs right
+  after request ID. It negotiates q-values, truncation, and wildcards; sets
+  `Content-Language` and `Vary: Accept-Language`; and localizes error titles
+  and validation messages through `pkg/apperror`. Keep `en.json`/`vi.json` keys
+  and `{placeholders}` in parity (startup fails otherwise).
+- **API versions:** `/api/v1` is always mounted. Implement `app.V2Module`
+  (`RegisterV2Routes`) to opt into `/api/v2`. `Accept-Version: 1|v1|2|v2` must
+  match the path, otherwise 406 `api.version_unsupported`. Version middleware
+  sets `API-Version`, `Vary: Accept-Version`, and optional
+  `Deprecation`/`Sunset`/`Link`; `versioning.Guard` returns 406 for unknown
+  `/api/vN`. Keep Swagger's base path at `/api/v1`.
 - **Auth/session:** JWT carries `token_version` and `tenant_id`;
   `session.Store` validates the version, tenant, and tenant status with
   generation-keyed invalidation. `tenant.Middleware` resolves `X-Tenant-Slug`
@@ -208,7 +224,8 @@ Offset helpers are for small admin/export tables only.
 
 Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
 
-1. Create `internal/modules/<name>/module.go` implementing `app.Module`.
+1. Create `internal/modules/<name>/module.go` implementing `app.Module`;
+   add `RegisterV2Routes` (`app.V2Module`) only for a breaking v2 surface.
 2. Keep handler/service/repository/DTO inside the module.
 3. Add permissions and protect every route (legacy exceptions are documented
    in `docs/module-template.md`).

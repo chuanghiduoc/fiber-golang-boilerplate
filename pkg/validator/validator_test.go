@@ -121,6 +121,9 @@ func TestValidateStruct_Min(t *testing.T) {
 	if !errors.As(err, &appErr) {
 		t.Fatalf("expected AppError, got %T", err)
 	}
+	if got := appErr.Errors[0].Params["min"]; got != "3" {
+		t.Errorf("min param = %q, want 3", got)
+	}
 }
 
 type maxReq struct {
@@ -135,6 +138,9 @@ func TestValidateStruct_Max(t *testing.T) {
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) {
 		t.Fatalf("expected AppError, got %T", err)
+	}
+	if got := appErr.Errors[0].Params["max"]; got != "5" {
+		t.Errorf("max param = %q, want 5", got)
 	}
 }
 

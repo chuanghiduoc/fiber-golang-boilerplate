@@ -28,6 +28,8 @@ const (
 	CodePermissionDenied  Code = "permission.denied"
 	CodeRateLimitExceeded Code = "rate_limit.exceeded"
 
+	CodeAPIVersionUnsupported Code = "api.version_unsupported"
+
 	CodeSystemInternal    Code = "system.internal"
 	CodeSystemTimeout     Code = "system.timeout"
 	CodeSystemUnavailable Code = "system.unavailable"
@@ -109,6 +111,12 @@ var catalog = map[Code]Spec{
 		Title:     "Rate limit exceeded",
 		Retryable: true,
 		DocPath:   "/errors/rate-limit-exceeded",
+	},
+
+	CodeAPIVersionUnsupported: {
+		Status:  http.StatusNotAcceptable,
+		Title:   "Unsupported API version",
+		DocPath: "/errors/api-version-unsupported",
 	},
 
 	CodeSystemInternal: {
