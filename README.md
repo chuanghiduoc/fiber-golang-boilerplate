@@ -380,7 +380,7 @@ to its signed `state` (not the header). Reset/verification links include
 | GET | `/api/v1/auth/google` | Google OAuth redirect (`?tenant=` browser fallback) |
 | GET | `/api/v1/auth/google/callback` | Google OAuth callback (tenant from signed state) |
 
-### Users (protected — JWT required)
+### Users (protected — JWT or `Authorization: ApiKey`)
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/users/me` | Get current user |
@@ -391,7 +391,7 @@ to its signed `state` (not the header). Reset/verification links include
 | PUT | `/api/v1/users/:id` | Update user (admin or self) |
 | DELETE | `/api/v1/users/:id` | Delete user (admin or self) |
 
-### Files (protected — JWT required)
+### Files (protected — JWT or `Authorization: ApiKey`)
 All file routes are scoped to the request tenant; a file id from another tenant
 returns `404`, including for admins. Blobs are stored under
 `<tenantID>/<userID>/<uuid>.<ext>`.
@@ -426,7 +426,7 @@ returned. Reads require `notifications:read`, user mutations require
 | GET | `/api/v1/notification-preferences/` | List explicit channel preferences |
 | PUT | `/api/v1/notification-preferences/` | Upsert `type` + `in_app`/`email` preference |
 
-### Admin (protected — admin role required)
+### Admin (protected — admin role; JWT or `Authorization: ApiKey`)
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/v1/admin/stats` | Statistics for the caller's tenant |
@@ -473,6 +473,39 @@ details.
 | POST | `/api/v1/webhooks/inbound-sources/:id/rotate-secret` | Rotate HMAC secret |
 | GET | `/api/v1/webhooks/inbound-sources/:id/events` | List deduplicated inbound events |
 | POST | `/api/v1/webhooks/inbound/:id` | Public HMAC receiver (no JWT) |
+
+### Notifications (protected — `notifications:read` / `notifications:write`)
+
+All feed and preference routes are scoped to the authenticated user and tenant.
+`POST /notifications/send` is admin-only (`notifications:send`). See
+[docs/api-design.md](docs/api-design.md#notifications).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/notifications` | List the caller's notifications (cursor, `unreadOnly`) |
+| GET | `/api/v1/notifications/unread-count` | Unread badge count |
+| GET | `/api/v1/notifications/:id` | Get one owned notification |
+| POST | `/api/v1/notifications/:id/read` | Mark one notification read |
+| POST | `/api/v1/notifications/read-all` | Mark every unread notification read |
+| POST | `/api/v1/notifications/send` | Admin send to a user in the tenant |
+| GET | `/api/v1/notification-preferences` | List explicit channel preferences |
+| PUT | `/api/v1/notification-preferences` | Upsert `{type, channel, enabled}` |
+
+### API keys (protected — `admin:api_keys:*`; admin role)
+
+Plaintext keys are returned only on create/rotate; list/get responses never
+contain them. The key inherits tenant/user binding and an explicit permission
+scope subset.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/admin/api-keys` | List tenant-scoped API keys |
+| POST | `/api/v1/admin/api-keys` | Create a key; returns the plaintext once |
+| GET | `/api/v1/admin/api-keys/:id` | Get key metadata |
+| PUT | `/api/v1/admin/api-keys/:id` | Update name/scopes |
+| DELETE | `/api/v1/admin/api-keys/:id` | Revoke immediately |
+| POST | `/api/v1/admin/api-keys/:id/revoke` | Revoke immediately (idempotent) |
+| POST | `/api/v1/admin/api-keys/:id/rotate` | Rotate with a 24h grace window |
 
 ### Infrastructure
 | Method | Path | Description |
