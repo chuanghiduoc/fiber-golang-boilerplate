@@ -614,7 +614,7 @@ func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 	var raw []byte
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`,
-		EmailJobKind,
+		EncryptedEmailJobKind,
 	).Scan(&raw))
 
 	encoded := string(raw)
@@ -669,7 +669,7 @@ func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
 	var raw []byte
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT payload FROM jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1`,
-		EmailJobKind,
+		EncryptedEmailJobKind,
 	).Scan(&raw))
 
 	assert.NotContains(t, string(raw), "tx-secret-token")

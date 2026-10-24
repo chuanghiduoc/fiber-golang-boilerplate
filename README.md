@@ -299,11 +299,14 @@ already exists.
   reset/verification links. Jobs queued as plaintext JSON before deployment are
   still delivered, but they remain readable at rest until delivered or cleared.
   External tooling that inspects `jobs.payload` sees the envelope, not email
-  JSON. Drain the queue and stop old workers before enabling encryption: a
-  pre-codec binary cannot decrypt new jobs, and the unknown-kind retry path
-  does not help because `email.send` is already registered. Rotating
-  `JWT_SECRET` changes the derived key and makes already-queued encrypted jobs
-  undecryptable; drain the queue before rotating the secret.
+  JSON. Encrypted jobs use the distinct kind `email.send.encrypted`; new
+  workers register both `email.send` and `email.send.encrypted`. During a
+  rolling deploy, old workers leave encrypted jobs queued as an unknown kind
+  (retrying with backoff) instead of misreading the envelope, so no message is
+  lost; they drain once the new workers are up. Draining before the rollout
+  still gives immediate delivery. Rotating `JWT_SECRET` changes the derived key
+  and makes already-queued encrypted jobs undecryptable; drain the queue before
+  rotating the secret.
 - A worker deletes terminal rows automatically: `succeeded` and `dead` jobs
   whose `updated_at` is older than 30 days are purged, by default every hour
   (the first pass runs as soon as the worker starts). Queued and running jobs
