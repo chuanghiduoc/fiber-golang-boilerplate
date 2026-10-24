@@ -11,6 +11,9 @@
 - [Operations](operations.md) — health/readiness, metrics, logs and request
   IDs, jobs, idempotency and Redis, migrations, Kubernetes caveats, and
   incident checklists.
+- [Webhooks](webhooks.md) — outbound event dispatch, HMAC signing and
+  verification, SSRF-safe delivery, retries, replay, inbound sources, secrets,
+  configuration, and operations.
 - [Swagger UI](../docs/swagger.json) — generated OpenAPI (served at `/swagger`
   outside production).
 

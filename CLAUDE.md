@@ -40,8 +40,8 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
-internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
+internal/contracts/         narrow cross-module identity/files admin interfaces and stdlib-only webhook event/dispatcher types
 internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
@@ -53,9 +53,11 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
 idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts), and
-`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents). Keep them current when routes/contracts change.
+layout, scaffold, routes/permissions/tables/contracts),
+`docs/webhooks.md` (outbound dispatch/signing/SSRF/retries, inbound receiver,
+secrets), and `docs/operations.md` (health, metrics, logs, jobs, idempotency,
+migrations, Kubernetes, incidents). Keep them current when routes/contracts
+change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -76,7 +78,7 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
 - Every tenant-owned table (`users`, `files`, `refresh_tokens`,
   `password_reset_tokens`, `email_verification_tokens`, `jobs`,
-  `audit_events`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
+  `audit_events`, `webhook_*`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
   New tenant-owned tables must do the same and lead their query indexes with
   `tenant_id`.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
@@ -94,7 +96,7 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
 Row-level security, per-tenant limits/quotas, distributed tracing, and
 environment promotion/rollout automation remain future work.
-`identity`, `files`, and `admin` own all of
+`identity`, `files`, `webhooks`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
@@ -184,6 +186,19 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
+- **Webhooks:** events go through `internal/contracts/webhooks.Dispatcher`
+  (`app.Deps.Events`), so producers never import the module. Dispatch inserts a
+  tenant-scoped `webhook_deliveries` row plus a `webhook.delivery` job in one
+  transaction and snapshots URL/payload/secret ciphertext. The worker signs
+  `<timestamp>.<raw-body>` with HMAC-SHA256, sends through `pkg/webhook.Client`
+  (private/loopback/link-local blocked unless allowlisted, no redirects, no
+  proxy, DNS pinned to vetted IPs), records every attempt, and retries 408/425/
+  429/5xx with exponential backoff or `Retry-After`; other 3xx/4xx are dead.
+  Receivers deduplicate on `X-Webhook-Delivery`. Secrets are AES-256-GCM sealed
+  with `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key
+  required in production) and returned only on create/rotate. The public
+  `POST /webhooks/inbound/:id` receiver uses the source tenant and HMAC, and
+  deduplicates `(source, X-Webhook-Id)`. See `docs/webhooks.md`.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.

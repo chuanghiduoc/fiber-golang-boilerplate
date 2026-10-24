@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -51,6 +52,10 @@ type Deps struct {
 	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
 	// is a pass-through for tests and minimal deployments.
 	TenantResolver tenant.Resolver
+	// Events publishes domain events to tenant-configured webhook endpoints.
+	// Modules depend on the stdlib-only contracts interface; a nil value is
+	// replaced with a no-op dispatcher.
+	Events webhookcontracts.Dispatcher
 }
 
 type App struct {
@@ -66,6 +71,9 @@ func New(cfg *config.Config, deps Deps) *App {
 	deps.Config = cfg
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
 	deps.Idempotency = middleware.Idempotency(deps.Cache)
+	if deps.Events == nil {
+		deps.Events = webhookcontracts.Noop{}
+	}
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",

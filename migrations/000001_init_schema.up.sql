@@ -261,3 +261,174 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_action_created
     ON audit_events (tenant_id, action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_resource
     ON audit_events (tenant_id, resource, resource_id);
+
+-- ---------------------------------------------------------------------------
+-- webhooks: outbound endpoints and versioned signing secrets
+--
+-- Secrets are sealed with AES-256-GCM by the webhooks module and only the
+-- ciphertext is stored. Rotating a secret deactivates the old row and inserts a
+-- new version; queued deliveries keep the ciphertext snapshot they were
+-- created with, so rotation never breaks in-flight work.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS webhook_endpoints (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    url VARCHAR(2048) NOT NULL,
+    description VARCHAR(255) NOT NULL DEFAULT '',
+    event_types TEXT[] NOT NULL DEFAULT ARRAY['*']::TEXT[],
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled')),
+    max_attempts INTEGER NOT NULL DEFAULT 8
+        CHECK (max_attempts BETWEEN 1 AND 50),
+    timeout_ms INTEGER NOT NULL DEFAULT 10000
+        CHECK (timeout_ms BETWEEN 100 AND 120000),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant_created_at_id
+    ON webhook_endpoints (tenant_id, created_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant_status
+    ON webhook_endpoints (tenant_id, status)
+    WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trigger_webhook_endpoints_updated_at ON webhook_endpoints;
+CREATE TRIGGER trigger_webhook_endpoints_updated_at
+    BEFORE UPDATE ON webhook_endpoints
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS webhook_endpoint_secrets (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    endpoint_id BIGINT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL CHECK (version > 0),
+    secret_ciphertext TEXT NOT NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_endpoint_version
+    ON webhook_endpoint_secrets (endpoint_id, version);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_active
+    ON webhook_endpoint_secrets (tenant_id, endpoint_id)
+    WHERE active;
+CREATE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_tenant_endpoint
+    ON webhook_endpoint_secrets (tenant_id, endpoint_id);
+
+-- ---------------------------------------------------------------------------
+-- webhooks: delivery outbox, delivery attempts, retained payload snapshots
+--
+-- A delivery row and its first durable job commit atomically. event_id is
+-- deduplicated per endpoint so re-dispatching the same domain event is safe.
+-- payload/url/secret_ciphertext are snapshots: editing or rotating an endpoint
+-- cannot change a queued delivery's signed request.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    endpoint_id BIGINT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+    event_id VARCHAR(128) NOT NULL,
+    event_type VARCHAR(128) NOT NULL,
+    event_created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    url VARCHAR(2048) NOT NULL,
+    payload JSONB NOT NULL,
+    secret_ciphertext TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'succeeded', 'dead')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts BETWEEN 1 AND 50),
+    next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    last_status_code INTEGER,
+    last_error TEXT,
+    delivered_at TIMESTAMP WITH TIME ZONE,
+    replayed_from_id BIGINT REFERENCES webhook_deliveries(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint_event
+    ON webhook_deliveries (tenant_id, endpoint_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_created_at_id
+    ON webhook_deliveries (tenant_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_endpoint_created
+    ON webhook_deliveries (tenant_id, endpoint_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status_next
+    ON webhook_deliveries (tenant_id, status, next_attempt_at);
+
+DROP TRIGGER IF EXISTS trigger_webhook_deliveries_updated_at ON webhook_deliveries;
+CREATE TRIGGER trigger_webhook_deliveries_updated_at
+    BEFORE UPDATE ON webhook_deliveries
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    delivery_id BIGINT NOT NULL REFERENCES webhook_deliveries(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL CHECK (attempt > 0),
+    status_code INTEGER,
+    duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+    error TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery_attempt
+    ON webhook_delivery_attempts (delivery_id, attempt);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_delivery
+    ON webhook_delivery_attempts (tenant_id, delivery_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_created
+    ON webhook_delivery_attempts (tenant_id, created_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- webhooks: inbound sources and deduplicated inbound events
+--
+-- The public receiver authenticates HMAC over the raw body and timestamp. The
+-- source secret is sealed at rest but must be decryptable for verification.
+-- Inbound events deduplicate on (tenant, source, external_event_id).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS webhook_inbound_sources (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(63) NOT NULL,
+    secret_ciphertext TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled')),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    deleted_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_slug_active
+    ON webhook_inbound_sources (tenant_id, slug)
+    WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_created
+    ON webhook_inbound_sources (tenant_id, created_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
+
+DROP TRIGGER IF EXISTS trigger_webhook_inbound_sources_updated_at ON webhook_inbound_sources;
+CREATE TRIGGER trigger_webhook_inbound_sources_updated_at
+    BEFORE UPDATE ON webhook_inbound_sources
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS webhook_inbound_events (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    source_id BIGINT NOT NULL REFERENCES webhook_inbound_sources(id) ON DELETE CASCADE,
+    external_event_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(128) NOT NULL DEFAULT '',
+    signature VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    received_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_events_source_event
+    ON webhook_inbound_events (tenant_id, source_id, external_event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_source_received
+    ON webhook_inbound_events (tenant_id, source_id, received_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_received
+    ON webhook_inbound_events (tenant_id, received_at DESC, id DESC);

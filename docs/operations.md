@@ -1,15 +1,17 @@
 # Operations Runbook
 
-Runbook for the deployed API: health, metrics, logs, jobs, idempotency,
-migrations, Kubernetes, and incident response. It describes the behavior in
-this repository; replace every `<placeholder>` and adapt thresholds to your
-service levels.
+Runbook for the deployed API: health, metrics, logs, jobs, webhooks,
+idempotency, migrations, Kubernetes, and incident response. It describes the
+behavior in this repository; replace every `<placeholder>` and adapt thresholds
+to your service levels.
 
 Related documents:
 
 - [Kubernetes deployment](../deploy/k8s/README.md) — manifests, staging/
   production overlays, GitHub Actions CD, migration order, rollback.
 - [Architecture](architecture.md) — modules, dependency rules, data ownership.
+- [Webhooks](webhooks.md) — outbound signing/retries/SSRF, inbound receiver,
+  secrets, and configuration.
 - [Module Template](module-template.md) — adding a module, routes, permissions,
   tables, and contracts.
 
@@ -298,7 +300,126 @@ WHERE id = <id>
 
 Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
 
-## 5. Idempotency and Redis
+## 5. Webhooks
+
+Outbound deliveries reuse the durable jobs queue under the
+`webhook.delivery` kind. Dispatch commits a `webhook_deliveries` row and its
+first job atomically; the worker sends one signed attempt and schedules the next
+attempt as a new job. Delivery is at-least-once, so receivers must deduplicate
+on `X-Webhook-Delivery`.
+
+### Delivery state and retries
+
+- `pending` is queued or awaiting the next attempt; `next_attempt_at` doubles as
+  the claim lease while an attempt is in flight.
+- `succeeded` means a 2xx response. `dead` is terminal after a permanent
+  failure or an exhausted attempt budget.
+- `2xx` succeeds; `3xx` is permanent (redirects are not followed); `4xx` is
+  permanent except `408`, `425`, `429`; `5xx` and transport errors retry.
+- Backoff is exponential from `WEBHOOK_RETRY_BASE_SECS` to
+  `WEBHOOK_RETRY_MAX_SECS`. A valid `Retry-After` (seconds or HTTP date) wins
+  and is capped at the same maximum.
+- Every attempt is recorded with status code, duration, and a bounded error.
+  Response bodies are not stored.
+- Endpoint edits/rotation do not change queued deliveries: URL, payload, event
+  timestamp, attempt budget, and the sealed secret are snapshotted at dispatch.
+  Replay creates a new delivery with the endpoint's current URL and active
+  secret.
+
+### Inspecting deliveries
+
+```sql
+-- Backlog by tenant/status
+SELECT tenant_id, status, count(*), min(next_attempt_at), max(updated_at)
+FROM webhook_deliveries
+GROUP BY tenant_id, status
+ORDER BY count(*) DESC;
+
+-- Dead deliveries
+SELECT id, tenant_id, endpoint_id, event_type, attempts, max_attempts,
+       last_status_code, last_error, updated_at
+FROM webhook_deliveries
+WHERE status = 'dead'
+ORDER BY updated_at DESC
+LIMIT 50;
+
+-- Attempt timeline
+SELECT attempt, status_code, duration_ms, error, created_at
+FROM webhook_delivery_attempts
+WHERE delivery_id = $1
+ORDER BY attempt;
+
+-- Pending work and its jobs
+SELECT d.id, d.tenant_id, d.next_attempt_at, j.id AS job_id, j.status, j.run_at
+FROM webhook_deliveries d
+LEFT JOIN jobs j
+  ON j.kind = 'webhook.delivery'
+ AND j.payload->>'deliveryId' = d.id::text
+WHERE d.status = 'pending'
+ORDER BY d.next_attempt_at
+LIMIT 50;
+```
+
+A pending delivery with a future `next_attempt_at` and no live job can happen
+after a crash in the narrow window between the HTTP attempt and bookkeeping.
+The original job lease normally retries it. Otherwise replay the delivery
+instead of bulk-editing state.
+
+### Secrets and key rotation
+
+Outbound endpoint secrets (`whsec_...`) and inbound source secrets
+(`whin_...`) are sealed with AES-256-GCM. The key comes from
+`WEBHOOK_SECRET_ENCRYPTION_KEY`; local/test fall back to `JWT_SECRET`, while
+production **requires** a dedicated key of at least 32 characters.
+
+Rotating `WEBHOOK_SECRET_ENCRYPTION_KEY` makes every stored webhook secret
+unreadable. Plan it as a secret reset, not a transparent key roll:
+
+1. Announce a receiver maintenance window.
+2. Deploy the new encryption key.
+3. Rotate every endpoint secret and inbound source secret; deliver the new
+   plaintext values to the owners.
+4. Expect in-flight outbound deliveries encrypted under the old key to become
+   `dead` with a decryption error; replay them after rotation if needed.
+5. Inbound requests fail `401` until their senders use the new secrets.
+
+Endpoint secret rotation itself is safe for in-flight work because queued
+deliveries keep their snapshot. Inbound rotation is immediate: the old secret
+stops verifying on the next request.
+
+### SSRF allowlist
+
+`WEBHOOK_SSRF_ALLOWLIST` lets trusted private receivers through. Entries are
+comma-separated IPs, CIDRs, or exact hostnames. The default (empty) blocks
+private, loopback, link-local, multicast, CGNAT, and reserved targets, pins DNS
+results to vetted IPs, disables environment proxies, and never follows
+redirects. Do not add broad ranges to make one receiver work; add the exact
+host/IP/CIDR and keep the list audited.
+
+### Retention
+
+An hourly loop (first pass at startup) deletes only terminal deliveries
+(`succeeded`/`dead`) and inbound events older than
+`WEBHOOK_RETENTION_DAYS`. Pending deliveries and endpoint/source
+configuration are never purged. Attempts and inbound events cascade with their
+parent row.
+
+### Receiver troubleshooting
+
+- `404`: source ID unknown, disabled, or soft-deleted; verify the configured
+  `receiverUrl`.
+- `401` with `webhook signature is required`: missing timestamp/signature.
+- `401` with stale/invalid timestamp: check clock skew against
+  `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`.
+- `401` with invalid signature: confirm the sender signs
+  `<timestamp>.<exact raw body>` with the active source secret, not a rotated
+  one.
+- `200` with `duplicate: true`: the event was already stored for
+  `(source, X-Webhook-Id)`; this is success.
+- Inbound events are stored under the source tenant and audited as
+  `webhook.inbound.received`; `X-Tenant-Slug` is ignored on the public route.
+
+## 6. Idempotency and Redis
 
 Idempotent mutations are opt-in with `Idempotency-Key` (1–128 chars of
 `[A-Za-z0-9._:-]`). The cache stores:
@@ -367,7 +488,7 @@ During a Redis outage:
   Moving to memory is an emergency, single-replica-only degradation and loses
   shared state. Revert as soon as Redis is healthy.
 
-## 6. Migrations and legacy upgrade
+## 7. Migrations and legacy upgrade
 
 Only `cmd/migrate` applies DDL. `cmd/api` and `cmd/seed` assume the schema
 exists, so replicas do not race. `cmd/migrate` loads only `DB_*` plus
@@ -467,7 +588,7 @@ kubectl -n <namespace> logs job/<migration-job>
   expand/contract for incompatible columns so old and new pods can coexist
   during a rolling update.
 
-## 7. Kubernetes deployment notes
+## 8. Kubernetes deployment notes
 
 Follow [deploy/k8s/README.md](../deploy/k8s/README.md) for the full commands.
 The operational invariants:
@@ -577,7 +698,7 @@ The migration Job is not rolled back. If a release applied an incompatible
 migration, restore from a verified backup/PITR snapshot or ship a forward fix;
 do not blindly roll the image back onto a newer schema.
 
-## 8. Incident checklist
+## 9. Incident checklist
 
 ### First 5 minutes
 
@@ -662,6 +783,31 @@ Actions:
    and accepts duplicate execution.
 6. Do not bulk-requeue `dead` rows: payloads are cleared. Fix the handler and
    re-trigger the business flow.
+
+### Webhook deliveries are failing or delayed
+
+Symptoms: `webhook_deliveries` pending/dead counts rising, `last_error`
+showing timeouts/5xx, receiver reports duplicate or missing events.
+
+Actions:
+
+1. Check the endpoint status, URL, event filters, and attempt budget. Disabled
+   or soft-deleted endpoints are not matched for new events.
+2. Inspect `webhook_delivery_attempts` for the status code and duration. A
+   timeout usually means the receiver is slow or unreachable; confirm the
+   configured `timeoutMs`.
+3. Remember `3xx` is permanent by design and redirects are never followed.
+   Fix the endpoint URL rather than expecting a retry.
+4. `408`, `425`, `429`, and `5xx` retry with backoff/`Retry-After`; a sustained
+   `429` means the receiver is throttling and the delivery may eventually die.
+5. Check that the worker is running (it is in-process with the API) and that
+   `jobs` has `webhook.delivery` rows. The delivery claim lease recovers a
+   crashed attempt; if no job remains, replay the delivery.
+6. A dead delivery retains its payload and secret snapshot, so replay is
+   possible after fixing the receiver. Replay uses the current URL/secret.
+7. For inbound failures, use the receiver troubleshooting checklist in
+   [Webhooks](webhooks.md) or section 5 above; check clock skew and signature
+   canonicalization before rotating secrets.
 
 ### Migration failed or schema is dirty
 

@@ -18,7 +18,11 @@ internal/modules
   files        upload, metadata, download, soft delete, restore
                (dto/repository/service/handler + adapter + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
-internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
+  webhooks     outbound endpoints/deliveries, inbound sources/events,
+               public HMAC receiver, dispatcher + delivery worker
+               (dto/repository/service/handler + queries + generated sqlc)
+internal/contracts  narrow cross-module identity/files admin interfaces plus
+                    stdlib-only webhook event/dispatcher types
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
@@ -26,7 +30,7 @@ internal/platform
   session      token-version/session cache
   tenant       request tenant resolver + locals helpers (X-Tenant-Slug)
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-pkg            reusable infrastructure (errors, response, database, cache, ...)
+pkg            reusable infrastructure (errors, response, database, cache, webhook, ...)
 ```
 
 Request flow:
@@ -39,6 +43,11 @@ client
   -> module route (JWT -> rate limit -> authz -> idempotency)
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
+
+The webhooks public receiver is the deliberate exception: it mounts auth per
+route instead of on the `/webhooks` group, so `POST /webhooks/inbound/:id`
+bypasses JWT and tenant-header selection. The source row supplies the tenant and
+the source HMAC authenticates the caller.
 
 `tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
 validates `[a-z0-9-]{1,63}`, resolves the slug (header or
@@ -53,8 +62,9 @@ they never depend on the `tenants` table.
 - One user belongs to exactly one tenant. `tenants.id` 1 with slug `default`
   is seeded by the baseline and preserves backward compatibility for header-less
   requests and rows written before multi-tenancy.
-- `tenant_id` is present on `users`, `files`, and all identity/platform token,
-  job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
+- `tenant_id` is present on `users`, `files`, all identity/platform token,
+  job, audit, and `webhook_*` tables, with
+  `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
 - Identity and files are tenant-isolated: every user/admin/stat and
@@ -64,6 +74,11 @@ they never depend on the `tenants` table.
   verify returned tenant/owner. Cross-tenant ids or tokens behave as not found.
   Public login/register/forgot/reset/resend/verify/refresh use the request
   tenant; non-default tenants must send `X-Tenant-Slug` consistently.
+- Webhooks are tenant-isolated at the SQL/index layer: endpoints, versioned
+  secrets, deliveries, attempts, inbound sources, and inbound events all lead
+  with `tenant_id`. The only unscoped lookup is the public receiver's source
+  lookup by ID; it authenticates with the source HMAC and installs the source
+  tenant before writing or auditing.
 - Durable jobs and audit events propagate the resolved tenant: enqueue writes
   `jobs.tenant_id` from the context, the worker restores it with
   `tenant.WithID` before calling a handler, and the audit middleware records
@@ -111,6 +126,16 @@ they never depend on the `tenants` table.
   ignores tenant boundaries.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
+- Outbound webhooks reuse the jobs outbox: a delivery row and its first
+  `webhook.delivery` job commit in one transaction. Each delivery snapshots the
+  URL, payload, event timestamp, max attempts, and sealed secret so later
+  endpoint edits/rotation cannot change an in-flight request. Webhook-level
+  retries schedule new jobs (honoring `Retry-After`), and every attempt is kept
+  in `webhook_delivery_attempts`. Receivers must deduplicate on
+  `X-Webhook-Delivery`.
+- The public inbound receiver resolves its tenant from the source row and
+  verifies HMAC over `<timestamp>.<raw-body>`; deduplication is unique per
+  `(tenant, source, external_event_id)`. See [Webhooks](webhooks.md).
 
 ## Schema ownership
 
@@ -142,16 +167,17 @@ they never depend on the `tenants` table.
 - **Errors:** services return `*apperror.AppError` with a stable catalog code.
   HTTP renders RFC 9457 `application/problem+json`.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes, cache-backed,
-  24h replay, body-bound for non-multipart requests.
+  24h replay, body-bound for non-multipart requests. Secret-returning creates
+  are excluded so plaintext secrets never enter the shared response cache.
 - **Observability:** request IDs, structured `slog`, Prometheus HTTP/job/audit
   metrics, readiness checks for DB/cache.
 
 ## Strangler status
 
-The migration is complete. `identity`, `files`, and `admin` own their DTOs,
-repositories, services, and HTTP handlers under `internal/modules/<name>`;
-there are no shared legacy handler/service/DTO/repository packages or
-compatibility aliases.
+The migration is complete. `identity`, `files`, `admin`, and `webhooks` own
+their DTOs, repositories, services, and HTTP handlers under
+`internal/modules/<name>`; there are no shared legacy
+handler/service/DTO/repository packages or compatibility aliases.
 
 The `admin` module depends on `internal/contracts.IdentityAdmin` and
 `internal/contracts.FilesAdmin`; identity and files implement those contracts
@@ -160,10 +186,11 @@ module, its repository, generated SQL, storage, database transactions, or
 session store. Identity and files each own their half of the dashboard stats
 (`AdminUserStats` / `AdminFileStats`), so no cross-module SQL remains.
 
-`identity` and `files` own module-scoped `queries/` and generated `sqlc/`
-packages; `sqlc.yaml` has one block per module. There is no shared generated
-package, and no module imports another module's sqlc types. New code should
-start in `internal/modules/<name>/` and use contracts for cross-module reads.
+`identity`, `files`, and `webhooks` own module-scoped `queries/` and generated
+`sqlc/` packages; `sqlc.yaml` has one block per module. There is no shared
+generated package, and no module imports another module's sqlc types. New code
+should start in `internal/modules/<name>/` and use contracts for cross-module
+reads; webhook producers use `internal/contracts/webhooks`.
 
 ## Extension checklist
 

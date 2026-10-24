@@ -19,6 +19,9 @@ const (
 
 	PermissionSessionsRevoke Permission = "sessions:revoke"
 
+	PermissionWebhooksRead  Permission = "webhooks:read"
+	PermissionWebhooksWrite Permission = "webhooks:write"
+
 	PermissionAdminUsersRead    Permission = "admin:users:read"
 	PermissionAdminUsersRole    Permission = "admin:users:role"
 	PermissionAdminUsersBan     Permission = "admin:users:ban"
@@ -43,6 +46,8 @@ var allPermissions = []Permission{
 	PermissionFilesWrite,
 	PermissionFilesDelete,
 	PermissionSessionsRevoke,
+	PermissionWebhooksRead,
+	PermissionWebhooksWrite,
 	PermissionAdminUsersRead,
 	PermissionAdminUsersRole,
 	PermissionAdminUsersBan,
