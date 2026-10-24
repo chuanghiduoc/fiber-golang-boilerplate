@@ -48,8 +48,9 @@ type UserService interface {
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
 	RevokeSessions(ctx context.Context, userID int64) error
 	// SetVerificationProvisioner wires registration email provisioning into the
-	// user-creation transaction. When unset, registration falls back to the
-	// handler's post-commit verification email.
+	// user-creation transaction. When unset, or when the provisioner cannot
+	// enqueue transactionally, registration falls back to the handler's
+	// post-commit verification email.
 	SetVerificationProvisioner(p VerificationProvisioner)
 	// RegistrationEmailsTransactional reports whether Register commits the
 	// verification email with the user. Callers must not send a second email
