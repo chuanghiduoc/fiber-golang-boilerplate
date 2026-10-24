@@ -27,6 +27,7 @@ var requiredTables = []string{
 	"refresh_tokens",
 	"password_reset_tokens",
 	"email_verification_tokens",
+	"api_keys",
 	"files",
 	"jobs",
 	"audit_events",
@@ -39,18 +40,24 @@ var requiredColumns = map[string][]string{
 	"refresh_tokens":            {"tenant_id", "token_version"},
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
-	"files":                     {"tenant_id"},
-	"jobs":                      {"tenant_id"},
-	"audit_events":              {"tenant_id"},
+	"api_keys": {
+		"tenant_id", "user_id", "key_hash", "scopes", "expires_at",
+		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",
+	},
+	"files":        {"tenant_id"},
+	"jobs":         {"tenant_id"},
+	"audit_events": {"tenant_id"},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens and duplicate active emails per tenant.
+// and verification tokens, duplicate active emails per tenant, and duplicate
+// API-key hashes.
 var requiredUniqueIndexes = []string{
 	"idx_users_tenant_email_lower_active",
 	"idx_users_tenant_google_id_active",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+	"idx_api_keys_key_hash",
 }
 
 func main() {

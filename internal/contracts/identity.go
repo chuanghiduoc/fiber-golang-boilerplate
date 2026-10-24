@@ -35,6 +35,25 @@ type UserStats struct {
 	DeletedUsers int64
 }
 
+// Principal is the identity-owned view needed to authenticate a request on
+// behalf of an API key's owner. It intentionally excludes credentials and
+// session fields.
+type Principal struct {
+	ID       int64
+	TenantID int64
+	Email    string
+	Name     string
+	Role     string
+}
+
+// PrincipalReader loads the current principal for a tenant/user pair. It is
+// used by API-key authentication so bans, deletions, and role changes take
+// effect immediately. Implementations must return apperror.ErrNotFound (or a
+// wrapped error) when the account is not active.
+type PrincipalReader interface {
+	GetPrincipal(ctx context.Context, tenantID, userID int64) (Principal, error)
+}
+
 // IdentityAdmin is the back-office surface identity exposes to admin.
 type IdentityAdmin interface {
 	ListUsers(ctx context.Context, limit int, startingAfter string) (UserPage, error)

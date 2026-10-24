@@ -197,3 +197,22 @@ func TestRequireAny_DeniesMissingRole(t *testing.T) {
 	status, contentType, body := doGet(t, app, "/either", "")
 	assertForbidden(t, status, contentType, body)
 }
+
+func TestRequire_UsesExplicitSubjectScopes(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Use(func(c fiber.Ctx) error {
+		// An administrator's API key limited to files:read must not inherit the
+		// administrator role catalog.
+		SetSubject(c, NewSubjectWithPermissions(1, 1, RoleAdmin, PermissionFilesRead))
+		return c.Next()
+	})
+	app.Get("/files", Require(PermissionFilesRead), func(c fiber.Ctx) error { return c.SendString("ok") })
+	app.Get("/admin", Require(PermissionAdminUsersRead), func(c fiber.Ctx) error { return c.SendString("ok") })
+
+	status, _, body := doGet(t, app, "/files", "")
+	if status != fiber.StatusOK {
+		t.Fatalf("files status = %d, want 200 (body=%s)", status, body)
+	}
+	status, contentType, body := doGet(t, app, "/admin", "")
+	assertForbidden(t, status, contentType, body)
+}

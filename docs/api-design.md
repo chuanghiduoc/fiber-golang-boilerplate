@@ -91,13 +91,31 @@ Rules:
 ## Authentication and authorization
 
 - `Authorization: Bearer <jwt>` for protected routes.
+- `Authorization: ApiKey <prefix>_<secret>` for API-key clients. The secret is
+  32 random bytes encoded as unpadded base64url; only its SHA-256 hash is
+  stored. Keys are bound to one tenant and user, carry an explicit
+  `authz.Permission` scope list, and may expire or be revoked. Rotating a key
+  issues a replacement and leaves the previous key valid for a 24-hour grace
+  window unless it is revoked; revocation is immediate. A key is shown once at
+  creation/rotation. Admin lifecycle routes live under `/admin/api-keys` and
+  require `admin:api_keys:read|create|update|revoke|rotate`. Successful API-key
+  authentication sets `user_id`, `tenant_id`, `api_key_id`, and
+  `auth_method=api_key`; JWT requests set `auth_method=jwt`.
 - JWT pins HS256, requires `exp`/`iat`/`aud`/`iss`, and carries `token_version`
   plus `tenant_id`. Tokens minted before multi-tenancy omit `tenant_id` and are
   rejected with 401; clients must log in again after the upgrade.
 - Access tokens are short-lived; refresh tokens rotate atomically, are
   single-use/version-bound, and are scoped to the tenant that issued them.
 - Permissions live in `internal/platform/authz`; route middleware uses
-  `authz.Require`. Never check role strings ad hoc in handlers.
+  `authz.Require`. Never check role strings ad hoc in handlers. API-key scopes
+  are intersected with the owner's current role, so a scoped key can neither
+  exceed its recorded scopes nor retain capabilities after a demotion.
+- Attribute-based checks use `authz.Subject` (explicit permissions, tenant,
+  owner, cross-tenant flag, attributes), `Policy`/`PolicySet`, `TenantPolicy`,
+  and `OwnerPolicy`. `Authorize` performs an RBAC pre-check followed by
+  deny-overrides policy evaluation: deny maps to `403 permission.denied` and
+  conceal maps to `404` so cross-tenant/foreign-owner resources are not
+  disclosed.
 - `POST /auth/logout-all` revokes all refresh tokens and bumps the token
   version, invalidating access tokens immediately.
 
@@ -109,9 +127,13 @@ Rules:
 - Invalid, unknown, or suspended slugs return `404` with detail
   `tenant not found`. `TENANT_REQUIRE_HEADER=true` rejects header-less requests
   the same way.
-- Authenticated requests use the JWT `tenant_id` claim. If an explicit
-  `X-Tenant-Slug` resolves to a different tenant, the request fails with
-  `403 permission.denied` and detail `tenant mismatch`.
+- Authenticated requests use the JWT `tenant_id` claim or the API key's bound
+  tenant. If an explicit `X-Tenant-Slug` resolves to a different tenant, the
+  request fails with `403 permission.denied` and detail `tenant mismatch`.
+- An API key without an explicit header remains usable for its own tenant; an
+  explicit header is only accepted when it resolves to the key's tenant. The
+  key owner is re-read on every successful authentication, so bans, deletions,
+  and role changes take effect immediately.
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
   Login, registration, refresh, password reset, and email verification use the
   resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
@@ -130,8 +152,9 @@ Rules:
 - `Idempotency-Key` is opt-in on mutating routes; 1-128 chars of
   `[A-Za-z0-9._:-]`. Replays return `Idempotent-Replayed: true`.
 - `Location`, `ETag` are returned where applicable and exposed through CORS.
-- Rate limits are tiered (strict/normal/relaxed) and keyed per user when
-  authenticated, otherwise per IP. `429` is retryable.
+- Rate limits are tiered (strict/normal/relaxed) and keyed per API key when
+  authenticated with `ApiKey`, otherwise per user, then per IP. `429` is
+  retryable. Rotating a key moves subsequent requests to a new bucket.
 
 ## Rate limits and quotas
 
@@ -153,10 +176,28 @@ Rules:
 
 - `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist,
   and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
-- Downloads are authenticated and tenant/ownership-checked; there is no public
-  `/uploads` tree. A cross-tenant id returns `404`, never `403`.
-- Deletes are soft; `includeDeleted=true` exposes trash to the owner.
+- Downloads are authenticated and tenant/ownership checked; there is no public
+  `/uploads` tree. A cross-tenant id returns `404`, never `403`; the same owner
+  check conceals another user's file within the tenant. Services enforce these
+  boundaries with `authz.TenantPolicy` + `authz.OwnerPolicy`; admin services use
+  the tenant policy only.
+- Deletes are soft; `includeDeleted=true` exposes trash to the owner and
+  `POST /files/:id/restore` requires `files:restore`.
 - `Content-Disposition` follows RFC 6266/5987.
+
+## API keys
+
+- `POST /admin/api-keys` returns the plaintext key once; list/get responses
+  never contain it. Name, owner (`userId`, defaults to the caller), scopes, and
+  optional `expiresAt` are recorded. Scopes must be known permissions and a
+  subset of the owner's role.
+- `PUT /admin/api-keys/:id` updates name/scopes, `DELETE /admin/api-keys/:id`
+  or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent), and
+  `POST /admin/api-keys/:id/rotate` issues a new secret while the old key stays
+  valid for 24 hours unless revoked.
+- All routes are tenant-scoped, return `404` for another tenant's key id,
+  accept `Idempotency-Key`, and attach `apiKeyId`/scope/rotation metadata to the
+  audit event (never the secret or hash).
 
 ## Jobs and asynchronous work
 

@@ -15,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -51,6 +52,9 @@ type Deps struct {
 	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
 	// is a pass-through for tests and minimal deployments.
 	TenantResolver tenant.Resolver
+	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
+	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
+	APIKeyVerifier *apikey.Verifier
 }
 
 type App struct {

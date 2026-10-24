@@ -18,9 +18,11 @@ internal/modules
   files        upload, metadata, download, soft delete, restore
                (dto/repository/service/handler + adapter + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
-internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
+  apikeys      tenant-scoped API-key lifecycle (dto/repository/service/handler + adapter)
+internal/contracts  narrow cross-module interfaces (identity/files admin + principal reader; stdlib only)
 internal/platform
-  authz        permission catalog + route middleware
+  apikey       key generation/hash, verifier, rotation grace, ApiKey middleware
+  authz        subject/policies, permission catalog, ABAC + route middleware
   audit        audit recorder + mutating-request middleware
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
@@ -36,15 +38,18 @@ client
   -> app global middleware (CORS, security, request ID, metrics, logger,
      recovery, audit, timeout, idempotency where wired)
   -> /api/v1 tenant middleware (X-Tenant-Slug or default tenant)
-  -> module route (JWT -> rate limit -> authz -> idempotency)
+  -> module route (JWT|ApiKey -> rate limit -> authz -> idempotency)
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
 
-`tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
+`tenant.Middleware` runs on the `/api/v1` group, before module auth. It
 validates `[a-z0-9-]{1,63}`, resolves the slug (header or
 `TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber locals.
 `JWTAuth` treats the JWT `tenant_id` claim as authoritative and rejects an
-explicit header that resolves to a different tenant with 403. Infrastructure
+explicit header that resolves to a different tenant with 403.
+`apikey.Authenticate` wraps the JWT handler: `Authorization: ApiKey ...`
+verifies the credential, re-reads the owner principal, and installs the same
+locals plus an `authz.Subject` limited to the key's scopes. Infrastructure
 probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution so
 they never depend on the `tenants` table.
 
@@ -75,6 +80,14 @@ they never depend on the `tenants` table.
   validator compares the claim with the stored user tenant and tenant status,
   so a suspended tenant cannot keep using an issued token beyond the 5-second
   session-cache TTL.
+- API keys are tenant/user-bound rows in `api_keys` with only a SHA-256 hash at
+  rest. Scopes are an explicit permission subset of the owner's role. Rotation
+  sets `rotated_at`/`rotation_grace_until` on the old row and creates the new
+  key in one transaction, so a grace-window key works until the deadline while
+  revocation is immediate. Last use is touched on a throttled interval.
+- ABAC subjects carry tenant, owner, explicit permissions, a cross-tenant flag,
+  and attributes. `TenantPolicy`/`OwnerPolicy` conceal boundary violations as
+  404; `Authorize` performs the RBAC pre-check first and is deny-overrides.
 - New blobs use `<tenantID>/<userID>/<uuid>.<ext>`; existing rows keep their
   old `<userID>/<uuid>` path. RLS and per-tenant limits remain future work.
 
@@ -96,6 +109,22 @@ they never depend on the `tenants` table.
   repository packages; the architecture test enforces this so the layer cannot
   return.
 - Enforced by `test/arch/imports_test.go` (`make arch`).
+
+## Authorization
+
+- Routes are protected by permissions, not role strings:
+  `authz.Require(authz.Permission...)`. API-key subjects use their explicit
+  scopes; JWT subjects derive the role catalog.
+- Services add object-level checks through `authz.Authorize`, which combines an
+  RBAC pre-check with a `PolicySet` over a `Resource`. `TenantPolicy` allows
+  only the subject's tenant (or a `CrossTenant` platform subject) and
+  `OwnerPolicy` only the resource owner. A boundary mismatch is a `Conceal`
+  decision rendered as 404; an explicit deny is 403.
+- `PolicySet` is deny-overrides and fails closed when empty. Handlers must not
+  invent role checks; add a permission to the catalog and protect the route.
+- Files use tenant+owner policies, admin files use the tenant policy only, and
+  direct trusted callers without a subject retain the legacy repository-scoped
+  checks.
 
 ## Data and transactions
 
@@ -122,6 +151,9 @@ they never depend on the `tenants` table.
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
   `default` tenant as row 1, so existing rows and header-less requests remain on
   the compatibility tenant.
+- `api_keys` stores a globally unique SHA-256 hash and scopes as a JSONB array,
+  with hash, tenant/user, and cursor indexes; the only global lookup is by hash,
+  before a request tenant can be trusted.
 - File blobs are external to PostgreSQL but follow the row's tenant: new keys
   are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
   authoritative key for downloads. Moving a blob without updating that column

@@ -11,6 +11,7 @@ END $$;
 
 DROP FUNCTION IF EXISTS protect_last_admin();
 
+DROP TABLE IF EXISTS api_keys;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS files;

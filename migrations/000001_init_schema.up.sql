@@ -177,6 +177,44 @@ CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_tenant_user_id
     ON email_verification_tokens (tenant_id, user_id);
 
 -- ---------------------------------------------------------------------------
+-- apikeys: tenant/user-bound API credentials (only SHA-256 hashes at rest)
+--
+-- prefix_<32-byte base64url> credentials are shown once at creation/rotation.
+-- A rotated key remains valid until rotation_grace_until; explicit revocation
+-- always wins. Scopes are an authz.Permission array validated by the module.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS api_keys (
+    id BIGSERIAL PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    prefix VARCHAR(16) NOT NULL,
+    key_hash VARCHAR(64) NOT NULL,
+    scopes JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(scopes) = 'array'),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    revoked_at TIMESTAMP WITH TIME ZONE,
+    rotated_at TIMESTAMP WITH TIME ZONE,
+    rotation_grace_until TIMESTAMP WITH TIME ZONE,
+    last_used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_key_hash
+    ON api_keys (key_hash);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_user
+    ON api_keys (tenant_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant_created_at_id
+    ON api_keys (tenant_id, created_at DESC, id DESC);
+
+DROP TRIGGER IF EXISTS trigger_api_keys_updated_at ON api_keys;
+CREATE TRIGGER trigger_api_keys_updated_at
+    BEFORE UPDATE ON api_keys
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+-- ---------------------------------------------------------------------------
 -- files: metadata (blobs live in local/S3 storage)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS files (

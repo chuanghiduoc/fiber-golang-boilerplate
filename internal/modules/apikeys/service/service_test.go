@@ -1,0 +1,444 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+)
+
+type fakeRepo struct {
+	keys   map[int64]*repository.APIKey
+	nextID int64
+}
+
+func newFakeRepo() *fakeRepo {
+	return &fakeRepo{keys: make(map[int64]*repository.APIKey), nextID: 1}
+}
+
+func (r *fakeRepo) Create(ctx context.Context, params repository.CreateParams) (*repository.APIKey, error) {
+	now := time.Now().UTC()
+	key := &repository.APIKey{
+		ID:        r.nextID,
+		TenantID:  tenant.EffectiveID(ctx),
+		UserID:    params.UserID,
+		Name:      params.Name,
+		Prefix:    params.Prefix,
+		Hash:      params.Hash,
+		Scopes:    append([]authz.Permission(nil), params.Scopes...),
+		ExpiresAt: params.ExpiresAt,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	r.keys[key.ID] = key
+	r.nextID++
+	clone := *key
+	return &clone, nil
+}
+
+func (r *fakeRepo) GetByID(ctx context.Context, id int64) (*repository.APIKey, error) {
+	key, ok := r.keys[id]
+	if !ok || key.TenantID != tenant.EffectiveID(ctx) {
+		return nil, apperror.ErrNotFound
+	}
+	clone := *key
+	return &clone, nil
+}
+
+func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*repository.APIKey, error) {
+	for _, key := range r.keys {
+		if key.Hash == hash {
+			clone := *key
+			return &clone, nil
+		}
+	}
+	return nil, apperror.ErrNotFound
+}
+
+func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]repository.APIKey, error) {
+	keys := make([]repository.APIKey, 0)
+	for _, key := range r.keys {
+		if key.TenantID == tenant.EffectiveID(ctx) {
+			keys = append(keys, *key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].CreatedAt.Equal(keys[j].CreatedAt) {
+			return keys[i].ID > keys[j].ID
+		}
+		return keys[i].CreatedAt.After(keys[j].CreatedAt)
+	})
+	limit := int(cur.Limit)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	return keys, nil
+}
+
+func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*repository.APIKey, error) {
+	key, ok := r.keys[id]
+	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
+		return nil, apperror.ErrNotFound
+	}
+	key.Name = name
+	key.Scopes = append([]authz.Permission(nil), scopes...)
+	key.UpdatedAt = time.Now().UTC()
+	clone := *key
+	return &clone, nil
+}
+
+func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*repository.APIKey, error) {
+	key, ok := r.keys[id]
+	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
+		return nil, apperror.ErrNotFound
+	}
+	now := time.Now().UTC()
+	key.RevokedAt = &now
+	key.UpdatedAt = now
+	clone := *key
+	return &clone, nil
+}
+
+func (r *fakeRepo) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*repository.APIKey, error) {
+	key, ok := r.keys[id]
+	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil || key.RotatedAt != nil {
+		return nil, apperror.ErrNotFound
+	}
+	now := time.Now().UTC()
+	until := now.Add(time.Duration(graceSeconds) * time.Second)
+	key.RotatedAt = &now
+	key.RotationGraceUntil = &until
+	key.UpdatedAt = now
+	clone := *key
+	return &clone, nil
+}
+
+func (r *fakeRepo) TouchLastUsed(_ context.Context, id int64, at time.Time) error {
+	if key, ok := r.keys[id]; ok {
+		key.LastUsedAt = &at
+	}
+	return nil
+}
+
+type fakePrincipals struct {
+	users map[int64]contracts.Principal
+}
+
+func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) (contracts.Principal, error) {
+	user, ok := p.users[userID]
+	if !ok || user.TenantID != tenantID {
+		return contracts.Principal{}, apperror.ErrNotFound
+	}
+	return user, nil
+}
+
+func testContext(tenantID int64) context.Context {
+	return tenant.WithID(context.Background(), tenantID)
+}
+
+func newTestService(repo *fakeRepo, principals contracts.PrincipalReader) Service {
+	return NewService(repo, principals, nil)
+}
+
+func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]contracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	}}
+	svc := newTestService(repo, principals)
+
+	created, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{
+		Name:   "  deploy  ",
+		Scopes: []string{"files:read", "files:read"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.Name != "deploy" {
+		t.Fatalf("name = %q, want trimmed deploy", created.Name)
+	}
+	if len(created.Scopes) != 1 || created.Scopes[0] != "files:read" {
+		t.Fatalf("scopes = %v, want deduplicated files:read", created.Scopes)
+	}
+	if !apikey.Valid(created.Key) {
+		t.Fatalf("returned key %q is malformed", created.Key)
+	}
+	if !strings.HasPrefix(created.Key, apikey.DefaultPrefix+"_") {
+		t.Fatalf("returned key %q has wrong prefix", created.Key)
+	}
+	stored := repo.keys[created.ID]
+	if stored == nil {
+		t.Fatal("key not persisted")
+	}
+	if stored.Hash != apikey.Hash(created.Key) {
+		t.Fatal("stored hash does not match the returned key")
+	}
+	if strings.Contains(stored.Hash, created.Key) {
+		t.Fatal("plaintext key must never be stored")
+	}
+	if stored.TenantID != 1 || stored.UserID != 10 {
+		t.Fatalf("stored binding = tenant %d user %d, want 1/10", stored.TenantID, stored.UserID)
+	}
+	if stored.Hash == "" || len(stored.Hash) != apikey.KeyHashBytes*2 {
+		t.Fatalf("stored hash = %q, want 64 hex chars", stored.Hash)
+	}
+
+	list, _, err := svc.List(testContext(1), 10, "")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("list length = %d, want 1", len(list))
+	}
+	// The list DTO has no secret fields by construction; a serialized API key
+	// response must not contain the plaintext.
+}
+
+func TestService_CreateRejectsInvalidRequests(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]contracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	}}
+	svc := newTestService(repo, principals)
+	ctx := testContext(1)
+
+	tests := []struct {
+		name string
+		req  apikeydto.CreateRequest
+	}{
+		{name: "blank name", req: apikeydto.CreateRequest{Name: "  ", Scopes: []string{"files:read"}}},
+		{name: "no scopes", req: apikeydto.CreateRequest{Name: "x"}},
+		{name: "unknown scope", req: apikeydto.CreateRequest{Name: "x", Scopes: []string{"root:everything"}}},
+		{name: "privilege escalation", req: apikeydto.CreateRequest{Name: "x", Scopes: []string{"admin:users:read"}}},
+		{name: "past expiry", req: apikeydto.CreateRequest{
+			Name:      "x",
+			Scopes:    []string{"files:read"},
+			ExpiresAt: ptrTime(time.Now().Add(-time.Minute)),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := svc.Create(ctx, 10, tt.req)
+			var appErr *apperror.AppError
+			if !errors.As(err, &appErr) || appErr.Status != 400 {
+				t.Fatalf("error = %v, want 400", err)
+			}
+		})
+	}
+
+	_, err := svc.Create(ctx, 99, apikeydto.CreateRequest{Name: "x", Scopes: []string{"files:read"}})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 404 {
+		t.Fatalf("missing owner error = %v, want 404", err)
+	}
+
+	// An API-key caller cannot grant a scope that its own key does not hold.
+	scopedCaller := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
+		10, 1, authz.RoleAdmin, authz.PermissionFilesRead,
+	))
+	_, err = svc.Create(scopedCaller, 10, apikeydto.CreateRequest{Name: "x", Scopes: []string{"files:write"}})
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("caller escalation error = %v, want 400", err)
+	}
+}
+
+func TestService_TenantIsolation(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]contracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+		20: {ID: 20, TenantID: 2, Role: authz.RoleUser},
+	}}
+	svc := newTestService(repo, principals)
+
+	keyA, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{Name: "a", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create tenant 1: %v", err)
+	}
+	keyB, err := svc.Create(testContext(2), 20, apikeydto.CreateRequest{Name: "b", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create tenant 2: %v", err)
+	}
+
+	if _, err := svc.Get(testContext(1), keyB.ID); !isNotFound(err) {
+		t.Fatalf("cross-tenant get error = %v, want 404", err)
+	}
+	if _, err := svc.Update(testContext(1), keyB.ID, apikeydto.UpdateRequest{Name: ptrString("hijack")}); !isNotFound(err) {
+		t.Fatalf("cross-tenant update error = %v, want 404", err)
+	}
+	if err := svc.Revoke(testContext(1), keyB.ID); !isNotFound(err) {
+		t.Fatalf("cross-tenant revoke error = %v, want 404", err)
+	}
+	if _, err := svc.Rotate(testContext(1), keyB.ID); !isNotFound(err) {
+		t.Fatalf("cross-tenant rotate error = %v, want 404", err)
+	}
+
+	listA, _, err := svc.List(testContext(1), 10, "")
+	if err != nil {
+		t.Fatalf("list tenant 1: %v", err)
+	}
+	if len(listA) != 1 || listA[0].ID != keyA.ID {
+		t.Fatalf("tenant 1 list = %+v, want only key %d", listA, keyA.ID)
+	}
+	listB, _, err := svc.List(testContext(2), 10, "")
+	if err != nil {
+		t.Fatalf("list tenant 2: %v", err)
+	}
+	if len(listB) != 1 || listB[0].ID != keyB.ID {
+		t.Fatalf("tenant 2 list = %+v, want only key %d", listB, keyB.ID)
+	}
+}
+
+func TestService_UpdateRevokeAndRotation(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]contracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	}}
+	svc := newTestService(repo, principals)
+	ctx := testContext(1)
+
+	created, err := svc.Create(ctx, 10, apikeydto.CreateRequest{
+		Name:   "deploy",
+		Scopes: []string{"files:read"},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	updated, err := svc.Update(ctx, created.ID, apikeydto.UpdateRequest{
+		Name:   ptrString("release"),
+		Scopes: []string{"files:read", "files:write"},
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if updated.Name != "release" || len(updated.Scopes) != 2 {
+		t.Fatalf("updated = %+v, want release with two scopes", updated)
+	}
+	if _, err := svc.Update(ctx, created.ID, apikeydto.UpdateRequest{Scopes: []string{"admin:users:read"}}); !isBadRequest(err) {
+		t.Fatalf("scope escalation update error = %v, want 400", err)
+	}
+
+	rotated, err := svc.Rotate(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if rotated.PreviousKeyID != created.ID {
+		t.Fatalf("previous key id = %d, want %d", rotated.PreviousKeyID, created.ID)
+	}
+	if rotated.Key == created.Key {
+		t.Fatal("rotation must return a new secret")
+	}
+	if rotated.ID == created.ID {
+		t.Fatal("rotation must create a new key row")
+	}
+	if len(rotated.Scopes) != 2 || rotated.Name != "release" {
+		t.Fatalf("rotated metadata = %+v, want inherited name/scopes", rotated)
+	}
+	old := repo.keys[created.ID]
+	if old.RotatedAt == nil || old.RotationGraceUntil == nil {
+		t.Fatal("old key must enter rotation grace")
+	}
+	if !old.RotationGraceUntil.After(time.Now()) {
+		t.Fatal("rotation grace must be in the future")
+	}
+
+	if _, err := svc.Rotate(ctx, created.ID); !isConflict(err) {
+		t.Fatalf("second rotate error = %v, want 409", err)
+	}
+	if err := svc.Revoke(ctx, rotated.ID); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	if err := svc.Revoke(ctx, rotated.ID); err != nil {
+		t.Fatalf("idempotent revoke: %v", err)
+	}
+	if _, err := svc.Update(ctx, rotated.ID, apikeydto.UpdateRequest{Name: ptrString("x")}); !isConflict(err) {
+		t.Fatalf("update revoked error = %v, want 409", err)
+	}
+	if _, err := svc.Rotate(ctx, rotated.ID); !isConflict(err) {
+		t.Fatalf("rotate revoked error = %v, want 409", err)
+	}
+}
+
+func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]contracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	}}
+	svc := newTestService(repo, principals)
+	ctx := testContext(1)
+
+	created, err := svc.Create(ctx, 10, apikeydto.CreateRequest{Name: "deploy", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	rotated, err := svc.Rotate(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	verifier := apikey.NewVerifier(verifierStore{repo: repo}, principals)
+	if _, err := verifier.Verify(ctx, created.Key, 1); err != nil {
+		t.Fatalf("old key must remain valid during grace: %v", err)
+	}
+	if _, err := verifier.Verify(ctx, rotated.Key, 1); err != nil {
+		t.Fatalf("new key must verify: %v", err)
+	}
+	if _, err := verifier.Verify(ctx, created.Key, 2); !isForbidden(err) {
+		t.Fatalf("tenant mismatch error = %v, want 403", err)
+	}
+}
+
+type verifierStore struct {
+	repo *fakeRepo
+}
+
+func (s verifierStore) FindByHash(ctx context.Context, hash string) (apikey.Key, error) {
+	key, err := s.repo.GetByHash(ctx, hash)
+	if err != nil {
+		return apikey.Key{}, err
+	}
+	return apikey.Key{
+		ID:                 key.ID,
+		TenantID:           key.TenantID,
+		UserID:             key.UserID,
+		Name:               key.Name,
+		Prefix:             key.Prefix,
+		Hash:               key.Hash,
+		Scopes:             key.Scopes,
+		ExpiresAt:          key.ExpiresAt,
+		RevokedAt:          key.RevokedAt,
+		RotatedAt:          key.RotatedAt,
+		RotationGraceUntil: key.RotationGraceUntil,
+		LastUsedAt:         key.LastUsedAt,
+		CreatedAt:          key.CreatedAt,
+		UpdatedAt:          key.UpdatedAt,
+	}, nil
+}
+
+func (s verifierStore) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+	return s.repo.TouchLastUsed(ctx, id, at)
+}
+
+func isNotFound(err error) bool   { return hasStatus(err, 404) }
+func isConflict(err error) bool   { return hasStatus(err, 409) }
+func isBadRequest(err error) bool { return hasStatus(err, 400) }
+func isForbidden(err error) bool  { return hasStatus(err, 403) }
+
+func hasStatus(err error, status int) bool {
+	var appErr *apperror.AppError
+	return errors.As(err, &appErr) && appErr.Status == status
+}
+
+func ptrString(value string) *string     { return &value }
+func ptrTime(value time.Time) *time.Time { return &value }
