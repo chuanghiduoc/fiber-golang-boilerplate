@@ -69,7 +69,7 @@ func setupOAuthIntegrationApp(t *testing.T, info *oauth.GoogleUserInfo) (*fiber.
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	txManager := database.NewTxManager(pool)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, nil)
 	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
 	authHandler := NewAuthHandler(
 		userSvc, refreshSvc, nil, nil, "oauth-integration-secret", 24, false,
