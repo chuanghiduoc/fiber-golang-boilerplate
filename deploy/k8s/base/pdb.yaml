@@ -9,8 +9,10 @@ metadata:
     app.kubernetes.io/part-of: fiber-boilerplate
     app.kubernetes.io/component: api
 spec:
-  # With the HPA minimum of 2 replicas this permits one voluntary disruption
-  # (node drain, cluster upgrade) while keeping one API pod available.
+  # Every environment runs at least two API replicas, so this permits one
+  # voluntary disruption (node drain, cluster upgrade) while keeping one pod
+  # available. Do not lower an environment's HPA minimum below 2 without also
+  # changing this PDB, or drains can deadlock.
   minAvailable: 1
   selector:
     matchLabels:

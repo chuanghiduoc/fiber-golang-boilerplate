@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The migration Job is applied separately, before the app. Keeping it in its own
+# kustomization root lets environment overlays set the namespace and image tag
+# without adding the Job to the app overlay.
+resources:
+  - job.yaml

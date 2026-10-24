@@ -12,9 +12,8 @@ spec:
   # seed commands never migrate.
   #
   # This Job is intentionally NOT part of the app kustomization. Apply it and
-  # wait for completion BEFORE `kubectl apply -k deploy/k8s` (see README.md).
-  # The app kustomization deliberately excludes this Job, so it must be applied
-  # explicitly and awaited; an unordered apply cannot guarantee this ordering.
+  # wait for completion BEFORE the app overlay (see README.md). The environment
+  # overlays under overlays/<env>/migration/ set the namespace and image tag.
   #
   # The Job name is stable. Jobs are immutable, so delete a previous completed
   # Job before applying a changed manifest (see README.md). ttlSecondsAfterFinished
@@ -46,9 +45,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          # This Job is applied outside kustomize, so the images transformer
-          # does not update it. Set the same immutable tag here that you set
-          # in kustomization.yaml when pinning a release.
+          # The app overlay's images transformer does not update this raw Job;
+          # overlays/<env>/migration/kustomization.yaml does. The deploy
+          # workflow injects the same tag into both before applying either.
           image: ghcr.io/OWNER/REPO:latest
           # Mutable placeholder tag: always pull. Switch to IfNotPresent after
           # pinning an immutable release tag.

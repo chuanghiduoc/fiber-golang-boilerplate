@@ -1,0 +1,12 @@
+# Production keeps at least three replicas and scales to 10. DB_MAX_CONNS in the
+# production ConfigMap is 10, so 10 replicas stay within the 100-connection
+# budget documented in the README. The HPA owns the replica count; the
+# Deployment intentionally has no spec.replicas.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  namespace: fiber-boilerplate
+  name: fiber-boilerplate
+spec:
+  minReplicas: 3
+  maxReplicas: 10
