@@ -95,6 +95,19 @@ func (q *Queries) DeleteRefreshToken(ctx context.Context, arg DeleteRefreshToken
 	return err
 }
 
+const deleteRefreshTokenByPossession = `-- name: DeleteRefreshTokenByPossession :exec
+DELETE FROM refresh_tokens
+WHERE token = $1
+`
+
+// Logout is possession-based: presenting the opaque token is sufficient to
+// revoke it, even if the caller omits X-Tenant-Slug. Possession cannot be used
+// to read or mint anything, so this does not weaken tenant isolation.
+func (q *Queries) DeleteRefreshTokenByPossession(ctx context.Context, token string) error {
+	_, err := q.db.Exec(ctx, deleteRefreshTokenByPossession, token)
+	return err
+}
+
 const deleteRefreshTokensByUserID = `-- name: DeleteRefreshTokensByUserID :exec
 DELETE FROM refresh_tokens
 WHERE user_id = $1 AND tenant_id = $2

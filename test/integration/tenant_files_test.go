@@ -150,7 +150,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	}
 }
 
-func (h *tenantFilesHarness) request(t *testing.T, method, path, bearer string, body []byte, contentType string) (*http.Response, []byte) {
+func (h *tenantFilesHarness) request(t *testing.T, method, path, bearer string, body []byte, contentType string) (resp *http.Response, respBody []byte) {
 	t.Helper()
 	req, err := http.NewRequest(method, path, bytes.NewReader(body))
 	require.NoError(t, err)
@@ -160,10 +160,10 @@ func (h *tenantFilesHarness) request(t *testing.T, method, path, bearer string, 
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	resp, err = h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err = io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return resp, respBody
 }

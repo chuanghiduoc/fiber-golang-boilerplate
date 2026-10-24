@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -149,7 +150,10 @@ func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
 	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"tenant_id": fiber.Locals[int64](c, "tenant_id")})
+		return c.JSON(fiber.Map{
+			"tenant_id":   fiber.Locals[int64](c, "tenant_id"),
+			"tenant_slug": fiber.Locals[string](c, "tenant_slug"),
+		})
 	})
 
 	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
@@ -166,6 +170,46 @@ func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), `"tenant_id":2`) {
 		t.Fatalf("body = %s, want tenant_id 2", body)
+	}
+	// The request resolved the default tenant before JWTAuth. Once the claim
+	// overrides tenant_id, the old slug would be misleading, so it is cleared.
+	if !strings.Contains(string(body), `"tenant_slug":""`) {
+		t.Fatalf("body = %s, want tenant_slug cleared when the claim overrides it", body)
+	}
+}
+
+func TestJWTAuth_NegativeTenantRejected(t *testing.T) {
+	secret := "test-secret"
+	app := newTestApp()
+	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
+	claims := token.Claims{
+		UserID:   1,
+		TenantID: -1,
+		Email:    "user@example.com",
+		Role:     "user",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "fiber-golang-boilerplate",
+			Audience:  jwt.ClaimStrings{"fiber-golang-boilerplate-api"},
+		},
+	}
+	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a negative tenant_id", resp.StatusCode)
 	}
 }
 

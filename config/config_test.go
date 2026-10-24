@@ -478,6 +478,7 @@ func productionValidConfig() Config {
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "require"
+	cfg.Tenant.RequireHeader = true
 	return cfg
 }
 
@@ -502,6 +503,7 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshExpireDays = 0 }},
 		{"invalid env", func(c *Config) { c.App.Env = "prod" }},
 		{"missing metrics token", func(c *Config) { c.App.MetricsAuthToken = "" }},
+		{"tenant header not required", func(c *Config) { c.Tenant.RequireHeader = false }},
 		{"weak admin password", func(c *Config) {
 			c.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
 		}},

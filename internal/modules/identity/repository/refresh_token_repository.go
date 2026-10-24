@@ -13,6 +13,10 @@ type RefreshTokenRepository interface {
 	// caller can win, which prevents refresh-token replay/rotation races.
 	Consume(ctx context.Context, token string) (*identitysqlc.RefreshToken, error)
 	Delete(ctx context.Context, token string) error
+	// DeleteByTokenPossession revokes a token without a tenant predicate.
+	// Logout uses it so a valid token is still revoked when the client omits
+	// X-Tenant-Slug; possessing the opaque token is the authorization.
+	DeleteByTokenPossession(ctx context.Context, token string) error
 	DeleteByUserID(ctx context.Context, userID int64) error
 }
 
@@ -60,6 +64,10 @@ func (r *refreshTokenRepository) Delete(ctx context.Context, token string) error
 		Token:    token,
 		TenantID: tenantID(ctx),
 	})
+}
+
+func (r *refreshTokenRepository) DeleteByTokenPossession(ctx context.Context, token string) error {
+	return r.q.DeleteRefreshTokenByPossession(ctx, token)
 }
 
 func (r *refreshTokenRepository) DeleteByUserID(ctx context.Context, userID int64) error {

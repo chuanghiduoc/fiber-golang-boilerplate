@@ -96,7 +96,7 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	}
 	token := hex.EncodeToString(b)
 
-	resetURL := fmt.Sprintf("%s/reset-password?token=%s", s.frontendURL, token)
+	resetURL := tokenLink(ctx, s.frontendURL, "reset-password", token)
 	msg := email.Message{
 		To:      []string{user.Email},
 		Subject: "Password Reset Request",
@@ -151,9 +151,16 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	if !queuedInTx {
 		// Send email asynchronously: SMTP latency must not create a timing
 		// oracle and must not block the request. Failures are logged, never
-		// returned.
+		// returned. Carry the request tenant explicitly: a bare background
+		// context would enqueue the job under the default tenant.
+		tenantID := user.TenantID
+		if tenantID <= 0 {
+			tenantID = tenant.EffectiveID(ctx)
+		}
+		tenantSlug := tenant.SlugFromContext(ctx)
 		async.Go(func() {
-			if err := s.emailSender.Send(context.Background(), msg); err != nil {
+			sendCtx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
+			if err := s.emailSender.Send(sendCtx, msg); err != nil {
 				slog.Warn("failed to send password reset email",
 					slog.Int64("user_id", user.ID),
 					slog.String("email", user.Email),

@@ -42,8 +42,12 @@ func GenerateWithVersion(userID int64, email, role string, tokenVersion int32, s
 }
 
 // GenerateWithVersionAndTenant creates a signed JWT token carrying both the
-// user's current token version and tenant ID.
+// user's current token version and tenant ID. A negative tenant ID is rejected;
+// zero remains reserved for legacy tokens that predate multi-tenancy.
 func GenerateWithVersionAndTenant(userID, tenantID int64, email, role string, tokenVersion int32, secret string, expireHour int) (string, error) {
+	if tenantID < 0 {
+		return "", errors.New("tenant ID must not be negative")
+	}
 	claims := Claims{
 		UserID:       userID,
 		TenantID:     tenantID,

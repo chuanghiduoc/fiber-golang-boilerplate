@@ -26,7 +26,9 @@ type Config struct {
 }
 
 // TenantConfig controls request-tenant resolution. The default slug preserves
-// compatibility for requests that do not send X-Tenant-Slug.
+// compatibility for requests that do not send X-Tenant-Slug in local/test.
+// Production validation requires RequireHeader so HTTP writes cannot silently
+// fall back to the compatibility tenant.
 type TenantConfig struct {
 	DefaultSlug   string `env:"TENANT_DEFAULT_SLUG" envDefault:"default"`
 	RequireHeader bool   `env:"TENANT_REQUIRE_HEADER" envDefault:"false"`
@@ -414,6 +416,12 @@ func (cfg *Config) Validate() error {
 	// Production-only safety rails. These would break local development
 	// defaults, so they are enforced only for the production environment.
 	if cfg.App.Env == "production" {
+		// Header-less requests must not silently fall back to the compatibility
+		// tenant in production. Requiring the header makes tenant selection
+		// explicit for every HTTP write and lets links carry a known slug.
+		if !cfg.Tenant.RequireHeader {
+			return fmt.Errorf("TENANT_REQUIRE_HEADER must be true in production so header-less writes cannot fall back to the default tenant")
+		}
 		if cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
 			return fmt.Errorf("APP_BODY_LIMIT (%d) must be greater than STORAGE_MAX_FILE_SIZE (%d) to allow multipart framing", cfg.App.BodyLimit, cfg.Storage.MaxFileSize)
 		}

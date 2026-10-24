@@ -48,8 +48,9 @@ type Deps struct {
 	Limiters    Limiters
 	Audit       audit.Recorder
 	Idempotency fiber.Handler
-	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
-	// is a pass-through for tests and minimal deployments.
+	// TenantResolver resolves X-Tenant-Slug (plus the browser auth query
+	// fallback) for public routes. A nil resolver is a pass-through for tests
+	// and minimal deployments.
 	TenantResolver tenant.Resolver
 }
 
@@ -171,7 +172,9 @@ func (a *App) setupInfrastructureRoutes() {
 func (a *App) Register(modules ...Module) {
 	// Tenant resolution is API-only: health and metrics probes must not depend
 	// on the tenants table. It runs before every module's JWT middleware so a
-	// conflicting X-Tenant-Slug can be rejected after the token is parsed.
+	// conflicting X-Tenant-Slug can be rejected after the token is parsed. The
+	// middleware itself exempts the OAuth callback, whose signed state is the
+	// tenant source.
 	defaultSlug := a.cfg.Tenant.DefaultSlug
 	if a.cfg.Tenant.RequireHeader {
 		defaultSlug = ""

@@ -265,7 +265,7 @@ info:
 paths:
   /admin/files:
     get:
-      description: Get a paginated list of all files
+      description: Get a paginated list of files in the caller's tenant
       parameters:
       - default: 20
         description: Max items to return
@@ -300,12 +300,12 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: List all files (admin)
+      summary: List tenant files (admin)
       tags:
       - Admin
   /admin/files/{id}:
     delete:
-      description: Soft-delete a file by ID regardless of owner
+      description: Soft-delete a file in the caller's tenant by ID regardless of owner
       parameters:
       - description: File ID
         in: path
@@ -333,12 +333,12 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Soft-delete any file (admin)
+      summary: Soft-delete a tenant file (admin)
       tags:
       - Admin
   /admin/files/{id}/download:
     get:
-      description: Download an active file by ID
+      description: Download an active file in the caller's tenant by ID
       parameters:
       - description: File ID
         in: path
@@ -368,12 +368,12 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Download any file (admin)
+      summary: Download a tenant file (admin)
       tags:
       - Admin
   /admin/files/{id}/restore:
     post:
-      description: Restore any file by ID
+      description: Restore any soft-deleted file in the caller's tenant by ID
       parameters:
       - description: File ID
         in: path
@@ -409,12 +409,12 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Restore a soft-deleted file (admin)
+      summary: Restore a tenant file (admin)
       tags:
       - Admin
   /admin/stats:
     get:
-      description: Get system-wide statistics (admin only)
+      description: Get statistics for the caller's tenant only (admin only)
       produces:
       - application/json
       responses:
@@ -432,12 +432,13 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Get system statistics
+      summary: Get tenant statistics
       tags:
       - Admin
   /admin/users:
     get:
-      description: Get a paginated list of all users including soft-deleted
+      description: Get a paginated list of users in the caller's tenant, including
+        soft-deleted
       parameters:
       - default: 20
         description: Max items to return
@@ -472,7 +473,7 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: List all users (admin)
+      summary: List tenant users (admin)
       tags:
       - Admin
   /admin/users/{id}/ban:
@@ -642,7 +643,14 @@ paths:
       - Auth
   /auth/google:
     get:
-      description: Redirects the user to Google's OAuth consent screen
+      description: Redirects to Google's OAuth consent screen. Browser navigation
+        may select the tenant with the validated tenant query parameter; the tenant
+        is bound into the signed state.
+      parameters:
+      - description: Tenant slug for browser navigation (X-Tenant-Slug takes precedence)
+        in: query
+        name: tenant
+        type: string
       responses:
         "302":
           description: Found
@@ -663,12 +671,18 @@ paths:
       - Auth
   /auth/google/callback:
     get:
-      description: Handles the callback from Google OAuth, creates/finds user and
-        redirects with tokens
+      description: Handles the callback from Google OAuth, creates/finds the user
+        in the tenant bound to the signed state, and redirects with tokens. X-Tenant-Slug
+        is ignored; unknown or suspended state tenants are rejected.
       parameters:
       - description: Authorization code
         in: query
         name: code
+        required: true
+        type: string
+      - description: OAuth state containing the tenant bound at start
+        in: query
+        name: state
         required: true
         type: string
       responses:
@@ -735,7 +749,8 @@ paths:
     post:
       consumes:
       - application/json
-      description: Revoke a refresh token
+      description: Revoke one refresh token by possession. The tenant header is not
+        required because possession of the opaque token authorizes revocation.
       parameters:
       - description: Refresh token to revoke
         in: body
@@ -894,8 +909,14 @@ paths:
     post:
       consumes:
       - application/json
-      description: Reset password using a token
+      description: Reset password using a token. The tenant query parameter is the
+        browser-link fallback for tenants that cannot send X-Tenant-Slug.
       parameters:
+      - description: Tenant slug from the emailed reset link (X-Tenant-Slug takes
+          precedence)
+        in: query
+        name: tenant
+        type: string
       - description: Reset password request
         in: body
         name: request
@@ -930,8 +951,14 @@ paths:
     post:
       consumes:
       - application/json
-      description: Verify email using a token
+      description: Verify email using a token. The tenant query parameter is the browser-link
+        fallback for tenants that cannot send X-Tenant-Slug.
       parameters:
+      - description: Tenant slug from the emailed verification link (X-Tenant-Slug
+          takes precedence)
+        in: query
+        name: tenant
+        type: string
       - description: Verify email request
         in: body
         name: request

@@ -95,8 +95,12 @@ At minimum, replace:
   `X-Tenant-Slug` in `CORS_ALLOW_HEADERS` and `Idempotent-Replayed` in
   `CORS_EXPOSE_HEADERS` for browser clients that use idempotent mutations or
   tenant selection.
-- `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES` and
-  the S3 endpoint. Keep environment-specific values in the overlay components.
+- `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES`,
+  `TENANT_REQUIRE_HEADER=true` (required in production so header-less writes
+  never fall back to tenant 1), and the S3 endpoint. Keep environment-specific
+  values in the overlay components. Every API client must send
+  `X-Tenant-Slug`; the frontend forwards the `?tenant=<slug>` from
+  reset/verification links to the API.
 - `base/networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
   managed services are not in `10.0.0.0/8` or use different ports.
 - The two overlay `namespace:` values and their Namespace rename patches, plus

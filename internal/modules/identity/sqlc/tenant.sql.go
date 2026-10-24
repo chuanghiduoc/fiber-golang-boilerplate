@@ -29,6 +29,27 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 	return i, err
 }
 
+const getTenantByIDIncludingSuspended = `-- name: GetTenantByIDIncludingSuspended :one
+SELECT id, slug, name, status, created_at, updated_at FROM tenants
+WHERE id = $1
+`
+
+// Startup checks need existence independent of request eligibility so a
+// suspended configured/default tenant does not crash the process.
+func (q *Queries) GetTenantByIDIncludingSuspended(ctx context.Context, id int64) (Tenant, error) {
+	row := q.db.QueryRow(ctx, getTenantByIDIncludingSuspended, id)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getTenantBySlug = `-- name: GetTenantBySlug :one
 SELECT id, slug, name, status, created_at, updated_at FROM tenants
 WHERE slug = $1
@@ -37,6 +58,27 @@ WHERE slug = $1
 
 func (q *Queries) GetTenantBySlug(ctx context.Context, slug string) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getTenantBySlug, slug)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getTenantBySlugIncludingSuspended = `-- name: GetTenantBySlugIncludingSuspended :one
+SELECT id, slug, name, status, created_at, updated_at FROM tenants
+WHERE slug = $1
+`
+
+// Startup checks need existence independent of request eligibility so a
+// suspended configured/default tenant does not crash the process.
+func (q *Queries) GetTenantBySlugIncludingSuspended(ctx context.Context, slug string) (Tenant, error) {
+	row := q.db.QueryRow(ctx, getTenantBySlugIncludingSuspended, slug)
 	var i Tenant
 	err := row.Scan(
 		&i.ID,

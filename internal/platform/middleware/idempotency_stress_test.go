@@ -174,7 +174,7 @@ func TestIdempotencyStressSingleExecution(t *testing.T) {
 	}
 
 	lockKey := idempotencyLockKey(idempotencyScope(
-		http.MethodPost, idempotencyStressPath, "0.0.0.0", key))
+		http.MethodPost, idempotencyStressPath, 0, "", "0.0.0.0", key))
 	exists, err := mem.Exists(context.Background(), lockKey)
 	if err != nil {
 		t.Fatalf("check lock: %v", err)

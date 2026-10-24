@@ -123,6 +123,9 @@ func (s *store) Validate(ctx context.Context, userID, tenantID int64, role strin
 }
 
 func validateSnapshot(snap snapshot, tenantID int64, role string, tokenVersion int32) error {
+	if tenantID <= 0 {
+		return apperror.NewUnauthorized("token is missing tenant")
+	}
 	if snap.TenantStatus != "active" {
 		return apperror.NewUnauthorized("tenant is not active")
 	}

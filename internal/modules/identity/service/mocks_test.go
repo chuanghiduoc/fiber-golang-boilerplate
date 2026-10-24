@@ -397,6 +397,11 @@ func (m *mockRefreshTokenRepo) Delete(ctx context.Context, token string) error {
 	return nil
 }
 
+func (m *mockRefreshTokenRepo) DeleteByTokenPossession(_ context.Context, token string) error {
+	delete(m.tokens, token)
+	return nil
+}
+
 func (m *mockRefreshTokenRepo) DeleteByUserID(ctx context.Context, userID int64) error {
 	m.deletedUserIDs = append(m.deletedUserIDs, userID)
 	for k, v := range m.tokens {
@@ -588,17 +593,18 @@ func (m *mockCache) Ping(_ context.Context) error { return nil }
 // ---------------------------------------------------------------------------
 
 type mockEmailSender struct {
-	mu       sync.Mutex
-	sendErr  error
-	sent     int
-	messages []email.Message
+	mu        sync.Mutex
+	sendErr   error
+	sent      int
+	messages  []email.Message
+	tenantIDs []int64
 }
 
 func newMockEmailSender() *mockEmailSender {
 	return &mockEmailSender{}
 }
 
-func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
+func (m *mockEmailSender) Send(ctx context.Context, msg email.Message) error {
 	if m.sendErr != nil {
 		return m.sendErr
 	}
@@ -606,6 +612,7 @@ func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 	defer m.mu.Unlock()
 	m.sent++
 	m.messages = append(m.messages, msg)
+	m.tenantIDs = append(m.tenantIDs, tenant.IDFromContext(ctx))
 	return nil
 }
 
@@ -622,6 +629,16 @@ func (m *mockEmailSender) Messages() []email.Message {
 	defer m.mu.Unlock()
 	out := make([]email.Message, len(m.messages))
 	copy(out, m.messages)
+	return out
+}
+
+// TenantIDs returns the tenant context recorded for each send. Tests use it to
+// prove fire-and-forget delivery does not silently fall back to tenant 1.
+func (m *mockEmailSender) TenantIDs() []int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]int64, len(m.tenantIDs))
+	copy(out, m.tenantIDs)
 	return out
 }
 

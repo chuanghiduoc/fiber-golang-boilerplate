@@ -21,10 +21,12 @@ data:
   # Replace with the public frontend origin (https is enforced in production).
   APP_FRONTEND_URL: "https://app.example.com"
   REQUIRE_EMAIL_VERIFICATION: "true"
-  # Requests without X-Tenant-Slug resolve to the default tenant. Enable
-  # TENANT_REQUIRE_HEADER only after every client sends the header.
+  # Production requires explicit tenant selection: header-less requests must
+  # not silently write to the compatibility tenant. Every API client (and the
+  # frontend forwarding reset/verification `?tenant=` links) must send
+  # X-Tenant-Slug. Production startup rejects TENANT_REQUIRE_HEADER=false.
   TENANT_DEFAULT_SLUG: "default"
-  TENANT_REQUIRE_HEADER: "false"
+  TENANT_REQUIRE_HEADER: "true"
 
   # The app runs behind ingress-nginx, so client IPs arrive in X-Forwarded-For.
   # Trust only the cluster's pod/service CIDR that contains ingress-nginx;

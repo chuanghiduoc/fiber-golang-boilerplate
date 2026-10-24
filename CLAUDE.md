@@ -86,10 +86,19 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   read/write and admin operation. Public auth flows resolve the request tenant;
   Google OAuth binds the tenant into `state`; the session validator rejects
   tenant mismatches and suspended tenants.
-- Tokens without a `tenant_id` claim are rejected fail-closed; rotate them after
-  upgrading. Keep `tenant_id` predicates in every new query and index
-  tenant-owned tables with `tenant_id` first. RLS and per-tenant limits remain
-  future work; do not claim whole-application isolation.
+- Startup checks tenant *existence* (`StartupTenants`, lookups ignoring status)
+  separately from active request resolution. A suspended configured/default
+  tenant must not crash `cmd/api`/`cmd/seed`; requests for it return 404.
+- Reset/verification links carry `?tenant=<slug>`, and the tenant middleware
+  accepts that validated query fallback only on the browser-facing auth paths
+  (`/auth/google`, `/auth/reset-password`, `/auth/verify-email`); the header
+  wins. The OAuth callback is exempt from middleware resolution and uses the
+  tenant in signed `state`.
+- Tokens without a `tenant_id` claim (or with a zero/negative claim) are
+  rejected fail-closed; rotate legacy tokens after upgrading. Keep `tenant_id`
+  predicates in every new query and index tenant-owned tables with `tenant_id`
+  first. RLS and per-tenant limits remain future work; do not claim
+  whole-application isolation.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
 Row-level security, per-tenant limits/quotas, distributed tracing, and
@@ -134,11 +143,16 @@ Offset helpers are for small admin/export tables only.
 - **Auth/session:** JWT carries `token_version` and `tenant_id`;
   `session.Store` validates the version, tenant, and tenant status with
   generation-keyed invalidation. `tenant.Middleware` resolves `X-Tenant-Slug`
-  (empty -> `TENANT_DEFAULT_SLUG`), `JWTAuth` rejects tokens without a tenant and
-  an explicit header that conflicts with the claim, and identity repositories
-  scope every query with `tenant.EffectiveID(ctx)`. Refresh tokens are atomic
-  single-use, tenant-scoped, and version-bound. `pkg/token` pins HS256 and
-  requires `exp`.
+  (empty -> `TENANT_DEFAULT_SLUG`; production requires the header), accepts a
+  validated `?tenant=` fallback on browser-facing auth paths, and skips the
+  OAuth callback so the signed `state` tenant wins. `JWTAuth` rejects tokens
+  without a positive tenant and an explicit header that conflicts with the
+  claim, and clears `tenant_slug` when the claim overrides an unresolved
+  default. Identity repositories scope every query with
+  `tenant.EffectiveID(ctx)`; the tenant-1 fallback is for jobs/internal/tests
+  only, not HTTP request handling. Refresh tokens are atomic single-use,
+  tenant-scoped, and version-bound; logout deletes by token possession.
+  `pkg/token` pins HS256 and requires `exp`.
 - **Files/tenant isolation:** repository methods always add
   `tenant.EffectiveID(ctx)` to the SQL parameters; service methods also compare
   the returned row's `TenantID`/`UserID` before exposing it. Uploads reject an
@@ -195,7 +209,8 @@ Offset helpers are for small admin/export tables only.
 - **Rate limits:** tiered, cache-backed in `internal/app`; authenticated
   requests are keyed per user, unauthenticated per IP.
 - **Idempotency:** opt-in `Idempotency-Key` on mutating routes via
-  `deps.Idempotency`; scoped by method/path/user (IP for public routes). 2xx
+  `deps.Idempotency`; scoped by method/path/tenant ID+slug/caller (user, or IP
+  for public routes). 2xx
   responses replay for 24h; non-multipart bodies up to 1 MiB are body-bound, so
   reuse with a different body gets 409. An owner-token lock is held for 2m
   (compare-and-delete when the cache supports it), concurrent duplicates get

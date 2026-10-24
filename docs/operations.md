@@ -305,12 +305,13 @@ Idempotent mutations are opt-in with `Idempotency-Key` (1–128 chars of
 
 | Key | TTL | Purpose |
 | --- | --- | --- |
-| `idempotency:<method>:<path>:<identity>:<key>:lock` | 2 minutes | Owner-token lock for the in-flight request. |
-| `idempotency:<method>:<path>:<identity>:<key>:response` | 24 hours | Cached 2xx status, body, and selected headers for replay. |
+| `idempotency:<method>:<path>:tenant=<id>:<slug>:<identity>:<key>:lock` | 2 minutes | Owner-token lock for the in-flight request. |
+| `idempotency:<method>:<path>:tenant=<id>:<slug>:<identity>:<key>:response` | 24 hours | Cached 2xx status, body, and selected headers for replay. |
 
 `identity` is the authenticated user ID, or the client IP for public routes.
-Keys are scoped by method, path, and identity, so the same client key on
-another endpoint or user does not collide.
+Keys are scoped by method, path, tenant ID/slug, and identity, so the same
+client key/body/IP in another tenant cannot replay a cross-tenant `201`.
+Existing keys from before tenant scoping stop matching and expire within 24h.
 
 Behavior to remember:
 
@@ -425,8 +426,17 @@ verifies the tenant table/columns/indexes, `tenant_id` on `jobs` and
 `audit_events`, and the default tenant row.
 
 `TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
-requests resolve to; `TENANT_REQUIRE_HEADER=true` rejects requests that omit
-`X-Tenant-Slug`. Roll out the latter only after all clients send the header.
+requests resolve to in local/test compatibility mode; `TENANT_REQUIRE_HEADER=true`
+rejects requests that omit `X-Tenant-Slug`. **Production requires it**, and the
+Kubernetes ConfigMap sets it, so no HTTP write can silently land in tenant 1.
+Roll it out in lower environments only after all clients send the header.
+Startup checks existence separately from request resolution: a suspended
+configured/default tenant does not fail `cmd/api` or `cmd/seed`, but its
+requests return 404 until an operator reactivates it. Browser OAuth start and
+reset/verify links may select the tenant with `?tenant=<slug>` because a header
+cannot be sent on navigation; the header still wins when both are present.
+`cmd/migrate` verifies `tenants.slug/status`, the tenant slug uniqueness, and
+that every tenant-owned query index leads with `tenant_id`.
 Identity, files, jobs, and audit now carry/propagate `tenant_id`; identity and
 files queries are tenant-scoped. Existing rows default to tenant 1 and their old
 `<userID>/<uuid>.<ext>` storage keys remain valid because downloads read
@@ -436,9 +446,10 @@ update `files.storage_path` in the same operation. RLS and per-tenant limits are
 future work; see the README scope note.
 
 `cmd/migrate` checks for a dirty migration state before running, and after
-migrating verifies required tables, columns, and unique indexes. A legacy
-partial schema fails with an actionable error instead of silently serving a
-broken database.
+migrating verifies required tables, columns, unique indexes, `tenants.slug`/
+`status`, and that each tenant-owned query index starts with `tenant_id`. A
+legacy partial schema or a same-named global index fails with an actionable
+error instead of silently serving a broken database.
 
 ### Failure and backup/restore
 

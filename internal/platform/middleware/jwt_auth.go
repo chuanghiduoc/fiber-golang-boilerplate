@@ -17,11 +17,11 @@ import (
 // working without a session store.
 //
 // The global tenant middleware runs first and resolves X-Tenant-Slug (or the
-// default tenant) into the tenant_id local. A token's tenant_id claim is
-// authoritative for authenticated requests; an explicitly supplied header
-// that resolves to a different tenant is rejected with 403. Tokens minted
-// before multi-tenancy carry no tenant claim and are rejected fail-closed:
-// deployments must rotate those tokens after upgrading.
+// configured default) into the tenant_id local. A token's positive tenant_id
+// claim is authoritative for authenticated requests; an explicitly supplied
+// header that resolves to a different tenant is rejected with 403. Tokens
+// minted before multi-tenancy carry no tenant claim and are rejected
+// fail-closed: deployments must rotate those tokens after upgrading.
 func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 	var store session.Store
 	if len(stores) > 0 {
@@ -44,18 +44,24 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 			return apperror.NewUnauthorized("invalid or expired token")
 		}
 
-		if claims.TenantID == 0 {
+		if claims.TenantID <= 0 {
 			return apperror.NewUnauthorized("token is missing tenant")
 		}
 
 		// Only an explicit header can conflict. The tenant middleware also
 		// resolves an absent header to the default tenant, which must not make
-		// every non-default JWT fail with 403. tenant_slug keeps the
-		// request-resolution value; tenant_id is authoritative for scoping.
+		// every non-default JWT fail with 403. tenant_id is authoritative for
+		// scoping; tenant_slug must describe that same tenant. When the claim
+		// overrides a header-less default resolution we do not know the slug,
+		// so clear it instead of leaving a misleading "default".
 		headerSlug := strings.TrimSpace(c.Get(tenant.Header))
-		headerTenantID := fiber.Locals[int64](c, "tenant_id")
-		if headerSlug != "" && headerTenantID != 0 && headerTenantID != claims.TenantID {
+		resolvedTenantID := fiber.Locals[int64](c, "tenant_id")
+		if headerSlug != "" && resolvedTenantID != claims.TenantID {
 			return apperror.NewCode(apperror.CodePermissionDenied, "tenant mismatch")
+		}
+		if headerSlug == "" && resolvedTenantID != 0 && resolvedTenantID != claims.TenantID {
+			fiber.Locals[string](c, "tenant_slug", "")
+			c.SetContext(tenant.WithSlug(c.Context(), ""))
 		}
 		fiber.Locals[int64](c, "tenant_id", claims.TenantID)
 		c.SetContext(tenant.WithID(c.Context(), claims.TenantID))

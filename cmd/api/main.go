@@ -152,16 +152,24 @@ func main() {
 	tenantResolver := identityadapter.NewTenantResolver(tenantRepo)
 	sessionStore := session.NewStore(userRepo, appCache)
 
-	// The baseline seeds tenant id 1. Fail fast instead of serving 404s (or
-	// creating an admin under an unexpected tenant) when migrations did not run.
-	if _, err := tenantRepo.GetByID(startupCtx, 1); err != nil {
-		pool.Close()
-		fail("default tenant (id 1) is missing; run cmd/migrate", err)
-	}
-	defaultTenant, err := tenantResolver.Resolve(startupCtx, cfg.Tenant.DefaultSlug)
+	// The baseline seeds tenant id 1. Startup checks existence, not request
+	// eligibility: a suspended configured/default tenant must not crash the
+	// process. Its requests still return 404 until it is reactivated.
+	_, defaultTenant, err := identityrepository.StartupTenants(
+		startupCtx, tenantRepo, cfg.Tenant.DefaultSlug,
+	)
 	if err != nil {
 		pool.Close()
-		fail("configured default tenant is not available; run cmd/migrate or fix TENANT_DEFAULT_SLUG", err)
+		fail("tenant startup check failed", err)
+	}
+	if defaultTenant.Status != "active" {
+		slog.Warn("configured default tenant is suspended; requests for it will return 404 until reactivated",
+			slog.String("tenant", defaultTenant.Slug),
+			slog.Int64("tenant_id", defaultTenant.ID),
+		)
+	}
+	if cfg.App.Env == "staging" && !cfg.Tenant.RequireHeader {
+		slog.Warn("TENANT_REQUIRE_HEADER=false in staging: header-less requests use the default tenant")
 	}
 
 	// Auto-seed admin user (idempotent) in the configured default tenant.

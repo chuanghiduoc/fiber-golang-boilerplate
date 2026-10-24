@@ -111,4 +111,8 @@ func TestValidateSnapshot(t *testing.T) {
 	if err := validateSnapshot(suspended, 1, "admin", 3); err == nil {
 		t.Error("suspended tenant must be rejected")
 	}
+
+	if err := validateSnapshot(snap, -1, "admin", 3); err == nil {
+		t.Error("negative tenant ID must be rejected")
+	}
 }

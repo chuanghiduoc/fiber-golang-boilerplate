@@ -92,6 +92,29 @@ func extractEmailToken(t *testing.T, msg email.Message) string {
 	return rest
 }
 
+func TestTenantIntegration_LogoutRevokesByTokenPossession(t *testing.T) {
+	h := setupTenantServiceHarness(t)
+	ctxA := tenantContext(tenant.DefaultID)
+	ctxB := tenantContext(h.tenantTwo)
+
+	userB, err := h.userRepo.Create(ctxB, identitysqlc.CreateUserParams{
+		Email: "logout-b@example.com", Name: "Logout B",
+	})
+	require.NoError(t, err)
+	plain, err := h.refreshSvc.Create(ctxB, userB.ID, userB.TokenVersion)
+	require.NoError(t, err)
+
+	// The client omits X-Tenant-Slug, so the request resolves tenant 1. Logout
+	// must still delete the tenant-B token by possession.
+	require.NoError(t, h.refreshSvc.Revoke(ctxA, plain))
+
+	var count int64
+	require.NoError(t, h.pool.QueryRow(ctxA,
+		`SELECT count(*) FROM refresh_tokens WHERE token = $1`, hashToken(plain),
+	).Scan(&count))
+	require.Zero(t, count, "logout must revoke the token regardless of request tenant")
+}
+
 func TestTenantIntegration_TokenRowsCarryTenant(t *testing.T) {
 	h := setupTenantServiceHarness(t)
 	ctxA := tenantContext(tenant.DefaultID)

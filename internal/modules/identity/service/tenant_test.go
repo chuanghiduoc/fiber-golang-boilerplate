@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,6 +157,25 @@ func TestRefreshToken_TenantMismatchRejected(t *testing.T) {
 	}
 }
 
+func TestRefreshToken_LogoutRevokesByPossessionAcrossTenant(t *testing.T) {
+	repo := newMockRefreshTokenRepo()
+	svc := NewRefreshTokenService(repo, 30)
+
+	plain, err := svc.Create(tenantCtx(2), 7, 0)
+	if err != nil {
+		t.Fatalf("create tenant 2 token: %v", err)
+	}
+
+	// Logout without X-Tenant-Slug resolves tenant 1. The opaque token is still
+	// revoked by possession instead of being silently left live.
+	if err := svc.Revoke(tenantCtx(1), plain); err != nil {
+		t.Fatalf("logout revoke: %v", err)
+	}
+	if _, _, _, err := svc.Consume(tenantCtx(2), plain); err == nil {
+		t.Fatal("a logged-out token must not remain consumable in its tenant")
+	}
+}
+
 func TestEmailVerification_TenantMismatchRejected(t *testing.T) {
 	svc, ur, vr, _, _ := newEmailVerifServiceForTest()
 	ur.users[1] = &identitysqlc.User{
@@ -173,6 +193,54 @@ func TestEmailVerification_TenantMismatchRejected(t *testing.T) {
 	}
 	if err := svc.Verify(tenantCtx(1), "cross-tenant"); err != nil {
 		t.Fatalf("verify in owning tenant: %v", err)
+	}
+}
+
+func TestPasswordReset_AsyncFallbackCarriesTenantAndSlug(t *testing.T) {
+	userRepo := newMockUserRepo()
+	resetRepo := newMockPasswordResetRepo()
+	sender := newMockEmailSender()
+	svc := newTestPasswordResetService(userRepo, resetRepo, newMockRefreshTokenRepo(), sender, newMockCache())
+
+	userRepo.users[1] = &identitysqlc.User{
+		TenantID: 2, ID: 1, Email: "tenant2@example.com", Name: "Tenant Two", Role: dto.RoleUser,
+		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}
+
+	ctx := tenant.WithSlug(tenantCtx(2), "acme")
+	if err := svc.ForgotPassword(ctx, dto.ForgotPasswordRequest{Email: "tenant2@example.com"}); err != nil {
+		t.Fatalf("forgot password: %v", err)
+	}
+	if !sender.WaitFor(1, time.Second) {
+		t.Fatal("expected a reset email")
+	}
+	ids := sender.TenantIDs()
+	if len(ids) != 1 || ids[0] != 2 {
+		t.Fatalf("async sender tenant IDs = %v, want [2]", ids)
+	}
+	msg := sender.Messages()[0]
+	if !strings.Contains(msg.HTML, "tenant=acme") {
+		t.Fatalf("reset link must carry the tenant slug: %s", msg.HTML)
+	}
+}
+
+func TestEmailVerification_LinkCarriesTenantSlug(t *testing.T) {
+	ur := newMockUserRepo()
+	vr := newMockEmailVerificationRepo()
+	sender := newMockEmailSender()
+	svc := NewEmailVerificationService(ur, vr, sender, newMockCache(), "http://localhost:3000", nil)
+
+	ctx := tenant.WithSlug(tenantCtx(2), "acme")
+	if err := svc.SendVerification(ctx, 1, "tenant2@example.com"); err != nil {
+		t.Fatalf("send verification: %v", err)
+	}
+	if !sender.WaitFor(1, time.Second) {
+		t.Fatal("expected a verification email")
+	}
+	msg := sender.Messages()[0]
+	if !strings.Contains(msg.HTML, "tenant=acme") {
+		t.Fatalf("verification link must carry the tenant slug: %s", msg.HTML)
 	}
 }
 

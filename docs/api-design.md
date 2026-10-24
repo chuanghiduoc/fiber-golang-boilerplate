@@ -104,21 +104,40 @@ Rules:
 ## Tenants
 
 - `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) selects the request tenant on
-  `/api/v1` routes. Omitting it resolves to `TENANT_DEFAULT_SLUG` (`default`),
-  preserving pre-multi-tenant behavior.
-- Invalid, unknown, or suspended slugs return `404` with detail
-  `tenant not found`. `TENANT_REQUIRE_HEADER=true` rejects header-less requests
-  the same way.
+  `/api/v1` routes. In local/test compatibility mode, omitting it resolves to
+  `TENANT_DEFAULT_SLUG` (`default`). `TENANT_REQUIRE_HEADER=true` rejects
+  header-less requests instead and is **required in production** so header-less
+  HTTP writes cannot fall back to tenant 1.
+- Invalid, unknown, or suspended slugs (including the configured default)
+  return `404` with detail `tenant not found`. Startup existence checks ignore
+  status: a suspended configured/default tenant does not crash the API or seed
+  commands; its requests return `404` until reactivated.
+- Validated `?tenant=<slug>` is accepted as a fallback on `GET /auth/google`
+  and the reset/verify endpoints because browser navigation and emailed links
+  cannot set a custom header. An explicit `X-Tenant-Slug` takes precedence.
 - Authenticated requests use the JWT `tenant_id` claim. If an explicit
   `X-Tenant-Slug` resolves to a different tenant, the request fails with
-  `403 permission.denied` and detail `tenant mismatch`.
+  `403 permission.denied` and detail `tenant mismatch`. Zero or negative tenant
+  claims are rejected with `401`.
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
   Login, registration, refresh, password reset, and email verification use the
   resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
-  every call. Cross-tenant user/file ids return 404 and cross-tenant tokens fail
-  as invalid.
-- Google OAuth binds the tenant into `state`; the callback uses that tenant
-  rather than the header and rejects a tenant suspended mid-flow.
+  every call unless a documented browser-auth query fallback applies.
+  Cross-tenant user/file ids return `404`, refresh tokens fail as invalid
+  (`401`), and reset/verification link tokens return `400`.
+- Password-reset and email-verification links include `?tenant=<slug>` in
+  addition to the opaque token. Token rows are tenant-bound, so completing a
+  link under another tenant fails without consuming the token.
+- Google OAuth binds the tenant into the signed `state`; the callback ignores
+  `X-Tenant-Slug`, uses that tenant, and rejects unknown or suspended tenants
+  (including one suspended mid-flow). Header-required mode does not block the
+  callback because tenant middleware exempts it and the handler validates
+  `state`.
+- `POST /auth/logout` revokes the presented refresh token by possession, with or
+  without `X-Tenant-Slug`; it returns `204` even if the token was already gone.
+- Idempotency scope includes method, path, tenant ID/slug, and caller (user ID
+  or public-route IP). The same key/body/IP in another tenant creates a new
+  response rather than replaying a cross-tenant `201`.
 - `UserResponse`/`FileResponse` include additive `tenantId` fields. Tokens
   without a `tenant_id` claim are rejected (fail-closed).
 - **Remaining:** row-level security and per-tenant limits/quotas.
@@ -127,6 +146,8 @@ Rules:
 
 - `X-Request-Id` is accepted if valid, otherwise generated; echoed on responses.
 - `X-Tenant-Slug` selects the tenant; it is in the default CORS allow list.
+  Browser-facing auth paths also accept a validated `?tenant=<slug>` fallback
+  (header wins).
 - `Idempotency-Key` is opt-in on mutating routes; 1-128 chars of
   `[A-Za-z0-9._:-]`. Replays return `Idempotent-Replayed: true`.
 - `Location`, `ETag` are returned where applicable and exposed through CORS.
@@ -147,6 +168,8 @@ Rules:
 - Concurrent duplicates return `409` while the first is in progress.
 - Non-multipart bodies up to 1 MiB are SHA-256-bound; same key with a different
   body returns `409`.
+- The scope includes the tenant ID and slug (plus user ID, or IP for public
+  routes), so one key cannot replay a `201` across tenants.
 - Auth token-minting endpoints are excluded by design.
 
 ## Files

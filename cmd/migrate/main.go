@@ -35,6 +35,7 @@ var requiredTables = []string{
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the consolidated baseline.
 var requiredColumns = map[string][]string{
+	"tenants":                   {"slug", "status"},
 	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at"},
 	"refresh_tokens":            {"tenant_id", "token_version"},
 	"password_reset_tokens":     {"tenant_id"},
@@ -45,12 +46,49 @@ var requiredColumns = map[string][]string{
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens and duplicate active emails per tenant.
+// and verification tokens, duplicate active emails per tenant, and duplicate
+// tenant slugs.
 var requiredUniqueIndexes = []string{
+	"tenants_slug_key",
 	"idx_users_tenant_email_lower_active",
 	"idx_users_tenant_google_id_active",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+}
+
+// requiredTenantLeadingIndexes are the query indexes that must start with
+// tenant_id. Checking the first key column (not just the index name) catches a
+// legacy global index that kept its name after the tenant rewrite.
+var requiredTenantLeadingIndexes = map[string][]string{
+	"users": {
+		"idx_users_tenant_email_lower_active",
+		"idx_users_tenant_google_id_active",
+		"idx_users_tenant_role_active",
+		"idx_users_tenant_created_at_id",
+	},
+	"refresh_tokens": {
+		"idx_refresh_tokens_tenant_user_id",
+	},
+	"password_reset_tokens": {
+		"idx_password_reset_tokens_tenant_user_id",
+	},
+	"email_verification_tokens": {
+		"idx_email_verification_tokens_tenant_user_id",
+	},
+	"files": {
+		"idx_files_tenant_user_id_deleted_at",
+		"idx_files_tenant_user_created",
+		"idx_files_tenant_created_at_id",
+	},
+	"jobs": {
+		"idx_jobs_tenant_status_run_at",
+		"idx_jobs_tenant_kind_status",
+	},
+	"audit_events": {
+		"idx_audit_events_tenant_created",
+		"idx_audit_events_tenant_actor_created",
+		"idx_audit_events_tenant_action_created",
+	},
 }
 
 func main() {
@@ -221,6 +259,51 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 	for _, index := range requiredUniqueIndexes {
 		if _, ok := foundIndexes[index]; !ok {
 			missing = append(missing, "unique index "+index)
+		}
+	}
+
+	// Tenant-owned query indexes must lead with tenant_id, not merely exist.
+	// A legacy global index with the same name would otherwise pass.
+	tenantIndexNames := make([]string, 0, len(requiredTenantLeadingIndexes))
+	for _, indexes := range requiredTenantLeadingIndexes {
+		tenantIndexNames = append(tenantIndexNames, indexes...)
+	}
+	leadingRows, err := pool.Query(ctx,
+		`SELECT c.relname, a.attname
+		 FROM pg_index i
+		 JOIN pg_class c ON c.oid = i.indexrelid
+		 JOIN pg_class t ON t.oid = i.indrelid
+		 JOIN pg_namespace n ON n.oid = t.relnamespace
+		 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+		schema, tenantIndexNames,
+	)
+	if err != nil {
+		return fmt.Errorf("verify tenant-leading indexes: %w", err)
+	}
+	defer leadingRows.Close()
+
+	foundLeading := make(map[string]string, len(tenantIndexNames))
+	for leadingRows.Next() {
+		var index, firstColumn string
+		if err := leadingRows.Scan(&index, &firstColumn); err != nil {
+			return fmt.Errorf("verify schema: scan tenant-leading index: %w", err)
+		}
+		foundLeading[index] = firstColumn
+	}
+	if err := leadingRows.Err(); err != nil {
+		return fmt.Errorf("verify tenant-leading indexes: %w", err)
+	}
+	for table, indexes := range requiredTenantLeadingIndexes {
+		for _, index := range indexes {
+			firstColumn, ok := foundLeading[index]
+			switch {
+			case !ok:
+				missing = append(missing, "tenant-leading index "+table+"."+index)
+			case firstColumn != "tenant_id":
+				missing = append(missing, "tenant-leading index "+table+"."+index+
+					" starts with "+firstColumn+", want tenant_id")
+			}
 		}
 	}
 

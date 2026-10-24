@@ -42,8 +42,9 @@ func NewFileRepository(db filesqlc.DBTX) FileRepository {
 }
 
 // tenantID returns the request tenant every repository query must scope to.
-// EffectiveID falls back to the default tenant only for pre-tenant call sites
-// and tests; production requests always carry an explicit context value.
+// EffectiveID falls back to the default tenant only for background jobs,
+// internal callers, and tests; HTTP requests resolve an explicit tenant (and
+// production requires X-Tenant-Slug).
 func tenantID(ctx context.Context) int64 {
 	return tenant.EffectiveID(ctx)
 }

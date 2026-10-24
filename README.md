@@ -60,7 +60,7 @@ internal/platform/
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
-  tenant/                           Tenant resolution from X-Tenant-Slug
+  tenant/                           Tenant resolution (X-Tenant-Slug + auth query fallback)
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
   apperror/                         RFC 9457 errors + typed error catalog
@@ -92,21 +92,30 @@ The schema, request pipeline, and identity module are tenant-scoped. One user
 belongs to exactly one tenant, and no identity read or write crosses tenants.
 
 - The baseline seeds a `default` tenant with id `1`. Requests without
-  `X-Tenant-Slug` resolve to `TENANT_DEFAULT_SLUG` (`default`), preserving the
-  previous single-tenant behavior. Set `TENANT_REQUIRE_HEADER=true` to reject
-  requests that omit the header.
+  `X-Tenant-Slug` resolve to `TENANT_DEFAULT_SLUG` (`default`) in local/test
+  compatibility mode. `TENANT_REQUIRE_HEADER=true` rejects header-less
+  requests instead, and **production requires it** so a write can never
+  silently fall back to tenant 1. Staging should set it too.
 - `X-Tenant-Slug` selects the request tenant on `/api/v1` routes. Invalid,
-  unknown, or suspended slugs return `404` `tenant not found`.
+  unknown, or suspended slugs return `404` `tenant not found`. Startup checks
+  tenant *existence* separately: a suspended configured/default tenant does
+  not crash `cmd/api` or `cmd/seed`; its requests return `404` until it is
+  reactivated.
 - Public auth calls operate on the resolved tenant: registration, login,
   forgot/reset password, resend/verify email, and refresh. A client that
   registered in a non-default tenant must send the same header on those calls.
+  Browser navigation and emailed links cannot send a header, so
+  `GET /auth/google` and the reset/verify endpoints also accept a validated
+  `?tenant=<slug>` query parameter; an explicit `X-Tenant-Slug` always wins.
 - Access tokens carry a `tenant_id` claim. Authenticated requests use the
   claim; if an explicit `X-Tenant-Slug` resolves to a different tenant, the
-  request fails with `403 permission.denied` (`tenant mismatch`).
+  request fails with `403 permission.denied` (`tenant mismatch`). Tokens with a
+  zero or negative tenant claim are rejected with `401`.
 - All identity SQL is scoped by `tenant_id`: users by id, email, Google ID,
   admin lists/stats, and refresh/reset/verification tokens. A cross-tenant id
-  or token behaves as not found (admin/user APIs return `404`, token flows
-  return `400`/`401`).
+  or token behaves as not found (admin/user APIs return `404`; refresh returns
+  `401`; reset/verification link tokens return `400`). A request for an
+  unknown or suspended tenant is rejected at resolution with `404`.
 - Emails and Google IDs are unique per tenant. The last-admin database trigger
   and the application check protect each tenant independently.
 - Identity and files are tenant-isolated: all user/admin/stats and
@@ -117,14 +126,28 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
 - Durable jobs and audit events carry `tenant_id`: enqueue records the request
   tenant, the worker restores tenant context for handlers, and audit rows are
   tenant-scoped.
-- Google OAuth binds the tenant into the OAuth `state` (and state cookie); the
-  callback uses that tenant, not `X-Tenant-Slug`, and refuses a tenant suspended
-  during consent.
+- Google OAuth binds the tenant into the OAuth `state` (and state cookie). The
+  callback ignores `X-Tenant-Slug`, uses the state tenant, and refuses an
+  unknown or suspended tenant even in `TENANT_REQUIRE_HEADER=true` mode.
+- Password-reset and verification links include `?tenant=<slug>` so the
+  browser can complete the flow without a custom header. The token row itself
+  is tenant-bound; completing it under another tenant returns `400`.
+- Idempotency keys are scoped by method, path, tenant ID/slug, and caller
+  (user ID, or IP for public routes), so the same key/body/IP in two tenants
+  cannot replay one tenant's `201` into another.
+- `POST /auth/logout` revokes by possession of the opaque refresh token. A
+  tenant-B token sent without `X-Tenant-Slug` is still deleted; logout returns
+  `204` even when the token is already absent.
 - Tokens issued before multi-tenancy have no `tenant_id` claim and are rejected
   fail-closed. Rotate access tokens after upgrading (users must log in again);
   refresh/reset/verification rows default to tenant 1.
 - The session validator compares the JWT `tenant_id` with the stored user tenant
-  and rejects suspended tenants within the 5-second session-cache TTL.
+  and rejects suspended tenants within the 5-second session-cache TTL. A token
+  minted while a tenant was active can therefore remain valid for that short
+  window; unknown/suspended request tenants are rejected by middleware first.
+- `tenant.EffectiveID(ctx)` falls back to tenant 1 only for jobs, internal
+  callers, and tests without request context. HTTP writes must resolve a
+  tenant through middleware (production enforces the header).
 - **Remaining:** row-level security and per-tenant limits/quotas.
 
 ## Quick Start
@@ -255,13 +278,18 @@ populated tables. Never edit a shipped migration after deployment.
 
 ## API Endpoints
 
-Public and authenticated API requests may send `X-Tenant-Slug`; omitting it
-uses the configured default tenant. Login, registration, refresh, password
-reset, and email verification all resolve the tenant from this header (or the
-default), so clients of a non-default tenant must send it consistently.
-Authenticated requests must not send a tenant that differs from the JWT
-`tenant_id` claim. Google OAuth uses the tenant bound to its `state` instead of
-the header on the callback.
+In production (`TENANT_REQUIRE_HEADER=true`) every API request must select a
+tenant explicitly with `X-Tenant-Slug`, except the documented browser-auth
+paths that use `?tenant=` or the OAuth callback's signed `state`. Local/test
+compatibility can omit both to use `TENANT_DEFAULT_SLUG`. Login,
+registration, refresh, password reset, and email verification all resolve the
+tenant from this header (or the default), so clients of a non-default tenant
+must send it consistently. Authenticated requests must not send a tenant that
+differs from the JWT `tenant_id` claim. Browser OAuth start and emailed
+reset/verification links may instead carry a validated `?tenant=<slug>`;
+`X-Tenant-Slug` takes precedence, and the OAuth callback uses the tenant bound
+to its signed `state` (not the header). Reset/verification links include
+`?tenant=<slug>` automatically.
 
 ### Auth (public)
 | Method | Path | Description |
@@ -272,11 +300,11 @@ the header on the callback.
 | POST | `/api/v1/auth/logout` | Revoke one refresh token |
 | POST | `/api/v1/auth/logout-all` | Revoke every refresh token for the current user |
 | POST | `/api/v1/auth/forgot-password` | Request password reset email |
-| POST | `/api/v1/auth/reset-password` | Reset password with token |
-| POST | `/api/v1/auth/verify-email` | Verify email with token |
+| POST | `/api/v1/auth/reset-password` | Reset password with token (`?tenant=` link fallback) |
+| POST | `/api/v1/auth/verify-email` | Verify email with token (`?tenant=` link fallback) |
 | POST | `/api/v1/auth/resend-verification` | Resend verification email |
-| GET | `/api/v1/auth/google` | Google OAuth redirect |
-| GET | `/api/v1/auth/google/callback` | Google OAuth callback |
+| GET | `/api/v1/auth/google` | Google OAuth redirect (`?tenant=` browser fallback) |
+| GET | `/api/v1/auth/google/callback` | Google OAuth callback (tenant from signed state) |
 
 ### Users (protected — JWT required)
 | Method | Path | Description |
@@ -306,15 +334,15 @@ returns `404`, including for admins. Blobs are stored under
 ### Admin (protected — admin role required)
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/v1/admin/stats` | System statistics |
-| GET | `/api/v1/admin/users` | List all users (including deleted) |
-| PUT | `/api/v1/admin/users/:id/role` | Update user role |
-| POST | `/api/v1/admin/users/:id/ban` | Ban user (soft delete) |
-| POST | `/api/v1/admin/users/:id/unban` | Unban user (restore) |
-| GET | `/api/v1/admin/files` | List all files (including soft-deleted) |
-| GET | `/api/v1/admin/files/:id/download` | Download any active file |
-| DELETE | `/api/v1/admin/files/:id` | Soft-delete any file (takedown) |
-| POST | `/api/v1/admin/files/:id/restore` | Restore any soft-deleted file |
+| GET | `/api/v1/admin/stats` | Statistics for the caller's tenant |
+| GET | `/api/v1/admin/users` | List users in the caller's tenant (including deleted) |
+| PUT | `/api/v1/admin/users/:id/role` | Update a user role in the caller's tenant |
+| POST | `/api/v1/admin/users/:id/ban` | Ban a user in the caller's tenant (soft delete) |
+| POST | `/api/v1/admin/users/:id/unban` | Unban a user in the caller's tenant (restore) |
+| GET | `/api/v1/admin/files` | List files in the caller's tenant (including soft-deleted) |
+| GET | `/api/v1/admin/files/:id/download` | Download any active file in the caller's tenant |
+| DELETE | `/api/v1/admin/files/:id` | Soft-delete any file in the caller's tenant (takedown) |
+| POST | `/api/v1/admin/files/:id/restore` | Restore any soft-deleted file in the caller's tenant |
 
 ### Infrastructure
 | Method | Path | Description |
@@ -344,9 +372,9 @@ characters; only `[A-Za-z0-9._:-]`). When present:
   compare-and-delete.
 - non-2xx responses are not cached, and cache failures fail open (the request
   runs normally)
-- keys are scoped by method, path, and caller (user ID, or IP for the public
-  registration route), so the same key on another endpoint or user does not
-  collide
+- keys are scoped by method, path, tenant ID/slug, and caller (user ID, or IP
+  for the public registration route), so the same key on another endpoint,
+  user, or tenant does not collide or replay a cross-tenant `201`
 
 Browser clients must be allowed to send `Idempotency-Key`. The default
 `CORS_ALLOW_HEADERS` includes it, and the default `CORS_EXPOSE_HEADERS` exposes
@@ -530,8 +558,8 @@ Key settings:
 - `APP_BODY_LIMIT` — must be greater than `STORAGE_MAX_FILE_SIZE` (multipart overhead)
 - `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
-- `TENANT_DEFAULT_SLUG` — tenant for requests without `X-Tenant-Slug` (default `default`)
-- `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`)
+- `TENANT_DEFAULT_SLUG` — tenant for header-less requests in compatibility mode (default `default`)
+- `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`; **must be `true` in production**, recommended in staging)
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
@@ -587,8 +615,11 @@ no legacy handler/service/DTO/repository packages remain.
 - Access tokens carry `token_version`; password changes/resets, bans,
   unbans, and role changes invalidate them immediately.
 - Access tokens also carry `tenant_id`. A request whose explicit
-  `X-Tenant-Slug` resolves to a different tenant is rejected with 403; a token
-  without a tenant claim, or one for a suspended tenant, is rejected with 401.
+  `X-Tenant-Slug` resolves to a different tenant is rejected with `403`; a token
+  without a tenant claim (or with a zero/negative claim) is rejected with
+  `401`. A request for an unknown or suspended tenant is rejected by tenant
+  resolution with `404` before authentication; a session snapshot that still
+  says suspended is rejected with `401` until the 5-second cache TTL expires.
 - Access tokens are validated against the current user record through a
   generation-keyed session cache. Use Redis in production so invalidation is
   shared across replicas.
@@ -600,8 +631,13 @@ no legacy handler/service/DTO/repository packages remain.
   tenant-scoped, and another tenant's id returns 404.
 - Banned emails cannot be reused through registration or Google login;
   self-deleted accounts can still be re-registered.
-- `POST /auth/logout` revokes one refresh token; use `/auth/logout-all` to bump
-  the token version and invalidate access tokens immediately.
+- `POST /auth/logout` revokes one refresh token by possession, even if the
+  caller omits `X-Tenant-Slug`; use `/auth/logout-all` to bump the token version
+  and invalidate access tokens immediately.
+- Idempotency keys include the tenant ID and slug in their cache scope, so the
+  same client key/body from one IP cannot replay across tenants. Existing
+  cached replays expire naturally after their 24-hour TTL.
 - Production startup rejects the sample JWT secret/default admin password,
   console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics
-  auth, `DB_SSLMODE=disable`, and a body limit smaller than the upload size.
+  auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit
+  smaller than the upload size.

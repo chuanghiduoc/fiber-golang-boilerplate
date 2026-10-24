@@ -114,8 +114,12 @@ func (s *refreshTokenService) Consume(ctx context.Context, token string) (userID
 	return rt.UserID, rt.TenantID, rt.TokenVersion, nil
 }
 
+// Revoke deletes by token possession, deliberately without a tenant
+// predicate. Logout must work even when the client omits X-Tenant-Slug (the
+// browser cannot reliably carry a header on every navigation); possessing the
+// opaque token is sufficient to revoke it and cannot be used for any read.
 func (s *refreshTokenService) Revoke(ctx context.Context, token string) error {
-	return s.repo.Delete(ctx, hashToken(token)) // Delete by hash
+	return s.repo.DeleteByTokenPossession(ctx, hashToken(token))
 }
 
 func (s *refreshTokenService) RevokeAllByUserID(ctx context.Context, userID int64) error {

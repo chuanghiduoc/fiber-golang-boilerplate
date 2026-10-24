@@ -22,14 +22,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get a paginated list of all files",
+                "description": "Get a paginated list of files in the caller's tenant",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "List all files (admin)",
+                "summary": "List tenant files (admin)",
                 "parameters": [
                     {
                         "type": "integer",
@@ -89,11 +89,11 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Soft-delete a file by ID regardless of owner",
+                "description": "Soft-delete a file in the caller's tenant by ID regardless of owner",
                 "tags": [
                     "Admin"
                 ],
-                "summary": "Soft-delete any file (admin)",
+                "summary": "Soft-delete a tenant file (admin)",
                 "parameters": [
                     {
                         "type": "integer",
@@ -141,14 +141,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Download an active file by ID",
+                "description": "Download an active file in the caller's tenant by ID",
                 "produces": [
                     "application/octet-stream"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "Download any file (admin)",
+                "summary": "Download a tenant file (admin)",
                 "parameters": [
                     {
                         "type": "integer",
@@ -196,14 +196,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Restore any file by ID",
+                "description": "Restore any soft-deleted file in the caller's tenant by ID",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "Restore a soft-deleted file (admin)",
+                "summary": "Restore a tenant file (admin)",
                 "parameters": [
                     {
                         "type": "integer",
@@ -260,14 +260,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get system-wide statistics (admin only)",
+                "description": "Get statistics for the caller's tenant only (admin only)",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "Get system statistics",
+                "summary": "Get tenant statistics",
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -297,14 +297,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get a paginated list of all users including soft-deleted",
+                "description": "Get a paginated list of users in the caller's tenant, including soft-deleted",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "List all users (admin)",
+                "summary": "List tenant users (admin)",
                 "parameters": [
                     {
                         "type": "integer",
@@ -615,11 +615,19 @@ const docTemplate = `{
         },
         "/auth/google": {
             "get": {
-                "description": "Redirects the user to Google's OAuth consent screen",
+                "description": "Redirects to Google's OAuth consent screen. Browser navigation may select the tenant with the validated tenant query parameter; the tenant is bound into the signed state.",
                 "tags": [
                     "Auth"
                 ],
                 "summary": "Redirect to Google OAuth",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug for browser navigation (X-Tenant-Slug takes precedence)",
+                        "name": "tenant",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "302": {
                         "description": "Found"
@@ -647,7 +655,7 @@ const docTemplate = `{
         },
         "/auth/google/callback": {
             "get": {
-                "description": "Handles the callback from Google OAuth, creates/finds user and redirects with tokens",
+                "description": "Handles the callback from Google OAuth, creates/finds the user in the tenant bound to the signed state, and redirects with tokens. X-Tenant-Slug is ignored; unknown or suspended state tenants are rejected.",
                 "tags": [
                     "Auth"
                 ],
@@ -657,6 +665,13 @@ const docTemplate = `{
                         "type": "string",
                         "description": "Authorization code",
                         "name": "code",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "OAuth state containing the tenant bound at start",
+                        "name": "state",
                         "in": "query",
                         "required": true
                     }
@@ -752,7 +767,7 @@ const docTemplate = `{
         },
         "/auth/logout": {
             "post": {
-                "description": "Revoke a refresh token",
+                "description": "Revoke one refresh token by possession. The tenant header is not required because possession of the opaque token authorizes revocation.",
                 "consumes": [
                     "application/json"
                 ],
@@ -997,7 +1012,7 @@ const docTemplate = `{
         },
         "/auth/reset-password": {
             "post": {
-                "description": "Reset password using a token",
+                "description": "Reset password using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1009,6 +1024,12 @@ const docTemplate = `{
                 ],
                 "summary": "Reset password",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug from the emailed reset link (X-Tenant-Slug takes precedence)",
+                        "name": "tenant",
+                        "in": "query"
+                    },
                     {
                         "description": "Reset password request",
                         "name": "request",
@@ -1052,7 +1073,7 @@ const docTemplate = `{
         },
         "/auth/verify-email": {
             "post": {
-                "description": "Verify email using a token",
+                "description": "Verify email using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1064,6 +1085,12 @@ const docTemplate = `{
                 ],
                 "summary": "Verify email address",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug from the emailed verification link (X-Tenant-Slug takes precedence)",
+                        "name": "tenant",
+                        "in": "query"
+                    },
                     {
                         "description": "Verify email request",
                         "name": "request",

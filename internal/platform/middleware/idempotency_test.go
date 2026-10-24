@@ -323,7 +323,7 @@ func TestIdempotency_SlowHandlerSingleExecution(t *testing.T) {
 		key         = "slow-key"
 		concurrency = 5
 	)
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/slow", "0.0.0.0", key))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/slow", 0, "", "0.0.0.0", key))
 
 	var calls atomic.Int32
 	started := make(chan struct{})
@@ -508,7 +508,7 @@ func TestIdempotency_ConcurrentClaimConflict(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
 
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", "0.0.0.0", "busy-key"))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "busy-key"))
 	if _, err := mem.Increment(context.Background(), lockKey, 30*time.Second); err != nil {
 		t.Fatalf("prime lock: %v", err)
 	}
@@ -688,6 +688,73 @@ func TestIdempotency_ScopesByUserPathAndMethod(t *testing.T) {
 	}
 }
 
+func TestIdempotency_ScopesByTenant(t *testing.T) {
+	mem := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = mem.Close() })
+
+	var calls atomic.Int32
+	tenantLocals := func(c fiber.Ctx) error {
+		// Simulate the global tenant middleware: the same caller IP and
+		// Idempotency-Key must not collide across tenants.
+		switch c.Get("X-Test-Tenant") {
+		case "acme":
+			fiber.Locals[int64](c, "tenant_id", int64(2))
+			fiber.Locals[string](c, "tenant_slug", "acme")
+		default:
+			fiber.Locals[int64](c, "tenant_id", int64(1))
+			fiber.Locals[string](c, "tenant_slug", "default")
+		}
+		return c.Next()
+	}
+	app := newTestApp()
+	app.Post("/register", tenantLocals, Idempotency(mem), func(c fiber.Ctx) error {
+		n := calls.Add(1)
+		return c.Status(fiber.StatusCreated).SendString("call-" + strconv.Itoa(int(n)))
+	})
+
+	do := func(tenant string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "/register", strings.NewReader(`{"email":"shared@example.com"}`))
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		req.Header.Set("Idempotency-Key", "shared-key")
+		req.Header.Set("Content-Type", fiber.MIMEApplicationJSON)
+		req.Header.Set("X-Test-Tenant", tenant)
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("app.Test: %v", err)
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		_ = resp.Body.Close()
+		return resp, string(data)
+	}
+
+	first, firstBody := do("default")
+	if first.StatusCode != fiber.StatusCreated || firstBody != "call-1" {
+		t.Fatalf("default tenant = %d %q, want 201 call-1", first.StatusCode, firstBody)
+	}
+	second, secondBody := do("acme")
+	if second.StatusCode != fiber.StatusCreated || secondBody != "call-2" {
+		t.Fatalf("acme tenant = %d %q, want 201 call-2", second.StatusCode, secondBody)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls = %d, want 2 (tenants must not share a replay)", got)
+	}
+
+	// A replay inside the same tenant still returns the original response.
+	replay, replayBody := do("acme")
+	if replay.StatusCode != fiber.StatusCreated || replayBody != "call-2" {
+		t.Fatalf("same-tenant replay = %d %q, want 201 call-2", replay.StatusCode, replayBody)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls after replay = %d, want 2", got)
+	}
+}
+
 func TestIdempotency_CacheFailureFailsOpen(t *testing.T) {
 	var calls atomic.Int32
 	app := newTestApp()
@@ -759,8 +826,8 @@ func TestIdempotency_KeysDoNotContainBodyOrPassword(t *testing.T) {
 				t.Errorf("cache key %q contains request data %q", key, secret)
 			}
 		}
-		if !strings.HasPrefix(key, "idempotency:POST:/test:0.0.0.0:") {
-			t.Errorf("cache key %q is not scoped by method, path, and identity", key)
+		if !strings.HasPrefix(key, "idempotency:POST:/test:tenant=0::0.0.0.0:") {
+			t.Errorf("cache key %q is not scoped by method, path, tenant, and identity", key)
 		}
 	}
 }

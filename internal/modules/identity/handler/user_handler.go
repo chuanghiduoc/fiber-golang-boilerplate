@@ -219,9 +219,10 @@ func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, user
 	if err := h.emailVerifSvc.Invalidate(ctx, user.ID); err != nil {
 		return
 	}
+	tenantSlug := tenant.SlugFromContext(ctx)
 	async.Go(func() {
-		ctx := tenant.WithID(context.Background(), user.TenantID)
-		_ = h.emailVerifSvc.SendVerification(ctx, user.ID, user.Email)
+		sendCtx := tenant.WithIdentity(context.Background(), user.TenantID, tenantSlug)
+		_ = h.emailVerifSvc.SendVerification(sendCtx, user.ID, user.Email)
 	})
 }
 

@@ -35,24 +35,33 @@ Request flow:
 client
   -> app global middleware (CORS, security, request ID, metrics, logger,
      recovery, audit, timeout, idempotency where wired)
-  -> /api/v1 tenant middleware (X-Tenant-Slug or default tenant)
+  -> /api/v1 tenant middleware (X-Tenant-Slug, browser auth query, or default)
   -> module route (JWT -> rate limit -> authz -> idempotency)
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
 
 `tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
-validates `[a-z0-9-]{1,63}`, resolves the slug (header or
-`TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber locals.
-`JWTAuth` treats the JWT `tenant_id` claim as authoritative and rejects an
-explicit header that resolves to a different tenant with 403. Infrastructure
-probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution so
-they never depend on the `tenants` table.
+validates `[a-z0-9-]{1,63}`, resolves the slug (header; validated `?tenant=`
+fallback on `/auth/google`, `/auth/reset-password`, and `/auth/verify-email`;
+otherwise `TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber
+locals and the request context. The Google OAuth callback is exempt so
+`TENANT_REQUIRE_HEADER=true` cannot reject it before the handler validates the
+signed `state`; the handler installs the state tenant itself. `JWTAuth` treats
+the JWT `tenant_id` claim as authoritative, rejects a non-positive claim, and
+rejects an explicit header that resolves to a different tenant with 403. It
+clears `tenant_slug` when a claim overrides a header-less default resolution
+rather than leaving a misleading slug. Infrastructure probes (`/healthz`,
+`/readyz`, `/metrics`) stay outside tenant resolution so they never depend on
+the `tenants` table.
 
 ## Multi-tenant model
 
 - One user belongs to exactly one tenant. `tenants.id` 1 with slug `default`
   is seeded by the baseline and preserves backward compatibility for header-less
-  requests and rows written before multi-tenancy.
+  local/test requests and rows written before multi-tenancy. Production sets
+  `TENANT_REQUIRE_HEADER=true`, so every HTTP write selects a tenant explicitly.
+  Startup checks tenant existence regardless of status; a suspended default
+  tenant starts normally and its requests return 404.
 - `tenant_id` is present on `users`, `files`, and all identity/platform token,
   job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
@@ -60,21 +69,30 @@ they never depend on the `tenants` table.
 - Identity and files are tenant-isolated: every user/admin/stat and
   refresh/reset/verification query filters `tenant_id`; every file metadata
   read/write, list, admin list/stats, download, delete, and restore filters the
-  request tenant. Repositories derive it from `tenant.EffectiveID(ctx)`; services
-  verify returned tenant/owner. Cross-tenant ids or tokens behave as not found.
+  request tenant. Repositories derive it from `tenant.EffectiveID(ctx)` (the
+  tenant-1 fallback is only for jobs/internal callers/tests without a request
+  tenant); services verify returned tenant/owner. Cross-tenant ids or tokens
+  behave as not found.
   Public login/register/forgot/reset/resend/verify/refresh use the request
-  tenant; non-default tenants must send `X-Tenant-Slug` consistently.
+  tenant; non-default tenants must send `X-Tenant-Slug` consistently on API
+  calls. Reset/verification links include `?tenant=<slug>`, and browser-facing
+  auth paths accept that validated fallback; header values take precedence.
 - Durable jobs and audit events propagate the resolved tenant: enqueue writes
   `jobs.tenant_id` from the context, the worker restores it with
   `tenant.WithID` before calling a handler, and the audit middleware records
   the request tenant. Job retention and job metrics stay global.
 - Google OAuth binds the tenant into `state` and the state cookie. The callback
   resolves that state tenant (and rejects suspended/unknown tenants) instead of
-  trusting `X-Tenant-Slug`.
-- JWTs without a `tenant_id` claim are rejected fail-closed. The session
-  validator compares the claim with the stored user tenant and tenant status,
-  so a suspended tenant cannot keep using an issued token beyond the 5-second
-  session-cache TTL.
+  trusting `X-Tenant-Slug`; tenant middleware exempts the callback path so
+  require-header mode does not 404 it first.
+- JWTs without a `tenant_id` claim, or with a non-positive claim, are rejected
+  fail-closed. The session validator compares the claim with the stored user
+  tenant and tenant status, so a suspended tenant cannot keep using an issued
+  token beyond the 5-second session-cache TTL.
+- Idempotency cache keys include the tenant ID/slug as well as method, path,
+  and caller, so a replayed `201` cannot cross tenants. Logout revokes refresh
+  tokens by possession rather than request tenant, so a valid token is deleted
+  even when the header is omitted.
 - New blobs use `<tenantID>/<userID>/<uuid>.<ext>`; existing rows keep their
   old `<userID>/<uuid>` path. RLS and per-tenant limits remain future work.
 

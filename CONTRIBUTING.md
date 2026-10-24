@@ -104,14 +104,19 @@ When releasing, move `[Unreleased]` entries under a version header:
 - Every tenant-owned table carries
   `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`, and its indexes
   lead with `tenant_id`. The `default` tenant (id 1) preserves compatibility for
-  requests without `X-Tenant-Slug`; emails and Google IDs are unique per tenant.
+  header-less local/test requests; production requires `X-Tenant-Slug`
+  (`TENANT_REQUIRE_HEADER=true`), and emails/Google IDs are unique per tenant.
 - The `users` last-admin trigger is per tenant. Application checks must use the
   same tenant scope as the trigger.
 - Identity and files are tenant-scoped: their queries filter `tenant_id`,
-  repositories derive it from `tenant.EffectiveID(ctx)`, public auth flows
-  resolve the tenant, and Google state carries it. Uploads use
-  `<tenantID>/<userID>/<uuid>.<ext>`. RLS and per-tenant limits remain future
-  work, so do not describe the whole application as fully isolated.
+  repositories derive it from `tenant.EffectiveID(ctx)` (tenant-1 fallback is
+  for jobs/internal/tests only, never a substitute for HTTP tenant resolution),
+  public auth flows resolve the tenant, and Google state carries it. Reset and
+  verification links carry `?tenant=<slug>`; browser-facing auth paths accept
+  that validated query fallback. Uploads use `<tenantID>/<userID>/<uuid>.<ext>`.
+  Idempotency keys include the tenant; logout revokes refresh tokens by
+  possession. RLS and per-tenant limits remain future work, so do not describe
+  the whole application as fully isolated.
 
 ### Upgrading an existing database
 

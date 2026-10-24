@@ -95,6 +95,12 @@ func TestGenerateWithVersion_LegacyOmitsTenant(t *testing.T) {
 	}
 }
 
+func TestGenerateWithVersionAndTenant_RejectsNegativeTenant(t *testing.T) {
+	if _, err := GenerateWithVersionAndTenant(42, -1, "user@test.com", "user", 0, testSecret, 1); err == nil {
+		t.Fatal("negative tenant ID must be rejected")
+	}
+}
+
 func TestParse_WrongSecret(t *testing.T) {
 	tok, _ := Generate(1, "a@b.com", "user", testSecret, 1)
 	_, err := Parse(tok, "wrong-secret")

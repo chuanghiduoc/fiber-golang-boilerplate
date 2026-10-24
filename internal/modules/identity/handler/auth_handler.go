@@ -45,6 +45,15 @@ func decodeOAuthState(state string) (nonce string, tenantID int64, ok bool) {
 	return state[:sep], id, true
 }
 
+// GoogleOAuthProvider is the subset of oauth.GoogleOAuth the auth handler
+// needs. It is an interface so HTTP/integration tests can exercise the whole
+// start/callback flow without calling Google.
+type GoogleOAuthProvider interface {
+	AuthURL(state string) string
+	Exchange(ctx context.Context, code string) (*oauth.GoogleUserInfo, error)
+	BuildCallbackURL(accessToken, refreshToken string) string
+}
+
 type AuthHandler struct {
 	userSvc                  service.UserService
 	refreshSvc               service.RefreshTokenService
@@ -53,10 +62,11 @@ type AuthHandler struct {
 	jwtSecret                string
 	jwtExpireHour            int
 	requireEmailVerification bool
-	googleOAuth              *oauth.GoogleOAuth
+	googleOAuth              GoogleOAuthProvider
 	// tenants is optional for source compatibility with handler tests and
 	// minimal deployments. Production wiring supplies it so the Google
-	// callback can prove the tenant carried through OAuth state is active.
+	// redirect/callback can resolve and validate the tenant carried through
+	// the OAuth state.
 	tenants repository.TenantRepository
 }
 
@@ -68,7 +78,7 @@ func NewAuthHandler(
 	jwtSecret string,
 	jwtExpireHour int,
 	requireEmailVerification bool,
-	googleOAuth *oauth.GoogleOAuth,
+	googleOAuth GoogleOAuthProvider,
 	tenants ...repository.TenantRepository,
 ) *AuthHandler {
 	var tenantRepo repository.TenantRepository
@@ -123,8 +133,9 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		if user.TenantID != 0 {
 			tenantID = user.TenantID
 		}
+		tenantSlug := tenant.SlugFromContext(c.Context())
 		async.Go(func() {
-			ctx := tenant.WithID(context.Background(), tenantID)
+			ctx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
 			_ = h.emailVerifSvc.SendVerification(ctx, user.ID, user.Email)
 		})
 	}
@@ -258,7 +269,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 
 // Logout godoc
 // @Summary Logout
-// @Description Revoke a refresh token
+// @Description Revoke one refresh token by possession. The tenant header is not required because possession of the opaque token authorizes revocation.
 // @Tags Auth
 // @Accept json
 // @Produce json
@@ -322,10 +333,11 @@ func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 
 // ResetPassword godoc
 // @Summary Reset password
-// @Description Reset password using a token
+// @Description Reset password using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.
 // @Tags Auth
 // @Accept json
 // @Produce json
+// @Param tenant query string false "Tenant slug from the emailed reset link (X-Tenant-Slug takes precedence)"
 // @Param request body dto.ResetPasswordRequest true "Reset password request"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} apperror.ProblemDetails
@@ -347,10 +359,11 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 
 // VerifyEmail godoc
 // @Summary Verify email address
-// @Description Verify email using a token
+// @Description Verify email using a token. The tenant query parameter is the browser-link fallback for tenants that cannot send X-Tenant-Slug.
 // @Tags Auth
 // @Accept json
 // @Produce json
+// @Param tenant query string false "Tenant slug from the emailed verification link (X-Tenant-Slug takes precedence)"
 // @Param request body dto.VerifyEmailRequest true "Verify email request"
 // @Success 200 {object} map[string]string
 // @Failure 400 {object} apperror.ProblemDetails
@@ -397,8 +410,9 @@ func (h *AuthHandler) ResendVerification(c fiber.Ctx) error {
 
 // GoogleRedirect godoc
 // @Summary Redirect to Google OAuth
-// @Description Redirects the user to Google's OAuth consent screen
+// @Description Redirects to Google's OAuth consent screen. Browser navigation may select the tenant with the validated tenant query parameter; the tenant is bound into the signed state.
 // @Tags Auth
+// @Param tenant query string false "Tenant slug for browser navigation (X-Tenant-Slug takes precedence)"
 // @Success 302
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 429 {object} apperror.ProblemDetails
@@ -413,10 +427,43 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	if _, err := rand.Read(b); err != nil {
 		return apperror.NewInternal("failed to generate state")
 	}
-	tenantID := tenant.EffectiveID(c.Context())
+
+	// X-Tenant-Slug is normally resolved by the global tenant middleware. When
+	// the handler is mounted without it (tests/minimal deployments), a
+	// validated `tenant` query parameter lets browser navigation start a
+	// non-default flow. Header/resolved context always wins; an explicit
+	// conflicting header therefore cannot be overridden by the query.
+	tenantID := tenant.ID(c)
+	tenantSlug := tenant.Slug(c)
+	if tenantID == 0 {
+		slug := strings.TrimSpace(c.Query(tenant.QueryParam))
+		if slug != "" {
+			if !tenant.IsValidSlug(slug) {
+				return apperror.NewNotFound("tenant not found")
+			}
+			if h.tenants == nil {
+				return apperror.NewInternal("oauth tenant validation is not configured")
+			}
+			found, err := h.tenants.ResolveBySlug(c.Context(), slug)
+			if err != nil {
+				if errors.Is(err, apperror.ErrNotFound) {
+					return apperror.NewNotFound("tenant not found")
+				}
+				return apperror.NewInternal("failed to resolve tenant")
+			}
+			tenantID, tenantSlug = found.ID, found.Slug
+		} else {
+			tenantID = tenant.EffectiveID(c.Context())
+			tenantSlug = tenant.SlugFromContext(c.Context())
+		}
+	}
 	if tenantID <= 0 {
 		return apperror.NewInternal("tenant context is required")
 	}
+	fiber.Locals[int64](c, "tenant_id", tenantID)
+	fiber.Locals[string](c, "tenant_slug", tenantSlug)
+	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
+
 	state := encodeOAuthState(hex.EncodeToString(b), tenantID)
 
 	c.Cookie(&fiber.Cookie{
@@ -434,9 +481,10 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 
 // GoogleCallback godoc
 // @Summary Google OAuth callback
-// @Description Handles the callback from Google OAuth, creates/finds user and redirects with tokens
+// @Description Handles the callback from Google OAuth, creates/finds the user in the tenant bound to the signed state, and redirects with tokens. X-Tenant-Slug is ignored; unknown or suspended state tenants are rejected.
 // @Tags Auth
 // @Param code query string true "Authorization code"
+// @Param state query string true "OAuth state containing the tenant bound at start"
 // @Success 302
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
@@ -464,12 +512,15 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return apperror.NewInternal("oauth tenant validation is not configured")
 	}
 	// GetByID only returns active tenants, so a tenant suspended during the
-	// consent round-trip cannot complete the login.
-	if _, err := h.tenants.GetByID(c.Context(), tenantID); err != nil {
+	// consent round-trip cannot complete the login. Ignore X-Tenant-Slug here:
+	// the signed state is the only trusted source for this browser redirect.
+	stateTenant, err := h.tenants.GetByID(c.Context(), tenantID)
+	if err != nil {
 		return apperror.NewBadRequest("invalid oauth state")
 	}
-	fiber.Locals[int64](c, "tenant_id", tenantID)
-	c.SetContext(tenant.WithID(c.Context(), tenantID))
+	fiber.Locals[int64](c, "tenant_id", stateTenant.ID)
+	fiber.Locals[string](c, "tenant_slug", stateTenant.Slug)
+	c.SetContext(tenant.WithIdentity(c.Context(), stateTenant.ID, stateTenant.Slug))
 	ctx := c.Context()
 
 	// Clear state cookie

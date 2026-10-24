@@ -62,6 +62,31 @@ func doRequest(t *testing.T, app *fiber.App, header string) (resp *http.Response
 	return resp, decoded
 }
 
+func TestWithID_ZeroFallsBackAndNegativePropagates(t *testing.T) {
+	ctx := WithID(context.Background(), 0)
+	if got := EffectiveID(ctx); got != DefaultID {
+		t.Errorf("EffectiveID(WithID(0)) = %d, want %d", got, DefaultID)
+	}
+
+	// A negative ID is visible to validation boundaries; it must not be
+	// silently rewritten to the compatibility tenant.
+	ctx = WithID(context.Background(), -1)
+	if got := IDFromContext(ctx); got != -1 {
+		t.Errorf("IDFromContext(WithID(-1)) = %d, want -1", got)
+	}
+	if got := EffectiveID(ctx); got != -1 {
+		t.Errorf("EffectiveID(WithID(-1)) = %d, want -1", got)
+	}
+
+	ctx = WithIdentity(context.Background(), 2, "acme")
+	if got := EffectiveID(ctx); got != 2 {
+		t.Errorf("EffectiveID(WithIdentity) = %d, want 2", got)
+	}
+	if got := SlugFromContext(ctx); got != "acme" {
+		t.Errorf("SlugFromContext = %q, want acme", got)
+	}
+}
+
 func TestMiddleware_DefaultTenant(t *testing.T) {
 	r := fakeResolver{tenants: map[string]Tenant{
 		"default": {ID: 1, Slug: "default", Name: "Default"},
@@ -170,4 +195,128 @@ func TestMiddleware_ResolverFailureIsInternalError(t *testing.T) {
 	if body["detail"] != "failed to resolve tenant" {
 		t.Fatalf("detail = %v, want failed to resolve tenant", body["detail"])
 	}
+}
+
+func newPathTestApp(r Resolver, defaultSlug, path string) *fiber.App {
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Use(Middleware(r, defaultSlug))
+	app.Get(path, func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"id": ID(c), "slug": Slug(c)})
+	})
+	return app
+}
+
+func doPathRequest(t *testing.T, app *fiber.App, path, header string) (resp *http.Response, result map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, path, http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if header != "" {
+		req.Header.Set(Header, header)
+	}
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode body %q: %v", body, err)
+	}
+	return resp, decoded
+}
+
+var tenantQueryTestResolver = fakeResolver{tenants: map[string]Tenant{
+	"default": {ID: 1, Slug: "default", Name: "Default"},
+	"acme":    {ID: 2, Slug: "acme", Name: "Acme"},
+}}
+
+func TestMiddleware_TenantQueryFallbackForBrowserAuth(t *testing.T) {
+	for _, path := range []string{
+		"/api/v1/auth/google",
+		"/api/v1/auth/reset-password",
+		"/api/v1/auth/verify-email",
+	} {
+		t.Run(path, func(t *testing.T) {
+			app := newPathTestApp(tenantQueryTestResolver, "", path)
+			resp, body := doPathRequest(t, app, path+"?tenant=acme", "")
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			if body["id"] != float64(2) || body["slug"] != "acme" {
+				t.Fatalf("locals = %v, want tenant 2/acme", body)
+			}
+		})
+	}
+}
+
+func TestMiddleware_HeaderPrecedesTenantQuery(t *testing.T) {
+	const path = "/api/v1/auth/reset-password"
+	app := newPathTestApp(tenantQueryTestResolver, "", path)
+
+	resp, body := doPathRequest(t, app, path+"?tenant=acme", "default")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if body["id"] != float64(1) || body["slug"] != "default" {
+		t.Fatalf("locals = %v, want header tenant 1/default", body)
+	}
+}
+
+func TestMiddleware_TenantQueryIgnoredOutsideBrowserAuth(t *testing.T) {
+	const path = "/api/v1/users/me"
+	app := newPathTestApp(tenantQueryTestResolver, "", path)
+
+	resp, body := doPathRequest(t, app, path+"?tenant=acme", "")
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	if body["detail"] != "tenant not found" {
+		t.Fatalf("detail = %v, want tenant not found", body["detail"])
+	}
+}
+
+type countingResolver struct {
+	calls int
+}
+
+func (c *countingResolver) Resolve(_ context.Context, slug string) (Tenant, error) {
+	c.calls++
+	if slug == "acme" {
+		return Tenant{ID: 2, Slug: "acme", Name: "Acme"}, nil
+	}
+	return Tenant{}, apperror.ErrNotFound
+}
+
+func TestMiddleware_OAuthCallbackSkipsResolution(t *testing.T) {
+	resolver := &countingResolver{}
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Use(Middleware(resolver, ""))
+	app.Get("/api/v1/auth/google/callback", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"id": ID(c), "slug": Slug(c)})
+	})
+
+	resp, err := app.Test(mustRequest(t, "/api/v1/auth/google/callback?state=x&code=y"))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (callback must bypass require-header)", resp.StatusCode)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0 for the OAuth callback", resolver.calls)
+	}
+}
+
+func mustRequest(t *testing.T, path string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, path, http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	return req
 }
