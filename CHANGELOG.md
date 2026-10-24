@@ -7,6 +7,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- Notification center: `internal/modules/notifications` owns a tenant/user-scoped in-app feed (`GET /notifications`, `GET /notifications/unread-count`, `GET /notifications/:id`, `POST /notifications/:id/read`, `POST /notifications/read-all`) and per-type `in_app`/`email` preferences (`GET`/`PUT /notification-preferences`). Missing preferences mean both channels are enabled; writes use `Idempotency-Key` and the generic audit middleware. The admin-only `POST /notifications/send` requires `notifications:send`; user routes use the new `notifications:read`/`notifications:write` permissions. Other modules create notifications through the stdlib-only `internal/contracts` `Notifier`, and identity supplies recipient email through `NotificationRecipientLookup`, so no module imports another module. The email channel enqueues the existing durable `email.send`/`email.send.encrypted` jobs with simple text/HTML; the in-app row and job commit atomically (an enqueue failure rolls the row back), inherit `jobs.tenant_id`, and are delivered at-least-once. Adds `notifications` and `notification_preferences` to the baseline schema with tenant-leading feed/unread indexes and a unique preference index; `cmd/migrate` verifies the new tables and index.
 - Multi-tenant foundation: `tenants` table (seeded `default` tenant id 1), `tenant_id` columns and tenant-leading indexes on users, files, refresh/reset/verification tokens, jobs, and audit events; per-tenant email/Google uniqueness and last-admin trigger. Requests resolve `X-Tenant-Slug` (empty -> `TENANT_DEFAULT_SLUG`, invalid/unknown -> 404) through `internal/platform/tenant`; JWTs carry `tenant_id`, authenticated requests use the claim, and a conflicting explicit header returns 403 `permission.denied`. Adds `TENANT_DEFAULT_SLUG`/`TENANT_REQUIRE_HEADER` config and the identity tenant repository/resolver.
 - Tenant-isolated identity: all identity SQL is scoped by `tenant_id`; registration/login/refresh/reset/verification/OAuth use the request tenant; per-tenant emails/Google IDs; tokens carry tenant; suspended/legacy tenantless tokens are rejected; admin user operations/stats/last-admin are tenant-scoped. Adds `tenantId` to `UserResponse`.
 - Files tenant isolation: every file metadata query and admin list/count/stats query filters `tenant_id`; cross-tenant file ids return 404; delete/restore never cross tenants; new blobs use `<tenantID>/<userID>/<uuid>.<ext>` (old keys remain readable); `FileResponse`/`contracts.File` carry `tenantId`.
@@ -67,8 +68,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
   existing database at the new `000001` or reset `schema_migrations`, and never
   edit a shipped migration after deployment. `cmd/migrate` now prints this
   guidance for legacy history and verifies required tables, columns, and unique
-  indexes after migrating. See
-  "Upgrading an existing database" in the README.
+  indexes after migrating. Add `notifications` and `notification_preferences`
+  (with their tenant-leading and unique indexes) to the same upgrade migration
+  for existing databases. See "Upgrading an existing database" in the README.
 
 ### Changed (API contract — breaking)
 - Errors now follow RFC 9457 Problem Details (`application/problem+json`): `type`, `title`, `status`, `code` (stable dotted domain code), `detail`, `instance`, `requestId`, `timestamp`, and a flat `errors[]` for validation. Configurable docs base via `ERROR_DOCS_BASE_URL`; typed codes use their catalog `DocPath` for `type`.

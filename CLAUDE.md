@@ -40,8 +40,8 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
-internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only)
+internal/contracts/         narrow cross-module admin/notification interfaces (stdlib only)
 internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
@@ -52,10 +52,11 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
 status), `docs/api-design.md` (API conventions, errors, pagination,
-idempotency, compatibility), `docs/module-template.md` (canonical module
-layout, scaffold, routes/permissions/tables/contracts), and
-`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
-Kubernetes, incidents). Keep them current when routes/contracts change.
+idempotency, notifications, compatibility), `docs/module-template.md`
+(canonical module layout, scaffold, routes/permissions/tables/contracts), and
+`docs/operations.md` (health, metrics, logs, jobs, notification email,
+idempotency, migrations, Kubernetes, incidents). Keep them current when
+routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -74,9 +75,10 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   migration above the current version (a fully migrated old deployment is at 3,
   so `000004`+) with only the missing objects. Never point an old database at
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
-- Every tenant-owned table (`users`, `files`, `refresh_tokens`,
-  `password_reset_tokens`, `email_verification_tokens`, `jobs`,
-  `audit_events`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
+- Every tenant-owned table (`users`, `files`, `notifications`,
+  `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
+  `email_verification_tokens`, `jobs`, `audit_events`) has
+  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
   New tenant-owned tables must do the same and lead their query indexes with
   `tenant_id`.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
@@ -94,11 +96,13 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
 Row-level security, per-tenant limits/quotas, distributed tracing, and
 environment promotion/rollout automation remain future work.
-`identity`, `files`, and `admin` own all of
+`identity`, `files`, `notifications`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
-never imports those modules. Each module with SQL owns its `queries/` and
+never imports those modules. Notifications exposes `contracts.Notifier` and
+consumes `contracts.NotificationRecipientLookup`, implemented by identity, so
+it never reads the users table. Each module with SQL owns its `queries/` and
 generated `sqlc/` package (`admin` is contract-only); there is no shared
 generated package and no cross-module sqlc imports, and no legacy
 handler/service/DTO/repository packages remain.
@@ -184,6 +188,18 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
+- **Notifications:** `internal/modules/notifications` owns the in-app feed,
+  per-type `in_app`/`email` preferences, and the email channel. Read/list/
+  unread/read-all and preference queries filter both `tenant_id` and `user_id`;
+  cross-tenant or other-user ids return `404`. Missing preferences mean both
+  channels are enabled. `contracts.Notifier` is the cross-module create API;
+  `contracts.NotificationRecipientLookup` lets identity supply the email
+  address without a module import. When email is enabled, the in-app row and
+  `email.send` job commit in one transaction (a queue failure rolls the row
+  back); the job inherits `jobs.tenant_id`. A suppressed notification (both
+  channels disabled) is a successful no-op. Routes are under
+  `/notifications` and `/notification-preferences`; writes use
+  `Idempotency-Key`, and admin sends require `notifications:send`.
 - **Audit:** `platform/audit.Middleware` records successful mutating requests;
   use `audit.Recorder` for explicit domain events.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.

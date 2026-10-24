@@ -17,8 +17,10 @@ internal/modules
                (dto/repository/service/handler + adapter + queries + generated sqlc)
   files        upload, metadata, download, soft delete, restore
                (dto/repository/service/handler + adapter + queries + generated sqlc)
+  notifications in-app feed, channel preferences, durable email channel
+               (dto/repository/service/handler + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
-internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
+internal/contracts  narrow cross-module admin/notification interfaces (stdlib only)
 internal/platform
   authz        permission catalog + route middleware
   audit        audit recorder + mutating-request middleware
@@ -40,6 +42,12 @@ client
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
 
+Notification creation follows the same flow for HTTP reads and preferences.
+Other modules call `contracts.Notifier`, and the notifications service resolves
+the recipient's email through `contracts.NotificationRecipientLookup`
+(implemented by identity). The service never imports identity or reads the
+`users` table.
+
 `tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
 validates `[a-z0-9-]{1,63}`, resolves the slug (header or
 `TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber locals.
@@ -53,8 +61,9 @@ they never depend on the `tenants` table.
 - One user belongs to exactly one tenant. `tenants.id` 1 with slug `default`
   is seeded by the baseline and preserves backward compatibility for header-less
   requests and rows written before multi-tenancy.
-- `tenant_id` is present on `users`, `files`, and all identity/platform token,
-  job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
+- `tenant_id` is present on `users`, `files`, `notifications`,
+  `notification_preferences`, and all identity/platform token, job, and audit
+  tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
 - Identity and files are tenant-isolated: every user/admin/stat and
@@ -64,10 +73,17 @@ they never depend on the `tenants` table.
   verify returned tenant/owner. Cross-tenant ids or tokens behave as not found.
   Public login/register/forgot/reset/resend/verify/refresh use the request
   tenant; non-default tenants must send `X-Tenant-Slug` consistently.
+- Notifications are tenant- and user-scoped. Every repository query filters
+  `(tenant_id, user_id)`, so a notification id from another tenant or another
+  user in the same tenant behaves as not found. Preferences use the same scope
+  and a unique `(tenant_id, user_id, type, channel)` index; a missing row means
+  both channels are enabled.
 - Durable jobs and audit events propagate the resolved tenant: enqueue writes
   `jobs.tenant_id` from the context, the worker restores it with
   `tenant.WithID` before calling a handler, and the audit middleware records
-  the request tenant. Job retention and job metrics stay global.
+  the request tenant. Job retention and job metrics stay global. Notification
+  email jobs are enqueued inside the notification transaction, so they inherit
+  the notification tenant.
 - Google OAuth binds the tenant into `state` and the state cookie. The callback
   resolves that state tenant (and rejects suspended/unknown tenants) instead of
   trusting `X-Tenant-Slug`.
@@ -111,6 +127,12 @@ they never depend on the `tenants` table.
   ignores tenant boundaries.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
+- Notification creation is atomic when the email channel is enabled: the
+  in-app row and its email job commit or roll back together. A suppressed
+  notification (both channels disabled) writes nothing. If an email sender is
+  wired without transactional support, the service falls back to a
+  post-insert send; production wiring always uses the queued transactional
+  sender.
 
 ## Schema ownership
 
@@ -126,15 +148,22 @@ they never depend on the `tenants` table.
   are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
   authoritative key for downloads. Moving a blob without updating that column
   (or vice versa) breaks the file.
-- `cmd/migrate` verifies required tenant tables/columns/indexes and that the
-  default tenant exists with id 1.
+- `notifications` and `notification_preferences` belong to the notifications
+  module. The feed index leads with `(tenant_id, user_id, created_at DESC,
+  id DESC)` and has a partial unread variant; the unique preference index makes
+  the upsert idempotent.
+- `cmd/migrate` verifies required tenant tables/columns/indexes (including
+  notifications and the unique preference index) and that the default tenant
+  exists with id 1.
 
 ## Cross-cutting conventions
 
 - **Authorization:** permissions live in `internal/platform/authz`; every route
   uses `authz.Require`. Roles are an implementation detail of the permission
-  matrix. Current legacy exceptions (`files` routes, some identity handler
-  checks) are listed in the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
+  matrix. Notification routes use `notifications:read`/`notifications:write`;
+  sending to another user requires the admin-only `notifications:send`. Current
+  legacy exceptions (`files` routes, some identity handler checks) are listed in
+  the [Module Template](module-template.md#legacy-exceptions-do-not-copy).
 - **Audit:** successful mutating requests are recorded with actor, request ID,
   IP, route, and the resolved tenant (`audit_events.tenant_id`, default 1).
   Explicit domain events use `audit.Recorder`; a zero `Event.TenantID` is
@@ -148,10 +177,10 @@ they never depend on the `tenants` table.
 
 ## Strangler status
 
-The migration is complete. `identity`, `files`, and `admin` own their DTOs,
-repositories, services, and HTTP handlers under `internal/modules/<name>`;
-there are no shared legacy handler/service/DTO/repository packages or
-compatibility aliases.
+The migration is complete. `identity`, `files`, `notifications`, and `admin`
+own their DTOs, repositories, services, and HTTP handlers under
+`internal/modules/<name>`; there are no shared legacy
+handler/service/DTO/repository packages or compatibility aliases.
 
 The `admin` module depends on `internal/contracts.IdentityAdmin` and
 `internal/contracts.FilesAdmin`; identity and files implement those contracts
@@ -160,10 +189,13 @@ module, its repository, generated SQL, storage, database transactions, or
 session store. Identity and files each own their half of the dashboard stats
 (`AdminUserStats` / `AdminFileStats`), so no cross-module SQL remains.
 
-`identity` and `files` own module-scoped `queries/` and generated `sqlc/`
-packages; `sqlc.yaml` has one block per module. There is no shared generated
-package, and no module imports another module's sqlc types. New code should
-start in `internal/modules/<name>/` and use contracts for cross-module reads.
+`identity`, `files`, and `notifications` own module-scoped `queries/` and
+generated `sqlc/` packages; `sqlc.yaml` has one block per module. There is no
+shared generated package, and no module imports another module's sqlc types.
+Notifications exposes `contracts.Notifier` to other modules and consumes
+`contracts.NotificationRecipientLookup`, implemented by the identity adapter;
+neither direction imports module internals. New code should start in
+`internal/modules/<name>/` and use contracts for cross-module reads.
 
 ## Extension checklist
 

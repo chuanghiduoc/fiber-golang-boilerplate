@@ -28,6 +28,8 @@ var requiredTables = []string{
 	"password_reset_tokens",
 	"email_verification_tokens",
 	"files",
+	"notifications",
+	"notification_preferences",
 	"jobs",
 	"audit_events",
 }
@@ -40,6 +42,8 @@ var requiredColumns = map[string][]string{
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id"},
+	"notifications":             {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at"},
+	"notification_preferences":  {"tenant_id", "user_id", "type", "channel", "enabled"},
 	"jobs":                      {"tenant_id"},
 	"audit_events":              {"tenant_id"},
 }
@@ -51,6 +55,7 @@ var requiredUniqueIndexes = []string{
 	"idx_users_tenant_google_id_active",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
+	"idx_notification_preferences_unique",
 }
 
 func main() {

@@ -115,8 +115,9 @@ Rules:
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
   Login, registration, refresh, password reset, and email verification use the
   resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
-  every call. Cross-tenant user/file ids return 404 and cross-tenant tokens fail
-  as invalid.
+  every call. Cross-tenant user/file/notification ids return 404 and
+  cross-tenant tokens fail as invalid. Notification feed and preference reads
+  are scoped to both the request tenant and the authenticated user.
 - Google OAuth binds the tenant into `state`; the callback uses that tenant
   rather than the header and rejects a tenant suspended mid-flow.
 - `UserResponse`/`FileResponse` include additive `tenantId` fields. Tokens
@@ -158,12 +159,52 @@ Rules:
 - Deletes are soft; `includeDeleted=true` exposes trash to the owner.
 - `Content-Disposition` follows RFC 6266/5987.
 
+## Notifications
+
+All notification routes require a JWT and are scoped to the authenticated user
+and request tenant. A notification id from another user or tenant returns
+`404`, never `403`.
+
+- `GET /notifications/` is cursor-paginated (`limit`, `startingAfter`) and
+  accepts `unreadOnly=true`. The list uses the standard
+  `{object,url,data,hasMore,nextCursor}` envelope.
+- `GET /notifications/unread-count` returns `{count}` for the badge.
+- `GET /notifications/:id` returns one owned notification.
+- `POST /notifications/:id/read` sets `read_at` once and returns the row;
+  repeating it is safe and does not move the timestamp.
+- `POST /notifications/read-all` marks every unread row and returns
+  `{updated}`.
+- `POST /notifications/send` is the admin-only back-office send. It requires
+  `notifications:send` and targets a user in the request tenant. The response
+  carries `notification` (null when the in-app channel is disabled) and
+  `emailQueued`.
+
+Preferences are per `(user, tenant, type, channel)` with channels `in_app` and
+`email`:
+
+- `GET /notification-preferences/` lists only explicit rows; a missing row
+  means the channel is enabled.
+- `PUT /notification-preferences/` upserts `{type, channel, enabled}`. `type`
+  is a lower-case identifier (`^[a-z0-9][a-z0-9._-]*$`, max 100). The unique
+  index makes the upsert idempotent.
+
+Writes use `Idempotency-Key`. Reads and preference updates are audited by the
+generic mutating-request middleware. When the email channel is enabled, the
+in-app row and the durable `email.send` job commit in one transaction; an
+enqueue failure returns `500` and leaves no in-app row. A notification is
+suppressed when both channels are disabled (create is a successful no-op; the
+admin send response has `notification: null` and `emailQueued: false`). Email
+delivery is at-least-once.
+
 ## Jobs and asynchronous work
 
-- Email verification/reset and other durable work are queued in PostgreSQL.
-- Delivery is at-least-once; clients must tolerate duplicate emails.
+- Email verification/reset, notification email, and other durable work are
+  queued in PostgreSQL.
+- Delivery is at-least-once; clients must tolerate duplicate emails. A failed
+  notification enqueue rolls back the in-app row.
 - Terminal jobs clear payloads; success/dead rows are retained 30 days.
-- Email payloads are encrypted at rest.
+- Email payloads are encrypted at rest; notification emails use the same
+  `email.send`/`email.send.encrypted` kinds as identity emails.
 
 ## Compatibility checklist
 

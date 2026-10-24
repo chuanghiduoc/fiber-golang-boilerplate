@@ -52,9 +52,12 @@ internal/modules/
   files/                            Upload, download, soft delete, restore
                                     (dto + repository + service + handler + adapter
                                      + queries + generated sqlc)
+  notifications/                    In-app feed, channel preferences, email channel
+                                    (dto + repository + service + handler
+                                     + queries + generated sqlc)
   admin/                            Back-office facade
                                     (dto + service + handler, contracts-only)
-internal/contracts/                 Narrow cross-module identity/files admin interfaces (stdlib only)
+internal/contracts/                 Narrow cross-module admin and notification interfaces (stdlib only)
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
@@ -117,6 +120,10 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
 - Durable jobs and audit events carry `tenant_id`: enqueue records the request
   tenant, the worker restores tenant context for handlers, and audit rows are
   tenant-scoped.
+- Notifications and notification preferences are tenant- and user-scoped:
+  every list/read/read-all/count/preference query filters both columns.
+  Cross-tenant or other-user ids return `404`. Email delivery inherits the
+  notification tenant in `jobs.tenant_id`.
 - Google OAuth binds the tenant into the OAuth `state` (and state cookie); the
   callback uses that tenant, not `X-Tenant-Slug`, and refuses a tenant suspended
   during consent.
@@ -248,6 +255,12 @@ New uploads use the blob key `<tenantID>/<userID>/<uuid>.<ext>`, while existing
 rows keep their old `<userID>/<uuid>.<ext>` path; if you copy blobs, update
 `files.storage_path` atomically.
 
+Notifications add two new tenant-owned tables (`notifications` and
+`notification_preferences`) plus their indexes. Existing databases need those
+objects in a numbered migration above their recorded version; fresh installs
+get them from `000001`. `cmd/migrate` now verifies both tables, their tenant
+columns, and the unique preference index.
+
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
 with the golang-migrate CLI's `force 1`) instead of running the file over
@@ -302,6 +315,27 @@ returns `404`, including for admins. Blobs are stored under
 | GET | `/api/v1/files/:id/download` | Download tenant-owned file (authenticated; storage is not publicly served) |
 | DELETE | `/api/v1/files/:id` | Delete tenant-owned file (soft) |
 | POST | `/api/v1/files/:id/restore` | Restore own soft-deleted file in the current tenant |
+
+### Notifications (protected — JWT required)
+Notifications are scoped to the authenticated user and request tenant.
+`GET /notifications/` accepts `unreadOnly=true`; `POST /notifications/:id/read`
+is idempotent and `POST /notifications/read-all` returns the number of newly
+read rows.
+Preferences default to enabled for both channels; only explicit rows are
+returned. Reads require `notifications:read`, user mutations require
+`notifications:write`, and sending to another user requires the admin-only
+`notifications:send` permission. Email is a durable job.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/notifications/` | List own notifications (cursor; `unreadOnly`) |
+| GET | `/api/v1/notifications/unread-count` | Unread badge count |
+| GET | `/api/v1/notifications/:id` | Get one own notification |
+| POST | `/api/v1/notifications/:id/read` | Mark one own notification read (idempotent) |
+| POST | `/api/v1/notifications/read-all` | Mark all own notifications read |
+| POST | `/api/v1/notifications/send` | Admin: notify a user in the tenant (`notifications:send`) |
+| GET | `/api/v1/notification-preferences/` | List explicit channel preferences |
+| PUT | `/api/v1/notification-preferences/` | Upsert `type` + `in_app`/`email` preference |
 
 ### Admin (protected — admin role required)
 | Method | Path | Description |
@@ -567,10 +601,14 @@ monolith, durable jobs, audit trail, permission-based authorization, single
 migration entrypoint, and tenant foundation (schema, resolution, JWT claim,
 config) exist. Remaining work:
 
-- Tenant isolation is implemented for identity and files, including
-  tenant-scoped SQL, admin lists/stats, tenant-bound Google OAuth state,
-  tenant-aware sessions, and tenant-prefixed storage keys. Row-level security
+- Tenant isolation is implemented for identity, files, and notifications,
+  including tenant-scoped SQL, admin lists/stats, tenant-bound Google OAuth
+  state, tenant-aware sessions, tenant-prefixed storage keys, and
+  tenant/user-scoped notification feeds and preferences. Row-level security
   and per-tenant limits remain future work.
+- Notifications include an in-app feed, per-type channel preferences, and a
+  durable email channel committed with the in-app row. Delivery remains
+  at-least-once; channel preferences default to enabled when no row exists.
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.

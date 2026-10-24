@@ -19,6 +19,12 @@ const (
 
 	PermissionSessionsRevoke Permission = "sessions:revoke"
 
+	PermissionNotificationsRead  Permission = "notifications:read"
+	PermissionNotificationsWrite Permission = "notifications:write"
+	// PermissionNotificationsSend is admin-only: it allows creating a
+	// notification for another user through the back-office endpoint.
+	PermissionNotificationsSend Permission = "notifications:send"
+
 	PermissionAdminUsersRead    Permission = "admin:users:read"
 	PermissionAdminUsersRole    Permission = "admin:users:role"
 	PermissionAdminUsersBan     Permission = "admin:users:ban"
@@ -43,6 +49,9 @@ var allPermissions = []Permission{
 	PermissionFilesWrite,
 	PermissionFilesDelete,
 	PermissionSessionsRevoke,
+	PermissionNotificationsRead,
+	PermissionNotificationsWrite,
+	PermissionNotificationsSend,
 	PermissionAdminUsersRead,
 	PermissionAdminUsersRole,
 	PermissionAdminUsersBan,
@@ -63,12 +72,14 @@ func buildRolePermissions() map[string]map[Permission]struct{} {
 	}
 
 	user := map[Permission]struct{}{
-		PermissionProfileRead:    {},
-		PermissionProfileWrite:   {},
-		PermissionFilesRead:      {},
-		PermissionFilesWrite:     {},
-		PermissionFilesDelete:    {},
-		PermissionSessionsRevoke: {},
+		PermissionProfileRead:        {},
+		PermissionProfileWrite:       {},
+		PermissionFilesRead:          {},
+		PermissionFilesWrite:         {},
+		PermissionFilesDelete:        {},
+		PermissionSessionsRevoke:     {},
+		PermissionNotificationsRead:  {},
+		PermissionNotificationsWrite: {},
 	}
 
 	return map[string]map[Permission]struct{}{
