@@ -16,6 +16,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -75,7 +76,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 				slog.Any("error", delErr),
 			)
 		}
-		if repository.IsUniqueViolation(err) {
+		if database.IsUniqueViolation(err) {
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
 		return nil, apperror.NewInternal("failed to save file metadata")
@@ -252,13 +253,13 @@ func (s *uploadService) toFileResponse(file *sqlc.File) *dto.FileResponse {
 
 // buildCursor mirrors the legacy service helper while the files slice lives in
 // the module. It normalizes the page size and decodes an optional cursor.
-func buildCursor(limit int, startingAfter string) (cur repository.Cursor, pageSize int, err error) {
+func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {
 	pageSize = pagination.NormalizeLimit(limit)
-	cur = repository.Cursor{Limit: pagination.RowLimit(pageSize + 1)}
+	cur = pagination.DBCursor{Limit: pagination.RowLimit(pageSize + 1)}
 	if startingAfter != "" {
 		ts, id, decErr := pagination.DecodeCursor(startingAfter)
 		if decErr != nil {
-			return repository.Cursor{}, 0, apperror.NewBadRequest("invalid cursor")
+			return pagination.DBCursor{}, 0, apperror.NewBadRequest("invalid cursor")
 		}
 		cur.HasCursor = true
 		cur.CreatedAt = ts

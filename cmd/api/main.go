@@ -21,13 +21,16 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	legacyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
+	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
+	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -142,7 +145,7 @@ func main() {
 	txManager := database.NewTxManager(pool)
 
 	// Dependency injection
-	userRepo := repository.NewUserRepository(pool)
+	userRepo := identityrepository.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
 
 	// Auto-seed admin user (idempotent)
@@ -152,25 +155,25 @@ func main() {
 	}
 	cancelStartup()
 
-	refreshTokenRepo := repository.NewRefreshTokenRepository(pool)
-	userSvc := service.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager, sessionStore)
+	refreshTokenRepo := identityrepository.NewRefreshTokenRepository(pool)
+	userSvc := identityservice.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager, sessionStore)
 
-	refreshSvc := service.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
+	refreshSvc := identityservice.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
 	// Durable email delivery: services enqueue; the worker sends and retries.
 	jobQueue := jobs.NewQueue(pool)
 	queuedEmail := jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(payloadCodec))
 
 	// Password reset
-	passwordResetRepo := repository.NewPasswordResetRepository(pool)
-	passwordResetSvc := service.NewPasswordResetService(
+	passwordResetRepo := identityrepository.NewPasswordResetRepository(pool)
+	passwordResetSvc := identityservice.NewPasswordResetService(
 		userRepo, passwordResetRepo, refreshTokenRepo,
 		queuedEmail, appCache, cfg.App.FrontendURL, txManager, sessionStore,
 	)
 
 	// Email verification
-	emailVerifRepo := repository.NewEmailVerificationRepository(pool)
-	emailVerifSvc := service.NewEmailVerificationService(
+	emailVerifRepo := identityrepository.NewEmailVerificationRepository(pool)
+	emailVerifSvc := identityservice.NewEmailVerificationService(
 		userRepo, emailVerifRepo, queuedEmail, appCache, cfg.App.FrontendURL, txManager,
 	)
 
@@ -178,11 +181,11 @@ func main() {
 	// transaction. Resend and email-change paths keep using their own flow.
 	userSvc.SetVerificationProvisioner(emailVerifSvc)
 
-	authHandler := handler.NewAuthHandler(
+	authHandler := identityhandler.NewAuthHandler(
 		userSvc, refreshSvc, passwordResetSvc, emailVerifSvc,
 		cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.App.RequireEmailVerification, googleOAuth,
 	)
-	userHandler := handler.NewUserHandler(userSvc, emailVerifSvc)
+	userHandler := identityhandler.NewUserHandler(userSvc, emailVerifSvc)
 
 	fileRepo := repository.NewFileRepository(pool)
 	uploadSvc := filesvc.NewUploadService(fileRepo, store)
@@ -190,7 +193,7 @@ func main() {
 
 	// Admin
 	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshTokenRepo, store, txManager, sessionStore)
-	adminHandler := handler.NewAdminHandler(adminSvc)
+	adminHandler := legacyhandler.NewAdminHandler(adminSvc)
 
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)

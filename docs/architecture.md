@@ -13,8 +13,8 @@ cmd/seed       standalone admin seeder (schema must already exist)
 
 internal/app   composition root: Fiber, middleware, infra routes, module registry
 internal/modules
-  identity     auth, users, sessions, tokens, admin seed
-  files        upload, metadata, download, soft delete, restore
+  identity     auth, users, sessions, tokens, admin seed (dto/repository/service/handler)
+  files        upload, metadata, download, soft delete, restore (handler/service)
   admin        back-office facade
 internal/platform
   authz        permission catalog + route middleware
@@ -22,7 +22,7 @@ internal/platform
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-internal/handler|service|repository|dto|sqlc   legacy strangler layer
+internal/handler|service|repository|dto|sqlc   remaining legacy strangler layer
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
 
@@ -80,17 +80,19 @@ client
 
 ## Strangler status
 
-The module wrappers own route tables. The `files` module now also owns its
-upload service and HTTP handler under `internal/modules/files/service` and
-`internal/modules/files/handler`; `internal/service` and `internal/handler`
+The module wrappers own route tables. The `identity` module now owns its DTOs,
+repositories, services, and HTTP handlers under `internal/modules/identity`;
+legacy identity code has been deleted rather than aliased. The `files` module
+owns its upload service and HTTP handler under `internal/modules/files/service`
+and `internal/modules/files/handler`; `internal/service` and `internal/handler`
 keep thin deprecated aliases and constructors so legacy call sites continue to
 compile. The files repository and DTOs still live in the legacy global
 packages.
 
-Other modules still keep their handler/service/repository/DTO internals in the
-legacy layer. Moving one module's internals at a time remains the next phase;
-new code should start in `internal/modules/<name>/` and use contracts for
-cross-module reads.
+`admin` still keeps its handler/service in the legacy layer while using the
+identity module's repository/DTO/service contracts. Moving the remaining
+internals one module at a time remains the next phase; new code should start in
+`internal/modules/<name>/` and use contracts for cross-module reads.
 
 ## Extension checklist
 

@@ -40,9 +40,9 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (+ admin seed), files (handler/service), admin
+internal/modules/           identity (full vertical slice + admin seed), files (handler/service), admin
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
-internal/handler|service|repository|dto|sqlc   current internals (strangler phase)
+internal/handler|service|repository|dto|sqlc   remaining legacy internals (strangler phase)
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -76,8 +76,10 @@ idempotency, compatibility). Keep both current when routes/contracts change.
 Tenant isolation, per-module sqlc generation, distributed tracing, environment
 promotion/rollout automation, and moving the remaining legacy
 handler/service/repository/DTO internals into modules remain future work.
-`files` already owns its upload handler/service; `identity` and `admin` still
-wrap the global layers. Kubernetes manifests and a GHCR release workflow exist
+`identity` owns its DTOs, repositories, services, and handlers under
+`internal/modules/identity`. `files` owns its upload handler/service but still
+uses the legacy repository/DTO layer, and `admin` still wraps the global
+handler/service packages. Kubernetes manifests and a GHCR release workflow exist
 under `deploy/k8s/` and `.github/workflows/release.yml`; they are a production
 foundation, not a complete CD platform.
 

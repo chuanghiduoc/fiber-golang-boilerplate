@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const (
@@ -14,6 +16,23 @@ const (
 	// MaxLimit caps a single page to protect the database.
 	MaxLimit = 100
 )
+
+// DBCursor carries decoded cursor-pagination parameters into repository
+// queries. Limit should already include the extra row used to detect the next
+// page. It is shared by repositories in any module; the HTTP layer owns the
+// wire format and this type owns the database hand-off.
+type DBCursor struct {
+	HasCursor bool
+	CreatedAt time.Time
+	ID        int64
+	Limit     int32
+}
+
+// CreatedAtParam returns the cursor timestamp as a nullable timestamptz so
+// the first page does not filter on a zero time.
+func (c DBCursor) CreatedAtParam() pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: c.CreatedAt, Valid: c.HasCursor}
+}
 
 // NormalizeLimit clamps a requested page size into [1, MaxLimit], defaulting
 // to DefaultLimit when non-positive.

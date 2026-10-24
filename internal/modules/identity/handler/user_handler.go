@@ -6,8 +6,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
@@ -36,7 +37,7 @@ func NewUserHandler(svc service.UserService, emailVerif ...service.EmailVerifica
 // @Failure 401 {object} apperror.ProblemDetails
 // @Router /users/me [get]
 func (h *UserHandler) GetMe(c fiber.Ctx) error {
-	user, err := h.service.GetByID(c.Context(), authUserID(c))
+	user, err := h.service.GetByID(c.Context(), httpx.AuthUserID(c))
 	if err != nil {
 		return err
 	}
@@ -57,7 +58,7 @@ func (h *UserHandler) GetMe(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /users/{id} [get]
 func (h *UserHandler) GetByID(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
@@ -69,7 +70,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 
 	// Only the account owner or an admin may read a profile (it contains PII
 	// such as the email address and role).
-	if id != authUserID(c) && authRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
 		// 404 rather than 403 avoids confirming that an otherwise private
 		// account ID exists.
 		return apperror.NewNotFound("user not found")
@@ -92,7 +93,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /users [get]
 func (h *UserHandler) List(c fiber.Ctx) error {
-	limit, startingAfter, err := cursorQuery(c)
+	limit, startingAfter, err := httpx.CursorQuery(c)
 	if err != nil {
 		return err
 	}
@@ -119,15 +120,15 @@ func (h *UserHandler) List(c fiber.Ctx) error {
 // @Router /users/me [put]
 func (h *UserHandler) UpdateMe(c fiber.Ctx) error {
 	var req dto.UpdateUserRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
-	if err := h.requirePasswordForEmailChange(c, authUserID(c), req); err != nil {
+	if err := h.requirePasswordForEmailChange(c, httpx.AuthUserID(c), req); err != nil {
 		return err
 	}
 
-	user, err := h.service.Update(c.Context(), authUserID(c), req)
+	user, err := h.service.Update(c.Context(), httpx.AuthUserID(c), req)
 	if err != nil {
 		return err
 	}
@@ -153,21 +154,21 @@ func (h *UserHandler) UpdateMe(c fiber.Ctx) error {
 // @Failure 422 {object} apperror.ProblemDetails
 // @Router /users/{id} [put]
 func (h *UserHandler) Update(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
 
-	if id != authUserID(c) && authRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
 		return apperror.NewForbidden("you can only update your own profile")
 	}
 
 	var req dto.UpdateUserRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
-	if id == authUserID(c) {
+	if id == httpx.AuthUserID(c) {
 		if err := h.requirePasswordForEmailChange(c, id, req); err != nil {
 			return err
 		}
@@ -237,11 +238,11 @@ func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, user
 // @Router /users/me/password [put]
 func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 	var req dto.ChangePasswordRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
-	if err := h.service.ChangePassword(c.Context(), authUserID(c), req); err != nil {
+	if err := h.service.ChangePassword(c.Context(), httpx.AuthUserID(c), req); err != nil {
 		return err
 	}
 
@@ -261,12 +262,12 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /users/{id} [delete]
 func (h *UserHandler) Delete(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
 
-	if id != authUserID(c) && authRole(c) != dto.RoleAdmin {
+	if id != httpx.AuthUserID(c) && httpx.AuthRole(c) != dto.RoleAdmin {
 		return apperror.NewForbidden("you can only delete your own profile")
 	}
 

@@ -29,6 +29,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - CI builds both binaries, runs `go vet`/`gofmt`, and includes a fresh-PostgreSQL migration job (baseline up/down + `cmd/migrate` twice)
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
 - Moved the files upload service and HTTP handler into `internal/modules/files/{service,handler}`; `internal/service` and `internal/handler` keep deprecated aliases/wrappers so existing call sites compile, while the files repository and DTOs remain in the legacy layer
+- Moved the identity bounded context into `internal/modules/identity/{dto,repository,service,handler}`. Identity handlers now use `internal/platform/httpx` helpers, shared cursor pagination lives in `pkg/pagination.DBCursor`, unique-violation detection lives in `pkg/database`, and the legacy global identity files were deleted. Admin keeps its legacy handler/service but consumes the identity module's repository/DTO contract; `files` repository/DTOs remain legacy.
 
 ### Fixed
 - `MemoryCache.Increment` now rejects non-integer values like Redis `INCR`, so an idempotency owner token is never mistaken for a free claim counter

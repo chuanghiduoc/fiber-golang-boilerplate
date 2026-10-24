@@ -46,7 +46,8 @@ cmd/migrate/main.go                 The only DB initializer/migrator (single ini
 cmd/seed/main.go                    Standalone admin seeder (schema must exist)
 internal/app/                       Composition root: Fiber, global middleware, module registry
 internal/modules/
-  identity/                         Auth, users, sessions, tokens (route table + admin seed)
+  identity/                         Auth, users, sessions, tokens
+                                    (dto + repository + service + handler + admin seed)
   files/                            Upload, download, soft delete, restore
                                     (service + handler now live here)
   admin/                            Back-office facade
@@ -55,10 +56,10 @@ internal/platform/
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
-internal/handler/                   Legacy handler internals + files compatibility wrappers
-internal/service/                   Legacy service internals + files compatibility wrappers
-internal/repository/                Current repository internals
-internal/dto/                       Current DTOs
+internal/handler/                   Legacy admin handler + files compatibility wrapper
+internal/service/                   Legacy admin service + files compatibility wrapper
+internal/repository/                Legacy files repository
+internal/dto/                       Legacy admin/files DTOs
 internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
@@ -411,11 +412,11 @@ already exists.
    `test/arch` rejects cross-module imports.
 8. Run `make swagger` and `make check` before opening a PR.
 
-> `files` owns its upload handler and service inside the module, while still
-> using the legacy repository/DTO layer. `identity` and `admin` still wrap the
-> global handler/service/repository packages. Moving the remaining internals is
-> the next strangler phase; new modules should start directly in the module
-> layout.
+> `identity` owns its DTOs, repositories, services, and handlers under
+> `internal/modules/identity`. `files` owns its upload handler and service but
+> still uses the legacy repository/DTO layer. `admin` still wraps the global
+> handler/service packages. Moving the remaining internals is the next
+> strangler phase; new modules should start directly in the module layout.
 
 ## Environment Variables
 
@@ -467,8 +468,9 @@ migration entrypoint exist. Remaining work:
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
 - Moving `internal/handler|service|repository|dto` internals into the module
-  directories (the strangler phase noted above). The files service and handler
-  have moved; the files repository and DTOs are still legacy.
+  directories (the strangler phase noted above). `identity` has fully moved;
+  the files service/handler and admin handler/service remain legacy, and the
+  files repository/DTOs still live in the global layer.
 
 ## Security notes
 

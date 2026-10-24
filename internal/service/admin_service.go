@@ -10,8 +10,11 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	filerepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -19,10 +22,10 @@ import (
 )
 
 type AdminService interface {
-	ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
-	UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error)
+	ListUsers(ctx context.Context, limit int, startingAfter string) ([]identitydto.UserResponse, bool, error)
+	UpdateRole(ctx context.Context, id int64, role string) (*identitydto.UserResponse, error)
 	BanUser(ctx context.Context, id int64) error
-	UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error)
+	UnbanUser(ctx context.Context, id int64) (*identitydto.UserResponse, error)
 	ListFiles(ctx context.Context, limit int, startingAfter string) ([]dto.FileResponse, bool, error)
 	Download(ctx context.Context, id int64) (*dto.FileResponse, io.ReadCloser, error)
 	DeleteFile(ctx context.Context, id int64) error
@@ -31,18 +34,18 @@ type AdminService interface {
 }
 
 type adminService struct {
-	userRepo         repository.UserRepository
-	fileRepo         repository.FileRepository
-	refreshTokenRepo repository.RefreshTokenRepository
+	userRepo         identityrepo.UserRepository
+	fileRepo         filerepo.FileRepository
+	refreshTokenRepo identityrepo.RefreshTokenRepository
 	storage          storage.Storage
 	txManager        *database.TxManager
 	sessions         session.Store
 }
 
 func NewAdminService(
-	userRepo repository.UserRepository,
-	fileRepo repository.FileRepository,
-	refreshTokenRepo repository.RefreshTokenRepository,
+	userRepo identityrepo.UserRepository,
+	fileRepo filerepo.FileRepository,
+	refreshTokenRepo identityrepo.RefreshTokenRepository,
 	store storage.Storage,
 	txManager *database.TxManager,
 	sessions ...session.Store,
@@ -58,7 +61,7 @@ func NewAdminService(
 	}
 }
 
-func (s *adminService) ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+func (s *adminService) ListUsers(ctx context.Context, limit int, startingAfter string) ([]identitydto.UserResponse, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -74,16 +77,16 @@ func (s *adminService) ListUsers(ctx context.Context, limit int, startingAfter s
 		users = users[:pageSize]
 	}
 
-	responses := make([]dto.UserResponse, len(users))
+	responses := make([]identitydto.UserResponse, len(users))
 	for i := range users {
-		responses[i] = *ToUserResponse(&users[i])
+		responses[i] = *identityservice.ToUserResponse(&users[i])
 	}
 
 	return responses, hasMore, nil
 }
 
-func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error) {
-	if role != dto.RoleUser && role != dto.RoleAdmin {
+func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*identitydto.UserResponse, error) {
+	if role != identitydto.RoleUser && role != identitydto.RoleAdmin {
 		return nil, apperror.NewBadRequest("role must be one of: user, admin")
 	}
 
@@ -97,7 +100,7 @@ func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*
 
 	// Do not allow the final admin to be demoted; that would lock every
 	// administrator out of the system.
-	if existing.Role == dto.RoleAdmin && role != dto.RoleAdmin {
+	if existing.Role == identitydto.RoleAdmin && role != identitydto.RoleAdmin {
 		admins, err := s.userRepo.CountActiveAdmins(ctx)
 		if err != nil {
 			return nil, apperror.NewInternal("failed to count admins")
@@ -125,7 +128,7 @@ func (s *adminService) UpdateRole(ctx context.Context, id int64, role string) (*
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, id)
 	}
-	return ToUserResponse(user), nil
+	return identityservice.ToUserResponse(user), nil
 }
 
 func (s *adminService) BanUser(ctx context.Context, id int64) error {
@@ -136,7 +139,7 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 		}
 		return apperror.NewInternal("failed to get user")
 	}
-	if existing.Role == dto.RoleAdmin {
+	if existing.Role == identitydto.RoleAdmin {
 		admins, err := s.userRepo.CountActiveAdmins(ctx)
 		if err != nil {
 			return apperror.NewInternal("failed to count admins")
@@ -146,7 +149,7 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 		}
 	}
 
-	doBan := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+	doBan := func(userRepo identityrepo.UserRepository, refreshRepo identityrepo.RefreshTokenRepository) error {
 		_, err := userRepo.Ban(ctx, id)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -167,7 +170,7 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doBan(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			return doBan(identityrepo.NewUserRepository(tx), identityrepo.NewRefreshTokenRepository(tx))
 		})
 	} else {
 		err = doBan(s.userRepo, s.refreshTokenRepo)
@@ -181,13 +184,13 @@ func (s *adminService) BanUser(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (s *adminService) UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error) {
+func (s *adminService) UnbanUser(ctx context.Context, id int64) (*identitydto.UserResponse, error) {
 	user, err := s.userRepo.Restore(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("user not found or not banned")
 		}
-		if repository.IsUniqueViolation(err) {
+		if database.IsUniqueViolation(err) {
 			return nil, apperror.NewConflict("the original email is already in use by another account")
 		}
 		return nil, apperror.NewInternal("failed to unban user")
@@ -205,7 +208,7 @@ func (s *adminService) UnbanUser(ctx context.Context, id int64) (*dto.UserRespon
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, id)
 	}
-	return ToUserResponse(user), nil
+	return identityservice.ToUserResponse(user), nil
 }
 
 func (s *adminService) ListFiles(ctx context.Context, limit int, startingAfter string) ([]dto.FileResponse, bool, error) {

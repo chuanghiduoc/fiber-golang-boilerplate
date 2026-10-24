@@ -13,9 +13,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -167,7 +167,7 @@ func (s *userService) createUser(
 		Name:         name,
 	})
 	if err != nil {
-		if repository.IsUniqueViolation(err) {
+		if database.IsUniqueViolation(err) {
 			return nil, apperror.NewCode(apperror.CodeUserEmailTaken, "email already registered")
 		}
 		return nil, apperror.NewInternal("failed to create user")
@@ -291,7 +291,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 				ID:       existing.ID,
 			})
 			if linkErr != nil {
-				if repository.IsUniqueViolation(linkErr) {
+				if database.IsUniqueViolation(linkErr) {
 					return nil, apperror.NewConflict("this Google account is already linked to another user")
 				}
 				return nil, apperror.NewInternal("failed to link google account")
@@ -361,7 +361,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 // retryOAuthLookup handles the concurrent-create race. It returns a user when
 // another request won, or nil to let the caller surface the original error.
 func (s *userService) retryOAuthLookup(ctx context.Context, googleID, email string, cause error) (*sqlc.User, error) {
-	if !repository.IsUniqueViolation(cause) {
+	if !database.IsUniqueViolation(cause) {
 		return nil, cause
 	}
 	if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
@@ -451,7 +451,7 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 			UpdateEmail: req.Email != nil,
 		})
 		if err != nil {
-			if repository.IsUniqueViolation(err) {
+			if database.IsUniqueViolation(err) {
 				return nil, apperror.NewConflict("email already in use")
 			}
 			return nil, apperror.NewInternal("failed to update user")

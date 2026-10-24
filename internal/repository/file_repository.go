@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 type FileRepository interface {
@@ -11,12 +12,12 @@ type FileRepository interface {
 	GetByID(ctx context.Context, id int64) (*sqlc.File, error)
 	GetByIDIncludingDeleted(ctx context.Context, id int64) (*sqlc.File, error)
 	ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]sqlc.File, error)
-	ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error)
+	ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error)
 	CountByUserID(ctx context.Context, userID int64) (int64, error)
 	Delete(ctx context.Context, id int64) (*sqlc.File, error)
 	Restore(ctx context.Context, id int64) (*sqlc.File, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.File, error)
-	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error)
+	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error)
 	AdminCount(ctx context.Context) (int64, error)
 }
 
@@ -62,12 +63,12 @@ func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, 
 	})
 }
 
-func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error) {
+func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error) {
 	return r.q.ListFilesByUserCursor(ctx, sqlc.ListFilesByUserCursorParams{
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -100,10 +101,10 @@ func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 	})
 }
 
-func (r *fileRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error) {
+func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
 	return r.q.AdminListFilesCursor(ctx, sqlc.AdminListFilesCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})

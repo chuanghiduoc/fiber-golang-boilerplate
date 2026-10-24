@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 type UserRepository interface {
@@ -14,7 +15,7 @@ type UserRepository interface {
 	GetByGoogleID(ctx context.Context, googleID string) (*sqlc.User, error)
 	GetBannedByEmail(ctx context.Context, email string) (*sqlc.User, error)
 	List(ctx context.Context, limit, offset int32) ([]sqlc.User, error)
-	ListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error)
+	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.User, error)
 	Count(ctx context.Context) (int64, error)
 	Create(ctx context.Context, params sqlc.CreateUserParams) (*sqlc.User, error)
 	CreateOAuthUser(ctx context.Context, params sqlc.CreateOAuthUserParams) (*sqlc.User, error)
@@ -28,7 +29,7 @@ type UserRepository interface {
 	Ban(ctx context.Context, id int64) (*sqlc.User, error)
 	Restore(ctx context.Context, id int64) (*sqlc.User, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.User, error)
-	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error)
+	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.User, error)
 	AdminCount(ctx context.Context) (int64, error)
 	CountActiveAdmins(ctx context.Context) (int64, error)
 	GetSystemStats(ctx context.Context) (sqlc.GetSystemStatsRow, error)
@@ -83,10 +84,10 @@ func (r *userRepository) List(ctx context.Context, limit, offset int32) ([]sqlc.
 	})
 }
 
-func (r *userRepository) ListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error) {
+func (r *userRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
 	return r.q.ListUsersCursor(ctx, sqlc.ListUsersCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -194,10 +195,10 @@ func (r *userRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 	})
 }
 
-func (r *userRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error) {
+func (r *userRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
 	return r.q.AdminListUsersCursor(ctx, sqlc.AdminListUsersCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
