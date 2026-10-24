@@ -1,0 +1,10 @@
+# Replace the host and TLS Secret with the production DNS name and certificate.
+- op: replace
+  path: /spec/rules/0/host
+  value: api.example.com
+- op: replace
+  path: /spec/tls/0/hosts/0
+  value: api.example.com
+- op: replace
+  path: /spec/tls/0/secretName
+  value: fiber-boilerplate-production-tls

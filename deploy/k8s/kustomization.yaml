@@ -1,29 +1,9 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# IMPORTANT: migration-job.yaml is intentionally NOT listed here. It must be
-# applied explicitly and awaited BEFORE this kustomization creates the app;
-# `kubectl apply -k` has no cross-resource ordering guarantee. See README.md
-# for the only safe flow.
-namespace: fiber-boilerplate
-
-# The real Secret is created out of band (or via External Secrets / Sealed
-# Secrets). secret.example.yaml is intentionally NOT listed and must never be
-# committed with real values.
+# Convenience entry point for `kubectl apply -k deploy/k8s`. The actual
+# resources live in base/ and prereqs/; environment-specific values live in
+# overlays/. The migration Job and secret.example.yaml stay outside this
+# kustomization.
 resources:
-  - namespace.yaml
-  - configmap.yaml
-  - deployment.yaml
-  - service.yaml
-  - hpa.yaml
-  - pdb.yaml
-  - networkpolicy.yaml
-  - ingress.yaml
-
-# Single source for the app image tag. Replace both name and newName with your
-# repository, and newTag with the release tag. The raw migration Job is outside
-# this kustomization by design; update its image line too when pinning a release.
-images:
-  - name: ghcr.io/OWNER/REPO
-    newName: ghcr.io/OWNER/REPO
-    newTag: latest
+  - base

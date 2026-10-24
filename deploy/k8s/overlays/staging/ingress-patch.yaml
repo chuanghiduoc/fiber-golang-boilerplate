@@ -1,0 +1,12 @@
+# Replace the host and TLS Secret with the staging DNS name and certificate.
+# A wildcard Secret (for example *.staging.example.com) may be reused; the name
+# is still environment-specific to avoid accidentally sharing it.
+- op: replace
+  path: /spec/rules/0/host
+  value: api.staging.example.com
+- op: replace
+  path: /spec/tls/0/hosts/0
+  value: api.staging.example.com
+- op: replace
+  path: /spec/tls/0/secretName
+  value: fiber-boilerplate-staging-tls

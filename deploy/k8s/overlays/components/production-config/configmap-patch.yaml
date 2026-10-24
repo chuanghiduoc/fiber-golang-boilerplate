@@ -1,0 +1,24 @@
+# Production ConfigMap overrides. Strategic merge keeps all unlisted base keys.
+# Replace the example.com hosts and REPLACE_* bucket before applying. APP_ENV
+# must stay production so the production-only safety rails remain enabled.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: fiber-boilerplate
+  name: fiber-boilerplate-config
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+
+  # Public API origin vs. browser frontend origin.
+  APP_FRONTEND_URL: "https://app.example.com"
+  CORS_ALLOW_ORIGINS: "https://app.example.com"
+
+  # Managed PostgreSQL/Redis/SMTP endpoints for production.
+  DB_HOST: "db.production.example.com"
+  DB_MAX_CONNS: "10"
+  SMTP_HOST: "smtp.production.example.com"
+  EMAIL_FROM_ADDRESS: "noreply@example.com"
+
+  # Separate bucket and credentials (credentials stay in the Secret).
+  STORAGE_S3_BUCKET: "REPLACE_WITH_PRODUCTION_S3_BUCKET"

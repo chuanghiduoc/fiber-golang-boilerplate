@@ -74,6 +74,9 @@ func New(cfg *config.Config, deps Deps) *App {
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		// Reject malformed/forwarded IP values so X-Forwarded-For cannot
+		// create arbitrary rate-limit/idempotency buckets.
+		EnableIPValidation: true,
 	}
 	if cfg.App.TrustProxy {
 		fiberCfg.TrustProxy = true

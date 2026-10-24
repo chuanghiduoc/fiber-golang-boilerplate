@@ -92,6 +92,15 @@ func contains(values []string, target string) bool {
 	return false
 }
 
+func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.App.TrustProxy = true
+	cfg.App.TrustedProxies = "0.0.0.0/0"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() should reject a wildcard trusted proxy")
+	}
+}
+
 func TestAppConfig_TrustedProxiesList(t *testing.T) {
 	a := AppConfig{TrustedProxies: "10.0.0.1, 192.168.0.0/16 ,"}
 	got := a.TrustedProxiesList()

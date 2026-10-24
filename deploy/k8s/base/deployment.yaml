@@ -10,10 +10,10 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   # This Deployment never runs migrations and has no migration initContainer.
-  # Apply migration-job.yaml and wait for it to complete before rolling out
+  # Apply migration/job.yaml and wait for it to complete before rolling out
   # this Deployment (see README.md).
-  # The HPA owns the replica count (minReplicas: 2); do not add spec.replicas
-  # here, or the two controllers will fight over it.
+  # The HPA owns the replica count (environment overlays set min/max); do not
+  # add spec.replicas here, or the two controllers will fight over it.
   revisionHistoryLimit: 3
   progressDeadlineSeconds: 600
   minReadySeconds: 10
@@ -72,9 +72,10 @@ spec:
       #   - name: ghcr-pull
       containers:
         - name: api
-          # The kustomize images: transformer (kustomization.yaml) rewrites
-          # this image. Replace the transformer's newName/newTag, or edit this
-          # literal and migration-job.yaml together when applying raw files.
+          # The kustomize images: transformer (base/kustomization.yaml or an
+          # environment overlay) rewrites this image. Replace the transformer's
+          # newName/newTag, or edit this literal and migration/job.yaml together
+          # when applying raw files.
           image: ghcr.io/OWNER/REPO:latest
           # The placeholder tag is mutable, so pull it on every start. Switch
           # to IfNotPresent after pinning an immutable release tag.

@@ -1,0 +1,25 @@
+# Staging ConfigMap overrides. Strategic merge keeps all unlisted base keys.
+# Replace the example.com hosts and REPLACE_* bucket before applying. Keep
+# APP_ENV=staging: the app then uses JSON logs without the production-only
+# HTTPS/CORS rails, while the values below still use HTTPS and explicit origins.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: fiber-boilerplate
+  name: fiber-boilerplate-config
+data:
+  APP_ENV: staging
+  LOG_LEVEL: info
+
+  # Public API origin vs. browser frontend origin.
+  APP_FRONTEND_URL: "https://app.staging.example.com"
+  CORS_ALLOW_ORIGINS: "https://app.staging.example.com"
+
+  # Managed PostgreSQL/Redis/SMTP endpoints for staging.
+  DB_HOST: "db.staging.example.com"
+  DB_MAX_CONNS: "5"
+  SMTP_HOST: "smtp.staging.example.com"
+  EMAIL_FROM_ADDRESS: "noreply@staging.example.com"
+
+  # Separate bucket and credentials (credentials stay in the Secret).
+  STORAGE_S3_BUCKET: "REPLACE_WITH_STAGING_S3_BUCKET"

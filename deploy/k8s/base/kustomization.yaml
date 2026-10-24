@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Reusable application base. Environment overlays live in ../overlays and
+# reference this directory directly; the top-level ../kustomization.yaml is a
+# convenience wrapper for `kubectl apply -k deploy/k8s`.
+#
+# IMPORTANT: migration/job.yaml is intentionally NOT listed here. It must be
+# applied explicitly and awaited BEFORE this kustomization creates the app;
+# `kubectl apply -k` has no cross-resource ordering guarantee. See README.md
+# for the only safe flow.
+namespace: fiber-boilerplate
+
+# The real Secret is created out of band (or via External Secrets / Sealed
+# Secrets). secret.example.yaml is intentionally NOT listed and must never be
+# committed with real values.
+resources:
+  # Namespace and ConfigMap are separate so a deploy can apply them before the
+  # migration Job without creating the Deployment.
+  - ../prereqs
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml
+
+# Single source for the app image. `name` is the stable source key used by the
+# overlays and the deploy workflow: keep it exactly as-is, and set newName to
+# your repository plus newTag to the release tag. The raw migration Job is
+# outside this kustomization; overlays/<env>/migration/kustomization.yaml sets
+# its image with the same source key.
+images:
+  - name: ghcr.io/OWNER/REPO
+    newName: ghcr.io/OWNER/REPO
+    newTag: latest

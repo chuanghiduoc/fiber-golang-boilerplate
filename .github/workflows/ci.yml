@@ -104,18 +104,52 @@ jobs:
           rm kustomize.tar.gz
 
       - name: Render app manifests
-        run: kustomize build deploy/k8s > /tmp/app-manifests.yaml
+        run: |
+          kustomize build deploy/k8s > /tmp/app-manifests.yaml
+          for env in staging production; do
+            kustomize build "deploy/k8s/overlays/$env" > "/tmp/${env}-manifests.yaml"
+            kustomize build "deploy/k8s/overlays/$env/prereqs" > "/tmp/${env}-prereqs.yaml"
+            kustomize build "deploy/k8s/overlays/$env/migration" > "/tmp/${env}-migration.yaml"
+          done
 
       - name: Check excluded resources
         run: |
-          if grep -qx 'kind: Secret' /tmp/app-manifests.yaml; then
-            echo "::error::secret.example.yaml must not be part of the app kustomization"
-            exit 1
-          fi
-          if grep -q 'name: fiber-boilerplate-migrate' /tmp/app-manifests.yaml; then
-            echo "::error::migration-job.yaml must be applied separately, not via the app kustomization"
-            exit 1
-          fi
+          for file in /tmp/app-manifests.yaml /tmp/staging-manifests.yaml /tmp/production-manifests.yaml; do
+            if grep -qx 'kind: Secret' "$file"; then
+              echo "::error::secret.example.yaml must not be part of an app kustomization ($file)"
+              exit 1
+            fi
+            if grep -q 'name: fiber-boilerplate-migrate' "$file"; then
+              echo "::error::migration/job.yaml must be applied separately, not via an app kustomization ($file)"
+              exit 1
+            fi
+          done
+
+      - name: Check overlay namespaces
+        run: |
+          set -euo pipefail
+          for env in staging production; do
+            ns="fiber-boilerplate-${env}"
+            for file in "/tmp/${env}-manifests.yaml" "/tmp/${env}-prereqs.yaml"; do
+              if ! grep -qE "^  name: ${ns}$" "$file"; then
+                echo "::error::Namespace object was not renamed to $ns in $file"
+                exit 1
+              fi
+            done
+            for file in \
+              "/tmp/${env}-manifests.yaml" \
+              "/tmp/${env}-prereqs.yaml" \
+              "/tmp/${env}-migration.yaml"; do
+              if grep -qE '^  namespace: fiber-boilerplate$' "$file"; then
+                echo "::error::$file still contains base-namespace resources"
+                exit 1
+              fi
+              if ! grep -qE "^  namespace: ${ns}$" "$file"; then
+                echo "::error::$file has no resource in namespace $ns"
+                exit 1
+              fi
+            done
+          done
 
       - name: Install kubeconform
         run: |
@@ -129,7 +163,13 @@ jobs:
         run: |
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
             /tmp/app-manifests.yaml \
-            deploy/k8s/migration-job.yaml \
+            /tmp/staging-manifests.yaml \
+            /tmp/production-manifests.yaml \
+            /tmp/staging-prereqs.yaml \
+            /tmp/production-prereqs.yaml \
+            /tmp/staging-migration.yaml \
+            /tmp/production-migration.yaml \
+            deploy/k8s/migration/job.yaml \
             deploy/k8s/secret.example.yaml
 
   migrations:
@@ -268,7 +308,7 @@ jobs:
 
       - name: Upload coverage
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: coverage.out
