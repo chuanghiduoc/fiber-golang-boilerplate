@@ -9,6 +9,7 @@ import (
 
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 func newTestUploadService(repo *mockFileRepo, store *mockStorage) UploadService {
@@ -308,8 +309,27 @@ func TestUploadDownload(t *testing.T) {
 		}
 
 		_, _, err := svc.Download(context.Background(), 1, 10)
-		if err == nil {
-			t.Fatal("expected storage error")
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) || appErr.Status != 500 {
+			t.Fatalf("expected 500 storage error, got %v", err)
+		}
+	})
+
+	t.Run("missing blob is not found", func(t *testing.T) {
+		repo := newMockFileRepo()
+		store := newMockStorage()
+		store.getErr = fmt.Errorf("%w: 10/abc.pdf", storage.ErrNotFound)
+		svc := newTestUploadService(repo, store)
+
+		repo.files[1] = &filesqlc.File{
+			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
+			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
+		}
+
+		_, _, err := svc.Download(context.Background(), 1, 10)
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) || appErr.Status != 404 {
+			t.Fatalf("expected 404 for a missing blob, got %v", err)
 		}
 	})
 }

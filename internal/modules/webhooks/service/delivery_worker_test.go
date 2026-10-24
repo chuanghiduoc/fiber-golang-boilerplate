@@ -32,6 +32,38 @@ type fakeWorkerStore struct {
 	// rejectCanceled makes bookkeeping writes fail on a canceled context,
 	// like a real database call would.
 	rejectCanceled bool
+	// activeSecret is the endpoint's current secret; nil means the snapshot
+	// is still active.
+	activeSecret *repository.SigningSecret
+	// leaseLost makes every fenced outcome write match no row.
+	leaseLost bool
+	// fencedAttempts records the attempt each fenced write was fenced on.
+	fencedAttempts []int32
+	released       bool
+	// beforeAttempt runs when the attempt is recorded, after the response.
+	beforeAttempt func()
+}
+
+func (f *fakeWorkerStore) ActiveSigningSecret(context.Context, int64) (*repository.SigningSecret, error) {
+	if f.activeSecret != nil {
+		return f.activeSecret, nil
+	}
+	if f.delivery == nil {
+		return nil, errors.New("not found")
+	}
+	return &repository.SigningSecret{Ciphertext: f.delivery.SecretCiphertext}, nil
+}
+
+func (f *fakeWorkerStore) ReleaseDeliveryClaim(ctx context.Context, _ int64, attempt int32) error {
+	if f.rejectCanceled && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	f.fencedAttempts = append(f.fencedAttempts, attempt)
+	if f.leaseLost {
+		return repository.ErrDeliveryLeaseLost
+	}
+	f.released = true
+	return nil
 }
 
 func (f *fakeWorkerStore) ExpireUnclaimableDelivery(context.Context, int64) (bool, error) {
@@ -61,12 +93,20 @@ func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*webhooksqlc.Webh
 	return f.delivery, nil
 }
 
-func (f *fakeWorkerStore) MarkDeliverySucceeded(context.Context, int64, int) error {
+func (f *fakeWorkerStore) MarkDeliverySucceeded(_ context.Context, _ int64, attempt int32, _ int) error {
+	f.fencedAttempts = append(f.fencedAttempts, attempt)
+	if f.leaseLost {
+		return repository.ErrDeliveryLeaseLost
+	}
 	f.succeeded = true
 	return nil
 }
 
-func (f *fakeWorkerStore) MarkDeliveryDead(_ context.Context, _ int64, _ int, reason string) error {
+func (f *fakeWorkerStore) MarkDeliveryDead(_ context.Context, _ int64, attempt int32, _ int, reason string) error {
+	f.fencedAttempts = append(f.fencedAttempts, attempt)
+	if f.leaseLost {
+		return repository.ErrDeliveryLeaseLost
+	}
 	f.dead = true
 	f.deadReason = reason
 	return nil
@@ -76,11 +116,18 @@ func (f *fakeWorkerStore) RescheduleDeliveryWithJob(ctx context.Context, draft r
 	if f.rejectCanceled && ctx.Err() != nil {
 		return ctx.Err()
 	}
+	f.fencedAttempts = append(f.fencedAttempts, draft.Attempt)
+	if f.leaseLost {
+		return repository.ErrDeliveryLeaseLost
+	}
 	f.retryDraft = &draft
 	return nil
 }
 
 func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft repository.AttemptDraft) error {
+	if f.beforeAttempt != nil {
+		f.beforeAttempt()
+	}
 	if f.rejectCanceled && ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -327,18 +374,20 @@ func TestDeliveryWorker_NotClaimable(t *testing.T) {
 }
 
 // TestDeliveryWorker_RecordsAttemptAfterShutdownCancel proves an attempt whose
-// request was sent is still recorded when the job context is canceled.
+// response arrived is still recorded when the job context is canceled before
+// the bookkeeping writes.
 func TestDeliveryWorker_RecordsAttemptAfterShutdownCancel(t *testing.T) {
 	codec, ciphertext := testCodec(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		cancel()
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
-	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3), rejectCanceled: true}
+	// Cancel deterministically after the response arrived; canceling inside
+	// the server handler races the client reading the response.
+	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3), rejectCanceled: true, beforeAttempt: cancel}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
 	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
@@ -391,5 +440,128 @@ func TestDeliveryWorker_InvalidPayload(t *testing.T) {
 	worker.codec = codec
 	if err := worker.Handle(context.Background(), json.RawMessage(`not-json`)); err == nil {
 		t.Fatal("invalid job payload must error")
+	}
+}
+
+// TestDeliveryWorker_ShutdownBeforeResponseReleasesAttempt proves a job
+// context canceled mid-request (worker shutdown) on the final attempt neither
+// records a failed attempt nor dead-letters the delivery: the attempt is given
+// back and the job context error is returned so the jobs worker releases the
+// job without consuming its attempt.
+func TestDeliveryWorker_ShutdownBeforeResponseReleasesAttempt(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 2, 3), rejectCanceled: true}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+
+	err := worker.Handle(ctx, payload)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Handle() error = %v, want context.Canceled so the job is released", err)
+	}
+	if !store.released || len(store.fencedAttempts) != 1 || store.fencedAttempts[0] != 3 {
+		t.Fatalf("claim must be released fenced on attempt 3: released=%v fenced=%v", store.released, store.fencedAttempts)
+	}
+	if store.dead || store.succeeded || store.retryDraft != nil {
+		t.Fatalf("interrupted attempt must not finish the delivery: dead=%v succeeded=%v retry=%+v",
+			store.dead, store.succeeded, store.retryDraft)
+	}
+	if len(store.attempts) != 0 {
+		t.Fatalf("interrupted attempt must not be recorded as a failure: %+v", store.attempts)
+	}
+}
+
+// TestDeliveryWorker_StaleOutcomeIsDiscarded proves outcome writes are fenced
+// on the claimed attempt, and a lost lease is logged and dropped instead of
+// failing (and endlessly retrying) the job.
+func TestDeliveryWorker_StaleOutcomeIsDiscarded(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	for _, lost := range []bool{false, true} {
+		store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 1, 3), leaseLost: lost}
+		worker, _ := testWorker(store, loopbackWebhookClient(t))
+		worker.codec = codec
+		payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+		if err := worker.Handle(context.Background(), payload); err != nil {
+			t.Fatalf("leaseLost=%v: Handle(): %v", lost, err)
+		}
+		if len(store.fencedAttempts) != 1 || store.fencedAttempts[0] != 2 {
+			t.Fatalf("leaseLost=%v: outcome must be fenced on the claimed attempt 2, got %v", lost, store.fencedAttempts)
+		}
+		if store.succeeded == lost {
+			t.Fatalf("leaseLost=%v: succeeded=%v", lost, store.succeeded)
+		}
+	}
+}
+
+// TestDeliveryWorker_RotationGraceCoSigns proves a retry whose snapshot
+// predates a secret rotation is signed with both secrets inside the grace
+// period and with the current secret alone after it.
+func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
+	codec, oldCiphertext := testCodec(t)
+	oldSecret := []byte("whsec_test_secret")
+	newSecret := []byte("whsec_rotated_secret")
+	newCiphertext, err := codec.Seal(newSecret)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		rotatedAt time.Time
+		oldValid  bool
+	}{
+		{"inside grace", now.Add(-time.Hour), true},
+		{"after grace", now.Add(-secretRotationGrace - time.Minute), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var newErr, oldErr error
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				newErr = webhook.VerifyRequest(newSecret, r.Header, body, time.Minute, now)
+				oldErr = webhook.VerifyRequest(oldSecret, r.Header, body, time.Minute, now)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			store := &fakeWorkerStore{
+				delivery:     fixedDelivery(server.URL, oldCiphertext, 0, 3),
+				activeSecret: &repository.SigningSecret{Ciphertext: newCiphertext, CreatedAt: tc.rotatedAt},
+			}
+			worker, _ := testWorker(store, loopbackWebhookClient(t))
+			worker.codec = codec
+			payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+			if err := worker.Handle(context.Background(), payload); err != nil {
+				t.Fatalf("Handle(): %v", err)
+			}
+			if newErr != nil {
+				t.Fatalf("a receiver on the rotated secret must verify: %v", newErr)
+			}
+			if tc.oldValid && oldErr != nil {
+				t.Fatalf("a receiver still on the snapshot secret must verify inside the grace: %v", oldErr)
+			}
+			if !tc.oldValid && !errors.Is(oldErr, webhook.ErrInvalidSignature) {
+				t.Fatalf("snapshot secret must stop signing after the grace, got %v", oldErr)
+			}
+		})
 	}
 }

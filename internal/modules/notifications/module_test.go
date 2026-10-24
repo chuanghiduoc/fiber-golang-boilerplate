@@ -72,7 +72,7 @@ func (s *routeService) ListPreferences(context.Context, int64) ([]dto.Preference
 }
 
 func (s *routeService) SetPreference(_ context.Context, userID int64, req dto.UpdatePreferenceRequest) (*dto.PreferenceResponse, error) {
-	return &dto.PreferenceResponse{ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: req.Enabled}, nil
+	return &dto.PreferenceResponse{ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: *req.Enabled}, nil
 }
 
 func newRouteApp(t *testing.T, svc *routeService) *fiber.App {

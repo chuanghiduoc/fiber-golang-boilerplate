@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 )
 
 type recordingWebhookDispatcher struct {
@@ -52,6 +53,61 @@ func TestUploadDispatchesWebhookEvent(t *testing.T) {
 	}
 	if dispatcher.events[1].Type != webhookcontracts.EventFileDeleted {
 		t.Errorf("event type = %q, want %q", dispatcher.events[1].Type, webhookcontracts.EventFileDeleted)
+	}
+}
+
+func TestUserRestoreDispatchesWebhookEvent(t *testing.T) {
+	repo := newMockFileRepo()
+	svc := newTestUploadService(repo, newMockStorage())
+	dispatcher := &recordingWebhookDispatcher{}
+	AttachWebhookDispatcher(svc, dispatcher)
+
+	resp, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if err := svc.Delete(context.Background(), resp.ID, 1); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := svc.Restore(context.Background(), resp.ID, 1); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if len(dispatcher.events) != 3 {
+		t.Fatalf("events = %d, want 3", len(dispatcher.events))
+	}
+	event := dispatcher.events[2]
+	if event.Type != webhookcontracts.EventFileRestored || event.TenantID != 1 {
+		t.Fatalf("restore event = %+v, want %q for tenant 1", event, webhookcontracts.EventFileRestored)
+	}
+	if !strings.Contains(string(event.Data), `"id":1`) {
+		t.Errorf("payload = %s, want file id", event.Data)
+	}
+}
+
+func TestAdminDeleteAndRestoreDispatchWebhookEvents(t *testing.T) {
+	repo := newFakeAdminFileRepo()
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
+	dispatcher := &recordingWebhookDispatcher{}
+	AttachAdminWebhookDispatcher(svc, dispatcher)
+	seedAdminFiles(repo, 1)
+
+	if err := svc.DeleteFile(context.Background(), 1); err != nil {
+		t.Fatalf("admin delete: %v", err)
+	}
+	if _, err := svc.RestoreFile(context.Background(), 1); err != nil {
+		t.Fatalf("admin restore: %v", err)
+	}
+	if len(dispatcher.events) != 2 {
+		t.Fatalf("events = %d, want 2", len(dispatcher.events))
+	}
+	for i, want := range []string{webhookcontracts.EventFileDeleted, webhookcontracts.EventFileRestored} {
+		event := dispatcher.events[i]
+		if event.Type != want || event.TenantID != 1 {
+			t.Errorf("event %d = %+v, want %q for tenant 1", i, event, want)
+		}
+		if !strings.Contains(string(event.Data), `"id":1`) {
+			t.Errorf("event %d payload = %s, want file id", i, event.Data)
+		}
 	}
 }
 

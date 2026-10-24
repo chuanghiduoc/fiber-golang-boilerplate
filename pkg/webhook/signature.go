@@ -42,6 +42,10 @@ const (
 	DefaultTolerance = 5 * time.Minute
 	// UserAgent identifies outbound delivery requests.
 	UserAgent = "fiber-golang-boilerplate-webhooks/1.0"
+	// maxTimestampSeconds (9999-12-31T23:59:59Z) rejects values that are not
+	// plausible Unix seconds, such as millisecond timestamps far in the future
+	// or values whose time.Time arithmetic would saturate.
+	maxTimestampSeconds = 253402300799
 )
 
 var (
@@ -103,12 +107,12 @@ func Verify(secret []byte, id, eventType string, timestamp time.Time, signature 
 	if timestamp.IsZero() {
 		return ErrMissingTimestamp
 	}
-	skew := now.Sub(timestamp)
-	if skew < 0 {
-		skew = -skew
-	}
-	if skew > tolerance {
-		return fmt.Errorf("%w: skew %s exceeds %s", ErrTimestampOutOfRange, skew.Truncate(time.Second), tolerance)
+	// Compare against window bounds instead of computing now.Sub(timestamp):
+	// time.Duration saturates for instants ~292 years apart and negating
+	// math.MinInt64 overflows back to negative, which would let a far-future
+	// or millisecond-unit timestamp pass any tolerance.
+	if timestamp.Before(now.Add(-tolerance)) || timestamp.After(now.Add(tolerance)) {
+		return fmt.Errorf("%w: tolerance %s", ErrTimestampOutOfRange, tolerance)
 	}
 
 	candidates := splitSignatures(signature)
@@ -140,7 +144,7 @@ func VerifyRequest(secret []byte, headers http.Header, body []byte, tolerance ti
 		return ErrMissingTimestamp
 	}
 	seconds, err := strconv.ParseInt(rawTimestamp, 10, 64)
-	if err != nil {
+	if err != nil || seconds <= 0 || seconds > maxTimestampSeconds {
 		return ErrInvalidTimestamp
 	}
 	signature := headers.Get(HeaderSignature)

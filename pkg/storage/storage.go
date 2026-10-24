@@ -2,11 +2,15 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
+
+// ErrNotFound is returned (wrapped) by Get when no object exists at the path.
+var ErrNotFound = errors.New("storage: object not found")
 
 type Storage interface {
 	Put(ctx context.Context, path string, reader io.Reader, size int64, contentType string) error

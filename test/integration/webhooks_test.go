@@ -842,3 +842,56 @@ func (h *webhookHarness) deliveryID(t *testing.T, eventID string) int64 {
 	).Scan(&id))
 	return id
 }
+
+// TestWebhooks_OutcomeWritesAreFencedByAttempt proves a stale worker whose
+// claim lease expired cannot overwrite the newer attempt's result, and that an
+// interrupted attempt is given back to the budget with its lease cleared.
+func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
+	h := setupWebhookHarness(t)
+	ctx := tenant.WithID(context.Background(), h.tenantA)
+	h.createEndpoint(t, h.tokenA, "http://127.0.0.1:9/hook", "fence.test")
+
+	event := webhookcontracts.Event{ID: "evt_fence", Type: "fence.test", TenantID: h.tenantA}
+	created, err := h.dispatcher.Dispatch(ctx, event)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	id := h.deliveryID(t, event.ID)
+
+	expireLease := func() {
+		t.Helper()
+		_, err := h.pool.Exec(ctx, `UPDATE webhook_deliveries SET next_attempt_at = NOW() - interval '1 second' WHERE id = $1`, id)
+		require.NoError(t, err)
+	}
+	stale, err := h.repo.ClaimDelivery(ctx, id, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), stale.Attempts)
+	expireLease()
+	current, err := h.repo.ClaimDelivery(ctx, id, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, int32(2), current.Attempts)
+
+	// Every outcome write from the stale attempt is discarded.
+	require.ErrorIs(t, h.repo.MarkDeliverySucceeded(ctx, id, stale.Attempts, http.StatusOK), webhookrepo.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.MarkDeliveryDead(ctx, id, stale.Attempts, http.StatusBadRequest, "stale"), webhookrepo.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.RescheduleDeliveryWithJob(ctx, webhookrepo.RetryDraft{
+		DeliveryID: id, Attempt: stale.Attempts, NextAttemptAt: time.Now().Add(time.Hour),
+	}), webhookrepo.ErrDeliveryLeaseLost)
+	got, err := h.repo.GetDelivery(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", got.Status)
+	assert.Equal(t, int32(2), got.Attempts)
+
+	// The current attempt is interrupted by shutdown: it is given back and
+	// immediately claimable again with the same attempt number.
+	require.NoError(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts))
+	require.ErrorIs(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts), webhookrepo.ErrDeliveryLeaseLost)
+	reclaimed, err := h.repo.ClaimDelivery(ctx, id, time.Minute)
+	require.NoError(t, err, "a released claim must be claimable without waiting for the lease")
+	assert.Equal(t, int32(2), reclaimed.Attempts)
+
+	// The current attempt's own result is applied.
+	require.NoError(t, h.repo.MarkDeliverySucceeded(ctx, id, reclaimed.Attempts, http.StatusNoContent))
+	got, err = h.repo.GetDelivery(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, "succeeded", got.Status)
+}

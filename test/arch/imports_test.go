@@ -178,8 +178,11 @@ func checkStdlibOnly(t *testing.T, dir string) {
 
 func checkNoBusinessImports(t *testing.T, dir string) {
 	t.Helper()
-	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") {
 			return nil
 		}
 		for _, imp := range parseImports(t, path) {
@@ -189,6 +192,9 @@ func checkNoBusinessImports(t *testing.T, dir string) {
 		}
 		return nil
 	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
 }
 
 func parseImports(t *testing.T, path string) []string {

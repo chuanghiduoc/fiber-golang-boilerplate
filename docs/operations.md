@@ -37,6 +37,12 @@ Readiness details contain only `database` (`up`, `busy`, or `down`) and
 | `busy` | any | `degraded` | `200` |
 | `down` | any | `down` | `503` |
 
+`/readyz` and `/health` are unauthenticated, so one readiness result is reused
+for 1s (`readinessCacheTTL` in `pkg/health`) and concurrent probes share the
+single in-flight check; a flood of probe requests issues at most about one
+PostgreSQL and one cache ping per second per pod. A check cut short by the
+caller disconnecting is not cached.
+
 `busy` means the ping timed out while every pool connection was checked out
 (`AcquiredConns >= MaxConns`). Those connections are serving requests against a
 reachable database, so the pod stays in rotation; removing every saturated pod
@@ -182,6 +188,10 @@ values, then compiled defaults. `FEATURE_FLAGS_FORCE_OFF` and a flag's kill
 switch always win. Check `feature_flag_snapshot_loads_total{result="error"}`,
 `feature_flag_snapshot_fallback_total`, and
 `feature_flag_snapshot_age_seconds` when behavior diverges between replicas.
+A TTL-expired snapshot within the max staleness is served while a single
+background reload runs, so a slow database raises the snapshot age instead of
+request latency; only a cold cache or an `Invalidate` makes callers wait (up
+to 5s) for the load.
 
 Admin writes invalidate only the replica that served the request; other
 replicas converge within `FEATURE_FLAGS_CACHE_TTL_SECONDS` (30s by default).
@@ -211,8 +221,10 @@ request is sampled, records also include `trace_id` and `span_id`.
   sensitive parameters; do not put secrets in URLs.
 - Request and response bodies are not logged. Keep it that way.
 
-`X-Request-Id` is accepted from a client only if it is 1–128 characters of
-`[A-Za-z0-9._:-]`; otherwise the API generates a UUID. The value
+An inbound `X-Request-Id` is honored only when the direct peer is a trusted
+proxy (`APP_TRUST_PROXY=true` and the peer is in `APP_TRUSTED_PROXIES`) and the
+value is 1–128 characters of `[A-Za-z0-9._:-]`; otherwise the API generates a
+UUID, so ordinary clients cannot forge or collide correlation IDs. The value
 is echoed on the response and included in RFC 9457 problem responses as
 `requestId`. Use it to correlate logs, audit events, and client reports:
 
@@ -253,8 +265,9 @@ Idempotent replays are skipped so a replay does not duplicate the trail, and
 audit rows are never cached with the idempotency response. When no tenant
 middleware ran (for example an internal call or a pre-tenant test), the event
 uses the compatibility tenant id 1. `audit_events` is append-only: only a
-started HTTP intent can transition to a terminal outcome, and only completion
-fields may change. Alert on `audit_intent_failures_total`,
+started HTTP intent can transition to a terminal outcome, only completion
+fields may change, and `DELETE`/`TRUNCATE` are rejected by triggers (a reviewed
+retention job must disable `trigger_audit_events_no_delete` as the owner). Alert on `audit_intent_failures_total`,
 `audit_completion_failures_total`, `audit_tx_missing_total`, and
 `audit_domain_missing_total`; investigate rows where
 `outcome = 'started' AND created_at < NOW() - INTERVAL '10 minutes'`. See
@@ -272,10 +285,11 @@ Every job is tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` resolve
 an explicit positive `Job.TenantID` is kept. The claim query returns the column
 and the worker installs `tenant.WithID(ctx, job.TenantID)` before invoking the
 handler, so email and audit handlers run with the tenant that enqueued the job.
-A claimed row with no tenant falls back to tenant 1 for compatibility. The
-`(tenant_id, status, run_at)` and `(tenant_id, kind, status)` indexes support
-tenant-first inspection. Retention and Prometheus labels are deliberately
-global: terminal jobs are purged by age regardless of tenant, and the metric
+A claimed row with no tenant falls back to tenant 1 for compatibility. Claim,
+lease recovery, and purge are global passes, so the only tenant-leading jobs
+index is the `(tenant_id, idempotency_key)` dedupe key; ad-hoc per-tenant
+inspection scans `idx_jobs_status_run_at`. Retention and Prometheus labels are
+deliberately global: terminal jobs are purged by age regardless of tenant, and the metric
 labels stay `kind` only to avoid cardinality growth.
 
 Enqueue captures the active W3C `traceparent` in `jobs.trace_parent` when the
@@ -473,7 +487,7 @@ Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
 
 `internal/platform/events` publishes metadata-rich events locally and/or as
 jobs. A durable subscription adds one job per event and handler, with
-`jobs.idempotency_key = event:<eventId>:<handler>:<tenantId>`. The job payload
+`jobs.idempotency_key = event:<eventName>:<eventId>:<handler>:<tenantId>`. The job payload
 is the event JSON, so `jobs.payload` contains the event data. Delivery is
 at-least-once; handlers must be idempotent. Local handler panics are recovered
 and combined with `errors.Join`; check `events_handled_total{outcome="panic"}`
@@ -530,7 +544,7 @@ ORDER BY count(*) DESC;
 
 Outbound deliveries reuse the durable jobs queue under the
 `webhook.delivery` kind. Producers with a transaction (registration, file
-upload/delete) enqueue a `webhook.dispatch` fan-out job in that transaction;
+upload/delete/restore, admin file delete/restore) enqueue a `webhook.dispatch` fan-out job in that transaction;
 the fan-out commits a `webhook_deliveries` row and its first job atomically per
 endpoint; the worker sends one signed attempt and schedules the next attempt as
 a new job. Delivery is at-least-once, so receivers must deduplicate on
@@ -556,12 +570,21 @@ the earlier `<timestamp>.<body>`; see [Webhooks](webhooks.md)).
 - Each attempt uses the endpoint's `timeoutMs` (snapshotted on the delivery),
   bounded by `WEBHOOK_REQUEST_TIMEOUT_SECS`. The attempt and its outcome are
   recorded with a detached 5s context even during shutdown.
+- A shutdown that cancels an attempt before any response arrives gives the
+  attempt back (`attempts` is decremented, the lease cleared) and the job is
+  released without consuming its job attempt, so a drain cannot dead-letter a
+  delivery on its final attempt. Expect a possible duplicate send instead.
+- Outcome writes are fenced by the claimed attempt; a `claim lease lost` warning
+  means a slow worker's stale result was discarded because a newer attempt
+  owned the delivery.
 - Every attempt is recorded with status code, duration, and a bounded error.
   Response bodies are not stored.
-- Endpoint edits/rotation do not change queued deliveries: URL, payload, event
+- Endpoint edits do not change queued deliveries: URL, payload, event
   timestamp, attempt budget, and the sealed secret are snapshotted at dispatch.
-  Replay creates a new delivery with the endpoint's current URL and active
-  secret.
+  After a secret rotation, attempts of older deliveries are co-signed with the
+  snapshot and current secret for 24 hours, then signed with the current
+  secret only. Replay creates a new delivery with the endpoint's current URL
+  and active secret.
 
 ### Inspecting deliveries
 
@@ -707,9 +730,26 @@ Behavior to remember:
   Redis cannot race. A client can send up to twice the limit across a window
   boundary. Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
   `X-RateLimit-Reset`, and `Retry-After` on `429`.
+- Protected routes also pass a per-client-IP `auth` tier
+  (`RATE_LIMIT_AUTH_MAX`, default 300 per `RATE_LIMIT_AUTH_WINDOW_SECS`, 60)
+  inside `Deps.Authenticate()`, **before** the token or API key is checked.
+  The per-user tiers run after authentication and cannot see the caller
+  earlier, so without it a flood of bogus `Authorization: ApiKey ...` headers
+  would cost one database lookup each. Every request from one IP counts, so
+  clients behind a shared NAT share this budget; raise it rather than remove
+  it. It sets only `Retry-After` on `429`, no `X-RateLimit-*` headers.
 - Rate-limit cache errors fail open: the request is allowed, a warning is
   logged, and `rate_limit_errors_total{tier}` increments. Login lockouts are a
   separate, fail-closed mechanism and are not relaxed by a cache error.
+- Fail-open must also be fail-fast. Each rate-limit increment is bounded to
+  250ms, idempotency lookups/claims to 250ms, and the post-handler response
+  write and lock release to 500ms. The Redis client itself uses short bounds
+  (`REDIS_DIAL_TIMEOUT_MS=2000`, `REDIS_READ_TIMEOUT_MS=500`,
+  `REDIS_WRITE_TIMEOUT_MS=500`, `REDIS_POOL_TIMEOUT_MS=1000`,
+  `REDIS_MAX_RETRIES=1`; these override timeout/retry parameters in
+  `REDIS_URL`) instead of go-redis's 5s dial, 3s read, and 3 retries, so a
+  blackholed Redis adds well under a second per request rather than stalling
+  every request.
 
 Operational checks:
 
@@ -953,8 +993,11 @@ Other caveats:
   does not advertise STARTTLS will fail sends.
 - **S3 / SeaweedFS:** set `STORAGE_DRIVER=s3` (AWS S3) or `seaweedfs` (the
   SeaweedFS S3 gateway, default port 8333), endpoint (`host:port`, no scheme),
-  region, bucket, access key, and secret key; enable `STORAGE_S3_USE_SSL` in
-  production. The client is aws-sdk-go-v2: `*.amazonaws.com` endpoints use
+  region, bucket, access key, and secret key. Production rejects
+  `STORAGE_S3_USE_SSL=false` unless `STORAGE_S3_ALLOW_INSECURE=true`
+  explicitly acknowledges plaintext storage traffic (only for storage reachable
+  solely over a trusted private network, such as a cluster-local SeaweedFS
+  behind a NetworkPolicy). The client is aws-sdk-go-v2: `*.amazonaws.com` endpoints use
   virtual-hosted addressing and the SDK's default checksums; every other
   endpoint (SeaweedFS, other S3-compatible servers) uses path-style
   addressing and checksums only when required. `minio` is no longer an
@@ -977,32 +1020,48 @@ Other caveats:
 - **Request bodies:** Fiber's `APP_BODY_LIMIT` (12 MiB) is the multipart upload
   ceiling. Every non-multipart body is capped by `APP_JSON_BODY_LIMIT` (default
   1 MiB, must not exceed `APP_BODY_LIMIT`) and rejected with `413
-  payload_too_large` before auth, rate limiting, or decoding. Residual risk:
-  Fiber buffers the whole body before middleware runs, so a non-multipart
-  request (including a chunked body without `Content-Length`) can still make a
-  pod read up to `APP_BODY_LIMIT` before rejection, and a client can label a
-  non-upload body `multipart/form-data` to reach the larger limit. Keep an
-  ingress body limit in front of the API.
+  payload_too_large` before auth, rate limiting, or decoding. Fiber-generated
+  413s (bodies above `APP_BODY_LIMIT`, rejected before any middleware) use the
+  same `payload_too_large` code, but carry no CORS, request-ID, or locale
+  headers because no middleware ran. Request bodies with any
+  `Content-Encoding` other than `identity` are rejected with `415
+  unsupported_media_type`: Fiber transparently decompresses gzip/br/deflate/
+  zstd, so a small compressed body would otherwise expand past the limit after
+  the check. Residual risk: Fiber buffers the whole body before middleware
+  runs, so a non-multipart request (including a chunked body without
+  `Content-Length`) can still make a pod read up to `APP_BODY_LIMIT` before
+  rejection, and a client can label a non-upload body `multipart/form-data` to
+  reach the larger limit on any route (the check runs before routing, and
+  `Bind().Body()` decodes multipart fields). Keep an ingress body limit in
+  front of the API.
 
 ### Graceful shutdown
 
 `terminationGracePeriodSeconds: 30` covers the 5s `preStop` sleep plus one
-shared 20s shutdown budget (`shutdownBudget` in `cmd/api/main.go`), leaving a
-5s margin before SIGKILL. After SIGTERM the process:
+shared 20s shutdown budget (`config.ShutdownBudget`), leaving a 5s margin
+before SIGKILL. The first 15s (budget minus `config.ShutdownReserve`) drain
+work; config validation rejects an `APP_REQUEST_TIMEOUT` above 15s so an
+in-flight request always fits that window (the default and the ConfigMap use
+15). After SIGTERM the process:
 
 1. stops accepting HTTP and drains in-flight requests, concurrently with
    cancelling the scheduler and then the job worker (they only need the pool
    and cache, which stay open);
 2. waits for `pkg/async` goroutines (post-commit emails started by handlers)
    once HTTP has stopped, so no new ones appear;
-3. flushes spans, bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` and the remaining
-   budget;
-4. closes the cache and the database pool.
+3. flushes spans, bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` and the budget left
+   after a 2s close reserve, but always given at least 1s;
+4. closes modules, the cache, and the database pool. `pgxpool.Close` waits
+   for every checked-out connection, so it runs in a goroutine bounded by the
+   rest of the budget (at least 1s); if a job or handler that ignored
+   cancellation still holds a connection, the process logs `database pool did
+   not close before the shutdown deadline` with the acquired count and exits
+   anyway.
 
-Every phase uses the same deadline, so a slow phase shortens the later ones
+The drain phases share one deadline, so a slow phase shortens the later ones
 instead of extending the total. A phase that misses the deadline logs a
 warning; HTTP forced shutdown sets exit code 1. Raise
-`terminationGracePeriodSeconds` and `shutdownBudget` together.
+`terminationGracePeriodSeconds` and `config.ShutdownBudget` together.
 - **Database connections:** `DB_MAX_CONNS` is per pod. Keep
   `DB_MAX_CONNS * maxReplicas` below the database limit; production uses 10
   with HPA max 10, for at most 100 connections. Staging uses 5 with max 4.

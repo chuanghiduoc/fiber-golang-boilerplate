@@ -170,22 +170,29 @@ WHERE webhook_deliveries.id = @id
       )
   );
 
--- name: MarkWebhookDeliverySucceeded :exec
+-- The outcome writes below are fenced by the attempt the worker claimed
+-- (attempts = @attempts): when a claim lease expired and another worker
+-- claimed the next attempt, the stale worker's write affects no row instead of
+-- overwriting the newer attempt's result.
+
+-- name: MarkWebhookDeliverySucceeded :execrows
 UPDATE webhook_deliveries
 SET status = 'succeeded',
     delivered_at = NOW(),
     next_attempt_at = NOW(),
     last_status_code = NULLIF(@status_code::integer, 0),
     last_error = NULL
-WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending';
+WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending'
+  AND attempts = @attempts;
 
--- name: MarkWebhookDeliveryDead :exec
+-- name: MarkWebhookDeliveryDead :execrows
 UPDATE webhook_deliveries
 SET status = 'dead',
     next_attempt_at = NOW(),
     last_status_code = NULLIF(@status_code::integer, 0),
     last_error = @last_error
-WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending';
+WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending'
+  AND attempts = @attempts;
 
 -- name: RescheduleWebhookDelivery :execrows
 UPDATE webhook_deliveries
@@ -193,7 +200,19 @@ SET status = 'pending',
     next_attempt_at = @next_attempt_at,
     last_status_code = NULLIF(@status_code::integer, 0),
     last_error = @last_error
-WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending';
+WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending'
+  AND attempts = @attempts;
+
+-- name: ReleaseWebhookDeliveryClaim :execrows
+-- Gives back a claimed attempt that was interrupted by worker shutdown before
+-- a response arrived, so a drain on the final attempt cannot dead-letter a
+-- delivery that may never have been sent. The claim lease is cleared so the
+-- requeued job can claim it again immediately.
+UPDATE webhook_deliveries
+SET attempts = attempts - 1,
+    next_attempt_at = NOW()
+WHERE id = @id AND tenant_id = @tenant_id AND status = 'pending'
+  AND attempts = @attempts AND attempts > 0;
 
 -- name: CreateWebhookDeliveryAttempt :one
 INSERT INTO webhook_delivery_attempts (
@@ -210,14 +229,6 @@ RETURNING id;
 SELECT * FROM webhook_delivery_attempts
 WHERE tenant_id = @tenant_id AND delivery_id = @delivery_id
 ORDER BY attempt ASC;
-
--- name: CountWebhookDeliveriesByStatus :one
-SELECT
-    count(*) FILTER (WHERE status = 'pending')::bigint AS pending,
-    count(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
-    count(*) FILTER (WHERE status = 'dead')::bigint AS dead
-FROM webhook_deliveries
-WHERE tenant_id = @tenant_id;
 
 -- name: PurgeWebhookDeliveries :execrows
 -- One bounded retention batch, served by idx_webhook_deliveries_terminal_updated_at.

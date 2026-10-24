@@ -104,27 +104,60 @@ func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Durat
 	return &delivery, nil
 }
 
-func (r *Postgres) MarkDeliverySucceeded(ctx context.Context, id int64, statusCode int) error {
+// MarkDeliverySucceeded finishes the claimed attempt. It returns
+// ErrDeliveryLeaseLost when the delivery is terminal or a newer attempt was
+// claimed.
+func (r *Postgres) MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error {
 	if r == nil || r.q == nil {
 		return ErrNoPool
 	}
-	return r.q.MarkWebhookDeliverySucceeded(ctx, webhooksqlc.MarkWebhookDeliverySucceededParams{
+	affected, err := r.q.MarkWebhookDeliverySucceeded(ctx, webhooksqlc.MarkWebhookDeliverySucceededParams{
 		StatusCode: httpStatus(statusCode),
 		ID:         id,
 		TenantID:   tenantID(ctx),
+		Attempts:   attempt,
 	})
+	return fencedResult(affected, err)
 }
 
-func (r *Postgres) MarkDeliveryDead(ctx context.Context, id int64, statusCode int, reason string) error {
+// MarkDeliveryDead dead-letters the claimed attempt, fenced like
+// MarkDeliverySucceeded.
+func (r *Postgres) MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error {
 	if r == nil || r.q == nil {
 		return ErrNoPool
 	}
-	return r.q.MarkWebhookDeliveryDead(ctx, webhooksqlc.MarkWebhookDeliveryDeadParams{
+	affected, err := r.q.MarkWebhookDeliveryDead(ctx, webhooksqlc.MarkWebhookDeliveryDeadParams{
 		StatusCode: httpStatus(statusCode),
 		LastError:  text(reason),
 		ID:         id,
 		TenantID:   tenantID(ctx),
+		Attempts:   attempt,
 	})
+	return fencedResult(affected, err)
+}
+
+// ReleaseDeliveryClaim returns an interrupted claimed attempt to the budget
+// and clears the claim lease, fenced like MarkDeliverySucceeded.
+func (r *Postgres) ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error {
+	if r == nil || r.q == nil {
+		return ErrNoPool
+	}
+	affected, err := r.q.ReleaseWebhookDeliveryClaim(ctx, webhooksqlc.ReleaseWebhookDeliveryClaimParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+		Attempts: attempt,
+	})
+	return fencedResult(affected, err)
+}
+
+func fencedResult(affected int64, err error) error {
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return ErrDeliveryLeaseLost
+	}
+	return nil
 }
 
 func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error {
@@ -142,14 +175,15 @@ func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft RetryDra
 			LastError:     text(draft.Error),
 			ID:            draft.DeliveryID,
 			TenantID:      tid,
+			Attempts:      draft.Attempt,
 		})
 		if err != nil {
 			return err
 		}
 		if affected == 0 {
-			// The delivery became terminal between claim and reschedule. Do not
-			// enqueue work for a finished delivery.
-			return nil
+			// The delivery became terminal, or a newer attempt was claimed,
+			// between claim and reschedule. Do not enqueue work for it.
+			return ErrDeliveryLeaseLost
 		}
 		return enqueueDeliveryJob(ctx, tx, r.queue, tid, draft.DeliveryID, draft.NextAttemptAt)
 	})

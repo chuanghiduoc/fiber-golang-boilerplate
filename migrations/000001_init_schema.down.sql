@@ -9,9 +9,12 @@ BEGIN
     END IF;
     IF to_regclass('audit_events') IS NOT NULL THEN
         DROP TRIGGER IF EXISTS trigger_audit_events_completion ON audit_events;
+        DROP TRIGGER IF EXISTS trigger_audit_events_no_delete ON audit_events;
+        DROP TRIGGER IF EXISTS trigger_audit_events_no_truncate ON audit_events;
     END IF;
 END $$;
 
+DROP FUNCTION IF EXISTS audit_events_append_only();
 DROP FUNCTION IF EXISTS audit_events_completion_guard();
 DROP FUNCTION IF EXISTS protect_last_admin();
 

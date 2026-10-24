@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -167,5 +168,70 @@ func TestVerifyRequest_Valid(t *testing.T) {
 	headers.Set(HeaderID, "evt_replayed")
 	if err := VerifyRequest(secret, headers, body, time.Minute, now); !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("replayed id error = %v, want ErrInvalidSignature", err)
+	}
+}
+
+// TestVerify_FarTimestampsDoNotOverflow guards the skew check: a timestamp
+// ~292+ years from now saturates time.Duration, and negating math.MinInt64
+// stays negative, so the old abs(now-ts) check accepted it under any
+// tolerance. Each signature here is valid for its timestamp.
+func TestVerify_FarTimestampsDoNotOverflow(t *testing.T) {
+	secret := []byte("secret")
+	body := []byte(`{}`)
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		timestamp time.Time
+	}{
+		{"milliseconds as seconds", time.Unix(now.UnixMilli(), 0).UTC()},
+		{"max int64 seconds", time.Unix(math.MaxInt64, 0).UTC()},
+		{"min int64 seconds", time.Unix(math.MinInt64, 0).UTC()},
+		{"500 years ahead", now.AddDate(500, 0, 0)},
+		{"500 years ago", now.AddDate(-500, 0, 0)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signature := SignatureHeader(Sign(secret, testID, testEvent, tc.timestamp, body))
+			err := Verify(secret, testID, testEvent, tc.timestamp, signature, body, time.Minute, now)
+			if !errors.Is(err, ErrTimestampOutOfRange) {
+				t.Fatalf("Verify() error = %v, want ErrTimestampOutOfRange", err)
+			}
+		})
+	}
+}
+
+func TestVerifyRequest_RejectsImplausibleTimestamps(t *testing.T) {
+	secret := []byte("secret")
+	body := []byte(`{}`)
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name string
+		raw  string
+		want error
+	}{
+		{"zero", "0", ErrInvalidTimestamp},
+		{"negative", "-1", ErrInvalidTimestamp},
+		{"min int64", strconv.FormatInt(math.MinInt64, 10), ErrInvalidTimestamp},
+		{"max int64", strconv.FormatInt(math.MaxInt64, 10), ErrInvalidTimestamp},
+		{"milliseconds", strconv.FormatInt(now.UnixMilli(), 10), ErrInvalidTimestamp},
+		{"year 3000 seconds", strconv.FormatInt(time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC).Unix(), 10), ErrTimestampOutOfRange},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			seconds, err := strconv.ParseInt(tc.raw, 10, 64)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tc.raw, err)
+			}
+			headers := http.Header{}
+			headers.Set(HeaderID, testID)
+			headers.Set(HeaderEvent, testEvent)
+			headers.Set(HeaderTimestamp, tc.raw)
+			headers.Set(HeaderSignature, SignatureHeader(Sign(secret, testID, testEvent, time.Unix(seconds, 0), body)))
+			if err := VerifyRequest(secret, headers, body, time.Minute, now); !errors.Is(err, tc.want) {
+				t.Fatalf("VerifyRequest() error = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }

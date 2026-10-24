@@ -24,8 +24,9 @@ type Module struct {
 
 	// userSvc and startup are set by Build; a module built with New (tests)
 	// has neither.
-	userSvc identityservice.UserService
-	startup func(ctx context.Context) error
+	userSvc  identityservice.UserService
+	resetSvc identityservice.PasswordResetService
+	startup  func(ctx context.Context) error
 }
 
 // New builds the module from its handlers. Production uses Build.
@@ -76,7 +77,11 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	auth.Post("/verify-email", rl.Normal, guard("auth.email_verified", "auth"), m.auth.VerifyEmail)
 	auth.Post("/resend-verification", rl.Normal, guard("auth.verification_resent", "auth"), m.auth.ResendVerification)
 	auth.Get("/google", rl.Normal, m.auth.GoogleRedirect)
-	auth.Get("/google/callback", rl.Normal, guard("auth.google_login", "auth"), m.auth.GoogleCallback)
+	// The callback is Tier 1: tenant middleware skips it and the tenant comes
+	// from the signed state, which a route-level Guard would record too early
+	// (tenant 1, anonymous). UserService writes auth.google_login with the
+	// state tenant and the signed-in user in the sign-in transaction.
+	auth.Get("/google/callback", rl.Normal, m.auth.GoogleCallback)
 
 	users := v1.Group("/users", deps.Authenticate())
 	users.Get("/me", rl.Relaxed, authz.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)

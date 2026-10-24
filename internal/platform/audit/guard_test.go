@@ -249,6 +249,20 @@ func TestGuard_CompletesWithActorAfterHandler(t *testing.T) {
 	assert.Equal(t, "admin", recorder.completions[0].Completion.ActorRole)
 }
 
+func TestGuard_ResourceIDFallsBackToKeyParam(t *testing.T) {
+	recorder := &guardRecorder{}
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Put("/flags/:key", Guard(recorder, Policy{Mode: ModeRequired, Action: "feature_flag.updated", Resource: "feature_flag"}),
+		func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusForbidden) })
+
+	req, err := http.NewRequest(http.MethodPut, "/flags/user_registration", http.NoBody)
+	require.NoError(t, err)
+	_, err = app.Test(req)
+	require.NoError(t, err)
+	require.Len(t, recorder.intents, 1)
+	assert.Equal(t, "user_registration", recorder.intents[0].ResourceID)
+}
+
 func TestGuard_HashesIdempotencyKey(t *testing.T) {
 	recorder := &guardRecorder{}
 	app := newGuardApp(recorder, Policy{Mode: ModeRequired, Action: "user.banned", Resource: "user"}, func(c fiber.Ctx) error {

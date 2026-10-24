@@ -693,6 +693,7 @@ definitions:
         type: string
     required:
     - channel
+    - enabled
     - type
     type: object
   dto.UpdateUserRequest:

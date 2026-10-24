@@ -159,6 +159,23 @@ func TestFiberErrorHandler_FiberError(t *testing.T) {
 	}
 }
 
+func TestFiberErrorHandler_BodyLimitUsesPayloadTooLargeCode(t *testing.T) {
+	// Fiber's server error handler passes fiber.ErrRequestEntityTooLarge to the
+	// configured ErrorHandler when a body exceeds Config.BodyLimit.
+	result, status, _ := decodeProblem(t, func(fiber.Ctx) error { return fiber.ErrRequestEntityTooLarge })
+	if status != fiber.StatusRequestEntityTooLarge || result["code"] != "payload_too_large" ||
+		result["type"] != "/errors/payload-too-large" || result["detail"] != "request body too large" {
+		t.Fatalf("fiber.ErrRequestEntityTooLarge rendered %d %v", status, result)
+	}
+
+	result, _, _ = decodeProblem(t, func(fiber.Ctx) error {
+		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "upload exceeds 10 MiB")
+	})
+	if result["code"] != "payload_too_large" || result["detail"] != "upload exceeds 10 MiB" {
+		t.Fatalf("custom 413 rendered %v, want payload_too_large with its detail", result)
+	}
+}
+
 func TestFiberErrorHandler_ClientCanceled(t *testing.T) {
 	result, status, _ := decodeProblem(t, func(c fiber.Ctx) error {
 		return fmt.Errorf("list users: %w", context.Canceled)

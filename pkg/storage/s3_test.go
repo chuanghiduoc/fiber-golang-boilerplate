@@ -1,6 +1,36 @@
 package storage
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+)
+
+type statusError int
+
+func (e statusError) Error() string       { return "http status" }
+func (e statusError) HTTPStatusCode() int { return int(e) }
+
+func TestIsS3NotFound(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"typed NoSuchKey", fmt.Errorf("get: %w", &types.NoSuchKey{}), true},
+		{"plain 404 response", fmt.Errorf("get: %w", statusError(http.StatusNotFound)), true},
+		{"403 response", fmt.Errorf("get: %w", statusError(http.StatusForbidden)), false},
+		{"transport error", errors.New("connection refused"), false},
+	}
+	for _, tc := range cases {
+		if got := isS3NotFound(tc.err); got != tc.want {
+			t.Errorf("%s: isS3NotFound = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
 
 func TestIsAWSEndpoint(t *testing.T) {
 	cases := map[string]bool{

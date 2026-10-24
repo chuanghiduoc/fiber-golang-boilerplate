@@ -5,6 +5,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -124,8 +125,8 @@ func TestSeaweedFSStorageRoundTrip(t *testing.T) {
 			if err := store.Delete(ctx, key); err != nil {
 				t.Fatalf("Delete: %v", err)
 			}
-			if _, err := store.Get(ctx, key); err == nil {
-				t.Fatal("Get after Delete should fail")
+			if _, err := store.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Get after Delete error = %v, want ErrNotFound", err)
 			}
 		})
 	}

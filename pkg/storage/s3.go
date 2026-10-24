@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -153,10 +154,24 @@ func (s *S3Storage) Get(ctx context.Context, path string) (io.ReadCloser, error)
 	})
 	if err != nil {
 		cancel()
+		if isS3NotFound(err) {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+		}
 		return nil, fmt.Errorf("failed to get from S3: %w", err)
 	}
 
 	return &cancelReadCloser{ReadCloser: obj.Body, cancel: cancel}, nil
+}
+
+// isS3NotFound reports a missing object: the typed NoSuchKey error, or any
+// HTTP 404 response (some S3-compatible servers omit the typed error code).
+func isS3NotFound(err error) bool {
+	var noSuchKey *types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var status interface{ HTTPStatusCode() int }
+	return errors.As(err, &status) && status.HTTPStatusCode() == http.StatusNotFound
 }
 
 type cancelReadCloser struct {

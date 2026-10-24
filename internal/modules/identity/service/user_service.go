@@ -28,10 +28,17 @@ import (
 )
 
 const (
-	bcryptCost         = 12
-	maxLoginAttempts   = 5
-	lockoutDuration    = 15 * time.Minute
-	loginAttemptPrefix = "login_attempts:"
+	bcryptCost = 12
+	// maxLoginAttempts is the per-(tenant, email, client IP) budget. Keying by
+	// source means a stranger cannot lock a victim out from one address.
+	maxLoginAttempts = 5
+	// accountLockoutMultiplier sets the global per-(tenant, email) budget,
+	// which still stops guessing distributed across many addresses. One source
+	// contributes at most maxLoginAttempts per window to it.
+	accountLockoutMultiplier = 5
+	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
+	lockoutDuration          = 15 * time.Minute
+	loginAttemptPrefix       = "login_attempts:"
 )
 
 // dummyPasswordHash equalizes the bcrypt work for unknown-email logins so the
@@ -103,7 +110,7 @@ func NewUserService(
 }
 
 func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	email := normalizeEmail(req.Email)
+	email := NormalizeEmail(req.Email)
 	name := strings.TrimSpace(req.Name)
 
 	existing, err := s.repo.GetByEmail(ctx, email)
@@ -194,7 +201,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	// A previous failed-login lockout must not survive registration.
-	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, email))
+	clearLoginAttempts(ctx, s.cache, email)
 
 	response := ToUserResponse(user)
 	if !webhookQueued {
@@ -290,16 +297,15 @@ func (s *userService) RegistrationEmailsTransactional() bool {
 }
 
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
-	email := normalizeEmail(req.Email)
+	email := NormalizeEmail(req.Email)
 
-	// Reserve an attempt before any lookup or password check. The counter is
-	// keyed by the normalized address whether or not an account exists, so a
-	// locked response cannot reveal existence, and the atomic increment means
-	// parallel guesses cannot all pass a stale "not locked yet" read.
-	// Registration clears the key, so pre-locking an unregistered address
-	// cannot lock out its future owner.
-	cacheKey := scopedKey(ctx, loginAttemptPrefix, email)
-	if err := s.reserveLoginAttempt(ctx, cacheKey); err != nil {
+	// Reserve an attempt before any lookup or password check. The counters
+	// are keyed by the normalized address (plus the client IP for the source
+	// budget) whether or not an account exists, so a locked response cannot
+	// reveal existence, and the atomic increments mean parallel guesses cannot
+	// all pass a stale "not locked yet" read. Registration clears the keys, so
+	// pre-locking an unregistered address cannot lock out its future owner.
+	if err := reserveLoginAttempt(ctx, s.cache, email); err != nil {
 		return nil, err
 	}
 
@@ -323,9 +329,9 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 		return nil, apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 
-	// The password was correct: clear the counter even if the account still
+	// The password was correct: clear the counters even if the account still
 	// needs verification, so a correct password never accrues a lockout.
-	s.clearLoginAttempts(ctx, cacheKey)
+	clearLoginAttempts(ctx, s.cache, email)
 
 	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
 		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
@@ -333,25 +339,58 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	return ToUserResponse(user), nil
 }
 
+// loginAttemptKeys returns the per-source key (tenant, email, client IP) and
+// the global per-account key (tenant, email) for one password attempt.
+func loginAttemptKeys(ctx context.Context, email string) (source, account string) {
+	account = scopedKey(ctx, loginAttemptPrefix, email)
+	return account + ":ip=" + clientIPFromContext(ctx), account
+}
+
 // reserveLoginAttempt atomically counts one password attempt and rejects it
-// once more than maxLoginAttempts were made inside the lockout window. It
-// fails closed: when the cache is unavailable the attempt is denied rather
-// than allowed without brute-force protection.
-func (s *userService) reserveLoginAttempt(ctx context.Context, cacheKey string) error {
-	attempts, err := s.cache.Increment(ctx, cacheKey, lockoutDuration)
+// once the source made more than maxLoginAttempts, or all sources together
+// more than maxAccountLoginAttempts, inside the lockout window. A source that
+// is already locked is rejected before it touches the account counter, so one
+// address alone can never exhaust the global budget. It fails closed: when
+// the cache is unavailable the attempt is denied (503) rather than allowed
+// without brute-force protection.
+func reserveLoginAttempt(ctx context.Context, store cache.Cache, email string) error {
+	sourceKey, accountKey := loginAttemptKeys(ctx, email)
+	locked := apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+
+	attempts, err := store.Increment(ctx, sourceKey, lockoutDuration)
 	if err != nil {
-		slog.Error("cache unavailable for login lockout check — denying request for safety", slog.Any("error", err))
-		return apperror.NewInternal("unable to verify login attempts, please try again later")
+		return loginLockoutUnavailable(err)
 	}
 	if attempts > maxLoginAttempts {
-		return apperror.NewTooManyRequests(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+		return locked
+	}
+	attempts, err = store.Increment(ctx, accountKey, lockoutDuration)
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if attempts > maxAccountLoginAttempts {
+		return locked
 	}
 	return nil
 }
 
-func (s *userService) clearLoginAttempts(ctx context.Context, cacheKey string) {
-	if err := s.cache.Delete(ctx, cacheKey); err != nil {
-		slog.Warn("cache error clearing login attempts", slog.Any("error", err))
+func loginLockoutUnavailable(err error) error {
+	slog.Error("cache unavailable for login lockout check — denying request for safety", slog.Any("error", err))
+	return apperror.NewCode(apperror.CodeSystemUnavailable, "unable to verify login attempts, please try again later")
+}
+
+// clearLoginAttempts drops the caller's source counter and the account
+// counter after a proof of the password (or a registration/reset). Other
+// sources' counters expire on their own.
+func clearLoginAttempts(ctx context.Context, store cache.Cache, email string) {
+	if store == nil {
+		return
+	}
+	sourceKey, accountKey := loginAttemptKeys(ctx, email)
+	for _, key := range []string{sourceKey, accountKey} {
+		if err := store.Delete(ctx, key); err != nil {
+			slog.Warn("cache error clearing login attempts", slog.Any("error", err))
+		}
 	}
 }
 
@@ -364,15 +403,15 @@ func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email,
 }
 
 func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string, allowSignUp bool) (*identitysqlc.User, error) {
-	email = normalizeEmail(email)
+	email = NormalizeEmail(email)
 
-	findOrCreate := func(repo repository.UserRepository) (*identitysqlc.User, error) {
+	findOrCreate := func(repo repository.UserRepository) (*identitysqlc.User, string, error) {
 		user, err := repo.GetByGoogleID(ctx, googleID)
 		if err == nil {
-			return user, nil
+			return user, googleAccountExisting, nil
 		}
 		if !errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewInternal("failed to find user by google id")
+			return nil, "", apperror.NewInternal("failed to find user by google id")
 		}
 
 		existing, err := repo.GetByEmail(ctx, email)
@@ -381,7 +420,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			// account. An attacker could otherwise pre-register a victim's
 			// address and take over the account when the victim uses Google.
 			if !existing.EmailVerifiedAt.Valid {
-				return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
+				return nil, "", apperror.NewConflict("an account with this email already exists; verify it before linking Google")
 			}
 			linked, linkErr := repo.LinkGoogleAccount(ctx, identitysqlc.LinkGoogleAccountParams{
 				GoogleID: pgtype.Text{String: googleID, Valid: true},
@@ -389,20 +428,25 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			})
 			if linkErr != nil {
 				if database.IsUniqueViolation(linkErr) {
-					return nil, apperror.NewConflict("this Google account is already linked to another user")
+					return nil, "", apperror.NewConflict("this Google account is already linked to another user")
 				}
-				return nil, apperror.NewInternal("failed to link google account")
+				// The guarded UPDATE matched no row: the account is already
+				// bound to a different Google identity, which is never replaced.
+				if errors.Is(linkErr, apperror.ErrNotFound) {
+					return nil, "", apperror.NewConflict("this account is already linked to a different Google account")
+				}
+				return nil, "", apperror.NewInternal("failed to link google account")
 			}
-			return linked, nil
+			return linked, googleAccountLinked, nil
 		}
 		if !errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewInternal("failed to find user by email")
+			return nil, "", apperror.NewInternal("failed to find user by email")
 		}
 		if !allowSignUp {
-			return nil, apperror.NewCode(apperror.CodeFeatureDisabled, "feature user_registration is disabled")
+			return nil, "", apperror.NewCode(apperror.CodeFeatureDisabled, "feature user_registration is disabled")
 		}
 		if err := ensureEmailNotBanned(ctx, repo, email); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		newUser, err := repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
@@ -413,22 +457,37 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			AuthProvider: "google",
 		})
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return newUser, nil
+		return newUser, googleAccountCreated, nil
 	}
 
 	if s.txManager != nil {
 		var result *identitysqlc.User
 		txErr := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			txUserRepo := repository.NewUserRepository(tx)
-			var err error
-			result, err = findOrCreate(txUserRepo)
-			return err
+			user, account, err := findOrCreate(txUserRepo)
+			if err != nil {
+				return err
+			}
+			// Tier 1: the login audit row commits with any account
+			// creation/link, or the whole sign-in rolls back.
+			if err := s.recordGoogleLogin(ctx, tx, user, account); err != nil {
+				return err
+			}
+			result = user
+			return nil
 		})
 		if txErr != nil {
 			if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, txErr); retryErr == nil {
 				if user != nil {
+					// A concurrent request created the account; this request
+					// still signs in and needs its own audit row.
+					if err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+						return s.recordGoogleLogin(ctx, tx, user, googleAccountExisting)
+					}); err != nil {
+						return nil, err
+					}
 					return user, nil
 				}
 			} else {
@@ -442,10 +501,16 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		return result, nil
 	}
 
-	result, err := findOrCreate(s.repo)
+	result, account, err := findOrCreate(s.repo)
+	if err == nil {
+		err = s.recordGoogleLogin(ctx, nil, result, account)
+	}
 	if err != nil {
 		if user, retryErr := s.retryOAuthLookup(ctx, googleID, email, err); retryErr == nil {
 			if user != nil {
+				if err := s.recordGoogleLogin(ctx, nil, user, googleAccountExisting); err != nil {
+					return nil, err
+				}
 				return user, nil
 			}
 		} else {
@@ -457,6 +522,37 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		return nil, apperror.NewInternal("failed to create oauth user")
 	}
 	return result, nil
+}
+
+// Google sign-in outcomes recorded in the auth.google_login audit metadata.
+const (
+	googleAccountExisting = "existing"
+	googleAccountLinked   = "linked"
+	googleAccountCreated  = "created"
+)
+
+// recordGoogleLogin writes the Tier 1 auth.google_login event. The OAuth
+// callback skips tenant middleware (its tenant comes from the signed state),
+// so the event takes its tenant and actor from the signed-in account rather
+// than from request-level audit state.
+func (s *userService) recordGoogleLogin(ctx context.Context, tx pgx.Tx, user *identitysqlc.User, account string) error {
+	event := audit.NewServiceEvent(ctx, "auth.google_login", "auth")
+	event.TenantID = user.TenantID
+	event.ResourceID = strconv.FormatInt(user.ID, 10)
+	event.ActorID = user.ID
+	event.ActorRole = user.Role
+	event.ActorType = audit.ActorTypeForRole(user.Role)
+	if event.ActorType == audit.ActorTypeUnknown {
+		event.ActorType = audit.ActorTypeUser
+	}
+	event.Metadata = map[string]any{
+		"account":        account,
+		"email_verified": user.EmailVerifiedAt.Valid,
+	}
+	if err := audit.RecordInTx(ctx, s.audit, tx, event); err != nil {
+		return auditWriteError(err)
+	}
+	return nil
 }
 
 // retryOAuthLookup handles the concurrent-create race. It returns a user when
@@ -526,8 +622,8 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		name = strings.TrimSpace(*req.Name)
 	}
 	if req.Email != nil {
-		requested := normalizeEmail(*req.Email)
-		if requested != normalizeEmail(existing.Email) {
+		requested := NormalizeEmail(*req.Email)
+		if requested != NormalizeEmail(existing.Email) {
 			dup, err := s.repo.GetByEmail(ctx, requested)
 			if err != nil && !errors.Is(err, apperror.ErrNotFound) {
 				return nil, apperror.NewInternal("failed to check email availability")
@@ -542,7 +638,7 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		}
 	}
 
-	emailChanged := normalizeEmail(existing.Email) != normalizeEmail(email)
+	emailChanged := NormalizeEmail(existing.Email) != NormalizeEmail(email)
 	nameChanged := req.Name != nil && strings.TrimSpace(*req.Name) != existing.Name
 
 	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*identitysqlc.User, error) {
@@ -634,16 +730,16 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 		return apperror.NewBadRequest("current password is incorrect")
 	}
 
-	// Shares the login counter so re-authentication cannot be used to guess
-	// the password in parallel either.
-	cacheKey := scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email))
-	if err := s.reserveLoginAttempt(ctx, cacheKey); err != nil {
+	// Shares the login counters (per source and per account) so
+	// re-authentication cannot be used to guess the password in parallel.
+	emailAddr := NormalizeEmail(user.Email)
+	if err := reserveLoginAttempt(ctx, s.cache, emailAddr); err != nil {
 		return err
 	}
 	if bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(password)) != nil {
 		return apperror.NewBadRequest("current password is incorrect")
 	}
-	s.clearLoginAttempts(ctx, cacheKey)
+	clearLoginAttempts(ctx, s.cache, emailAddr)
 	return nil
 }
 
@@ -819,7 +915,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, userID)
 	}
-	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email)))
+	clearLoginAttempts(ctx, s.cache, NormalizeEmail(user.Email))
 
 	return nil
 }

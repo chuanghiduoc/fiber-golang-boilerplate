@@ -182,16 +182,14 @@ const listNotificationsCursor = `-- name: ListNotificationsCursor :many
 SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
 WHERE tenant_id = $1::bigint
   AND user_id = $2::bigint
-  AND (NOT $3::boolean OR read_at IS NULL)
-  AND (created_at, id) < ($4::timestamptz, $5::bigint)
+  AND (created_at, id) < ($3::timestamptz, $4::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $6::int
+LIMIT $5::int
 `
 
 type ListNotificationsCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
 	UserID          int64              `json:"user_id"`
-	UnreadOnly      bool               `json:"unread_only"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -201,7 +199,64 @@ func (q *Queries) ListNotificationsCursor(ctx context.Context, arg ListNotificat
 	rows, err := q.db.Query(ctx, listNotificationsCursor,
 		arg.TenantID,
 		arg.UserID,
-		arg.UnreadOnly,
+		arg.CursorCreatedAt,
+		arg.CursorID,
+		arg.RowLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Notification{}
+	for rows.Next() {
+		var i Notification
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.UserID,
+			&i.Type,
+			&i.Title,
+			&i.Body,
+			&i.Data,
+			&i.ReadAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUnreadNotificationsCursor = `-- name: ListUnreadNotificationsCursor :many
+SELECT id, tenant_id, user_id, type, title, body, data, read_at, created_at, updated_at FROM notifications
+WHERE tenant_id = $1::bigint
+  AND user_id = $2::bigint
+  AND read_at IS NULL
+  AND (created_at, id) < ($3::timestamptz, $4::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT $5::int
+`
+
+type ListUnreadNotificationsCursorParams struct {
+	TenantID        int64              `json:"tenant_id"`
+	UserID          int64              `json:"user_id"`
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+// A separate unread query (instead of a "(NOT @unread_only OR read_at IS
+// NULL)" flag) lets a generic plan prove the partial index predicate and use
+// idx_notifications_tenant_user_unread.
+func (q *Queries) ListUnreadNotificationsCursor(ctx context.Context, arg ListUnreadNotificationsCursorParams) ([]Notification, error) {
+	rows, err := q.db.Query(ctx, listUnreadNotificationsCursor,
+		arg.TenantID,
+		arg.UserID,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

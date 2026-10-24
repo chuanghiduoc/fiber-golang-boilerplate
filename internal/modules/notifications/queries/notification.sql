@@ -13,7 +13,18 @@ WHERE id = @id::bigint
 SELECT * FROM notifications
 WHERE tenant_id = @tenant_id::bigint
   AND user_id = @user_id::bigint
-  AND (NOT @unread_only::boolean OR read_at IS NULL)
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- A separate unread query (instead of a "(NOT @unread_only OR read_at IS
+-- NULL)" flag) lets a generic plan prove the partial index predicate and use
+-- idx_notifications_tenant_user_unread.
+-- name: ListUnreadNotificationsCursor :many
+SELECT * FROM notifications
+WHERE tenant_id = @tenant_id::bigint
+  AND user_id = @user_id::bigint
+  AND read_at IS NULL
   AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;

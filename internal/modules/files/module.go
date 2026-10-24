@@ -18,8 +18,10 @@ import (
 // Module owns file upload, metadata, download, soft delete, and restore.
 type Module struct {
 	upload *fileshandler.UploadHandler
-	// uploadSvc is set by Build so AttachWebhooks can wire the dispatcher.
+	// uploadSvc and adminSvc are set by Build so AttachWebhooks can wire the
+	// dispatcher.
 	uploadSvc filesvc.UploadService
+	adminSvc  filesvc.AdminFileService
 }
 
 // New builds the module from its handler. Production uses Build.

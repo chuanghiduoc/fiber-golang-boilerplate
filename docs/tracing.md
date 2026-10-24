@@ -60,7 +60,7 @@ All settings are optional and read at startup through `config.Load`.
 | `OTEL_TRUST_INCOMING_TRACE` | `false` | Honor an inbound W3C `traceparent`. With `APP_TRUST_PROXY=true` it is honored only from a peer in `APP_TRUSTED_PROXIES`. Off by default so a client cannot force sampling. |
 | `OTEL_BATCH_TIMEOUT_SECS` | `5` | Maximum delay before a batch is exported. |
 | `OTEL_EXPORT_TIMEOUT_SECS` | `30` | Per-export timeout. |
-| `OTEL_SHUTDOWN_TIMEOUT_SECS` | `10` | Bounded flush on process shutdown. |
+| `OTEL_SHUTDOWN_TIMEOUT_SECS` | `10` | Bounded flush on process shutdown. The flush runs after HTTP/jobs drain and is also capped by what remains of the 20s shutdown budget minus a 2s close reserve, but always gets at least 1s (see [Graceful shutdown](operations.md#graceful-shutdown)). |
 | `OTEL_BATCH_MAX_QUEUE_SIZE` | `2048` | Spans buffered in memory; new spans are dropped when full. |
 | `OTEL_BATCH_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request; must not exceed the queue size. |
 

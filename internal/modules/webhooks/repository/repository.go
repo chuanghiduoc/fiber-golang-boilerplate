@@ -43,6 +43,10 @@ var (
 	// ErrNotClaimable means the delivery is terminal or another attempt holds
 	// the claim lease. Workers reload it to decide whether to retry the job.
 	ErrNotClaimable = errors.New("webhooks: delivery is not claimable")
+	// ErrDeliveryLeaseLost means an outcome write matched no row: the delivery
+	// is terminal or another worker claimed a newer attempt after this
+	// worker's claim lease expired. The stale result must be discarded.
+	ErrDeliveryLeaseLost = errors.New("webhooks: delivery claim lease lost")
 )
 
 // DeliveryJobPayload is the job payload for one delivery attempt.
@@ -109,7 +113,9 @@ type ListDeliveriesParams struct {
 // RetryDraft reschedules a pending delivery and enqueues its next job in one
 // transaction.
 type RetryDraft struct {
-	DeliveryID    int64
+	DeliveryID int64
+	// Attempt is the claimed attempt number; it fences the write.
+	Attempt       int32
 	NextAttemptAt time.Time
 	StatusCode    int
 	Error         string
@@ -158,6 +164,14 @@ type EndpointStore interface {
 	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*webhooksqlc.WebhookEndpoint, error)
 	ActiveEndpoints(ctx context.Context, tenantID int64) ([]ActiveEndpoint, error)
 	ActiveEndpointSecret(ctx context.Context, endpointID int64) (string, error)
+	ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error)
+}
+
+// SigningSecret is an endpoint's current active sealed secret and when it
+// became active (its rotation time).
+type SigningSecret struct {
+	Ciphertext string
+	CreatedAt  time.Time
 }
 
 // DeliveryStore covers the outbox, attempts, claims, and retention.
@@ -166,8 +180,9 @@ type DeliveryStore interface {
 	GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error)
 	ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]webhooksqlc.WebhookDelivery, error)
 	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error)
-	MarkDeliverySucceeded(ctx context.Context, id int64, statusCode int) error
-	MarkDeliveryDead(ctx context.Context, id int64, statusCode int, reason string) error
+	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
+	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
+	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
 	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error

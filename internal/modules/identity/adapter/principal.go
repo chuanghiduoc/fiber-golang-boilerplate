@@ -32,12 +32,17 @@ func (r *PrincipalReader) GetPrincipal(ctx context.Context, tenantID, userID int
 		}
 		return identitycontracts.Principal{}, err
 	}
-	return identitycontracts.Principal{
+	principal := identitycontracts.Principal{
 		ID:           user.ID,
 		TenantID:     user.TenantID,
 		Email:        user.Email,
 		Name:         user.Name,
 		Role:         user.Role,
 		TenantStatus: user.TenantStatus,
-	}, nil
+	}
+	if user.CredentialsRevokedAt.Valid {
+		revokedAt := user.CredentialsRevokedAt.Time
+		principal.CredentialsRevokedAt = &revokedAt
+	}
+	return principal, nil
 }

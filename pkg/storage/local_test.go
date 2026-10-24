@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -57,10 +58,10 @@ func TestLocalStorage_PutGetDelete(t *testing.T) {
 		t.Fatalf("Delete failed: %v", err)
 	}
 
-	// Get after delete should fail
+	// Get after delete should fail with the not-found sentinel.
 	_, err = ls.Get(ctx, "test/file.txt")
-	if err == nil {
-		t.Error("Get after Delete should fail")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get after Delete error = %v, want ErrNotFound", err)
 	}
 }
 

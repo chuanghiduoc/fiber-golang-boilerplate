@@ -74,11 +74,22 @@ func (r *notificationRepository) GetByID(ctx context.Context, id, userID int64) 
 	return &row, nil
 }
 
+// ListCursor picks a dedicated query per filter: a boolean "unread only"
+// parameter would hide the read_at IS NULL predicate from generic plans and
+// keep them off the partial unread index.
 func (r *notificationRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]notificationsqlc.Notification, error) {
+	if unreadOnly {
+		return r.q.ListUnreadNotificationsCursor(ctx, notificationsqlc.ListUnreadNotificationsCursorParams{
+			TenantID:        tenantID(ctx),
+			UserID:          userID,
+			CursorCreatedAt: cur.CreatedAtParam(),
+			CursorID:        cur.IDParam(),
+			RowLimit:        cur.Limit,
+		})
+	}
 	return r.q.ListNotificationsCursor(ctx, notificationsqlc.ListNotificationsCursorParams{
 		TenantID:        tenantID(ctx),
 		UserID:          userID,
-		UnreadOnly:      unreadOnly,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,

@@ -165,6 +165,62 @@ func (failingCounter) Increment(context.Context, string, time.Duration) (int64, 
 	return 0, errors.New("redis: connection refused")
 }
 
+// blackholeCache models an unreachable cache whose calls hang: every
+// operation blocks until its context ends (or blackholeMaxWait as a test
+// safety net), so callers only return quickly if they bound each call.
+type blackholeCache struct{ calls atomic.Int64 }
+
+const blackholeMaxWait = 10 * time.Second
+
+func (b *blackholeCache) wait(ctx context.Context) error {
+	b.calls.Add(1)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(blackholeMaxWait):
+		return errors.New("blackhole: caller did not bound the cache call")
+	}
+}
+
+func (b *blackholeCache) Get(ctx context.Context, _ string) ([]byte, error) { return nil, b.wait(ctx) }
+func (b *blackholeCache) Set(ctx context.Context, _ string, _ []byte, _ time.Duration) error {
+	return b.wait(ctx)
+}
+func (b *blackholeCache) Delete(ctx context.Context, _ string) error { return b.wait(ctx) }
+func (b *blackholeCache) Exists(ctx context.Context, _ string) (bool, error) {
+	return false, b.wait(ctx)
+}
+func (b *blackholeCache) Increment(ctx context.Context, _ string, _ time.Duration) (int64, error) {
+	return 0, b.wait(ctx)
+}
+func (b *blackholeCache) Close() error                   { return nil }
+func (b *blackholeCache) Ping(ctx context.Context) error { return b.wait(ctx) }
+
+func TestNewLimiter_FailsOpenFastOnHangingCache(t *testing.T) {
+	counter := &blackholeCache{}
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Get("/", NewLimiter(1, 60, "normal", counter), func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
+	start := time.Now()
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/", http.NoBody))
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	_ = resp.Body.Close()
+	elapsed := time.Since(start)
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail open)", resp.StatusCode)
+	}
+	if counter.calls.Load() != 1 {
+		t.Fatalf("cache calls = %d, want 1", counter.calls.Load())
+	}
+	if elapsed < rateLimitCacheOpTimeout || elapsed > 4*rateLimitCacheOpTimeout {
+		t.Fatalf("request took %v, want about the %v per-op bound", elapsed, rateLimitCacheOpTimeout)
+	}
+}
+
 func TestNewLimiter_FailsOpenOnCacheError(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
 	app.Get("/", NewLimiter(1, 60, "normal", failingCounter{}), func(c fiber.Ctx) error {

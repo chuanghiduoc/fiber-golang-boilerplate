@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -25,9 +27,33 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
+// ResetRequestJobKind is the durable job that performs a forgot-password
+// request: account lookup, token creation, and the email.send enqueue.
+const ResetRequestJobKind = "password_reset.request"
+
+// resetRequestMaxAttempts bounds retries of a transient lookup/enqueue failure.
+const resetRequestMaxAttempts = 5
+
 type PasswordResetService interface {
 	ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error
 	ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error
+	// HandleResetRequestJob processes one ResetRequestJobKind job. Delivery is
+	// at-least-once: a duplicate run replaces the user's single reset token
+	// (the newest emailed link wins), so it is safe to repeat.
+	HandleResetRequestJob(ctx context.Context, payload json.RawMessage) error
+}
+
+// ResetRequestQueue is the durable queue ForgotPassword writes to.
+// *jobs.Queue implements it.
+type ResetRequestQueue interface {
+	Enqueue(ctx context.Context, job jobs.Job) (int64, error)
+}
+
+// resetRequestPayload is the job payload. It carries the slug because the
+// worker restores only the tenant ID, and the emailed link needs the slug.
+type resetRequestPayload struct {
+	Email      string `json:"email"`
+	TenantSlug string `json:"tenantSlug,omitempty"`
 }
 
 type passwordResetService struct {
@@ -39,6 +65,23 @@ type passwordResetService struct {
 	cache       cache.Cache
 	frontendURL string
 	sessions    session.Store
+	// requestQueue makes ForgotPassword constant-shape; requestCodec seals
+	// the address in the job payload at rest (nil stores plaintext JSON).
+	requestQueue ResetRequestQueue
+	requestCodec *jobs.PayloadCodec
+}
+
+// AttachResetRequestQueue moves forgot-password work into a durable job.
+// With a queue attached, ForgotPassword does the same work (rate-limit check
+// plus one job insert) for every address and can only fail for reasons that
+// do not depend on the account, so neither latency nor errors reveal whether
+// an address is registered. Without one (unit tests, minimal wiring) requests
+// are processed inline. Production wiring (identity.Build) always attaches it.
+func AttachResetRequestQueue(svc PasswordResetService, queue ResetRequestQueue, codec *jobs.PayloadCodec) {
+	if s, ok := svc.(*passwordResetService); ok {
+		s.requestQueue = queue
+		s.requestCodec = codec
+	}
 }
 
 func NewPasswordResetService(
@@ -68,7 +111,7 @@ func NewPasswordResetService(
 }
 
 func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error {
-	emailAddr := normalizeEmail(req.Email)
+	emailAddr := NormalizeEmail(req.Email)
 
 	// Rate limit before the lookup, for every address. Increment is atomic and
 	// sets the TTL on the first request. Returning the same generic success
@@ -80,7 +123,60 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 		}
 	}
 
-	// Always return success to prevent email enumeration
+	if s.requestQueue == nil {
+		return s.processResetRequest(ctx, emailAddr)
+	}
+	return s.enqueueResetRequest(ctx, emailAddr)
+}
+
+// enqueueResetRequest writes the durable job without reading the account.
+func (s *passwordResetService) enqueueResetRequest(ctx context.Context, emailAddr string) error {
+	payload, err := json.Marshal(resetRequestPayload{Email: emailAddr, TenantSlug: tenant.SlugFromContext(ctx)})
+	if err != nil {
+		return apperror.NewInternal("failed to process request")
+	}
+	if s.requestCodec != nil {
+		if payload, err = s.requestCodec.Seal(payload); err != nil {
+			slog.Error("failed to seal password reset request", slog.Any("error", err))
+			return apperror.NewInternal("failed to process request")
+		}
+	}
+	if _, err := s.requestQueue.Enqueue(ctx, jobs.Job{
+		Kind:        ResetRequestJobKind,
+		Payload:     payload,
+		MaxAttempts: resetRequestMaxAttempts,
+	}); err != nil {
+		slog.Error("failed to enqueue password reset request", slog.Any("error", err))
+		return apperror.NewInternal("failed to process request")
+	}
+	return nil
+}
+
+func (s *passwordResetService) HandleResetRequestJob(ctx context.Context, payload json.RawMessage) error {
+	raw := []byte(payload)
+	if s.requestCodec != nil {
+		opened, err := s.requestCodec.Open(payload)
+		if err != nil {
+			return fmt.Errorf("open password reset request: %w", err)
+		}
+		raw = opened
+	}
+	var req resetRequestPayload
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return fmt.Errorf("decode password reset request: %w", err)
+	}
+	emailAddr := NormalizeEmail(req.Email)
+	if emailAddr == "" {
+		return errors.New("password reset request has no email")
+	}
+	// The worker restores the job's tenant ID; the slug only shapes the link.
+	return s.processResetRequest(tenant.WithSlug(ctx, req.TenantSlug), emailAddr)
+}
+
+// processResetRequest looks the account up and, when it exists, replaces its
+// reset token and enqueues the email in one transaction.
+func (s *passwordResetService) processResetRequest(ctx context.Context, emailAddr string) error {
+	// Unknown addresses succeed silently so callers cannot enumerate accounts.
 	user, err := s.userRepo.GetByEmail(ctx, emailAddr)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -276,7 +372,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		// can actually sign in with the new password.
 		if s.cache != nil {
 			if user, err := s.userRepo.GetByID(ctx, resetUserID); err == nil {
-				_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, normalizeEmail(user.Email)))
+				clearLoginAttempts(ctx, s.cache, NormalizeEmail(user.Email))
 			}
 		}
 		if s.sessions != nil {

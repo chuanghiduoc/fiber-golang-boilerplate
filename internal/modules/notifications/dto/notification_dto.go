@@ -41,10 +41,12 @@ type PreferenceResponse struct {
 
 // UpdatePreferenceRequest upserts the enabled state for one notification type
 // and channel. Types are lower-case identifiers such as "security.alert".
+// Enabled is a pointer so an omitted field is rejected instead of silently
+// decoding as false (which would disable the channel).
 type UpdatePreferenceRequest struct {
 	Type    string `json:"type" validate:"required,max=100"`
 	Channel string `json:"channel" validate:"required,oneof=in_app email"`
-	Enabled bool   `json:"enabled"`
+	Enabled *bool  `json:"enabled" validate:"required"`
 }
 
 // SendNotificationRequest is the back-office request for creating a
@@ -60,6 +62,6 @@ type SendNotificationRequest struct {
 // SendNotificationResponse reports which channels accepted the notification.
 // Notification is null when the user disabled the in-app channel.
 type SendNotificationResponse struct {
-	Notification *NotificationResponse `json:"notification,omitempty"`
+	Notification *NotificationResponse `json:"notification"`
 	EmailQueued  bool                  `json:"emailQueued"`
 }

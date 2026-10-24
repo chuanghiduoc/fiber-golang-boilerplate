@@ -9,12 +9,30 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
-// normalizeEmail canonicalizes an address before storage, lookup, and
-// rate-limit keying. Email local-parts are technically case-sensitive, but every
+// NormalizeEmail canonicalizes an address before storage, lookup, and
+// rate-limit keying. Handlers use it too, so deciding whether a request
+// changes the email matches the service exactly. Email local-parts are technically case-sensitive, but every
 // mainstream provider treats them case-insensitively and the API contract
 // promises one account per address inside a tenant.
-func normalizeEmail(email string) string {
+func NormalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
+}
+
+type clientIPKey struct{}
+
+// WithClientIP records the caller's IP for per-source login throttling.
+// Handlers pass Fiber's c.IP(), which honors the trusted-proxy configuration;
+// the value is cloned because Fiber strings alias pooled request buffers.
+// Services never read HTTP state directly.
+func WithClientIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey{}, strings.Clone(strings.TrimSpace(ip)))
+}
+
+// clientIPFromContext returns the IP stored by WithClientIP, or "" for
+// internal callers and tests, which then share one source bucket.
+func clientIPFromContext(ctx context.Context) string {
+	ip, _ := ctx.Value(clientIPKey{}).(string)
+	return ip
 }
 
 // scopedKey prefixes a rate-limit cache key with the request tenant. The same

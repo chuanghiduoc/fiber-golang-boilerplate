@@ -14,7 +14,7 @@ type RedisCache struct {
 }
 
 func NewRedisCache(cfg config.CacheConfig) (*RedisCache, error) {
-	opts, err := redis.ParseURL(cfg.RedisURL)
+	opts, err := redisOptions(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -29,6 +29,27 @@ func NewRedisCache(cfg config.CacheConfig) (*RedisCache, error) {
 	}
 
 	return &RedisCache{client: client}, nil
+}
+
+// redisOptions parses REDIS_URL and applies the configured client bounds,
+// overriding any timeout/retry parameters in the URL. Short bounds make an
+// unreachable Redis fail fast, so fail-open callers (rate limiting,
+// idempotency) do not stall requests for go-redis's multi-second defaults.
+func redisOptions(cfg config.CacheConfig) (*redis.Options, error) {
+	opts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		return nil, err
+	}
+	opts.DialTimeout = cfg.RedisDialTimeout()
+	opts.ReadTimeout = cfg.RedisReadTimeout()
+	opts.WriteTimeout = cfg.RedisWriteTimeout()
+	opts.PoolTimeout = cfg.RedisPoolTimeout()
+	// go-redis treats 0 as "use the default of 3 retries" and -1 as none.
+	opts.MaxRetries = cfg.RedisMaxRetries
+	if opts.MaxRetries == 0 {
+		opts.MaxRetries = -1
+	}
+	return opts, nil
 }
 
 func (r *RedisCache) Get(ctx context.Context, key string) ([]byte, error) {

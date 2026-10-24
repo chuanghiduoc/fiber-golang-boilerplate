@@ -288,6 +288,7 @@ func TestEvaluatorCacheTTLAndInvalidation(t *testing.T) {
 
 	now = now.Add(11 * time.Second)
 	_ = evaluator.Enabled(context.Background(), KeyEmailVerification, Subject{TenantID: 1, UserID: 42})
+	waitForRefresh(evaluator)
 	if store.loads != 2 {
 		t.Fatalf("store loads = %d, want 2 after TTL", store.loads)
 	}
@@ -322,10 +323,12 @@ func TestEvaluatorServesStaleSnapshotWithinMaxStaleness(t *testing.T) {
 	if !got.Enabled || got.Source != SourceUserTarget {
 		t.Fatalf("stale evaluation = %+v, want user target from stale snapshot", got)
 	}
+	waitForRefresh(evaluator)
 
 	// An immediate retry is throttled and must not hit the store again.
 	loads := store.loads
 	_ = evaluator.Enabled(context.Background(), KeyEmailVerification, Subject{TenantID: 1, UserID: 42})
+	waitForRefresh(evaluator)
 	if store.loads != loads {
 		t.Fatalf("failed snapshot load was not throttled: loads %d -> %d", loads, store.loads)
 	}
@@ -502,5 +505,94 @@ func TestEvaluatorInvalidateKeepsSnapshotAsFallback(t *testing.T) {
 	got = evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
 	if !got.Enabled || got.Source != SourceEnvironment {
 		t.Fatalf("evaluation after recovery = %+v, want environment true", got)
+	}
+}
+
+// waitForRefresh blocks until any background snapshot refresh has finished.
+// Evaluate acquires refreshMu before starting the background load, and the
+// load holds it until it completes, so locking here waits for that load.
+func waitForRefresh(evaluator Evaluator) {
+	cached := evaluator.(*CachedEvaluator)
+	for !cached.refreshMu.TryLock() {
+		time.Sleep(time.Millisecond)
+	}
+	cached.refreshMu.Unlock()
+}
+
+func TestEvaluatorServesStaleSnapshotWhileSlowReloadRuns(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		now   = time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+		loads int
+	)
+	release := make(chan struct{})
+	store := StoreFunc(func(ctx context.Context) (Snapshot, error) {
+		mu.Lock()
+		loads++
+		first := loads == 1
+		mu.Unlock()
+		if first {
+			return killSwitchSnapshot(), nil
+		}
+		// A slow database: the reload blocks until released or timed out.
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return Snapshot{}, ctx.Err()
+		}
+		return Snapshot{}, nil
+	})
+	evaluator := NewEvaluator(Options{
+		Store:        store,
+		CacheTTL:     10 * time.Second,
+		MaxStaleness: 60 * time.Second,
+		Now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		},
+	})
+
+	if got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1}); got.Source != SourceKillSwitch {
+		t.Fatalf("initial evaluation = %+v, want kill switch", got)
+	}
+	mu.Lock()
+	now = now.Add(11 * time.Second)
+	mu.Unlock()
+
+	// Concurrent callers after the TTL must all get the stale snapshot
+	// without waiting for the slow reload.
+	const callers = 20
+	var wg sync.WaitGroup
+	results := make(chan Result, callers)
+	start := time.Now()
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+		}()
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("stale callers took %v; they must not wait for the reload", elapsed)
+	}
+	close(results)
+	for got := range results {
+		if got.Source != SourceKillSwitch {
+			t.Fatalf("stale evaluation = %+v, want kill switch from the stale snapshot", got)
+		}
+	}
+
+	close(release)
+	waitForRefresh(evaluator)
+	mu.Lock()
+	gotLoads := loads
+	mu.Unlock()
+	if gotLoads != 2 {
+		t.Fatalf("store loads = %d, want exactly one background reload", gotLoads)
+	}
+	if got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1}); got.Source == SourceKillSwitch {
+		t.Fatalf("evaluation after background reload = %+v, want the reloaded snapshot", got)
 	}
 }

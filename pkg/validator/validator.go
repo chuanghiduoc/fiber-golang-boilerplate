@@ -72,15 +72,29 @@ func ValidateStruct(s interface{}) error {
 
 	fields := make([]apperror.FieldError, 0, len(validationErrors))
 	for _, fe := range validationErrors {
+		path := fieldPath(fe)
 		fields = append(fields, apperror.FieldError{
-			Path:    fe.Field(),
+			Path:    path,
 			Code:    codeForTag(fe.Tag()),
-			Message: formatError(fe),
+			Message: formatError(fe, path),
 			Params:  paramsForError(fe),
 		})
 	}
 
 	return apperror.NewValidation("One or more fields did not pass validation.", fields)
+}
+
+// fieldPath returns the JSON path of the failing field, such as
+// "items[0].name". Namespace() is built from JSON tag names (see
+// RegisterTagNameFunc) but starts with the Go root struct name, which is not
+// part of the request contract, so that first segment is dropped. Field()
+// alone would report only "name" and lose which element failed.
+func fieldPath(fe validator.FieldError) string {
+	namespace := fe.Namespace()
+	if _, path, ok := strings.Cut(namespace, "."); ok && path != "" {
+		return path
+	}
+	return fe.Field()
 }
 
 // codeForTag maps a validator tag to a stable snake_case error code (i18n key).
@@ -118,21 +132,21 @@ func paramsForError(fe validator.FieldError) map[string]string {
 	}
 }
 
-func formatError(fe validator.FieldError) string {
+func formatError(fe validator.FieldError, path string) string {
 	switch fe.Tag() {
 	case "required":
-		return fmt.Sprintf("%s is required", fe.Field())
+		return fmt.Sprintf("%s is required", path)
 	case "email":
-		return fmt.Sprintf("%s must be a valid email", fe.Field())
+		return fmt.Sprintf("%s must be a valid email", path)
 	case "min":
-		return fmt.Sprintf("%s must be at least %s characters", fe.Field(), fe.Param())
+		return fmt.Sprintf("%s must be at least %s characters", path, fe.Param())
 	case "max":
-		return fmt.Sprintf("%s must be at most %s characters", fe.Field(), fe.Param())
+		return fmt.Sprintf("%s must be at most %s characters", path, fe.Param())
 	case "password":
-		return fmt.Sprintf("%s must be 8-72 characters with uppercase, lowercase, digit, and special character", fe.Field())
+		return fmt.Sprintf("%s must be 8-72 characters with uppercase, lowercase, digit, and special character", path)
 	case "notblank":
-		return fmt.Sprintf("%s must not be blank", fe.Field())
+		return fmt.Sprintf("%s must not be blank", path)
 	default:
-		return fmt.Sprintf("%s is invalid", fe.Field())
+		return fmt.Sprintf("%s is invalid", path)
 	}
 }

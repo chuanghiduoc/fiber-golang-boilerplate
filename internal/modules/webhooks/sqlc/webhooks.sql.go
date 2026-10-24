@@ -66,28 +66,6 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 	return i, err
 }
 
-const countWebhookDeliveriesByStatus = `-- name: CountWebhookDeliveriesByStatus :one
-SELECT
-    count(*) FILTER (WHERE status = 'pending')::bigint AS pending,
-    count(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded,
-    count(*) FILTER (WHERE status = 'dead')::bigint AS dead
-FROM webhook_deliveries
-WHERE tenant_id = $1
-`
-
-type CountWebhookDeliveriesByStatusRow struct {
-	Pending   int64 `json:"pending"`
-	Succeeded int64 `json:"succeeded"`
-	Dead      int64 `json:"dead"`
-}
-
-func (q *Queries) CountWebhookDeliveriesByStatus(ctx context.Context, tenantID int64) (CountWebhookDeliveriesByStatusRow, error) {
-	row := q.db.QueryRow(ctx, countWebhookDeliveriesByStatus, tenantID)
-	var i CountWebhookDeliveriesByStatusRow
-	err := row.Scan(&i.Pending, &i.Succeeded, &i.Dead)
-	return i, err
-}
-
 const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
 
 INSERT INTO webhook_deliveries (
@@ -994,13 +972,14 @@ func (q *Queries) LockWebhookEndpoint(ctx context.Context, arg LockWebhookEndpoi
 	return i, err
 }
 
-const markWebhookDeliveryDead = `-- name: MarkWebhookDeliveryDead :exec
+const markWebhookDeliveryDead = `-- name: MarkWebhookDeliveryDead :execrows
 UPDATE webhook_deliveries
 SET status = 'dead',
     next_attempt_at = NOW(),
     last_status_code = NULLIF($1::integer, 0),
     last_error = $2
 WHERE id = $3 AND tenant_id = $4 AND status = 'pending'
+  AND attempts = $5
 `
 
 type MarkWebhookDeliveryDeadParams struct {
@@ -1008,19 +987,25 @@ type MarkWebhookDeliveryDeadParams struct {
 	LastError  pgtype.Text `json:"last_error"`
 	ID         int64       `json:"id"`
 	TenantID   int64       `json:"tenant_id"`
+	Attempts   int32       `json:"attempts"`
 }
 
-func (q *Queries) MarkWebhookDeliveryDead(ctx context.Context, arg MarkWebhookDeliveryDeadParams) error {
-	_, err := q.db.Exec(ctx, markWebhookDeliveryDead,
+func (q *Queries) MarkWebhookDeliveryDead(ctx context.Context, arg MarkWebhookDeliveryDeadParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markWebhookDeliveryDead,
 		arg.StatusCode,
 		arg.LastError,
 		arg.ID,
 		arg.TenantID,
+		arg.Attempts,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const markWebhookDeliverySucceeded = `-- name: MarkWebhookDeliverySucceeded :exec
+const markWebhookDeliverySucceeded = `-- name: MarkWebhookDeliverySucceeded :execrows
+
 UPDATE webhook_deliveries
 SET status = 'succeeded',
     delivered_at = NOW(),
@@ -1028,17 +1013,31 @@ SET status = 'succeeded',
     last_status_code = NULLIF($1::integer, 0),
     last_error = NULL
 WHERE id = $2 AND tenant_id = $3 AND status = 'pending'
+  AND attempts = $4
 `
 
 type MarkWebhookDeliverySucceededParams struct {
 	StatusCode int32 `json:"status_code"`
 	ID         int64 `json:"id"`
 	TenantID   int64 `json:"tenant_id"`
+	Attempts   int32 `json:"attempts"`
 }
 
-func (q *Queries) MarkWebhookDeliverySucceeded(ctx context.Context, arg MarkWebhookDeliverySucceededParams) error {
-	_, err := q.db.Exec(ctx, markWebhookDeliverySucceeded, arg.StatusCode, arg.ID, arg.TenantID)
-	return err
+// The outcome writes below are fenced by the attempt the worker claimed
+// (attempts = @attempts): when a claim lease expired and another worker
+// claimed the next attempt, the stale worker's write affects no row instead of
+// overwriting the newer attempt's result.
+func (q *Queries) MarkWebhookDeliverySucceeded(ctx context.Context, arg MarkWebhookDeliverySucceededParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markWebhookDeliverySucceeded,
+		arg.StatusCode,
+		arg.ID,
+		arg.TenantID,
+		arg.Attempts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const nextWebhookEndpointSecretVersion = `-- name: NextWebhookEndpointSecretVersion :one
@@ -1113,6 +1112,32 @@ func (q *Queries) PurgeWebhookInboundEvents(ctx context.Context, arg PurgeWebhoo
 	return result.RowsAffected(), nil
 }
 
+const releaseWebhookDeliveryClaim = `-- name: ReleaseWebhookDeliveryClaim :execrows
+UPDATE webhook_deliveries
+SET attempts = attempts - 1,
+    next_attempt_at = NOW()
+WHERE id = $1 AND tenant_id = $2 AND status = 'pending'
+  AND attempts = $3 AND attempts > 0
+`
+
+type ReleaseWebhookDeliveryClaimParams struct {
+	ID       int64 `json:"id"`
+	TenantID int64 `json:"tenant_id"`
+	Attempts int32 `json:"attempts"`
+}
+
+// Gives back a claimed attempt that was interrupted by worker shutdown before
+// a response arrived, so a drain on the final attempt cannot dead-letter a
+// delivery that may never have been sent. The claim lease is cleared so the
+// requeued job can claim it again immediately.
+func (q *Queries) ReleaseWebhookDeliveryClaim(ctx context.Context, arg ReleaseWebhookDeliveryClaimParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseWebhookDeliveryClaim, arg.ID, arg.TenantID, arg.Attempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const rescheduleWebhookDelivery = `-- name: RescheduleWebhookDelivery :execrows
 UPDATE webhook_deliveries
 SET status = 'pending',
@@ -1120,6 +1145,7 @@ SET status = 'pending',
     last_status_code = NULLIF($2::integer, 0),
     last_error = $3
 WHERE id = $4 AND tenant_id = $5 AND status = 'pending'
+  AND attempts = $6
 `
 
 type RescheduleWebhookDeliveryParams struct {
@@ -1128,6 +1154,7 @@ type RescheduleWebhookDeliveryParams struct {
 	LastError     pgtype.Text        `json:"last_error"`
 	ID            int64              `json:"id"`
 	TenantID      int64              `json:"tenant_id"`
+	Attempts      int32              `json:"attempts"`
 }
 
 func (q *Queries) RescheduleWebhookDelivery(ctx context.Context, arg RescheduleWebhookDeliveryParams) (int64, error) {
@@ -1137,6 +1164,7 @@ func (q *Queries) RescheduleWebhookDelivery(ctx context.Context, arg RescheduleW
 		arg.LastError,
 		arg.ID,
 		arg.TenantID,
+		arg.Attempts,
 	)
 	if err != nil {
 		return 0, err

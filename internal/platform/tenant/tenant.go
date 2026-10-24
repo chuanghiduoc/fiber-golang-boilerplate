@@ -128,9 +128,13 @@ func Middleware(r Resolver, defaultSlug string) fiber.Handler {
 			return c.Next()
 		}
 
-		slug := strings.TrimSpace(c.Get(Header))
+		// c.Get and c.Query return zero-copy views into fasthttp's pooled
+		// request buffer, which is reused by the next request on the
+		// connection. The slug outlives this request (resolver cache keys,
+		// locals), so it must be an owned copy.
+		slug := strings.Clone(strings.TrimSpace(c.Get(Header)))
 		if slug == "" && allowsTenantQuery(path) {
-			slug = strings.TrimSpace(c.Query(QueryParam))
+			slug = strings.Clone(strings.TrimSpace(c.Query(QueryParam)))
 		}
 		if slug == "" {
 			slug = defaultSlug

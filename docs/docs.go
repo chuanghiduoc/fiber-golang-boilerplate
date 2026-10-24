@@ -5462,6 +5462,7 @@ const docTemplate = `{
             "type": "object",
             "required": [
                 "channel",
+                "enabled",
                 "type"
             ],
             "properties": {

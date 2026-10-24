@@ -26,8 +26,16 @@ const (
 	idempotencyMaxBodyHashSize   = 1 << 20 // 1 MiB
 	idempotencyLockTTL           = 2 * time.Minute
 	idempotencyResponseTTL       = 24 * time.Hour
-	idempotencyCacheOpTimeout    = 5 * time.Second
 	idempotencyBodyMismatchError = "idempotency key was used with a different request body"
+
+	// idempotencyCacheReadTimeout bounds each cache call made before the
+	// handler runs (lookup, claim, lock token). These fail open, so a slow
+	// cache must not stall the request for the client's full timeouts.
+	idempotencyCacheReadTimeout = 250 * time.Millisecond
+	// idempotencyCacheWriteTimeout bounds storing the response and releasing
+	// the lock after the handler ran. It is longer than the read bound because
+	// losing the stored response lets a retry repeat a completed mutation.
+	idempotencyCacheWriteTimeout = 500 * time.Millisecond
 )
 
 // cachedResponse is the replay payload persisted under the response key. Only
@@ -79,7 +87,9 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 		}
 
 		lockKey := idempotencyLockKey(scope)
-		claimed, err := appCache.Increment(c.Context(), lockKey, idempotencyLockTTL)
+		claimCtx, cancelClaim := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
+		claimed, err := appCache.Increment(claimCtx, lockKey, idempotencyLockTTL)
+		cancelClaim()
 		if err != nil {
 			// The claim counter is replaced by an owner token once acquired, so
 			// a non-integer increment means another request owns the lock (Redis
@@ -228,7 +238,9 @@ func idempotencyResponseKey(scope string) string { return scope + ":response" }
 func idempotencyLockKey(scope string) string { return scope + ":lock" }
 
 func idempotencyLockHeld(c fiber.Ctx, appCache cache.Cache, lockKey string) (bool, error) {
-	value, err := appCache.Get(c.Context(), lockKey)
+	ctx, cancel := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
+	defer cancel()
+	value, err := appCache.Get(ctx, lockKey)
 	if err != nil {
 		return false, err
 	}
@@ -236,7 +248,7 @@ func idempotencyLockHeld(c fiber.Ctx, appCache cache.Cache, lockKey string) (boo
 }
 
 func setLockToken(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byte) error {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheOpTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheReadTimeout)
 	defer cancel()
 	return appCache.Set(ctx, lockKey, token, idempotencyLockTTL)
 }
@@ -244,7 +256,7 @@ func setLockToken(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byt
 // releaseLock only deletes the lock when this request still owns it. When the
 // optional CompareDeleter capability is unavailable, it falls back to Delete.
 func releaseLock(c fiber.Ctx, appCache cache.Cache, lockKey string, token []byte) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheOpTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheWriteTimeout)
 	defer cancel()
 
 	if deleter, ok := appCache.(cache.CompareDeleter); ok {
@@ -300,7 +312,7 @@ func nextAndCache(c fiber.Ctx, appCache cache.Cache, responseKey, bodyHash strin
 
 	// Use a detached, bounded context so a client disconnect does not abandon a
 	// response that later retries need to replay.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheOpTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), idempotencyCacheWriteTimeout)
 	defer cancel()
 	if err := appCache.Set(ctx, responseKey, payload, idempotencyResponseTTL); err != nil {
 		slog.Warn("idempotency response cache failed; returning original response",
@@ -312,7 +324,9 @@ func nextAndCache(c fiber.Ctx, appCache cache.Cache, responseKey, bodyHash strin
 }
 
 func loadCachedResponse(c fiber.Ctx, appCache cache.Cache, responseKey string) (*cachedResponse, bool) {
-	data, err := appCache.Get(c.Context(), responseKey)
+	ctx, cancel := context.WithTimeout(c.Context(), idempotencyCacheReadTimeout)
+	defer cancel()
+	data, err := appCache.Get(ctx, responseKey)
 	if err != nil {
 		slog.Warn("idempotency cache read failed; proceeding normally",
 			slog.String("request_id", fiber.Locals[string](c, "request_id")),

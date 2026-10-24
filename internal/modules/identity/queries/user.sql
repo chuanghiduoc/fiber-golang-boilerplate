@@ -14,7 +14,8 @@ WHERE u.id = $1 AND u.deleted_at IS NULL;
 -- name: GetUserPrincipal :one
 -- API-key authentication needs the owner's current role and the owning
 -- tenant's status in one lookup, so a suspended tenant's keys stop working.
-SELECT u.id, u.tenant_id, u.email, u.name, u.role, t.status AS tenant_status
+-- credentials_revoked_at lets the verifier reject keys created before a ban.
+SELECT u.id, u.tenant_id, u.email, u.name, u.role, u.credentials_revoked_at, t.status AS tenant_status
 FROM users u
 JOIN tenants t ON t.id = u.tenant_id
 WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL;
@@ -26,6 +27,13 @@ WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NULL;
 -- name: GetBannedUserByEmail :one
 SELECT * FROM users
 WHERE tenant_id = $1 AND lower(email) = lower($2) AND banned_at IS NOT NULL
+LIMIT 1;
+
+-- name: GetDeletedUserByEmail :one
+-- Startup admin seed only (one query per boot): finds a banned or
+-- self-deleted account so the seed never resurrects it.
+SELECT * FROM users
+WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NOT NULL
 LIMIT 1;
 
 -- name: ListUsers :many
@@ -40,6 +48,13 @@ WHERE tenant_id = $1 AND deleted_at IS NULL;
 -- name: CreateUser :one
 INSERT INTO users (tenant_id, email, password_hash, name)
 VALUES ($1, $2, $3, $4)
+RETURNING *;
+
+-- name: CreateAdminUser :one
+-- Startup admin seed: the role and verification are set in the same INSERT,
+-- so a crash can never leave a half-seeded non-admin account behind.
+INSERT INTO users (tenant_id, email, password_hash, name, role, email_verified_at)
+VALUES ($1, $2, $3, $4, 'admin', NOW())
 RETURNING *;
 
 -- name: UpdateUser :one
@@ -75,7 +90,9 @@ RETURNING *;
 -- name: BanUser :one
 UPDATE users
 SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),
-    token_version = token_version + 1, password_changed_at = NOW()
+    token_version = token_version + 1, password_changed_at = NOW(),
+    -- Kept by RestoreUser, so API keys issued before the ban stay dead.
+    credentials_revoked_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 RETURNING *;
 
@@ -87,11 +104,6 @@ SET deleted_at = NULL, banned_at = NULL, updated_at = NOW(),
     token_version = token_version + 1, password_changed_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL AND banned_at IS NOT NULL
 RETURNING *;
-
--- name: ListDeletedUsers :many
-SELECT * FROM users
-WHERE tenant_id = $1 AND deleted_at IS NOT NULL
-ORDER BY deleted_at DESC LIMIT $2 OFFSET $3;
 
 -- name: CountDeletedUsers :one
 SELECT count(*) FROM users
@@ -107,8 +119,11 @@ VALUES ($1, $2, $3, $4, $5, NOW())
 RETURNING *;
 
 -- name: LinkGoogleAccount :one
-UPDATE users SET google_id = $1, auth_provider = 'google', updated_at = NOW()
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+-- Never replaces a different Google identity: zero rows means the account is
+-- already linked to another Google account (or is no longer active).
+UPDATE users SET google_id = @google_id, auth_provider = 'google', updated_at = NOW()
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+  AND (google_id IS NULL OR google_id = @google_id)
 RETURNING *;
 
 -- name: UpdateUserPassword :one

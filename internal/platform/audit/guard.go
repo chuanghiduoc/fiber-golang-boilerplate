@@ -105,6 +105,12 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 			}
 		} else {
 			info := requestInfoFor(c, 0, action, resource)
+			// Feature-flag routes name the target :key, not :id; fall back
+			// like audit.Middleware so a denied attempt still records it.
+			resourceID := c.Params("id")
+			if resourceID == "" {
+				resourceID = c.Params("key")
+			}
 			intent := Event{
 				TenantID:           info.TenantID,
 				ActorID:            info.ActorID,
@@ -112,7 +118,7 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 				ActorRole:          info.ActorRole,
 				Action:             action,
 				Resource:           resource,
-				ResourceID:         c.Params("id"),
+				ResourceID:         resourceID,
 				Metadata:           map[string]any{"method": c.Method(), "route": routePath},
 				IP:                 info.IP,
 				UserAgent:          info.UserAgent,

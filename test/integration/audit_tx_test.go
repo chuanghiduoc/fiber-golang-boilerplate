@@ -15,11 +15,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -199,6 +203,67 @@ func TestAuditTx_FileDeleteAndRestoreRollBackWhenAuditFails(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT deleted_at FROM files WHERE id = $1`, fileID).Scan(&deletedAt))
 	require.NotNil(t, deletedAt, "file restore must roll back when audit fails")
+}
+
+// TestFilesWebhooks_AdminAndRestoreUseOutbox proves admin delete and both
+// restores enqueue file.deleted/file.restored in the mutation transaction, and
+// that an outbox failure rolls the mutation back (fail-closed).
+func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
+	h := setupAuditTxHarness(t)
+	bg := context.Background()
+	adminID := h.insertUser(t, tenant.DefaultID, "files-webhook-admin@test.com", "admin")
+	ownerID := h.insertUser(t, tenant.DefaultID, "files-webhook-owner@test.com", "user")
+	var fileID int64
+	require.NoError(t, h.pool.QueryRow(bg,
+		`INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
+		 VALUES ($1, $2, 'hook.pdf', '1/2/hook.pdf', 'application/pdf', 10) RETURNING id`,
+		tenant.DefaultID, ownerID,
+	).Scan(&fileID))
+
+	queue := jobs.NewQueue(h.pool)
+	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), queue)
+	adminSvc := filesvc.NewAdminFileService(h.files, h.tx, h.recorder, h.store)
+	filesvc.AttachAdminWebhookDispatcher(adminSvc, dispatcher)
+	uploadSvc := filesvc.NewUploadService(h.files, h.store)
+	filesvc.AttachTxManager(uploadSvc, h.tx)
+	filesvc.AttachWebhookDispatcher(uploadSvc, dispatcher)
+
+	adminCtx := h.actorCtx(tenant.DefaultID, adminID, "admin")
+	ownerCtx := h.actorCtx(tenant.DefaultID, ownerID, "user")
+	require.NoError(t, adminSvc.DeleteFile(adminCtx, fileID))
+	_, err := adminSvc.RestoreFile(adminCtx, fileID)
+	require.NoError(t, err)
+	_, err = h.pool.Exec(bg, `UPDATE files SET deleted_at = NOW() WHERE id = $1`, fileID)
+	require.NoError(t, err)
+	_, err = uploadSvc.Restore(ownerCtx, fileID, ownerID)
+	require.NoError(t, err)
+
+	rows, err := h.pool.Query(bg,
+		`SELECT payload->>'type' FROM jobs WHERE kind = $1 AND tenant_id = $2 ORDER BY id`,
+		webhookservice.DispatchJobKind, tenant.DefaultID)
+	require.NoError(t, err)
+	var types []string
+	for rows.Next() {
+		var eventType string
+		require.NoError(t, rows.Scan(&eventType))
+		types = append(types, eventType)
+	}
+	require.NoError(t, rows.Err())
+	rows.Close()
+	assert.Equal(t, []string{
+		webhookcontracts.EventFileDeleted,
+		webhookcontracts.EventFileRestored,
+		webhookcontracts.EventFileRestored,
+	}, types)
+
+	// A dispatcher whose outbox cannot enqueue fails the admin delete closed.
+	broken := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), nil)
+	brokenSvc := filesvc.NewAdminFileService(h.files, h.tx, h.recorder, h.store)
+	filesvc.AttachAdminWebhookDispatcher(brokenSvc, broken)
+	require.Error(t, brokenSvc.DeleteFile(adminCtx, fileID))
+	var deletedAt *time.Time
+	require.NoError(t, h.pool.QueryRow(bg, `SELECT deleted_at FROM files WHERE id = $1`, fileID).Scan(&deletedAt))
+	assert.Nil(t, deletedAt, "the delete must roll back when the webhook outbox fails")
 }
 
 func TestAuditTx_RecordsTenantAndActor(t *testing.T) {

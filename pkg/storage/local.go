@@ -2,8 +2,10 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,6 +139,9 @@ func (s *LocalStorage) Get(_ context.Context, path string) (io.ReadCloser, error
 
 	f, err := os.Open(fullPath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+		}
 		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 

@@ -412,9 +412,12 @@ type AppConfig struct {
 	BodyLimit int `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
 	// JSONBodyLimit caps every non-multipart request body (JSON, form, raw).
 	// Only multipart/form-data uploads may use the larger APP_BODY_LIMIT.
-	JSONBodyLimit            int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
-	LogLevel                 string `env:"LOG_LEVEL" envDefault:"info"`
-	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"30"` // seconds
+	JSONBodyLimit int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
+	LogLevel      string `env:"LOG_LEVEL" envDefault:"info"`
+	// RequestTimeout must fit the shutdown drain window
+	// (ShutdownBudget - ShutdownReserve) so an in-flight request can finish
+	// before the process stops waiting for it.
+	RequestTimeout           int    `env:"APP_REQUEST_TIMEOUT" envDefault:"15"` // seconds
 	FrontendURL              string `env:"APP_FRONTEND_URL" envDefault:"http://localhost:3000"`
 	RequireEmailVerification bool   `env:"REQUIRE_EMAIL_VERIFICATION" envDefault:"false"`
 	// TrustProxy enables reading the client IP from ProxyHeader only when the
@@ -429,6 +432,20 @@ type AppConfig struct {
 	// "https://docs.example.com" yields ".../errors/not-found". Empty = relative.
 	ErrorDocsBaseURL string `env:"ERROR_DOCS_BASE_URL"`
 }
+
+// ShutdownBudget is the total graceful-shutdown time after SIGTERM.
+// Kubernetes allows terminationGracePeriodSeconds (30s) including the 5s
+// preStop sleep, so 20s leaves a 5s margin before SIGKILL. ShutdownReserve is
+// held back from draining requests and jobs for the tracing flush and closing
+// shared resources. Keep deploy/k8s/base/deployment.yaml in sync.
+const (
+	ShutdownBudget  = 20 * time.Second
+	ShutdownReserve = 5 * time.Second
+)
+
+// MaxRequestTimeoutSeconds is the largest APP_REQUEST_TIMEOUT that still lets
+// an in-flight request finish inside the shutdown drain window.
+const MaxRequestTimeoutSeconds = int((ShutdownBudget - ShutdownReserve) / time.Second)
 
 // TrustedProxiesList returns the parsed list of trusted proxy IPs/CIDRs.
 func (a AppConfig) TrustedProxiesList() []string {
@@ -450,7 +467,7 @@ func (a AppConfig) EffectiveJSONBodyLimit() int {
 
 type CORSConfig struct {
 	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
-	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
+	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,PATCH,DELETE,OPTIONS"`
 	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"`
 	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link"`
 	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
@@ -463,6 +480,32 @@ type RateLimitConfig struct {
 	NormalWindow  int `env:"RATE_LIMIT_NORMAL_WINDOW_SECS" envDefault:"60"`
 	RelaxedMax    int `env:"RATE_LIMIT_RELAXED_MAX" envDefault:"120"`
 	RelaxedWindow int `env:"RATE_LIMIT_RELAXED_WINDOW_SECS" envDefault:"60"`
+	// Auth is the per-client-IP budget checked before authentication on every
+	// protected route, so bogus credentials cannot hit the API-key store
+	// unthrottled. Every request from one IP (NAT included) counts, so it is
+	// generous; the per-user tiers behind it stay the real quota. Zero uses
+	// the defaults below.
+	AuthMax    int `env:"RATE_LIMIT_AUTH_MAX" envDefault:"300"`
+	AuthWindow int `env:"RATE_LIMIT_AUTH_WINDOW_SECS" envDefault:"60"`
+}
+
+// Pre-authentication limiter defaults for RateLimitConfig literals that leave
+// the Auth tier unset (tests and tools); Load fills the env defaults.
+const (
+	DefaultRateLimitAuthMax    = 300
+	DefaultRateLimitAuthWindow = 60
+)
+
+// EffectiveAuth returns the pre-authentication limit and window in seconds.
+func (r RateLimitConfig) EffectiveAuth() (maxRequests, windowSecs int) {
+	maxRequests, windowSecs = r.AuthMax, r.AuthWindow
+	if maxRequests <= 0 {
+		maxRequests = DefaultRateLimitAuthMax
+	}
+	if windowSecs <= 0 {
+		windowSecs = DefaultRateLimitAuthWindow
+	}
+	return maxRequests, windowSecs
 }
 
 type DBConfig struct {
@@ -494,6 +537,74 @@ type CacheConfig struct {
 	// lockout, and session invalidation per process, so it is rejected in
 	// production unless this is explicitly true.
 	AllowMemoryInProduction bool `env:"CACHE_ALLOW_MEMORY_IN_PRODUCTION" envDefault:"false"`
+	// Redis client bounds. go-redis defaults (5s dial, 3s read, 3 retries)
+	// would turn a blackholed Redis into multi-second stalls on every request
+	// even though rate limiting and idempotency fail open, so these are short.
+	// They override timeout/retry parameters in REDIS_URL.
+	RedisDialTimeoutMS  int `env:"REDIS_DIAL_TIMEOUT_MS" envDefault:"2000"`
+	RedisReadTimeoutMS  int `env:"REDIS_READ_TIMEOUT_MS" envDefault:"500"`
+	RedisWriteTimeoutMS int `env:"REDIS_WRITE_TIMEOUT_MS" envDefault:"500"`
+	RedisPoolTimeoutMS  int `env:"REDIS_POOL_TIMEOUT_MS" envDefault:"1000"`
+	// RedisMaxRetries is the number of retries after the first attempt; 0
+	// disables retries.
+	RedisMaxRetries int `env:"REDIS_MAX_RETRIES" envDefault:"1"`
+}
+
+// Redis client defaults, used when a CacheConfig literal leaves a timeout at
+// zero (tests and tools); Load always fills the env defaults.
+const (
+	DefaultRedisDialTimeout  = 2 * time.Second
+	DefaultRedisReadTimeout  = 500 * time.Millisecond
+	DefaultRedisWriteTimeout = 500 * time.Millisecond
+	DefaultRedisPoolTimeout  = time.Second
+	maxRedisRetries          = 10
+)
+
+func millisOrDefault(ms int, fallback time.Duration) time.Duration {
+	if ms <= 0 {
+		return fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// RedisDialTimeout returns the Redis connect timeout.
+func (c CacheConfig) RedisDialTimeout() time.Duration {
+	return millisOrDefault(c.RedisDialTimeoutMS, DefaultRedisDialTimeout)
+}
+
+// RedisReadTimeout returns the Redis per-command read timeout.
+func (c CacheConfig) RedisReadTimeout() time.Duration {
+	return millisOrDefault(c.RedisReadTimeoutMS, DefaultRedisReadTimeout)
+}
+
+// RedisWriteTimeout returns the Redis per-command write timeout.
+func (c CacheConfig) RedisWriteTimeout() time.Duration {
+	return millisOrDefault(c.RedisWriteTimeoutMS, DefaultRedisWriteTimeout)
+}
+
+// RedisPoolTimeout returns how long a command waits for a free connection.
+func (c CacheConfig) RedisPoolTimeout() time.Duration {
+	return millisOrDefault(c.RedisPoolTimeoutMS, DefaultRedisPoolTimeout)
+}
+
+// Validate checks the cache driver and Redis client bounds.
+func (c CacheConfig) Validate() error {
+	switch c.Driver {
+	case "memory":
+	case "redis":
+		if c.RedisURL == "" {
+			return fmt.Errorf("REDIS_URL is required when CACHE_DRIVER=redis")
+		}
+	default:
+		return fmt.Errorf("CACHE_DRIVER must be one of: memory, redis (got %q)", c.Driver)
+	}
+	if c.RedisDialTimeoutMS < 0 || c.RedisReadTimeoutMS < 0 || c.RedisWriteTimeoutMS < 0 || c.RedisPoolTimeoutMS < 0 {
+		return fmt.Errorf("REDIS_*_TIMEOUT_MS values must not be negative")
+	}
+	if c.RedisMaxRetries < 0 || c.RedisMaxRetries > maxRedisRetries {
+		return fmt.Errorf("REDIS_MAX_RETRIES must be between 0 and %d", maxRedisRetries)
+	}
+	return nil
 }
 
 type EmailConfig struct {
@@ -521,6 +632,10 @@ type StorageConfig struct {
 	S3AccessKey      string `env:"STORAGE_S3_ACCESS_KEY"`
 	S3SecretKey      string `env:"STORAGE_S3_SECRET_KEY"`
 	S3UseSSL         bool   `env:"STORAGE_S3_USE_SSL" envDefault:"false"`
+	// S3AllowInsecure acknowledges plaintext object-storage traffic in
+	// production (for example a cluster-local SeaweedFS behind a
+	// NetworkPolicy). Without it, production requires STORAGE_S3_USE_SSL=true.
+	S3AllowInsecure bool `env:"STORAGE_S3_ALLOW_INSECURE" envDefault:"false"`
 }
 
 // splitCSV splits a comma-separated string into trimmed, non-empty values.
@@ -634,15 +749,25 @@ func LoadDatabase() (DBConfig, error) {
 		return DBConfig{}, fmt.Errorf("APP_ENV must be one of: local, test, development, staging, production (got %q)", parsed.App.Env)
 	}
 	// Migration jobs skip the full application validation, but must not
-	// silently downgrade transport security relative to the API. allow/prefer
-	// permit a plaintext fallback, so they are not acceptable in production.
+	// silently downgrade transport security relative to the API.
 	if appEnv == "production" {
-		switch strings.ToLower(parsed.DB.SSLMode) {
-		case "disable", "allow", "prefer":
-			return DBConfig{}, fmt.Errorf("DB_SSLMODE=%s permits plaintext in production; use require or verify-full", parsed.DB.SSLMode)
+		if err := validateProductionSSLMode(parsed.DB.SSLMode); err != nil {
+			return DBConfig{}, err
 		}
 	}
 	return parsed.DB, nil
+}
+
+// validateProductionSSLMode rejects DB_SSLMODE values that permit plaintext:
+// disable never encrypts, and allow/prefer silently fall back to plaintext
+// when the server or a network attacker refuses TLS. The API and cmd/migrate
+// share this rule.
+func validateProductionSSLMode(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "disable", "allow", "prefer":
+		return fmt.Errorf("DB_SSLMODE=%s permits plaintext in production; use require, verify-ca, or verify-full", mode)
+	}
+	return nil
 }
 
 func (cfg *Config) Validate() error {
@@ -656,6 +781,10 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.App.RequestTimeout < 1 {
 		return fmt.Errorf("APP_REQUEST_TIMEOUT must be at least 1 second")
+	}
+	if cfg.App.RequestTimeout > MaxRequestTimeoutSeconds {
+		return fmt.Errorf("APP_REQUEST_TIMEOUT (%d) must be at most %d seconds so in-flight requests finish within the shutdown budget",
+			cfg.App.RequestTimeout, MaxRequestTimeoutSeconds)
 	}
 	if cfg.App.FrontendURL != "" {
 		u, err := url.Parse(cfg.App.FrontendURL)
@@ -783,6 +912,9 @@ func (cfg *Config) Validate() error {
 	if cfg.RateLimit.StrictWindow < 1 || cfg.RateLimit.NormalWindow < 1 || cfg.RateLimit.RelaxedWindow < 1 {
 		return fmt.Errorf("all RATE_LIMIT_*_WINDOW_SECS values must be at least 1")
 	}
+	if cfg.RateLimit.AuthMax < 0 || cfg.RateLimit.AuthWindow < 0 {
+		return fmt.Errorf("RATE_LIMIT_AUTH_MAX and RATE_LIMIT_AUTH_WINDOW_SECS must not be negative")
+	}
 	if cfg.Storage.MaxFileSize < 1 {
 		return fmt.Errorf("STORAGE_MAX_FILE_SIZE must be at least 1 byte")
 	}
@@ -800,15 +932,8 @@ func (cfg *Config) Validate() error {
 		return err
 	}
 
-	// Cache config validation
-	switch cfg.Cache.Driver {
-	case "memory":
-	case "redis":
-		if cfg.Cache.RedisURL == "" {
-			return fmt.Errorf("REDIS_URL is required when CACHE_DRIVER=redis")
-		}
-	default:
-		return fmt.Errorf("CACHE_DRIVER must be one of: memory, redis (got %q)", cfg.Cache.Driver)
+	if err := cfg.Cache.Validate(); err != nil {
+		return err
 	}
 
 	// Email config validation
@@ -914,8 +1039,15 @@ func (cfg *Config) Validate() error {
 		if u, err := url.Parse(cfg.App.FrontendURL); err != nil || u.Scheme != "https" {
 			return fmt.Errorf("APP_FRONTEND_URL must use https in production")
 		}
-		if cfg.DB.SSLMode == "disable" {
-			return fmt.Errorf("DB_SSLMODE must not be disable in production")
+		if err := validateProductionSSLMode(cfg.DB.SSLMode); err != nil {
+			return err
+		}
+		// Object storage carries user uploads and credentials. A deployment
+		// whose storage is reachable only over a trusted private network must
+		// opt out explicitly.
+		if (cfg.Storage.Driver == "s3" || cfg.Storage.Driver == "seaweedfs") &&
+			!cfg.Storage.S3UseSSL && !cfg.Storage.S3AllowInsecure {
+			return fmt.Errorf("STORAGE_S3_USE_SSL must be true in production (set STORAGE_S3_ALLOW_INSECURE=true only for storage on a trusted private network)")
 		}
 		if cfg.OAuth.GoogleClientID != "" {
 			if u, err := url.Parse(cfg.OAuth.FrontendURL); err != nil || u.Scheme != "https" {

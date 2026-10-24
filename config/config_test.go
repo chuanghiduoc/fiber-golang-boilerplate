@@ -284,7 +284,7 @@ func baseValidConfig() Config {
 	return Config{
 		App: AppConfig{
 			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
-			RequestTimeout: 30, FrontendURL: "http://localhost:3000",
+			RequestTimeout: 15, FrontendURL: "http://localhost:3000",
 		},
 		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30},
 		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
@@ -784,6 +784,16 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 			c.JWT.Secret = "your-super-secret-key-change-in-production"
 		}},
 		{"db ssl disabled", func(c *Config) { c.DB.SSLMode = "disable" }},
+		{"db ssl disabled uppercase", func(c *Config) { c.DB.SSLMode = "DISABLE" }},
+		{"db ssl allow", func(c *Config) { c.DB.SSLMode = "allow" }},
+		{"db ssl prefer", func(c *Config) { c.DB.SSLMode = "Prefer" }},
+		{"s3 without ssl", func(c *Config) {
+			c.Storage = StorageConfig{
+				Driver: "s3", S3Endpoint: "s3.amazonaws.com", S3AccessKey: "ak", S3SecretKey: "sk",
+				S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: "image/png",
+			}
+		}},
+		{"request timeout beyond shutdown drain", func(c *Config) { c.App.RequestTimeout = MaxRequestTimeoutSeconds + 1 }},
 		{"empty cors origins", func(c *Config) { c.CORS.AllowOrigins = "" }},
 		{"malformed cors origin", func(c *Config) { c.CORS.AllowOrigins = "not-a-url" }},
 	}
@@ -796,6 +806,92 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 				t.Error("Validate() should reject this production config")
 			}
 		})
+	}
+}
+
+func TestValidate_ProductionTLSAccepted(t *testing.T) {
+	for _, mode := range []string{"require", "verify-ca", "verify-full", "VERIFY-FULL"} {
+		cfg := productionValidConfig()
+		cfg.DB.SSLMode = mode
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("DB_SSLMODE=%s should be accepted in production: %v", mode, err)
+		}
+	}
+
+	cfg := productionValidConfig()
+	cfg.Storage = StorageConfig{
+		Driver: "seaweedfs", S3Endpoint: "seaweedfs:8333", S3AccessKey: "ak", S3SecretKey: "sk",
+		S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: "image/png",
+		S3AllowInsecure: true,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("STORAGE_S3_ALLOW_INSECURE=true should permit plaintext storage: %v", err)
+	}
+	cfg.Storage.S3AllowInsecure = false
+	cfg.Storage.S3UseSSL = true
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("STORAGE_S3_USE_SSL=true should be accepted in production: %v", err)
+	}
+}
+
+func TestValidate_RequestTimeoutFitsShutdownBudget(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.App.RequestTimeout = MaxRequestTimeoutSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("APP_REQUEST_TIMEOUT=%d should be valid: %v", MaxRequestTimeoutSeconds, err)
+	}
+	cfg.App.RequestTimeout = MaxRequestTimeoutSeconds + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("APP_REQUEST_TIMEOUT beyond the shutdown drain window must be rejected")
+	}
+	if time.Duration(MaxRequestTimeoutSeconds)*time.Second+ShutdownReserve > ShutdownBudget {
+		t.Fatal("the maximum request timeout plus the reserve must fit the shutdown budget")
+	}
+}
+
+func TestLoad_CacheRedisDefaults(t *testing.T) {
+	var c CacheConfig
+	if err := env.Parse(&c); err != nil {
+		t.Fatalf("parse cache defaults: %v", err)
+	}
+	if c.RedisDialTimeout() != 2*time.Second || c.RedisReadTimeout() != 500*time.Millisecond ||
+		c.RedisWriteTimeout() != 500*time.Millisecond || c.RedisPoolTimeout() != time.Second || c.RedisMaxRetries != 1 {
+		t.Fatalf("unexpected Redis defaults: %+v", c)
+	}
+	if (CacheConfig{}).RedisReadTimeout() != DefaultRedisReadTimeout {
+		t.Fatal("a zero Redis timeout must fall back to the package default")
+	}
+}
+
+func TestValidate_CacheRedisBounds(t *testing.T) {
+	for name, mutate := range map[string]func(*CacheConfig){
+		"negative timeout": func(c *CacheConfig) { c.RedisReadTimeoutMS = -1 },
+		"negative retries": func(c *CacheConfig) { c.RedisMaxRetries = -1 },
+		"too many retries": func(c *CacheConfig) { c.RedisMaxRetries = 11 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			mutate(&cfg.Cache)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("Validate() should reject this cache config")
+			}
+		})
+	}
+}
+
+func TestLoad_DefaultsIncludePatchAndFitShutdown(t *testing.T) {
+	var parsed struct {
+		App  AppConfig
+		CORS CORSConfig
+	}
+	if err := env.Parse(&parsed); err != nil {
+		t.Fatalf("parse defaults: %v", err)
+	}
+	if !contains(parsed.CORS.Methods(), "PATCH") {
+		t.Errorf("default CORS_ALLOW_METHODS = %q, want PATCH included", parsed.CORS.AllowMethods)
+	}
+	if parsed.App.RequestTimeout > MaxRequestTimeoutSeconds {
+		t.Errorf("default APP_REQUEST_TIMEOUT %d exceeds %d", parsed.App.RequestTimeout, MaxRequestTimeoutSeconds)
 	}
 }
 
