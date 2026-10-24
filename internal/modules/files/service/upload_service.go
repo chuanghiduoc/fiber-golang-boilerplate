@@ -13,7 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -40,11 +40,11 @@ type UploadService interface {
 }
 
 type uploadService struct {
-	repo    repository.FileRepository
+	repo    filesrepo.FileRepository
 	storage storage.Storage
 }
 
-func NewUploadService(repo repository.FileRepository, store storage.Storage) UploadService {
+func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
 	return &uploadService{repo: repo, storage: store}
 }
 
@@ -75,7 +75,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 				slog.Any("error", delErr),
 			)
 		}
-		if repository.IsUniqueViolation(err) {
+		if filesrepo.IsUniqueViolation(err) {
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
 		return nil, apperror.NewInternal("failed to save file metadata")
@@ -252,13 +252,13 @@ func (s *uploadService) toFileResponse(file *sqlc.File) *dto.FileResponse {
 
 // buildCursor mirrors the legacy service helper while the files slice lives in
 // the module. It normalizes the page size and decodes an optional cursor.
-func buildCursor(limit int, startingAfter string) (cur repository.Cursor, pageSize int, err error) {
+func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {
 	pageSize = pagination.NormalizeLimit(limit)
-	cur = repository.Cursor{Limit: pagination.RowLimit(pageSize + 1)}
+	cur = pagination.DBCursor{Limit: pagination.RowLimit(pageSize + 1)}
 	if startingAfter != "" {
 		ts, id, decErr := pagination.DecodeCursor(startingAfter)
 		if decErr != nil {
-			return repository.Cursor{}, 0, apperror.NewBadRequest("invalid cursor")
+			return pagination.DBCursor{}, 0, apperror.NewBadRequest("invalid cursor")
 		}
 		cur.HasCursor = true
 		cur.CreatedAt = ts

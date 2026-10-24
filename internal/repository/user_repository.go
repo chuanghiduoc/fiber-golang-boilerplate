@@ -86,7 +86,7 @@ func (r *userRepository) List(ctx context.Context, limit, offset int32) ([]sqlc.
 func (r *userRepository) ListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error) {
 	return r.q.ListUsersCursor(ctx, sqlc.ListUsersCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cursorCreatedAt(cur),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -197,7 +197,7 @@ func (r *userRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 func (r *userRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.User, error) {
 	return r.q.AdminListUsersCursor(ctx, sqlc.AdminListUsersCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cursorCreatedAt(cur),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})

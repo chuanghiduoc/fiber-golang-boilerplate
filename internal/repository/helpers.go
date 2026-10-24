@@ -3,25 +3,21 @@ package repository
 import (
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // Cursor carries decoded cursor-pagination parameters into repository queries.
-// Limit should already include the extra row used to detect the next page.
-type Cursor struct {
-	HasCursor bool
-	CreatedAt time.Time
-	ID        int64
-	Limit     int32
-}
+// It aliases the neutral pagination type so global repositories and module
+// repositories share one cursor representation.
+type Cursor = pagination.DBCursor
 
-func (c Cursor) createdAt() pgtype.Timestamptz {
+func cursorCreatedAt(c Cursor) pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: c.CreatedAt, Valid: c.HasCursor}
 }
 

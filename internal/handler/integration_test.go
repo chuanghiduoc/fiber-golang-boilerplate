@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
@@ -48,7 +49,7 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, repository.UserRepository, f
 	userSvc := service.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
 	userHandler := NewUserHandler(userSvc)
 
-	fileRepo := repository.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(pool)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 	adminSvc := service.NewAdminService(userRepo, fileRepo, refreshRepo, store, txManager, sessionStore)

@@ -40,7 +40,7 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (+ admin seed), files (handler/service), admin
+internal/modules/           identity (+ admin seed), files (handler/service/repository), admin
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
 internal/handler|service|repository|dto|sqlc   current internals (strangler phase)
 pkg/                        apperror, response, database, cache, storage, email, ...

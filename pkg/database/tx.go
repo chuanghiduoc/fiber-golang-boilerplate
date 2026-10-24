@@ -26,7 +26,7 @@ func NewTxManager(pool *pgxpool.Pool) *TxManager {
 //
 //	err := txManager.WithTx(ctx, func(tx pgx.Tx) error {
 //	    userRepo := repository.NewUserRepository(tx)
-//	    fileRepo := repository.NewFileRepository(tx)
+//	    fileRepo := filesrepo.NewFileRepository(tx)
 //	    // ... transactional operations ...
 //	    return nil
 //	})

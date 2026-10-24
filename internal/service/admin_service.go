@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
@@ -32,7 +33,7 @@ type AdminService interface {
 
 type adminService struct {
 	userRepo         repository.UserRepository
-	fileRepo         repository.FileRepository
+	fileRepo         filesrepo.FileRepository
 	refreshTokenRepo repository.RefreshTokenRepository
 	storage          storage.Storage
 	txManager        *database.TxManager
@@ -41,7 +42,7 @@ type adminService struct {
 
 func NewAdminService(
 	userRepo repository.UserRepository,
-	fileRepo repository.FileRepository,
+	fileRepo filesrepo.FileRepository,
 	refreshTokenRepo repository.RefreshTokenRepository,
 	store storage.Storage,
 	txManager *database.TxManager,
