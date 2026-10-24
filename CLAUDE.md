@@ -40,16 +40,20 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity, files, admin (route tables)
-internal/platform/          authz, audit, jobs, and future shared mechanics
+internal/modules/           identity (+ admin seed), files, admin (route tables)
+internal/platform/          authz, audit, jobs, session, and future shared mechanics
 internal/handler|service|repository|dto|sqlc   current internals (strangler phase)
-internal/middleware|session
+internal/middleware
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 ```
 
 **Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
+
+**Design docs:** `docs/architecture.md` (module map, ownership, strangler
+status) and `docs/api-design.md` (API conventions, errors, pagination,
+idempotency, compatibility). Keep both current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`

@@ -10,8 +10,8 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )

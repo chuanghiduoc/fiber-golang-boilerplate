@@ -19,9 +19,9 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"

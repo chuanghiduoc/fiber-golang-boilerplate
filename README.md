@@ -46,20 +46,20 @@ cmd/migrate/main.go                 The only DB initializer/migrator (single ini
 cmd/seed/main.go                    Standalone admin seeder (schema must exist)
 internal/app/                       Composition root: Fiber, global middleware, module registry
 internal/modules/
-  identity/                         Auth, users, sessions, tokens (route table)
+  identity/                         Auth, users, sessions, tokens (route table + admin seed)
   files/                            Upload, download, soft delete, restore
   admin/                            Back-office facade
 internal/platform/
   authz/                            Permission catalog + Fiber middleware
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
+  session/                          Token-version/session validation
 internal/handler/                   Current handler internals (being moved into modules)
 internal/service/                   Current service internals
 internal/repository/                Current repository internals
 internal/dto/                       Current DTOs
 internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
-internal/middleware/                JWT, rate limit, logger, recovery, security headers, metrics
-internal/session/                   Token-version/session validation
+internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
   apperror/                         RFC 9457 errors + typed error catalog
   response/                         JSON response helpers
@@ -67,9 +67,13 @@ pkg/
   validator/ token/ cache/ storage/ email/ pagination/ logger/ health/ oauth/ metrics/ async/
 migrations/000001_init_schema.*     Single consolidated init schema (up/down)
 queries/                            sqlc query files
-docs/                               Generated Swagger docs
+docs/                               Swagger + architecture/API design docs
 deploy/k8s/                         Kubernetes production manifests (see deploy/k8s/README.md)
 ```
+
+See [docs/architecture.md](docs/architecture.md) for dependency rules and the
+strangler status, and [docs/api-design.md](docs/api-design.md) for the API
+design system (errors, pagination, idempotency, status codes).
 
 Request flow: `Client → app middleware → module route → handler/service/repository → sqlc → PostgreSQL`.
 
