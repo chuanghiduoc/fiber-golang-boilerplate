@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -50,7 +50,7 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVer
 
 	expiresAt := time.Now().Add(time.Duration(s.expireDays) * 24 * time.Hour)
 
-	_, err := s.repo.Create(ctx, sqlc.CreateRefreshTokenParams{
+	_, err := s.repo.Create(ctx, identitysqlc.CreateRefreshTokenParams{
 		UserID:       userID,
 		Token:        hashToken(plainToken), // Store hash, not plaintext
 		ExpiresAt:    pgtype.Timestamptz{Time: expiresAt, Valid: true},

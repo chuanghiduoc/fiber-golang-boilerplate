@@ -9,8 +9,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -106,7 +106,7 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 		}
 	}
 
-	user, err := s.userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
+	user, err := s.userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
 		ID:   id,
 		Role: role,
 	})

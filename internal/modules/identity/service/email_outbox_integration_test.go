@@ -12,8 +12,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -30,7 +30,7 @@ func TestPasswordResetIntegrationEnqueuesEmailInTokenTransaction(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	userRepo := repository.NewUserRepository(pool)
-	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
 		Email: "reset-outbox@example.com",
 		Name:  "Reset Outbox",
 	})
@@ -77,7 +77,7 @@ func TestPasswordResetIntegrationRollsBackTokenWhenEnqueueFails(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	userRepo := repository.NewUserRepository(pool)
-	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
 		Email: "reset-rollback@example.com",
 		Name:  "Reset Rollback",
 	})
@@ -120,7 +120,7 @@ func TestEmailVerificationIntegrationEnqueuesEmailInTokenTransaction(t *testing.
 	t.Cleanup(cleanup)
 
 	userRepo := repository.NewUserRepository(pool)
-	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
 		Email: "verify-outbox@example.com",
 		Name:  "Verify Outbox",
 	})
@@ -128,7 +128,7 @@ func TestEmailVerificationIntegrationEnqueuesEmailInTokenTransaction(t *testing.
 
 	// Keep a pending token so the test also covers the delete-then-create path.
 	verifRepo := repository.NewEmailVerificationRepository(pool)
-	_, err = verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+	_, err = verifRepo.Create(ctx, identitysqlc.CreateEmailVerificationTokenParams{
 		UserID:    user.ID,
 		Email:     user.Email,
 		Token:     "old-token-hash",
@@ -179,7 +179,7 @@ func TestEmailVerificationIntegrationRollsBackTokenWhenEnqueueFails(t *testing.T
 	t.Cleanup(cleanup)
 
 	userRepo := repository.NewUserRepository(pool)
-	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
 		Email: "verify-rollback@example.com",
 		Name:  "Verify Rollback",
 	})
@@ -187,7 +187,7 @@ func TestEmailVerificationIntegrationRollsBackTokenWhenEnqueueFails(t *testing.T
 
 	verifRepo := repository.NewEmailVerificationRepository(pool)
 	const oldToken = "old-token-hash"
-	_, err = verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+	_, err = verifRepo.Create(ctx, identitysqlc.CreateEmailVerificationTokenParams{
 		UserID:    user.ID,
 		Email:     user.Email,
 		Token:     oldToken,

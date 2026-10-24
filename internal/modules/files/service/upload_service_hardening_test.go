@@ -7,15 +7,15 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 )
 
 func TestUploadList_IncludeDeleted(t *testing.T) {
 	repo := newMockFileRepo()
 	svc := newTestUploadService(repo, newMockStorage())
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	repo.files[1] = &sqlc.File{ID: 1, UserID: 1, OriginalName: "active.txt", CreatedAt: now}
-	repo.files[2] = &sqlc.File{ID: 2, UserID: 1, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: now}
+	repo.files[1] = &filesqlc.File{ID: 1, UserID: 1, OriginalName: "active.txt", CreatedAt: now}
+	repo.files[2] = &filesqlc.File{ID: 2, UserID: 1, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: now}
 	repo.nextID = 3
 
 	activeOnly, _, err := svc.List(context.Background(), 1, 10, "", false)

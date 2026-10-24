@@ -30,7 +30,6 @@ linters:
         text: "G117"
     paths:
       - docs
-      - internal/sqlc
       - third_party$
       - builtin$
       - examples$

@@ -13,7 +13,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -32,7 +32,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		name = "Admin"
 	}
 
-	verify := func(user *sqlc.User) error {
+	verify := func(user *identitysqlc.User) error {
 		if user.EmailVerifiedAt.Valid {
 			return nil
 		}
@@ -42,7 +42,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		return nil
 	}
 
-	promote := func(existing *sqlc.User) error {
+	promote := func(existing *identitysqlc.User) error {
 		if existing.Role == dto.RoleAdmin {
 			if err := verify(existing); err != nil {
 				return err
@@ -56,7 +56,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 			bcrypt.CompareHashAndPassword([]byte(existing.PasswordHash.String), []byte(cfg.Password)) != nil {
 			return fmt.Errorf("ADMIN_EMAIL %q already belongs to a non-admin account with a different password", email)
 		}
-		promoted, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
+		promoted, err := userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
 			ID:   existing.ID,
 			Role: dto.RoleAdmin,
 		})
@@ -88,7 +88,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		return fmt.Errorf("hash admin password: %w", err)
 	}
 
-	user, err := userRepo.Create(ctx, sqlc.CreateUserParams{
+	user, err := userRepo.Create(ctx, identitysqlc.CreateUserParams{
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -104,7 +104,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 		return fmt.Errorf("create admin user: %w", err)
 	}
 
-	adminUser, err := userRepo.UpdateRole(ctx, sqlc.UpdateUserRoleParams{
+	adminUser, err := userRepo.UpdateRole(ctx, identitysqlc.UpdateUserRoleParams{
 		ID:   user.ID,
 		Role: dto.RoleAdmin,
 	})

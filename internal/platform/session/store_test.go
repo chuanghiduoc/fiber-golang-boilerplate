@@ -4,30 +4,30 @@ import (
 	"context"
 	"testing"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 type fakeUsers struct {
-	calls int
-	user  *sqlc.User
-	err   error
+	calls        int
+	role         string
+	tokenVersion int32
+	err          error
 }
 
-func (f *fakeUsers) GetByID(_ context.Context, _ int64) (*sqlc.User, error) {
+func (f *fakeUsers) GetSessionState(_ context.Context, _ int64) (role string, tokenVersion int32, err error) {
 	f.calls++
 	if f.err != nil {
-		return nil, f.err
+		return "", 0, f.err
 	}
-	return f.user, nil
+	return f.role, f.tokenVersion, nil
 }
 
 func TestStore_CachesAndInvalidates(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	defer func() { _ = mem.Close() }()
 
-	users := &fakeUsers{user: &sqlc.User{ID: 1, Role: "user", TokenVersion: 0}}
+	users := &fakeUsers{role: "user", tokenVersion: 0}
 	store := NewStore(users, mem)
 	ctx := context.Background()
 

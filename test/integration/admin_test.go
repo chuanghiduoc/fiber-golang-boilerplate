@@ -28,10 +28,10 @@ import (
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -125,13 +125,13 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	// to compare against.
 	hash, err := bcrypt.GenerateFromPassword([]byte("Admin123!"), bcrypt.MinCost)
 	require.NoError(t, err)
-	admin, err := userRepo.Create(context.Background(), sqlc.CreateUserParams{
+	admin, err := userRepo.Create(context.Background(), identitysqlc.CreateUserParams{
 		Email:        "admin@test.com",
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         "Integration Admin",
 	})
 	require.NoError(t, err)
-	admin, err = userRepo.UpdateRole(context.Background(), sqlc.UpdateUserRoleParams{
+	admin, err = userRepo.UpdateRole(context.Background(), identitysqlc.UpdateUserRoleParams{
 		ID:   admin.ID,
 		Role: identitydto.RoleAdmin,
 	})

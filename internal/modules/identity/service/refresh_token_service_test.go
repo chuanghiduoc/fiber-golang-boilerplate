@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -48,7 +48,7 @@ func TestRefreshTokenVerify(t *testing.T) {
 		// Store a hashed token with valid expiry
 		plain := "test-token-plain"
 		hashed := hashToken(plain)
-		repo.tokens[hashed] = &sqlc.RefreshToken{
+		repo.tokens[hashed] = &identitysqlc.RefreshToken{
 			ID:        1,
 			UserID:    1,
 			Token:     hashed,
@@ -85,7 +85,7 @@ func TestRefreshTokenVerify(t *testing.T) {
 
 		plain := "expired-token"
 		hashed := hashToken(plain)
-		repo.tokens[hashed] = &sqlc.RefreshToken{
+		repo.tokens[hashed] = &identitysqlc.RefreshToken{
 			ID:        1,
 			UserID:    1,
 			Token:     hashed,
@@ -116,7 +116,7 @@ func TestRefreshTokenRevoke(t *testing.T) {
 
 	plain := "revoke-me"
 	hashed := hashToken(plain)
-	repo.tokens[hashed] = &sqlc.RefreshToken{
+	repo.tokens[hashed] = &identitysqlc.RefreshToken{
 		ID:     1,
 		UserID: 1,
 		Token:  hashed,
@@ -136,9 +136,9 @@ func TestRefreshTokenRevokeAllByUserID(t *testing.T) {
 	svc, repo := newRefreshTokenServiceForTest()
 
 	// Create multiple tokens for the same user
-	repo.tokens["hash1"] = &sqlc.RefreshToken{UserID: 1, Token: "hash1"}
-	repo.tokens["hash2"] = &sqlc.RefreshToken{UserID: 1, Token: "hash2"}
-	repo.tokens["hash3"] = &sqlc.RefreshToken{UserID: 2, Token: "hash3"}
+	repo.tokens["hash1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash1"}
+	repo.tokens["hash2"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash2"}
+	repo.tokens["hash3"] = &identitysqlc.RefreshToken{UserID: 2, Token: "hash3"}
 
 	err := svc.RevokeAllByUserID(context.Background(), 1)
 	if err != nil {

@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -74,7 +74,7 @@ func TestSendVerification(t *testing.T) {
 		svc, _, vr, _, _ := newEmailVerifServiceForTest()
 
 		// Pre-populate an old token
-		vr.tokens["old-token"] = &sqlc.EmailVerificationToken{
+		vr.tokens["old-token"] = &identitysqlc.EmailVerificationToken{
 			ID:     1,
 			UserID: 1,
 			Token:  "old-token",
@@ -173,7 +173,7 @@ func TestVerify(t *testing.T) {
 		svc, ur, vr, _, _ := newEmailVerifServiceForTest()
 
 		// Create a user
-		ur.users[1] = &sqlc.User{
+		ur.users[1] = &identitysqlc.User{
 			ID:        1,
 			Email:     "user@example.com",
 			CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -182,7 +182,7 @@ func TestVerify(t *testing.T) {
 
 		// Create a valid token — the repo stores only the hash, so the mock is
 		// keyed by hashToken(plaintext) just like the real service writes it.
-		vr.tokens[hashToken("valid-token")] = &sqlc.EmailVerificationToken{
+		vr.tokens[hashToken("valid-token")] = &identitysqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
 			Email:     "user@example.com",
@@ -225,7 +225,7 @@ func TestVerify(t *testing.T) {
 	t.Run("expired token", func(t *testing.T) {
 		svc, _, vr, _, _ := newEmailVerifServiceForTest()
 
-		vr.tokens[hashToken("expired")] = &sqlc.EmailVerificationToken{
+		vr.tokens[hashToken("expired")] = &identitysqlc.EmailVerificationToken{
 			ID:        1,
 			UserID:    1,
 			Email:     "user@example.com",
@@ -256,7 +256,7 @@ func TestResendVerification(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		svc, ur, vr, es, _ := newEmailVerifServiceForTest()
 
-		ur.users[1] = &sqlc.User{
+		ur.users[1] = &identitysqlc.User{
 			ID:        1,
 			Email:     "user@example.com",
 			CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -303,7 +303,7 @@ func TestResendVerification(t *testing.T) {
 	t.Run("already verified returns nil", func(t *testing.T) {
 		svc, ur, _, es, _ := newEmailVerifServiceForTest()
 
-		ur.users[1] = &sqlc.User{
+		ur.users[1] = &identitysqlc.User{
 			ID:              1,
 			Email:           "user@example.com",
 			EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},

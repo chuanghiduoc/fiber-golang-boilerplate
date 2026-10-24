@@ -40,10 +40,9 @@ cmd/api/main.go             bootstrap + module registration + graceful shutdown
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
-internal/modules/           identity (full vertical slice + admin seed), files (dto/repository/service/handler + adapter), admin (dto/service/handler, contracts-only)
+internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
-internal/sqlc/              shared generated SQL (the only shared generated package)
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -77,13 +76,15 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant isolation, per-module sqlc generation, distributed tracing, and
-environment promotion/rollout automation remain future work. `identity`,
-`files`, and `admin` own all of their DTOs, repositories, services, and
-handlers under `internal/modules/<name>`; `admin` depends only on the
-stdlib-only `internal/contracts` interfaces implemented by identity/files
-adapters and never imports those modules. `internal/sqlc` is the only shared
-generated package; no legacy handler/service/DTO/repository packages remain.
+Tenant isolation, distributed tracing, and environment promotion/rollout
+automation remain future work. `identity`, `files`, and `admin` own all of
+their DTOs, repositories, services, and handlers under
+`internal/modules/<name>`; `admin` depends only on the stdlib-only
+`internal/contracts` interfaces implemented by identity/files adapters and
+never imports those modules. Each module with SQL owns its `queries/` and
+generated `sqlc/` package (`admin` is contract-only); there is no shared
+generated package and no cross-module sqlc imports, and no legacy
+handler/service/DTO/repository packages remain.
 Kubernetes manifests and a GHCR release workflow exist under `deploy/k8s/` and
 `.github/workflows/release.yml`; they are a production foundation, not a
 complete CD platform.
@@ -183,7 +184,8 @@ Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
 2. Keep handler/service/repository/DTO inside the module.
 3. Add permissions and protect every route (legacy exceptions are documented
    in `docs/module-template.md`).
-4. Add queries and run `make sqlc-generate`.
+4. Add queries under `internal/modules/<name>/queries/`, add the module's
+   sqlc block to `sqlc.yaml`, and run `make sqlc-generate`.
 5. Add a migration only for a deployed DB; otherwise update the single init
    schema.
 6. Register the module in `cmd/api/main.go`.

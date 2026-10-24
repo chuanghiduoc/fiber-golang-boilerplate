@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
@@ -28,18 +28,18 @@ func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
 // ---------------------------------------------------------------------------
 
 type mockFileRepo struct {
-	files  map[int64]*sqlc.File
+	files  map[int64]*filesqlc.File
 	nextID int64
 }
 
 var _ filesrepo.FileRepository = (*mockFileRepo)(nil)
 
 func newMockFileRepo() *mockFileRepo {
-	return &mockFileRepo{files: make(map[int64]*sqlc.File), nextID: 1}
+	return &mockFileRepo{files: make(map[int64]*filesqlc.File), nextID: 1}
 }
 
-func (m *mockFileRepo) Create(_ context.Context, params sqlc.CreateFileParams) (*sqlc.File, error) {
-	f := &sqlc.File{
+func (m *mockFileRepo) Create(_ context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error) {
+	f := &filesqlc.File{
 		ID:           m.nextID,
 		UserID:       params.UserID,
 		OriginalName: params.OriginalName,
@@ -53,7 +53,7 @@ func (m *mockFileRepo) Create(_ context.Context, params sqlc.CreateFileParams) (
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByID(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *mockFileRepo) GetByID(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -61,7 +61,7 @@ func (m *mockFileRepo) GetByID(_ context.Context, id int64) (*sqlc.File, error) 
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *mockFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -69,8 +69,8 @@ func (m *mockFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*sq
 	return f, nil
 }
 
-func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offset int32) ([]sqlc.File, error) {
-	var result []sqlc.File
+func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offset int32) ([]filesqlc.File, error) {
+	var result []filesqlc.File
 	for _, f := range m.files {
 		if f.UserID == userID {
 			result = append(result, *f)
@@ -87,16 +87,16 @@ func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offs
 	return result[start:end], nil
 }
 
-func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error) {
+func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesqlc.File, error) {
 	return m.listCursor(&userID, cur, includeDeleted), nil
 }
 
-func (m *mockFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
+func (m *mockFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
 	return m.listCursor(nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includeDeleted bool) []sqlc.File {
-	all := make([]sqlc.File, 0, len(m.files))
+func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includeDeleted bool) []filesqlc.File {
+	all := make([]filesqlc.File, 0, len(m.files))
 	for _, f := range m.files {
 		if userID != nil && f.UserID != *userID {
 			continue
@@ -109,7 +109,7 @@ func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includ
 	sort.Slice(all, func(i, j int) bool {
 		return cursorLess(all[j].CreatedAt.Time, all[j].ID, all[i].CreatedAt.Time, all[i].ID)
 	})
-	out := make([]sqlc.File, 0, len(all))
+	out := make([]filesqlc.File, 0, len(all))
 	for _, f := range all {
 		if cur.HasCursor && !cursorLess(f.CreatedAt.Time, f.ID, cur.CreatedAt, cur.ID) {
 			continue
@@ -132,7 +132,7 @@ func (m *mockFileRepo) CountByUserID(_ context.Context, userID int64) (int64, er
 	return count, nil
 }
 
-func (m *mockFileRepo) Delete(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *mockFileRepo) Delete(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -141,7 +141,7 @@ func (m *mockFileRepo) Delete(_ context.Context, id int64) (*sqlc.File, error) {
 	return f, nil
 }
 
-func (m *mockFileRepo) Restore(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *mockFileRepo) Restore(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -150,8 +150,8 @@ func (m *mockFileRepo) Restore(_ context.Context, id int64) (*sqlc.File, error) 
 	return f, nil
 }
 
-func (m *mockFileRepo) AdminList(_ context.Context, limit, offset int32) ([]sqlc.File, error) {
-	all := make([]sqlc.File, 0, len(m.files))
+func (m *mockFileRepo) AdminList(_ context.Context, limit, offset int32) ([]filesqlc.File, error) {
+	all := make([]filesqlc.File, 0, len(m.files))
 	for _, f := range m.files {
 		all = append(all, *f)
 	}
@@ -170,8 +170,8 @@ func (m *mockFileRepo) AdminCount(_ context.Context) (int64, error) {
 	return int64(len(m.files)), nil
 }
 
-func (m *mockFileRepo) AdminFileStats(_ context.Context) (sqlc.AdminFileStatsRow, error) {
-	var stats sqlc.AdminFileStatsRow
+func (m *mockFileRepo) AdminFileStats(_ context.Context) (filesqlc.AdminFileStatsRow, error) {
+	var stats filesqlc.AdminFileStatsRow
 	for _, f := range m.files {
 		if f.DeletedAt.Valid {
 			continue
