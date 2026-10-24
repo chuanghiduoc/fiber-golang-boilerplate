@@ -36,9 +36,11 @@ type Dispatcher interface {
 - A zero `TenantID` resolves from the context (`tenant.EffectiveID`).
 - `Data` defaults to `{}`; it must be valid JSON.
 
-`cmd/api/main.go` installs the dispatcher in `app.Deps.Events`; modules can also
-inject it directly. A nil dispatcher is a no-op, so tests and minimal
-deployments do not need the webhooks module.
+`cmd/api/main.go` installs the dispatcher in `app.Deps.Webhooks`; identity
+registration and file upload/delete emit `user.registered`, `file.uploaded`,
+and `file.deleted` through it. Modules can also inject the contract directly. A
+nil dispatcher is a no-op, so tests and minimal deployments do not need the
+webhooks module.
 
 ### Endpoint model
 
