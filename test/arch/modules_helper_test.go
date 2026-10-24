@@ -68,15 +68,32 @@ type mountedRoute struct {
 	route  fiber.Route
 }
 
-// moduleRoutes mounts each module on its own Fiber app under /api/v1 so every
-// route (and every middleware-bearing group prefix) is attributed to the
-// module that registered it.
+// apiPrefixes are the versioned groups app.Register mounts modules under.
+var apiPrefixes = []string{"/api/v1", "/api/v2"}
+
+// underAPIPrefix reports whether path is below a versioned API group.
+func underAPIPrefix(path string) bool {
+	for _, prefix := range apiPrefixes {
+		if strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// moduleRoutes mounts each module on its own Fiber app under /api/v1 (and,
+// for app.V2Module implementations, /api/v2, exactly like app.Register) so
+// every route (and every middleware-bearing group prefix) is attributed to
+// the module that registered it.
 func moduleRoutes(t *testing.T) (endpoints, groupMiddleware []mountedRoute) {
 	t.Helper()
 	modules, deps := productionModules(t)
 	for _, m := range modules {
 		fiberApp := fiber.New()
 		m.RegisterRoutes(fiberApp.Group("/api/v1"), deps)
+		if v2, ok := m.(app.V2Module); ok {
+			v2.RegisterV2Routes(fiberApp.Group("/api/v2"), deps)
+		}
 
 		// GetRoutes(false) additionally lists Use() registrations, which is
 		// how Fiber mounts group middleware (Group(prefix, handlers...)).
@@ -112,16 +129,35 @@ func routeKey(route fiber.Route) string {
 	return key
 }
 
-// handlerChainContains reports whether any handler's function name contains
-// one of the fragments.
-func handlerChainContains(route fiber.Route, fragments ...string) bool {
-	for _, handler := range route.Handlers {
+// modulePath is the Go module path; handler names are matched by full import
+// path so a local package that happens to be named authz or audit cannot
+// satisfy a check.
+const modulePath = "github.com/chuanghiduoc/fiber-golang-boilerplate"
+
+// isPlatformFunc reports whether a runtime function name is fn (or one of its
+// closures) in pkg, e.g. isPlatformFunc(name, "internal/platform/authz",
+// "Require") matches ".../internal/platform/authz.Require.func1".
+func isPlatformFunc(name, pkg, fn string) bool {
+	full := modulePath + "/" + pkg + "." + fn
+	return name == full || strings.HasPrefix(name, full+".")
+}
+
+// handlerChainHas reports whether any handler in the chain is fn in pkg.
+func handlerChainHas(route fiber.Route, pkg string, fns ...string) bool {
+	return handlerIndex(route, pkg, fns...) >= 0
+}
+
+// handlerIndex returns the position of the last handler that is fn in pkg,
+// or -1.
+func handlerIndex(route fiber.Route, pkg string, fns ...string) int {
+	index := -1
+	for i, handler := range route.Handlers {
 		name := handlerName(handler)
-		for _, fragment := range fragments {
-			if strings.Contains(name, fragment) {
-				return true
+		for _, fn := range fns {
+			if isPlatformFunc(name, pkg, fn) {
+				index = i
 			}
 		}
 	}
-	return false
+	return index
 }

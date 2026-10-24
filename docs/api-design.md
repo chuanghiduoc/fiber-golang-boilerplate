@@ -244,7 +244,12 @@ Rules:
 - Configured via `RATE_LIMIT_*`; separate keyspaces per tier.
 - Cache-backed (Redis in production); memory is single-replica only.
 - Login attempts, password-reset requests, and verification resends have
-  dedicated lockouts in addition to route limits.
+  dedicated lockouts in addition to route limits. Login failures are counted
+  per (tenant, email, client IP); the account locks for every IP only after
+  5x the per-IP threshold, so a single client cannot lock someone else out.
+- Every authenticated route group runs an IP-keyed `auth` limiter
+  (`RATE_LIMIT_AUTH_MAX`/`RATE_LIMIT_AUTH_WINDOW_SECS`) before credential
+  verification, so bogus credentials cannot drive unthrottled lookups.
 
 ## Idempotency
 
@@ -312,7 +317,8 @@ Rules:
 - Outbound delivery is at-least-once. Requests carry `X-Webhook-Id`,
   `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`,
   `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, and
-  `X-Webhook-Attempt`. Sign `<timestamp>.<raw-body>` with HMAC-SHA256.
+  `X-Webhook-Attempt`. Sign
+  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>` with HMAC-SHA256.
 - Retryable responses are `408`, `425`, `429`, and `5xx`; all other `3xx`/`4xx`
   are permanent (`dead`). `Retry-After` is honored (seconds or HTTP date) and
   capped by config.
@@ -395,9 +401,12 @@ delivery is at-least-once.
   queued in PostgreSQL.
 - Outbound webhook delivery uses the same queue (`webhook.delivery`) and is
   at-least-once; receivers deduplicate on `X-Webhook-Delivery`. Identity
-  registration and file upload/delete emit `user.registered`,
-  `file.uploaded`, and `file.deleted` through the contracts dispatcher; a
-  dispatch failure is logged and never fails the committed mutation.
+  registration, file upload/delete (user and admin), and file restore emit
+  `user.registered`, `file.uploaded`, `file.deleted`, and `file.restored`.
+  When the transaction manager is wired (the default bootstrap), the event is
+  enqueued inside the mutation's transaction (`DispatchTx`), so an outbox
+  failure fails the mutation (fail-closed); only the unwired fallback
+  dispatches after commit and logs failures.
 - Delivery is at-least-once; clients must tolerate duplicate emails. A failed
   notification enqueue rolls back the in-app row.
 - Terminal jobs clear payloads; success/dead rows are retained 30 days.

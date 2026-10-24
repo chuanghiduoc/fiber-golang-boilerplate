@@ -123,7 +123,8 @@ type Options struct {
 
 // CachedEvaluator caches one database snapshot in process memory. The mutex
 // protects the snapshot; refreshMu serialises database loads so a cold cache
-// does not cause a thundering herd.
+// does not cause a thundering herd. A TTL-expired snapshot within
+// MaxStaleness is served while a single background load refreshes it.
 type CachedEvaluator struct {
 	store        Store
 	env          map[Key]bool
@@ -258,13 +259,38 @@ func (e *CachedEvaluator) snapshotFor(ctx context.Context) *Snapshot {
 
 	metrics.FeatureFlagCacheMissesTotal.Inc()
 
+	// Stale-while-revalidate: a TTL-expired snapshot that is still within
+	// MaxStaleness is served immediately while at most one goroutine reloads in
+	// the background, so a slow database cannot stall every request for up to
+	// snapshotLoadTimeout. Only callers without a usable snapshot, or after an
+	// explicit Invalidate (which promises the next evaluation reloads), wait
+	// for the load.
+	e.mu.RLock()
+	staleSnapshot, staleAt, invalidated := e.snapshot, e.loadedAt, e.invalidated
+	e.mu.RUnlock()
+	if !invalidated && e.withinMaxStaleness(staleSnapshot, staleAt, now) {
+		if e.refreshMu.TryLock() {
+			go func() {
+				defer e.refreshMu.Unlock()
+				e.refreshLocked(ctx)
+			}()
+		}
+		return e.usableStale(staleSnapshot, staleAt, now)
+	}
+
 	e.refreshMu.Lock()
 	defer e.refreshMu.Unlock()
+	return e.refreshLocked(ctx)
+}
 
+// refreshLocked reloads the snapshot unless another goroutine already did,
+// and returns the snapshot to evaluate against (nil means no usable
+// snapshot). The caller must hold refreshMu.
+func (e *CachedEvaluator) refreshLocked(ctx context.Context) *Snapshot {
 	for {
 		// Another goroutine may have refreshed (or invalidated) while we
 		// waited for the refresh lock.
-		now = e.now()
+		now := e.now()
 		if snapshot, age, ok := e.freshSnapshot(now); ok {
 			metrics.FeatureFlagCacheHitsTotal.Inc()
 			metrics.FeatureFlagSnapshotAgeSeconds.Set(age.Seconds())
@@ -337,16 +363,22 @@ func (e *CachedEvaluator) freshSnapshot(now time.Time) (*Snapshot, time.Duration
 	return e.snapshot, age, true
 }
 
-func (e *CachedEvaluator) usableStale(snapshot *Snapshot, loadedAt, now time.Time) *Snapshot {
+// withinMaxStaleness reports whether snapshot may still be served as a stale
+// fallback at now.
+func (e *CachedEvaluator) withinMaxStaleness(snapshot *Snapshot, loadedAt, now time.Time) bool {
 	if snapshot == nil || loadedAt.IsZero() {
+		return false
+	}
+	age := now.Sub(loadedAt)
+	return age >= 0 && age <= e.maxStaleness
+}
+
+func (e *CachedEvaluator) usableStale(snapshot *Snapshot, loadedAt, now time.Time) *Snapshot {
+	if !e.withinMaxStaleness(snapshot, loadedAt, now) {
 		metrics.FeatureFlagSnapshotFallbackTotal.Inc()
 		return nil
 	}
 	age := now.Sub(loadedAt)
-	if age < 0 || age > e.maxStaleness {
-		metrics.FeatureFlagSnapshotFallbackTotal.Inc()
-		return nil
-	}
 	metrics.FeatureFlagSnapshotStaleTotal.Inc()
 	metrics.FeatureFlagSnapshotAgeSeconds.Set(age.Seconds())
 	return snapshot

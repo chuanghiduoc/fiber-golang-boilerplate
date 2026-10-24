@@ -47,19 +47,20 @@ type Tenant struct {
 }
 
 type User struct {
-	ID                int64              `json:"id"`
-	TenantID          int64              `json:"tenant_id"`
-	Email             string             `json:"email"`
-	PasswordHash      pgtype.Text        `json:"password_hash"`
-	Name              string             `json:"name"`
-	Role              string             `json:"role"`
-	GoogleID          pgtype.Text        `json:"google_id"`
-	AuthProvider      string             `json:"auth_provider"`
-	EmailVerifiedAt   pgtype.Timestamptz `json:"email_verified_at"`
-	TokenVersion      int32              `json:"token_version"`
-	PasswordChangedAt pgtype.Timestamptz `json:"password_changed_at"`
-	BannedAt          pgtype.Timestamptz `json:"banned_at"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+	ID                   int64              `json:"id"`
+	TenantID             int64              `json:"tenant_id"`
+	Email                string             `json:"email"`
+	PasswordHash         pgtype.Text        `json:"password_hash"`
+	Name                 string             `json:"name"`
+	Role                 string             `json:"role"`
+	GoogleID             pgtype.Text        `json:"google_id"`
+	AuthProvider         string             `json:"auth_provider"`
+	EmailVerifiedAt      pgtype.Timestamptz `json:"email_verified_at"`
+	TokenVersion         int32              `json:"token_version"`
+	PasswordChangedAt    pgtype.Timestamptz `json:"password_changed_at"`
+	BannedAt             pgtype.Timestamptz `json:"banned_at"`
+	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`
 }

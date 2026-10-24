@@ -809,6 +809,39 @@ func TestIdempotency_CacheFailureFailsOpen(t *testing.T) {
 	}
 }
 
+func TestIdempotency_HangingCacheFailsOpenFast(t *testing.T) {
+	appCache := &blackholeCache{}
+	var calls atomic.Int32
+	app := newTestApp()
+	app.Post("/test", Idempotency(appCache), func(c fiber.Ctx) error {
+		calls.Add(1)
+		return c.Status(fiber.StatusCreated).SendString("ok")
+	})
+
+	req, err := http.NewRequest(http.MethodPost, "/test", http.NoBody)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set(idempotencyHeader, "cache-hangs")
+	start := time.Now()
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second, FailOnTimeout: true})
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	_ = resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != fiber.StatusCreated || calls.Load() != 1 {
+		t.Fatalf("status = %d, handler calls = %d; want 201 and 1 (fail open)", resp.StatusCode, calls.Load())
+	}
+	// Every call is bounded: lookup, claim, held check, and re-lookup use the
+	// read bound; storing the response uses the write bound.
+	budget := 4*idempotencyCacheReadTimeout + idempotencyCacheWriteTimeout
+	if elapsed > budget+time.Second {
+		t.Fatalf("request took %v with a hanging cache, want at most about %v", elapsed, budget)
+	}
+}
+
 func TestIdempotency_NilCacheFailsOpen(t *testing.T) {
 	var calls atomic.Int32
 	app := newTestApp()

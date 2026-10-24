@@ -49,6 +49,11 @@ type Principal struct {
 	// "suspended"). API-key authentication rejects anything but
 	// TenantStatusActive.
 	TenantStatus string
+	// CredentialsRevokedAt is set when the account was banned and survives an
+	// unban. API keys created at or before it must be rejected, so a restored
+	// account never revives credentials issued before the ban. Nil means no
+	// revocation.
+	CredentialsRevokedAt *time.Time
 }
 
 // TenantStatusActive is the only tenant status that may authenticate.

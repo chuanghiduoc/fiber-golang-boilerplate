@@ -41,11 +41,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 	}
 
 	requestID := fmt.Sprintf("audit-test-%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM audit_events WHERE request_id = $1`, requestID)
-	})
+	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
 
 	recorder := NewPostgresRecorder(pool)
 	wantMetadata := map[string]any{
@@ -138,11 +134,12 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 	requestID := fmt.Sprintf("audit-tenant-test-%d", time.Now().UnixNano())
 	ctxRequestID := requestID + "-ctx"
 	t.Cleanup(func() {
+		deleteTestAuditRows(t, pool, requestID, ctxRequestID)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx,
-			`DELETE FROM audit_events WHERE request_id IN ($1, $2)`, requestID, ctxRequestID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM tenants WHERE id = $1`, tenantID)
+		if _, err := pool.Exec(cleanupCtx, `DELETE FROM tenants WHERE id = $1`, tenantID); err != nil {
+			t.Errorf("cleanup tenant: %v", err)
+		}
 	})
 
 	recorder := NewPostgresRecorder(pool)
@@ -196,11 +193,7 @@ func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 	}
 
 	requestID := fmt.Sprintf("audit-test-defaults-%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM audit_events WHERE request_id = $1`, requestID)
-	})
+	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
 
 	before := time.Now().UTC().Add(-time.Minute)
 	require.NoError(t, NewPostgresRecorder(pool).Record(ctx, Event{
@@ -291,12 +284,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NoError(t, pool.Ping(ctx))
 
 	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx,
-			`DELETE FROM audit_events WHERE request_id IN ($1, $2)`, requestID, requestID+"-service")
-	})
+	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID, requestID+"-service") })
 
 	recorder := NewPostgresRecorder(pool)
 	id, err := recorder.RecordID(ctx, Event{
@@ -373,4 +361,51 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	_, err = pool.Exec(ctx,
 		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, serviceID)
 	require.Error(t, err, "terminal rows must reject updates")
+
+	// Append-only covers removal too: neither DELETE nor TRUNCATE may drop
+	// audit rows outside a reviewed, trigger-disabling maintenance path.
+	_, err = pool.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceID)
+	require.ErrorContains(t, err, "append-only", "audit rows must reject DELETE")
+	// Inside a rolled-back transaction so a missing trigger cannot wipe a
+	// shared test database.
+	truncateTx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = truncateTx.Exec(ctx, `TRUNCATE audit_events`)
+	require.NoError(t, truncateTx.Rollback(ctx))
+	require.ErrorContains(t, err, "append-only", "audit_events must reject TRUNCATE")
+	var remaining int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, id, serviceID).Scan(&remaining))
+	assert.Equal(t, int64(2), remaining)
+}
+
+// deleteTestAuditRows removes this test's rows from a shared TEST_DATABASE_URL
+// database. audit_events rejects DELETE, so the cleanup disables the
+// append-only row trigger inside one transaction (requires table ownership,
+// like running migrations); other sessions never observe it disabled.
+func deleteTestAuditRows(t *testing.T, pool *pgxpool.Pool, requestIDs ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Errorf("cleanup audit rows: %v", err)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_events DISABLE TRIGGER trigger_audit_events_no_delete`); err != nil {
+		t.Errorf("cleanup audit rows: disable trigger: %v", err)
+		return
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE request_id = ANY($1)`, requestIDs); err != nil {
+		t.Errorf("cleanup audit rows: delete: %v", err)
+		return
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_events ENABLE TRIGGER trigger_audit_events_no_delete`); err != nil {
+		t.Errorf("cleanup audit rows: enable trigger: %v", err)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Errorf("cleanup audit rows: commit: %v", err)
+	}
 }

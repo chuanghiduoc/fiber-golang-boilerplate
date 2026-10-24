@@ -29,14 +29,18 @@ func Build(infra app.Infra) (*Module, Provides) {
 
 	m := New(uploadHandler)
 	m.uploadSvc = uploadSvc
+	m.adminSvc = filesAdminSvc
 	return m, Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}
 }
 
-// AttachWebhooks wires the outbound webhook dispatcher into upload/delete.
-// The webhooks module is built after files, so the composition root attaches
-// it once both exist.
+// AttachWebhooks wires the outbound webhook dispatcher into user and admin
+// upload/delete/restore. The webhooks module is built after files, so the
+// composition root attaches it once both exist.
 func (m *Module) AttachWebhooks(dispatcher webhookcontracts.Dispatcher) {
 	if m.uploadSvc != nil {
 		filesvc.AttachWebhookDispatcher(m.uploadSvc, dispatcher)
+	}
+	if m.adminSvc != nil {
+		filesvc.AttachAdminWebhookDispatcher(m.adminSvc, dispatcher)
 	}
 }

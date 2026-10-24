@@ -201,15 +201,37 @@ type Deps struct {
 	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
 	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
 	APIKeyVerifier *apikey.Verifier
+
+	// authGuard is the per-IP pre-authentication limit installed by New. Nil
+	// (a Deps literal in tests) skips it.
+	authGuard func(fiber.Ctx) error
 }
+
+// authLimiterTier namespaces the pre-authentication counters.
+const authLimiterTier = "auth"
 
 // Authenticate returns the standard authentication chain for protected module
 // routes: `Authorization: ApiKey` is verified by APIKeyVerifier and everything
 // else by the JWT/session middleware. A nil verifier keeps JWT behavior and
 // rejects API-key attempts with 401. Route permissions still come from
 // authz.Require, which sees an API key's scopes as the subject permissions.
+//
+// A per-client-IP limit (RATE_LIMIT_AUTH_*) runs first, because the caller
+// is unknown until authentication succeeds and the per-user tiers mounted
+// after it cannot throttle floods of bogus credentials, each of which would
+// otherwise cost an API-key lookup or session check.
 func (d Deps) Authenticate() fiber.Handler {
-	return apikey.Authenticate(middleware.JWTAuth(d.Config.JWT.Secret, d.Sessions), d.APIKeyVerifier)
+	authenticate := apikey.Authenticate(middleware.JWTAuth(d.Config.JWT.Secret, d.Sessions), d.APIKeyVerifier)
+	guard := d.authGuard
+	if guard == nil {
+		return authenticate
+	}
+	return func(c fiber.Ctx) error {
+		if err := guard(c); err != nil {
+			return err
+		}
+		return authenticate(c)
+	}
 }
 
 type App struct {
@@ -232,6 +254,7 @@ func New(cfg *config.Config, deps Deps) *App {
 		})
 	}
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
+	deps.authGuard = buildAuthGuard(cfg, deps.Cache)
 	deps.Idempotency = middleware.Idempotency(deps.Cache)
 	if deps.Webhooks == nil {
 		deps.Webhooks = webhookcontracts.Noop{}
@@ -276,6 +299,12 @@ func buildLimiters(cfg *config.Config, appCache cache.Cache) Limiters {
 		Normal:  middleware.NewLimiter(rl.NormalMax, rl.NormalWindow, "normal", appCache),
 		Relaxed: middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow, "relaxed", appCache),
 	}
+}
+
+func buildAuthGuard(cfg *config.Config, appCache cache.Cache) func(fiber.Ctx) error {
+	maxRequests, windowSecs := cfg.RateLimit.EffectiveAuth()
+	// A nil cache falls back to a process-local counter inside NewIPGuard.
+	return middleware.NewIPGuard(maxRequests, windowSecs, authLimiterTier, appCache)
 }
 
 func (a *App) setupGlobalMiddleware() {

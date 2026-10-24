@@ -28,12 +28,19 @@ func validRequestID(value string) bool {
 	return true
 }
 
+// RequestID assigns the request correlation ID. An inbound X-Request-Id is
+// honored only from a trusted proxy (APP_TRUST_PROXY with the peer in
+// APP_TRUSTED_PROXIES); any other client gets a generated ID, so it cannot
+// forge or collide correlation IDs in logs, audit rows, and traces.
 func RequestID() fiber.Handler {
 	return func(c fiber.Ctx) error {
-		// Clone: Fiber header strings are zero-copy views into a pooled buffer
-		// (Immutable=false), but the ID outlives the request in contexts,
-		// async goroutines, and asynchronously exported span attributes.
-		requestID := strings.Clone(c.Get("X-Request-Id"))
+		var requestID string
+		if c.IsProxyTrusted() {
+			// Clone: Fiber header strings are zero-copy views into a pooled
+			// buffer (Immutable=false), but the ID outlives the request in
+			// contexts, async goroutines, and exported span attributes.
+			requestID = strings.Clone(c.Get("X-Request-Id"))
+		}
 		if !validRequestID(requestID) {
 			requestID = uuid.New().String()
 		}

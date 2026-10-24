@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS users (
     token_version INTEGER NOT NULL DEFAULT 0,
     password_changed_at TIMESTAMP WITH TIME ZONE,
     banned_at TIMESTAMP WITH TIME ZONE,
+    -- Set by a ban and never cleared by unban: API keys created at or before
+    -- it stay invalid after the account is restored.
+    credentials_revoked_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     deleted_at TIMESTAMP WITH TIME ZONE
@@ -93,6 +96,11 @@ CREATE INDEX IF NOT EXISTS idx_users_tenant_role_active
     WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_users_tenant_created_at_id
     ON users (tenant_id, created_at DESC, id DESC);
+-- GetBannedUserByEmail runs on public registration/email changes; the active
+-- partial index above excludes banned (soft-deleted) rows.
+CREATE INDEX IF NOT EXISTS idx_users_tenant_email_lower_banned
+    ON users (tenant_id, lower(email))
+    WHERE banned_at IS NOT NULL;
 -- Required as the parent key for tenant-aware feature flag user targets:
 -- a target's (tenant_id, user_id) must reference a user in the same tenant.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_id_id
@@ -146,18 +154,23 @@ CREATE TRIGGER trigger_protect_last_admin
 -- ---------------------------------------------------------------------------
 -- identity: refresh tokens (stores SHA-256 hashes, never plaintext)
 -- ---------------------------------------------------------------------------
+-- Identity token tables are fully owned by their user, so the composite
+-- (tenant_id, user_id) FK cascades: the database rejects a token whose tenant
+-- differs from its user's (parent key: idx_users_tenant_id_id).
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     token VARCHAR(255) NOT NULL UNIQUE,
     token_version INTEGER NOT NULL DEFAULT 0,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_refresh_tokens_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE CASCADE
 );
 
--- Token lookups use the implicit refresh_tokens_token_key UNIQUE index.
-CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+-- Token lookups use the implicit refresh_tokens_token_key UNIQUE index; every
+-- per-user query (and the FK cascade) filters (tenant_id, user_id).
 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant_user_id
     ON refresh_tokens (tenant_id, user_id);
 
@@ -167,15 +180,17 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_tenant_user_id
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     token VARCHAR(255) NOT NULL UNIQUE,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_password_reset_tokens_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id
-    ON password_reset_tokens (user_id);
-CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_tenant_user_id
+-- One live token per user (user ids are global, so this is the same rule as a
+-- user_id-only key) and the tenant-leading index for every per-user query.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_password_reset_tokens_tenant_user_id
     ON password_reset_tokens (tenant_id, user_id);
 
 -- ---------------------------------------------------------------------------
@@ -184,16 +199,17 @@ CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_tenant_user_id
 CREATE TABLE IF NOT EXISTS email_verification_tokens (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
-    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    user_id BIGINT NOT NULL,
     email VARCHAR(255) NOT NULL,
     token VARCHAR(255) NOT NULL UNIQUE,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_email_verification_tokens_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES users (tenant_id, id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verification_tokens_user_id
-    ON email_verification_tokens (user_id);
-CREATE INDEX IF NOT EXISTS idx_email_verification_tokens_tenant_user_id
+-- One live token per user, tenant-leading for every per-user query.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_email_verification_tokens_tenant_user_id
     ON email_verification_tokens (tenant_id, user_id);
 
 -- ---------------------------------------------------------------------------
@@ -421,11 +437,9 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 -- claimJobsSQL is a cross-tenant pass: the due CTE (status = 'queued',
 -- run_at <= now()) and the lease-expiry CTE (status = 'running') use this.
+-- Claim and purge are global by design, so there is no tenant-leading
+-- status/kind index; the only tenant-scoped lookup is the idempotency key.
 CREATE INDEX IF NOT EXISTS idx_jobs_status_run_at ON jobs (status, run_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_tenant_status_run_at
-    ON jobs (tenant_id, status, run_at);
-CREATE INDEX IF NOT EXISTS idx_jobs_tenant_kind_status
-    ON jobs (tenant_id, kind, status);
 -- Keys are scoped by tenant because callers may use user-provided keys.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_tenant_idempotency_key
     ON jobs (tenant_id, idempotency_key)
@@ -565,6 +579,26 @@ CREATE TRIGGER trigger_audit_events_completion
     FOR EACH ROW
     EXECUTE FUNCTION audit_events_completion_guard();
 
+-- Deleting audit rows is never an application path. A reviewed retention or
+-- erasure job must disable these triggers explicitly as the table owner.
+CREATE OR REPLACE FUNCTION audit_events_append_only() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'audit_events rows are append-only (% is not allowed)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_audit_events_no_delete ON audit_events;
+CREATE TRIGGER trigger_audit_events_no_delete
+    BEFORE DELETE ON audit_events
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_events_append_only();
+
+DROP TRIGGER IF EXISTS trigger_audit_events_no_truncate ON audit_events;
+CREATE TRIGGER trigger_audit_events_no_truncate
+    BEFORE TRUNCATE ON audit_events
+    FOR EACH STATEMENT
+    EXECUTE FUNCTION audit_events_append_only();
+
 -- ---------------------------------------------------------------------------
 -- webhooks: outbound endpoints and versioned signing secrets
 --
@@ -673,8 +707,6 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_created_at_id
     ON webhook_deliveries (tenant_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_endpoint_created
     ON webhook_deliveries (tenant_id, endpoint_id, created_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_status_next
-    ON webhook_deliveries (tenant_id, status, next_attempt_at);
 -- Retention is a cross-tenant maintenance pass, so these purge indexes are
 -- deliberately not tenant-leading. The predicate matches PurgeWebhookDeliveries.
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_terminal_updated_at
@@ -711,10 +743,10 @@ CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_delivery_attempt
     ON webhook_delivery_attempts (delivery_id, attempt);
+-- Tenant-leading index for ListWebhookDeliveryAttempts. Attempts have no
+-- time-ordered listing, so there is no (tenant_id, created_at) index.
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_delivery
     ON webhook_delivery_attempts (tenant_id, delivery_id);
-CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_created
-    ON webhook_delivery_attempts (tenant_id, created_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- webhooks: inbound sources and deduplicated inbound events
@@ -771,8 +803,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_events_source_event
     ON webhook_inbound_events (tenant_id, source_id, external_event_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_source_received
     ON webhook_inbound_events (tenant_id, source_id, received_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_received
-    ON webhook_inbound_events (tenant_id, received_at DESC, id DESC);
 -- Cross-tenant retention purge (PurgeWebhookInboundEvents).
 CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_received_at
     ON webhook_inbound_events (received_at);

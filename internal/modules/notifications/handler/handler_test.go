@@ -106,7 +106,7 @@ func (f *fakeService) SetPreference(_ context.Context, userID int64, req dto.Upd
 		return nil, f.err
 	}
 	return &dto.PreferenceResponse{
-		ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: req.Enabled,
+		ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: *req.Enabled,
 	}, nil
 }
 
@@ -221,7 +221,7 @@ func TestPreferenceHandlers(t *testing.T) {
 	require.Len(t, data, 1)
 
 	resp, body = doJSON(t, app, http.MethodPut, "/notification-preferences", dto.UpdatePreferenceRequest{
-		Type: "security.alert", Channel: "email", Enabled: true,
+		Type: "security.alert", Channel: "email", Enabled: new(true),
 	})
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
 	assert.Equal(t, true, body["enabled"])
@@ -231,6 +231,20 @@ func TestPreferenceHandlers(t *testing.T) {
 		"type": "security.alert", "channel": "push", "enabled": true,
 	})
 	assert.Equal(t, fiber.StatusUnprocessableEntity, resp.StatusCode)
+
+	// Omitting enabled is a validation error, not an implicit disable;
+	// explicit false is accepted.
+	svc.lastPreference = dto.UpdatePreferenceRequest{}
+	resp, _ = doJSON(t, app, http.MethodPut, "/notification-preferences", map[string]any{
+		"type": "security.alert", "channel": "email",
+	})
+	assert.Equal(t, fiber.StatusUnprocessableEntity, resp.StatusCode)
+	assert.Empty(t, svc.lastPreference.Type, "the service must not be called")
+	resp, body = doJSON(t, app, http.MethodPut, "/notification-preferences", map[string]any{
+		"type": "security.alert", "channel": "email", "enabled": false,
+	})
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, false, body["enabled"])
 
 	resp, _ = doJSON(t, app, http.MethodPut, "/notification-preferences", map[string]any{
 		"type": "security.alert", "channel": "email", "enabled": true, "unknown": 1,
@@ -258,6 +272,17 @@ func TestSendHandler(t *testing.T) {
 	assert.Equal(t, int64(1), svc.lastInput.TenantID)
 	assert.Equal(t, int64(10), svc.lastInput.UserID)
 	assert.JSONEq(t, `{"k":"v"}`, string(svc.lastInput.Data))
+
+	// In-app disabled: the documented contract is "notification": null, not
+	// an absent field.
+	svc.createResult = service.CreateResult{EmailQueued: true}
+	resp, body = doJSON(t, app, http.MethodPost, "/notifications/send", map[string]any{
+		"userId": 10, "type": "system.info", "title": "Hello", "body": "Body",
+	})
+	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
+	notification, present := body["notification"]
+	assert.True(t, present, "notification must be present")
+	assert.Nil(t, notification)
 }
 
 func TestHandlerPropagatesErrors(t *testing.T) {

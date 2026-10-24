@@ -41,7 +41,7 @@ internal/bootstrap/         the single ordered module list + contract cross-wiri
 cmd/migrate/main.go         the only schema initializer/migrator
 cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry, provider hooks, app.Infra
-internal/modules/           each module: module.go (Build + providers), catalog/ (permissions, error codes, flags, locales), dto/handler/service/repository, queries/sqlc. identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc)
+internal/modules/           each module: module.go (Build + providers), catalog/ (permissions, error codes, flags, locales), dto/handler/service/repository, queries/sqlc. identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), features (admin flag API + queries/sqlc), notifications (dto/repository/service/handler + queries/sqlc), admin (dto/service/handler, contracts-only), webhooks (dto/repository/service/handler + dispatcher/delivery worker + queries/sqlc), apikeys (dto/repository/service/handler + adapter + queries/sqlc)
 internal/contracts/<provider>/ stdlib-only cross-module contracts per providing module: identity (admin, principal reader, notification recipient), files (admin), notifications (notifier), webhooks (event/dispatcher)
 internal/platform/          authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, and shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
@@ -69,20 +69,27 @@ secrets). Keep them current when routes/contracts change.
 - One module owns each table; cross-module reads use a contract/read model,
   not another module's repository.
 - Enforce with `test/arch/imports_test.go`; do not weaken it. `test/arch` also
-  builds every module from `internal/bootstrap` and fails when a route under
-  `/api/v1` lacks `authz.Require` (explicit public allowlist), when a
-  mutating route is neither Tier 1 nor `audit.Guard`ed, when one module's
-  group middleware covers another module's routes (the `/admin` overlap
-  class), or when a module's `queries/*.sql` touch another module's tables.
+  builds every module from `internal/bootstrap` (v1 and `app.V2Module` v2
+  routes) and fails when a route under `/api/v1` or `/api/v2` lacks
+  `internal/platform/authz.Require` (explicit public allowlist), when a
+  mutating route is neither Tier 1 (whose owning module must record the
+  action with `RecordInTx`) nor `audit.Guard`ed, when one module's group
+  middleware covers another module's routes (the `/admin` overlap class),
+  when a module's `queries/*.sql` touch another module's tables, or when an
+  `internal/modules/<name>` directory is not registered in bootstrap.
 
 **Schema ownership**
 - Only `cmd/migrate` applies DDL. API/seed assume the schema exists.
 - `cmd/migrate` uses `config.LoadDatabase` (DB_* only; no JWT/admin/SMTP
   secrets).
 - Fresh installs: one `migrations/000001_init_schema.up.sql`.
-- Existing databases: keep their `schema_migrations` history and add a
-  migration above the current version with only the missing objects. New
-  migrations use UTC timestamp versions (`make migrate-create module=<owner>
+- Existing databases: add a migration above the current version with only
+  the missing objects. A legacy `000001`-`000003` database cannot do that from
+  this repo (those source files are gone and the arch test rejects restoring
+  sequential versions), so it is upgraded once by hand: apply the reviewed
+  upgrade DDL, baseline with `migrate force 1` only after the schema matches,
+  then run `cmd/migrate` to verify (README "Upgrading an existing database").
+  New migrations use UTC timestamp versions (`make migrate-create module=<owner>
   name=<purpose>` -> `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`), which
   are always above the legacy sequential versions (an old deployment is at 3)
   and do not collide across branches. `test/arch/migrations_test.go` rejects
@@ -90,19 +97,26 @@ secrets). Keep them current when routes/contracts change.
   unknown owners. golang-migrate never applies a version below the recorded
   one, so regenerate a branch migration whose timestamp is older than the
   newest migration on main before merging. Never point an old database at
-  the new `000001`, reset `schema_migrations`, or edit a shipped migration.
+  the new `000001`, rewrite `schema_migrations` to skip DDL that was not
+  applied, or edit a shipped migration.
   The `jobs.trace_parent` column is folded into the baseline because this
   boilerplate has no deployed database; a database already at version 1 needs
   the `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT` upgrade in
   `docs/tracing.md` before running this build.
 - Every tenant-owned table (`users`, `files`, `notifications`,
   `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
-  `email_verification_tokens`, `jobs`, `audit_events`,
+  `email_verification_tokens`, `api_keys`, `jobs`, `audit_events`,
   `feature_flag_targets`, `webhook_*`) has
   `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
-  New tenant-owned tables must do the same and lead their query indexes with
-  `tenant_id`. `feature_flags` is process-wide configuration and is the
-  deliberate exception.
+  New tenant-owned tables must do the same and lead their tenant-scoped query
+  indexes with `tenant_id`. `feature_flags` is process-wide configuration and
+  is the deliberate exception. Job claim/lease recovery/purge are global by
+  design, so `jobs` has only the tenant-leading idempotency index.
+- `cmd/migrate` verifies required tables, columns, unique indexes (including
+  every `ON CONFLICT` target), tenant-leading indexes, and enabled triggers
+  (`trigger_protect_last_admin`, audit completion/no-delete/no-truncate);
+  `cmd/migrate/main_test.go` fails when that list drifts from the baseline.
+  `audit_events` rejects `DELETE`/`TRUNCATE` at the database.
 - `jobs.idempotency_key` is nullable with a partial unique
   `(tenant_id, idempotency_key)` index; `EnqueueOnce`/`EnqueueOnceTx` use it.
 - `scheduler_leases` (one named leader row) and `scheduler_runs` (unique
@@ -216,7 +230,16 @@ full replace (webhooks); new modules use `PATCH` for partial updates (see
   `tenant.EffectiveID(ctx)`; the tenant-1 fallback is for jobs/internal/tests
   only, not HTTP request handling. Refresh tokens are atomic single-use,
   tenant-scoped, and version-bound; logout deletes by token possession.
-  `pkg/token` pins HS256 and requires `exp`.
+  `pkg/token` pins HS256 and requires `exp`. Login lockout counts failures
+  per (tenant, email, client IP) and locks the account globally only after
+  5x that threshold, so one IP cannot lock a victim out. Banning sets
+  `users.credentials_revoked_at`; the API-key verifier rejects keys created
+  at or before it, so unban never revives old keys. Changing another user's
+  email is refused for API-key callers and for admin targets (re-auth via
+  the target's own session). The Google callback is Tier 1:
+  `auth.google_login` is recorded in the sign-in transaction with the state
+  tenant. The admin seed only creates a missing admin; an existing demoted,
+  banned, or deleted account is logged and skipped, never re-promoted.
 - **Files/tenant isolation:** repository methods always add
   `tenant.EffectiveID(ctx)` to the SQL parameters; service methods also compare
   the returned row's `TenantID`/`UserID` before exposing it. Uploads reject an
@@ -227,7 +250,10 @@ full replace (webhooks); new modules use `PATCH` for partial updates (see
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their
   `email.send` job in one transaction (`QueuedSender.SendTx`), so an enqueue
-  failure rolls the token back. When transactional email provisioning is wired
+  failure rolls the token back. `POST /auth/forgot-password` only enqueues an
+  encrypted `password_reset.request` job for every request (same response
+  shape and work whether or not the account exists); the job handler does
+  the lookup and the token + `email.send` transaction. When transactional email provisioning is wired
   (as in `identity.Build`), registration is atomic too: `UserService.Register`
   creates the user, verification token, and `email.send` job in one transaction,
   so a failed outbox write rolls the account back (fail-closed); without that
@@ -269,12 +295,12 @@ full replace (webhooks); new modules use `PATCH` for partial updates (see
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
-- **Webhooks:** identity registration and file upload/delete emit through
+- **Webhooks:** identity registration and file upload/delete/restore emit through
   `internal/contracts/webhooks.Dispatcher` (`app.Deps.Webhooks`), so producers
   never import the module. Dispatch inserts
   a tenant-scoped `webhook_deliveries` row plus a `webhook.delivery` job in one
   transaction and snapshots URL/payload/secret ciphertext. The worker signs
-  `<timestamp>.<raw-body>` with HMAC-SHA256, sends through `pkg/webhook.Client`
+  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>` with HMAC-SHA256, sends through `pkg/webhook.Client`
   (private/loopback/link-local blocked unless allowlisted, no redirects, no
   proxy, DNS pinned to vetted IPs), records every attempt, and retries 408/425/
   429/5xx with exponential backoff or `Retry-After`; other 3xx/4xx are dead.
@@ -287,7 +313,7 @@ full replace (webhooks); new modules use `PATCH` for partial updates (see
   carries id/name/tenant/request/actor/timestamp/data; missing tenant, request,
   and actor metadata is resolved from the context. `Subscribe` is synchronous
   local delivery; `SubscribeDurable` enqueues one job per event and handler
-  with key `event:<id>:<handler>:<tenantId>`; `PublishTx` keeps the job and the
+  with key `event:<name>:<id>:<handler>:<tenantId>`; `PublishTx` keeps the job and the
   business transaction atomic. Panics are recovered per handler and errors are
   combined with `errors.Join`. Durable handlers are at-least-once, so they must
   be idempotent. `RegisterJobs` wires subscriptions into the worker.

@@ -25,6 +25,12 @@ const (
 	// bookkeepingTimeout bounds the detached writes that record an attempt
 	// after the HTTP request was sent.
 	bookkeepingTimeout = 5 * time.Second
+	// secretRotationGrace is how long after an endpoint secret rotation a
+	// delivery whose snapshot predates the rotation is signed with both the
+	// snapshot and the current secret. Receivers can switch to the new secret
+	// at any time inside the window without failing pending retries; after it
+	// only the current secret signs.
+	secretRotationGrace = 24 * time.Hour
 )
 
 // WorkerOptions configures retry and claim behavior.
@@ -46,8 +52,10 @@ type DeliveryEnvelope struct {
 type WorkerStore interface {
 	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error)
 	GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error)
-	MarkDeliverySucceeded(ctx context.Context, id int64, statusCode int) error
-	MarkDeliveryDead(ctx context.Context, id int64, statusCode int, reason string) error
+	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
+	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
+	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
+	ActiveSigningSecret(ctx context.Context, endpointID int64) (*repository.SigningSecret, error)
 	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft repository.RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft repository.AttemptDraft) error
@@ -124,10 +132,8 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 			Attempt:    delivery.Attempts,
 			Error:      reason,
 		})
-		if markErr := w.store.MarkDeliveryDead(ctx, delivery.ID, 0, reason); markErr != nil {
-			return markErr
-		}
-		return nil
+		return w.fenced(delivery, "mark delivery dead",
+			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
 	}
 
 	body, err := json.Marshal(DeliveryEnvelope{
@@ -145,7 +151,8 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		}); attemptErr != nil {
 			return attemptErr
 		}
-		return w.store.MarkDeliveryDead(ctx, delivery.ID, 0, reason)
+		return w.fenced(delivery, "mark delivery dead",
+			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
 	}
 
 	timestamp := w.now()
@@ -154,8 +161,7 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	reqHeaders.Set(webhook.HeaderDelivery, strconv.FormatInt(delivery.ID, 10))
 	reqHeaders.Set(webhook.HeaderEvent, delivery.EventType)
 	reqHeaders.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
-	reqHeaders.Set(webhook.HeaderSignature, webhook.SignatureHeader(
-		webhook.Sign(secret, delivery.EventID, delivery.EventType, timestamp, body)))
+	reqHeaders.Set(webhook.HeaderSignature, w.signatureHeader(ctx, delivery, secret, timestamp, body))
 	reqHeaders.Set(webhook.HeaderAttempt, strconv.FormatInt(int64(delivery.Attempts), 10))
 	reqHeaders.Set("Content-Type", "application/json")
 
@@ -166,12 +172,36 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	result, doErr := w.client.Do(reqCtx, delivery.Url, reqHeaders, body)
 	elapsed := time.Since(started)
 	cancelReq()
+	// The job context itself ended (worker shutdown or job timeout), as
+	// opposed to the per-endpoint request timeout, before any response
+	// arrived. That says nothing about the receiver.
+	interrupted := doErr != nil && ctx.Err() != nil
+	jobErr := ctx.Err()
 
 	// The request has been sent, so its outcome must be recorded even if the
 	// job is being canceled for shutdown; otherwise the attempt is lost and a
 	// retry can deliver a duplicate before the lease even expires.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
 	defer cancel()
+
+	if interrupted {
+		// Give the attempt back instead of recording a failure: on the final
+		// attempt a failure would dead-letter a delivery that may never have
+		// reached the receiver. The request may still have arrived, which is
+		// within the at-least-once contract (receivers deduplicate).
+		if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
+			if !errors.Is(err, repository.ErrDeliveryLeaseLost) {
+				return fmt.Errorf("webhooks: release interrupted delivery %d: %w", delivery.ID, err)
+			}
+			slog.Warn("webhooks: interrupted delivery claim was already superseded",
+				slog.Int64("delivery_id", delivery.ID),
+				slog.Int("attempt", int(delivery.Attempts)),
+			)
+		}
+		// Returning the job context's error lets the jobs worker requeue the
+		// job without consuming its attempt when it is shutting down.
+		return fmt.Errorf("webhooks: delivery %d interrupted before a response: %w", delivery.ID, jobErr)
+	}
 
 	if doErr != nil {
 		outcome := webhook.ClassifyError(doErr)
@@ -209,23 +239,17 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, outcome webhook.Outcome, statusCode int, reason, retryAfter string) error {
 	switch outcome {
 	case webhook.OutcomeSuccess:
-		if err := w.store.MarkDeliverySucceeded(ctx, delivery.ID, statusCode); err != nil {
-			return fmt.Errorf("webhooks: mark delivery succeeded: %w", err)
-		}
-		return nil
+		return w.fenced(delivery, "mark delivery succeeded",
+			w.store.MarkDeliverySucceeded(ctx, delivery.ID, delivery.Attempts, statusCode))
 
 	case webhook.OutcomePermanent:
-		if err := w.store.MarkDeliveryDead(ctx, delivery.ID, statusCode, reason); err != nil {
-			return fmt.Errorf("webhooks: mark delivery dead: %w", err)
-		}
-		return nil
+		return w.fenced(delivery, "mark delivery dead",
+			w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, statusCode, reason))
 
 	default:
 		if delivery.Attempts >= delivery.MaxAttempts {
-			if err := w.store.MarkDeliveryDead(ctx, delivery.ID, statusCode, reason); err != nil {
-				return fmt.Errorf("webhooks: mark delivery dead after retries: %w", err)
-			}
-			return nil
+			return w.fenced(delivery, "mark delivery dead after retries",
+				w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, statusCode, reason))
 		}
 		now := w.now()
 		delay, _ := webhook.RetryDelay(int(delivery.Attempts), w.opts.RetryBase, w.opts.RetryMax, retryAfter, now)
@@ -233,16 +257,71 @@ func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.Webho
 			delay = 0
 		}
 		next := now.Add(delay)
-		if err := w.store.RescheduleDeliveryWithJob(ctx, repository.RetryDraft{
+		return w.fenced(delivery, "reschedule delivery", w.store.RescheduleDeliveryWithJob(ctx, repository.RetryDraft{
 			DeliveryID:    delivery.ID,
+			Attempt:       delivery.Attempts,
 			NextAttemptAt: next,
 			StatusCode:    statusCode,
 			Error:         reason,
-		}); err != nil {
-			return fmt.Errorf("webhooks: reschedule delivery: %w", err)
-		}
+		}))
+	}
+}
+
+// fenced wraps an outcome write. ErrDeliveryLeaseLost means this worker's
+// claim lease expired and a newer attempt (or a terminal state) owns the row;
+// the stale result is discarded with a warning rather than retried, because a
+// retry would hit the same fence forever.
+func (w *DeliveryWorker) fenced(delivery *webhooksqlc.WebhookDelivery, action string, err error) error {
+	if errors.Is(err, repository.ErrDeliveryLeaseLost) {
+		slog.Warn("webhooks: discarded stale delivery outcome; claim lease lost",
+			slog.Int64("delivery_id", delivery.ID),
+			slog.Int("attempt", int(delivery.Attempts)),
+			slog.String("action", action),
+		)
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("webhooks: %s: %w", action, err)
+	}
+	return nil
+}
+
+// signatureHeader signs with the delivery's snapshot secret. When the endpoint
+// secret was rotated after the snapshot, it also signs with the current secret
+// during secretRotationGrace (receivers accept either "v1=" value), and with
+// the current secret alone after it. A failed lookup falls back to the
+// snapshot signature, which is what the delivery was created with.
+func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, snapshot []byte, timestamp time.Time, body []byte) string {
+	sign := func(secret []byte) string {
+		return webhook.SignatureHeader(webhook.Sign(secret, delivery.EventID, delivery.EventType, timestamp, body))
+	}
+	current, err := w.store.ActiveSigningSecret(ctx, delivery.EndpointID)
+	if err != nil {
+		slog.Error("webhooks: load current endpoint secret; signing with the snapshot only",
+			slog.Int64("delivery_id", delivery.ID),
+			slog.Int64("endpoint_id", delivery.EndpointID),
+			slog.Any("error", err),
+		)
+		return sign(snapshot)
+	}
+	// Each rotation seals a fresh secret with a random nonce, so an identical
+	// ciphertext means the snapshot is still the active secret.
+	if current.Ciphertext == delivery.SecretCiphertext {
+		return sign(snapshot)
+	}
+	currentSecret, err := w.codec.Open(current.Ciphertext)
+	if err != nil {
+		slog.Error("webhooks: current endpoint secret could not be decrypted; signing with the snapshot only",
+			slog.Int64("delivery_id", delivery.ID),
+			slog.Int64("endpoint_id", delivery.EndpointID),
+			slog.Any("error", err),
+		)
+		return sign(snapshot)
+	}
+	if w.now().Before(current.CreatedAt.Add(secretRotationGrace)) {
+		return sign(snapshot) + "," + sign(currentSecret)
+	}
+	return sign(currentSecret)
 }
 
 // handleNotClaimable distinguishes an already-terminal delivery (nothing to

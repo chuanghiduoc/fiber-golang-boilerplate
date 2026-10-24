@@ -231,6 +231,15 @@ func writeProblem(c fiber.Ctx, e *AppError, localizer Localizer) error {
 
 // fromStatus derives an AppError from a bare HTTP status (e.g. a fiber.Error).
 func fromStatus(status int, detail string) *AppError {
+	// Fiber rejects bodies over APP_BODY_LIMIT before any middleware runs.
+	// Render that 413 with the same code as the BodyLimit middleware so
+	// clients see one payload_too_large contract, not request_entity_too_large.
+	if status == fiber.StatusRequestEntityTooLarge {
+		if detail == "" || detail == http.StatusText(status) {
+			detail = "request body too large"
+		}
+		return NewPayloadTooLarge(detail)
+	}
 	title := http.StatusText(status)
 	if title == "" {
 		title = "Error"

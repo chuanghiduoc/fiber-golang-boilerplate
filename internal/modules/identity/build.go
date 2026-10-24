@@ -14,6 +14,7 @@ import (
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -71,6 +72,16 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 		userRepo, passwordResetRepo, refreshTokenRepo,
 		infra.Email, infra.Cache, cfg.App.FrontendURL, infra.Tx, sessionStore,
 	)
+	// Forgot-password requests run as durable jobs so the public endpoint has
+	// the same cost and failure modes for registered and unknown addresses.
+	// The address in the payload is sealed like email jobs (JWT_SECRET key).
+	if infra.Queue != nil {
+		resetCodec, err := jobs.NewPayloadCodec(cfg.JWT.Secret)
+		if err != nil {
+			return nil, Provides{}, fmt.Errorf("password reset job payload encryption: %w", err)
+		}
+		identityservice.AttachResetRequestQueue(passwordResetSvc, infra.Queue, resetCodec)
+	}
 
 	emailVerifRepo := identityrepository.NewEmailVerificationRepository(infra.Pool)
 	emailVerifSvc := identityservice.NewEmailVerificationService(
@@ -90,6 +101,7 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 
 	m := New(authHandler, userHandler)
 	m.userSvc = userSvc
+	m.resetSvc = passwordResetSvc
 	m.startup = func(ctx context.Context) error {
 		return startup(ctx, infra, userRepo, tenantRepo)
 	}
@@ -118,6 +130,14 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 func (m *Module) AttachWebhooks(dispatcher webhookcontracts.Dispatcher) {
 	if m.userSvc != nil {
 		identityservice.AttachWebhookDispatcher(m.userSvc, dispatcher)
+	}
+}
+
+// RegisterJobs implements app.JobProvider: the worker performs queued
+// forgot-password requests. A module built with New (tests) registers nothing.
+func (m *Module) RegisterJobs(registrar jobs.Registrar) {
+	if m.resetSvc != nil {
+		registrar.Register(identityservice.ResetRequestJobKind, m.resetSvc.HandleResetRequestJob)
 	}
 }
 

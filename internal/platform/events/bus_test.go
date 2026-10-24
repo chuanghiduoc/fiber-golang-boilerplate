@@ -175,7 +175,7 @@ func TestPublishDurableEnqueuesOneJobPerHandler(t *testing.T) {
 	for _, job := range enqueued {
 		byKind[job.Kind] = job
 		assert.Equal(t, int64(5), job.TenantID)
-		assert.Equal(t, "event:"+event.ID+":"+handlerNameForKind(job.Kind)+":5", job.IdempotencyKey)
+		assert.Equal(t, "event:invoice.paid:"+event.ID+":"+handlerNameForKind(job.Kind)+":5", job.IdempotencyKey)
 		var decoded Event
 		require.NoError(t, json.Unmarshal(job.Payload, &decoded))
 		assert.Equal(t, event.ID, decoded.ID)

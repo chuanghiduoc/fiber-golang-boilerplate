@@ -120,9 +120,11 @@ func WithLeaseDuration(d time.Duration) Option {
 }
 
 // WithJobTimeout limits how long a handler may run before its context is
-// canceled. The worker then records a normal failure, so the job retries or is
-// dead-lettered by the usual attempt budget. Values less than or equal to zero
-// disable the timeout.
+// canceled. A handler that then returns an error records a normal failure, so
+// the job retries or is dead-lettered by the usual attempt budget; one that
+// ignores the cancellation and still returns nil is recorded as succeeded (its
+// side effects already happened) and the overrun is logged. Values less than
+// or equal to zero disable the timeout.
 func WithJobTimeout(d time.Duration) Option {
 	return func(w *Worker) {
 		if d > 0 {
@@ -456,8 +458,16 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 		}
 		stopHeartbeat()
 		if handlerErr == nil && timedOut {
-			// The handler ignored cancellation and returned after its deadline.
-			handlerErr = fmt.Errorf("jobs: handler exceeded the %s job timeout", w.jobTimeout)
+			// The handler ignored cancellation and returned after its deadline,
+			// but it reported success: its side effects already happened, so
+			// recording a failure would re-run them. Record success and make
+			// the overrun visible instead.
+			slog.Warn("jobs: handler succeeded after exceeding the job timeout",
+				"job_id", job.ID,
+				"kind", job.Kind,
+				"worker_id", w.id,
+				"timeout", w.jobTimeout.String(),
+			)
 		}
 	}
 

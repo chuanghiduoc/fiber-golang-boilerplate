@@ -1,6 +1,9 @@
 package arch_test
 
 import (
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -23,25 +26,27 @@ var publicRoutes = map[string]string{
 	"POST /api/v1/webhooks/inbound/:id":     "source HMAC signature",
 }
 
-// authzFragments are the function-name fragments of the permission
-// middleware constructors (runtime.FuncForPC names their closures
-// ".../authz.Require.func1").
-var authzFragments = []string{"/authz.Require.", "/authz.RequireAny."}
+// authzPackage and authzFuncs identify the permission middleware
+// constructors by full import path (runtime.FuncForPC names their closures
+// "<module>/internal/platform/authz.Require.func1").
+const authzPackage = "internal/platform/authz"
+
+var authzFuncs = []string{"Require", "RequireAny"}
 
 // TestEveryProtectedRouteRequiresAPermission fails when a route under
-// /api/v1 has no authz.Require/RequireAny in its handler chain and is not an
-// explicitly listed public route. It runs over every module in
+// /api/v1 or /api/v2 has no authz.Require/RequireAny in its handler chain and
+// is not an explicitly listed public route. It runs over every module in
 // internal/bootstrap, so a new module is checked without editing this test.
 func TestEveryProtectedRouteRequiresAPermission(t *testing.T) {
 	endpoints, _ := moduleRoutes(t)
 	seenPublic := map[string]bool{}
 	for _, mounted := range endpoints {
 		route := mounted.route
-		if !strings.HasPrefix(route.Path, "/api/v1/") {
+		if !underAPIPrefix(route.Path) {
 			continue
 		}
 		key := route.Method + " " + route.Path
-		hasAuthz := handlerChainContains(route, authzFragments...)
+		hasAuthz := handlerChainHas(route, authzPackage, authzFuncs...)
 		if _, public := publicRoutes[key]; public {
 			seenPublic[key] = true
 			if hasAuthz {
@@ -71,7 +76,7 @@ func TestGroupMiddlewareDoesNotCoverAnotherModule(t *testing.T) {
 	endpoints, groups := moduleRoutes(t)
 	for _, group := range groups {
 		prefix := strings.TrimSuffix(group.route.Path, "/")
-		if prefix == "" || prefix == "/api/v1" {
+		if prefix == "" || slices.Contains(apiPrefixes, prefix) {
 			t.Errorf("module %s mounts middleware on %q, which covers every module; use per-route middleware",
 				group.module, group.route.Path)
 			continue
@@ -85,6 +90,51 @@ func TestGroupMiddlewareDoesNotCoverAnotherModule(t *testing.T) {
 				t.Errorf("module %s group middleware on %s also runs for module %s route %s %s",
 					group.module, prefix, endpoint.module, endpoint.route.Method, path)
 			}
+		}
+	}
+}
+
+// nonModuleDirs are directories under internal/modules that are deliberately
+// not registered in internal/bootstrap. There are none today.
+var nonModuleDirs = map[string]string{}
+
+// TestEveryModuleDirectoryIsRegistered fails when internal/modules/<name>
+// exists but no module named <name> is in bootstrap.Build's list (its routes,
+// catalogs, and jobs would silently never mount), or when a registered
+// module's Name() has no directory of that name.
+func TestEveryModuleDirectoryIsRegistered(t *testing.T) {
+	modules, _ := productionModules(t)
+	registered := map[string]bool{}
+	for _, m := range modules {
+		registered[m.Name()] = true
+	}
+	entries, err := os.ReadDir(filepath.Join(repoRoot(t), "internal", "modules"))
+	if err != nil {
+		t.Fatalf("read modules: %v", err)
+	}
+	dirs := map[string]bool{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		dirs[name] = true
+		_, exempt := nonModuleDirs[name]
+		switch {
+		case exempt && registered[name]:
+			t.Errorf("internal/modules/%s is registered; remove it from nonModuleDirs", name)
+		case !exempt && !registered[name]:
+			t.Errorf("internal/modules/%s is not registered in internal/bootstrap (no module Name() == %q)", name, name)
+		}
+	}
+	for name := range registered {
+		if !dirs[name] {
+			t.Errorf("registered module %q has no internal/modules/%s directory", name, name)
+		}
+	}
+	for name := range nonModuleDirs {
+		if !dirs[name] {
+			t.Errorf("nonModuleDirs entry %q no longer exists; remove it", name)
 		}
 	}
 }

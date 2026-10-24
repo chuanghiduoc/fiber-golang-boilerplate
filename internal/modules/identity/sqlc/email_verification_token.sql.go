@@ -42,9 +42,8 @@ INSERT INTO email_verification_tokens (tenant_id, user_id, email, token, expires
 SELECT u.tenant_id, $1, $2, $3, $4
 FROM users u
 WHERE u.id = $1 AND u.tenant_id = $5 AND u.deleted_at IS NULL
-ON CONFLICT (user_id) DO UPDATE
-SET tenant_id = EXCLUDED.tenant_id,
-    email = EXCLUDED.email,
+ON CONFLICT (tenant_id, user_id) DO UPDATE
+SET email = EXCLUDED.email,
     token = EXCLUDED.token,
     expires_at = EXCLUDED.expires_at,
     created_at = NOW()

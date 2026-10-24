@@ -2,13 +2,13 @@ package handler
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -176,6 +176,8 @@ func (h *UserHandler) Update(c fiber.Ctx) error {
 		if err := h.requirePasswordForEmailChange(c, id, req); err != nil {
 			return err
 		}
+	} else if err := h.refuseDelegatedEmailChange(c, id, req); err != nil {
+		return err
 	}
 
 	user, err := h.service.Update(c.Context(), id, req)
@@ -200,8 +202,10 @@ func (h *UserHandler) requirePasswordForEmailChange(c fiber.Ctx, userID int64, r
 		return err
 	}
 	// A full-resource PUT often echoes the existing email; that is not an
-	// identity change and must not demand re-authentication.
-	if strings.EqualFold(strings.TrimSpace(*req.Email), current.Email) {
+	// identity change and must not demand re-authentication. Compare with the
+	// service's normalization: any looser folding would let a real change
+	// skip the password check.
+	if service.NormalizeEmail(*req.Email) == service.NormalizeEmail(current.Email) {
 		return nil
 	}
 	if !current.HasPassword {
@@ -210,7 +214,46 @@ func (h *UserHandler) requirePasswordForEmailChange(c fiber.Ctx, userID int64, r
 	if req.CurrentPassword == nil || *req.CurrentPassword == "" {
 		return apperror.NewBadRequest("currentPassword is required to change email")
 	}
-	return h.service.VerifyPassword(c.Context(), userID, *req.CurrentPassword)
+	return h.service.VerifyPassword(withClientIP(c), userID, *req.CurrentPassword)
+}
+
+// refuseDelegatedEmailChange limits changing ANOTHER user's email, which skips
+// the target's re-authentication. Moving an account's address and then using
+// forgot-password takes the account over, so:
+//   - an API key may never do it: a key with admin:users:write would otherwise
+//     escalate to a full session of any user, beyond its own scopes;
+//   - nobody may do it to an admin: an admin's address changes only from the
+//     admin's own session, with their current password.
+//
+// Name-only updates and a PUT that echoes the current email are unaffected.
+func (h *UserHandler) refuseDelegatedEmailChange(c fiber.Ctx, targetID int64, req dto.UpdateUserRequest) error {
+	if req.Email == nil {
+		return nil
+	}
+	target, err := h.service.GetByID(c.Context(), targetID)
+	if err != nil {
+		return err
+	}
+	if service.NormalizeEmail(*req.Email) == service.NormalizeEmail(target.Email) {
+		return nil
+	}
+	if authenticatedWithAPIKey(c) {
+		return apperror.NewCode(apperror.CodePermissionDenied, "API keys cannot change another user's email")
+	}
+	if target.Role == dto.RoleAdmin {
+		return apperror.NewCode(apperror.CodePermissionDenied, "an admin's email can only be changed from their own session")
+	}
+	return nil
+}
+
+// authenticatedWithAPIKey reports whether apikey.Authenticate authenticated
+// the request. Either marker is enough to deny.
+func authenticatedWithAPIKey(c fiber.Ctx) bool {
+	if fiber.Locals[string](c, apikey.LocalAuthMethod) == apikey.AuthMethodAPIKey {
+		return true
+	}
+	subject, ok := authz.SubjectFromFiber(c)
+	return ok && subject.Attribute(authz.AttributeAuthMethod) == apikey.AuthMethodAPIKey
 }
 
 // sendVerificationAfterEmailChange invalidates tokens sent to the old address
@@ -248,7 +291,7 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.service.ChangePassword(c.Context(), httpx.AuthUserID(c), req); err != nil {
+	if err := h.service.ChangePassword(withClientIP(c), httpx.AuthUserID(c), req); err != nil {
 		return err
 	}
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -197,6 +198,26 @@ func TestAdminDownloadFile(t *testing.T) {
 	}
 	if string(data) != "payload" {
 		t.Errorf("payload = %q, want payload", data)
+	}
+}
+
+func TestAdminDownloadFile_MissingBlobIsNotFound(t *testing.T) {
+	repo := newFakeAdminFileRepo()
+	store := newFakeAdminStorage()
+	store.getErr = fmt.Errorf("%w: uploads/file.txt", storage.ErrNotFound)
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, store)
+	seedAdminFiles(repo, 1)
+
+	_, _, err := svc.Download(context.Background(), 1)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 404 {
+		t.Fatalf("expected 404 for a missing blob, got %v", err)
+	}
+
+	store.getErr = errors.New("storage unavailable")
+	_, _, err = svc.Download(context.Background(), 1)
+	if !errors.As(err, &appErr) || appErr.Status != 500 {
+		t.Fatalf("expected 500 for a storage failure, got %v", err)
 	}
 }
 

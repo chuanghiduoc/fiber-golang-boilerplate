@@ -3,6 +3,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +96,9 @@ func (r *CachedResolver) store(slug string, entry cachedTenant, ttl time.Duratio
 	if ttl <= 0 {
 		return
 	}
+	// The key outlives the caller's request; never retain a view into a
+	// pooled buffer (see Middleware).
+	slug = strings.Clone(slug)
 	now := r.now()
 	entry.expiresAt = now.Add(ttl)
 

@@ -55,7 +55,7 @@ var requiredTables = []string{
 // predates the column hardening folded into the consolidated baseline.
 var requiredColumns = map[string][]string{
 	"tenants":                   {"slug", "status"},
-	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at"},
+	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at", "credentials_revoked_at"},
 	"refresh_tokens":            {"tenant_id", "token_version"},
 	"password_reset_tokens":     {"tenant_id"},
 	"email_verification_tokens": {"tenant_id", "email"},
@@ -88,18 +88,39 @@ var requiredColumns = map[string][]string{
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
 // and verification tokens, duplicate active emails per tenant, duplicate
-// tenant slugs, and duplicate API-key hashes.
+// tenant slugs, and duplicate API-key hashes, plus every unique index an
+// ON CONFLICT target relies on (without it the upsert fails at runtime with
+// "no unique or exclusion constraint matching the ON CONFLICT specification").
 var requiredUniqueIndexes = []string{
 	"tenants_slug_key",
 	"idx_users_tenant_email_lower_active",
 	"idx_users_tenant_google_id_active",
 	"idx_users_tenant_id_id",
-	"idx_password_reset_tokens_user_id",
-	"idx_email_verification_tokens_user_id",
+	"idx_password_reset_tokens_tenant_user_id",
+	"idx_email_verification_tokens_tenant_user_id",
 	"idx_webhook_inbound_sources_tenant_slug_active",
 	"idx_webhook_inbound_events_source_event",
 	"idx_api_keys_key_hash",
 	"idx_notification_preferences_unique",
+	"idx_jobs_tenant_idempotency_key",
+	"idx_scheduler_runs_schedule_slot",
+	"idx_feature_flag_targets_tenant_target",
+	"idx_feature_flag_targets_user_target",
+	"idx_webhook_endpoint_secrets_active",
+	"idx_webhook_endpoint_secrets_endpoint_version",
+	"idx_webhook_deliveries_endpoint_event",
+	"idx_webhook_delivery_attempts_delivery_attempt",
+}
+
+// requiredTriggers are the database-level invariants the application relies
+// on: the per-tenant last-admin guard and the audit append-only guards.
+var requiredTriggers = map[string][]string{
+	"users": {"trigger_protect_last_admin"},
+	"audit_events": {
+		"trigger_audit_events_completion",
+		"trigger_audit_events_no_delete",
+		"trigger_audit_events_no_truncate",
+	},
 }
 
 // requiredTenantLeadingIndexes are the query indexes that must start with
@@ -111,6 +132,7 @@ var requiredTenantLeadingIndexes = map[string][]string{
 		"idx_users_tenant_google_id_active",
 		"idx_users_tenant_role_active",
 		"idx_users_tenant_created_at_id",
+		"idx_users_tenant_email_lower_banned",
 	},
 	"refresh_tokens": {
 		"idx_refresh_tokens_tenant_user_id",
@@ -125,9 +147,10 @@ var requiredTenantLeadingIndexes = map[string][]string{
 		"idx_files_tenant_user_created",
 		"idx_files_tenant_created_at_id",
 	},
+	// Claim and purge are global; the only tenant-scoped jobs lookup is the
+	// idempotency key.
 	"jobs": {
-		"idx_jobs_tenant_status_run_at",
-		"idx_jobs_tenant_kind_status",
+		"idx_jobs_tenant_idempotency_key",
 	},
 	"audit_events": {
 		"idx_audit_events_tenant_created",
@@ -158,18 +181,15 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	"webhook_deliveries": {
 		"idx_webhook_deliveries_tenant_created_at_id",
 		"idx_webhook_deliveries_tenant_endpoint_created",
-		"idx_webhook_deliveries_tenant_status_next",
 	},
 	"webhook_delivery_attempts": {
 		"idx_webhook_delivery_attempts_tenant_delivery",
-		"idx_webhook_delivery_attempts_tenant_created",
 	},
 	"webhook_inbound_sources": {
 		"idx_webhook_inbound_sources_tenant_created",
 	},
 	"webhook_inbound_events": {
 		"idx_webhook_inbound_events_tenant_source_received",
-		"idx_webhook_inbound_events_tenant_received",
 	},
 }
 
@@ -212,9 +232,9 @@ func run() error {
 	if err := database.RunMigrations(dbCfg.DSN(), "migrations"); err != nil {
 		if hasHistory && version > 1 && version <= maxSequentialVersion {
 			return fmt.Errorf(
-				"run migrations from legacy version %d: %w; restore the historical migration files "+
-					"(they must remain source versions for the recorded history) and add an upgrade "+
-					"migration, or follow the manual steps in README.md section %q",
+				"run migrations from legacy version %d: %w; this repository ships no sequential "+
+					"migrations after the 000001 baseline, so apply the reviewed upgrade DDL manually, "+
+					"verify the schema, then baseline it as described in README.md section %q",
 				version, err, "Upgrading an existing database",
 			)
 		}
@@ -234,8 +254,8 @@ func run() error {
 
 // currentMigrationVersion reads the recorded golang-migrate version. It lets
 // the command turn an opaque "no migration found" error into an actionable
-// legacy-upgrade message without blocking the documented path of restoring the
-// historical files.
+// legacy-upgrade message. It only reads the version: the command never
+// rewrites schema_migrations itself.
 func currentMigrationVersion(ctx context.Context, pool *pgxpool.Pool) (version int64, dirty, exists bool, err error) {
 	if err := pool.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&exists); err != nil {
 		return 0, false, false, fmt.Errorf("check migration version: %w", err)
@@ -385,6 +405,49 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 			case firstColumn != "tenant_id":
 				missing = append(missing, "tenant-leading index "+table+"."+index+
 					" starts with "+firstColumn+", want tenant_id")
+			}
+		}
+	}
+
+	// Triggers enforce invariants the application does not re-check, so a
+	// disabled trigger is as bad as a missing one.
+	triggerNames := make([]string, 0)
+	for _, triggers := range requiredTriggers {
+		triggerNames = append(triggerNames, triggers...)
+	}
+	triggerRows, err := pool.Query(ctx,
+		`SELECT c.relname, tg.tgname, tg.tgenabled <> 'D'
+		 FROM pg_trigger tg
+		 JOIN pg_class c ON c.oid = tg.tgrelid
+		 JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = $1 AND NOT tg.tgisinternal AND tg.tgname = ANY($2)`,
+		schema, triggerNames,
+	)
+	if err != nil {
+		return fmt.Errorf("verify schema triggers: %w", err)
+	}
+	defer triggerRows.Close()
+
+	foundTriggers := make(map[string]bool, len(triggerNames))
+	for triggerRows.Next() {
+		var table, trigger string
+		var enabled bool
+		if err := triggerRows.Scan(&table, &trigger, &enabled); err != nil {
+			return fmt.Errorf("verify schema: scan trigger: %w", err)
+		}
+		foundTriggers[table+"."+trigger] = enabled
+	}
+	if err := triggerRows.Err(); err != nil {
+		return fmt.Errorf("verify schema triggers: %w", err)
+	}
+	for table, triggers := range requiredTriggers {
+		for _, trigger := range triggers {
+			enabled, ok := foundTriggers[table+"."+trigger]
+			switch {
+			case !ok:
+				missing = append(missing, "trigger "+table+"."+trigger)
+			case !enabled:
+				missing = append(missing, "enabled trigger "+table+"."+trigger)
 			}
 		}
 	}

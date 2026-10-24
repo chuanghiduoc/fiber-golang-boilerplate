@@ -25,7 +25,12 @@ authenticated user. Cross-tenant and other-user ids return `404`. Mutations use
 `notifications` stores the in-app delivery (`type`, `title`, `body`, JSON
 `data`, `read_at`). `notification_preferences` stores explicit
 `(tenant_id, user_id, type, channel)` opt-outs; a missing row means the channel
-is enabled. Both tables are tenant-owned and cascade with the user.
+is enabled. `PUT /notification-preferences` requires an explicit boolean
+`enabled` (an omitted field is a `422`, never an implicit disable). Title,
+body, and `data` must be valid UTF-8 without NUL characters (including a
+`\u0000` JSON escape), otherwise `400`. Both tables are tenant-owned and
+cascade with the user. The feed list uses separate all/unread queries so the
+unread filter can use the partial `idx_notifications_tenant_user_unread`.
 
 ## Cross-module API
 

@@ -107,8 +107,8 @@ Request flow: `Client → app middleware (request ID, locale) → /api/vN versio
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
-run the single `000001_init_schema.up.sql`; add new numbered migrations only
-after a database is deployed.
+run the single `000001_init_schema.up.sql`; add new timestamped migrations
+(`make migrate-create`) only after a database is deployed.
 
 ## Multi-tenancy
 
@@ -281,8 +281,9 @@ they assume the schema exists, so API replicas never race on migrations.
 `cmd/migrate` loads only database configuration (`config.LoadDatabase`), so a
 production migration job needs `DB_*` variables (host, port, database, user,
 password, schema, SSL mode) and no JWT, admin, SMTP, or other application
-secrets. `DB_SSLMODE=disable` is rejected when `APP_ENV=production`. After
-migrating, the command verifies that every required table exists and fails with
+secrets. `DB_SSLMODE=disable|allow|prefer` is rejected when `APP_ENV=production`. After
+migrating, the command verifies the required tables, columns, unique and
+tenant-leading indexes, and triggers, and fails with
 an actionable error if it finds a legacy partial schema.
 
 ### Upgrading an existing database
@@ -293,26 +294,37 @@ shipped migrations `000001`–`000003` and also creates the `jobs` and
 
 A database that already applied the old migrations has a different
 `schema_migrations` history (normally version 3 if all old migrations were
-applied). Do not point it at the new `000001`, and never reset
-`schema_migrations` to force the baseline through. Keep the applied history and
-add a migration containing only the missing tables/indexes. The new version
-must be higher than the version already recorded (a fully migrated old
-deployment is at 3); `make migrate-create` timestamp versions always are.
+applied). Do not point it at the new `000001`: running the baseline over the
+old schema is never supported.
 
-Because this refactor removed the old `000002`/`000003` source files, restore
-them from git history first (do not edit them): golang-migrate requires the
-recorded version to exist in the source before it will advance. Add a
-timestamped migration for `jobs`, `audit_events`, and any other missing objects, then run
-`cmd/migrate`. `cmd/migrate` prints this guidance when it detects a legacy
-version whose source files are missing. Alternatively, apply the missing DDL
-manually with `psql` and baseline the version; do not run the new `000001` over
-the old schema.
+This repository deliberately ships no sequential migrations after the
+baseline: `test/arch/migrations_test.go` rejects any version other than `1`
+that is not a UTC timestamp, so do not restore the old `000002`/`000003` files
+into `migrations/` (a fresh install would then run them after the new
+baseline). golang-migrate cannot advance a database whose recorded version is
+missing from the source, so the supported upgrade is a one-time, reviewed
+manual step:
+
+1. Take a verified backup/PITR snapshot.
+2. Apply the missing DDL listed in this section with `psql` in one
+   transaction (tables, columns, indexes, triggers, and the default tenant),
+   so the schema matches `000001_init_schema.up.sql`.
+3. Record the baseline only after the schema matches it:
+   `migrate -path migrations -database "$DSN" force 1`. This rewrites the
+   version, not the schema; never use it to skip DDL that was not applied.
+4. Run `cmd/migrate`. It applies any newer timestamped migrations and then
+   verifies the required tables, columns, unique indexes, tenant-leading
+   indexes, triggers, and default tenant, failing with the missing objects if
+   step 2 was incomplete.
+
+`cmd/migrate` prints this guidance when it detects a legacy version whose
+source files are missing. Later migrations are ordinary timestamped files
+(`make migrate-create`), which are always above the legacy versions.
 
 The multi-tenant foundation also changes `000001` (new `tenants` table,
 `tenant_id` columns, per-tenant indexes, and the per-tenant last-admin
 trigger). An existing database does **not** get these objects from the baseline.
-Create the next numbered migration above its recorded version (or apply
-reviewed DDL manually) that:
+The manual upgrade DDL (step 2 above) must:
 
 1. creates `tenants` and inserts `('default','Default')` as the first row so it
    receives id 1;
@@ -342,9 +354,19 @@ until the migration is applied and `cmd/migrate` verifies the objects.
 
 Notifications add two new tenant-owned tables (`notifications` and
 `notification_preferences`) plus their indexes. Existing databases need those
-objects in a numbered migration above their recorded version; fresh installs
-get them from `000001`. `cmd/migrate` now verifies both tables, their tenant
-columns, and the unique preference index.
+objects in the same manual upgrade DDL; fresh installs get them from `000001`.
+`cmd/migrate` verifies both tables, their tenant columns, and the unique
+preference index.
+
+The upgrade DDL must also create every unique index an `ON CONFLICT` target
+uses (`idx_jobs_tenant_idempotency_key`, `idx_scheduler_runs_schedule_slot`,
+the feature-flag target indexes, and the webhook secret/delivery/attempt
+indexes) and the `trigger_protect_last_admin`,
+`trigger_audit_events_completion`, `trigger_audit_events_no_delete`, and
+`trigger_audit_events_no_truncate` triggers; `cmd/migrate` reports any that
+are missing or disabled. `audit_events` rejects `DELETE` and `TRUNCATE`; a
+reviewed retention or erasure job must disable those triggers explicitly as
+the table owner.
 
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
@@ -634,7 +656,9 @@ already exists.
 - Each handler runs with a 10m timeout. Set it with `WithJobTimeout`; a value
   less than or equal to zero disables the deadline. A timed-out handler is
   canceled and recorded as a normal failure, so the job retries or is
-  dead-lettered. Cancellation is cooperative: the worker cannot preempt a
+  dead-lettered; one that ignores the cancellation and still returns nil is
+  recorded as succeeded (its side effects already ran) with a warning log.
+  Cancellation is cooperative: the worker cannot preempt a
   handler that ignores its context, so heartbeats keep running until that
   handler returns. The final bookkeeping write uses a detached 5s context.
 - Running jobs renew a lease with a 30s heartbeat (5m lease by default). A
@@ -821,7 +845,7 @@ Key settings:
 - `STORAGE_DRIVER` — `local` | `s3` | `seaweedfs`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
-- `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`
+- `DB_SSLMODE` — `disable`, `allow`, and `prefer` are rejected in production; use `require` or `verify-full`
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`
 - `OTEL_ENABLED` — enable OpenTelemetry tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`, and `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317`
 - `ADMIN_EMAIL` / `ADMIN_PASSWORD` — Auto-seed admin user on API startup (also available via `make seed`; password must be 12+ chars in production)

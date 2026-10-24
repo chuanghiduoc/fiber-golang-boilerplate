@@ -97,7 +97,7 @@ func (s *emailVerificationService) SupportsTransactionalEnqueue() bool {
 }
 
 func (s *emailVerificationService) SendVerification(ctx context.Context, userID int64, userEmail string) error {
-	userEmail = normalizeEmail(userEmail)
+	userEmail = NormalizeEmail(userEmail)
 	msg, tokenHash, err := s.buildVerificationMessage(ctx, userEmail)
 	if err != nil {
 		return err
@@ -150,7 +150,7 @@ func (s *emailVerificationService) SendVerificationTx(ctx context.Context, tx pg
 		return errors.New("send verification: transaction is required")
 	}
 
-	userEmail = normalizeEmail(userEmail)
+	userEmail = NormalizeEmail(userEmail)
 	msg, tokenHash, err := s.buildVerificationMessage(ctx, userEmail)
 	if err != nil {
 		return err
@@ -275,7 +275,7 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 		}
 		return apperror.NewInternal("failed to load user")
 	}
-	if normalizeEmail(user.Email) != normalizeEmail(vt.Email) {
+	if NormalizeEmail(user.Email) != NormalizeEmail(vt.Email) {
 		return apperror.NewBadRequest("verification token does not match the current email")
 	}
 
@@ -291,7 +291,7 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 }
 
 func (s *emailVerificationService) ResendVerification(ctx context.Context, emailAddr string) error {
-	emailAddr = normalizeEmail(emailAddr)
+	emailAddr = NormalizeEmail(emailAddr)
 
 	// Rate limit before user lookup so the response cannot reveal whether the
 	// address exists. Increment is atomic and sets the TTL on first use.

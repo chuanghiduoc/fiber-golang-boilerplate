@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
@@ -66,7 +67,7 @@ func main() {
 			slog.Warn("CACHE_DRIVER=memory in production: rate limits and session invalidation are not shared across replicas")
 		}
 		if (cfg.Storage.Driver == "s3" || cfg.Storage.Driver == "seaweedfs") && !cfg.Storage.S3UseSSL {
-			slog.Warn("STORAGE_S3_USE_SSL=false in production: object storage traffic is not encrypted")
+			slog.Warn("STORAGE_S3_ALLOW_INSECURE=true in production: object storage traffic is not encrypted")
 		}
 	}
 
@@ -345,10 +346,14 @@ func main() {
 	}
 	signal.Stop(sigChan)
 
-	// One deadline covers every phase so the total stays inside Kubernetes'
-	// terminationGracePeriodSeconds (30s, of which preStop uses 5s). Phases
-	// share it instead of each taking a fixed 10s.
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownBudget)
+	// One deadline (config.ShutdownBudget) covers every phase so the total
+	// stays inside Kubernetes' terminationGracePeriodSeconds (30s, of which
+	// preStop uses 5s). Draining HTTP, jobs, and async work gets the budget
+	// minus config.ShutdownReserve; config validation keeps
+	// APP_REQUEST_TIMEOUT inside that drain window, so the reserve is left for
+	// the tracing flush and closing shared resources.
+	shutdownDeadline := time.Now().Add(config.ShutdownBudget)
+	shutdownCtx, cancelShutdown := context.WithDeadline(context.Background(), shutdownDeadline.Add(-config.ShutdownReserve))
 
 	// 1. Stop accepting HTTP and drain in-flight requests, concurrently with
 	//    the background workers: they are independent (both only need the
@@ -376,20 +381,26 @@ func main() {
 		slog.Warn("async goroutines did not finish before the shutdown deadline", slog.Any("error", err))
 	}
 
-	// 4. Flush spans after HTTP, workers, and async work have stopped, bounded
-	//    by both OTEL_SHUTDOWN_TIMEOUT_SECS and the remaining budget. Export
-	//    failures (for example a collector outage) are logged but never change
-	//    the exit code; losing telemetry must not fail a clean shutdown.
+	cancelShutdown()
+
+	// 4. Flush spans after HTTP, workers, and async work have stopped. The
+	//    flush gets OTEL_SHUTDOWN_TIMEOUT_SECS capped by what is left of the
+	//    budget after the close reserve, but never less than
+	//    traceFlushMinimum: a drain that used its whole window must not leave
+	//    tracing with a zero deadline. Export failures (for example a
+	//    collector outage) are logged but never change the exit code; losing
+	//    telemetry must not fail a clean shutdown.
 	traceShutdownTimeout := time.Duration(cfg.Tracing.ShutdownTimeout) * time.Second
 	if traceShutdownTimeout <= 0 {
 		traceShutdownTimeout = 5 * time.Second
 	}
-	traceShutdownCtx, cancelTrace := context.WithTimeout(shutdownCtx, traceShutdownTimeout)
+	traceShutdownTimeout = min(traceShutdownTimeout, time.Until(shutdownDeadline)-closeReserve)
+	traceShutdownTimeout = max(traceShutdownTimeout, traceFlushMinimum)
+	traceShutdownCtx, cancelTrace := context.WithTimeout(context.Background(), traceShutdownTimeout)
 	if err := traceProvider.Shutdown(traceShutdownCtx); err != nil {
 		slog.Warn("tracing shutdown incomplete; remaining spans were dropped", slog.Any("error", err))
 	}
 	cancelTrace()
-	cancelShutdown()
 
 	// 5. Close shared resources last.
 	for _, closeModule := range modules.Close {
@@ -398,7 +409,7 @@ func main() {
 	if err := appCache.Close(); err != nil {
 		slog.Error("failed to close cache", slog.Any("error", err))
 	}
-	pool.Close()
+	closePool(pool, max(time.Until(shutdownDeadline), closeMinimum))
 
 	slog.Info("server exited")
 	if exitCode != 0 {
@@ -406,18 +417,44 @@ func main() {
 	}
 }
 
-// shutdownBudget is the total graceful-shutdown time after SIGTERM. Kubernetes
-// allows terminationGracePeriodSeconds (30s) including the 5s preStop sleep, so
-// 20s leaves a 5s margin before SIGKILL. Keep deploy/k8s/base/deployment.yaml in
-// sync when changing it.
-const shutdownBudget = 20 * time.Second
+// Slices of config.ShutdownReserve. closeReserve is kept back from the tracing
+// flush for closing modules, the cache, and the pool; the minimums apply when
+// earlier phases already used their share, and the overrun stays inside the
+// 5s margin before SIGKILL.
+const (
+	closeReserve      = 2 * time.Second
+	traceFlushMinimum = time.Second
+	closeMinimum      = time.Second
+)
 
-// waitForShutdown waits for done or the shared shutdown deadline, logging
-// which component did not stop in time.
+// closePool closes the database pool without blocking past timeout.
+// pgxpool.Close waits for every acquired connection to be released, so a
+// handler or job that ignored cancellation would otherwise hold the process
+// until Kubernetes sends SIGKILL. On timeout the process exits anyway and the
+// server drops the remaining connections.
+func closePool(pool *pgxpool.Pool, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("database pool did not close before the shutdown deadline; connections are still checked out",
+			slog.Duration("timeout", timeout),
+			slog.Int("acquired_conns", int(pool.Stat().AcquiredConns())),
+		)
+	}
+}
+
+// waitForShutdown waits for done or the shared drain deadline, logging which
+// component did not stop in time.
 func waitForShutdown(ctx context.Context, done <-chan struct{}, component string) {
 	select {
 	case <-done:
 	case <-ctx.Done():
-		slog.Warn(component+" did not stop before the shutdown deadline", slog.Duration("budget", shutdownBudget))
+		slog.Warn(component+" did not stop before the shutdown deadline",
+			slog.Duration("drain_budget", config.ShutdownBudget-config.ShutdownReserve))
 	}
 }

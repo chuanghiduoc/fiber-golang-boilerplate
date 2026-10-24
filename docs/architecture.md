@@ -104,7 +104,7 @@ outside tenant resolution so they never depend on the `tenants` table.
   Startup checks tenant existence regardless of status; a suspended default
   tenant starts normally and its requests return 404.
 - `tenant_id` is present on `users`, `files`, `notifications`,
-  `notification_preferences`, `feature_flag_targets`, `webhook_*`, and all
+  `notification_preferences`, `feature_flag_targets`, `api_keys`, `webhook_*`, and all
   identity/platform token, job, and audit tables, with
   `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
@@ -228,10 +228,12 @@ outside tenant resolution so they never depend on the `tenants` table.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
 - Outbound webhooks reuse the jobs outbox: a delivery row and its first
-  `webhook.delivery` job commit in one transaction. Identity registration and
-  file upload/delete emit `user.registered`, `file.uploaded`, and
-  `file.deleted` through the contracts dispatcher after the mutation commits;
-  dispatch failures are logged and never fail the API call. Each delivery
+  `webhook.delivery` job commit in one transaction. Identity registration,
+  file upload/delete (user and admin), and file restore emit
+  `user.registered`, `file.uploaded`, `file.deleted`, and `file.restored`
+  through the webhooks outbox (`DispatchTx`) inside the mutation's
+  transaction, so an enqueue failure rolls the mutation back (fail-closed);
+  only an unwired deployment falls back to a logged post-commit dispatch. Each delivery
   snapshots the
   URL, payload, event timestamp, max attempts, and sealed secret so later
   endpoint edits/rotation cannot change an in-flight request. Webhook-level
@@ -239,7 +241,7 @@ outside tenant resolution so they never depend on the `tenants` table.
   in `webhook_delivery_attempts`. Receivers must deduplicate on
   `X-Webhook-Delivery`.
 - The public inbound receiver resolves its tenant from the source row and
-  verifies HMAC over `<timestamp>.<raw-body>`; deduplication is unique per
+  verifies HMAC over `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`; deduplication is unique per
   `(tenant, source, external_event_id)`. See [Webhooks](webhooks.md).
 - Notification creation is atomic when the email channel is enabled: the
   in-app row and its email job commit or roll back together. A suppressed

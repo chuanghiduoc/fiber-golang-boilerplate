@@ -1,31 +1,114 @@
 package arch_test
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
 )
 
+// tier1Audit names the module whose service records a Tier 1 route's audit
+// event in the mutation transaction, and the event's action literal. The
+// owner can differ from the module that mounts the route: admin routes call
+// identity/files through contracts.
+type tier1Audit struct {
+	owner  string
+	action string
+}
+
 // tier1Mutations are audited inside the service's database transaction. They
 // must not also carry a route-level Guard intent row.
-var tier1Mutations = map[string]bool{
-	"POST /api/v1/auth/register":           true,
-	"PUT /api/v1/users/me":                 true,
-	"PUT /api/v1/users/me/password":        true,
-	"PUT /api/v1/users/:id":                true,
-	"DELETE /api/v1/users/:id":             true,
-	"PUT /api/v1/admin/users/:id/role":     true,
-	"POST /api/v1/admin/users/:id/ban":     true,
-	"POST /api/v1/admin/users/:id/unban":   true,
-	"DELETE /api/v1/admin/files/:id":       true,
-	"POST /api/v1/admin/files/:id/restore": true,
+var tier1Mutations = map[string]tier1Audit{
+	"POST /api/v1/auth/register": {"identity", "auth.registered"},
+	// Signed-state tenant: UserService records auth.google_login in the
+	// sign-in transaction with the state tenant and the signed-in user.
+	"GET /api/v1/auth/google/callback":     {"identity", "auth.google_login"},
+	"PUT /api/v1/users/me":                 {"identity", "user.profile_updated"},
+	"PUT /api/v1/users/me/password":        {"identity", "user.password_changed"},
+	"PUT /api/v1/users/:id":                {"identity", "user.profile_updated"},
+	"DELETE /api/v1/users/:id":             {"identity", "user.deleted"},
+	"PUT /api/v1/admin/users/:id/role":     {"identity", "admin.user.role_changed"},
+	"POST /api/v1/admin/users/:id/ban":     {"identity", "admin.user.banned"},
+	"POST /api/v1/admin/users/:id/unban":   {"identity", "admin.user.unbanned"},
+	"DELETE /api/v1/admin/files/:id":       {"files", "admin.file.deleted"},
+	"POST /api/v1/admin/files/:id/restore": {"files", "admin.file.restored"},
 	// API-key lifecycle: apikeys service records in the mutation transaction.
-	"POST /api/v1/admin/api-keys/":           true,
-	"PUT /api/v1/admin/api-keys/:id":         true,
-	"DELETE /api/v1/admin/api-keys/:id":      true,
-	"POST /api/v1/admin/api-keys/:id/revoke": true,
-	"POST /api/v1/admin/api-keys/:id/rotate": true,
+	"POST /api/v1/admin/api-keys/":           {"apikeys", "api_key.created"},
+	"PUT /api/v1/admin/api-keys/:id":         {"apikeys", "api_key.updated"},
+	"DELETE /api/v1/admin/api-keys/:id":      {"apikeys", "api_key.revoked"},
+	"POST /api/v1/admin/api-keys/:id/revoke": {"apikeys", "api_key.revoked"},
+	"POST /api/v1/admin/api-keys/:id/rotate": {"apikeys", "api_key.rotated"},
+}
+
+// auditPackage identifies audit.Guard by full import path.
+const auditPackage = "internal/platform/audit"
+
+// tier1Recorders are the in-transaction audit calls a Tier 1 service uses.
+var tier1Recorders = []string{"audit.RecordInTx(", ".RecordTx("}
+
+// TestTier1RoutesRecordInTransaction makes the Tier 1 exemption verifiable:
+// a route may skip audit.Guard only if the owning module has a non-test
+// source file that both names the route's action literal and calls
+// RecordInTx/RecordTx. This is a source grep, not a call-graph proof: it
+// catches a renamed action, a removed in-transaction write, or a wrong owner,
+// but not a call that sits in the right file on the wrong code path (the
+// owning service's tests cover that).
+func TestTier1RoutesRecordInTransaction(t *testing.T) {
+	root := repoRoot(t)
+	sources := map[string][]string{}
+	for key, want := range tier1Mutations {
+		files, ok := sources[want.owner]
+		if !ok {
+			files = moduleSources(t, filepath.Join(root, "internal", "modules", want.owner))
+			sources[want.owner] = files
+		}
+		found := false
+		for _, src := range files {
+			if strings.Contains(src, `"`+want.action+`"`) && containsAny(src, tier1Recorders) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Tier 1 route %s: no internal/modules/%s source records %q with RecordInTx/RecordTx",
+				key, want.owner, want.action)
+		}
+	}
+}
+
+// moduleSources returns the contents of every non-test Go file under dir.
+func moduleSources(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		out = append(out, string(raw))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	return out
+}
+
+func containsAny(s string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // fallbackAudited are existing mutating routes that are neither Tier 1 nor
@@ -60,9 +143,9 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 		}
 
 		key := route.Method + " " + route.Path
-		if tier1Mutations[key] {
+		if _, tier1 := tier1Mutations[key]; tier1 {
 			seenTier1[key] = true
-			if handlerChainContains(route, "audit.Guard") {
+			if handlerChainHas(route, auditPackage, "Guard") {
 				t.Errorf("Tier 1 route %s must not also carry audit.Guard (double intent row)", key)
 			}
 			continue
@@ -72,14 +155,10 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 			continue
 		}
 
-		guardIndex := -1
+		guardIndex := handlerIndex(route, auditPackage, "Guard")
 		idempotencyIndex := -1
 		for i, handler := range route.Handlers {
-			name := handlerName(handler)
-			if strings.Contains(name, "audit.Guard") {
-				guardIndex = i
-			}
-			if strings.Contains(name, "testIdempotency") {
+			if strings.HasSuffix(handlerName(handler), "/test/arch_test.testIdempotency") {
 				idempotencyIndex = i
 			}
 		}

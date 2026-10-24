@@ -147,8 +147,12 @@ The evaluator keeps one full snapshot in process memory:
 
 - A snapshot younger than `FEATURE_FLAGS_CACHE_TTL_SECONDS` is served without a
   database query.
-- An expired snapshot triggers one reload; concurrent callers serialize behind
-  the refresh lock and reuse the fresh result.
+- An expired snapshot that is still within `FEATURE_FLAGS_MAX_STALENESS_SECONDS`
+  is served immediately while one background reload refreshes it
+  (stale-while-revalidate), so a slow database never stalls requests. Callers
+  block on the reload only when there is no usable snapshot (cold start, or
+  older than the max staleness) or after `Invalidate`; concurrent blocked
+  callers serialize behind the refresh lock and reuse the fresh result.
 - Loads are detached from the request context (`context.WithoutCancel`) and
   bounded by a 5s timeout, so a client disconnect cannot fail a load for
   everyone. A load that still returns `context.Canceled` is not counted as a

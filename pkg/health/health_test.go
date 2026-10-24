@@ -3,6 +3,8 @@ package health
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -81,6 +83,75 @@ func TestReadiness(t *testing.T) {
 				t.Errorf("Details = %v, must only contain database and cache states (no pool stats)", got.Details)
 			}
 		})
+	}
+}
+
+func TestReadiness_CachesResultBriefly(t *testing.T) {
+	var mu sync.Mutex
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	var pings atomic.Int32
+	checker := &Checker{
+		pingDB:      func(context.Context) error { pings.Add(1); return nil },
+		dbSaturated: func() bool { return false },
+		cache:       pingCache{},
+		now: func() time.Time {
+			mu.Lock()
+			defer mu.Unlock()
+			return now
+		},
+	}
+
+	// A flood of concurrent probes within the TTL shares one check.
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got := checker.Readiness(context.Background()); got.Status != StatusUp {
+				t.Errorf("Status = %q, want up", got.Status)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := pings.Load(); got != 1 {
+		t.Fatalf("database pings = %d, want 1 within the cache TTL", got)
+	}
+
+	// Callers get copies: mutating one result must not leak into the cache.
+	checker.Readiness(context.Background()).Details["database"] = "tampered"
+	if got := checker.Readiness(context.Background()); got.Details["database"] != "up" {
+		t.Fatalf("cached details were mutated: %v", got.Details)
+	}
+
+	mu.Lock()
+	now = now.Add(readinessCacheTTL)
+	mu.Unlock()
+	checker.Readiness(context.Background())
+	if got := pings.Load(); got != 2 {
+		t.Fatalf("database pings = %d, want a fresh check after the TTL", got)
+	}
+}
+
+func TestReadiness_DoesNotCacheCanceledCheck(t *testing.T) {
+	var pings atomic.Int32
+	checker := &Checker{
+		pingDB: func(ctx context.Context) error {
+			pings.Add(1)
+			return ctx.Err()
+		},
+		dbSaturated: func() bool { return false },
+		cache:       pingCache{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := checker.Readiness(ctx); got.Status != StatusDown {
+		t.Fatalf("canceled check Status = %q, want down", got.Status)
+	}
+	if got := checker.Readiness(context.Background()); got.Status != StatusUp {
+		t.Fatalf("next check Status = %q, want up (a canceled result must not be cached)", got.Status)
+	}
+	if got := pings.Load(); got != 2 {
+		t.Fatalf("database pings = %d, want 2", got)
 	}
 }
 

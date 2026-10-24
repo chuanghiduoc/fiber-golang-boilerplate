@@ -319,7 +319,7 @@ func (b *Bus) enqueueDurable(ctx context.Context, tx pgx.Tx, event Event) error 
 }
 
 func durableIdempotencyKey(event Event, sub durableSubscription) string {
-	return fmt.Sprintf("event:%s:%s:%d", event.ID, sub.Handler, event.TenantID)
+	return fmt.Sprintf("event:%s:%s:%s:%d", event.Name, event.ID, sub.Handler, event.TenantID)
 }
 
 func (b *Bus) jobHandler(sub durableSubscription) jobs.Handler {

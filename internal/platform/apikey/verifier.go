@@ -133,6 +133,11 @@ func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID int6
 		if loaded.TenantStatus != identitycontracts.TenantStatusActive {
 			return Verified{}, apperror.NewUnauthorized("tenant is not active")
 		}
+		// A ban revokes every key issued before it; unban restores the account
+		// but not those keys. Both timestamps come from the database clock.
+		if loaded.CredentialsRevokedAt != nil && !key.CreatedAt.After(*loaded.CredentialsRevokedAt) {
+			return Verified{}, apperror.NewUnauthorized("API key has been revoked")
+		}
 		principal = loaded
 	}
 	if principal.ID != key.UserID || principal.TenantID != key.TenantID {

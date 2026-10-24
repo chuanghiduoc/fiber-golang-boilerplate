@@ -159,6 +159,44 @@ func TestValidateStruct_DefaultTag(t *testing.T) {
 	}
 }
 
+type nestedItem struct {
+	Name string `json:"name" validate:"required"`
+}
+
+type nestedReq struct {
+	Title string       `json:"title" validate:"required"`
+	Items []nestedItem `json:"items" validate:"dive"`
+	Owner struct {
+		Email string `json:"email" validate:"email"`
+	} `json:"owner"`
+}
+
+func TestValidateStruct_NestedPathsUseJSONNames(t *testing.T) {
+	req := nestedReq{Items: []nestedItem{{Name: "ok"}, {Name: ""}}}
+	req.Owner.Email = "not-email"
+	err := ValidateStruct(req)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected AppError, got %T", err)
+	}
+	paths := make(map[string]string, len(appErr.Errors))
+	for _, field := range appErr.Errors {
+		paths[field.Path] = field.Message
+	}
+	for path, message := range map[string]string{
+		"title":         "title is required",
+		"items[1].name": "items[1].name is required",
+		"owner.email":   "owner.email must be a valid email",
+	} {
+		if got, ok := paths[path]; !ok || got != message {
+			t.Errorf("path %q message = %q (present %v), want %q; all: %v", path, got, ok, message, paths)
+		}
+	}
+	if len(paths) != 3 {
+		t.Errorf("errors = %v, want exactly 3 paths", paths)
+	}
+}
+
 func TestValidateStruct_Valid(t *testing.T) {
 	err := ValidateStruct(emailReq{Email: "valid@example.com"})
 	if err != nil {

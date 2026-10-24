@@ -19,10 +19,15 @@ type UserRepository interface {
 	GetByEmail(ctx context.Context, email string) (*identitysqlc.User, error)
 	GetByGoogleID(ctx context.Context, googleID string) (*identitysqlc.User, error)
 	GetBannedByEmail(ctx context.Context, email string) (*identitysqlc.User, error)
+	// GetDeletedByEmail returns a banned or self-deleted account with email.
+	// It is unindexed by design and only used by the startup admin seed.
+	GetDeletedByEmail(ctx context.Context, email string) (*identitysqlc.User, error)
 	List(ctx context.Context, limit, offset int32) ([]identitysqlc.User, error)
 	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error)
 	Count(ctx context.Context) (int64, error)
 	Create(ctx context.Context, params identitysqlc.CreateUserParams) (*identitysqlc.User, error)
+	// CreateAdmin inserts a verified admin in one statement (startup seed).
+	CreateAdmin(ctx context.Context, params identitysqlc.CreateAdminUserParams) (*identitysqlc.User, error)
 	CreateOAuthUser(ctx context.Context, params identitysqlc.CreateOAuthUserParams) (*identitysqlc.User, error)
 	Update(ctx context.Context, params identitysqlc.UpdateUserParams) (*identitysqlc.User, error)
 	UpdatePassword(ctx context.Context, params identitysqlc.UpdateUserPasswordParams) (*identitysqlc.User, error)
@@ -110,6 +115,17 @@ func (r *userRepository) GetBannedByEmail(ctx context.Context, email string) (*i
 	return &user, nil
 }
 
+func (r *userRepository) GetDeletedByEmail(ctx context.Context, email string) (*identitysqlc.User, error) {
+	user, err := r.q.GetDeletedUserByEmail(ctx, identitysqlc.GetDeletedUserByEmailParams{
+		TenantID: tenantID(ctx),
+		Lower:    email,
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &user, nil
+}
+
 func (r *userRepository) List(ctx context.Context, limit, offset int32) ([]identitysqlc.User, error) {
 	return r.q.ListUsers(ctx, identitysqlc.ListUsersParams{
 		TenantID: tenantID(ctx),
@@ -134,6 +150,15 @@ func (r *userRepository) Count(ctx context.Context) (int64, error) {
 func (r *userRepository) Create(ctx context.Context, params identitysqlc.CreateUserParams) (*identitysqlc.User, error) {
 	params.TenantID = tenantID(ctx)
 	user, err := r.q.CreateUser(ctx, params)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return &user, nil
+}
+
+func (r *userRepository) CreateAdmin(ctx context.Context, params identitysqlc.CreateAdminUserParams) (*identitysqlc.User, error) {
+	params.TenantID = tenantID(ctx)
+	user, err := r.q.CreateAdminUser(ctx, params)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

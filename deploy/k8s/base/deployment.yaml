@@ -38,8 +38,9 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       # 5s preStop + the API's 20s shared shutdown budget (HTTP drain, job
-      # worker/scheduler, async goroutines, span flush) + 5s margin. Raise this
-      # together with the budget in cmd/api/main.go.
+      # worker/scheduler, async goroutines, span flush, pool close) + 5s margin.
+      # Raise this together with config.ShutdownBudget; APP_REQUEST_TIMEOUT
+      # must stay within the budget minus its 5s reserve (15s).
       terminationGracePeriodSeconds: 30
       securityContext:
         # Match the Docker image user: appuser is UID 100 / GID 101. The

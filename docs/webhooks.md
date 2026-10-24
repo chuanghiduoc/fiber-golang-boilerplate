@@ -37,9 +37,17 @@ type Dispatcher interface {
 - `Data` defaults to `{}`; it must be valid JSON.
 
 `internal/bootstrap` attaches the webhooks module's dispatcher to identity and
-files and `cmd/api/main.go` installs it in `app.Deps.Webhooks`; identity
-registration and file upload/delete emit `user.registered`, `file.uploaded`,
-and `file.deleted` through it. Modules can also inject the contract directly. A
+files and `cmd/api/main.go` installs it in `app.Deps.Webhooks`. Emitted
+events:
+
+| Event | Producer |
+|---|---|
+| `user.registered` | Identity registration. |
+| `file.uploaded` | File upload. |
+| `file.deleted` | User soft delete and admin takedown (`DELETE /admin/files/:id`). |
+| `file.restored` | User restore and admin restore. |
+
+`file.deleted`/`file.restored` carry `{id, tenantId, userId, originalName}`. Modules can also inject the contract directly. A
 nil dispatcher is a no-op, so tests and minimal deployments do not need the
 webhooks module.
 
@@ -61,9 +69,11 @@ normal fan-out with that stable ID; because deliveries are unique per
 `(tenant, endpoint, event)`, a retried job only creates the deliveries still
 missing. Endpoints are matched when the job runs, not at commit time.
 
-Identity registration (when `TxManager` is wired) and file upload/delete (when
-`filesvc.AttachTxManager` is wired, as in `files.Build`) use this path;
-without it they fall back to the best-effort post-commit `Dispatch`.
+Identity registration (when `TxManager` is wired), user file
+upload/delete/restore (when `filesvc.AttachTxManager` is wired, as in
+`files.Build`), and admin file delete/restore (inside their audit
+transaction) use this path; without a transaction manager they fall back to
+the best-effort post-commit `Dispatch`.
 
 ### Endpoint model
 
@@ -105,6 +115,21 @@ failed — the next job for it marks it `dead` (`last_error` is `endpoint is
 disabled or deleted` or `delivery attempts exhausted`) instead of leaving it
 `pending` forever. A live claim lease is never touched.
 
+Outcome writes (succeeded, dead, reschedule) are fenced by the claimed attempt
+number (`attempts = <claimed attempt>`). If a worker's claim lease expired and
+another worker claimed the next attempt, the stale worker's write matches no
+row; it is logged (`claim lease lost`) and dropped instead of overwriting the
+newer attempt's result.
+
+If the worker or job context ends (shutdown, or the platform job timeout)
+before a response arrives, the attempt is not recorded as a failure: the
+claimed attempt is given back (`attempts - 1`, lease cleared) and the handler
+returns the context error, so the jobs worker releases the job without
+consuming its attempt. A drain on the final attempt therefore cannot
+dead-letter a delivery that may never have been sent. The request may still
+have reached the receiver, which is within the at-least-once contract. The
+per-endpoint request timeout is a normal retryable failure.
+
 ### Signed request
 
 Headers:
@@ -115,7 +140,7 @@ Headers:
 | `X-Webhook-Delivery` | Delivery ID. **Deduplicate on this value**; delivery is at-least-once. |
 | `X-Webhook-Event` | Event type. |
 | `X-Webhook-Timestamp` | Unix seconds used in the signature. |
-| `X-Webhook-Signature` | `v1=<lowercase hex HMAC-SHA256>`. |
+| `X-Webhook-Signature` | `v1=<lowercase hex HMAC-SHA256>`; two comma-separated values during a secret rotation grace period (see Rotation). |
 | `X-Webhook-Attempt` | 1-based attempt number. |
 | `User-Agent` | `fiber-golang-boilerplate-webhooks/1.0`. |
 
@@ -148,8 +173,10 @@ Signature input is the exact bytes:
 Use the raw header values exactly as received (an absent `X-Webhook-Event`
 signs as the empty string). Verify with `webhook.Sign`/`webhook.VerifyRequest`
 and a small timestamp tolerance (default 5 minutes); always compare in constant
-time. Support multiple comma-separated signatures to allow a receiver-side key
-transition.
+time. Accept the request when any of the comma-separated `v1=` values matches;
+the sender co-signs during endpoint secret rotation. `X-Webhook-Timestamp`
+must be positive Unix **seconds** (a millisecond value is rejected as invalid)
+and within the tolerance in both directions.
 
 ### Retry classification
 
@@ -246,8 +273,17 @@ Rotation:
 
 - Endpoint rotation locks the endpoint row, deactivates the old secret, and
   inserts the next version, so concurrent rotations serialize. Queued
-  deliveries keep the ciphertext snapshot they were created with, so rotation
-  does not break in-flight work. Replays use the current active secret.
+  deliveries keep the ciphertext snapshot they were created with. For **24
+  hours after a rotation** (`secretRotationGrace`), an attempt whose snapshot
+  predates the rotation is signed with both the snapshot and the current
+  secret (`v1=<old>,v1=<new>`), so a receiver can switch to the new secret at
+  any point in the window without failing pending retries. After the window
+  such attempts are signed with the current secret only; receivers must have
+  switched by then. Only the snapshot and the current secret co-sign: after
+  two rotations inside the window, a receiver still on the intermediate
+  secret will reject them. If the current secret cannot be loaded or
+  decrypted, the attempt is signed with the snapshot only and the failure is
+  logged. Replays use the current active secret.
 - Inbound rotation replaces the verification secret immediately; old signatures
   fail on the next request.
 - Rotating `WEBHOOK_SECRET_ENCRYPTION_KEY` makes all stored endpoint/inbound

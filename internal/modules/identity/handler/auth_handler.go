@@ -32,6 +32,13 @@ import (
 
 const oauthStateCookieName = "oauth_state"
 
+// withClientIP returns the request context carrying the client IP that the
+// login lockout keys its per-source budget on. c.IP() honors Fiber's
+// trusted-proxy configuration; the service clones the value.
+func withClientIP(c fiber.Ctx) context.Context {
+	return service.WithClientIP(c.Context(), c.IP())
+}
+
 // oauthStateKeyInfo domain-separates the OAuth state MAC key from every other
 // use of the JWT secret.
 const oauthStateKeyInfo = "fiber-golang-boilerplate/identity/oauth-state/v1"
@@ -191,7 +198,7 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.userSvc.Register(c.Context(), req)
+	user, err := h.userSvc.Register(withClientIP(c), req)
 	if err != nil {
 		return err
 	}
@@ -240,7 +247,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.userSvc.Authenticate(c.Context(), req)
+	user, err := h.userSvc.Authenticate(withClientIP(c), req)
 	if err != nil {
 		return err
 	}
@@ -441,7 +448,7 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.resetSvc.ResetPassword(c.Context(), req); err != nil {
+	if err := h.resetSvc.ResetPassword(withClientIP(c), req); err != nil {
 		return err
 	}
 
@@ -654,6 +661,8 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if user.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
 	}
+	// Attribute request-level audit/logging to the signed-in user, as Login does.
+	fiber.Locals(c, "user_id", user.ID)
 	// Same rule as Login/Refresh. A Google-linked account whose email was
 	// later changed (which clears email_verified_at) must not mint a session.
 	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {

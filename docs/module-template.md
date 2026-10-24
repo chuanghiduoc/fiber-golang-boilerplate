@@ -469,7 +469,8 @@ Rules:
 - Do not record secrets just because the event is important. Record identifiers
   and outcomes.
 - The audit table is append-only in normal operation; do not add update/delete
-  paths for audit rows.
+  paths for audit rows. Database triggers reject `DELETE` and `TRUNCATE` on
+  `audit_events` and every update except completing a started intent.
 
 ## 6. Idempotency
 
@@ -552,9 +553,12 @@ reference to another owner's table; reviewed exceptions go in
 - `test/arch/migrations_test.go` fails on duplicate versions, a missing up or
   down file, a non-timestamp version after the baseline, or a name that does
   not start with a module (or `platform`) owner.
-- A database that applied the old `000001`–`000003` history keeps that history.
-  Restore those source files from git history if needed and add a timestamped
-  migration; do not point it at the consolidated baseline. See
+- A database that applied the old `000001`–`000003` history is upgraded once,
+  manually: apply the reviewed upgrade DDL, baseline it at version 1 only after
+  the schema matches, then run `cmd/migrate` to verify. Do not restore
+  `000002`/`000003` into `migrations/` (the arch test rejects sequential
+  versions, and a fresh install would run them after the baseline), and never
+  run the consolidated baseline over the old schema. See
   [Upgrading an existing database](../README.md#upgrading-an-existing-database).
 - The down migration reverses only what its up migration created. Do not use
   down migrations as the production rollback plan; they are for local/test

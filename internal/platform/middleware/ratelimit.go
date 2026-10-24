@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"strconv"
 	"time"
@@ -22,6 +23,11 @@ const (
 	headerRateLimitLimit     = "X-RateLimit-Limit"
 	headerRateLimitRemaining = "X-RateLimit-Remaining"
 	headerRateLimitReset     = "X-RateLimit-Reset"
+
+	// rateLimitCacheOpTimeout bounds one counter increment. Cache errors fail
+	// open, so a slow or blackholed cache must fail fast instead of adding the
+	// cache client's dial/read timeouts to every request.
+	rateLimitCacheOpTimeout = 250 * time.Millisecond
 )
 
 // NewLimiter returns a fixed-window rate limiter backed by the atomic
@@ -51,19 +57,8 @@ func NewLimiter(maxRequests, windowSecs int, prefix string, counter cache.Cache)
 	limit := strconv.Itoa(maxRequests)
 
 	return func(c fiber.Ctx) error {
-		now := time.Now().Unix()
-		windowStart := now - now%window
-		resetIn := windowStart + window - now // 1..windowSecs
-
-		key := rateLimitKeyPrefix + limiterKey(c, prefix) + ":" + strconv.FormatInt(windowStart, 10)
-		hits, err := counter.Increment(c.Context(), key, time.Duration(resetIn)*time.Second+rateLimitKeySlack)
-		if err != nil {
-			metrics.RateLimitErrorsTotal.WithLabelValues(prefix).Inc()
-			slog.Warn("rate-limit counter failed; allowing request",
-				slog.String("tier", prefix),
-				slog.String("request_id", fiber.Locals[string](c, "request_id")),
-				slog.Any("error", err),
-			)
+		hits, resetIn, ok := countHit(c, counter, prefix, limiterKey(c, prefix), window)
+		if !ok {
 			return c.Next()
 		}
 
@@ -79,6 +74,57 @@ func NewLimiter(maxRequests, windowSecs int, prefix string, counter cache.Cache)
 		c.Set(headerRateLimitReset, reset)
 		return handlerErr
 	}
+}
+
+// NewIPGuard returns a fixed-window, per-client-IP limit check that does not
+// call c.Next: it returns nil when the request may proceed and a 429 problem
+// otherwise. It is meant to run in front of authentication, where the caller
+// is not yet known, so floods of bogus credentials cannot reach the API-key
+// store or session checks unthrottled. Windows, the shared cache counter, and
+// fail-open behavior match NewLimiter; no X-RateLimit-* headers are set,
+// because the per-user tier behind authentication reports the caller's quota.
+func NewIPGuard(maxRequests, windowSecs int, prefix string, counter cache.Cache) func(fiber.Ctx) error {
+	if maxRequests < 1 || windowSecs < 1 {
+		// Config validation enforces both; reaching this is a programming error.
+		panic("middleware: NewIPGuard requires maxRequests >= 1 and windowSecs >= 1")
+	}
+	if counter == nil {
+		counter = cache.NewMemoryCache()
+	}
+	window := int64(windowSecs)
+
+	return func(c fiber.Ctx) error {
+		hits, resetIn, ok := countHit(c, counter, prefix, prefix+":ip:"+c.IP(), window)
+		if !ok || hits <= int64(maxRequests) {
+			return nil
+		}
+		c.Set(fiber.HeaderRetryAfter, strconv.FormatInt(resetIn, 10))
+		return apperror.NewCode(apperror.CodeRateLimitExceeded, "too many requests, please try again later")
+	}
+}
+
+// countHit increments the current window's counter for bucket. ok is false
+// when the cache failed; the caller then fails open (the failure is logged and
+// counted here).
+func countHit(c fiber.Ctx, counter cache.Cache, prefix, bucket string, window int64) (hits, resetIn int64, ok bool) {
+	now := time.Now().Unix()
+	windowStart := now - now%window
+	resetIn = windowStart + window - now // 1..window
+
+	key := rateLimitKeyPrefix + bucket + ":" + strconv.FormatInt(windowStart, 10)
+	opCtx, cancel := context.WithTimeout(c.Context(), rateLimitCacheOpTimeout)
+	hits, err := counter.Increment(opCtx, key, time.Duration(resetIn)*time.Second+rateLimitKeySlack)
+	cancel()
+	if err != nil {
+		metrics.RateLimitErrorsTotal.WithLabelValues(prefix).Inc()
+		slog.Warn("rate-limit counter failed; allowing request",
+			slog.String("tier", prefix),
+			slog.String("request_id", fiber.Locals[string](c, "request_id")),
+			slog.Any("error", err),
+		)
+		return 0, resetIn, false
+	}
+	return hits, resetIn, true
 }
 
 // limiterKey namespaces by tier (strict/normal/relaxed) so one bucket cannot

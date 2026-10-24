@@ -181,3 +181,20 @@ func (r *Postgres) ActiveEndpointSecret(ctx context.Context, endpointID int64) (
 	}
 	return secret.SecretCiphertext, nil
 }
+
+// ActiveSigningSecret returns the endpoint's active sealed secret and its
+// rotation time, so the delivery worker can co-sign retries during the
+// rotation grace period.
+func (r *Postgres) ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error) {
+	if r == nil || r.q == nil {
+		return nil, ErrNoPool
+	}
+	secret, err := r.q.GetActiveWebhookEndpointSecret(ctx, webhooksqlc.GetActiveWebhookEndpointSecretParams{
+		TenantID:   tenantID(ctx),
+		EndpointID: endpointID,
+	})
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return &SigningSecret{Ciphertext: secret.SecretCiphertext, CreatedAt: secret.CreatedAt.Time}, nil
+}

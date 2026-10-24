@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -41,6 +42,7 @@ const (
 	invalidBody   = "body is required"
 	invalidData   = "data must be a JSON object"
 	invalidTenant = "tenant context is required"
+	invalidText   = "title, body, and data must be valid UTF-8 without NUL characters"
 )
 
 var notificationTypePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
@@ -334,12 +336,15 @@ func (s *notificationService) SetPreference(ctx context.Context, userID int64, r
 	if req.Channel != ChannelInApp && req.Channel != ChannelEmail {
 		return nil, apperror.NewBadRequest("channel must be in_app or email")
 	}
+	if req.Enabled == nil {
+		return nil, apperror.NewBadRequest("enabled is required")
+	}
 
 	row, err := s.repo.UpsertPreference(ctx, notificationsqlc.UpsertNotificationPreferenceParams{
 		UserID:  userID,
 		Type:    notificationType,
 		Channel: req.Channel,
-		Enabled: req.Enabled,
+		Enabled: *req.Enabled,
 	})
 	if err != nil {
 		return nil, apperror.NewInternal("failed to save notification preference")
@@ -379,6 +384,11 @@ func normalizeInput(input notificationcontracts.CreateNotificationInput) (notifi
 	if err := validateType(input.Type); err != nil {
 		return notificationcontracts.CreateNotificationInput{}, err
 	}
+	// PostgreSQL text rejects NUL bytes and invalid UTF-8; reject them here as
+	// a 400 instead of surfacing the insert failure as a 500.
+	if !storableText(input.Title) || !storableText(input.Body) {
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidText)
+	}
 	if input.Title == "" {
 		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidTitle)
 	}
@@ -399,12 +409,45 @@ func normalizeInput(input notificationcontracts.CreateNotificationInput) (notifi
 	if len(data) > maxDataBytes {
 		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("data is too large")
 	}
-	var object map[string]json.RawMessage
+	// encoding/json silently replaces invalid UTF-8, so check the raw bytes;
+	// jsonb also rejects the \u0000 escape, which only a decoded walk can tell
+	// apart from an escaped backslash followed by "u0000".
+	var object map[string]any
 	if err := json.Unmarshal(data, &object); err != nil || object == nil {
 		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidData)
 	}
+	if !utf8.Valid(data) || jsonContainsNUL(object) {
+		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest(invalidText)
+	}
 	input.Data = json.RawMessage(data)
 	return input, nil
+}
+
+// storableText reports whether s can be stored in a PostgreSQL text column.
+func storableText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
+}
+
+// jsonContainsNUL reports whether any decoded string or object key contains
+// a NUL character.
+func jsonContainsNUL(value any) bool {
+	switch v := value.(type) {
+	case string:
+		return strings.ContainsRune(v, 0)
+	case map[string]any:
+		for key, item := range v {
+			if strings.ContainsRune(key, 0) || jsonContainsNUL(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range v {
+			if jsonContainsNUL(item) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func validateType(notificationType string) error {

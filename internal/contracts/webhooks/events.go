@@ -20,6 +20,8 @@ const (
 	EventFileUploaded = "file.uploaded"
 	// EventFileDeleted is emitted after a file is soft-deleted.
 	EventFileDeleted = "file.deleted"
+	// EventFileRestored is emitted after a soft-deleted file is restored.
+	EventFileRestored = "file.restored"
 	// EventUserRegistered is emitted after a user account is created.
 	EventUserRegistered = "user.registered"
 

@@ -94,6 +94,15 @@ func (m *mockUserRepo) GetBannedByEmail(ctx context.Context, addr string) (*iden
 	return nil, apperror.ErrNotFound
 }
 
+func (m *mockUserRepo) GetDeletedByEmail(ctx context.Context, addr string) (*identitysqlc.User, error) {
+	for _, u := range m.users {
+		if u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) && strings.EqualFold(u.Email, addr) {
+			return u, nil
+		}
+	}
+	return nil, apperror.ErrNotFound
+}
+
 func (m *mockUserRepo) List(ctx context.Context, limit, offset int32) ([]identitysqlc.User, error) {
 	all := make([]identitysqlc.User, 0, len(m.users))
 	for _, u := range m.users {
@@ -183,6 +192,18 @@ func (m *mockUserRepo) Create(ctx context.Context, params identitysqlc.CreateUse
 	return u, nil
 }
 
+func (m *mockUserRepo) CreateAdmin(ctx context.Context, params identitysqlc.CreateAdminUserParams) (*identitysqlc.User, error) {
+	u, err := m.Create(ctx, identitysqlc.CreateUserParams{
+		Email: params.Email, PasswordHash: params.PasswordHash, Name: params.Name,
+	})
+	if err != nil {
+		return nil, err
+	}
+	u.Role = "admin"
+	u.EmailVerifiedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	return u, nil
+}
+
 func (m *mockUserRepo) CreateOAuthUser(ctx context.Context, params identitysqlc.CreateOAuthUserParams) (*identitysqlc.User, error) {
 	tid := mockTenant(ctx)
 	// Enforce active, case-insensitive email uniqueness inside the tenant.
@@ -265,7 +286,11 @@ func (m *mockUserRepo) VerifyEmail(ctx context.Context, id int64, addr string) (
 
 func (m *mockUserRepo) LinkGoogleAccount(ctx context.Context, params identitysqlc.LinkGoogleAccountParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok || !inMockTenant(ctx, u.TenantID) {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
+		return nil, apperror.ErrNotFound
+	}
+	// Mirrors the SQL guard: never replace a different Google identity.
+	if u.GoogleID.Valid && u.GoogleID.String != params.GoogleID.String {
 		return nil, apperror.ErrNotFound
 	}
 	u.GoogleID = params.GoogleID
@@ -294,6 +319,7 @@ func (m *mockUserRepo) Ban(ctx context.Context, id int64) (*identitysqlc.User, e
 	u.BannedAt = now
 	u.TokenVersion++
 	u.PasswordChangedAt = now
+	u.CredentialsRevokedAt = now
 	return u, nil
 }
 
@@ -354,7 +380,8 @@ func (m *mockUserRepo) GetPrincipal(ctx context.Context, id int64) (*identitysql
 		return nil, err
 	}
 	return &identitysqlc.GetUserPrincipalRow{
-		ID: u.ID, TenantID: u.TenantID, Email: u.Email, Name: u.Name, Role: u.Role, TenantStatus: "active",
+		ID: u.ID, TenantID: u.TenantID, Email: u.Email, Name: u.Name, Role: u.Role,
+		CredentialsRevokedAt: u.CredentialsRevokedAt, TenantStatus: "active",
 	}, nil
 }
 

@@ -369,8 +369,13 @@ func TestRequestID_Generated(t *testing.T) {
 	}
 }
 
-func TestRequestID_Passthrough(t *testing.T) {
-	app := newTestApp()
+func TestRequestID_PassthroughFromTrustedProxy(t *testing.T) {
+	// app.Test connections come from 0.0.0.0.
+	app := fiber.New(fiber.Config{
+		ErrorHandler:     apperror.FiberErrorHandler,
+		TrustProxy:       true,
+		TrustProxyConfig: fiber.TrustProxyConfig{Proxies: []string{"0.0.0.0"}},
+	})
 	app.Get("/test", RequestID(), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
@@ -386,6 +391,36 @@ func TestRequestID_Passthrough(t *testing.T) {
 	requestID := resp.Header.Get("X-Request-Id")
 	if requestID != "my-custom-id" {
 		t.Errorf("X-Request-Id = %q, want my-custom-id", requestID)
+	}
+}
+
+func TestRequestID_IgnoresUntrustedClientHeader(t *testing.T) {
+	for name, cfg := range map[string]fiber.Config{
+		"proxy trust disabled": {ErrorHandler: apperror.FiberErrorHandler},
+		"peer not in trusted proxies": {
+			ErrorHandler:     apperror.FiberErrorHandler,
+			TrustProxy:       true,
+			TrustProxyConfig: fiber.TrustProxyConfig{Proxies: []string{"10.0.0.1"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app := fiber.New(cfg)
+			app.Get("/test", RequestID(), func(c fiber.Ctx) error {
+				return c.SendString(fiber.Locals[string](c, "request_id"))
+			})
+
+			req, _ := http.NewRequest("GET", "/test", http.NoBody)
+			req.Header.Set("X-Request-Id", "forged-id")
+			resp, err := app.Test(req)
+			if err != nil {
+				t.Fatalf("app.Test failed: %v", err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			got := resp.Header.Get("X-Request-Id")
+			if got == "forged-id" || got == "" || string(body) != got {
+				t.Fatalf("X-Request-Id = %q (local %q), want a generated ID", got, body)
+			}
+		})
 	}
 }
 

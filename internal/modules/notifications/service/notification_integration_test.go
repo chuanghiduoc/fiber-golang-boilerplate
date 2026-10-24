@@ -155,7 +155,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
 	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelEmail, Enabled: false,
+		Type: "marketing.promo", Channel: ChannelEmail, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -172,7 +172,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	assert.Zero(t, jobsForType, "a disabled email channel must not enqueue a job")
 
 	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: false,
+		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -184,7 +184,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 
 	// Re-enable in-app and exercise unread/read/read-all against real SQL.
 	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: true,
+		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(true),
 	})
 	require.NoError(t, err)
 	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{

@@ -150,6 +150,10 @@ func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ dto.ResetP
 	return nil
 }
 
+func (m *mockPasswordResetService) HandleResetRequestJob(_ context.Context, _ json.RawMessage) error {
+	return nil
+}
+
 // mockEmailVerificationService is a manual mock for testing handlers.
 type mockEmailVerificationService struct {
 	sendVerificationCalls atomic.Int64

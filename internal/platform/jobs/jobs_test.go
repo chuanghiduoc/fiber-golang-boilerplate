@@ -453,7 +453,7 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 		assert.Empty(t, fake.succeededIDs())
 	})
 
-	t.Run("enabled timeout classifies a late nil return", func(t *testing.T) {
+	t.Run("enabled timeout records a late nil return as success", func(t *testing.T) {
 		t.Parallel()
 
 		fake := &fakeStore{}
@@ -472,10 +472,10 @@ func TestWorkerJobTimeoutCancelsHandler(t *testing.T) {
 			MaxAttempts: 3,
 		}))
 
-		require.Len(t, fake.failures, 1)
-		assert.Contains(t, fake.failures[0].reason, "job timeout")
-		assert.Empty(t, fake.succeededIDs(),
-			"a handler that returns nil after its deadline must not be marked succeeded")
+		assert.Equal(t, []int64{33}, fake.succeededIDs(),
+			"a handler that returns nil after its deadline already ran its side effects; it must be marked succeeded")
+		assert.Empty(t, fake.failures,
+			"recording a failure would re-run a handler that reported success")
 	})
 
 	t.Run("disabled timeout does not misclassify parent cancellation", func(t *testing.T) {
