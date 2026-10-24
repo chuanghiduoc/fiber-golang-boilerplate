@@ -144,6 +144,15 @@ Offset helpers are for small admin/export tables only.
   (`console|smtp`) are selected by config factories.
 - **Rate limits:** tiered, cache-backed in `internal/app`; authenticated
   requests are keyed per user, unauthenticated per IP.
+- **Idempotency:** opt-in `Idempotency-Key` on mutating routes via
+  `deps.Idempotency`; scoped by method/path/user (IP for public routes). 2xx
+  responses replay for 24h; non-multipart bodies up to 1 MiB are body-bound, so
+  reuse with a different body gets 409. An owner-token lock is held for 2m
+  (compare-and-delete when the cache supports it), concurrent duplicates get
+  409, and cache errors fail open. Replays set `Idempotent-Replayed: true` and
+  `idempotency_replayed=true` so audit skips them. Keep `Idempotency-Key` in
+  `CORS_ALLOW_HEADERS`; never add the middleware to token-minting endpoints or
+  GET/HEAD/OPTIONS.
 
 ## Adding a Module
 

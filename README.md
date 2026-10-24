@@ -221,6 +221,51 @@ populated tables. Never edit a shipped migration after deployment.
 | GET | `/metrics` | Prometheus metrics (requires `METRICS_AUTH_TOKEN` in production) |
 | GET | `/swagger` | Swagger UI (non-production only) |
 
+### Idempotency
+
+Mutating endpoints accept an optional `Idempotency-Key` header (1–128
+characters; only `[A-Za-z0-9._:-]`). When present:
+
+- the first request runs and its 2xx status, body, and selected headers
+  (`Content-Type`, `Location`, `ETag`) are cached for 24 hours; retries with the
+  same key replay that response without running the handler again and carry
+  `Idempotent-Replayed: true`
+- for non-multipart request bodies up to 1 MiB, the key is bound to a SHA-256
+  hash of the body. Reusing the key with a different body returns `409 Conflict`
+  (`idempotency key was used with a different request body`) instead of replaying
+  the first response. Multipart and larger bodies are not body-bound.
+- the first request holds an owner-token lock for 2 minutes (above the 60-second
+  HTTP write timeout). Concurrent requests with the same key while it is held
+  return `409 Conflict`; after the owner finishes, retries replay the cached
+  response. A lock is released only by its owner when the cache supports
+  compare-and-delete.
+- non-2xx responses are not cached, and cache failures fail open (the request
+  runs normally)
+- keys are scoped by method, path, and caller (user ID, or IP for the public
+  registration route), so the same key on another endpoint or user does not
+  collide
+
+Browser clients must be allowed to send `Idempotency-Key`. The default
+`CORS_ALLOW_HEADERS` includes it, and the default `CORS_EXPOSE_HEADERS` exposes
+`Location`, `ETag`, and `Idempotent-Replayed`. If you override those settings,
+keep the relevant values.
+
+This is opt-in and applied to registration, profile/password updates, user
+updates/deletes, file upload/delete/restore, and admin role/ban/unban/file
+actions. GET, HEAD, and OPTIONS requests never use it. Token-minting and
+credential-verification endpoints (login, refresh, logout, logout-all,
+forgot/reset/verify/resend, Google OAuth) are excluded; password change
+(`PUT /users/me/password`) is covered because it is a normal authenticated
+mutation, not a token-minting endpoint.
+
+Registration is IP-scoped because no authenticated user exists yet. Two users
+behind the same NAT should use distinct keys; reusing a key with a different
+JSON body returns 409 rather than replaying another user's response. Cached 2xx
+bodies may contain personal data and are retained for 24 hours, so size Redis
+accordingly and account for eviction: evicted entries simply cause a later retry
+to execute again. Use Redis (`CACHE_DRIVER=redis`) so replays and locks work
+across multiple replicas; memory caching is per process.
+
 ## Makefile Commands
 
 ```bash
@@ -364,7 +409,7 @@ Key settings:
 - `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
-- `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, and session invalidation across replicas)
+- `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
 - `DB_SSLMODE` — `disable` is rejected in production; use `require` or `verify-full`
 - `METRICS_AUTH_TOKEN` — required in production; sent as `Authorization: Bearer <token>`

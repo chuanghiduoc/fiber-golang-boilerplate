@@ -40,12 +40,13 @@ type Limiters struct {
 // Deps carries process-wide dependencies shared by modules. Keep this small;
 // module-specific dependencies should be captured by the module constructor.
 type Deps struct {
-	Config   *config.Config
-	Cache    cache.Cache
-	Sessions session.Store
-	Health   *health.Checker
-	Limiters Limiters
-	Audit    audit.Recorder
+	Config      *config.Config
+	Cache       cache.Cache
+	Sessions    session.Store
+	Health      *health.Checker
+	Limiters    Limiters
+	Audit       audit.Recorder
+	Idempotency fiber.Handler
 }
 
 type App struct {
@@ -60,6 +61,7 @@ type App struct {
 func New(cfg *config.Config, deps Deps) *App {
 	deps.Config = cfg
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
+	deps.Idempotency = middleware.Idempotency(deps.Cache)
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
@@ -100,6 +102,7 @@ func (a *App) setupGlobalMiddleware() {
 		AllowOrigins:     a.cfg.CORS.Origins(),
 		AllowMethods:     a.cfg.CORS.Methods(),
 		AllowHeaders:     a.cfg.CORS.Headers(),
+		ExposeHeaders:    a.cfg.CORS.ExposedHeaders(),
 		AllowCredentials: a.cfg.CORS.AllowCredentials,
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))

@@ -12,6 +12,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Prometheus job and audit metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`, `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler dead-letters only; lease-expiry dead letters are table-visible but not counted), `jobs_claim_errors_total`, `jobs_purged_total`, and `audit_write_failures_total`
 - Automatic terminal-job retention: workers purge `succeeded` and `dead` rows older than 30 days (hourly by default, first pass on startup, 1,000-row batches under a 5s bound) via `WithRetention`/`WithPurgeInterval`; queued and running rows are never deleted
 - Encrypted email job payloads at rest: `jobs.PayloadCodec` derives an AES-256-GCM key from `JWT_SECRET` with HKDF-SHA256 and seals `jobs.payload`, so reset/verification links are not readable in a database dump, backup, or replication stream while a job is queued. `EmailHandler` still accepts legacy plaintext JSON from jobs queued before deployment; those rows remain readable at rest until delivered or cleared, and external tools see the envelope in `jobs.payload`. Encrypted jobs use the distinct kind `email.send.encrypted`; new workers register both kinds, so during a rolling deploy old workers leave encrypted jobs queued as unknown-kind retries instead of misreading them, and the new workers drain them. Rotating `JWT_SECRET` makes already-queued encrypted jobs undecryptable; drain the queue before rotating it.
+- Opt-in `Idempotency-Key` support on mutating endpoints: 2xx responses replay for 24 hours, concurrent duplicates get 409, cache failures fail open, and token/credential endpoints plus GET/HEAD/OPTIONS are excluded (Redis is recommended for multi-replica deployments). Keys are body-bound for non-multipart payloads up to 1 MiB (different body -> 409), an owner-token lock is held for 2 minutes, replays expose `Idempotent-Replayed: true`, audit skips replayed mutations, and the default CORS allow list includes `Idempotency-Key`
 - Permission-based authorization (`internal/platform/authz`) with a role→permission matrix and `Require`/`RequireAny` middleware
 - Generic audit trail (`internal/platform/audit`) for successful mutating requests plus explicit domain events
 - Typed error catalog (`pkg/apperror/catalog.go`) mapping stable codes to HTTP status/title
@@ -28,6 +29,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
 
 ### Fixed
+- `MemoryCache.Increment` now rejects non-integer values like Redis `INCR`, so an idempotency owner token is never mistaken for a free claim counter
 - Worker claim errors are retried with exponential backoff capped at 30s instead of terminating the worker (and the API process that hosts it)
 - Job heartbeat, success, and failure writes are fenced by `attempts`, so a worker whose lease was reclaimed cannot finish the job under its new owner
 - Login, register, and refresh audit events now carry the authenticated user ID instead of an anonymous actor

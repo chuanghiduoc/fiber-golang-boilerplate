@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/caarlos0/env/v11"
 )
 
 func TestStorageConfig_AllowedTypes(t *testing.T) {
@@ -60,6 +62,34 @@ func TestCORSConfig_Headers(t *testing.T) {
 	if len(got) != 4 {
 		t.Errorf("Headers() len = %d, want 4", len(got))
 	}
+}
+
+func TestCORSConfig_DefaultsIncludeIdempotencyHeaders(t *testing.T) {
+	t.Setenv("CORS_ALLOW_HEADERS", "")
+	t.Setenv("CORS_EXPOSE_HEADERS", "")
+
+	var c CORSConfig
+	if err := env.Parse(&c); err != nil {
+		t.Fatalf("parse CORS defaults: %v", err)
+	}
+
+	if !contains(c.Headers(), "Idempotency-Key") {
+		t.Errorf("default CORS allowed headers = %v, want Idempotency-Key", c.Headers())
+	}
+	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed"} {
+		if !contains(c.ExposedHeaders(), header) {
+			t.Errorf("default CORS exposed headers = %v, want %s", c.ExposedHeaders(), header)
+		}
+	}
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAppConfig_TrustedProxiesList(t *testing.T) {

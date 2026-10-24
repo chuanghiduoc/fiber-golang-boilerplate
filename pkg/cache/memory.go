@@ -1,7 +1,9 @@
 package cache
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strconv"
 	"sync"
 	"time"
@@ -64,6 +66,21 @@ func (m *MemoryCache) Delete(_ context.Context, key string) error {
 	return nil
 }
 
+// CompareAndDelete deletes key only when its current value exactly matches
+// value. It returns false when the key is missing, expired, or owned by someone
+// else.
+func (m *MemoryCache) CompareAndDelete(_ context.Context, key string, value []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	e, ok := m.items[key]
+	if !ok || e.expired() || !bytes.Equal(e.data, value) {
+		return false, nil
+	}
+	delete(m.items, key)
+	return true, nil
+}
+
 func (m *MemoryCache) Exists(_ context.Context, key string) (bool, error) {
 	m.mu.RLock()
 	e, ok := m.items[key]
@@ -80,7 +97,12 @@ func (m *MemoryCache) Increment(_ context.Context, key string, ttl time.Duration
 	defer m.mu.Unlock()
 
 	if e, ok := m.items[key]; ok && !e.expired() {
-		n, _ := strconv.ParseInt(string(e.data), 10, 64)
+		n, err := strconv.ParseInt(string(e.data), 10, 64)
+		if err != nil {
+			// Match Redis INCR: a non-integer value is not a counter. Callers
+			// use the error to distinguish an owned token from a free counter.
+			return 0, fmt.Errorf("cache: increment non-integer value at %q", key)
+		}
 		n++
 		// Preserve the original expiry so the lockout window is not extended by
 		// each subsequent attempt.
