@@ -91,7 +91,8 @@ Rules:
 ## Authentication and authorization
 
 - `Authorization: Bearer <jwt>` for protected routes.
-- JWT pins HS256, requires `exp`/`iat`/`aud`/`iss`, and carries `token_version`.
+- JWT pins HS256, requires `exp`/`iat`/`aud`/`iss`, and carries `token_version`
+  plus `tenant_id` (tokens minted before multi-tenancy omit `tenant_id`).
 - Access tokens are short-lived; refresh tokens rotate atomically and are
   single-use/version-bound.
 - Permissions live in `internal/platform/authz`; route middleware uses
@@ -99,9 +100,24 @@ Rules:
 - `POST /auth/logout-all` revokes all refresh tokens and bumps the token
   version, invalidating access tokens immediately.
 
+## Tenants
+
+- `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) selects the request tenant on
+  `/api/v1` routes. Omitting it resolves to `TENANT_DEFAULT_SLUG` (`default`),
+  preserving pre-multi-tenant behavior.
+- Invalid or unknown slugs return `404` with detail `tenant not found`.
+  `TENANT_REQUIRE_HEADER=true` rejects header-less requests the same way.
+- Authenticated requests use the JWT `tenant_id` claim. If an explicit
+  `X-Tenant-Slug` resolves to a different tenant, the request fails with
+  `403 permission.denied` and detail `tenant mismatch`.
+- One user belongs to one tenant; emails and Google IDs are unique per tenant.
+- **Not yet isolated:** existing queries are not scoped by tenant. Treat this
+  as a foundation, not an isolation boundary.
+
 ## Headers
 
 - `X-Request-Id` is accepted if valid, otherwise generated; echoed on responses.
+- `X-Tenant-Slug` selects the tenant; it is in the default CORS allow list.
 - `Idempotency-Key` is opt-in on mutating routes; 1-128 chars of
   `[A-Za-z0-9._:-]`. Replays return `Idempotent-Replayed: true`.
 - `Location`, `ETag` are returned where applicable and exposed through CORS.
@@ -148,6 +164,8 @@ Rules:
 - New permission: additive; grant it deliberately.
 - New migration: fresh installs update the baseline; deployed DBs get a
   numbered migration.
+- Tenant-aware behavior: sending/omitting `X-Tenant-Slug` must preserve the
+  default tenant when omitted; changing tenant selection is breaking.
 
 ## References
 

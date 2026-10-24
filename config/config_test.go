@@ -133,6 +133,7 @@ func baseValidConfig() Config {
 		CORS:      CORSConfig{AllowOrigins: "*"},
 		Cache:     CacheConfig{Driver: "memory"},
 		Email:     EmailConfig{Driver: "console"},
+		Tenant:    TenantConfig{DefaultSlug: "default"},
 	}
 }
 
@@ -172,6 +173,54 @@ func TestValidate_InvalidExpireHour(t *testing.T) {
 	cfg.JWT.ExpireHour = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for ExpireHour < 1")
+	}
+}
+
+func TestValidate_TenantSlug(t *testing.T) {
+	t.Run("valid custom slug", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Tenant.DefaultSlug = "acme-corp"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() rejected a valid tenant slug: %v", err)
+		}
+	})
+
+	for _, slug := range []string{"", "Acme", "has space", "under_score", strings.Repeat("a", 64)} {
+		t.Run("invalid "+slug, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.Tenant.DefaultSlug = slug
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("Validate() should reject tenant slug %q", slug)
+			}
+		})
+	}
+}
+
+func TestLoad_TenantDefaults(t *testing.T) {
+	t.Setenv("TENANT_DEFAULT_SLUG", "")
+	t.Setenv("TENANT_REQUIRE_HEADER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.Tenant.DefaultSlug != "default" {
+		t.Errorf("TENANT_DEFAULT_SLUG = %q, want default", cfg.Tenant.DefaultSlug)
+	}
+	if cfg.Tenant.RequireHeader {
+		t.Error("TENANT_REQUIRE_HEADER should default to false")
+	}
+}
+
+func TestLoad_TenantRequireHeader(t *testing.T) {
+	t.Setenv("TENANT_REQUIRE_HEADER", "true")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if !cfg.Tenant.RequireHeader {
+		t.Error("TENANT_REQUIRE_HEADER=true was not parsed")
 	}
 }
 

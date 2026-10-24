@@ -12,7 +12,7 @@ import (
 )
 
 const consumePasswordResetToken = `-- name: ConsumePasswordResetToken :one
-DELETE FROM password_reset_tokens WHERE token = $1 RETURNING id, user_id, token, expires_at, created_at
+DELETE FROM password_reset_tokens WHERE token = $1 RETURNING id, tenant_id, user_id, token, expires_at, created_at
 `
 
 func (q *Queries) ConsumePasswordResetToken(ctx context.Context, token string) (PasswordResetToken, error) {
@@ -20,6 +20,7 @@ func (q *Queries) ConsumePasswordResetToken(ctx context.Context, token string) (
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -35,7 +36,7 @@ ON CONFLICT (user_id) DO UPDATE
 SET token = EXCLUDED.token,
     expires_at = EXCLUDED.expires_at,
     created_at = NOW()
-RETURNING id, user_id, token, expires_at, created_at
+RETURNING id, tenant_id, user_id, token, expires_at, created_at
 `
 
 type CreatePasswordResetTokenParams struct {
@@ -49,6 +50,7 @@ func (q *Queries) CreatePasswordResetToken(ctx context.Context, arg CreatePasswo
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -76,7 +78,7 @@ func (q *Queries) DeletePasswordResetTokensByUserID(ctx context.Context, userID 
 }
 
 const getPasswordResetTokenByToken = `-- name: GetPasswordResetTokenByToken :one
-SELECT id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1
+SELECT id, tenant_id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1
 `
 
 func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, token string) (PasswordResetToken, error) {
@@ -84,6 +86,7 @@ func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, token string
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,
@@ -93,7 +96,7 @@ func (q *Queries) GetPasswordResetTokenByToken(ctx context.Context, token string
 }
 
 const getPasswordResetTokenByTokenForUpdate = `-- name: GetPasswordResetTokenByTokenForUpdate :one
-SELECT id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1 FOR UPDATE
+SELECT id, tenant_id, user_id, token, expires_at, created_at FROM password_reset_tokens WHERE token = $1 FOR UPDATE
 `
 
 func (q *Queries) GetPasswordResetTokenByTokenForUpdate(ctx context.Context, token string) (PasswordResetToken, error) {
@@ -101,6 +104,7 @@ func (q *Queries) GetPasswordResetTokenByTokenForUpdate(ctx context.Context, tok
 	var i PasswordResetToken
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.Token,
 		&i.ExpiresAt,

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -21,7 +22,17 @@ type Config struct {
 	Cache     CacheConfig
 	Email     EmailConfig
 	Admin     AdminConfig
+	Tenant    TenantConfig
 }
+
+// TenantConfig controls request-tenant resolution. The default slug preserves
+// compatibility for requests that do not send X-Tenant-Slug.
+type TenantConfig struct {
+	DefaultSlug   string `env:"TENANT_DEFAULT_SLUG" envDefault:"default"`
+	RequireHeader bool   `env:"TENANT_REQUIRE_HEADER" envDefault:"false"`
+}
+
+var tenantSlugPattern = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
 
 type AdminConfig struct {
 	Email    string `env:"ADMIN_EMAIL"`
@@ -60,7 +71,7 @@ func (a AppConfig) TrustedProxiesList() []string {
 type CORSConfig struct {
 	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
 	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,DELETE,OPTIONS"`
-	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization,Idempotency-Key"`
+	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Authorization,Idempotency-Key,X-Tenant-Slug"`
 	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed"`
 	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }
@@ -293,6 +304,11 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.JWT.RefreshExpireDays < 1 {
 		return fmt.Errorf("JWT_REFRESH_EXPIRE_DAYS must be at least 1")
+	}
+
+	// Tenant slugs are used as external identifiers and must stay DNS-safe.
+	if !tenantSlugPattern.MatchString(cfg.Tenant.DefaultSlug) {
+		return fmt.Errorf("TENANT_DEFAULT_SLUG must match [a-z0-9-]{1,63} (got %q)", cfg.Tenant.DefaultSlug)
 	}
 
 	if cfg.App.BodyLimit < 1 {

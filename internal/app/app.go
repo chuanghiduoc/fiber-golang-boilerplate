@@ -18,6 +18,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
@@ -47,6 +48,9 @@ type Deps struct {
 	Limiters    Limiters
 	Audit       audit.Recorder
 	Idempotency fiber.Handler
+	// TenantResolver resolves X-Tenant-Slug for public routes. A nil resolver
+	// is a pass-through for tests and minimal deployments.
+	TenantResolver tenant.Resolver
 }
 
 type App struct {
@@ -162,7 +166,14 @@ func (a *App) setupInfrastructureRoutes() {
 // sense that the caller must register before Listen; duplicate paths are a
 // programming error caught by Fiber's router.
 func (a *App) Register(modules ...Module) {
-	v1 := a.fiber.Group("/api/v1")
+	// Tenant resolution is API-only: health and metrics probes must not depend
+	// on the tenants table. It runs before every module's JWT middleware so a
+	// conflicting X-Tenant-Slug can be rejected after the token is parsed.
+	defaultSlug := a.cfg.Tenant.DefaultSlug
+	if a.cfg.Tenant.RequireHeader {
+		defaultSlug = ""
+	}
+	v1 := a.fiber.Group("/api/v1", tenant.Middleware(a.deps.TenantResolver, defaultSlug))
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		m.RegisterRoutes(v1, a.deps)

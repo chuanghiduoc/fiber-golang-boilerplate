@@ -53,9 +53,9 @@ At minimum, replace:
 - `configmap.yaml`: `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`,
   `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET`, and the
   `APP_TRUSTED_PROXIES`/S3 endpoint values for your platform. Keep
-  `Idempotency-Key` in `CORS_ALLOW_HEADERS` and
+  `Idempotency-Key` and `X-Tenant-Slug` in `CORS_ALLOW_HEADERS` and
   `Idempotent-Replayed` in `CORS_EXPOSE_HEADERS` for browser clients that use
-  idempotent mutations.
+  idempotent mutations or tenant selection.
 - `secret.example.yaml` (copied outside the repo): every `REPLACE_*` value.
 - `networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
   managed services are not in `10.0.0.0/8` or use different ports.

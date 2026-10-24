@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/joho/godotenv/autoload"
 
@@ -20,6 +22,7 @@ import (
 // check catches a legacy database that reports migration version 1 but predates
 // the consolidated baseline, which golang-migrate alone would treat as current.
 var requiredTables = []string{
+	"tenants",
 	"users",
 	"refresh_tokens",
 	"password_reset_tokens",
@@ -32,16 +35,20 @@ var requiredTables = []string{
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the consolidated baseline.
 var requiredColumns = map[string][]string{
-	"users":                     {"token_version", "password_changed_at", "banned_at"},
-	"refresh_tokens":            {"token_version"},
-	"email_verification_tokens": {"email"},
+	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at"},
+	"refresh_tokens":            {"tenant_id", "token_version"},
+	"password_reset_tokens":     {"tenant_id"},
+	"email_verification_tokens": {"tenant_id", "email"},
+	"files":                     {"tenant_id"},
+	"jobs":                      {"tenant_id"},
+	"audit_events":              {"tenant_id"},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens and case-insensitive duplicate active emails.
+// and verification tokens and duplicate active emails per tenant.
 var requiredUniqueIndexes = []string{
-	"idx_users_email_lower_active",
-	"idx_users_google_id_active",
+	"idx_users_tenant_email_lower_active",
+	"idx_users_tenant_google_id_active",
 	"idx_password_reset_tokens_user_id",
 	"idx_email_verification_tokens_user_id",
 }
@@ -214,6 +221,23 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 	for _, index := range requiredUniqueIndexes {
 		if _, ok := foundIndexes[index]; !ok {
 			missing = append(missing, "unique index "+index)
+		}
+	}
+
+	// The default tenant is the backward-compatibility anchor: rows without an
+	// explicit tenant (and legacy requests without X-Tenant-Slug) resolve to it.
+	if _, ok := foundTables["tenants"]; ok {
+		var tenantID int64
+		err := pool.QueryRow(ctx,
+			`SELECT id FROM tenants WHERE slug = 'default'`,
+		).Scan(&tenantID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			missing = append(missing, "default tenant row (slug default)")
+		case err != nil:
+			return fmt.Errorf("verify default tenant: %w", err)
+		case tenantID != 1:
+			missing = append(missing, "default tenant id 1")
 		}
 	}
 

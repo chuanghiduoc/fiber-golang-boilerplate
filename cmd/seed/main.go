@@ -42,6 +42,10 @@ func run() error {
 
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
 	userRepo := repository.NewUserRepository(pool)
+	tenantRepo := repository.NewTenantRepository(pool)
+	if _, err := tenantRepo.GetByID(ctx, 1); err != nil {
+		return fmt.Errorf("default tenant (id 1) is missing; run cmd/migrate: %w", err)
+	}
 
 	if cfg.Admin.Email == "" || cfg.Admin.Password == "" {
 		return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set for seeding")

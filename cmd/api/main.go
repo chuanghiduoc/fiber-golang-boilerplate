@@ -148,7 +148,20 @@ func main() {
 
 	// Dependency injection
 	userRepo := identityrepository.NewUserRepository(pool)
+	tenantRepo := identityrepository.NewTenantRepository(pool)
+	tenantResolver := identityadapter.NewTenantResolver(tenantRepo)
 	sessionStore := session.NewStore(userRepo, appCache)
+
+	// The baseline seeds tenant id 1. Fail fast instead of serving 404s (or
+	// creating an admin under an unexpected tenant) when migrations did not run.
+	if _, err := tenantRepo.GetByID(startupCtx, 1); err != nil {
+		pool.Close()
+		fail("default tenant (id 1) is missing; run cmd/migrate", err)
+	}
+	if _, err := tenantResolver.Resolve(startupCtx, cfg.Tenant.DefaultSlug); err != nil {
+		pool.Close()
+		fail("configured default tenant is not available; run cmd/migrate or fix TENANT_DEFAULT_SLUG", err)
+	}
 
 	// Auto-seed admin user (idempotent)
 	if err := seed.Admin(startupCtx, cfg.Admin, userRepo); err != nil {
@@ -209,10 +222,11 @@ func main() {
 	// Composition root. Modules own their route tables; app owns global
 	// middleware, infrastructure routes, and lifecycle.
 	application := app.New(cfg, app.Deps{
-		Cache:    appCache,
-		Sessions: sessionStore,
-		Health:   healthChecker,
-		Audit:    audit.NewPostgresRecorder(pool),
+		Cache:          appCache,
+		Sessions:       sessionStore,
+		Health:         healthChecker,
+		Audit:          audit.NewPostgresRecorder(pool),
+		TenantResolver: tenantResolver,
 	})
 	application.Register(
 		identity.New(authHandler, userHandler),

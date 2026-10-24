@@ -684,6 +684,7 @@ func ToUserResponse(user *identitysqlc.User) *dto.UserResponse {
 		CreatedAt:     user.CreatedAt.Time,
 		UpdatedAt:     user.UpdatedAt.Time,
 		TokenVersion:  user.TokenVersion,
+		TenantID:      user.TenantID,
 	}
 	if user.DeletedAt.Valid {
 		deletedAt := user.DeletedAt.Time

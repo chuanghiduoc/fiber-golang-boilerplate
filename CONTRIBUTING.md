@@ -101,6 +101,16 @@ When releasing, move `[Unreleased]` entries under a version header:
   numbered migration instead (`make migrate-create name=...`).
 - One module owns each table. Cross-module access goes through a contract or
   read model, not another module's repository.
+- Every tenant-owned table carries
+  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`, and its indexes
+  lead with `tenant_id`. The `default` tenant (id 1) preserves compatibility for
+  requests without `X-Tenant-Slug`; emails and Google IDs are unique per tenant.
+- The `users` last-admin trigger is per tenant. Application checks must use the
+  same tenant scope as the trigger.
+- Tenant resolution, the JWT `tenant_id` claim, and the schema exist, but
+  existing SQL is not scoped yet. The isolation milestone adds `tenant_id`
+  predicates to queries and repositories; do not describe the current state as
+  tenant-isolated.
 
 ### Upgrading an existing database
 
@@ -115,6 +125,12 @@ database's current version (a fully migrated old deployment is at 3, so
 set or rename it explicitly. A fresh schema created out-of-band that already
 matches `000001` can be baselined manually after verification (for example, the
 golang-migrate CLI's `force 1`) instead of re-running the file.
+
+The multi-tenant foundation also changes `000001` (tenants table, `tenant_id`
+columns, per-tenant indexes and last-admin trigger). Existing databases need a
+new numbered migration or reviewed manual DDL; see the README's "Upgrading an
+existing database" section. Do not assume the baseline created the tenant
+objects on an already-deployed database.
 
 ## Adding a New Module
 

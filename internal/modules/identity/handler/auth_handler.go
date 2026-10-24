@@ -119,7 +119,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 		return err
 	}
 
-	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate access token")
 	}
@@ -181,7 +181,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 		return apperror.NewCode(apperror.CodeAuthEmailNotVerified, "email not verified")
 	}
 
-	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate access token")
 	}
@@ -424,7 +424,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return err
 	}
 
-	accessToken, err := token.GenerateWithVersion(user.ID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
+	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
 	if err != nil {
 		return apperror.NewInternal("failed to generate token")
 	}

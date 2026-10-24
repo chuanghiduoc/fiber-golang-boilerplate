@@ -42,7 +42,7 @@ cmd/seed/main.go            admin seeder (schema must exist)
 internal/app/               Fiber app, global middleware, Module registry
 internal/modules/           identity (full vertical slice + admin seed + queries/sqlc), files (dto/repository/service/handler + adapter + queries/sqlc), admin (dto/service/handler, contracts-only)
 internal/contracts/         narrow cross-module identity/files admin interfaces (stdlib only)
-internal/platform/          authz, audit, jobs, session, and future shared mechanics
+internal/platform/          authz, audit, jobs, session, tenant, and future shared mechanics
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
@@ -74,10 +74,22 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   migration above the current version (a fully migrated old deployment is at 3,
   so `000004`+) with only the missing objects. Never point an old database at
   the new `000001`, reset `schema_migrations`, or edit a shipped migration.
+- Every tenant-owned table (`users`, `files`, `refresh_tokens`,
+  `password_reset_tokens`, `email_verification_tokens`, `jobs`,
+  `audit_events`) has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`.
+  New tenant-owned tables must do the same and lead their query indexes with
+  `tenant_id`.
+- The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
+  tenant; the `users` last-admin trigger is scoped per tenant.
+- The multi-tenant foundation is schema + request resolution + JWT claim only.
+  Existing SQL is not tenant-scoped yet; add `tenant_id` predicates to query
+  files and repository methods in the isolation milestone. Do not claim
+  isolation before that lands.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant isolation, distributed tracing, and environment promotion/rollout
-automation remain future work. `identity`, `files`, and `admin` own all of
+Tenant query isolation/RLS, tenant-aware registration/login/OAuth, distributed
+tracing, and environment promotion/rollout automation remain future work.
+`identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
@@ -114,8 +126,11 @@ Offset helpers are for small admin/export tables only.
 
 ## Key Patterns
 
-- **Auth/session:** JWT carries `token_version`; `session.Store` validates it
-  with generation-keyed invalidation. Refresh tokens are atomic single-use and
+- **Auth/session:** JWT carries `token_version` and (for tokens minted after
+  multi-tenancy) `tenant_id`; `session.Store` validates the version with
+  generation-keyed invalidation. `tenant.Middleware` resolves `X-Tenant-Slug`
+  (empty -> `TENANT_DEFAULT_SLUG`), and `JWTAuth` rejects an explicit header
+  that conflicts with the claim. Refresh tokens are atomic single-use and
   version-bound. `pkg/token` pins HS256 and requires `exp`.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook

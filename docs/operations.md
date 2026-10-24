@@ -388,6 +388,32 @@ uses a separate Job and ordered flow (see below).
   verify the objects and baseline the version (for example `force 1`) instead
   of applying the file over populated tables.
 
+### Multi-tenant foundation upgrade
+
+The baseline now creates `tenants`, seeds tenant id 1 (`default`), adds
+`tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to users, files,
+refresh/reset/verification tokens, jobs, and audit events, adds tenant-leading
+indexes, and scopes the last-admin trigger per tenant. A database deployed
+before this change does **not** receive those objects from the edited baseline.
+Create the next numbered migration above its recorded version (or apply
+reviewed DDL manually) that:
+
+1. creates `tenants` and inserts `('default','Default')` first so it gets id 1;
+2. adds/backfills the `tenant_id` columns (default 1) and foreign keys;
+3. rebuilds user uniqueness as `(tenant_id, lower(email))` and
+   `(tenant_id, google_id)` for active rows, and adds the tenant-leading
+   indexes;
+4. replaces `protect_last_admin()` with the per-tenant body.
+
+Keep tenant id 1 as the compatibility anchor unless you also change the column
+defaults and backfill every row. After the upgrade, run `cmd/migrate`; it
+verifies the tenant table/columns/indexes and the default tenant row.
+
+`TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
+requests resolve to; `TENANT_REQUIRE_HEADER=true` rejects requests that omit
+`X-Tenant-Slug`. Roll out the latter only after all clients send the header.
+This foundation does not scope existing queries yet; see the README scope note.
+
 `cmd/migrate` checks for a dirty migration state before running, and after
 migrating verifies required tables, columns, and unique indexes. A legacy
 partial schema fails with an actionable error instead of silently serving a

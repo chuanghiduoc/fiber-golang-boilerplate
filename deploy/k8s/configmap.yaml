@@ -21,6 +21,10 @@ data:
   # Replace with the public frontend origin (https is enforced in production).
   APP_FRONTEND_URL: "https://app.example.com"
   REQUIRE_EMAIL_VERIFICATION: "true"
+  # Requests without X-Tenant-Slug resolve to the default tenant. Enable
+  # TENANT_REQUIRE_HEADER only after every client sends the header.
+  TENANT_DEFAULT_SLUG: "default"
+  TENANT_REQUIRE_HEADER: "false"
 
   # The app runs behind ingress-nginx, so client IPs arrive in X-Forwarded-For.
   # Trust only the cluster's pod/service CIDR that contains ingress-nginx;
@@ -34,7 +38,7 @@ data:
   # Explicit origins only; "*" is rejected when APP_ENV=production.
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
-  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization,Idempotency-Key"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization,Idempotency-Key,X-Tenant-Slug"
   CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed"
   CORS_ALLOW_CREDENTIALS: "false"
 

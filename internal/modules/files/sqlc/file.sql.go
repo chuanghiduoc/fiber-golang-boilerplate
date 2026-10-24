@@ -42,7 +42,7 @@ func (q *Queries) AdminFileStats(ctx context.Context) (AdminFileStatsRow, error)
 }
 
 const adminListFiles = `-- name: AdminListFiles :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files ORDER BY id DESC LIMIT $1 OFFSET $2
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files ORDER BY id DESC LIMIT $1 OFFSET $2
 `
 
 type AdminListFilesParams struct {
@@ -61,6 +61,7 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -80,7 +81,7 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 }
 
 const adminListFilesCursor = `-- name: AdminListFilesCursor :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
 WHERE (NOT $1::boolean OR (created_at, id) < ($2::timestamptz, $3::bigint))
 ORDER BY created_at DESC, id DESC
 LIMIT $4::int
@@ -109,6 +110,7 @@ func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCu
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -141,7 +143,7 @@ func (q *Queries) CountFilesByUserID(ctx context.Context, userID int64) (int64, 
 const createFile = `-- name: CreateFile :one
 INSERT INTO files (user_id, original_name, storage_path, mime_type, size)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
 type CreateFileParams struct {
@@ -163,6 +165,7 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -177,7 +180,7 @@ func (q *Queries) CreateFile(ctx context.Context, arg CreateFileParams) (File, e
 const deleteFile = `-- name: DeleteFile :one
 UPDATE files SET deleted_at = NOW()
 WHERE id = $1 AND deleted_at IS NULL
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
 func (q *Queries) DeleteFile(ctx context.Context, id int64) (File, error) {
@@ -185,6 +188,7 @@ func (q *Queries) DeleteFile(ctx context.Context, id int64) (File, error) {
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -197,7 +201,7 @@ func (q *Queries) DeleteFile(ctx context.Context, id int64) (File, error) {
 }
 
 const getFileByID = `-- name: GetFileByID :one
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1 AND deleted_at IS NULL
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1 AND deleted_at IS NULL
 `
 
 func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
@@ -205,6 +209,7 @@ func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -217,7 +222,7 @@ func (q *Queries) GetFileByID(ctx context.Context, id int64) (File, error) {
 }
 
 const getFileByIDIncludingDeleted = `-- name: GetFileByIDIncludingDeleted :one
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE id = $1
 `
 
 func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (File, error) {
@@ -225,6 +230,7 @@ func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (Fi
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,
@@ -237,7 +243,7 @@ func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, id int64) (Fi
 }
 
 const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files
 WHERE user_id = $1::bigint
   AND (deleted_at IS NULL OR $2::boolean)
   AND (NOT $3::boolean OR (created_at, id) < ($4::timestamptz, $5::bigint))
@@ -272,6 +278,7 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -291,7 +298,7 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 }
 
 const listFilesByUserID = `-- name: ListFilesByUserID :many
-SELECT id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2 OFFSET $3
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at FROM files WHERE user_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT $2 OFFSET $3
 `
 
 type ListFilesByUserIDParams struct {
@@ -311,6 +318,7 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 		var i File
 		if err := rows.Scan(
 			&i.ID,
+			&i.TenantID,
 			&i.UserID,
 			&i.OriginalName,
 			&i.StoragePath,
@@ -332,7 +340,7 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 const restoreFile = `-- name: RestoreFile :one
 UPDATE files SET deleted_at = NULL
 WHERE id = $1 AND deleted_at IS NOT NULL
-RETURNING id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
+RETURNING id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, deleted_at
 `
 
 func (q *Queries) RestoreFile(ctx context.Context, id int64) (File, error) {
@@ -340,6 +348,7 @@ func (q *Queries) RestoreFile(ctx context.Context, id int64) (File, error) {
 	var i File
 	err := row.Scan(
 		&i.ID,
+		&i.TenantID,
 		&i.UserID,
 		&i.OriginalName,
 		&i.StoragePath,

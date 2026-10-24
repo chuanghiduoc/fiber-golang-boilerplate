@@ -24,6 +24,7 @@ internal/platform
   audit        audit recorder + mutating-request middleware
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
+  tenant       request tenant resolver + locals helpers (X-Tenant-Slug)
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
@@ -34,9 +35,34 @@ Request flow:
 client
   -> app global middleware (CORS, security, request ID, metrics, logger,
      recovery, audit, timeout, idempotency where wired)
+  -> /api/v1 tenant middleware (X-Tenant-Slug or default tenant)
   -> module route (JWT -> rate limit -> authz -> idempotency)
   -> handler -> service -> repository -> sqlc -> PostgreSQL
 ```
+
+`tenant.Middleware` runs on the `/api/v1` group, before module JWTs. It
+validates `[a-z0-9-]{1,63}`, resolves the slug (header or
+`TENANT_DEFAULT_SLUG`), and stores `tenant_id`/`tenant_slug` in Fiber locals.
+`JWTAuth` treats the JWT `tenant_id` claim as authoritative and rejects an
+explicit header that resolves to a different tenant with 403. Infrastructure
+probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution so
+they never depend on the `tenants` table.
+
+## Multi-tenant model
+
+- One user belongs to exactly one tenant. `tenants.id` 1 with slug `default`
+  is seeded by the baseline and preserves backward compatibility: no header,
+  no claim, and rows written before multi-tenancy all resolve to it.
+- `tenant_id` is present on `users`, `files`, and all identity/platform token,
+  job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
+- Emails and Google IDs are unique per tenant; the last-admin trigger counts
+  only admins in the affected tenant.
+- **The foundation does not scope existing queries.** Repositories still read
+  across tenants; the isolation milestone adds `WHERE tenant_id = ...` (or RLS)
+  and tenant-aware registration/login. Do not treat this as data isolation.
+- Google OAuth start/callback does not carry the tenant header yet; Google
+  users use the existing lookup path and the stored user tenant.
+
 
 ## Dependency rules
 
@@ -73,6 +99,12 @@ client
 - Fresh installs use one baseline: `migrations/000001_init_schema.{up,down}.sql`.
 - Once a database is deployed, add numbered migrations; never edit a shipped
   migration. Legacy databases must keep their recorded history (see README).
+- Tenant-owned tables carry `tenant_id` with a default of 1 and a foreign key to
+  `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
+  `default` tenant as row 1, so existing rows and header-less requests remain on
+  the compatibility tenant.
+- `cmd/migrate` verifies required tenant tables/columns/indexes and that the
+  default tenant exists with id 1.
 
 ## Cross-cutting conventions
 

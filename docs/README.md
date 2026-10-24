@@ -1,7 +1,7 @@
 # Documentation
 
 - [Architecture](architecture.md) — module map, dependency rules, request flow,
-  data ownership, jobs/outbox, migration policy.
+  tenant model, data ownership, jobs/outbox, migration policy.
 - [API Design System](api-design.md) — URL/versioning, JSON conventions,
   success/error shapes, pagination, auth, idempotency, rate limits, status
   codes, compatibility rules.

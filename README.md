@@ -60,6 +60,7 @@ internal/platform/
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
+  tenant/                           Tenant resolution from X-Tenant-Slug
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
   apperror/                         RFC 9457 errors + typed error catalog
@@ -84,6 +85,30 @@ Request flow: `Client → app middleware → module route → handler/service/re
 assume the schema exists, so replicas never race on migrations. Fresh installs
 run the single `000001_init_schema.up.sql`; add new numbered migrations only
 after a database is deployed.
+
+## Multi-tenancy foundation
+
+The schema and request pipeline are tenant-aware. One user belongs to exactly
+one tenant.
+
+- The baseline seeds a `default` tenant with id `1`. Requests without
+  `X-Tenant-Slug` resolve to `TENANT_DEFAULT_SLUG` (`default`), preserving the
+  previous single-tenant behavior.
+- `X-Tenant-Slug` selects the request tenant on `/api/v1` routes. Invalid or
+  unknown slugs return `404` `tenant not found`. Set
+  `TENANT_REQUIRE_HEADER=true` to reject requests that omit the header.
+- Access tokens carry a `tenant_id` claim. Authenticated requests use the
+  claim; if an explicit `X-Tenant-Slug` resolves to a different tenant, the
+  request fails with `403 permission.denied` (`tenant mismatch`).
+- Emails and Google IDs are unique per tenant. The last-admin database trigger
+  protects each tenant independently.
+- **Current limitation:** existing SQL is not tenant-scoped yet. This branch is
+  the foundation (schema, resolution, JWT claim, config); query scoping,
+  tenant-aware registration/login, and per-tenant limits are the next
+  milestone. Do not treat it as data isolation.
+- Google OAuth start/callback does not propagate `X-Tenant-Slug` yet. Google
+  users follow the existing lookup/creation path and their JWT uses the stored
+  user tenant (currently the default tenant).
 
 ## Quick Start
 
@@ -176,12 +201,34 @@ version whose source files are missing. Alternatively, apply the missing DDL
 manually with `psql` and baseline the version; do not run the new `000001` over
 the old schema.
 
+The multi-tenant foundation also changes `000001` (new `tenants` table,
+`tenant_id` columns, per-tenant indexes, and the per-tenant last-admin
+trigger). An existing database does **not** get these objects from the baseline.
+Create the next numbered migration above its recorded version (or apply
+reviewed DDL manually) that:
+
+1. creates `tenants` and inserts `('default','Default')` as the first row so it
+   receives id 1;
+2. adds `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to
+   `users`, `files`, `refresh_tokens`, `password_reset_tokens`,
+   `email_verification_tokens`, `jobs`, and `audit_events`;
+3. rebuilds the user indexes with `tenant_id` leading, then adds the
+   tenant-leading indexes used by scoped queries;
+4. replaces `protect_last_admin()` with the per-tenant version.
+
+Keep the default tenant id 1 unless you also change the column defaults and
+backfill every row. Fresh installs get all of this from `000001`.
+
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
 with the golang-migrate CLI's `force 1`) instead of running the file over
 populated tables. Never edit a shipped migration after deployment.
 
 ## API Endpoints
+
+Public and authenticated API requests may send `X-Tenant-Slug`; omitting it
+uses the configured default tenant. Authenticated requests must not send a
+tenant that differs from the JWT `tenant_id` claim.
 
 ### Auth (public)
 | Method | Path | Description |
@@ -437,6 +484,8 @@ Key settings:
 - `APP_BODY_LIMIT` — must be greater than `STORAGE_MAX_FILE_SIZE` (multipart overhead)
 - `DB_CONNECT_TIMEOUT` — database connect timeout in seconds (default 10)
 - `REQUIRE_EMAIL_VERIFICATION` — require a verified email before login/refresh
+- `TENANT_DEFAULT_SLUG` — tenant for requests without `X-Tenant-Slug` (default `default`)
+- `TENANT_REQUIRE_HEADER` — require `X-Tenant-Slug` on `/api/v1` requests (default `false`)
 - `STORAGE_DRIVER` — `local` | `s3` | `minio`
 - `CACHE_DRIVER` — `memory` | `redis` (Redis shares rate-limit counters, login lockouts, session invalidation, and idempotency locks/replays across replicas)
 - `EMAIL_DRIVER` — `console` | `smtp` (`console` is rejected in production)
@@ -468,11 +517,12 @@ binary.
 ## Scope and Remaining Work
 
 This is a boilerplate, not a finished multi-tenant SaaS platform. The modular
-monolith, durable jobs, audit trail, permission-based authorization, and single
-migration entrypoint exist. Remaining work:
+monolith, durable jobs, audit trail, permission-based authorization, single
+migration entrypoint, and tenant foundation (schema, resolution, JWT claim,
+config) exist. Remaining work:
 
-- Tenant isolation: tenant-scoped data, query enforcement/row-level security,
-  and per-tenant limits.
+- Tenant isolation: tenant-scoped SQL and query enforcement/row-level security,
+  tenant-aware registration/login/OAuth, and per-tenant limits.
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
@@ -488,12 +538,14 @@ no legacy handler/service/DTO/repository packages remain.
   version, and rotated on every refresh.
 - Access tokens carry `token_version`; password changes/resets, bans,
   unbans, and role changes invalidate them immediately.
+- Access tokens also carry `tenant_id`. A request whose explicit
+  `X-Tenant-Slug` resolves to a different tenant is rejected with 403.
 - Access tokens are validated against the current user record through a
   generation-keyed session cache. Use Redis in production so invalidation is
   shared across replicas.
-- Emails are normalized and unique case-insensitively among active accounts;
-  email changes require the current password, reset verification, revoke
-  sessions, and send a fresh verification link.
+- Emails are normalized and unique case-insensitively among active accounts
+  within a tenant; email changes require the current password, reset
+  verification, revoke sessions, and send a fresh verification link.
 - Uploaded files are never served from a public directory; downloads require
   authentication and ownership (or admin role).
 - Banned emails cannot be reused through registration or Google login;

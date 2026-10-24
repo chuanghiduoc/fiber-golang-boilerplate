@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -12,6 +13,9 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 )
 
 type pingModule struct{}
@@ -21,6 +25,15 @@ func (pingModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
 	v1.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })
 }
 
+type staticTenantResolver struct{}
+
+func (staticTenantResolver) Resolve(_ context.Context, slug string) (tenant.Tenant, error) {
+	if slug == "default" {
+		return tenant.Tenant{ID: 1, Slug: "default", Name: "Default"}, nil
+	}
+	return tenant.Tenant{}, apperror.ErrNotFound
+}
+
 func TestModuleRegistryMountsRoutes(t *testing.T) {
 	cfg := &config.Config{
 		// production disables the Swagger file loader, which resolves relative
@@ -28,12 +41,63 @@ func TestModuleRegistryMountsRoutes(t *testing.T) {
 		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
 		CORS:      config.CORSConfig{AllowOrigins: "*"},
 		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	application := app.New(cfg, app.Deps{})
 	application.Register(pingModule{})
 
 	req, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
 	resp, err := application.Fiber().Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+func TestTenantMiddlewareRejectsUnknownHeader(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	application := app.New(cfg, app.Deps{TenantResolver: staticTenantResolver{}, Health: health.NewChecker(nil, nil)})
+	application.Register(pingModule{})
+
+	withHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
+	withHeader.Header.Set(tenant.Header, "missing")
+	resp, err := application.Fiber().Test(withHeader)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+
+	withoutHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
+	resp, err = application.Fiber().Test(withoutHeader)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+
+	// Infrastructure probes are outside the tenant scope.
+	healthReq, _ := http.NewRequest("GET", "/healthz", http.NoBody)
+	resp, err = application.Fiber().Test(healthReq)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+func TestTenantMiddlewareRequiresHeaderWhenConfigured(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default", RequireHeader: true},
+	}
+	application := app.New(cfg, app.Deps{TenantResolver: staticTenantResolver{}})
+	application.Register(pingModule{})
+
+	withoutHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
+	resp, err := application.Fiber().Test(withoutHeader)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+
+	withHeader, _ := http.NewRequest("GET", "/api/v1/ping", http.NoBody)
+	withHeader.Header.Set(tenant.Header, "default")
+	resp, err = application.Fiber().Test(withHeader)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
 }
