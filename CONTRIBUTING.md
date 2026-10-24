@@ -107,10 +107,12 @@ When releasing, move `[Unreleased]` entries under a version header:
   requests without `X-Tenant-Slug`; emails and Google IDs are unique per tenant.
 - The `users` last-admin trigger is per tenant. Application checks must use the
   same tenant scope as the trigger.
-- Tenant resolution, the JWT `tenant_id` claim, and the schema exist, but
-  existing SQL is not scoped yet. The isolation milestone adds `tenant_id`
-  predicates to queries and repositories; do not describe the current state as
-  tenant-isolated.
+- Tenant resolution, the JWT `tenant_id` claim, and the schema exist. Files are
+  tenant-scoped: every file query filters `tenant_id`, repositories derive it
+  from `tenant.EffectiveID(ctx)`, admin file lists/stats are tenant-scoped, and
+  uploads use `<tenantID>/<userID>/<uuid>.<ext>` blob keys. Identity query
+  isolation and RLS are still future work, so do not describe the whole
+  application as fully isolated.
 
 ### Upgrading an existing database
 
@@ -130,7 +132,10 @@ The multi-tenant foundation also changes `000001` (tenants table, `tenant_id`
 columns, per-tenant indexes and last-admin trigger). Existing databases need a
 new numbered migration or reviewed manual DDL; see the README's "Upgrading an
 existing database" section. Do not assume the baseline created the tenant
-objects on an already-deployed database.
+objects on an already-deployed database. Files isolation needs no new schema:
+existing `files` rows default to tenant 1, their old `<user>/<uuid>` storage
+keys keep working, and only new uploads use the `<tenantID>/<userID>/<uuid>`
+layout. If you copy blobs, update `files.storage_path` atomically.
 
 ## Adding a New Module
 

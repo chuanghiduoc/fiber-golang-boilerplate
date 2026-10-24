@@ -10,6 +10,7 @@ import (
 
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
@@ -32,15 +33,23 @@ type mockFileRepo struct {
 	nextID int64
 }
 
+// scoped mirrors the repository's tenant predicate so service tests cannot
+// accidentally read another tenant's rows.
+func (m *mockFileRepo) scoped(ctx context.Context, f *filesqlc.File) bool {
+	return f.TenantID == tenant.EffectiveID(ctx)
+}
+
 var _ filesrepo.FileRepository = (*mockFileRepo)(nil)
 
 func newMockFileRepo() *mockFileRepo {
 	return &mockFileRepo{files: make(map[int64]*filesqlc.File), nextID: 1}
 }
 
-func (m *mockFileRepo) Create(_ context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error) {
+func (m *mockFileRepo) Create(ctx context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error) {
+	params.TenantID = tenant.EffectiveID(ctx)
 	f := &filesqlc.File{
 		ID:           m.nextID,
+		TenantID:     params.TenantID,
 		UserID:       params.UserID,
 		OriginalName: params.OriginalName,
 		StoragePath:  params.StoragePath,
@@ -53,26 +62,26 @@ func (m *mockFileRepo) Create(_ context.Context, params filesqlc.CreateFileParam
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByID(_ context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) GetByID(ctx context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
-	if !ok {
+	if !ok || f.DeletedAt.Valid || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
-	if !ok {
+	if !ok || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
 	return f, nil
 }
 
-func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offset int32) ([]filesqlc.File, error) {
+func (m *mockFileRepo) ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]filesqlc.File, error) {
 	var result []filesqlc.File
 	for _, f := range m.files {
-		if f.UserID == userID {
+		if f.UserID == userID && !f.DeletedAt.Valid && m.scoped(ctx, f) {
 			result = append(result, *f)
 		}
 	}
@@ -87,17 +96,20 @@ func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offs
 	return result[start:end], nil
 }
 
-func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesqlc.File, error) {
-	return m.listCursor(&userID, cur, includeDeleted), nil
+func (m *mockFileRepo) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesqlc.File, error) {
+	return m.listCursor(ctx, &userID, cur, includeDeleted), nil
 }
 
-func (m *mockFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
-	return m.listCursor(nil, cur, true), nil
+func (m *mockFileRepo) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
+	return m.listCursor(ctx, nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includeDeleted bool) []filesqlc.File {
+func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagination.DBCursor, includeDeleted bool) []filesqlc.File {
 	all := make([]filesqlc.File, 0, len(m.files))
 	for _, f := range m.files {
+		if !m.scoped(ctx, f) {
+			continue
+		}
 		if userID != nil && f.UserID != *userID {
 			continue
 		}
@@ -122,38 +134,40 @@ func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includ
 	return out
 }
 
-func (m *mockFileRepo) CountByUserID(_ context.Context, userID int64) (int64, error) {
+func (m *mockFileRepo) CountByUserID(ctx context.Context, userID int64) (int64, error) {
 	var count int64
 	for _, f := range m.files {
-		if f.UserID == userID {
+		if f.UserID == userID && !f.DeletedAt.Valid && m.scoped(ctx, f) {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func (m *mockFileRepo) Delete(_ context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) Delete(ctx context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
-	if !ok {
+	if !ok || f.DeletedAt.Valid || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
 	f.DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return f, nil
 }
 
-func (m *mockFileRepo) Restore(_ context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) Restore(ctx context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
-	if !ok {
+	if !ok || !f.DeletedAt.Valid || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
 	f.DeletedAt = pgtype.Timestamptz{}
 	return f, nil
 }
 
-func (m *mockFileRepo) AdminList(_ context.Context, limit, offset int32) ([]filesqlc.File, error) {
+func (m *mockFileRepo) AdminList(ctx context.Context, limit, offset int32) ([]filesqlc.File, error) {
 	all := make([]filesqlc.File, 0, len(m.files))
 	for _, f := range m.files {
-		all = append(all, *f)
+		if m.scoped(ctx, f) {
+			all = append(all, *f)
+		}
 	}
 	start := int(offset)
 	if start > len(all) {
@@ -166,14 +180,20 @@ func (m *mockFileRepo) AdminList(_ context.Context, limit, offset int32) ([]file
 	return all[start:end], nil
 }
 
-func (m *mockFileRepo) AdminCount(_ context.Context) (int64, error) {
-	return int64(len(m.files)), nil
+func (m *mockFileRepo) AdminCount(ctx context.Context) (int64, error) {
+	var count int64
+	for _, f := range m.files {
+		if m.scoped(ctx, f) {
+			count++
+		}
+	}
+	return count, nil
 }
 
-func (m *mockFileRepo) AdminFileStats(_ context.Context) (filesqlc.AdminFileStatsRow, error) {
+func (m *mockFileRepo) AdminFileStats(ctx context.Context) (filesqlc.AdminFileStatsRow, error) {
 	var stats filesqlc.AdminFileStatsRow
 	for _, f := range m.files {
-		if f.DeletedAt.Valid {
+		if f.DeletedAt.Valid || !m.scoped(ctx, f) {
 			continue
 		}
 		stats.TotalFiles++

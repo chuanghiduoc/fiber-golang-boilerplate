@@ -86,7 +86,7 @@ assume the schema exists, so replicas never race on migrations. Fresh installs
 run the single `000001_init_schema.up.sql`; add new numbered migrations only
 after a database is deployed.
 
-## Multi-tenancy foundation
+## Multi-tenancy
 
 The schema and request pipeline are tenant-aware. One user belongs to exactly
 one tenant.
@@ -102,10 +102,14 @@ one tenant.
   request fails with `403 permission.denied` (`tenant mismatch`).
 - Emails and Google IDs are unique per tenant. The last-admin database trigger
   protects each tenant independently.
-- **Current limitation:** existing SQL is not tenant-scoped yet. This branch is
-  the foundation (schema, resolution, JWT claim, config); query scoping,
-  tenant-aware registration/login, and per-tenant limits are the next
-  milestone. Do not treat it as data isolation.
+- Files are tenant-isolated. Every upload/list/read/download/delete/restore and
+  admin list/download/delete/restore/stats query filters by the request tenant,
+  and another tenant's file id behaves as `404`. Uploaded blobs use the key
+  `<tenantID>/<userID>/<uuid>.<ext>`, so equal user ids or filenames in different
+  tenants cannot collide in storage.
+- **Current limitation:** identity query isolation, row-level security, and
+  per-tenant limits are still future work. Do not treat the whole application
+  as a finished isolation boundary.
 - Google OAuth start/callback does not propagate `X-Tenant-Slug` yet. Google
   users follow the existing lookup/creation path and their JWT uses the stored
   user tenant (currently the default tenant).
@@ -219,6 +223,15 @@ reviewed DDL manually) that:
 Keep the default tenant id 1 unless you also change the column defaults and
 backfill every row. Fresh installs get all of this from `000001`.
 
+Files isolation needs no further schema change: `files.tenant_id` and the
+tenant-leading indexes already exist. New uploads use the blob key
+`<tenantID>/<userID>/<uuid>.<ext>`, while existing rows keep their old
+`<userID>/<uuid>.<ext>` value because downloads read `files.storage_path`
+verbatim. Existing files were backfilled to tenant 1 and remain accessible only
+through that tenant. If you copy blobs to the new layout, update
+`files.storage_path` in the same operation; do not move blobs without updating
+metadata.
+
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
 with the golang-migrate CLI's `force 1`) instead of running the file over
@@ -257,14 +270,18 @@ tenant that differs from the JWT `tenant_id` claim.
 | DELETE | `/api/v1/users/:id` | Delete user (admin or self) |
 
 ### Files (protected — JWT required)
+All file routes are scoped to the request tenant; a file id from another tenant
+returns `404`, including for admins. Blobs are stored under
+`<tenantID>/<userID>/<uuid>.<ext>`.
+
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/api/v1/files/upload` | Upload file |
-| GET | `/api/v1/files/` | List own files (paginated; `includeDeleted=true` shows trash) |
-| GET | `/api/v1/files/:id` | Get file info |
-| GET | `/api/v1/files/:id/download` | Download file (authenticated; storage is not publicly served) |
-| DELETE | `/api/v1/files/:id` | Delete file (soft) |
-| POST | `/api/v1/files/:id/restore` | Restore own soft-deleted file |
+| GET | `/api/v1/files/` | List own files in the current tenant (paginated; `includeDeleted=true` shows trash) |
+| GET | `/api/v1/files/:id` | Get tenant-owned file info |
+| GET | `/api/v1/files/:id/download` | Download tenant-owned file (authenticated; storage is not publicly served) |
+| DELETE | `/api/v1/files/:id` | Delete tenant-owned file (soft) |
+| POST | `/api/v1/files/:id/restore` | Restore own soft-deleted file in the current tenant |
 
 ### Admin (protected — admin role required)
 | Method | Path | Description |
@@ -521,8 +538,9 @@ monolith, durable jobs, audit trail, permission-based authorization, single
 migration entrypoint, and tenant foundation (schema, resolution, JWT claim,
 config) exist. Remaining work:
 
-- Tenant isolation: tenant-scoped SQL and query enforcement/row-level security,
-  tenant-aware registration/login/OAuth, and per-tenant limits.
+- Tenant isolation: files SQL and repositories are tenant-scoped, including
+  admin lists/stats and tenant-prefixed storage keys. Identity isolation,
+  row-level security, and per-tenant limits remain future work.
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
@@ -547,7 +565,8 @@ no legacy handler/service/DTO/repository packages remain.
   within a tenant; email changes require the current password, reset
   verification, revoke sessions, and send a fresh verification link.
 - Uploaded files are never served from a public directory; downloads require
-  authentication and ownership (or admin role).
+  authentication and ownership (or admin role). File metadata and blob keys are
+  tenant-scoped, and another tenant's id returns 404.
 - Banned emails cannot be reused through registration or Google login;
   self-deleted accounts can still be re-registered.
 - `POST /auth/logout` revokes one refresh token; use `/auth/logout-all` to bump

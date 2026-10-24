@@ -111,8 +111,13 @@ Rules:
   `X-Tenant-Slug` resolves to a different tenant, the request fails with
   `403 permission.denied` and detail `tenant mismatch`.
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
-- **Not yet isolated:** existing queries are not scoped by tenant. Treat this
-  as a foundation, not an isolation boundary.
+- Files are tenant-isolated: upload/list/read/download/delete/restore and all
+  admin file list/download/delete/restore/stats calls use the request tenant.
+  A file id owned by another tenant returns `404`, including for admins.
+  `FileResponse` includes an additive `tenantId`, and new blobs use the storage
+  key `<tenantID>/<userID>/<uuid>.<ext>`.
+- **Not yet isolated:** identity queries and RLS are separate milestones. Treat
+  file scoping as the implemented boundary, not whole-application isolation.
 
 ## Headers
 
@@ -142,8 +147,10 @@ Rules:
 
 ## Files
 
-- `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist.
-- Downloads are authenticated and ownership-checked; no public `/uploads` tree.
+- `POST /files/upload` accepts multipart `file`, enforces size/MIME allowlist,
+  and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+- Downloads are authenticated and tenant/ownership-checked; there is no public
+  `/uploads` tree. A cross-tenant id returns `404`, never `403`.
 - Deletes are soft; `includeDeleted=true` exposes trash to the owner.
 - `Content-Disposition` follows RFC 6266/5987.
 

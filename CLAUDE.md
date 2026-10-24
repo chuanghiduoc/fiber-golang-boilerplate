@@ -81,13 +81,16 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   `tenant_id`.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
   tenant; the `users` last-admin trigger is scoped per tenant.
-- The multi-tenant foundation is schema + request resolution + JWT claim only.
-  Existing SQL is not tenant-scoped yet; add `tenant_id` predicates to query
-  files and repository methods in the isolation milestone. Do not claim
-  isolation before that lands.
+- The multi-tenant foundation is schema + request resolution + JWT claim
+  plumbing. Files are tenant-scoped: every file query filters `tenant_id`,
+  repositories derive it from `tenant.EffectiveID(ctx)`, admin list/stats are
+  scoped to the caller's tenant, and new blobs use
+  `<tenantID>/<userID>/<uuid>.<ext>`. Identity query isolation, RLS, and
+  per-tenant limits are still future work; do not claim whole-application
+  isolation.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant query isolation/RLS, tenant-aware registration/login/OAuth, distributed
+Identity query isolation/RLS, tenant-aware registration/login/OAuth, distributed
 tracing, and environment promotion/rollout automation remain future work.
 `identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
@@ -132,6 +135,12 @@ Offset helpers are for small admin/export tables only.
   (empty -> `TENANT_DEFAULT_SLUG`), and `JWTAuth` rejects an explicit header
   that conflicts with the claim. Refresh tokens are atomic single-use and
   version-bound. `pkg/token` pins HS256 and requires `exp`.
+- **Files/tenant isolation:** repository methods always add
+  `tenant.EffectiveID(ctx)` to the SQL parameters; service methods also compare
+  the returned row's `TenantID`/`UserID` before exposing it. Uploads reject an
+  invalid tenant and store blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+  Cross-tenant ids must behave as not found (`404`), never forbidden, so file
+  existence is not disclosed.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their

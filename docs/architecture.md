@@ -57,9 +57,16 @@ they never depend on the `tenants` table.
   job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
-- **The foundation does not scope existing queries.** Repositories still read
-  across tenants; the isolation milestone adds `WHERE tenant_id = ...` (or RLS)
-  and tenant-aware registration/login. Do not treat this as data isolation.
+- Files are tenant-isolated: every metadata read/write, list, admin list/stats,
+  download, delete, and restore query is scoped by `tenant_id`. Repositories
+  derive the tenant from `tenant.EffectiveID(ctx)`; services also verify the
+  returned row's tenant before exposing it. Cross-tenant ids behave as not
+  found. New blobs use `<tenantID>/<userID>/<uuid>.<ext>`, so tenant key spaces
+  cannot collide; existing rows keep their stored `<userID>/<uuid>` path.
+- **The foundation does not scope every query yet.** Files isolation is
+  implemented, but identity SQL, RLS, and tenant-aware registration/login are
+  separate milestones. Do not treat the whole application as an isolation
+  boundary.
 - Google OAuth start/callback does not carry the tenant header yet; Google
   users use the existing lookup path and the stored user tenant.
 
@@ -103,6 +110,10 @@ they never depend on the `tenants` table.
   `tenants`; tenant-leading indexes back scoped queries. The baseline seeds the
   `default` tenant as row 1, so existing rows and header-less requests remain on
   the compatibility tenant.
+- File blobs are external to PostgreSQL but follow the row's tenant: new keys
+  are `<tenantID>/<userID>/<uuid>.<ext>`, while `files.storage_path` is the
+  authoritative key for downloads. Moving a blob without updating that column
+  (or vice versa) breaks the file.
 - `cmd/migrate` verifies required tenant tables/columns/indexes and that the
   default tenant exists with id 1.
 

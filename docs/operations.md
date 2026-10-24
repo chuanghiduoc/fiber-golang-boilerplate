@@ -412,7 +412,14 @@ verifies the tenant table/columns/indexes and the default tenant row.
 `TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
 requests resolve to; `TENANT_REQUIRE_HEADER=true` rejects requests that omit
 `X-Tenant-Slug`. Roll out the latter only after all clients send the header.
-This foundation does not scope existing queries yet; see the README scope note.
+Files queries and admin file lists/stats are tenant-scoped. Files isolation
+needs no schema change: existing rows default to tenant 1, and their old
+`<userID>/<uuid>.<ext>` storage keys remain valid because downloads read
+`files.storage_path`. New uploads use
+`<tenantID>/<userID>/<uuid>.<ext>`; if you migrate existing blobs to that
+layout, copy first and update `files.storage_path` in the same operation.
+Identity query isolation and RLS are separate milestones; see the README scope
+note.
 
 `cmd/migrate` checks for a dirty migration state before running, and after
 migrating verifies required tables, columns, and unique indexes. A legacy
@@ -486,7 +493,9 @@ Other caveats:
   credentials prevents startup. After startup, object reads/writes/deletes fail
   on use and are not covered by `/readyz`. Local storage needs a shared
   ReadWriteMany volume; `emptyDir` is node-local and unsuitable for multiple
-  replicas.
+  replicas. Blob keys start with `<tenantID>/<userID>/`; preserve that prefix in
+  backup/restore tooling and never serve the backing directory or bucket
+  publicly.
 - **Redis:** `CACHE_DRIVER=redis` and `REDIS_URL` (use `rediss://` when
   available) are required for shared rate limits, session invalidation, and
   idempotency across replicas. Memory cache is single-replica only.

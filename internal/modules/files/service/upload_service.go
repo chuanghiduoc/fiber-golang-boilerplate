@@ -15,6 +15,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -50,17 +51,27 @@ func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) Uplo
 }
 
 func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*dto.FileResponse, error) {
+	tenantID := tenant.EffectiveID(ctx)
+	if tenantID <= 0 {
+		return nil, apperror.NewInternal("tenant context is required")
+	}
+
 	originalName := cleanOriginalName(filename)
 	// Never derive the stored extension from the client-supplied filename: a
 	// content-type allowlist must not leave an .html/.svg path that a browser
 	// could later render as executable markup.
-	storagePath := fmt.Sprintf("%d/%s%s", userID, uuid.New().String(), extensionForMIME(contentType))
+	//
+	// The tenant prefix keeps identically named blobs from different tenants
+	// in separate key spaces and makes the owning tenant visible during
+	// storage/backup operations.
+	storagePath := fmt.Sprintf("%d/%d/%s%s", tenantID, userID, uuid.New().String(), extensionForMIME(contentType))
 
 	if err := s.storage.Put(ctx, storagePath, reader, size, contentType); err != nil {
 		return nil, apperror.NewInternal("failed to store file")
 	}
 
 	file, err := s.repo.Create(ctx, filesqlc.CreateFileParams{
+		TenantID:     tenantID,
 		UserID:       userID,
 		OriginalName: originalName,
 		StoragePath:  storagePath,
@@ -122,7 +133,7 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 		return nil, apperror.NewInternal("failed to get file")
 	}
 
-	if file.UserID != userID {
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		// Do not reveal that another tenant's file ID exists.
 		return nil, apperror.NewNotFound("file not found")
 	}
@@ -139,7 +150,7 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 		return nil, nil, apperror.NewInternal("failed to get file")
 	}
 
-	if file.UserID != userID {
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
 
@@ -188,7 +199,7 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		return apperror.NewInternal("failed to get file")
 	}
 
-	if file.UserID != userID {
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return apperror.NewNotFound("file not found")
 	}
 
@@ -216,7 +227,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 		}
 		return nil, apperror.NewInternal("failed to get file")
 	}
-	if file.UserID != userID {
+	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, apperror.NewNotFound("file not found")
 	}
 	if !file.DeletedAt.Valid {
@@ -236,6 +247,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 func (s *uploadService) toFileResponse(file *filesqlc.File) *dto.FileResponse {
 	resp := &dto.FileResponse{
 		ID:           file.ID,
+		TenantID:     file.TenantID,
 		UserID:       file.UserID,
 		OriginalName: file.OriginalName,
 		MimeType:     file.MimeType,
