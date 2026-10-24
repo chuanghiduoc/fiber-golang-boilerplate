@@ -164,6 +164,10 @@ func main() {
 		userRepo, emailVerifRepo, queuedEmail, appCache, cfg.App.FrontendURL, txManager,
 	)
 
+	// Registration commits the user, verification token, and email job in one
+	// transaction. Resend and email-change paths keep using their own flow.
+	userSvc.SetVerificationProvisioner(emailVerifSvc)
+
 	authHandler := handler.NewAuthHandler(
 		userSvc, refreshSvc, passwordResetSvc, emailVerifSvc,
 		cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.App.RequireEmailVerification, googleOAuth,

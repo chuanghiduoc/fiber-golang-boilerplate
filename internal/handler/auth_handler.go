@@ -78,8 +78,10 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		return err
 	}
 
-	// Fire-and-forget email verification
-	if h.emailVerifSvc != nil {
+	// When the user service provisions the verification email in the
+	// registration transaction, sending here would duplicate it. Fall back to
+	// the post-commit send only when registration was not transactional.
+	if h.emailVerifSvc != nil && !h.userSvc.RegistrationEmailsTransactional() {
 		async.Go(func() {
 			_ = h.emailVerifSvc.SendVerification(context.Background(), user.ID, user.Email)
 		})

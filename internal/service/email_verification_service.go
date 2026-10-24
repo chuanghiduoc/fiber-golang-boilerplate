@@ -28,8 +28,20 @@ type transactionalEmailSender interface {
 	SendTx(ctx context.Context, tx pgx.Tx, msg email.Message) error
 }
 
+// VerificationProvisioner creates a verification token and enqueues its email
+// on a caller-owned transaction. UserService uses it during registration so
+// the user, token, and email job commit together.
+type VerificationProvisioner interface {
+	SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error
+	// SupportsTransactionalEnqueue reports whether SendVerificationTx can
+	// enqueue the email on the caller's transaction.
+	SupportsTransactionalEnqueue() bool
+}
+
 type EmailVerificationService interface {
 	SendVerification(ctx context.Context, userID int64, userEmail string) error
+	SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error
+	SupportsTransactionalEnqueue() bool
 	Verify(ctx context.Context, token string) error
 	ResendVerification(ctx context.Context, emailAddr string) error
 	// Invalidate removes pending verification tokens, e.g. after an email
@@ -64,71 +76,38 @@ func NewEmailVerificationService(
 	}
 }
 
+// SupportsTransactionalEnqueue reports whether this service can write the
+// token and enqueue its email on a caller-owned transaction.
+func (s *emailVerificationService) SupportsTransactionalEnqueue() bool {
+	if s.txManager == nil {
+		return false
+	}
+	_, transactional := s.sender.(transactionalEmailSender)
+	return transactional
+}
+
 func (s *emailVerificationService) SendVerification(ctx context.Context, userID int64, userEmail string) error {
 	userEmail = normalizeEmail(userEmail)
-
-	// Generate token
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Errorf("generate verification token: %w", err)
-	}
-	token := hex.EncodeToString(b)
-
-	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", s.frontURL, token)
-	msg := email.Message{
-		To:      []string{userEmail},
-		Subject: "Verify Your Email Address",
-		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to verify your email address. This link expires in 24 hours.</p>", verifyURL),
+	msg, tokenHash, err := s.buildVerificationMessage(userEmail)
+	if err != nil {
+		return err
 	}
 	txSender, transactional := s.sender.(transactionalEmailSender)
 
-	queuedInTx := false
-	createToken := func(verifRepo repository.EmailVerificationRepository, tx pgx.Tx) error {
-		// Delete old tokens first so a user has at most one live link.
-		if err := verifRepo.DeleteByUserID(ctx, userID); err != nil {
-			return fmt.Errorf("delete old verification tokens: %w", err)
-		}
-
-		// Create with 24 hour expiry. Store only the hash; the plaintext token
-		// is delivered to the user via email so a DB leak cannot be replayed.
-		_, err := verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
-			UserID:    userID,
-			Email:     userEmail,
-			Token:     hashToken(token),
-			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
-		})
-		if err != nil {
-			return fmt.Errorf("create verification token: %w", err)
-		}
-
-		if tx != nil && transactional {
-			// Enqueue on the same transaction: a crash between the token insert
-			// and the enqueue cannot leave a usable verification link without
-			// an email.
-			if err := txSender.SendTx(ctx, tx, msg); err != nil {
-				slog.Error("failed to enqueue verification email",
-					slog.Int64("user_id", userID),
-					slog.String("email", userEmail),
-					slog.Any("error", err),
-				)
-				return fmt.Errorf("send verification email: %w", err)
-			}
-			queuedInTx = true
-		}
-		return nil
-	}
-
 	if s.txManager != nil {
 		if err := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return createToken(repository.NewEmailVerificationRepository(tx), tx)
+			return s.persistVerification(
+				ctx, repository.NewEmailVerificationRepository(tx), tx, txSender, userID, userEmail, tokenHash, msg,
+			)
 		}); err != nil {
 			return err
 		}
-	} else if err := createToken(s.verifRepo, nil); err != nil {
+	} else if err := s.persistVerification(ctx, s.verifRepo, nil, nil, userID, userEmail, tokenHash, msg); err != nil {
 		return err
 	}
 
-	if queuedInTx {
+	if s.txManager != nil && transactional {
+		// persistVerification enqueued the message on the token transaction.
 		return nil
 	}
 
@@ -144,6 +123,96 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 		return fmt.Errorf("send verification email: %w", err)
 	}
 
+	return nil
+}
+
+// SendVerificationTx creates the verification token and enqueues its email on
+// tx, so the caller can commit both with the state change that triggered them.
+// It fails closed: a nil transaction or a non-transactional sender is an error
+// rather than a silent post-commit send.
+func (s *emailVerificationService) SendVerificationTx(ctx context.Context, tx pgx.Tx, userID int64, userEmail string) error {
+	// Check sender capability first: a non-transactional sender can never honor
+	// this method, regardless of whether the transaction is present.
+	txSender, transactional := s.sender.(transactionalEmailSender)
+	if !transactional {
+		return errors.New("send verification: sender does not support transactional enqueue")
+	}
+	if tx == nil {
+		return errors.New("send verification: transaction is required")
+	}
+
+	userEmail = normalizeEmail(userEmail)
+	msg, tokenHash, err := s.buildVerificationMessage(userEmail)
+	if err != nil {
+		return err
+	}
+
+	return s.persistVerification(
+		ctx, repository.NewEmailVerificationRepository(tx), tx, txSender, userID, userEmail, tokenHash, msg,
+	)
+}
+
+// buildVerificationMessage generates a fresh verification token and the email
+// that delivers it. Only the returned hash is ever persisted.
+func (s *emailVerificationService) buildVerificationMessage(userEmail string) (email.Message, string, error) {
+	// Generate token
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return email.Message{}, "", fmt.Errorf("generate verification token: %w", err)
+	}
+	token := hex.EncodeToString(b)
+
+	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", s.frontURL, token)
+	msg := email.Message{
+		To:      []string{userEmail},
+		Subject: "Verify Your Email Address",
+		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to verify your email address. This link expires in 24 hours.</p>", verifyURL),
+	}
+	return msg, hashToken(token), nil
+}
+
+// persistVerification replaces any pending token and, when tx is present,
+// enqueues the verification email on the same transaction.
+func (s *emailVerificationService) persistVerification(
+	ctx context.Context,
+	verifRepo repository.EmailVerificationRepository,
+	tx pgx.Tx,
+	txSender transactionalEmailSender,
+	userID int64,
+	userEmail string,
+	tokenHash string,
+	msg email.Message,
+) error {
+	// Delete old tokens first so a user has at most one live link.
+	if err := verifRepo.DeleteByUserID(ctx, userID); err != nil {
+		return fmt.Errorf("delete old verification tokens: %w", err)
+	}
+
+	// Create with 24 hour expiry. Store only the hash; the plaintext token
+	// is delivered to the user via email so a DB leak cannot be replayed.
+	_, err := verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+		UserID:    userID,
+		Email:     userEmail,
+		Token:     tokenHash,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("create verification token: %w", err)
+	}
+
+	if tx != nil && txSender != nil {
+		// Enqueue on the same transaction: a crash between the token insert
+		// and the enqueue cannot leave a usable verification link without
+		// an email.
+		if err := txSender.SendTx(ctx, tx, msg); err != nil {
+			slog.Error("failed to enqueue verification email",
+				slog.Int64("user_id", userID),
+				slog.String("email", userEmail),
+				slog.Any("error", err),
+			)
+			return fmt.Errorf("send verification email: %w", err)
+		}
+	}
 	return nil
 }
 
