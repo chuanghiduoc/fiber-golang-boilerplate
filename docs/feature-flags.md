@@ -36,7 +36,7 @@ Each flag is enforced by its owning module with the request subject
 
 | Key | Enforced at | Subject | When off |
 | --- | --- | --- | --- |
-| `user_registration` | `POST /auth/register` (handler) | request tenant | `404 feature.disabled` |
+| `user_registration` | `POST /auth/register` (handler) and new-account creation in `GET /auth/google/callback` | request tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
 | `google_oauth` | `GET /auth/google` and `GET /auth/google/callback` (handler) | redirect: resolved tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
 | `file_uploads` | `POST /files/upload` (route middleware after auth, before idempotency/audit) | request tenant + JWT user | `404 feature.disabled` |
 | `email_verification` | `POST /auth/login`, `POST /auth/refresh` | user's tenant + user | when **on**, unverified users get `403 auth.email_not_verified` |
@@ -50,9 +50,10 @@ Each flag is enforced by its owning module with the request subject
   Google credentials (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`) remain the
   real switch. Disable it globally or per tenant to return
   `404 feature.disabled`.
-- Google sign-up of a *new* user is not yet gated by `user_registration`: the
-  find-or-create decision lives in the identity service. Use `google_oauth`
-  to disable Google sign-in entirely for a tenant.
+- `user_registration` gates only *new* Google accounts: the callback passes
+  the flag to the identity service, which still signs in an existing Google
+  user and links a verified local account, but refuses to create one. Use
+  `google_oauth` to disable Google sign-in entirely for a tenant.
 
 `feature.disabled` is a `404`: a disabled feature behaves like an absent
 route (consistent with "Google OAuth not configured"), and the stable code

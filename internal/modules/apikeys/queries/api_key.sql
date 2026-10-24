@@ -48,6 +48,6 @@ WHERE id = $1;
 -- name: ListAPIKeysCursor :many
 SELECT * FROM api_keys
 WHERE tenant_id = @tenant_id::bigint
-  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;

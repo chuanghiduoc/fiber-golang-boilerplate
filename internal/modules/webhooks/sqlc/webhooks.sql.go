@@ -704,16 +704,15 @@ SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, 
 WHERE tenant_id = $1
   AND ($2::bigint = 0 OR endpoint_id = $2)
   AND ($3::text = '' OR status = $3)
-  AND (NOT $4::boolean OR (created_at, id) < ($5::timestamptz, $6::bigint))
+  AND (created_at, id) < ($4::timestamptz, $5::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $7::int
+LIMIT $6::int
 `
 
 type ListWebhookDeliveriesParams struct {
 	TenantID        int64              `json:"tenant_id"`
 	EndpointID      int64              `json:"endpoint_id"`
 	Status          string             `json:"status"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -724,7 +723,6 @@ func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeli
 		arg.TenantID,
 		arg.EndpointID,
 		arg.Status,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,
@@ -812,14 +810,13 @@ const listWebhookEndpoints = `-- name: ListWebhookEndpoints :many
 SELECT id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at FROM webhook_endpoints
 WHERE tenant_id = $1
   AND deleted_at IS NULL
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type ListWebhookEndpointsParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -828,7 +825,6 @@ type ListWebhookEndpointsParams struct {
 func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpointsParams) ([]WebhookEndpoint, error) {
 	rows, err := q.db.Query(ctx, listWebhookEndpoints,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,
@@ -866,15 +862,14 @@ func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpo
 const listWebhookInboundEvents = `-- name: ListWebhookInboundEvents :many
 SELECT id, tenant_id, source_id, external_event_id, event_type, signature, payload, received_at FROM webhook_inbound_events
 WHERE tenant_id = $1 AND source_id = $2
-  AND (NOT $3::boolean OR (received_at, id) < ($4::timestamptz, $5::bigint))
+  AND (received_at, id) < ($3::timestamptz, $4::bigint)
 ORDER BY received_at DESC, id DESC
-LIMIT $6::int
+LIMIT $5::int
 `
 
 type ListWebhookInboundEventsParams struct {
 	TenantID         int64              `json:"tenant_id"`
 	SourceID         int64              `json:"source_id"`
-	HasCursor        bool               `json:"has_cursor"`
 	CursorReceivedAt pgtype.Timestamptz `json:"cursor_received_at"`
 	CursorID         int64              `json:"cursor_id"`
 	RowLimit         int32              `json:"row_limit"`
@@ -884,7 +879,6 @@ func (q *Queries) ListWebhookInboundEvents(ctx context.Context, arg ListWebhookI
 	rows, err := q.db.Query(ctx, listWebhookInboundEvents,
 		arg.TenantID,
 		arg.SourceID,
-		arg.HasCursor,
 		arg.CursorReceivedAt,
 		arg.CursorID,
 		arg.RowLimit,
@@ -920,14 +914,13 @@ const listWebhookInboundSources = `-- name: ListWebhookInboundSources :many
 SELECT id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE tenant_id = $1
   AND deleted_at IS NULL
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type ListWebhookInboundSourcesParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -936,7 +929,6 @@ type ListWebhookInboundSourcesParams struct {
 func (q *Queries) ListWebhookInboundSources(ctx context.Context, arg ListWebhookInboundSourcesParams) ([]WebhookInboundSource, error) {
 	rows, err := q.db.Query(ctx, listWebhookInboundSources,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

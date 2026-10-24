@@ -6,6 +6,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- Cursor pagination no longer degrades on deep pages: every cursor query uses a plain `(created_at, id) < (...)` row comparison (first page binds `('infinity', MaxInt64)` via `DBCursor.CreatedAtParam`/`IDParam`) instead of `NOT has_cursor OR ...`, so the bound is an index condition under generic plans.
+- Google OAuth honors `user_registration` for new accounts: existing and linkable accounts still sign in, but creating an account returns `404 feature.disabled` when registration is off for the tenant.
+
 ### Changed
 - Module self-registration for 100+ modules: `app.PermissionProvider`, `app.ErrorProvider`, `app.LocaleProvider`, and `app.FlagProvider` with `authz.Register`, `apperror.Register`, `features.Register`, and `i18n.New(locale, sources...)` (fail on duplicate/conflicting keys, invalid identifiers, unknown roles, and en/vi parity). Module permissions, error codes, flags, and strings moved to `internal/modules/<m>/catalog/` with unchanged string values; only cross-module/platform entries stay central. `internal/bootstrap` holds the single ordered module list built from `app.Infra` via each module's `Build`; `cmd/api` registers catalogs before validating `FEATURE_FLAGS` (now syntax-only in `config.Load`), building i18n, and serving. Webhook delivery/dispatch jobs register through `app.JobProvider`.
 - Contracts split per provider: `internal/contracts/{identity,files,notifications,webhooks}`.

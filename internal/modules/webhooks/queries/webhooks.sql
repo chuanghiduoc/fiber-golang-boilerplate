@@ -17,7 +17,7 @@ WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL;
 SELECT * FROM webhook_endpoints
 WHERE tenant_id = @tenant_id
   AND deleted_at IS NULL
-  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -119,7 +119,7 @@ SELECT * FROM webhook_deliveries
 WHERE tenant_id = @tenant_id
   AND (@endpoint_id::bigint = 0 OR endpoint_id = @endpoint_id)
   AND (@status::text = '' OR status = @status)
-  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -258,7 +258,7 @@ WHERE id = @id AND deleted_at IS NULL;
 SELECT * FROM webhook_inbound_sources
 WHERE tenant_id = @tenant_id
   AND deleted_at IS NULL
-  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -299,7 +299,7 @@ WHERE tenant_id = @tenant_id
 -- name: ListWebhookInboundEvents :many
 SELECT * FROM webhook_inbound_events
 WHERE tenant_id = @tenant_id AND source_id = @source_id
-  AND (NOT @has_cursor::boolean OR (received_at, id) < (@cursor_received_at::timestamptz, @cursor_id::bigint))
+  AND (received_at, id) < (@cursor_received_at::timestamptz, @cursor_id::bigint)
 ORDER BY received_at DESC, id DESC
 LIMIT @row_limit::int;
 

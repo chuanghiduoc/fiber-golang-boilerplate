@@ -96,9 +96,8 @@ func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur
 		TenantID:        tenantID(ctx),
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }
@@ -143,9 +142,8 @@ func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
 	return r.q.AdminListFilesCursor(ctx, filesqlc.AdminListFilesCursorParams{
 		TenantID:        tenantID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }

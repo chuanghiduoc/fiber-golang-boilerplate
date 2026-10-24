@@ -114,9 +114,8 @@ func (r *apiKeyRepository) GetByHash(ctx context.Context, hash string) (*APIKey,
 func (r *apiKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error) {
 	rows, err := r.q.ListAPIKeysCursor(ctx, apikeyssqlc.ListAPIKeysCursorParams{
 		TenantID:        tenant.EffectiveID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 	if err != nil {

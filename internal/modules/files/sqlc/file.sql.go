@@ -90,14 +90,13 @@ func (q *Queries) AdminListFiles(ctx context.Context, arg AdminListFilesParams) 
 const adminListFilesCursor = `-- name: AdminListFilesCursor :many
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at FROM files
 WHERE tenant_id = $1::bigint
-  AND (NOT $2::boolean OR (created_at, id) < ($3::timestamptz, $4::bigint))
+  AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $5::int
+LIMIT $4::int
 `
 
 type AdminListFilesCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -106,7 +105,6 @@ type AdminListFilesCursorParams struct {
 func (q *Queries) AdminListFilesCursor(ctx context.Context, arg AdminListFilesCursorParams) ([]File, error) {
 	rows, err := q.db.Query(ctx, adminListFilesCursor,
 		arg.TenantID,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,
@@ -287,16 +285,15 @@ SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, cre
 WHERE tenant_id = $1::bigint
   AND user_id = $2::bigint
   AND (deleted_at IS NULL OR $3::boolean)
-  AND (NOT $4::boolean OR (created_at, id) < ($5::timestamptz, $6::bigint))
+  AND (created_at, id) < ($4::timestamptz, $5::bigint)
 ORDER BY created_at DESC, id DESC
-LIMIT $7::int
+LIMIT $6::int
 `
 
 type ListFilesByUserCursorParams struct {
 	TenantID        int64              `json:"tenant_id"`
 	UserID          int64              `json:"user_id"`
 	IncludeDeleted  bool               `json:"include_deleted"`
-	HasCursor       bool               `json:"has_cursor"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
 	CursorID        int64              `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
@@ -307,7 +304,6 @@ func (q *Queries) ListFilesByUserCursor(ctx context.Context, arg ListFilesByUser
 		arg.TenantID,
 		arg.UserID,
 		arg.IncludeDeleted,
-		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
 		arg.RowLimit,

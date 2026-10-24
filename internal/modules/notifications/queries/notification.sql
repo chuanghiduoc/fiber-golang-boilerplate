@@ -14,7 +14,7 @@ SELECT * FROM notifications
 WHERE tenant_id = @tenant_id::bigint
   AND user_id = @user_id::bigint
   AND (NOT @unread_only::boolean OR read_at IS NULL)
-  AND (NOT @has_cursor::boolean OR (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint))
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 

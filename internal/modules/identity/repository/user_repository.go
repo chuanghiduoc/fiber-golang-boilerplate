@@ -121,9 +121,8 @@ func (r *userRepository) List(ctx context.Context, limit, offset int32) ([]ident
 func (r *userRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
 	return r.q.ListUsersCursor(ctx, identitysqlc.ListUsersCursorParams{
 		TenantID:        tenantID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }
@@ -253,9 +252,8 @@ func (r *userRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 func (r *userRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
 	return r.q.AdminListUsersCursor(ctx, identitysqlc.AdminListUsersCursorParams{
 		TenantID:        tenantID(ctx),
-		HasCursor:       cur.HasCursor,
 		CursorCreatedAt: cur.CreatedAtParam(),
-		CursorID:        cur.ID,
+		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	})
 }

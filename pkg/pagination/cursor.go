@@ -3,6 +3,7 @@ package pagination
 import (
 	"encoding/base64"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -28,10 +29,26 @@ type DBCursor struct {
 	Limit     int32
 }
 
-// CreatedAtParam returns the cursor timestamp as a nullable timestamptz so
-// the first page does not filter on a zero time.
+// Cursor queries always compare `(created_at, id) < (@cursor_created_at,
+// @cursor_id)` instead of `NOT @has_cursor OR ...`: under a generic plan the
+// OR form can only filter, so deep pages scanned every newer row, while the
+// plain row comparison is an index condition. The first page therefore binds
+// an upper bound above every row: ('infinity', MaxInt64).
+
+// CreatedAtParam returns the cursor timestamp, or +infinity on the first page.
 func (c DBCursor) CreatedAtParam() pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: c.CreatedAt, Valid: c.HasCursor}
+	if !c.HasCursor {
+		return pgtype.Timestamptz{InfinityModifier: pgtype.Infinity, Valid: true}
+	}
+	return pgtype.Timestamptz{Time: c.CreatedAt, Valid: true}
+}
+
+// IDParam returns the cursor id, or math.MaxInt64 on the first page.
+func (c DBCursor) IDParam() int64 {
+	if !c.HasCursor {
+		return math.MaxInt64
+	}
+	return c.ID
 }
 
 // NormalizeLimit clamps a requested page size into [1, MaxLimit], defaulting
