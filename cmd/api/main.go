@@ -343,6 +343,10 @@ func main() {
 	webhookHandler := webhookshandler.New(webhookSvc)
 	webhookDispatcher := webhookservice.NewDispatcher(webhookRepo)
 
+	// Domain events are emitted best-effort after the business mutation commits:
+	// file upload/delete and user registration feed tenant-configured webhooks.
+	filesvc.AttachWebhookDispatcher(uploadSvc, webhookDispatcher)
+	identityservice.AttachWebhookDispatcher(userSvc, webhookDispatcher)
 	// API keys: the verifier only needs a hash lookup plus the identity
 	// principal adapter; the admin service owns lifecycle and rotation.
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)

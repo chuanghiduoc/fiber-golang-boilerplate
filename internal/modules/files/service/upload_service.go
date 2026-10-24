@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
@@ -43,8 +45,9 @@ type UploadService interface {
 }
 
 type uploadService struct {
-	repo    filesrepo.FileRepository
-	storage storage.Storage
+	repo     filesrepo.FileRepository
+	storage  storage.Storage
+	webhooks webhookcontracts.Dispatcher
 }
 
 func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
@@ -97,7 +100,42 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		return nil, apperror.NewInternal("failed to save file metadata")
 	}
 
-	return s.toFileResponse(file), nil
+	response := s.toFileResponse(file)
+	s.dispatchWebhook(ctx, webhookcontracts.EventFileUploaded, tenantID, response)
+	return response, nil
+}
+
+// SetWebhookDispatcher wires outbound domain events.
+func (s *uploadService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
+	s.webhooks = dispatcher
+}
+
+// AttachWebhookDispatcher wires the production dispatcher without widening the
+// UploadService interface, so handler fakes remain small.
+func AttachWebhookDispatcher(svc UploadService, dispatcher webhookcontracts.Dispatcher) {
+	if s, ok := svc.(*uploadService); ok {
+		s.webhooks = dispatcher
+	}
+}
+
+// dispatchWebhook emits one best-effort domain event. Delivery failures are
+// logged; they must not turn a committed file mutation into an API error.
+func (s *uploadService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
+	if s.webhooks == nil {
+		return
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
+		return
+	}
+	if _, err := s.webhooks.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
+		Type:     eventType,
+		TenantID: tenantID,
+		Data:     payload,
+	}); err != nil {
+		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
+	}
 }
 
 func cleanOriginalName(name string) string {
@@ -231,6 +269,12 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		slog.Int64("file_id", id),
 		slog.String("path", file.StoragePath),
 	)
+	s.dispatchWebhook(ctx, webhookcontracts.EventFileDeleted, file.TenantID, map[string]any{
+		"id":           file.ID,
+		"tenantId":     file.TenantID,
+		"userId":       file.UserID,
+		"originalName": file.OriginalName,
+	})
 
 	return nil
 }

@@ -225,7 +225,11 @@ outside tenant resolution so they never depend on the `tenants` table.
 - Email payloads are encrypted at rest with AES-256-GCM; keys are derived from
   `JWT_SECRET` via HKDF. Rotate the secret only after draining the queue.
 - Outbound webhooks reuse the jobs outbox: a delivery row and its first
-  `webhook.delivery` job commit in one transaction. Each delivery snapshots the
+  `webhook.delivery` job commit in one transaction. Identity registration and
+  file upload/delete emit `user.registered`, `file.uploaded`, and
+  `file.deleted` through the contracts dispatcher after the mutation commits;
+  dispatch failures are logged and never fail the API call. Each delivery
+  snapshots the
   URL, payload, event timestamp, max attempts, and sealed secret so later
   endpoint edits/rotation cannot change an in-flight request. Webhook-level
   retries schedule new jobs (honoring `Retry-After`), and every attempt is kept

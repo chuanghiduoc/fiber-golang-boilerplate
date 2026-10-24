@@ -113,6 +113,10 @@ type Resolver interface {
 // header, so the handler derives the tenant from the signed OAuth state and
 // installs the context itself. Exempting it prevents require-header mode from
 // rejecting the callback before that validation runs.
+//
+// The public webhook receiver is exempt for the same reason: its source row,
+// authenticated by HMAC, selects the tenant, so requiring X-Tenant-Slug would
+// make the endpoint unusable for third-party senders.
 func Middleware(r Resolver, defaultSlug string) fiber.Handler {
 	if r == nil {
 		return func(c fiber.Ctx) error { return c.Next() }
@@ -120,7 +124,7 @@ func Middleware(r Resolver, defaultSlug string) fiber.Handler {
 
 	return func(c fiber.Ctx) error {
 		path := canonicalPath(c.Path())
-		if path == oauthCallbackPath {
+		if path == oauthCallbackPath || strings.HasPrefix(path, webhookInboundPrefix) {
 			return c.Next()
 		}
 
@@ -171,6 +175,10 @@ func IsValidSlug(slug string) bool {
 }
 
 const oauthCallbackPath = "/api/v1/auth/google/callback"
+
+// webhookInboundPrefix is the public webhook receiver. The source row, not a
+// request header, owns the tenant, so tenant middleware must not run first.
+const webhookInboundPrefix = "/api/v1/webhooks/inbound/"
 
 // tenantQueryPaths are public/browser-facing endpoints that may select their
 // tenant with a validated query parameter because navigation or an emailed link

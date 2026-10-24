@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
@@ -69,6 +71,7 @@ type userService struct {
 	audit                    audit.TxRecorder
 	sessions                 session.Store
 	verificationProvisioner  VerificationProvisioner
+	webhooks                 webhookcontracts.Dispatcher
 }
 
 func NewUserService(
@@ -175,7 +178,42 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	// A previous failed-login lockout must not survive registration.
 	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, email))
 
-	return ToUserResponse(user), nil
+	response := ToUserResponse(user)
+	s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
+	return response, nil
+}
+
+// SetWebhookDispatcher wires outbound domain events.
+func (s *userService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
+	s.webhooks = dispatcher
+}
+
+// AttachWebhookDispatcher wires the production dispatcher without widening the
+// UserService interface, so handler fakes remain small.
+func AttachWebhookDispatcher(svc UserService, dispatcher webhookcontracts.Dispatcher) {
+	if s, ok := svc.(*userService); ok {
+		s.webhooks = dispatcher
+	}
+}
+
+// dispatchWebhook emits one best-effort domain event. Delivery failures are
+// logged; they must not turn a committed registration into an API error.
+func (s *userService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
+	if s.webhooks == nil {
+		return
+	}
+	payload, err := json.Marshal(data)
+	if err != nil {
+		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
+		return
+	}
+	if _, err := s.webhooks.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
+		Type:     eventType,
+		TenantID: tenantID,
+		Data:     payload,
+	}); err != nil {
+		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
+	}
 }
 
 // createUser creates a local account with a precomputed password hash through

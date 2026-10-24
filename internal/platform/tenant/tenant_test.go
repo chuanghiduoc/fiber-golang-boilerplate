@@ -312,6 +312,30 @@ func TestMiddleware_OAuthCallbackSkipsResolution(t *testing.T) {
 	}
 }
 
+func TestMiddleware_WebhookInboundSkipsResolution(t *testing.T) {
+	resolver := &countingResolver{}
+	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app.Use(Middleware(resolver, ""))
+	app.Post("/api/v1/webhooks/inbound/:id", func(c fiber.Ctx) error {
+		return c.SendStatus(http.StatusAccepted)
+	})
+
+	req, err := http.NewRequest(http.MethodPost, "/api/v1/webhooks/inbound/42", http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (receiver must bypass require-header)", resp.StatusCode)
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0 for the public webhook receiver", resolver.calls)
+	}
+}
+
 func mustRequest(t *testing.T, path string) *http.Request {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, path, http.NoBody)

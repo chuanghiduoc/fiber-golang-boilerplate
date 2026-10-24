@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -121,6 +122,42 @@ func TestRegister(t *testing.T) {
 			t.Errorf("expected 'email already registered', got %q", err.Error())
 		}
 	})
+}
+
+func TestRegisterDispatchesUserRegistered(t *testing.T) {
+	dispatcher := &recordUserWebhookDispatcher{}
+	svc := newTestUserService(newMockUserRepo(), false)
+	AttachWebhookDispatcher(svc, dispatcher)
+
+	if _, err := svc.Register(context.Background(), dto.RegisterRequest{
+		Email:    "webhook@example.com",
+		Password: "Password1!",
+		Name:     "Webhook User",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if len(dispatcher.events) != 1 {
+		t.Fatalf("events = %d, want 1", len(dispatcher.events))
+	}
+	event := dispatcher.events[0]
+	if event.Type != webhookcontracts.EventUserRegistered {
+		t.Errorf("event type = %q, want %q", event.Type, webhookcontracts.EventUserRegistered)
+	}
+	if event.TenantID != 1 {
+		t.Errorf("tenant = %d, want 1", event.TenantID)
+	}
+	if !strings.Contains(string(event.Data), `"email":"webhook@example.com"`) {
+		t.Errorf("payload = %s, want registered email", event.Data)
+	}
+}
+
+type recordUserWebhookDispatcher struct {
+	events []webhookcontracts.Event
+}
+
+func (r *recordUserWebhookDispatcher) Dispatch(_ context.Context, events ...webhookcontracts.Event) (int, error) {
+	r.events = append(r.events, events...)
+	return len(events), nil
 }
 
 // ---------------------------------------------------------------------------

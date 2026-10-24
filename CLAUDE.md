@@ -234,8 +234,9 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
-- **Webhooks:** events go through `internal/contracts/webhooks.Dispatcher`
-  (`app.Deps.Webhooks`), so producers never import the module. Dispatch inserts
+- **Webhooks:** identity registration and file upload/delete emit through
+  `internal/contracts/webhooks.Dispatcher` (`app.Deps.Webhooks`), so producers
+  never import the module. Dispatch inserts
   a tenant-scoped `webhook_deliveries` row plus a `webhook.delivery` job in one
   transaction and snapshots URL/payload/secret ciphertext. The worker signs
   `<timestamp>.<raw-body>` with HMAC-SHA256, sends through `pkg/webhook.Client`

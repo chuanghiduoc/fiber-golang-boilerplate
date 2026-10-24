@@ -334,7 +334,10 @@ delivery is at-least-once.
 - Email verification/reset, notification email, and other durable work are
   queued in PostgreSQL.
 - Outbound webhook delivery uses the same queue (`webhook.delivery`) and is
-  at-least-once; receivers deduplicate on `X-Webhook-Delivery`.
+  at-least-once; receivers deduplicate on `X-Webhook-Delivery`. Identity
+  registration and file upload/delete emit `user.registered`,
+  `file.uploaded`, and `file.deleted` through the contracts dispatcher; a
+  dispatch failure is logged and never fails the committed mutation.
 - Delivery is at-least-once; clients must tolerate duplicate emails. A failed
   notification enqueue rolls back the in-app row.
 - Terminal jobs clear payloads; success/dead rows are retained 30 days.
