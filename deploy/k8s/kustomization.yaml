@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# IMPORTANT: `kubectl apply -k` applies resources without a cross-kind
+# ordering guarantee. For first installs and upgrades, apply and await
+# migration-job.yaml BEFORE applying this kustomization (see README.md).
+namespace: fiber-boilerplate
+
+# secret.example.yaml is intentionally NOT listed. Create the real Secret out
+# of band (or via External Secrets / Sealed Secrets); never commit it.
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - migration-job.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - ingress.yaml

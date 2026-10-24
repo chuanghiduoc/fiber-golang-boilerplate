@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fiber-boilerplate
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/instance: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: api
+  annotations:
+    # Replace api.example.com and provide the TLS Secret, or use cert-manager
+    # (uncomment the cluster-issuer annotation and adapt it).
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Keep this above APP_BODY_LIMIT (12 MiB) so multipart uploads are not
+    # rejected by nginx before the application sees them.
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: fiber-boilerplate-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: fiber-boilerplate
+                port:
+                  name: http

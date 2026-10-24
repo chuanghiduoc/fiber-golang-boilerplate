@@ -1,0 +1,114 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fiber-boilerplate-config
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: config
+data:
+  # ---------------------------------------------------------------------------
+  # Application
+  # ---------------------------------------------------------------------------
+  APP_ENV: "production"
+  APP_PORT: "8080"
+  # APP_BODY_LIMIT must stay above STORAGE_MAX_FILE_SIZE: multipart framing
+  # adds overhead before the upload handler can enforce the file limit.
+  APP_BODY_LIMIT: "12582912"
+  APP_REQUEST_TIMEOUT: "30"
+  LOG_LEVEL: "info"
+  # Replace with the public frontend origin (https is enforced in production).
+  APP_FRONTEND_URL: "https://app.example.com"
+  REQUIRE_EMAIL_VERIFICATION: "true"
+
+  # The app runs behind ingress-nginx, so client IPs arrive in X-Forwarded-For.
+  # Trust only the cluster's pod/service CIDR that contains ingress-nginx;
+  # do not widen this to 0.0.0.0/0 or clients can spoof their source IP.
+  APP_TRUST_PROXY: "true"
+  APP_TRUSTED_PROXIES: "10.0.0.0/8"
+
+  # ---------------------------------------------------------------------------
+  # CORS
+  # ---------------------------------------------------------------------------
+  # Explicit origins only; "*" is rejected when APP_ENV=production.
+  CORS_ALLOW_ORIGINS: "https://app.example.com"
+  CORS_ALLOW_METHODS: "GET,POST,PUT,DELETE,OPTIONS"
+  CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Authorization"
+  CORS_ALLOW_CREDENTIALS: "false"
+
+  # ---------------------------------------------------------------------------
+  # Rate limiting (tiered)
+  # ---------------------------------------------------------------------------
+  RATE_LIMIT_STRICT_MAX: "5"
+  RATE_LIMIT_STRICT_WINDOW_SECS: "60"
+  RATE_LIMIT_NORMAL_MAX: "60"
+  RATE_LIMIT_NORMAL_WINDOW_SECS: "60"
+  RATE_LIMIT_RELAXED_MAX: "120"
+  RATE_LIMIT_RELAXED_WINDOW_SECS: "60"
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL (managed/external service; DB_PASSWORD lives in the Secret)
+  # ---------------------------------------------------------------------------
+  DB_HOST: "db.example.com"
+  DB_PORT: "5432"
+  DB_DATABASE: "boilerplate"
+  DB_USERNAME: "app"
+  DB_SCHEMA: "public"
+  # "require" or "verify-full" is mandatory when APP_ENV=production.
+  DB_SSLMODE: "require"
+  DB_CONNECT_TIMEOUT: "10"
+  # Per-pod pool. Keep DB_MAX_CONNS * HPA maxReplicas (10) below the managed
+  # database's connection limit. The defaults here allow at most 100 connections.
+  DB_MAX_CONNS: "10"
+  DB_MIN_CONNS: "2"
+  DB_MAX_CONN_LIFETIME: "3600"
+  DB_MAX_CONN_IDLE_TIME: "300"
+
+  # ---------------------------------------------------------------------------
+  # JWT (JWT_SECRET lives in the Secret)
+  # ---------------------------------------------------------------------------
+  JWT_EXPIRE_HOUR: "24"
+  JWT_REFRESH_EXPIRE_DAYS: "30"
+
+  # ---------------------------------------------------------------------------
+  # Object storage (recommended for multi-replica production deployments)
+  # ---------------------------------------------------------------------------
+  STORAGE_DRIVER: "s3"
+  # Only used when STORAGE_DRIVER=local. See deployment.yaml for the
+  # writable-volume caveat; S3 avoids a shared filesystem entirely.
+  STORAGE_LOCAL_PATH: "/app/uploads"
+  STORAGE_MAX_FILE_SIZE: "10485760"
+  STORAGE_ALLOWED_MIME_TYPES: "image/jpeg,image/png,image/gif,image/webp,application/pdf"
+  # MinIO client endpoint (host[:port], no scheme). Replace for MinIO or for a
+  # different AWS region. S3_ACCESS_KEY / S3_SECRET_KEY live in the Secret.
+  STORAGE_S3_ENDPOINT: "s3.us-east-1.amazonaws.com"
+  STORAGE_S3_REGION: "us-east-1"
+  STORAGE_S3_BUCKET: "REPLACE_WITH_S3_BUCKET"
+  STORAGE_S3_USE_SSL: "true"
+
+  # ---------------------------------------------------------------------------
+  # Cache (Redis is required for multi-replica session invalidation)
+  # ---------------------------------------------------------------------------
+  CACHE_DRIVER: "redis"
+  # REDIS_URL is in the Secret because it normally contains credentials.
+
+  # ---------------------------------------------------------------------------
+  # Email (SMTP is mandatory in production; console is rejected)
+  # ---------------------------------------------------------------------------
+  EMAIL_DRIVER: "smtp"
+  SMTP_HOST: "smtp.example.com"
+  SMTP_PORT: "587"
+  SMTP_REQUIRE_TLS: "true"
+  EMAIL_FROM_ADDRESS: "noreply@example.com"
+  EMAIL_FROM_NAME: "Fiber App"
+  # SMTP_USERNAME / SMTP_PASSWORD live in the Secret.
+
+  # ---------------------------------------------------------------------------
+  # Optional: Google OAuth (disabled by default)
+  # ---------------------------------------------------------------------------
+  # Uncomment all four values (including GOOGLE_CLIENT_SECRET in the Secret)
+  # to enable OAuth. Production requires https callback URLs.
+  # GOOGLE_CLIENT_ID: "REPLACE_WITH_GOOGLE_CLIENT_ID.apps.googleusercontent.com"
+  # GOOGLE_REDIRECT_URL: "https://api.example.com/api/v1/auth/google/callback"
+  # OAUTH_FRONTEND_URL: "https://app.example.com/auth/callback"
