@@ -144,6 +144,10 @@ Offset helpers are for small admin/export tables only.
   (`console|smtp`) are selected by config factories.
 - **Rate limits:** tiered, cache-backed in `internal/app`; authenticated
   requests are keyed per user, unauthenticated per IP.
+- **Idempotency:** opt-in `Idempotency-Key` on mutating routes via
+  `deps.Idempotency`; scoped by method/path/user (IP for public routes). 2xx
+  responses replay for 24h, concurrent duplicates get 409, cache errors fail
+  open. Never add it to token/credential endpoints or GETs.
 
 ## Adding a Module
 

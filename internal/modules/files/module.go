@@ -24,10 +24,10 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters
 
 	files := v1.Group("/files", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
-	files.Post("/upload", rl.Normal, m.upload.Upload)
+	files.Post("/upload", rl.Normal, deps.Idempotency, m.upload.Upload)
 	files.Get("/", rl.Relaxed, m.upload.List)
 	files.Get("/:id/download", rl.Relaxed, m.upload.Download)
 	files.Get("/:id", rl.Relaxed, m.upload.GetInfo)
-	files.Delete("/:id", rl.Normal, m.upload.Delete)
-	files.Post("/:id/restore", rl.Normal, m.upload.Restore)
+	files.Delete("/:id", rl.Normal, deps.Idempotency, m.upload.Delete)
+	files.Post("/:id/restore", rl.Normal, deps.Idempotency, m.upload.Restore)
 }

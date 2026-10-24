@@ -26,7 +26,7 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters
 
 	auth := v1.Group("/auth")
-	auth.Post("/register", rl.Strict, m.auth.Register)
+	auth.Post("/register", rl.Strict, deps.Idempotency, m.auth.Register)
 	auth.Post("/login", rl.Strict, m.auth.Login)
 	auth.Post("/refresh", rl.Normal, m.auth.Refresh)
 	auth.Post("/logout", rl.Normal, m.auth.Logout)
@@ -40,10 +40,10 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 
 	users := v1.Group("/users", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
 	users.Get("/me", rl.Relaxed, m.users.GetMe)
-	users.Put("/me", rl.Normal, m.users.UpdateMe)
-	users.Put("/me/password", rl.Normal, m.users.ChangePassword)
+	users.Put("/me", rl.Normal, deps.Idempotency, m.users.UpdateMe)
+	users.Put("/me/password", rl.Normal, deps.Idempotency, m.users.ChangePassword)
 	users.Get("/:id", rl.Relaxed, m.users.GetByID)
 	users.Get("/", rl.Relaxed, authz.Require(authz.PermissionAdminUsersRead), m.users.List)
-	users.Put("/:id", rl.Normal, m.users.Update)
-	users.Delete("/:id", rl.Normal, m.users.Delete)
+	users.Put("/:id", rl.Normal, deps.Idempotency, m.users.Update)
+	users.Delete("/:id", rl.Normal, deps.Idempotency, m.users.Delete)
 }

@@ -221,6 +221,29 @@ populated tables. Never edit a shipped migration after deployment.
 | GET | `/metrics` | Prometheus metrics (requires `METRICS_AUTH_TOKEN` in production) |
 | GET | `/swagger` | Swagger UI (non-production only) |
 
+### Idempotency
+
+Mutating endpoints accept an optional `Idempotency-Key` header (1–128
+characters; only `[A-Za-z0-9._:-]`). When present:
+
+- the first request runs and its 2xx status, body, and selected headers
+  (`Content-Type`, `Location`, `ETag`) are cached for 24 hours; retries with the
+  same key replay that response without running the handler again
+- concurrent requests with the same key while the first is still running return
+  `409 Conflict`
+- non-2xx responses are not cached, and cache failures fail open (the request
+  runs normally)
+- keys are scoped by method, path, and caller (user ID, or IP for the public
+  registration route), so the same key on another endpoint or user does not
+  collide
+
+This is opt-in and applied to registration, profile/password updates, user
+updates/deletes, file upload/delete/restore, and admin role/ban/unban/file
+actions. GETs and token/credential endpoints (login, refresh, logout,
+logout-all, forgot/reset/verify/resend, Google OAuth) never use it. Use Redis
+(`CACHE_DRIVER=redis`) so replays work across multiple replicas; memory caching
+is per process.
+
 ## Makefile Commands
 
 ```bash
