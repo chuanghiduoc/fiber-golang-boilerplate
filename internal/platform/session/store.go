@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
@@ -33,14 +33,20 @@ type snapshot struct {
 	TokenVersion int32  `json:"tokenVersion"`
 }
 
+// userStore is the narrow read contract the session validator needs. Keeping
+// it local prevents platform code from depending on a business module.
+type userStore interface {
+	GetByID(ctx context.Context, id int64) (*sqlc.User, error)
+}
+
 type store struct {
-	users repository.UserRepository
+	users userStore
 	cache cache.Cache
 }
 
 // NewStore creates a session validator. A cache is optional; without one every
 // authenticated request performs a single indexed user lookup.
-func NewStore(users repository.UserRepository, appCache cache.Cache) Store {
+func NewStore(users userStore, appCache cache.Cache) Store {
 	return &store{users: users, cache: appCache}
 }
 

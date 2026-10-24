@@ -7,7 +7,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -76,7 +75,7 @@ func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cursorCreatedAt(cur),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -112,7 +111,7 @@ func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
 	return r.q.AdminListFilesCursor(ctx, sqlc.AdminListFilesCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cursorCreatedAt(cur),
+		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -120,10 +119,6 @@ func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBC
 
 func (r *fileRepository) AdminCount(ctx context.Context) (int64, error) {
 	return r.q.AdminCountFiles(ctx)
-}
-
-func cursorCreatedAt(cur pagination.DBCursor) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: cur.CreatedAt, Valid: cur.HasCursor}
 }
 
 // wrapErr translates pgx errors to app-level sentinel errors. Keeping it local
@@ -138,11 +133,4 @@ func wrapErr(err error) error {
 		return apperror.NewConflict("cannot remove the last active admin")
 	}
 	return err
-}
-
-// IsUniqueViolation reports whether err is a PostgreSQL unique constraint
-// violation (SQLSTATE 23505).
-func IsUniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

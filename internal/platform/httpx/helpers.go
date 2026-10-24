@@ -1,16 +1,20 @@
-// Package httpx contains HTTP helpers shared by module handlers without
-// pulling in the legacy handler package (which would create an import cycle).
+// Package httpx contains HTTP helpers shared by module handlers and the
+// legacy handler package without creating an import cycle.
 package httpx
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 // ParamID extracts and validates a required int64 path parameter.
@@ -26,6 +30,37 @@ func ParamID(c fiber.Ctx, name string) (int64, error) {
 // The key is set by middleware.JWTAuth.
 func AuthUserID(c fiber.Ctx) int64 {
 	return fiber.Locals[int64](c, "user_id")
+}
+
+// AuthRole returns the authenticated user's role from the JWT context.
+// The key is set by middleware.JWTAuth.
+func AuthRole(c fiber.Ctx) string {
+	return fiber.Locals[string](c, "role")
+}
+
+// BindAndValidate parses the request body and runs struct validation. Unknown
+// fields and trailing JSON values are rejected so client typos cannot silently
+// pass validation.
+func BindAndValidate(c fiber.Ctx, req any) error {
+	body := c.Body()
+	if len(body) == 0 {
+		return apperror.NewBadRequest("request body is required")
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(req); err != nil {
+		var syntaxErr *json.SyntaxError
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+			return apperror.NewBadRequest("invalid JSON body")
+		}
+		return apperror.NewBadRequest("failed to parse request body")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return apperror.NewBadRequest("invalid JSON body")
+	}
+	return validator.ValidateStruct(req)
 }
 
 // ContentDispositionAttachment builds an RFC 6266 Content-Disposition header
@@ -60,7 +95,10 @@ func ContentDispositionAttachment(name string) string {
 
 // CursorQuery binds the limit + startingAfter cursor pagination params.
 func CursorQuery(c fiber.Ctx) (limit int, startingAfter string, err error) {
-	var q dto.CursorQuery
+	var q struct {
+		Limit         int    `query:"limit"`
+		StartingAfter string `query:"startingAfter"`
+	}
 	if err := c.Bind().Query(&q); err != nil {
 		return 0, "", apperror.NewBadRequest("invalid query parameters")
 	}

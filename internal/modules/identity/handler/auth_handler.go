@@ -10,8 +10,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
@@ -69,7 +70,7 @@ func NewAuthHandler(
 // @Router /auth/register [post]
 func (h *AuthHandler) Register(c fiber.Ctx) error {
 	var req dto.RegisterRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -109,7 +110,7 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 // @Router /auth/login [post]
 func (h *AuthHandler) Login(c fiber.Ctx) error {
 	var req dto.LoginRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -153,7 +154,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 // @Router /auth/refresh [post]
 func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	var req dto.RefreshRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -213,7 +214,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 // @Router /auth/logout [post]
 func (h *AuthHandler) Logout(c fiber.Ctx) error {
 	var req dto.RefreshRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -233,7 +234,7 @@ func (h *AuthHandler) Logout(c fiber.Ctx) error {
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/logout-all [post]
 func (h *AuthHandler) LogoutAll(c fiber.Ctx) error {
-	if err := h.userSvc.RevokeSessions(c.Context(), authUserID(c)); err != nil {
+	if err := h.userSvc.RevokeSessions(c.Context(), httpx.AuthUserID(c)); err != nil {
 		return err
 	}
 	return response.NoContent(c)
@@ -253,7 +254,7 @@ func (h *AuthHandler) LogoutAll(c fiber.Ctx) error {
 // @Router /auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 	var req dto.ForgotPasswordRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -278,7 +279,7 @@ func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 // @Router /auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 	var req dto.ResetPasswordRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -303,7 +304,7 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 // @Router /auth/verify-email [post]
 func (h *AuthHandler) VerifyEmail(c fiber.Ctx) error {
 	var req dto.VerifyEmailRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -328,7 +329,7 @@ func (h *AuthHandler) VerifyEmail(c fiber.Ctx) error {
 // @Router /auth/resend-verification [post]
 func (h *AuthHandler) ResendVerification(c fiber.Ctx) error {
 	var req dto.ResendVerificationRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 

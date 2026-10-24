@@ -4,18 +4,18 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/handler"
+	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module owns authentication, user profiles, sessions, and token lifecycle.
 type Module struct {
-	auth  *handler.AuthHandler
-	users *handler.UserHandler
+	auth  *identityhandler.AuthHandler
+	users *identityhandler.UserHandler
 }
 
-func New(auth *handler.AuthHandler, users *handler.UserHandler) *Module {
+func New(auth *identityhandler.AuthHandler, users *identityhandler.UserHandler) *Module {
 	return &Module{auth: auth, users: users}
 }
 

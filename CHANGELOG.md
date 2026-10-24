@@ -30,8 +30,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - `make run` migrates before starting; `make seed` depends on migration
 - CI builds both binaries, runs `go vet`/`gofmt`, and includes a fresh-PostgreSQL migration job (baseline up/down + `cmd/migrate` twice)
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
-- Moved the files upload service and HTTP handler into `internal/modules/files/{service,handler}`; `internal/service` and `internal/handler` keep deprecated aliases/wrappers so existing call sites compile, while the files DTOs remain in the legacy layer
-- Moved the files repository and its SQL access into `internal/modules/files/repository`; `repository.Cursor` is now an alias of the neutral `pagination.DBCursor`, preserving cursor compatibility across the remaining legacy repositories
+- Moved the files upload service, HTTP handler, and repository into `internal/modules/files/{service,handler,repository}`; the module keeps thin legacy aliases only for the upload service/handler, while the files DTO remains in the legacy layer
+- Moved the identity bounded context into `internal/modules/identity/{dto,repository,service,handler}`. Identity handlers use `internal/platform/httpx` helpers, shared cursor pagination lives in `pkg/pagination.DBCursor`, unique-violation detection lives in `pkg/database`, and the legacy global identity files were deleted. Admin keeps its legacy handler/service but consumes the identity/files module repositories.
 
 ### Fixed
 - Kubernetes ConfigMap CORS now allows the `Idempotency-Key` request header and exposes `Idempotent-Replayed`, so browser idempotency works behind the template policy

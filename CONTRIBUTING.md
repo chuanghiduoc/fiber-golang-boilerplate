@@ -49,7 +49,7 @@ local server, point it at a disposable database:
 
 ```bash
 TEST_DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@127.0.0.1:5432/apptest?sslmode=disable" \
-  go test -tags=integration -race -count=1 ./internal/handler ./internal/platform/jobs ./internal/platform/audit
+  go test -tags=integration -race -count=1 ./internal/modules/identity/... ./internal/handler ./internal/platform/jobs ./internal/platform/audit
 ```
 
 CI's `Migrations` job applies the baseline up/down on a fresh PostgreSQL
@@ -138,9 +138,10 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 7. Run `make swagger`, `make check`, and `go test -race ./...`.
 8. Update `CHANGELOG.md`.
 
-> `files` owns its upload handler/service/repository in the module but still
-> uses the legacy DTO layer. `identity` and `admin` still wrap the global
-> handler/service/repository packages. Moving the remaining internals is the
+> `identity` owns its DTOs, repositories, services, and handlers under
+> `internal/modules/identity`. `files` owns its upload handler/service/repository
+> in the module but still uses the legacy DTO layer. `admin` still wraps the
+> global handler/service packages. Moving the remaining internals is the
 > next strangler phase; new modules should start in the module layout.
 
 ## Code Style
@@ -148,7 +149,7 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 - Error handling: return `*apperror.AppError` via the typed catalog
   (`apperror.NewCode(...)`), not raw errors or magic strings
 - Responses: use `pkg/response` helpers, not `c.JSON()`
-- Roles: use `dto.RoleAdmin` / `dto.RoleUser`, not magic strings
+- Roles: use `identity/dto.RoleAdmin` / `identity/dto.RoleUser`, not magic strings
 - Permissions: use `authz.Permission*`, not ad-hoc role checks
 - Int conversion: use `pagination.clampInt32()`, not direct `int32()` cast
 - Durable background work: enqueue in `internal/platform/jobs`; never use

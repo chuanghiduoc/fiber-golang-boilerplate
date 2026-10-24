@@ -5,19 +5,15 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // cursorLess reports whether (ts1,id1) sorts before (ts2,id2) in the
@@ -96,15 +92,15 @@ func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User
 	return all[start:end], nil
 }
 
-func (m *mockUserRepo) ListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
+func (m *mockUserRepo) ListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
 	return m.listCursor(cur, false), nil
 }
 
-func (m *mockUserRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.User, error) {
+func (m *mockUserRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
 	return m.listCursor(cur, true), nil
 }
 
-func (m *mockUserRepo) listCursor(cur repository.Cursor, includeDeleted bool) []sqlc.User {
+func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) []sqlc.User {
 	all := make([]sqlc.User, 0, len(m.users))
 	for _, u := range m.users {
 		if u.DeletedAt.Valid && !includeDeleted {
@@ -427,15 +423,15 @@ func (m *mockFileRepo) ListByUserID(_ context.Context, userID int64, limit, offs
 	return result[start:end], nil
 }
 
-func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur repository.Cursor, includeDeleted bool) ([]sqlc.File, error) {
+func (m *mockFileRepo) ListByUserCursor(_ context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error) {
 	return m.listCursor(&userID, cur, includeDeleted), nil
 }
 
-func (m *mockFileRepo) AdminListCursor(_ context.Context, cur repository.Cursor) ([]sqlc.File, error) {
+func (m *mockFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
 	return m.listCursor(nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(userID *int64, cur repository.Cursor, includeDeleted bool) []sqlc.File {
+func (m *mockFileRepo) listCursor(userID *int64, cur pagination.DBCursor, includeDeleted bool) []sqlc.File {
 	all := make([]sqlc.File, 0, len(m.files))
 	for _, f := range m.files {
 		if userID != nil && f.UserID != *userID {
@@ -508,248 +504,6 @@ func (m *mockFileRepo) AdminList(_ context.Context, limit, offset int32) ([]sqlc
 
 func (m *mockFileRepo) AdminCount(_ context.Context) (int64, error) {
 	return int64(len(m.files)), nil
-}
-
-// ---------------------------------------------------------------------------
-// mockEmailVerificationRepo
-// ---------------------------------------------------------------------------
-
-type mockEmailVerificationRepo struct {
-	tokens map[string]*sqlc.EmailVerificationToken
-	nextID int64
-}
-
-func newMockEmailVerificationRepo() *mockEmailVerificationRepo {
-	return &mockEmailVerificationRepo{tokens: make(map[string]*sqlc.EmailVerificationToken), nextID: 1}
-}
-
-func (m *mockEmailVerificationRepo) Create(_ context.Context, params sqlc.CreateEmailVerificationTokenParams) (*sqlc.EmailVerificationToken, error) {
-	t := &sqlc.EmailVerificationToken{
-		ID:        m.nextID,
-		UserID:    params.UserID,
-		Email:     params.Email,
-		Token:     params.Token,
-		ExpiresAt: params.ExpiresAt,
-		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-	}
-	m.tokens[params.Token] = t
-	m.nextID++
-	return t, nil
-}
-
-func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) (*sqlc.EmailVerificationToken, error) {
-	t, ok := m.tokens[token]
-	if !ok {
-		return nil, apperror.ErrNotFound
-	}
-	return t, nil
-}
-
-func (m *mockEmailVerificationRepo) Consume(_ context.Context, token string) (*sqlc.EmailVerificationToken, error) {
-	t, ok := m.tokens[token]
-	if !ok {
-		return nil, apperror.ErrNotFound
-	}
-	delete(m.tokens, token)
-	return t, nil
-}
-
-func (m *mockEmailVerificationRepo) Delete(_ context.Context, token string) error {
-	delete(m.tokens, token)
-	return nil
-}
-
-func (m *mockEmailVerificationRepo) DeleteByUserID(_ context.Context, userID int64) error {
-	for k, v := range m.tokens {
-		if v.UserID == userID {
-			delete(m.tokens, k)
-		}
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// mockPasswordResetRepo
-// ---------------------------------------------------------------------------
-
-type mockPasswordResetRepo struct {
-	tokens map[string]*sqlc.PasswordResetToken
-	nextID int64
-}
-
-func newMockPasswordResetRepo() *mockPasswordResetRepo {
-	return &mockPasswordResetRepo{tokens: make(map[string]*sqlc.PasswordResetToken), nextID: 1}
-}
-
-func (m *mockPasswordResetRepo) Create(_ context.Context, params sqlc.CreatePasswordResetTokenParams) (*sqlc.PasswordResetToken, error) {
-	t := &sqlc.PasswordResetToken{
-		ID:        m.nextID,
-		UserID:    params.UserID,
-		Token:     params.Token,
-		ExpiresAt: params.ExpiresAt,
-		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
-	}
-	m.tokens[params.Token] = t
-	m.nextID++
-	return t, nil
-}
-
-func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*sqlc.PasswordResetToken, error) {
-	t, ok := m.tokens[token]
-	if !ok {
-		return nil, apperror.ErrNotFound
-	}
-	return t, nil
-}
-
-func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
-	return m.GetByToken(ctx, token)
-}
-
-func (m *mockPasswordResetRepo) Consume(_ context.Context, token string) (*sqlc.PasswordResetToken, error) {
-	t, ok := m.tokens[token]
-	if !ok {
-		return nil, apperror.ErrNotFound
-	}
-	delete(m.tokens, token)
-	return t, nil
-}
-
-func (m *mockPasswordResetRepo) Delete(_ context.Context, token string) error {
-	delete(m.tokens, token)
-	return nil
-}
-
-func (m *mockPasswordResetRepo) DeleteByUserID(_ context.Context, userID int64) error {
-	for k, v := range m.tokens {
-		if v.UserID == userID {
-			delete(m.tokens, k)
-		}
-	}
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// mockCache
-// ---------------------------------------------------------------------------
-
-type mockCache struct {
-	items map[string][]byte
-	ttls  map[string]time.Duration
-}
-
-func newMockCache() *mockCache {
-	return &mockCache{items: make(map[string][]byte), ttls: make(map[string]time.Duration)}
-}
-
-func (m *mockCache) Get(_ context.Context, key string) ([]byte, error) {
-	v, ok := m.items[key]
-	if !ok {
-		return nil, nil
-	}
-	return v, nil
-}
-
-func (m *mockCache) Set(_ context.Context, key string, value []byte, ttl time.Duration) error {
-	m.items[key] = value
-	m.ttls[key] = ttl
-	return nil
-}
-
-func (m *mockCache) Delete(_ context.Context, key string) error {
-	delete(m.items, key)
-	return nil
-}
-
-func (m *mockCache) Exists(_ context.Context, key string) (bool, error) {
-	_, ok := m.items[key]
-	return ok, nil
-}
-
-func (m *mockCache) Increment(_ context.Context, key string, ttl time.Duration) (int64, error) {
-	var n int64
-	if v, ok := m.items[key]; ok {
-		n, _ = strconv.ParseInt(string(v), 10, 64)
-	}
-	n++
-	m.items[key] = []byte(strconv.FormatInt(n, 10))
-	m.ttls[key] = ttl
-	return n, nil
-}
-
-func (m *mockCache) Close() error                 { return nil }
-func (m *mockCache) Ping(_ context.Context) error { return nil }
-
-// ---------------------------------------------------------------------------
-// mockEmailSender implements email.Sender
-// ---------------------------------------------------------------------------
-
-type mockEmailSender struct {
-	mu       sync.Mutex
-	sendErr  error
-	sent     int
-	messages []email.Message
-}
-
-func newMockEmailSender() *mockEmailSender {
-	return &mockEmailSender{}
-}
-
-func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
-	if m.sendErr != nil {
-		return m.sendErr
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.sent++
-	m.messages = append(m.messages, msg)
-	return nil
-}
-
-func (m *mockEmailSender) Sent() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sent
-}
-
-// WaitFor waits for asynchronously sent mail to arrive without sleeping in the
-// happy path. Used by tests that exercise fire-and-forget email delivery.
-func (m *mockEmailSender) WaitFor(n int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if m.Sent() >= n {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return m.Sent() >= n
-}
-
-// mockTransactionalEmailSender is both an email.Sender and a
-// transactionalEmailSender. Tests use it to prove that services only call
-// SendTx when they actually have a transaction; otherwise they must fall back
-// to exactly one Send.
-type mockTransactionalEmailSender struct {
-	*mockEmailSender
-	mu          sync.Mutex
-	sendTxCalls int
-}
-
-func newMockTransactionalEmailSender() *mockTransactionalEmailSender {
-	return &mockTransactionalEmailSender{mockEmailSender: newMockEmailSender()}
-}
-
-func (m *mockTransactionalEmailSender) SendTx(ctx context.Context, _ pgx.Tx, msg email.Message) error {
-	m.mu.Lock()
-	m.sendTxCalls++
-	m.mu.Unlock()
-	return m.Send(ctx, msg)
-}
-
-func (m *mockTransactionalEmailSender) SendTxCalls() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sendTxCalls
 }
 
 // ---------------------------------------------------------------------------

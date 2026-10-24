@@ -4,8 +4,11 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
@@ -49,7 +52,7 @@ func (h *AdminHandler) GetStats(c fiber.Ctx) error {
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/users [get]
 func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
-	limit, startingAfter, err := cursorQuery(c)
+	limit, startingAfter, err := httpx.CursorQuery(c)
 	if err != nil {
 		return err
 	}
@@ -79,16 +82,16 @@ func (h *AdminHandler) ListUsers(c fiber.Ctx) error {
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/role [put]
 func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
-	if id == authUserID(c) {
+	if id == httpx.AuthUserID(c) {
 		return apperror.NewBadRequest("you cannot change your own role")
 	}
 
 	var req dto.UpdateRoleRequest
-	if err := bindAndValidate(c, &req); err != nil {
+	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
 
@@ -115,11 +118,11 @@ func (h *AdminHandler) UpdateRole(c fiber.Ctx) error {
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/ban [post]
 func (h *AdminHandler) BanUser(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
-	if id == authUserID(c) {
+	if id == httpx.AuthUserID(c) {
 		return apperror.NewBadRequest("you cannot ban your own account")
 	}
 
@@ -145,7 +148,7 @@ func (h *AdminHandler) BanUser(c fiber.Ctx) error {
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/users/{id}/unban [post]
 func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
@@ -171,7 +174,7 @@ func (h *AdminHandler) UnbanUser(c fiber.Ctx) error {
 // @Failure 403 {object} apperror.ProblemDetails
 // @Router /admin/files [get]
 func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
-	limit, startingAfter, err := cursorQuery(c)
+	limit, startingAfter, err := httpx.CursorQuery(c)
 	if err != nil {
 		return err
 	}
@@ -198,7 +201,7 @@ func (h *AdminHandler) ListFiles(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/files/{id}/download [get]
 func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
@@ -209,7 +212,7 @@ func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
 	}
 
 	c.Set("Content-Type", file.MimeType)
-	c.Set("Content-Disposition", contentDispositionAttachment(file.OriginalName))
+	c.Set("Content-Disposition", httpx.ContentDispositionAttachment(file.OriginalName))
 	return c.SendStream(reader, int(file.Size))
 }
 
@@ -226,7 +229,7 @@ func (h *AdminHandler) DownloadFile(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Router /admin/files/{id} [delete]
 func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
@@ -251,7 +254,7 @@ func (h *AdminHandler) DeleteFile(c fiber.Ctx) error {
 // @Failure 409 {object} apperror.ProblemDetails
 // @Router /admin/files/{id}/restore [post]
 func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
-	id, err := paramID(c, "id")
+	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
@@ -261,4 +264,22 @@ func (h *AdminHandler) RestoreFile(c fiber.Ctx) error {
 		return err
 	}
 	return response.Success(c, file)
+}
+
+// nextUserCursor exposes the opaque cursor clients must pass as startingAfter
+// on the next request.
+func nextUserCursor(items []identitydto.UserResponse) string {
+	if len(items) == 0 {
+		return ""
+	}
+	last := items[len(items)-1]
+	return pagination.EncodeCursor(last.CreatedAt, last.ID)
+}
+
+func nextFileCursor(items []dto.FileResponse) string {
+	if len(items) == 0 {
+		return ""
+	}
+	last := items[len(items)-1]
+	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }

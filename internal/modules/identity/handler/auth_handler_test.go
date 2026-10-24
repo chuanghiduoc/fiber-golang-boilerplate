@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -81,21 +81,21 @@ func TestAuthAudit_ActorAttribution(t *testing.T) {
 		{
 			name:        "login",
 			path:        "/auth/login",
-			payload:     dto.LoginRequest{Email: "test@example.com", Password: "Password1!"},
+			payload:     identitydto.LoginRequest{Email: "test@example.com", Password: "Password1!"},
 			wantStatus:  fiber.StatusOK,
 			wantActorID: 1,
 		},
 		{
 			name:        "register",
 			path:        "/auth/register",
-			payload:     dto.RegisterRequest{Email: "new@example.com", Password: "Password1!", Name: "New User"},
+			payload:     identitydto.RegisterRequest{Email: "new@example.com", Password: "Password1!", Name: "New User"},
 			wantStatus:  fiber.StatusCreated,
 			wantActorID: 2,
 		},
 		{
 			name:        "refresh",
 			path:        "/auth/refresh",
-			payload:     dto.RefreshRequest{RefreshToken: "valid-refresh-token"},
+			payload:     identitydto.RefreshRequest{RefreshToken: "valid-refresh-token"},
 			wantStatus:  fiber.StatusOK,
 			wantActorID: 1,
 		},
@@ -141,7 +141,7 @@ func TestAuthAudit_FailedLoginIsNotAttributed(t *testing.T) {
 	})
 	app.Post("/auth/login", authHandler.Login)
 
-	status := postJSON(t, app, "/auth/login", dto.LoginRequest{
+	status := postJSON(t, app, "/auth/login", identitydto.LoginRequest{
 		Email:    "test@example.com",
 		Password: "WrongPassword2@",
 	})

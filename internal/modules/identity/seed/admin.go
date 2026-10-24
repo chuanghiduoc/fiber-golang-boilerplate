@@ -11,10 +11,11 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Admin creates an admin user if ADMIN_EMAIL and ADMIN_PASSWORD are set
@@ -95,7 +96,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 	if err != nil {
 		// Another replica may have won the startup race. Treat that as success
 		// if the row is now present and promote it.
-		if repository.IsUniqueViolation(err) {
+		if database.IsUniqueViolation(err) {
 			if existing, lookupErr := userRepo.GetByEmail(ctx, email); lookupErr == nil {
 				return promote(existing)
 			}

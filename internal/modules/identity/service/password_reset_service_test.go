@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 )
 

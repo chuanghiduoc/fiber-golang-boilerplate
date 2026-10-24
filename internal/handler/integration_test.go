@@ -19,9 +19,13 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
+	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -33,21 +37,22 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
-func setupIntegrationApp(t *testing.T) (*fiber.App, repository.UserRepository, func()) {
+func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository) {
 	t.Helper()
 	ctx := context.Background()
 
 	pool, cleanup, err := testutil.SetupTestDB(ctx)
 	require.NoError(t, err)
+	t.Cleanup(cleanup)
 
-	refreshRepo := repository.NewRefreshTokenRepository(pool)
+	refreshRepo := identityrepo.NewRefreshTokenRepository(pool)
 	appCache := cache.NewMemoryCache()
 	txManager := database.NewTxManager(pool)
 
-	userRepo := repository.NewUserRepository(pool)
+	userRepo := identityrepo.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
-	userSvc := service.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
-	userHandler := NewUserHandler(userSvc)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
+	userHandler := identityhandler.NewUserHandler(userSvc)
 
 	fileRepo := filesrepo.NewFileRepository(pool)
 	store, err := storage.NewLocalStorage(t.TempDir())
@@ -60,8 +65,8 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, repository.UserRepository, f
 	})
 
 	app.Post("/auth/register", func(c fiber.Ctx) error {
-		var req dto.RegisterRequest
-		if err := bindAndValidate(c, &req); err != nil {
+		var req identitydto.RegisterRequest
+		if err := httpx.BindAndValidate(c, &req); err != nil {
 			return err
 		}
 		user, err := userSvc.Register(c.Context(), req)
@@ -73,9 +78,6 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, repository.UserRepository, f
 
 	users := app.Group("/users", middleware.JWTAuth("integration-secret", sessionStore))
 	users.Get("/me", userHandler.GetMe)
-	users.Get("/:id", userHandler.GetByID)
-	users.Put("/:id", userHandler.Update)
-	users.Delete("/:id", userHandler.Delete)
 
 	admin := app.Group("/admin",
 		middleware.JWTAuth("integration-secret", sessionStore),
@@ -87,72 +89,14 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, repository.UserRepository, f
 	admin.Post("/users/:id/ban", adminHandler.BanUser)
 	admin.Post("/users/:id/unban", adminHandler.UnbanUser)
 
-	return app, userRepo, cleanup
-}
-
-func TestIntegration_FullUserFlow(t *testing.T) {
-	app, _, cleanup := setupIntegrationApp(t)
-	defer cleanup()
-
-	// 1. Register
-	body, _ := json.Marshal(dto.RegisterRequest{
-		Email:    "integration@test.com",
-		Password: "Password1!",
-		Name:     "Integration User",
-	})
-	req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
-
-	// Register returns the created user resource directly (no envelope).
-	respBody, _ := io.ReadAll(resp.Body)
-	var userResp dto.UserResponse
-	require.NoError(t, json.Unmarshal(respBody, &userResp))
-	userID := userResp.ID
-
-	// 2. Get user (with JWT)
-	accessToken, _ := token.Generate(userID, "integration@test.com", "user", "integration-secret", 24)
-
-	req, _ = http.NewRequest("GET", "/users/me", http.NoBody)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
-
-	// 3. Update user
-	name := "Updated Name"
-	body, _ = json.Marshal(dto.UpdateUserRequest{Name: &name})
-	req, _ = http.NewRequest("PUT", "/users/1", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
-
-	// 4. Soft delete user
-	req, _ = http.NewRequest("DELETE", "/users/1", http.NoBody)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
-
-	// 5. The deleted user's access token is rejected by the session validator
-	//    immediately, rather than remaining usable until JWT expiry.
-	req, _ = http.NewRequest("GET", "/users/me", http.NoBody)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err = app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
+	return app, userRepo
 }
 
 func TestIntegration_AdminOperations(t *testing.T) {
-	app, userRepo, cleanup := setupIntegrationApp(t)
-	defer cleanup()
+	app, userRepo := setupIntegrationApp(t)
 
 	// Register a regular user
-	body, _ := json.Marshal(dto.RegisterRequest{
+	body, _ := json.Marshal(identitydto.RegisterRequest{
 		Email:    "regular@test.com",
 		Password: "Password1!",
 		Name:     "Regular User",
@@ -164,7 +108,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	require.Equal(t, fiber.StatusCreated, resp.StatusCode)
 
 	respBody, _ := io.ReadAll(resp.Body)
-	var regular dto.UserResponse
+	var regular identitydto.UserResponse
 	require.NoError(t, json.Unmarshal(respBody, &regular))
 	regularToken, err := token.GenerateWithVersion(regular.ID, regular.Email, regular.Role, regular.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
@@ -181,7 +125,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	require.NoError(t, err)
 	admin, err = userRepo.UpdateRole(context.Background(), sqlc.UpdateUserRoleParams{
 		ID:   admin.ID,
-		Role: dto.RoleAdmin,
+		Role: identitydto.RoleAdmin,
 	})
 	require.NoError(t, err)
 	adminToken, err := token.GenerateWithVersion(admin.ID, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
@@ -252,7 +196,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 
 	// A separate regular user gets 403 (not 401): their session is valid, but
 	// their role is insufficient.
-	body, _ = json.Marshal(dto.RegisterRequest{
+	body, _ = json.Marshal(identitydto.RegisterRequest{
 		Email:    "other@test.com",
 		Password: "Password1!",
 		Name:     "Other User",
@@ -263,7 +207,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fiber.StatusCreated, resp.StatusCode)
 
-	var other dto.UserResponse
+	var other identitydto.UserResponse
 	respBody, _ = io.ReadAll(resp.Body)
 	require.NoError(t, json.Unmarshal(respBody, &other))
 	userToken, err := token.GenerateWithVersion(other.ID, other.Email, other.Role, other.TokenVersion, "integration-secret", 24)

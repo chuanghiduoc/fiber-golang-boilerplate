@@ -16,6 +16,7 @@ import (
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -75,7 +76,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 				slog.Any("error", delErr),
 			)
 		}
-		if filesrepo.IsUniqueViolation(err) {
+		if database.IsUniqueViolation(err) {
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
 		return nil, apperror.NewInternal("failed to save file metadata")
