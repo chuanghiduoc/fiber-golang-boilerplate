@@ -81,9 +81,10 @@ automation remain future work. `identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
 `internal/contracts` interfaces implemented by identity/files adapters and
-never imports those modules. Each module owns its `queries/` and generated
-`sqlc/` package; there is no shared generated package and no cross-module sqlc
-imports, and no legacy handler/service/DTO/repository packages remain.
+never imports those modules. Each module with SQL owns its `queries/` and
+generated `sqlc/` package (`admin` is contract-only); there is no shared
+generated package and no cross-module sqlc imports, and no legacy
+handler/service/DTO/repository packages remain.
 Kubernetes manifests and a GHCR release workflow exist under `deploy/k8s/` and
 `.github/workflows/release.yml`; they are a production foundation, not a
 complete CD platform.

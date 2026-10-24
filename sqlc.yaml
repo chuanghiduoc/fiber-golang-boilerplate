@@ -10,6 +10,7 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
+        omit_unused_structs: true
   - engine: "postgresql"
     queries: "internal/modules/files/queries/"
     schema: "migrations/"
@@ -20,3 +21,4 @@ sql:
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
+        omit_unused_structs: true

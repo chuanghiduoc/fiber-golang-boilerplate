@@ -48,8 +48,9 @@ client
 - One module owns each table. Cross-module reads go through a read model or
   contract, never another module's repository.
 - Module DTOs, repositories, services, and handlers stay inside the owning
-  module. Each module owns its `queries/` and generated `sqlc/` package; a
-  module must never import another module's generated SQL types.
+  module. Each module that has SQL owns its `queries/` and generated `sqlc/`
+  package (`admin` is contract-only); a module must never import another
+  module's generated SQL types.
 - Modules must not import the deleted shared legacy handler/service/DTO/
   repository packages; the architecture test enforces this so the layer cannot
   return.

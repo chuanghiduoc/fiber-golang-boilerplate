@@ -142,9 +142,9 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 > `identity`, `files`, and `admin` own all of their DTOs, repositories,
 > services, and handlers under `internal/modules/<name>`. `admin` consumes
 > identity/files only through `internal/contracts`; it does not import their
-> internals. Each module owns its generated `sqlc/` package; never import
-> another module's sqlc types, and no legacy handler/service/DTO/repository
-> packages remain.
+> internals. Each module with SQL owns its generated `sqlc/` package (`admin`
+> is contract-only); never import another module's sqlc types, and no legacy
+> handler/service/DTO/repository packages remain.
 
 ## Code Style
 

@@ -8,19 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-type AuditEvent struct {
-	ID         int64              `json:"id"`
-	ActorID    pgtype.Int8        `json:"actor_id"`
-	Action     string             `json:"action"`
-	Resource   string             `json:"resource"`
-	ResourceID pgtype.Text        `json:"resource_id"`
-	Metadata   []byte             `json:"metadata"`
-	Ip         pgtype.Text        `json:"ip"`
-	UserAgent  pgtype.Text        `json:"user_agent"`
-	RequestID  pgtype.Text        `json:"request_id"`
-	CreatedAt  pgtype.Timestamptz `json:"created_at"`
-}
-
 type EmailVerificationToken struct {
 	ID        int64              `json:"id"`
 	UserID    int64              `json:"user_id"`
@@ -28,32 +15,6 @@ type EmailVerificationToken struct {
 	Token     string             `json:"token"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
-}
-
-type File struct {
-	ID           int64              `json:"id"`
-	UserID       int64              `json:"user_id"`
-	OriginalName string             `json:"original_name"`
-	StoragePath  string             `json:"storage_path"`
-	MimeType     string             `json:"mime_type"`
-	Size         int64              `json:"size"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
-	DeletedAt    pgtype.Timestamptz `json:"deleted_at"`
-}
-
-type Job struct {
-	ID          int64              `json:"id"`
-	Kind        string             `json:"kind"`
-	Payload     []byte             `json:"payload"`
-	Status      string             `json:"status"`
-	Attempts    int32              `json:"attempts"`
-	MaxAttempts int32              `json:"max_attempts"`
-	RunAt       pgtype.Timestamptz `json:"run_at"`
-	LockedAt    pgtype.Timestamptz `json:"locked_at"`
-	LockedBy    pgtype.Text        `json:"locked_by"`
-	LastError   pgtype.Text        `json:"last_error"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
 type PasswordResetToken struct {
