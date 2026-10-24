@@ -123,7 +123,7 @@ func (s *fakeStore) LoadSnapshot(context.Context) (Snapshot, error) {
 func testSnapshot() Snapshot {
 	return Snapshot{
 		Flags: map[Key]FlagState{
-			KeyEmailVerification: {Enabled: true},
+			KeyEmailVerification: {Enabled: boolPtr(true)},
 		},
 		TenantTargets: map[Key]map[int64]bool{
 			KeyEmailVerification: {1: false},
@@ -186,7 +186,7 @@ func TestEvaluatorPrecedence(t *testing.T) {
 			key:        KeyEmailVerification,
 			subject:    Subject{TenantID: 1},
 			env:        map[Key]bool{KeyEmailVerification: false},
-			snapshot:   Snapshot{Flags: map[Key]FlagState{KeyEmailVerification: {Enabled: true}}},
+			snapshot:   Snapshot{Flags: map[Key]FlagState{KeyEmailVerification: {Enabled: boolPtr(true)}}},
 			want:       true,
 			wantSource: SourceDatabaseDefault,
 		},
@@ -227,7 +227,7 @@ func TestEvaluatorPrecedence(t *testing.T) {
 
 func killSwitchSnapshot() Snapshot {
 	snapshot := testSnapshot()
-	snapshot.Flags[KeyEmailVerification] = FlagState{Enabled: true, KillSwitch: true}
+	snapshot.Flags[KeyEmailVerification] = FlagState{Enabled: boolPtr(true), KillSwitch: true}
 	return snapshot
 }
 
@@ -244,7 +244,7 @@ func TestEvaluatorUserTargetIsTenantScoped(t *testing.T) {
 
 func TestEvaluatorDisabledUserTargetOverridesEnabledDefault(t *testing.T) {
 	snapshot := Snapshot{
-		Flags: map[Key]FlagState{KeyUserRegistration: {Enabled: true}},
+		Flags: map[Key]FlagState{KeyUserRegistration: {Enabled: boolPtr(true)}},
 		UserTargets: map[Key]map[UserTargetKey]bool{
 			KeyUserRegistration: {{TenantID: 1, UserID: 9}: false},
 		},
@@ -258,7 +258,7 @@ func TestEvaluatorDisabledUserTargetOverridesEnabledDefault(t *testing.T) {
 
 func TestEvaluatorZeroSubjectUsesContextTenant(t *testing.T) {
 	snapshot := Snapshot{
-		Flags:         map[Key]FlagState{KeyEmailVerification: {Enabled: true}},
+		Flags:         map[Key]FlagState{KeyEmailVerification: {Enabled: boolPtr(true)}},
 		TenantTargets: map[Key]map[int64]bool{KeyEmailVerification: {1: false}},
 	}
 	evaluator := NewEvaluator(Options{Store: &fakeStore{snapshot: snapshot}})
@@ -356,7 +356,7 @@ func TestEvaluatorInvalidationDropsInFlightSnapshot(t *testing.T) {
 	store := StoreFunc(func(context.Context) (Snapshot, error) {
 		startedOnce.Do(func() { close(started) })
 		<-release
-		return Snapshot{Flags: map[Key]FlagState{KeyUserRegistration: {Enabled: false}}}, nil
+		return Snapshot{Flags: map[Key]FlagState{KeyUserRegistration: {Enabled: boolPtr(false)}}}, nil
 	})
 	evaluator := NewEvaluator(Options{Store: store, CacheTTL: time.Minute})
 
@@ -382,5 +382,125 @@ func TestEvaluatorInvalidationDropsInFlightSnapshot(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("evaluation did not finish")
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func TestEvaluatorRowWithoutDatabaseDefaultFallsThrough(t *testing.T) {
+	// A row created only to anchor tenant 2's target must not force a
+	// database default on tenant 1.
+	snapshot := Snapshot{
+		Flags:         map[Key]FlagState{KeyGoogleOAuth: {}},
+		TenantTargets: map[Key]map[int64]bool{KeyGoogleOAuth: {2: true}},
+	}
+	evaluator := NewEvaluator(Options{
+		Store: &fakeStore{snapshot: snapshot},
+		Env:   map[Key]bool{KeyGoogleOAuth: false},
+	})
+
+	got := evaluator.Evaluate(context.Background(), KeyGoogleOAuth, Subject{TenantID: 1})
+	if got.Enabled || got.Source != SourceEnvironment {
+		t.Fatalf("tenant without target = %+v, want environment false", got)
+	}
+	got = evaluator.Evaluate(context.Background(), KeyGoogleOAuth, Subject{TenantID: 2})
+	if !got.Enabled || got.Source != SourceTenantTarget {
+		t.Fatalf("targeted tenant = %+v, want tenant target true", got)
+	}
+}
+
+func TestEvaluatorTargetsApplyWithoutFlagRow(t *testing.T) {
+	snapshot := Snapshot{
+		UserTargets: map[Key]map[UserTargetKey]bool{
+			KeyFileUploads: {{TenantID: 3, UserID: 5}: false},
+		},
+	}
+	evaluator := NewEvaluator(Options{Store: &fakeStore{snapshot: snapshot}})
+	got := evaluator.Evaluate(context.Background(), KeyFileUploads, Subject{TenantID: 3, UserID: 5})
+	if got.Enabled || got.Source != SourceUserTarget {
+		t.Fatalf("user target without row = %+v, want false/user_target", got)
+	}
+	got = evaluator.Evaluate(context.Background(), KeyFileUploads, Subject{TenantID: 3, UserID: 6})
+	if !got.Enabled || got.Source != SourceCompiledDefault {
+		t.Fatalf("untargeted user = %+v, want compiled default true", got)
+	}
+}
+
+func TestEvaluatorLoadIsDetachedFromRequestCancellation(t *testing.T) {
+	var sawErr error
+	var sawDeadline bool
+	store := StoreFunc(func(ctx context.Context) (Snapshot, error) {
+		sawErr = ctx.Err()
+		_, sawDeadline = ctx.Deadline()
+		return killSwitchSnapshot(), nil
+	})
+	evaluator := NewEvaluator(Options{Store: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got := evaluator.Evaluate(ctx, KeyEmailVerification, Subject{TenantID: 1})
+	if sawErr != nil {
+		t.Fatalf("load context error = %v, want detached from request cancellation", sawErr)
+	}
+	if !sawDeadline {
+		t.Fatal("load context must carry a bounded timeout")
+	}
+	if got.Source != SourceKillSwitch {
+		t.Fatalf("Evaluate() = %+v, want kill switch from the loaded snapshot", got)
+	}
+}
+
+func TestEvaluatorCanceledLoadIsNotThrottled(t *testing.T) {
+	store := &fakeStore{snapshot: killSwitchSnapshot(), err: context.Canceled}
+	evaluator := NewEvaluator(Options{Store: store, CacheTTL: time.Minute})
+
+	_ = evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+	store.err = nil
+	got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+	if store.loads != 2 {
+		t.Fatalf("store loads = %d, want an immediate retry after a canceled load", store.loads)
+	}
+	if got.Source != SourceKillSwitch {
+		t.Fatalf("Evaluate() = %+v, want kill switch after retry", got)
+	}
+}
+
+func TestEvaluatorInvalidateKeepsSnapshotAsFallback(t *testing.T) {
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{snapshot: killSwitchSnapshot()}
+	evaluator := NewEvaluator(Options{
+		Store:        store,
+		CacheTTL:     10 * time.Second,
+		MaxStaleness: 60 * time.Second,
+		Env:          map[Key]bool{KeyEmailVerification: true},
+		Now:          func() time.Time { return now },
+	})
+
+	if got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1}); got.Source != SourceKillSwitch {
+		t.Fatalf("initial evaluation = %+v, want kill switch", got)
+	}
+	if err := evaluator.Invalidate(context.Background()); err != nil {
+		t.Fatalf("Invalidate: %v", err)
+	}
+
+	// The reload after invalidation fails: the kill switch must stay in force
+	// instead of failing open to the environment value.
+	store.err = errors.New("database down")
+	got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+	if got.Enabled || got.Source != SourceKillSwitch {
+		t.Fatalf("evaluation after invalidate+failure = %+v, want stale kill switch", got)
+	}
+	if store.loads != 2 {
+		t.Fatalf("store loads = %d, want a reload attempt after invalidation", store.loads)
+	}
+
+	// Once the database recovers and the failure throttle expires, the
+	// invalidated snapshot is replaced.
+	store.err = nil
+	store.snapshot = Snapshot{}
+	now = now.Add(11 * time.Second)
+	got = evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+	if !got.Enabled || got.Source != SourceEnvironment {
+		t.Fatalf("evaluation after recovery = %+v, want environment true", got)
 	}
 }

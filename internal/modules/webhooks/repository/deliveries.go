@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -30,6 +31,7 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraf
 			Payload:          draft.Payload,
 			SecretCiphertext: draft.SecretCiphertext,
 			MaxAttempts:      draft.MaxAttempts,
+			TimeoutMs:        draft.TimeoutMS,
 			ReplayedFromID:   nullableInt8(draft.ReplayedFromID),
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -187,7 +189,49 @@ func (r *Postgres) PurgeDeliveries(ctx context.Context, retentionDays int32) (in
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
-	return r.q.PurgeWebhookDeliveries(ctx, retentionDays)
+	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
+		return r.q.PurgeWebhookDeliveries(ctx, webhooksqlc.PurgeWebhookDeliveriesParams{
+			RetentionDays: retentionDays,
+			BatchSize:     purgeBatchSize,
+		})
+	})
+}
+
+// purgeInBatches runs bounded retention batches until one is short (the
+// backlog is drained) or ctx ends, so a large backlog never holds one long
+// transaction or lock set. Rows deleted before an error are still returned.
+func purgeInBatches(ctx context.Context, batch func(context.Context) (int64, error)) (int64, error) {
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, fmt.Errorf("webhooks: purge: %w", err)
+		}
+		deleted, err := batch(ctx)
+		if err != nil {
+			return total, fmt.Errorf("webhooks: purge: %w", err)
+		}
+		total += deleted
+		if deleted < purgeBatchSize {
+			return total, nil
+		}
+	}
+}
+
+// ExpireUnclaimableDelivery dead-letters a pending delivery that can never be
+// claimed again (inactive endpoint or exhausted attempts). It reports whether
+// the delivery was expired; a live claim lease is never touched.
+func (r *Postgres) ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error) {
+	if r == nil || r.q == nil {
+		return false, ErrNoPool
+	}
+	affected, err := r.q.ExpireUnclaimableWebhookDelivery(ctx, webhooksqlc.ExpireUnclaimableWebhookDeliveryParams{
+		ID:       id,
+		TenantID: tenantID(ctx),
+	})
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 func httpStatus(code int) int32 {

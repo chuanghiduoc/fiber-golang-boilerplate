@@ -18,6 +18,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -43,7 +44,7 @@ func setupIntegrationApp(t *testing.T) *fiber.App {
 
 	userRepo := identityrepo.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, nil, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, audit.Noop{}, sessionStore)
 	userHandler := NewUserHandler(userSvc)
 
 	app := fiber.New(fiber.Config{

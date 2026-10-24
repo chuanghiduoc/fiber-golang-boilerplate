@@ -11,7 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -24,7 +25,7 @@ func testContext(tenantID int64) context.Context {
 }
 
 func newTestService(repo *mockRepository, sender *mockEmailSender) NotificationService {
-	recipients := &mockRecipientLookup{recipients: map[int64]contracts.NotificationRecipient{
+	recipients := &mockRecipientLookup{recipients: map[int64]identitycontracts.NotificationRecipient{
 		10: {UserID: 10, Email: "user10@example.com", Name: "User Ten"},
 		11: {UserID: 11, Email: "user11@example.com", Name: "User Eleven"},
 	}}
@@ -57,7 +58,7 @@ func TestCreateStoresInAppAndQueuesEmail(t *testing.T) {
 	sender := &mockEmailSender{}
 	svc := newTestService(repo, sender)
 
-	result, err := svc.Create(testContext(1), contracts.CreateNotificationInput{
+	result, err := svc.Create(testContext(1), notificationcontracts.CreateNotificationInput{
 		UserID: 10,
 		Type:   "security.alert",
 		Title:  "Security <alert>",
@@ -95,7 +96,7 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 	_, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelInApp, Enabled: false})
 	require.NoError(t, err)
 
-	result, err := svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "security.alert", Title: "Email only", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -109,7 +110,7 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelEmail, Enabled: false})
 	require.NoError(t, err)
 
-	result, err = svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "security.alert", Title: "In-app only", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -120,7 +121,7 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 
 	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelInApp, Enabled: false})
 	require.NoError(t, err)
-	result, err = svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "security.alert", Title: "Suppressed", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -135,7 +136,7 @@ func TestCreateRollsBackWhenEmailEnqueueFails(t *testing.T) {
 	sender := &mockEmailSender{fail: errors.New("queue unavailable")}
 	svc := newTestService(repo, sender)
 
-	result, err := svc.Create(testContext(1), contracts.CreateNotificationInput{
+	result, err := svc.Create(testContext(1), notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "security.alert", Title: "Atomic", Body: "Body",
 	})
 	require.Error(t, err)
@@ -151,31 +152,31 @@ func TestCreateRollsBackWhenEmailEnqueueFails(t *testing.T) {
 func TestCreateRejectsInvalidInput(t *testing.T) {
 	tests := []struct {
 		name  string
-		input contracts.CreateNotificationInput
+		input notificationcontracts.CreateNotificationInput
 		ctx   context.Context
 		code  int
 	}{
 		{
 			name:  "missing user",
-			input: contracts.CreateNotificationInput{Type: "system.info", Title: "Title", Body: "Body"},
+			input: notificationcontracts.CreateNotificationInput{Type: "system.info", Title: "Title", Body: "Body"},
 			ctx:   testContext(1),
 			code:  400,
 		},
 		{
 			name:  "empty title",
-			input: contracts.CreateNotificationInput{UserID: 10, Type: "system.info", Body: "Body"},
+			input: notificationcontracts.CreateNotificationInput{UserID: 10, Type: "system.info", Body: "Body"},
 			ctx:   testContext(1),
 			code:  400,
 		},
 		{
 			name:  "uppercase type",
-			input: contracts.CreateNotificationInput{UserID: 10, Type: "System.Info", Title: "Title", Body: "Body"},
+			input: notificationcontracts.CreateNotificationInput{UserID: 10, Type: "System.Info", Title: "Title", Body: "Body"},
 			ctx:   testContext(1),
 			code:  400,
 		},
 		{
 			name: "data array",
-			input: contracts.CreateNotificationInput{
+			input: notificationcontracts.CreateNotificationInput{
 				UserID: 10, Type: "system.info", Title: "Title", Body: "Body", Data: json.RawMessage(`[1]`),
 			},
 			ctx:  testContext(1),
@@ -183,7 +184,7 @@ func TestCreateRejectsInvalidInput(t *testing.T) {
 		},
 		{
 			name: "data null",
-			input: contracts.CreateNotificationInput{
+			input: notificationcontracts.CreateNotificationInput{
 				UserID: 10, Type: "system.info", Title: "Title", Body: "Body", Data: json.RawMessage(`null`),
 			},
 			ctx:  testContext(1),
@@ -191,7 +192,7 @@ func TestCreateRejectsInvalidInput(t *testing.T) {
 		},
 		{
 			name: "tenant mismatch",
-			input: contracts.CreateNotificationInput{
+			input: notificationcontracts.CreateNotificationInput{
 				TenantID: 2, UserID: 10, Type: "system.info", Title: "Title", Body: "Body",
 			},
 			ctx:  testContext(1),
@@ -217,7 +218,7 @@ func TestCreateUsesExplicitTenantWhenContextHasNone(t *testing.T) {
 	repo := newMockRepository()
 	svc := newTestService(repo, &mockEmailSender{})
 
-	result, err := svc.Create(context.Background(), contracts.CreateNotificationInput{
+	result, err := svc.Create(context.Background(), notificationcontracts.CreateNotificationInput{
 		TenantID: 2, UserID: 10, Type: "system.info", Title: "Explicit tenant", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -228,7 +229,7 @@ func TestCreateUsesExplicitTenantWhenContextHasNone(t *testing.T) {
 func TestCreateEmailOnlyWithoutTransactionManager(t *testing.T) {
 	repo := newMockRepository()
 	sender := &mockEmailSender{}
-	recipients := &mockRecipientLookup{recipients: map[int64]contracts.NotificationRecipient{
+	recipients := &mockRecipientLookup{recipients: map[int64]identitycontracts.NotificationRecipient{
 		10: {UserID: 10, Email: "user10@example.com"},
 	}}
 	svc := NewNotificationService(repo, recipients, sender, nil)
@@ -237,7 +238,7 @@ func TestCreateEmailOnlyWithoutTransactionManager(t *testing.T) {
 	_, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "system.info", Channel: ChannelInApp, Enabled: false})
 	require.NoError(t, err)
 
-	result, err := svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "system.info", Title: "Email only", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -252,7 +253,7 @@ func TestCreateRequiresRecipient(t *testing.T) {
 	repo := newMockRepository()
 	svc := newTestService(repo, &mockEmailSender{})
 
-	_, err := svc.Create(testContext(1), contracts.CreateNotificationInput{
+	_, err := svc.Create(testContext(1), notificationcontracts.CreateNotificationInput{
 		UserID: 99, Type: "system.info", Title: "Title", Body: "Body",
 	})
 	require.Error(t, err)
@@ -398,7 +399,7 @@ func TestNotifyHonorsSuppressionAndQueueErrors(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}
-	err := svc.Notify(ctx, contracts.CreateNotificationInput{
+	err := svc.Notify(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "system.info", Title: "Suppressed", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -409,7 +410,7 @@ func TestNotifyHonorsSuppressionAndQueueErrors(t *testing.T) {
 	})
 	require.NoError(t, err)
 	sender.fail = errors.New("queue unavailable")
-	err = svc.Notify(ctx, contracts.CreateNotificationInput{
+	err = svc.Notify(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "system.info", Title: "Fails", Body: "Body",
 	})
 	require.Error(t, err)

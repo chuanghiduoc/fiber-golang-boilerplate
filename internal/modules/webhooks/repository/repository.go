@@ -30,6 +30,8 @@ const (
 	// budget is generous because a transient database outage between an HTTP
 	// attempt and bookkeeping should not strand the delivery.
 	deliveryJobMaxAttempts = 20
+	// purgeBatchSize bounds one retention DELETE statement.
+	purgeBatchSize = 1000
 )
 
 var (
@@ -92,6 +94,7 @@ type DeliveryDraft struct {
 	Payload          json.RawMessage
 	SecretCiphertext string
 	MaxAttempts      int32
+	TimeoutMS        int32
 	RunAt            time.Time
 	ReplayedFromID   int64
 }
@@ -165,6 +168,7 @@ type DeliveryStore interface {
 	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error)
 	MarkDeliverySucceeded(ctx context.Context, id int64, statusCode int) error
 	MarkDeliveryDead(ctx context.Context, id int64, statusCode int, reason string) error
+	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error
 	ListDeliveryAttempts(ctx context.Context, deliveryID int64) ([]webhooksqlc.WebhookDeliveryAttempt, error)

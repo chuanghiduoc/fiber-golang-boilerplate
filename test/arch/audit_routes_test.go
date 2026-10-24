@@ -1,25 +1,11 @@
 package arch_test
 
 import (
-	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
-	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
-	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
-	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 )
-
-const guardTestSecret = "audit-route-coverage-secret"
 
 // tier1Mutations are audited inside the service's database transaction. They
 // must not also carry a route-level Guard intent row.
@@ -34,49 +20,36 @@ var tier1Mutations = map[string]bool{
 	"POST /api/v1/admin/users/:id/unban":   true,
 	"DELETE /api/v1/admin/files/:id":       true,
 	"POST /api/v1/admin/files/:id/restore": true,
+	// API-key lifecycle: apikeys service records in the mutation transaction.
+	"POST /api/v1/admin/api-keys/":           true,
+	"PUT /api/v1/admin/api-keys/:id":         true,
+	"DELETE /api/v1/admin/api-keys/:id":      true,
+	"POST /api/v1/admin/api-keys/:id/revoke": true,
+	"POST /api/v1/admin/api-keys/:id/rotate": true,
 }
 
-// testIdempotency is a named marker so the coverage test can find the
-// idempotency position in the handler chain.
-func testIdempotency(c fiber.Ctx) error { return c.Next() }
-
-func passthrough(c fiber.Ctx) error { return c.Next() }
-
-func handlerName(handler fiber.Handler) string {
-	if handler == nil {
-		return ""
-	}
-	fn := runtime.FuncForPC(reflect.ValueOf(handler).Pointer())
-	if fn == nil {
-		return ""
-	}
-	return fn.Name()
+// fallbackAudited are existing mutating routes that are neither Tier 1 nor
+// wrapped by audit.Guard. They are recorded only by the best-effort global
+// audit.Middleware (plus, for the receiver, a best-effort service event), so
+// an unavailable audit store does not fail them. Privileged mutations must be
+// Tier 1 or guarded; only non-privileged writes belong here.
+var fallbackAudited = map[string]bool{
+	// Public receiver: authenticated by the source HMAC, deduplicated per
+	// (source, X-Webhook-Id); every accepted event is stored.
+	"POST /api/v1/webhooks/inbound/:id": true,
+	// The caller's own notification state, not privileged configuration.
+	"POST /api/v1/notifications/read-all":   true,
+	"POST /api/v1/notifications/:id/read":   true,
+	"PUT /api/v1/notification-preferences/": true,
 }
 
 func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: guardTestSecret}}
-	deps := app.Deps{
-		Config: cfg,
-		Limiters: app.Limiters{
-			Strict:  passthrough,
-			Normal:  passthrough,
-			Relaxed: passthrough,
-		},
-		Idempotency: testIdempotency,
-		Audit:       audit.Noop{},
-	}
-
-	fiberApp := fiber.New()
-	v1 := fiberApp.Group("/api/v1")
-	identity.New(
-		identityhandler.NewAuthHandler(nil, nil, nil, nil, guardTestSecret, 24, false, nil),
-		identityhandler.NewUserHandler(nil),
-	).RegisterRoutes(v1, deps)
-	files.New(fileshandler.NewUploadHandler(nil, 0, nil)).RegisterRoutes(v1, deps)
-	admin.New(adminhandler.NewHandler(nil)).RegisterRoutes(v1, deps)
+	endpoints, _ := moduleRoutes(t)
 
 	seenTier1 := make(map[string]bool, len(tier1Mutations))
-	for _, route := range fiberApp.GetRoutes(true) {
+	seenFallback := make(map[string]bool, len(fallbackAudited))
+	for _, mounted := range endpoints {
+		route := mounted.route
 		mutating := route.Method == fiber.MethodPost ||
 			route.Method == fiber.MethodPut ||
 			route.Method == fiber.MethodPatch ||
@@ -89,6 +62,13 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 		key := route.Method + " " + route.Path
 		if tier1Mutations[key] {
 			seenTier1[key] = true
+			if handlerChainContains(route, "audit.Guard") {
+				t.Errorf("Tier 1 route %s must not also carry audit.Guard (double intent row)", key)
+			}
+			continue
+		}
+		if fallbackAudited[key] {
+			seenFallback[key] = true
 			continue
 		}
 
@@ -104,7 +84,7 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 			}
 		}
 		if guardIndex < 0 {
-			t.Errorf("mutating route %s is neither Tier 1 nor wrapped by audit.Guard", key)
+			t.Errorf("module %s: mutating route %s is neither Tier 1 nor wrapped by audit.Guard", mounted.module, key)
 			continue
 		}
 		if idempotencyIndex >= 0 && idempotencyIndex > guardIndex {
@@ -116,6 +96,11 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 	for key := range tier1Mutations {
 		if !seenTier1[key] {
 			t.Errorf("Tier 1 route %s is missing; update the coverage map with the real route", key)
+		}
+	}
+	for key := range fallbackAudited {
+		if !seenFallback[key] {
+			t.Errorf("fallback-audited route %s no longer exists (or became guarded); remove it from the list", key)
 		}
 	}
 }

@@ -3,9 +3,7 @@ package handler
 import (
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // HTTP helpers shared across handlers live in platform/httpx. These
@@ -25,14 +23,4 @@ func contentDispositionAttachment(name string) string {
 
 func cursorQuery(c fiber.Ctx) (limit int, startingAfter string, err error) {
 	return httpx.CursorQuery(c)
-}
-
-// nextFileCursor exposes the opaque cursor clients must pass as startingAfter
-// on the next request.
-func nextFileCursor(items []dto.FileResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }

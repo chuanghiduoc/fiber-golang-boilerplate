@@ -26,7 +26,11 @@ const httpInstrumentationName = "github.com/chuanghiduoc/fiber-golang-boilerplat
 // route template (never the raw path or query), method, status, request ID,
 // user ID, tenant ID, and an application error code. Error messages, request
 // bodies, headers, and payloads are never attached.
-func Tracing(tp trace.TracerProvider, excludePaths []string) fiber.Handler {
+//
+// trustIncoming (OTEL_TRUST_INCOMING_TRACE) controls whether an incoming
+// traceparent is honored. When the app trusts a proxy (APP_TRUST_PROXY), it
+// is honored only from a peer in APP_TRUSTED_PROXIES.
+func Tracing(tp trace.TracerProvider, excludePaths []string, trustIncoming bool) fiber.Handler {
 	excluded := make(map[string]struct{}, len(excludePaths))
 	for _, path := range excludePaths {
 		if path != "" {
@@ -45,7 +49,12 @@ func Tracing(tp trace.TracerProvider, excludePaths []string) fiber.Handler {
 
 		// W3C trace context from an upstream service or load balancer is
 		// parsed by the OpenTelemetry propagator; malformed values are ignored.
-		ctx := tracing.ExtractRemoteContext(c.Context(), c.Get(tracing.TraceParentHeader))
+		// An untrusted caller's traceparent is dropped: with a parent-based
+		// sampler its sampled flag would otherwise force 100% sampling.
+		ctx := c.Context()
+		if trustIncoming && incomingTraceTrusted(c) {
+			ctx = tracing.ExtractRemoteContext(ctx, c.Get(tracing.TraceParentHeader))
+		}
 		route := routeTemplate(c)
 		ctx, span := tracer.Start(ctx, httpSpanName(c.Method(), route),
 			trace.WithSpanKind(trace.SpanKindServer),
@@ -109,6 +118,16 @@ func routeTemplate(c fiber.Ctx) string {
 		return ""
 	}
 	return route
+}
+
+// incomingTraceTrusted reports whether the direct peer may set the trace
+// parent. Without proxy trust configured there is no peer allowlist, so the
+// OTEL_TRUST_INCOMING_TRACE opt-in alone decides.
+func incomingTraceTrusted(c fiber.Ctx) bool {
+	if !c.App().Config().TrustProxy {
+		return true
+	}
+	return c.IsProxyTrusted()
 }
 
 func httpSpanName(method, route string) string {

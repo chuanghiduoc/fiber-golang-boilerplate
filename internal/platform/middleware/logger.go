@@ -9,6 +9,8 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // sensitiveQueryKeys are redacted before a request URL is written to logs.
@@ -66,6 +68,9 @@ func Logger() fiber.Handler {
 		attrs = append(attrs, traceAttrs(c.Context())...)
 
 		switch {
+		case status == apperror.StatusClientClosedRequest:
+			// A client disconnect is expected noise, not a request failure.
+			slog.LogAttrs(c.Context(), slog.LevelInfo, "request", attrs...)
 		case status >= 500:
 			slog.LogAttrs(c.Context(), slog.LevelError, "request", attrs...)
 		case status >= 400:

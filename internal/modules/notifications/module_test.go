@@ -15,10 +15,11 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -30,7 +31,7 @@ type routeService struct {
 	createCalls  int
 }
 
-func (s *routeService) Create(_ context.Context, input contracts.CreateNotificationInput) (service.CreateResult, error) {
+func (s *routeService) Create(_ context.Context, input notificationcontracts.CreateNotificationInput) (service.CreateResult, error) {
 	s.createCalls++
 	now := time.Now().UTC()
 	return service.CreateResult{
@@ -42,7 +43,9 @@ func (s *routeService) Create(_ context.Context, input contracts.CreateNotificat
 	}, nil
 }
 
-func (s *routeService) Notify(context.Context, contracts.CreateNotificationInput) error { return nil }
+func (s *routeService) Notify(context.Context, notificationcontracts.CreateNotificationInput) error {
+	return nil
+}
 
 func (s *routeService) Get(context.Context, int64, int64) (*dto.NotificationResponse, error) {
 	return &dto.NotificationResponse{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body"}, nil
@@ -81,10 +84,25 @@ func newRouteApp(t *testing.T, svc *routeService) *fiber.App {
 		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{Cache: cache.NewMemoryCache()})
+	application := app.New(cfg, app.Deps{Cache: cache.NewMemoryCache(), Audit: &intentRecorder{}})
 	application.Register(New(notificationshandler.New(svc)))
 	return application.Fiber()
 }
+
+// intentRecorder implements the Guard recorder contracts so the required
+// audit guard on the admin send can write intent rows in tests.
+type intentRecorder struct {
+	intents []audit.Event
+}
+
+func (r *intentRecorder) Record(context.Context, audit.Event) error { return nil }
+
+func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (int64, error) {
+	r.intents = append(r.intents, event)
+	return int64(len(r.intents)), nil
+}
+
+func (r *intentRecorder) Complete(context.Context, int64, audit.Completion) error { return nil }
 
 func doRoute(t *testing.T, application *fiber.App, method, path, jwt string, body any) (resp *http.Response, payload []byte) {
 	t.Helper()
@@ -133,8 +151,30 @@ func TestModuleRequiresAuthenticationAndPermissions(t *testing.T) {
 	resp, _ = doRoute(t, application, http.MethodPost, "/api/v1/notifications/send", adminToken, map[string]any{
 		"userId": 11, "type": "system.info", "title": "Title", "body": "Body",
 	})
-	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
 	assert.Equal(t, 1, svc.createCalls)
+}
+
+func TestModuleSendFailsClosedWithoutAuditStore(t *testing.T) {
+	svc := &routeService{}
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		JWT:       config.JWTConfig{Secret: "test-secret"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	// No Deps.Audit: the required Guard has no intent-capable recorder.
+	application := app.New(cfg, app.Deps{Cache: cache.NewMemoryCache()})
+	application.Register(New(notificationshandler.New(svc)))
+
+	adminToken, err := token.GenerateWithTenant(1, 2, "admin@example.com", "admin", "test-secret", 24)
+	require.NoError(t, err)
+	resp, _ := doRoute(t, application.Fiber(), http.MethodPost, "/api/v1/notifications/send", adminToken, map[string]any{
+		"userId": 11, "type": "system.info", "title": "Title", "body": "Body",
+	})
+	assert.Equal(t, fiber.StatusServiceUnavailable, resp.StatusCode)
+	assert.Zero(t, svc.createCalls, "an unaudited send must not reach the service")
 }
 
 func TestModuleWriteRoutesAreIdempotent(t *testing.T) {

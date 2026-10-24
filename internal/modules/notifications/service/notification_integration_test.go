@@ -13,7 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
@@ -33,17 +34,17 @@ func integrationTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
 	return id
 }
 
-func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
+func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address string) int64 {
 	t.Helper()
 	var id int64
 	require.NoError(t, pool.QueryRow(context.Background(),
 		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`,
-		tenantID, email,
+		tenantID, address,
 	).Scan(&id))
 	return id
 }
 
-func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients contracts.NotificationRecipientLookup) NotificationService {
+func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) NotificationService {
 	t.Helper()
 	sender := jobs.NewQueuedSender(jobs.NewQueue(pool))
 	return NewNotificationService(
@@ -54,12 +55,12 @@ func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients contract
 	)
 }
 
-type staticRecipients map[int64]contracts.NotificationRecipient
+type staticRecipients map[int64]identitycontracts.NotificationRecipient
 
-func (s staticRecipients) NotificationRecipient(_ context.Context, userID int64) (contracts.NotificationRecipient, error) {
+func (s staticRecipients) NotificationRecipient(_ context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
 	recipient, ok := s[userID]
 	if !ok {
-		return contracts.NotificationRecipient{}, apperror.ErrNotFound
+		return identitycontracts.NotificationRecipient{}, apperror.ErrNotFound
 	}
 	return recipient, nil
 }
@@ -81,7 +82,7 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 	svc := newIntegrationService(t, pool, recipients)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	result, err := svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userOne,
 		Type:   "security.alert",
 		Title:  "Sign-in from a new device",
@@ -118,7 +119,7 @@ func TestCreateIntegrationPersistsRowAndEmailJob(t *testing.T) {
 
 	// The same service called in the second tenant writes only tenant-two data.
 	ctxTwo := tenant.WithID(context.Background(), tenantTwo)
-	resultTwo, err := svc.Create(ctxTwo, contracts.CreateNotificationInput{
+	resultTwo, err := svc.Create(ctxTwo, notificationcontracts.CreateNotificationInput{
 		UserID: userTwo, Type: "system.info", Title: "Tenant two", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -157,7 +158,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 		Type: "marketing.promo", Channel: ChannelEmail, Enabled: false,
 	})
 	require.NoError(t, err)
-	result, err := svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "marketing.promo", Title: "In-app only", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -174,7 +175,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 		Type: "marketing.promo", Channel: ChannelInApp, Enabled: false,
 	})
 	require.NoError(t, err)
-	result, err = svc.Create(ctx, contracts.CreateNotificationInput{
+	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "marketing.promo", Title: "Suppressed", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -186,7 +187,7 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 		Type: "marketing.promo", Channel: ChannelInApp, Enabled: true,
 	})
 	require.NoError(t, err)
-	_, err = svc.Create(ctx, contracts.CreateNotificationInput{
+	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "marketing.promo", Title: "Read me", Body: "Body",
 	})
 	require.NoError(t, err)
@@ -229,7 +230,7 @@ func TestCreateIntegrationRollsBackNotificationWhenQueueFails(t *testing.T) {
 	_, err = pool.Exec(ctx, `DROP TABLE jobs`)
 	require.NoError(t, err)
 
-	_, err = svc.Create(ctx, contracts.CreateNotificationInput{
+	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "system.info", Title: "Atomic", Body: "Body",
 	})
 	require.Error(t, err)

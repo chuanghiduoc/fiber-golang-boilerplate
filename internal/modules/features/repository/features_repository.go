@@ -60,8 +60,15 @@ func (r *featureRepository) UpsertFlag(ctx context.Context, params featuressqlc.
 	return flag, nil
 }
 
+// DeleteFlag relies on the RESTRICT foreign key instead of a count-then-delete
+// check, so a target inserted concurrently in any tenant still blocks the
+// delete. The conflict deliberately does not say which tenants own targets.
 func (r *featureRepository) DeleteFlag(ctx context.Context, key string) error {
 	if _, err := r.q.DeleteFeatureFlag(ctx, key); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == flagKeyFK {
+			return apperror.NewConflict("feature flag has targets; delete them before deleting the flag")
+		}
 		return wrapErr(err)
 	}
 	return nil
@@ -110,6 +117,11 @@ func (r *featureRepository) DeleteTarget(ctx context.Context, key string, id int
 	return nil
 }
 
+// flagKeyFK is the feature_flag_targets -> feature_flags constraint. It is ON
+// DELETE RESTRICT, so it fires when a flag is deleted while targets exist (in
+// any tenant), or when a target upsert races a concurrent flag delete.
+const flagKeyFK = "feature_flag_targets_flag_key_fk"
+
 // wrapErr translates persistence errors into application sentinels without
 // leaking SQL or driver types to the service.
 func wrapErr(err error) error {
@@ -120,6 +132,10 @@ func wrapErr(err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23503": // foreign_key_violation
+			if pgErr.ConstraintName == flagKeyFK {
+				// A target upsert lost a race with a concurrent flag delete.
+				return apperror.NewConflict("feature flag was modified concurrently; retry the request")
+			}
 			return apperror.NewBadRequest("target references a user or tenant outside the current scope")
 		case "23505": // unique_violation
 			return apperror.NewConflict("feature flag target already exists")

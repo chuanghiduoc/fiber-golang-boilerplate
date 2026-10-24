@@ -15,7 +15,10 @@ func Recovery(env string) fiber.Handler {
 			if r := recover(); r != nil {
 				stackTrace := debug.Stack()
 
+				// request_id is empty when the panic happened before the
+				// RequestID middleware ran (outermost Recovery).
 				slog.Error("panic recovered",
+					slog.String("request_id", fiber.Locals[string](c, "request_id")),
 					slog.Any("error", r),
 					slog.String("stack", string(stackTrace)),
 				)

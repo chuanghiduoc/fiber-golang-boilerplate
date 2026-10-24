@@ -800,7 +800,6 @@ definitions:
       killSwitch:
         type: boolean
     required:
-    - enabled
     - killSwitch
     type: object
   featuresdto.UpsertTargetRequest:
@@ -1157,8 +1156,9 @@ paths:
       - Admin
   /admin/features/flags/{key}:
     delete:
-      description: Delete the database default and all targets, reverting the flag
-        to environment and compiled defaults
+      description: Delete the process-wide flag row, reverting the flag to environment
+        and compiled defaults. Platform tenant administrators only; returns 409 while
+        targets exist in any tenant.
       parameters:
       - description: Feature flag key
         in: path
@@ -1180,6 +1180,10 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "404":
           description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
@@ -1223,8 +1227,9 @@ paths:
     put:
       consumes:
       - application/json
-      description: Replace the database default, kill switch, and description for
-        a compile-time flag
+      description: Replace the process-wide database default (omit enabled to clear
+        it), kill switch, and description for a compile-time flag. Platform tenant
+        administrators only; other tenants get 403 permission.denied.
       parameters:
       - description: Feature flag key
         in: path
@@ -1989,6 +1994,10 @@ paths:
           description: Bad Request
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: feature.disabled when user_registration is off
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "422":
           description: Unprocessable Entity
           schema:
@@ -2323,6 +2332,10 @@ paths:
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: feature.disabled when file_uploads is off
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "413":
           description: Request Entity Too Large
           schema:
@@ -2571,8 +2584,8 @@ paths:
       produces:
       - application/json
       responses:
-        "200":
-          description: OK
+        "201":
+          description: Created
           schema:
             $ref: '#/definitions/dto.SendNotificationResponse'
         "400":

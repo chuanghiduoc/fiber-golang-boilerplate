@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v3"
 
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
@@ -63,7 +65,7 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore, nextUserCursor(users))
+	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u admindto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
 }
 
 // UpdateRole godoc
@@ -185,7 +187,7 @@ func (h *Handler) ListFiles(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, files, hasMore, nextFileCursor(files))
+	return response.List(c, files, hasMore, pagination.NextCursor(files, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
 // DownloadFile godoc
@@ -265,22 +267,4 @@ func (h *Handler) RestoreFile(c fiber.Ctx) error {
 		return err
 	}
 	return response.Success(c, file)
-}
-
-// nextUserCursor exposes the opaque cursor clients must pass as startingAfter
-// on the next request.
-func nextUserCursor(items []admindto.UserResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
-}
-
-func nextFileCursor(items []admindto.FileResponse) string {
-	if len(items) == 0 {
-		return ""
-	}
-	last := items[len(items)-1]
-	return pagination.EncodeCursor(last.CreatedAt, last.ID)
 }

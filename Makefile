@@ -65,8 +65,14 @@ migrate-up:
 migrate-down:
 	@migrate -path migrations -database "$(DSN)" down
 
+# Timestamp versions (UTC, 20060102150405) instead of -seq: two branches that
+# each add a migration no longer collide on the same number. Files are named
+# <ts>_<module>_<purpose>.{up,down}.sql; test/arch/migrations_test.go rejects
+# duplicate versions, missing up/down pairs, and unknown owners.
+# Usage: make migrate-create module=files name=add_checksum
 migrate-create:
-	@migrate create -ext sql -dir migrations -seq $(name)
+	@test -n "$(module)" -a -n "$(name)" || { echo "usage: make migrate-create module=<module|platform> name=<purpose>"; exit 1; }
+	@migrate create -ext sql -dir migrations -format 20060102150405 -tz UTC $(module)_$(name)
 
 # SQLC
 sqlc-generate:

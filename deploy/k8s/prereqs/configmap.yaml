@@ -16,6 +16,8 @@ data:
   # APP_BODY_LIMIT must stay above STORAGE_MAX_FILE_SIZE: multipart framing
   # adds overhead before the upload handler can enforce the file limit.
   APP_BODY_LIMIT: "12582912"
+  # Every non-multipart body (JSON, forms) is capped at this smaller limit.
+  APP_JSON_BODY_LIMIT: "1048576"
   APP_REQUEST_TIMEOUT: "30"
   LOG_LEVEL: "info"
   # Replace with the public frontend origin (https is enforced in production).
@@ -133,6 +135,9 @@ data:
   OTEL_TRACES_SAMPLER_ARG: "0.1"
   OTEL_TRACING_EXCLUDE_PATHS: "/healthz,/readyz,/health,/metrics"
   OTEL_INSTRUMENT_DB: "true"
+  # Honor incoming traceparent only from APP_TRUSTED_PROXIES; off by default
+  # so clients cannot force sampling.
+  OTEL_TRUST_INCOMING_TRACE: "false"
   OTEL_BATCH_TIMEOUT_SECS: "5"
   OTEL_EXPORT_TIMEOUT_SECS: "30"
   OTEL_SHUTDOWN_TIMEOUT_SECS: "10"

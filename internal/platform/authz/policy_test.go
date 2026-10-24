@@ -10,15 +10,15 @@ import (
 
 func TestSubject_Permissions(t *testing.T) {
 	roleSubject := NewSubject(10, 1, RoleUser)
-	if !roleSubject.Has(PermissionFilesRead) {
+	if !roleSubject.Has(testPermissionRead) {
 		t.Fatal("role subject should derive files:read from the user role")
 	}
 	if roleSubject.Has(PermissionAdminUsersRead) {
 		t.Fatal("role subject must not gain admin permissions")
 	}
 
-	scoped := NewSubjectWithPermissions(10, 1, RoleAdmin, PermissionFilesRead)
-	if !scoped.Has(PermissionFilesRead) {
+	scoped := NewSubjectWithPermissions(10, 1, RoleAdmin, testPermissionRead)
+	if !scoped.Has(testPermissionRead) {
 		t.Fatal("explicit scope should be granted")
 	}
 	if scoped.Has(PermissionAdminUsersRead) {
@@ -29,7 +29,7 @@ func TestSubject_Permissions(t *testing.T) {
 	if empty.Permissions == nil {
 		t.Fatal("explicit empty scopes must be non-nil")
 	}
-	if empty.Has(PermissionAdminUsersRead) || empty.Has(PermissionFilesRead) {
+	if empty.Has(PermissionAdminUsersRead) || empty.Has(testPermissionRead) {
 		t.Fatal("explicit empty scopes must deny everything")
 	}
 }
@@ -51,13 +51,13 @@ func TestSubject_ContextHelpers(t *testing.T) {
 	if _, ok := SubjectFromContext(ctx); ok {
 		t.Fatal("empty context must not contain a subject")
 	}
-	subject := NewSubjectWithPermissions(7, 3, RoleUser, PermissionFilesRead)
+	subject := NewSubjectWithPermissions(7, 3, RoleUser, testPermissionRead)
 	ctx = WithSubject(ctx, subject)
 	got, ok := SubjectFromContext(ctx)
 	if !ok {
 		t.Fatal("subject missing from context")
 	}
-	if got.UserID != 7 || got.TenantID != 3 || !got.Has(PermissionFilesRead) {
+	if got.UserID != 7 || got.TenantID != 3 || !got.Has(testPermissionRead) {
 		t.Fatalf("subject = %+v, want user 7 tenant 3 files:read", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestAuthorize_MapsDecisions(t *testing.T) {
 	resource := Resource{TenantID: 1, OwnerID: 1}
 
 	t.Run("missing subject is forbidden", func(t *testing.T) {
-		err := Authorize(context.Background(), PermissionFilesRead, resource, TenantPolicy{})
+		err := Authorize(context.Background(), testPermissionRead, resource, TenantPolicy{})
 		requirePermissionDenied(t, err)
 	})
 
@@ -121,20 +121,20 @@ func TestAuthorize_MapsDecisions(t *testing.T) {
 
 	t.Run("policy deny is forbidden", func(t *testing.T) {
 		subject := NewSubject(1, 1, RoleUser)
-		err := AuthorizeSubject(subject, PermissionFilesRead, resource,
+		err := AuthorizeSubject(subject, testPermissionRead, resource,
 			PolicyFunc(func(Subject, Resource) Decision { return Deny }))
 		requirePermissionDenied(t, err)
 	})
 
 	t.Run("policy conceal is not found", func(t *testing.T) {
 		subject := NewSubject(2, 2, RoleUser)
-		err := AuthorizeSubject(subject, PermissionFilesRead, resource, TenantPolicy{}, OwnerPolicy{})
+		err := AuthorizeSubject(subject, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{})
 		requireNotFound(t, err)
 	})
 
 	t.Run("allow returns nil", func(t *testing.T) {
 		ctx := WithSubject(context.Background(), NewSubject(1, 1, RoleUser))
-		if err := Authorize(ctx, PermissionFilesRead, resource, TenantPolicy{}, OwnerPolicy{}); err != nil {
+		if err := Authorize(ctx, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{}); err != nil {
 			t.Fatalf("authorize: %v", err)
 		}
 	})

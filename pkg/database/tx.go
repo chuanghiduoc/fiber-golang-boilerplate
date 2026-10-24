@@ -4,10 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// rollbackTimeout bounds the detached rollback in WithTx. pgx closes the
+// connection when a rollback fails, so the pool never reuses a connection with
+// an open transaction.
+const rollbackTimeout = 5 * time.Second
 
 // TxManager manages database transactions.
 type TxManager struct {
@@ -39,8 +45,11 @@ func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) (err 
 	// Always roll back if the function panics or returns early. A panic used to
 	// skip both Commit and Rollback and leak a pooled connection.
 	defer func() {
-		// The rollback must still run if the request context was canceled.
-		rbErr := tx.Rollback(context.WithoutCancel(ctx))
+		// The rollback must still run if the request context was canceled, but
+		// bounded so a hung connection cannot block the caller forever.
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		rbErr := tx.Rollback(rbCtx)
 		if rbErr == nil || errors.Is(rbErr, pgx.ErrTxClosed) {
 			return
 		}

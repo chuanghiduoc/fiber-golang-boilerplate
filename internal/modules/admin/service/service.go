@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -27,11 +28,11 @@ type Service interface {
 }
 
 type service struct {
-	identity contracts.IdentityAdmin
-	files    contracts.FilesAdmin
+	identity identitycontracts.IdentityAdmin
+	files    filescontracts.FilesAdmin
 }
 
-func NewService(identity contracts.IdentityAdmin, files contracts.FilesAdmin) Service {
+func NewService(identity identitycontracts.IdentityAdmin, files filescontracts.FilesAdmin) Service {
 	return &service{identity: identity, files: files}
 }
 
@@ -123,7 +124,7 @@ func (s *service) GetStats(ctx context.Context) (*admindto.AdminStatsResponse, e
 	}, nil
 }
 
-func toUserResponse(user contracts.User) admindto.UserResponse {
+func toUserResponse(user identitycontracts.User) admindto.UserResponse {
 	return admindto.UserResponse{
 		ID:            user.ID,
 		Email:         user.Email,
@@ -138,7 +139,7 @@ func toUserResponse(user contracts.User) admindto.UserResponse {
 	}
 }
 
-func toFileResponse(file contracts.File) admindto.FileResponse {
+func toFileResponse(file filescontracts.File) admindto.FileResponse {
 	resp := admindto.FileResponse{
 		ID:           file.ID,
 		UserID:       file.UserID,

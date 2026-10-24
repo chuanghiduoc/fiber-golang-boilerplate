@@ -110,6 +110,9 @@ ORDER BY flag_key
 // Feature flag state is owned by internal/platform/features; this module owns
 // the admin transport and its persistence queries. User targets always carry
 // the request tenant, enforced by the (tenant_id, user_id) foreign key.
+// Target upserts create the parent flag row on demand, in the same statement,
+// with a NULL database default so a tenant target never forces a
+// process-wide default on every other tenant.
 func (q *Queries) ListFeatureFlags(ctx context.Context) ([]FeatureFlag, error) {
 	rows, err := q.db.Query(ctx, listFeatureFlags)
 	if err != nil {
@@ -149,10 +152,10 @@ RETURNING flag_key, enabled, kill_switch, description, created_at, updated_at
 `
 
 type UpsertFeatureFlagParams struct {
-	FlagKey     string `json:"flag_key"`
-	Enabled     bool   `json:"enabled"`
-	KillSwitch  bool   `json:"kill_switch"`
-	Description string `json:"description"`
+	FlagKey     string      `json:"flag_key"`
+	Enabled     pgtype.Bool `json:"enabled"`
+	KillSwitch  bool        `json:"kill_switch"`
+	Description string      `json:"description"`
 }
 
 func (q *Queries) UpsertFeatureFlag(ctx context.Context, arg UpsertFeatureFlagParams) (FeatureFlag, error) {
@@ -175,6 +178,11 @@ func (q *Queries) UpsertFeatureFlag(ctx context.Context, arg UpsertFeatureFlagPa
 }
 
 const upsertFeatureFlagTenantTarget = `-- name: UpsertFeatureFlagTenantTarget :one
+WITH flag AS (
+    INSERT INTO feature_flags (flag_key, enabled)
+    VALUES ($1, NULL)
+    ON CONFLICT (flag_key) DO NOTHING
+)
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES ($1, $2, NULL, $3)
 ON CONFLICT (flag_key, tenant_id) WHERE user_id IS NULL
@@ -204,6 +212,11 @@ func (q *Queries) UpsertFeatureFlagTenantTarget(ctx context.Context, arg UpsertF
 }
 
 const upsertFeatureFlagUserTarget = `-- name: UpsertFeatureFlagUserTarget :one
+WITH flag AS (
+    INSERT INTO feature_flags (flag_key, enabled)
+    VALUES ($1, NULL)
+    ON CONFLICT (flag_key) DO NOTHING
+)
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES ($1, $2, $3, $4)
 ON CONFLICT (flag_key, tenant_id, user_id) WHERE user_id IS NOT NULL

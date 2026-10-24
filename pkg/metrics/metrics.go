@@ -55,6 +55,19 @@ var (
 		[]string{"kind"},
 	)
 
+	// JobsQueueLagSeconds is observed once per claimed job: the time between
+	// the job becoming due (run_at) and its claim. It only sees jobs that are
+	// claimed, so a fully stalled queue shows up as an absence of observations
+	// (alert on jobs_claimed_total rate as well).
+	JobsQueueLagSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "jobs_queue_lag_seconds",
+			Help:    "Seconds a job waited between becoming due and being claimed, partitioned by job kind.",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600},
+		},
+		[]string{"kind"},
+	)
+
 	JobsClaimErrorsTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "jobs_claim_errors_total",
@@ -214,5 +227,13 @@ var (
 			Name: "scheduler_runs_purged_total",
 			Help: "Total number of scheduler run-ledger rows deleted by retention.",
 		},
+	)
+
+	RateLimitErrorsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "rate_limit_errors_total",
+			Help: "Total number of rate-limit counter failures; the request was allowed (fail-open), partitioned by tier.",
+		},
+		[]string{"tier"},
 	)
 )

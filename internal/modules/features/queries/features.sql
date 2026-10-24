@@ -1,6 +1,9 @@
 -- Feature flag state is owned by internal/platform/features; this module owns
 -- the admin transport and its persistence queries. User targets always carry
 -- the request tenant, enforced by the (tenant_id, user_id) foreign key.
+-- Target upserts create the parent flag row on demand, in the same statement,
+-- with a NULL database default so a tenant target never forces a
+-- process-wide default on every other tenant.
 
 -- name: ListFeatureFlags :many
 SELECT * FROM feature_flags
@@ -31,15 +34,25 @@ WHERE tenant_id = $1 AND flag_key = $2
 ORDER BY user_id NULLS FIRST, id;
 
 -- name: UpsertFeatureFlagTenantTarget :one
+WITH flag AS (
+    INSERT INTO feature_flags (flag_key, enabled)
+    VALUES (@flag_key, NULL)
+    ON CONFLICT (flag_key) DO NOTHING
+)
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
-VALUES ($1, $2, NULL, $3)
+VALUES (@flag_key, @tenant_id, NULL, @enabled)
 ON CONFLICT (flag_key, tenant_id) WHERE user_id IS NULL
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING *;
 
 -- name: UpsertFeatureFlagUserTarget :one
+WITH flag AS (
+    INSERT INTO feature_flags (flag_key, enabled)
+    VALUES (@flag_key, NULL)
+    ON CONFLICT (flag_key) DO NOTHING
+)
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
-VALUES ($1, $2, $3, $4)
+VALUES (@flag_key, @tenant_id, @user_id, @enabled)
 ON CONFLICT (flag_key, tenant_id, user_id) WHERE user_id IS NOT NULL
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING *;

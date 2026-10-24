@@ -8,9 +8,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	featurescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/catalog"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 )
 
 // Module wires the feature-flag admin HTTP surface into the application.
@@ -24,19 +25,27 @@ func New(handler *featureshandler.Handler) *Module {
 }
 
 // Name identifies the module in the registry.
-func (m *Module) Name() string { return "features" }
+func (m *Module) Name() string { return featurescatalog.Owner }
 
 // RegisterRoutes mounts the admin feature-flag routes below /api/v1.
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	cfg := deps.Config
 	rl := deps.Limiters
+	// Flag mutations are Tier 2: a required intent row is written before the
+	// handler runs, so an unavailable audit store rejects the change (503).
+	guard := func(action, resource string) fiber.Handler {
+		return audit.Guard(deps.Audit, audit.Policy{
+			Mode:     audit.ModeRequired,
+			Action:   action,
+			Resource: resource,
+		})
+	}
 
-	admin := v1.Group("/admin/features", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
-	admin.Get("/flags", rl.Relaxed, authz.Require(authz.PermissionAdminFeaturesRead), m.handler.ListFlags)
-	admin.Get("/flags/:key", rl.Relaxed, authz.Require(authz.PermissionAdminFeaturesRead), m.handler.GetFlag)
-	admin.Put("/flags/:key", rl.Normal, authz.Require(authz.PermissionAdminFeaturesWrite), deps.Idempotency, m.handler.UpsertFlag)
-	admin.Delete("/flags/:key", rl.Normal, authz.Require(authz.PermissionAdminFeaturesWrite), deps.Idempotency, m.handler.DeleteFlag)
-	admin.Get("/flags/:key/targets", rl.Relaxed, authz.Require(authz.PermissionAdminFeaturesRead), m.handler.ListTargets)
-	admin.Put("/flags/:key/targets", rl.Normal, authz.Require(authz.PermissionAdminFeaturesWrite), deps.Idempotency, m.handler.UpsertTarget)
-	admin.Delete("/flags/:key/targets/:id", rl.Normal, authz.Require(authz.PermissionAdminFeaturesWrite), deps.Idempotency, m.handler.DeleteTarget)
+	admin := v1.Group("/admin/features", deps.Authenticate())
+	admin.Get("/flags", rl.Relaxed, authz.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.ListFlags)
+	admin.Get("/flags/:key", rl.Relaxed, authz.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.GetFlag)
+	admin.Put("/flags/:key", rl.Normal, authz.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag.updated", "feature_flag"), m.handler.UpsertFlag)
+	admin.Delete("/flags/:key", rl.Normal, authz.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag.deleted", "feature_flag"), m.handler.DeleteFlag)
+	admin.Get("/flags/:key/targets", rl.Relaxed, authz.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.ListTargets)
+	admin.Put("/flags/:key/targets", rl.Normal, authz.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag_target.updated", "feature_flag_target"), m.handler.UpsertTarget)
+	admin.Delete("/flags/:key/targets/:id", rl.Normal, authz.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag_target.deleted", "feature_flag_target"), m.handler.DeleteTarget)
 }

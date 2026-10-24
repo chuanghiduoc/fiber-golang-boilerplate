@@ -1,0 +1,87 @@
+// Package bootstrap holds the single ordered list of business modules and
+// their contract cross-wiring. cmd/api uses it to build the application and
+// test/arch uses the same list, so every new module is automatically covered
+// by the route, authorization, and ownership checks.
+//
+// This is the only non-cmd package allowed to import several modules (it is
+// part of the composition root, like cmd/api). Modules never import it.
+package bootstrap
+
+import (
+	"context"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+)
+
+// Modules is the built module set plus the platform-facing values the
+// composition root installs in app.Deps and runs during the lifecycle.
+type Modules struct {
+	// List is registration order: routes, catalogs, and providers are
+	// registered in this order.
+	List []app.Module
+
+	Sessions       session.Store
+	TenantResolver tenant.Resolver
+	APIKeyVerifier *apikey.Verifier
+	Webhooks       webhookcontracts.Dispatcher
+
+	// Startup runs one-time checks that need the database (tenant
+	// existence, admin seed) inside the caller's startup deadline.
+	Startup func(ctx context.Context) error
+	// Background runs best-effort loops that share the job worker lifecycle
+	// (canceled with the worker context during shutdown).
+	Background []func(ctx context.Context)
+	// Close releases module resources after HTTP and workers stopped.
+	Close []func()
+}
+
+// Build constructs every module from infra in dependency order and wires the
+// cross-module contracts. It performs no I/O. To add a module: build it here
+// (passing only contracts from earlier modules) and append it to List.
+func Build(infra app.Infra) (*Modules, error) {
+	identityModule, identityProvides, err := identity.Build(infra)
+	if err != nil {
+		return nil, err
+	}
+	filesModule, filesProvides := files.Build(infra)
+	webhooksModule, webhooksProvides, err := webhooks.Build(infra, identityProvides.TenantActive)
+	if err != nil {
+		return nil, err
+	}
+	// File upload/delete and user registration enqueue webhook events inside
+	// their own transactions; the dispatcher exists only after webhooks.
+	identityModule.AttachWebhooks(webhooksProvides.Dispatcher)
+	filesModule.AttachWebhooks(webhooksProvides.Dispatcher)
+
+	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
+
+	return &Modules{
+		List: []app.Module{
+			identityModule,
+			filesModule,
+			admin.Build(identityProvides.Admin, filesProvides.Admin),
+			features.Build(infra),
+			webhooksModule,
+			apikeysModule,
+			notifications.Build(infra, identityProvides.Recipients),
+		},
+		Sessions:       identityProvides.Sessions,
+		TenantResolver: identityProvides.TenantResolver,
+		APIKeyVerifier: apikeysProvides.Verifier,
+		Webhooks:       webhooksProvides.Dispatcher,
+		Startup:        identityModule.Startup,
+		Background:     []func(context.Context){webhooksModule.RunRetention},
+		Close:          []func(){webhooksModule.Close},
+	}, nil
+}

@@ -113,7 +113,9 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 	tid := tenantID(ctx)
 	var endpoint webhooksqlc.WebhookEndpoint
 	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
-		current, err := q.GetWebhookEndpoint(ctx, webhooksqlc.GetWebhookEndpointParams{ID: id, TenantID: tid})
+		// Lock the endpoint row so concurrent rotations serialize instead of
+		// both reading the same next version and failing the unique index.
+		current, err := q.LockWebhookEndpoint(ctx, webhooksqlc.LockWebhookEndpointParams{ID: id, TenantID: tid})
 		if err != nil {
 			return mapNotFound(err)
 		}

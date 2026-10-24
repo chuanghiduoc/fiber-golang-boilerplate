@@ -42,7 +42,8 @@ The project is a **modular monolith**: one deployable, module-owned route tables
 platform packages for cross-cutting mechanics.
 
 ```
-cmd/api/main.go                     Bootstrap, module registration, graceful shutdown
+cmd/api/main.go                     Infra setup, catalog registration, lifecycle, graceful shutdown
+internal/bootstrap/                 Single ordered module list + contract cross-wiring
 cmd/migrate/main.go                 The only DB initializer/migrator (single init schema)
 cmd/seed/main.go                    Standalone admin seeder (schema must exist)
 internal/app/                       Composition root: Fiber, global middleware, module registry
@@ -294,14 +295,14 @@ A database that already applied the old migrations has a different
 `schema_migrations` history (normally version 3 if all old migrations were
 applied). Do not point it at the new `000001`, and never reset
 `schema_migrations` to force the baseline through. Keep the applied history and
-add a numbered migration containing only the missing tables/indexes. The new
-version must be higher than the version already recorded, so a fully migrated
-old deployment needs `000004` or later.
+add a migration containing only the missing tables/indexes. The new version
+must be higher than the version already recorded (a fully migrated old
+deployment is at 3); `make migrate-create` timestamp versions always are.
 
 Because this refactor removed the old `000002`/`000003` source files, restore
 them from git history first (do not edit them): golang-migrate requires the
-recorded version to exist in the source before it will advance. Add `000004`
-(or later) for `jobs`, `audit_events`, and any other missing objects, then run
+recorded version to exist in the source before it will advance. Add a
+timestamped migration for `jobs`, `audit_events`, and any other missing objects, then run
 `cmd/migrate`. `cmd/migrate` prints this guidance when it detects a legacy
 version whose source files are missing. Alternatively, apply the missing DDL
 manually with `psql` and baseline the version; do not run the new `000001` over
@@ -574,7 +575,7 @@ make docker-run                   # Start with Docker Compose (includes migrate 
 make docker-down                  # Stop Docker Compose
 make migrate-up                   # Run migrations with the golang-migrate CLI
 make migrate-down                 # Rollback migrations
-make migrate-create name=xxx      # Create a new migration after deployment
+make migrate-create module=files name=add_x  # New UTC-timestamp migration (<ts>_<owner>_<purpose>)
 make sqlc-generate                # Regenerate sqlc code
 make swagger                      # Regenerate Swagger docs
 make seed                         # Apply schema, then seed the admin user
@@ -593,7 +594,7 @@ and safe to retry. Use `Queue.EnqueueTx` when a job must commit atomically with
 the business transaction that produced it. Password-reset and email-verification
 services already do this: the token row and the `email.send` job share one
 transaction, so a crash cannot leave a usable link without a queued email.
-When transactional email provisioning is wired (as in `cmd/api/main.go`),
+When transactional email provisioning is wired (as in `identity.Build`),
 registration is atomic as well: the user row, its verification token, and the
 `email.send` job commit together, and an outbox write failure rolls the account
 back (fail-closed). Without that wiring, the handler falls back to a
@@ -776,16 +777,17 @@ checklist.
 2. Keep the module's handler/service/repository/DTO inside its directory.
    Do not import another module's internals; use `internal/contracts` or a
    narrow exported interface.
-3. Add permissions to `internal/platform/authz` and protect every route with
-   `authz.Require(...)`. The legacy exceptions are documented in the
+3. Declare permissions, error codes, flags, and en/vi strings in the module's
+   `catalog/` (self-registered through the app provider hooks) and protect
+   every route with `authz.Require(...)`. The legacy exceptions are documented in the
    [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
    do not copy them.
 4. Write queries in the module-scoped
-   `internal/modules/<name>/queries/<name>.sql` file, add a sqlc block in
-   `sqlc.yaml` for the module, and run `make sqlc-generate`.
-5. For a deployed database, add a numbered migration. For this boilerplate's
+   `internal/modules/<name>/queries/<name>.sql` file (the scaffold appends the
+   `sqlc.yaml` block) and run `make sqlc-generate`.
+5. For a deployed database, `make migrate-create module=<name> name=<purpose>`. For this boilerplate's
    fresh installs, update the single `000001_init_schema` file.
-6. Register the module once in `cmd/api/main.go`.
+6. Register the module once in `internal/bootstrap/modules.go`.
 7. Add module unit tests and an integration test; the architecture test in
    `test/arch` rejects cross-module imports.
 8. Run `make swagger` and `make check` before opening a PR.

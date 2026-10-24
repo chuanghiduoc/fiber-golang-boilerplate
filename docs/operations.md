@@ -22,13 +22,26 @@ Never put real secrets in this file, a ticket, a log line, or an error message.
 | Endpoint | Purpose | Behavior |
 | --- | --- | --- |
 | `GET /healthz` | Liveness | Always `200` with `{"status":"up"}` while the process runs. Does not check dependencies. |
-| `GET /readyz` | Readiness | Checks PostgreSQL and cache concurrently (2s each). `200` only when both are up; otherwise `503` with `status:"degraded"`. |
+| `GET /readyz` | Readiness | Checks PostgreSQL and cache concurrently (2s each). `503` with `status:"down"` only when PostgreSQL is down; a cache outage or a saturated DB pool is `200` with `status:"degraded"`. |
 | `GET /health` | Readiness alias | Same handler and response as `/readyz`. |
 | `GET /metrics` | Prometheus | Bearer token required when `METRICS_AUTH_TOKEN` is set. Production config requires a token of at least 16 characters. |
 | `GET /swagger` | API docs | Non-production only. |
 
-Readiness details include `database`, `cache`, and, when the database is up,
-`db_total_conns` and `db_idle_conns`:
+Readiness details contain only `database` (`up`, `busy`, or `down`) and
+`cache` (`up` or `down`). Pool sizes are not exposed on the public probe:
+
+| `database` | `cache` | `status` | HTTP |
+| --- | --- | --- | --- |
+| `up` | `up` | `up` | `200` |
+| `up` | `down` | `degraded` | `200` |
+| `busy` | any | `degraded` | `200` |
+| `down` | any | `down` | `503` |
+
+`busy` means the ping timed out while every pool connection was checked out
+(`AcquiredConns >= MaxConns`). Those connections are serving requests against a
+reachable database, so the pod stays in rotation; removing every saturated pod
+at once would cascade the load. If the database is really gone, in-flight
+queries fail and release their connections, and the next probe reports `down`.
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz
@@ -62,10 +75,11 @@ Probe behavior:
   job metrics and the `jobs` table. Do not assume a green `/readyz` means email
   or uploads are working.
 
-Important trade-off: because `/readyz` includes the cache, a Redis outage marks
-every replica unready even if PostgreSQL is healthy. If the product must serve
-degraded reads during a cache outage, that is a deliberate readiness-design
-change, not something to improvise during an incident.
+Trade-off: a Redis outage keeps every replica ready (`degraded`) because rate
+limiting and idempotency fail open and sessions fall back to PostgreSQL. The
+API keeps serving with weaker abuse protection and possible duplicate
+mutations; alert on `status:"degraded"` and `rate_limit_errors_total` instead of
+relying on readiness to page.
 
 ## 2. Metrics
 
@@ -87,6 +101,7 @@ Application metrics:
 | `jobs_succeeded_total` | `kind` | Successful outcomes recorded in the database. |
 | `jobs_retried_total` | `kind` | Failed jobs requeued for another attempt. |
 | `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
+| `jobs_queue_lag_seconds` | `kind` | Histogram of seconds between a job becoming due (`run_at`) and its claim, computed by the claim query (database clock; no extra query). Only claimed jobs are observed, so a fully stalled queue shows up as missing observations; alert on `jobs_claimed_total` too. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
 | `audit_write_failures_total` | — | Best-effort audit events that could not be recorded. |
@@ -189,6 +204,8 @@ request is sampled, records also include `trace_id` and `span_id`.
 - `status` is the effective status after the Fiber error handler; a handler
   returning an error is not logged as `200`.
 - 4xx requests log at `WARN`; 5xx log at `ERROR`; the rest log at `INFO`.
+  A request whose client disconnected (`context.Canceled`) is reported as
+  `499 client_closed_request` at `INFO` and is not counted as a 5xx.
 - Query values for keys named `code`, `state`, `password`, or containing
   `token` or `secret` are redacted. Do not rely on this to protect other
   sensitive parameters; do not put secrets in URLs.
@@ -221,7 +238,9 @@ are audited in two tiers:
   mutation transaction. If the insert fails, the transaction rolls back and the
   API returns `503 system.audit_unavailable`. These are the identity
   registration/profile/password/delete operations, admin role/ban/unban, and
-  admin file delete/restore.
+  admin file delete/restore. A successful `audit.RecordInTx` marks the
+  request, so the generic fallback middleware does not write a second row. A
+  service built without a recorder fails closed with the same 503.
 - **Tier 2** routes run `audit.Guard` after idempotency. The guard inserts an
   `outcome=started`, `source=http` intent row before the handler and completes
   it as `succeeded`, `failed`, or `denied` with the HTTP status/error code. A
@@ -289,12 +308,39 @@ until retention removes the row.
   claim by any worker requeues the expired job. A reclaimed job consumes an
   attempt. The previous owner may still be executing the old handler, so
   duplicate concurrent execution is possible; handlers must be idempotent.
-- On SIGINT/SIGTERM the worker stops claiming, cancels running handlers, and
-  the process waits up to 10s before shutting down HTTP. A non-cooperative
-  handler can exceed that window.
+- On SIGINT/SIGTERM the worker stops claiming and cancels running handlers
+  while HTTP drains concurrently, all inside the shared 20s shutdown budget
+  (see [Graceful shutdown](#graceful-shutdown)). A non-cooperative handler can
+  exceed that window. A handler that fails while the worker is
+  stopping is requeued immediately **without consuming its attempt**
+  (`last_error` starts with `jobs: interrupted by worker shutdown`, span
+  outcome `released`), so a drain during the final attempt never
+  dead-letters the job. A handler that still succeeds is recorded normally.
+- The worker and scheduler identity (`locked_by`, lease `holder`) is
+  `<hostname>-<pid>-<random>`, so replicas with the same hostname never share
+  a lease identity.
 
 Delivery is **at-least-once**, never exactly-once. Duplicate emails and
 duplicate side effects must be expected.
+
+### Dedicated workers for slow kinds
+
+One worker processes every registered kind by default, so a burst of slow jobs
+(for example large exports) can occupy every slot and delay fast ones such as
+`email.send` (head-of-line blocking; watch `jobs_queue_lag_seconds{kind}`).
+`jobs.WithKinds(kinds...)` restricts a worker's claim query to the listed
+kinds and `jobs.WithExcludeKinds(kinds...)` skips them, so a deployment can run
+
+```go
+slow := jobs.NewWorker(pool, instanceID+"-slow", jobs.WithKinds("reports.render"), jobs.WithConcurrency(2))
+general := jobs.NewWorker(pool, instanceID, jobs.WithExcludeKinds("reports.render"))
+```
+
+in one process or in separate deployments. Both filters only narrow which due
+jobs are claimed; expired-lease recovery stays global, so any worker requeues
+a crashed job of any kind (it never executes it). Register a handler for every
+kind a worker claims, and make sure every kind is claimed by some worker:
+an excluded kind with no dedicated worker simply waits in the queue.
 
 ### Notification email
 
@@ -328,15 +374,18 @@ ORDER BY updated_at DESC;
 Notification emails have no links or secrets, so dead-lettered rows only need a
 re-send through the admin endpoint or the producing module. The generic audit
 trail records successful `POST /notifications/:id/read`,
-`POST /notifications/read-all`, `PUT /notification-preferences`, and
-`POST /notifications/send` requests; replays are skipped.
+`POST /notifications/read-all`, and `PUT /notification-preferences` requests;
+`POST /notifications/send` is guarded by a required `notification.sent`
+intent row (503 when the audit store is down). Replays are skipped.
 
 ### Retention and payload clearing
 
 Workers purge `succeeded` and `dead` rows older than 30 days, hourly by
 default; the first pass runs when a worker starts. Queued and running rows are
 never purged. Each pass is bounded to 5s and deletes at most 1,000 rows per
-batch, so a large backlog cannot hold one transaction open.
+batch, so a large backlog cannot hold one transaction open. The partial index
+`idx_jobs_terminal_updated_at ON jobs (updated_at) WHERE status IN
+('succeeded','dead')` serves the purge's predicate and ordering.
 
 Successful and dead jobs have `payload = '{}'`. This prevents reset and
 verification links from lingering in a dump, but it also means **a dead job
@@ -446,8 +495,10 @@ cancels the current pass and steps down.
   runs only the newest, `all` replays in order up to
   `SCHEDULER_CATCHUP_LIMIT` per poll. A slow poll during continuous leadership
   still runs the latest slot under `none`, so short schedules are not starved.
-- `SCHEDULER_RETENTION_DAYS` bounds `scheduler_runs`. Purging the ledger does
-  not replay old slots; the next evaluation starts from the current slot.
+- `SCHEDULER_RETENTION_DAYS` bounds `scheduler_runs`, but the newest row of
+  every schedule is always kept: it anchors catch-up, and deleting it would
+  make a sparse schedule (for example `@yearly`) look never-run and re-enqueue
+  its already executed slot.
 - A schedule's job payload is `{"schedule","scheduledFor","data"}` and its key
   is `scheduler:<name>:<slot>`. The job kind must have a worker handler; a
   missing handler follows the normal retry/dead-letter path.
@@ -478,10 +529,14 @@ ORDER BY count(*) DESC;
 ## 5. Webhooks
 
 Outbound deliveries reuse the durable jobs queue under the
-`webhook.delivery` kind. Dispatch commits a `webhook_deliveries` row and its
-first job atomically; the worker sends one signed attempt and schedules the next
-attempt as a new job. Delivery is at-least-once, so receivers must deduplicate
-on `X-Webhook-Delivery`.
+`webhook.delivery` kind. Producers with a transaction (registration, file
+upload/delete) enqueue a `webhook.dispatch` fan-out job in that transaction;
+the fan-out commits a `webhook_deliveries` row and its first job atomically per
+endpoint; the worker sends one signed attempt and schedules the next attempt as
+a new job. Delivery is at-least-once, so receivers must deduplicate on
+`X-Webhook-Delivery`. The signature covers
+`<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<body>` (a breaking change from
+the earlier `<timestamp>.<body>`; see [Webhooks](webhooks.md)).
 
 ### Delivery state and retries
 
@@ -492,8 +547,15 @@ on `X-Webhook-Delivery`.
 - `2xx` succeeds; `3xx` is permanent (redirects are not followed); `4xx` is
   permanent except `408`, `425`, `429`; `5xx` and transport errors retry.
 - Backoff is exponential from `WEBHOOK_RETRY_BASE_SECS` to
-  `WEBHOOK_RETRY_MAX_SECS`. A valid `Retry-After` (seconds or HTTP date) wins
-  and is capped at the same maximum.
+  `WEBHOOK_RETRY_MAX_SECS`. A valid `Retry-After` (seconds or HTTP date) can
+  only lengthen the backoff (`0`/past dates do not retry immediately) and is
+  capped at the same maximum.
+- Disabled or deleted endpoints are never claimed; their pending deliveries,
+  and pending deliveries whose attempts are exhausted, become `dead` on the
+  next job instead of staying `pending`.
+- Each attempt uses the endpoint's `timeoutMs` (snapshotted on the delivery),
+  bounded by `WEBHOOK_REQUEST_TIMEOUT_SECS`. The attempt and its outcome are
+  recorded with a detached 5s context even during shutdown.
 - Every attempt is recorded with status code, duration, and a bounded error.
   Response bodies are not stored.
 - Endpoint edits/rotation do not change queued deliveries: URL, payload, event
@@ -576,19 +638,24 @@ host/IP/CIDR and keep the list audited.
 An hourly loop (first pass at startup) deletes only terminal deliveries
 (`succeeded`/`dead`) and inbound events older than
 `WEBHOOK_RETENTION_DAYS`. Pending deliveries and endpoint/source
-configuration are never purged. Attempts and inbound events cascade with their
-parent row.
+configuration are never purged. Delivery attempts cascade with their delivery;
+endpoints and inbound sources are soft-deleted and their deliveries/events use
+`ON DELETE RESTRICT`, so history only leaves through this purge. Purges delete in batches of at most 1,000 rows until drained (30s
+per pass) using the non-tenant-leading retention indexes described in
+[Webhooks](webhooks.md).
 
 ### Receiver troubleshooting
 
-- `404`: source ID unknown, disabled, or soft-deleted; verify the configured
-  `receiverUrl`.
+- `404`: source ID unknown, disabled, or soft-deleted, or its tenant is
+  suspended; verify the configured `receiverUrl`.
 - `401` with `webhook signature is required`: missing timestamp/signature.
 - `401` with stale/invalid timestamp: check clock skew against
   `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`.
 - `401` with invalid signature: confirm the sender signs
-  `<timestamp>.<exact raw body>` with the active source secret, not a rotated
-  one.
+  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<exact raw body>` (raw header
+  values; empty event if the header is absent) with the active source secret,
+  not a rotated one. Senders still signing the old `<timestamp>.<body>` input
+  fail here.
 - `200` with `duplicate: true`: the event was already stored for
   `(source, X-Webhook-Id)`; this is success.
 - Inbound events are stored under the source tenant and audited as
@@ -626,11 +693,23 @@ Behavior to remember:
 - Cached bodies may contain personal data and live for 24 hours. Size Redis
   accordingly, restrict access, and account for eviction. If an entry is
   evicted, a later retry executes again.
+- Scope `<path>` is the matched route template plus its parameter values, so
+  `/Users/7/ban/` and `/users/7/ban` (same route under case-insensitive,
+  non-strict routing) share one scope. Keys written before this change stop
+  matching and expire within 24h.
 - Memory cache is per process. It is not suitable for multiple replicas or for
-  replay/lock guarantees across restarts. Use `CACHE_DRIVER=redis` in
-  production.
-- Rate-limit cache errors also fail open. Login lockouts are a separate,
-  fail-closed mechanism and are not relaxed by a cache error.
+  replay/lock guarantees across restarts. Production config rejects
+  `CACHE_DRIVER=memory` unless `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true`, which
+  is only for a deliberate single-replica deployment.
+- Rate limits are fixed windows aligned to epoch multiples of the tier window.
+  Each request runs one atomic `INCR` (+`PEXPIRE` on first hit) on
+  `ratelimit:<tier>:<apikey|user|ip>:<id>:<windowStart>`, so replicas sharing
+  Redis cannot race. A client can send up to twice the limit across a window
+  boundary. Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
+  `X-RateLimit-Reset`, and `Retry-After` on `429`.
+- Rate-limit cache errors fail open: the request is allowed, a warning is
+  logged, and `rate_limit_errors_total{tier}` increments. Login lockouts are a
+  separate, fail-closed mechanism and are not relaxed by a cache error.
 
 Operational checks:
 
@@ -652,8 +731,8 @@ validation. Eviction is also destructive to idempotency: configure
 
 During a Redis outage:
 
-- `/readyz` reports `cache: down` and returns `503`; Kubernetes removes pods
-  from the Service even though PostgreSQL may be healthy.
+- `/readyz` reports `cache: down` with `status:"degraded"` and still returns
+  `200`, so pods stay in the Service while PostgreSQL is healthy.
 - Session validation falls back to PostgreSQL, but cache invalidation writes
   can fail. Bans, password changes, and role changes made during the outage may
   not propagate to every replica immediately. Re-check security-sensitive
@@ -688,11 +767,19 @@ uses a separate Job and ordered flow (see below).
 ### Fresh installs vs deployed databases
 
 - A fresh install uses `migrations/000001_init_schema.up.sql`.
-- Once a database is deployed, never edit `000001`. Add a numbered migration
-  with only the new objects.
+- Once a database is deployed, never edit `000001`. Add a migration with only
+  the new objects: `make migrate-create module=<owner> name=<purpose>` writes
+  `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql` (golang-migrate
+  `-format 20060102150405 -tz UTC`). Timestamp versions do not collide when
+  branches each add a migration and are always above legacy versions 1..3.
+  golang-migrate only applies versions above the recorded one, so a branch
+  migration older than main's newest must be regenerated before merge.
+  `test/arch/migrations_test.go` (part of `make test`/CI) rejects duplicate
+  versions, missing up/down pairs, non-timestamp versions, and unknown
+  owners.
 - A database that applied the old `000001`–`000003` history must keep that
   history. Restore the old source files from git history (golang-migrate needs
-  the recorded version to exist), add `000004` or later, and run
+  the recorded version to exist), add a timestamped migration, and run
   `cmd/migrate`. Never point an old database at the consolidated `000001` and
   never reset `schema_migrations` to force it through.
 - If a fresh schema was created out-of-band and already matches the baseline,
@@ -706,7 +793,7 @@ The baseline now creates `tenants`, seeds tenant id 1 (`default`), adds
 notifications, notification preferences, refresh/reset/verification tokens,
 jobs, and audit events, adds tenant-leading indexes, and scopes the last-admin
 trigger per tenant. A database deployed before this change does **not** receive
-those objects from the edited baseline. Create the next numbered migration
+those objects from the edited baseline. Create a timestamped migration
 above its recorded version (or apply reviewed DDL manually) that:
 
 1. creates `tenants` and inserts `('default','Default')` first so it gets id 1;
@@ -854,7 +941,37 @@ Other caveats:
   publicly.
 - **Redis:** `CACHE_DRIVER=redis` and `REDIS_URL` (use `rediss://` when
   available) are required for shared rate limits, session invalidation, and
-  idempotency across replicas. Memory cache is single-replica only.
+  idempotency across replicas. Memory cache is single-replica only and is
+  rejected in production unless `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true`.
+- **Request bodies:** Fiber's `APP_BODY_LIMIT` (12 MiB) is the multipart upload
+  ceiling. Every non-multipart body is capped by `APP_JSON_BODY_LIMIT` (default
+  1 MiB, must not exceed `APP_BODY_LIMIT`) and rejected with `413
+  payload_too_large` before auth, rate limiting, or decoding. Residual risk:
+  Fiber buffers the whole body before middleware runs, so a non-multipart
+  request (including a chunked body without `Content-Length`) can still make a
+  pod read up to `APP_BODY_LIMIT` before rejection, and a client can label a
+  non-upload body `multipart/form-data` to reach the larger limit. Keep an
+  ingress body limit in front of the API.
+
+### Graceful shutdown
+
+`terminationGracePeriodSeconds: 30` covers the 5s `preStop` sleep plus one
+shared 20s shutdown budget (`shutdownBudget` in `cmd/api/main.go`), leaving a
+5s margin before SIGKILL. After SIGTERM the process:
+
+1. stops accepting HTTP and drains in-flight requests, concurrently with
+   cancelling the scheduler and then the job worker (they only need the pool
+   and cache, which stay open);
+2. waits for `pkg/async` goroutines (post-commit emails started by handlers)
+   once HTTP has stopped, so no new ones appear;
+3. flushes spans, bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` and the remaining
+   budget;
+4. closes the cache and the database pool.
+
+Every phase uses the same deadline, so a slow phase shortens the later ones
+instead of extending the total. A phase that misses the deadline logs a
+warning; HTTP forced shutdown sets exit code 1. Raise
+`terminationGracePeriodSeconds` and `shutdownBudget` together.
 - **Database connections:** `DB_MAX_CONNS` is per pod. Keep
   `DB_MAX_CONNS * maxReplicas` below the database limit; production uses 10
   with HPA max 10, for at most 100 connections. Staging uses 5 with max 4.
@@ -929,11 +1046,14 @@ Operational rules:
   bounded SDK queue and are then dropped. The API stays ready. Check the
   endpoint, DNS, NetworkPolicy egress 4317, and collector health; do not
   restart the app to "recover" spans.
-- Shutdown flushes spans last with `OTEL_SHUTDOWN_TIMEOUT_SECS`. A flush
-  failure is logged as a warning and never changes the exit code.
-- Sampling is parent-based: an upstream `traceparent` with the sampled flag
-  off stays unsampled regardless of the local ratio. Use
-  `OTEL_TRACES_SAMPLER_ARG` to control root sampling.
+- Shutdown flushes spans after HTTP, workers, and async goroutines stop,
+  bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` and the remaining shutdown budget. A
+  flush failure is logged as a warning and never changes the exit code.
+- Incoming `traceparent` is ignored unless `OTEL_TRUST_INCOMING_TRACE=true`
+  (and, with `APP_TRUST_PROXY=true`, only from `APP_TRUSTED_PROXIES`), so a
+  client cannot force 100% sampling. When trusted, sampling is parent-based:
+  an upstream `traceparent` decides. Use `OTEL_TRACES_SAMPLER_ARG` to control
+  root sampling.
 - Never add attributes containing emails, tokens, headers, query strings,
   payloads, SQL, file names, or raw error text. Use `tracing.MarkError` for
   failures; it records only a bounded `error.type`.
@@ -959,15 +1079,16 @@ Operational rules:
 
 ### PostgreSQL is down or saturated
 
-Symptoms: `/readyz` shows `database: down` (503), 5xx responses, session
-validation failures, `jobs: claim failed` warnings, rising
-`jobs_claim_errors_total`.
+Symptoms: `/readyz` shows `database: down` (503) or `database: busy`
+(`degraded`, 200, pool saturated), 5xx responses, session validation
+failures, `jobs: claim failed` warnings, rising `jobs_claim_errors_total`.
 
 Actions:
 
 1. Check DNS, network policy, TLS mode, credentials, and provider status.
-2. Check connection saturation: `db_total_conns` vs `DB_MAX_CONNS` and the
-   database's own limit. Do not raise the pool beyond capacity.
+2. Check connection saturation (`database: busy`) against `DB_MAX_CONNS` and
+   the database's own limit (`pg_stat_activity`). Do not raise the pool beyond
+   capacity.
 3. If failover is in progress, keep pods alive; liveness does not depend on the
    database. Readiness will recover automatically.
 4. After recovery, confirm `/readyz`, watch job backlog drain, and check for
@@ -975,7 +1096,8 @@ Actions:
 
 ### Redis is down or degraded
 
-Symptoms: `/readyz` shows `cache: down` (503), rate limits stop rejecting,
+Symptoms: `/readyz` shows `cache: down` (`degraded`, 200), rising
+`rate_limit_errors_total`, rate limits stop rejecting,
 idempotency replay/locks fail open, session invalidation warnings, provider
 memory/eviction alerts.
 
@@ -985,9 +1107,10 @@ Actions:
 2. Expect duplicate mutations and weaker rate limiting during the outage.
 3. Treat security-sensitive changes (ban, password change, role change) made
    during the outage as potentially not propagated; re-check after recovery.
-4. If readiness removes all pods, service is unavailable even though the
-   database is healthy. Restoring Redis is the primary fix; a memory-cache
-   restart is an emergency, single-replica degradation only.
+4. Pods stay ready (`degraded`) while the database is healthy. Restoring Redis
+   is the primary fix; a memory-cache restart is an emergency, single-replica
+   degradation only (production also requires
+   `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true`).
 5. After recovery, verify login, a rate-limited endpoint, and an idempotent
    mutation.
 

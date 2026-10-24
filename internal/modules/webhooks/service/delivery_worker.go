@@ -22,6 +22,9 @@ const (
 	DeliveryJobKind = repository.DeliveryJobKind
 	defaultLease    = 3 * time.Minute
 	maxErrorLen     = 1000
+	// bookkeepingTimeout bounds the detached writes that record an attempt
+	// after the HTTP request was sent.
+	bookkeepingTimeout = 5 * time.Second
 )
 
 // WorkerOptions configures retry and claim behavior.
@@ -45,6 +48,7 @@ type WorkerStore interface {
 	GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error)
 	MarkDeliverySucceeded(ctx context.Context, id int64, statusCode int) error
 	MarkDeliveryDead(ctx context.Context, id int64, statusCode int, reason string) error
+	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft repository.RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft repository.AttemptDraft) error
 }
@@ -150,13 +154,24 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	reqHeaders.Set(webhook.HeaderDelivery, strconv.FormatInt(delivery.ID, 10))
 	reqHeaders.Set(webhook.HeaderEvent, delivery.EventType)
 	reqHeaders.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
-	reqHeaders.Set(webhook.HeaderSignature, webhook.SignatureHeader(webhook.Sign(secret, timestamp, body)))
+	reqHeaders.Set(webhook.HeaderSignature, webhook.SignatureHeader(
+		webhook.Sign(secret, delivery.EventID, delivery.EventType, timestamp, body)))
 	reqHeaders.Set(webhook.HeaderAttempt, strconv.FormatInt(int64(delivery.Attempts), 10))
 	reqHeaders.Set("Content-Type", "application/json")
 
+	// The endpoint timeout (snapshotted on the delivery) can only shorten the
+	// client's global request timeout.
+	reqCtx, cancelReq := context.WithTimeout(ctx, deliveryTimeout(delivery.TimeoutMs))
 	started := time.Now()
-	result, doErr := w.client.Do(ctx, delivery.Url, reqHeaders, body)
+	result, doErr := w.client.Do(reqCtx, delivery.Url, reqHeaders, body)
 	elapsed := time.Since(started)
+	cancelReq()
+
+	// The request has been sent, so its outcome must be recorded even if the
+	// job is being canceled for shutdown; otherwise the attempt is lost and a
+	// retry can deliver a duplicate before the lease even expires.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+	defer cancel()
 
 	if doErr != nil {
 		outcome := webhook.ClassifyError(doErr)
@@ -243,10 +258,30 @@ func (w *DeliveryWorker) handleNotClaimable(ctx context.Context, id int64) error
 		}
 		return fmt.Errorf("webhooks: load delivery %d: %w", id, err)
 	}
-	if delivery.Status == "pending" {
-		return fmt.Errorf("webhooks: delivery %d claim is busy", id)
+	if delivery.Status != "pending" {
+		return nil
 	}
-	return nil
+	// A pending delivery that can never be claimed again (endpoint disabled or
+	// deleted, or every attempt consumed but the final bookkeeping lost) would
+	// otherwise stay pending forever once this job dead-letters.
+	expired, err := w.store.ExpireUnclaimableDelivery(ctx, id)
+	if err != nil {
+		return fmt.Errorf("webhooks: expire delivery %d: %w", id, err)
+	}
+	if expired {
+		slog.Warn("webhooks: dead-lettered unclaimable delivery", slog.Int64("delivery_id", id))
+		return nil
+	}
+	return fmt.Errorf("webhooks: delivery %d claim is busy", id)
+}
+
+// deliveryTimeout converts a snapshotted endpoint timeout, falling back to the
+// schema default for rows that predate the snapshot.
+func deliveryTimeout(timeoutMS int32) time.Duration {
+	if timeoutMS <= 0 {
+		return defaultTimeoutMS * time.Millisecond
+	}
+	return time.Duration(timeoutMS) * time.Millisecond
 }
 
 func truncateError(value string) string {

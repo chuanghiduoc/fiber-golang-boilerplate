@@ -589,7 +589,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Replace the database default, kill switch, and description for a compile-time flag",
+                "description": "Replace the process-wide database default (omit enabled to clear it), kill switch, and description for a compile-time flag. Platform tenant administrators only; other tenants get 403 permission.denied.",
                 "consumes": [
                     "application/json"
                 ],
@@ -663,7 +663,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Delete the database default and all targets, reverting the flag to environment and compiled defaults",
+                "description": "Delete the process-wide flag row, reverting the flag to environment and compiled defaults. Platform tenant administrators only; returns 409 while targets exist in any tenant.",
                 "produces": [
                     "application/json"
                 ],
@@ -698,6 +698,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -1827,6 +1833,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
+                    "404": {
+                        "description": "feature.disabled when user_registration is off",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
                     "422": {
                         "description": "Unprocessable Entity",
                         "schema": {
@@ -2140,6 +2152,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "feature.disabled when file_uploads is off",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -2627,8 +2645,8 @@ const docTemplate = `{
                     }
                 ],
                 "responses": {
-                    "200": {
-                        "description": "OK",
+                    "201": {
+                        "description": "Created",
                         "schema": {
                             "$ref": "#/definitions/dto.SendNotificationResponse"
                         }
@@ -5607,7 +5625,6 @@ const docTemplate = `{
         "featuresdto.UpsertFlagRequest": {
             "type": "object",
             "required": [
-                "enabled",
                 "killSwitch"
             ],
             "properties": {

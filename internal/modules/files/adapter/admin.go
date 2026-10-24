@@ -6,67 +6,67 @@ package adapter
 import (
 	"context"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 )
 
-// AdminFiles adapts the files admin service to contracts.FilesAdmin.
+// AdminFiles adapts the files admin service to filescontracts.FilesAdmin.
 type AdminFiles struct {
 	service service.AdminFileService
 }
 
-var _ contracts.FilesAdmin = (*AdminFiles)(nil)
+var _ filescontracts.FilesAdmin = (*AdminFiles)(nil)
 
 func NewAdminFiles(svc service.AdminFileService) *AdminFiles {
 	return &AdminFiles{service: svc}
 }
 
-func (a *AdminFiles) ListFiles(ctx context.Context, limit int, startingAfter string) (contracts.FilePage, error) {
+func (a *AdminFiles) ListFiles(ctx context.Context, limit int, startingAfter string) (filescontracts.FilePage, error) {
 	files, hasMore, err := a.service.ListFiles(ctx, limit, startingAfter)
 	if err != nil {
-		return contracts.FilePage{}, err
+		return filescontracts.FilePage{}, err
 	}
-	items := make([]contracts.File, len(files))
+	items := make([]filescontracts.File, len(files))
 	for i := range files {
 		items[i] = toFile(files[i])
 	}
-	return contracts.FilePage{Items: items, HasMore: hasMore}, nil
+	return filescontracts.FilePage{Items: items, HasMore: hasMore}, nil
 }
 
-func (a *AdminFiles) OpenFile(ctx context.Context, id int64) (contracts.FileDownload, error) {
+func (a *AdminFiles) OpenFile(ctx context.Context, id int64) (filescontracts.FileDownload, error) {
 	file, reader, err := a.service.Download(ctx, id)
 	if err != nil {
-		return contracts.FileDownload{}, err
+		return filescontracts.FileDownload{}, err
 	}
-	return contracts.FileDownload{File: toFile(*file), Reader: reader}, nil
+	return filescontracts.FileDownload{File: toFile(*file), Reader: reader}, nil
 }
 
 func (a *AdminFiles) DeleteFile(ctx context.Context, id int64) error {
 	return a.service.DeleteFile(ctx, id)
 }
 
-func (a *AdminFiles) RestoreFile(ctx context.Context, id int64) (contracts.File, error) {
+func (a *AdminFiles) RestoreFile(ctx context.Context, id int64) (filescontracts.File, error) {
 	file, err := a.service.RestoreFile(ctx, id)
 	if err != nil {
-		return contracts.File{}, err
+		return filescontracts.File{}, err
 	}
 	return toFile(*file), nil
 }
 
-func (a *AdminFiles) GetFileStats(ctx context.Context) (contracts.FileStats, error) {
+func (a *AdminFiles) GetFileStats(ctx context.Context) (filescontracts.FileStats, error) {
 	stats, err := a.service.GetFileStats(ctx)
 	if err != nil {
-		return contracts.FileStats{}, err
+		return filescontracts.FileStats{}, err
 	}
-	return contracts.FileStats{
+	return filescontracts.FileStats{
 		TotalFiles:    stats.TotalFiles,
 		TotalFileSize: stats.TotalFileSize,
 	}, nil
 }
 
-func toFile(file dto.FileResponse) contracts.File {
-	return contracts.File{
+func toFile(file dto.FileResponse) filescontracts.File {
+	return filescontracts.File{
 		ID:           file.ID,
 		TenantID:     file.TenantID,
 		UserID:       file.UserID,

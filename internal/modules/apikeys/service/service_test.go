@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -132,13 +133,13 @@ func (r *fakeRepo) TouchLastUsed(_ context.Context, id int64, at time.Time) erro
 }
 
 type fakePrincipals struct {
-	users map[int64]contracts.Principal
+	users map[int64]identitycontracts.Principal
 }
 
-func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) (contracts.Principal, error) {
+func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
 	user, ok := p.users[userID]
 	if !ok || user.TenantID != tenantID {
-		return contracts.Principal{}, apperror.ErrNotFound
+		return identitycontracts.Principal{}, apperror.ErrNotFound
 	}
 	return user, nil
 }
@@ -147,14 +148,14 @@ func testContext(tenantID int64) context.Context {
 	return tenant.WithID(context.Background(), tenantID)
 }
 
-func newTestService(repo *fakeRepo, principals contracts.PrincipalReader) Service {
-	return NewService(repo, principals, nil)
+func newTestService(repo *fakeRepo, principals identitycontracts.PrincipalReader) Service {
+	return NewService(repo, principals, nil, audit.Noop{})
 }
 
 func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]contracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
@@ -207,8 +208,8 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 
 func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]contracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
@@ -245,19 +246,30 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 
 	// An API-key caller cannot grant a scope that its own key does not hold.
 	scopedCaller := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
-		10, 1, authz.RoleAdmin, authz.PermissionFilesRead,
+		10, 1, authz.RoleAdmin, testScopeFilesRead,
 	))
 	_, err = svc.Create(scopedCaller, 10, apikeydto.CreateRequest{Name: "x", Scopes: []string{"files:write"}})
 	if !errors.As(err, &appErr) || appErr.Status != 400 {
 		t.Fatalf("caller escalation error = %v, want 400", err)
 	}
+
+	// Rotation mints a secret with the existing scopes, so a narrower caller
+	// cannot rotate a broader key either.
+	broad, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{Name: "broad", Scopes: []string{"files:write"}})
+	if err != nil {
+		t.Fatalf("create broad key: %v", err)
+	}
+	_, err = svc.Rotate(scopedCaller, broad.ID)
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("rotate escalation error = %v, want 400", err)
+	}
 }
 
 func TestService_TenantIsolation(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]contracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
-		20: {ID: 20, TenantID: 2, Role: authz.RoleUser},
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		20: {ID: 20, TenantID: 2, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
@@ -301,8 +313,8 @@ func TestService_TenantIsolation(t *testing.T) {
 
 func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]contracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
@@ -372,8 +384,8 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 
 func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	repo := newFakeRepo()
-	principals := fakePrincipals{users: map[int64]contracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser},
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)

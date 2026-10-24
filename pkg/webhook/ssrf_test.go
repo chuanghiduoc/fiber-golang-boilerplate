@@ -44,6 +44,44 @@ func TestGuard_BlocksNonPublicAddresses(t *testing.T) {
 	}
 }
 
+func TestIsBlockedIP_IPv6Transition(t *testing.T) {
+	cases := []struct {
+		ip      string
+		blocked bool
+	}{
+		// Well-known NAT64: only as public as the embedded IPv4 address.
+		{"64:ff9b::7f00:1", true},       // 127.0.0.1
+		{"64:ff9b::a9fe:a9fe", true},    // 169.254.169.254
+		{"64:ff9b::a00:1", true},        // 10.0.0.1
+		{"64:ff9b::808:808", false},     // 8.8.8.8
+		{"64:ff9b:1::808:808", true},    // local-use NAT64
+		{"2002:7f00:1::1", true},        // 6to4 of 127.0.0.1
+		{"2002:c0a8:101::1", true},      // 6to4 of 192.168.1.1
+		{"2002:808:808::1", false},      // 6to4 of 8.8.8.8
+		{"::7f00:1", true},              // IPv4-compatible 127.0.0.1
+		{"::a00:1", true},               // IPv4-compatible 10.0.0.1
+		{"::808:808", false},            // IPv4-compatible 8.8.8.8
+		{"::ffff:0:7f00:1", true},       // IPv4-translated 127.0.0.1
+		{"::ffff:0:808:808", false},     // IPv4-translated 8.8.8.8
+		{"fec0::1", true},               // site-local
+		{"feff::1", true},               // top of site-local /10
+		{"2001::1", true},               // Teredo
+		{"2001:0:4136:e378::1", true},   // Teredo
+		{"2001:4860:4860::8888", false}, // public, outside Teredo /32
+	}
+	for _, tc := range cases {
+		t.Run(tc.ip, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("invalid test IP %q", tc.ip)
+			}
+			if got := isBlockedIP(ip); got != tc.blocked {
+				t.Fatalf("isBlockedIP(%s) = %v, want %v", tc.ip, got, tc.blocked)
+			}
+		})
+	}
+}
+
 func TestGuard_Allowlist(t *testing.T) {
 	guard, err := NewGuard([]string{"127.0.0.1", "10.10.0.0/16", "internal.example"})
 	if err != nil {
@@ -121,7 +159,7 @@ func TestSign_DeterministicForUnixSeconds(t *testing.T) {
 	secret := []byte("s")
 	ts := time.Unix(1_792_843_200, 900_000_000)
 	other := time.Unix(1_792_843_200, 100_000_000)
-	if Sign(secret, ts, []byte("x")) != Sign(secret, other, []byte("x")) {
+	if Sign(secret, "evt", "a.b", ts, []byte("x")) != Sign(secret, "evt", "a.b", other, []byte("x")) {
 		t.Error("Sign must derive only from Unix seconds")
 	}
 }
@@ -194,6 +232,17 @@ func TestRetryDelay_UsesRetryAfter(t *testing.T) {
 	delay, used = RetryDelay(3, base, maxDelay, "garbage", now)
 	if used || delay != 4*base {
 		t.Fatalf("invalid Retry-After fallback = %s, used=%v", delay, used)
+	}
+
+	// A zero or past Retry-After never shortens the backoff schedule.
+	delay, used = RetryDelay(3, base, maxDelay, "0", now)
+	if !used || delay != 4*base {
+		t.Fatalf("RetryDelay(Retry-After 0) = %s, used=%v, want %s", delay, used, 4*base)
+	}
+	pastDate := now.Add(-time.Hour).UTC().Format(http.TimeFormat)
+	delay, used = RetryDelay(1, base, maxDelay, pastDate, now)
+	if !used || delay != base {
+		t.Fatalf("RetryDelay(past Retry-After) = %s, used=%v, want %s", delay, used, base)
 	}
 }
 

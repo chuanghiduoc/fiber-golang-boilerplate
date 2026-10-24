@@ -299,7 +299,7 @@ func (m *mockUserRepo) Ban(ctx context.Context, id int64) (*identitysqlc.User, e
 
 func (m *mockUserRepo) Restore(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || !u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
+	if !ok || !u.DeletedAt.Valid || !u.BannedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.DeletedAt = pgtype.Timestamptz{}
@@ -347,6 +347,18 @@ func (m *mockUserRepo) AdminUserStats(ctx context.Context) (identitysqlc.AdminUs
 	}
 	return identitysqlc.AdminUserStatsRow{ActiveUsers: active, DeletedUsers: deleted}, nil
 }
+
+func (m *mockUserRepo) GetPrincipal(ctx context.Context, id int64) (*identitysqlc.GetUserPrincipalRow, error) {
+	u, err := m.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &identitysqlc.GetUserPrincipalRow{
+		ID: u.ID, TenantID: u.TenantID, Email: u.Email, Name: u.Name, Role: u.Role, TenantStatus: "active",
+	}, nil
+}
+
+func (m *mockUserRepo) LockAdminChanges(context.Context) error { return nil }
 
 // ---------------------------------------------------------------------------
 // mockRefreshTokenRepo

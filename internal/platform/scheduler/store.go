@@ -93,11 +93,21 @@ RETURNING id`
 const setRunJobSQL = `
 UPDATE scheduler_runs SET job_id = $1 WHERE id = $2`
 
+// purgeRunsSQL deletes one batch of old ledger rows but never a schedule's
+// newest slot: LastRun anchors catch-up on that row, so deleting it would make
+// the schedule look never-run and re-enqueue an already executed slot. The
+// EXISTS probe uses idx_scheduler_runs_schedule_slot.
 const purgeRunsSQL = `
 WITH batch AS (
     SELECT id
-    FROM scheduler_runs
+    FROM scheduler_runs AS candidate
     WHERE created_at < now() - make_interval(secs => $1::double precision)
+      AND EXISTS (
+          SELECT 1
+          FROM scheduler_runs AS newer
+          WHERE newer.schedule = candidate.schedule
+            AND newer.scheduled_for > candidate.scheduled_for
+      )
     ORDER BY created_at
     LIMIT $2
     FOR UPDATE SKIP LOCKED

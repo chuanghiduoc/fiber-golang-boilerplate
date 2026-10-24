@@ -27,6 +27,16 @@ type fakeWorkerStore struct {
 	dead       bool
 	deadReason string
 	retryDraft *repository.RetryDraft
+	expire     bool
+	expired    bool
+	// rejectCanceled makes bookkeeping writes fail on a canceled context,
+	// like a real database call would.
+	rejectCanceled bool
+}
+
+func (f *fakeWorkerStore) ExpireUnclaimableDelivery(context.Context, int64) (bool, error) {
+	f.expired = f.expire
+	return f.expire, nil
 }
 
 func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (*webhooksqlc.WebhookDelivery, error) {
@@ -62,12 +72,18 @@ func (f *fakeWorkerStore) MarkDeliveryDead(_ context.Context, _ int64, _ int, re
 	return nil
 }
 
-func (f *fakeWorkerStore) RescheduleDeliveryWithJob(_ context.Context, draft repository.RetryDraft) error {
+func (f *fakeWorkerStore) RescheduleDeliveryWithJob(ctx context.Context, draft repository.RetryDraft) error {
+	if f.rejectCanceled && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	f.retryDraft = &draft
 	return nil
 }
 
-func (f *fakeWorkerStore) CreateDeliveryAttempt(_ context.Context, draft repository.AttemptDraft) error {
+func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft repository.AttemptDraft) error {
+	if f.rejectCanceled && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	f.attempts = append(f.attempts, draft)
 	return nil
 }
@@ -294,9 +310,77 @@ func TestDeliveryWorker_NotClaimable(t *testing.T) {
 		t.Fatal("pending delivery with an active claim should retry the job")
 	}
 
+	// A pending delivery that can never be claimed again (inactive endpoint
+	// or exhausted attempts) is dead-lettered instead of staying pending.
+	store.expire = true
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("unclaimable pending delivery should be expired: %v", err)
+	}
+	if !store.expired {
+		t.Fatal("expected ExpireUnclaimableDelivery to dead-letter the delivery")
+	}
+
 	store.delivery.Status = "succeeded"
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("terminal delivery should be a no-op: %v", err)
+	}
+}
+
+// TestDeliveryWorker_RecordsAttemptAfterShutdownCancel proves an attempt whose
+// request was sent is still recorded when the job context is canceled.
+func TestDeliveryWorker_RecordsAttemptAfterShutdownCancel(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cancel()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3), rejectCanceled: true}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(ctx, payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if len(store.attempts) != 1 {
+		t.Fatalf("attempts recorded = %d, want 1", len(store.attempts))
+	}
+	if store.retryDraft == nil {
+		t.Fatal("the next attempt must still be scheduled")
+	}
+}
+
+// TestDeliveryWorker_AppliesEndpointTimeout proves the snapshotted endpoint
+// timeout bounds the request even when the client timeout is longer.
+func TestDeliveryWorker_AppliesEndpointTimeout(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	defer close(release)
+
+	delivery := fixedDelivery(server.URL, ciphertext, 0, 3)
+	delivery.TimeoutMs = 100
+	store := &fakeWorkerStore{delivery: delivery}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+
+	started := time.Now()
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("request took %s; the 100ms endpoint timeout was not applied", elapsed)
+	}
+	if store.succeeded || store.retryDraft == nil {
+		t.Fatalf("timeout must schedule a retry: succeeded=%v retry=%v", store.succeeded, store.retryDraft)
 	}
 }
 

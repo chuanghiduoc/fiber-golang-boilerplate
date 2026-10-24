@@ -103,16 +103,10 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 		previousRole = existing.Role
 
 		// Do not allow the final admin to be demoted; that would lock every
-		// administrator out of the system. This check runs inside the same
-		// transaction as the update so two concurrent demotions cannot both
-		// observe two admins.
+		// administrator out of the system.
 		if existing.Role == dto.RoleAdmin && role != dto.RoleAdmin {
-			admins, err := userRepo.CountActiveAdmins(ctx)
-			if err != nil {
-				return nil, apperror.NewInternal("failed to count admins")
-			}
-			if admins <= 1 {
-				return nil, apperror.NewCode(apperror.CodeUserLastAdmin, "cannot demote the last active admin")
+			if err := ensureNotLastAdmin(ctx, userRepo, "cannot demote the last active admin"); err != nil {
+				return nil, err
 			}
 		}
 
@@ -181,12 +175,8 @@ func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
 			return apperror.NewInternal("failed to get user")
 		}
 		if existing.Role == dto.RoleAdmin {
-			admins, err := userRepo.CountActiveAdmins(ctx)
-			if err != nil {
-				return apperror.NewInternal("failed to count admins")
-			}
-			if admins <= 1 {
-				return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot ban the last active admin")
+			if err := ensureNotLastAdmin(ctx, userRepo, "cannot ban the last active admin"); err != nil {
+				return err
 			}
 		}
 
@@ -297,6 +287,28 @@ func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*dto.UserRe
 		_ = s.sessions.Invalidate(ctx, id)
 	}
 	return ToUserResponse(user), nil
+}
+
+// ensureNotLastAdmin returns 409 user.last_admin when removing one admin would
+// leave the tenant without any. It first takes the per-tenant admin-change
+// lock, so concurrent demote/ban/delete requests run one at a time and the
+// count below sees the previous one's committed result (READ COMMITTED takes a
+// fresh snapshot per statement). Without that lock the protect_last_admin
+// trigger would still keep one admin, but two concurrent requests can
+// deadlock on each other's rows instead of getting a clean 409. The trigger
+// remains the database-level guarantee for writes outside this service.
+func ensureNotLastAdmin(ctx context.Context, userRepo repository.UserRepository, detail string) error {
+	if err := userRepo.LockAdminChanges(ctx); err != nil {
+		return apperror.NewInternal("failed to lock admin changes")
+	}
+	admins, err := userRepo.CountActiveAdmins(ctx)
+	if err != nil {
+		return apperror.NewInternal("failed to count admins")
+	}
+	if admins <= 1 {
+		return apperror.NewCode(apperror.CodeUserLastAdmin, detail)
+	}
+	return nil
 }
 
 func (s *adminUserService) GetUserStats(ctx context.Context) (UserStats, error) {

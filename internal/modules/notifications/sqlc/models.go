@@ -18,6 +18,7 @@ type Notification struct {
 	Data      []byte             `json:"data"`
 	ReadAt    pgtype.Timestamptz `json:"read_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type NotificationPreference struct {

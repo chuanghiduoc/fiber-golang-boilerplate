@@ -173,5 +173,10 @@ func (r *Postgres) PurgeInboundEvents(ctx context.Context, retentionDays int32) 
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
-	return r.q.PurgeWebhookInboundEvents(ctx, retentionDays)
+	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
+		return r.q.PurgeWebhookInboundEvents(ctx, webhooksqlc.PurgeWebhookInboundEventsParams{
+			RetentionDays: retentionDays,
+			BatchSize:     purgeBatchSize,
+		})
+	})
 }

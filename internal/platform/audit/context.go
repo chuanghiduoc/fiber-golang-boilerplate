@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -28,6 +29,10 @@ type RequestInfo struct {
 	// Guard with RequireDomain uses it to detect a route that mutated without
 	// writing its domain audit row.
 	DomainEvents int
+	// ServiceRecorded counts Tier 1 service events successfully written by
+	// RecordInTx for this request. The fallback Middleware skips a request
+	// with ServiceRecorded > 0 so one mutation never yields two audit rows.
+	ServiceRecorded int
 }
 
 // WithRequestInfo stores info in ctx.
@@ -62,6 +67,9 @@ func WithActor(ctx context.Context, actorID int64, role string) context.Context 
 }
 
 // WithRequestMeta enriches the request audit identity with transport metadata.
+// Values are cloned because callers pass Fiber strings (c.IP(), c.Get), which
+// are zero-copy views into pooled request buffers, while RequestInfo outlives
+// the handler in the context.
 func WithRequestMeta(ctx context.Context, requestID, ip, userAgent string) context.Context {
 	info := RequestInfoFromContext(ctx)
 	if info == nil {
@@ -69,13 +77,13 @@ func WithRequestMeta(ctx context.Context, requestID, ip, userAgent string) conte
 		ctx = WithRequestInfo(ctx, info)
 	}
 	if requestID != "" {
-		info.RequestID = requestID
+		info.RequestID = strings.Clone(requestID)
 	}
 	if ip != "" {
-		info.IP = ip
+		info.IP = strings.Clone(ip)
 	}
 	if userAgent != "" {
-		info.UserAgent = userAgent
+		info.UserAgent = strings.Clone(userAgent)
 	}
 	return ctx
 }

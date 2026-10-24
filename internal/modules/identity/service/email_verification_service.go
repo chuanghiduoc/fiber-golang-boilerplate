@@ -57,6 +57,9 @@ type emailVerificationService struct {
 	cache     cache.Cache
 	frontURL  string
 	txManager *database.TxManager
+	// tenants is optional (tests/minimal deployments). Production supplies it
+	// so links built without a request slug still carry the right tenant.
+	tenants repository.TenantRepository
 }
 
 func NewEmailVerificationService(
@@ -66,7 +69,12 @@ func NewEmailVerificationService(
 	appCache cache.Cache,
 	frontendURL string,
 	txManager *database.TxManager,
+	tenants ...repository.TenantRepository,
 ) EmailVerificationService {
+	var tenantRepo repository.TenantRepository
+	if len(tenants) > 0 {
+		tenantRepo = tenants[0]
+	}
 	return &emailVerificationService{
 		userRepo:  userRepo,
 		verifRepo: verifRepo,
@@ -74,6 +82,7 @@ func NewEmailVerificationService(
 		cache:     appCache,
 		frontURL:  frontendURL,
 		txManager: txManager,
+		tenants:   tenantRepo,
 	}
 }
 
@@ -118,7 +127,6 @@ func (s *emailVerificationService) SendVerification(ctx context.Context, userID 
 	if err := s.sender.Send(ctx, msg); err != nil {
 		slog.Error("failed to send verification email",
 			slog.Int64("user_id", userID),
-			slog.String("email", userEmail),
 			slog.Any("error", err),
 		)
 		return fmt.Errorf("send verification email: %w", err)
@@ -163,13 +171,34 @@ func (s *emailVerificationService) buildVerificationMessage(ctx context.Context,
 	}
 	token := hex.EncodeToString(b)
 
-	verifyURL := tokenLink(ctx, s.frontURL, "verify-email", token)
+	linkCtx, err := s.withLinkTenantSlug(ctx)
+	if err != nil {
+		return email.Message{}, "", err
+	}
+	verifyURL := tokenLink(linkCtx, s.frontURL, "verify-email", token)
 	msg := email.Message{
 		To:      []string{userEmail},
 		Subject: "Verify Your Email Address",
 		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to verify your email address. This link expires in 24 hours.</p>", verifyURL),
 	}
 	return msg, hashToken(token), nil
+}
+
+// withLinkTenantSlug makes sure the link carries the slug of the tenant the
+// token is written to. The request slug is absent when an authenticated
+// credential's tenant overrode a header-less default resolution (JWTAuth and
+// the API-key middleware clear it); a link without a slug would then be
+// resolved against the default tenant and never verify. In that case the slug
+// is looked up from the token's tenant ID.
+func (s *emailVerificationService) withLinkTenantSlug(ctx context.Context) (context.Context, error) {
+	if tenant.SlugFromContext(ctx) != "" || s.tenants == nil {
+		return ctx, nil
+	}
+	found, err := s.tenants.GetByIDIncludingSuspended(ctx, tenant.EffectiveID(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("resolve tenant slug for verification link: %w", err)
+	}
+	return tenant.WithSlug(ctx, found.Slug), nil
 }
 
 // persistVerification replaces any pending token and, when tx is present,
@@ -209,7 +238,6 @@ func (s *emailVerificationService) persistVerification(
 		if err := txSender.SendTx(ctx, tx, msg); err != nil {
 			slog.Error("failed to enqueue verification email",
 				slog.Int64("user_id", userID),
-				slog.String("email", userEmail),
 				slog.Any("error", err),
 			)
 			return fmt.Errorf("send verification email: %w", err)
@@ -298,7 +326,6 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 		if err := s.SendVerification(sendCtx, user.ID, user.Email); err != nil {
 			slog.Error("failed to resend verification email",
 				slog.Int64("user_id", user.ID),
-				slog.String("email", user.Email),
 				slog.Any("error", err),
 			)
 		}

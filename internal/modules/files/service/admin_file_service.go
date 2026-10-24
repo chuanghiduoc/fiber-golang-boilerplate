@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
@@ -189,7 +190,7 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.File
 		return nil, apperror.NewNotFound("file not found")
 	}
 	if !existing.DeletedAt.Valid {
-		return nil, apperror.NewCode(apperror.CodeFileNotDeleted, "file is not deleted")
+		return nil, apperror.NewCode(filescatalog.CodeFileNotDeleted, "file is not deleted")
 	}
 
 	restore := func(repo repository.FileRepository) (*filesqlc.File, error) {

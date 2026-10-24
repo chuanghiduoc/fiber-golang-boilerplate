@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -35,6 +36,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -156,9 +158,18 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 		DefaultMaxAttempts: 3,
 		DefaultTimeoutMS:   2000,
 		TimestampTolerance: 5 * time.Minute,
+		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id int64) (bool, error) {
+			if _, err := tenantRepo.GetByID(ctx, id); err != nil {
+				if errors.Is(err, apperror.ErrNotFound) {
+					return false, nil
+				}
+				return false, err
+			}
+			return true, nil
+		}),
 	})
 	handler := webhookshandler.New(svc)
-	dispatcher := webhookservice.NewDispatcher(repo)
+	dispatcher := webhookservice.NewDispatcher(repo, jobQueue)
 	guard, err := webhook.NewGuard([]string{"127.0.0.1"})
 	require.NoError(t, err)
 	client := webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second})
@@ -199,7 +210,7 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	}
 }
 
-func (h *webhookHarness) do(t *testing.T, method, path, bearer string, body any, headers map[string]string) (int, []byte, http.Header) {
+func (h *webhookHarness) do(t *testing.T, method, path, bearer string, body any, headers map[string]string) (status int, payload []byte, header http.Header) {
 	t.Helper()
 	var reader io.Reader
 	if body != nil {
@@ -271,20 +282,22 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		status, _, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
 
-		// Rotation is idempotent with the same key: the second response replays
-		// the first secret and the database still has exactly one active secret.
+		// Rotation is never served from the idempotency cache (the plaintext
+		// secret must not be stored there): a repeated key rotates again and
+		// the database still has exactly one active secret.
 		key := "rotate-endpoint-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		status, body, headers := h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		rotated := decodeJSON[endpointDTO](t, body)
 		require.NotEmpty(t, rotated.Secret)
 		assert.NotEqual(t, endpointA.Secret, rotated.Secret)
 
-		status, replayBody, replayHeaders := h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
-		require.Equal(t, fiber.StatusOK, status, "body: %s", replayBody)
-		replayed := decodeJSON[endpointDTO](t, replayBody)
-		assert.Equal(t, rotated.Secret, replayed.Secret)
-		assert.Equal(t, "true", replayHeaders.Get("Idempotent-Replayed"), "first response headers: %v", headers)
+		status, retryBody, retryHeaders := h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		require.Equal(t, fiber.StatusOK, status, "body: %s", retryBody)
+		retried := decodeJSON[endpointDTO](t, retryBody)
+		require.NotEmpty(t, retried.Secret)
+		assert.NotEqual(t, rotated.Secret, retried.Secret)
+		assert.Empty(t, retryHeaders.Get("Idempotent-Replayed"))
 
 		var activeSecrets, versions int
 		require.NoError(t, h.pool.QueryRow(ctx,
@@ -292,7 +305,19 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			endpointA.ID, h.tenantA,
 		).Scan(&activeSecrets, &versions))
 		assert.Equal(t, 1, activeSecrets)
-		assert.Equal(t, 2, versions)
+		assert.Equal(t, 3, versions)
+
+		// Each rotation is guarded: a succeeded intent row plus the service's
+		// domain event linked to it as a child.
+		var intents, children int
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT count(*) FILTER (WHERE parent_id IS NULL AND outcome = 'succeeded')::int,
+			        count(*) FILTER (WHERE parent_id IS NOT NULL)::int
+			 FROM audit_events WHERE tenant_id = $1 AND action = 'webhook.endpoint.secret_rotated'`,
+			h.tenantA,
+		).Scan(&intents, &children))
+		assert.Equal(t, 2, intents)
+		assert.Equal(t, 2, children)
 
 		var auditCount int
 		require.NoError(t, h.pool.QueryRow(ctx,
@@ -323,7 +348,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Equal(t, fiber.StatusUnauthorized, status)
 
 		// Persist the rotated secret for the outbound worker subtest.
-		h.endpointSecret = rotated.Secret
+		h.endpointSecret = retried.Secret
 		h.endpointID = endpointA.ID
 	})
 
@@ -543,7 +568,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 				webhook.HeaderID:        eventID,
 				webhook.HeaderEvent:     "invoice.paid",
 				webhook.HeaderTimestamp: strconv.FormatInt(ts.Unix(), 10),
-				webhook.HeaderSignature: webhook.SignatureHeader(webhook.Sign([]byte(secret), ts, payload)),
+				webhook.HeaderSignature: webhook.SignatureHeader(webhook.Sign([]byte(secret), eventID, "invoice.paid", ts, payload)),
 			}
 		}
 
@@ -613,10 +638,186 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			h.tenantB,
 		).Scan(&auditB))
 		assert.Equal(t, 1, auditB)
+
+		// A captured request replayed under a fresh id no longer verifies:
+		// the id is part of the signed content.
+		replayed := headers(rotated.Secret, "evt_in_signed")
+		replayed[webhook.HeaderID] = "evt_in_forged"
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, replayed)
+		assert.Equal(t, fiber.StatusUnauthorized, status)
+		relabeled := headers(rotated.Secret, "evt_in_relabel")
+		relabeled[webhook.HeaderEvent] = "invoice.refunded"
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, relabeled)
+		assert.Equal(t, fiber.StatusUnauthorized, status)
+
+		// A suspended source tenant behaves like a missing source.
+		_, err := h.pool.Exec(ctx, `UPDATE tenants SET status = 'suspended' WHERE id = $1`, h.tenantB)
+		require.NoError(t, err)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceB.ReceiverURL, payload, headers(sourceB.Secret, "evt_in_b_suspended"))
+		assert.Equal(t, fiber.StatusNotFound, status)
+		_, err = h.pool.Exec(ctx, `UPDATE tenants SET status = 'active' WHERE id = $1`, h.tenantB)
+		require.NoError(t, err)
+	})
+
+	t.Run("transactional dispatch commits with the producer", func(t *testing.T) {
+		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/tx", "tx.*")
+
+		countJobs := func() int {
+			var n int
+			require.NoError(t, h.pool.QueryRow(ctx,
+				`SELECT count(*)::int FROM jobs WHERE tenant_id = $1 AND kind = $2`,
+				h.tenantA, webhookservice.DispatchJobKind,
+			).Scan(&n))
+			return n
+		}
+		before := countJobs()
+
+		// A rolled-back producer transaction leaves no webhook behind.
+		tx, err := h.pool.Begin(ctx)
+		require.NoError(t, err)
+		require.NoError(t, h.dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
+			Type: "tx.rolled_back", TenantID: h.tenantA, Data: json.RawMessage(`{}`),
+		}))
+		require.NoError(t, tx.Rollback(ctx))
+		assert.Equal(t, before, countJobs())
+
+		tx, err = h.pool.Begin(ctx)
+		require.NoError(t, err)
+		require.NoError(t, h.dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
+			ID: "evt_tx_1", Type: "tx.committed", TenantID: h.tenantA, Data: json.RawMessage(`{"n":1}`),
+		}))
+		require.NoError(t, tx.Commit(ctx))
+		require.Equal(t, before+1, countJobs())
+
+		var payload []byte
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT payload FROM jobs WHERE tenant_id = $1 AND kind = $2 AND idempotency_key = $3`,
+			h.tenantA, webhookservice.DispatchJobKind, webhookservice.DispatchJobKind+":evt_tx_1",
+		).Scan(&payload))
+		// At-least-once: running the fan-out twice creates one delivery.
+		for range 2 {
+			require.NoError(t, h.dispatcher.HandleDispatchJob(tenant.WithID(ctx, h.tenantA), payload))
+		}
+		var deliveries int
+		var timeoutMS int32
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT count(*)::int, max(timeout_ms) FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2 AND event_id = 'evt_tx_1'`,
+			h.tenantA, endpoint.ID,
+		).Scan(&deliveries, &timeoutMS))
+		assert.Equal(t, 1, deliveries)
+		assert.Equal(t, int32(2000), timeoutMS, "the endpoint timeout is snapshotted on the delivery")
+	})
+
+	t.Run("unclaimable pending deliveries are dead-lettered", func(t *testing.T) {
+		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/stuck", "stuck.*")
+		tenantCtx := tenant.WithID(ctx, h.tenantA)
+		_, err := h.dispatcher.Dispatch(tenantCtx,
+			webhookcontracts.Event{ID: "evt_stuck_exhausted", Type: "stuck.one", TenantID: h.tenantA},
+			webhookcontracts.Event{ID: "evt_stuck_disabled", Type: "stuck.two", TenantID: h.tenantA},
+		)
+		require.NoError(t, err)
+		exhausted := h.deliveryID(t, "evt_stuck_exhausted")
+		disabled := h.deliveryID(t, "evt_stuck_disabled")
+
+		// Simulate a final attempt whose bookkeeping write was lost.
+		_, err = h.pool.Exec(ctx,
+			`UPDATE webhook_deliveries SET attempts = max_attempts, next_attempt_at = now() - interval '1 second' WHERE id = $1`,
+			exhausted)
+		require.NoError(t, err)
+		job, _ := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: exhausted})
+		require.NoError(t, h.worker.Handle(tenantCtx, job))
+
+		// A disabled endpoint stops receiving retries.
+		_, err = h.pool.Exec(ctx, `UPDATE webhook_endpoints SET status = 'disabled' WHERE id = $1`, endpoint.ID)
+		require.NoError(t, err)
+		job, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: disabled})
+		require.NoError(t, h.worker.Handle(tenantCtx, job))
+
+		for id, reason := range map[int64]string{
+			exhausted: "delivery attempts exhausted",
+			disabled:  "endpoint is disabled or deleted",
+		} {
+			var status, lastError string
+			var attempts int32
+			require.NoError(t, h.pool.QueryRow(ctx,
+				`SELECT status, COALESCE(last_error, ''), attempts FROM webhook_deliveries WHERE id = $1`, id,
+			).Scan(&status, &lastError, &attempts))
+			assert.Equal(t, "dead", status, "delivery %d", id)
+			assert.Equal(t, reason, lastError, "delivery %d", id)
+		}
+		var disabledAttempts int
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT count(*)::int FROM webhook_delivery_attempts WHERE delivery_id = $1`, disabled,
+		).Scan(&disabledAttempts))
+		assert.Zero(t, disabledAttempts, "a disabled endpoint must not be called")
+	})
+
+	t.Run("concurrent secret rotations serialize", func(t *testing.T) {
+		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/rotate", "*")
+		tenantCtx := tenant.WithID(ctx, h.tenantA)
+		const rotations = 8
+		var wg sync.WaitGroup
+		errs := make(chan error, rotations)
+		for i := range rotations {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, err := h.repo.RotateEndpointSecret(tenantCtx, endpoint.ID, fmt.Sprintf("sealed-%d", i))
+				errs <- err
+			}(i)
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			assert.NoError(t, err)
+		}
+		var maxVersion, active int
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT max(version), count(*) FILTER (WHERE active) FROM webhook_endpoint_secrets WHERE endpoint_id = $1`,
+			endpoint.ID,
+		).Scan(&maxVersion, &active))
+		assert.Equal(t, rotations+1, maxVersion)
+		assert.Equal(t, 1, active)
+	})
+
+	t.Run("retention purges terminal rows in batches", func(t *testing.T) {
+		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/purge", "purge.*")
+		_, err := h.pool.Exec(ctx, `
+			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id, event_type, event_created_at,
+			    url, payload, secret_ciphertext, status, max_attempts)
+			SELECT $1, $2, 'evt_purge_' || g, 'purge.old', now(), 'https://receiver.example/purge',
+			       '{}'::jsonb, 'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3
+			FROM generate_series(1, 1500) AS g`,
+			h.tenantA, endpoint.ID)
+		require.NoError(t, err)
+		_, err = h.pool.Exec(ctx, `
+			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id, event_type, event_created_at,
+			    url, payload, secret_ciphertext, status, max_attempts)
+			VALUES ($1, $2, 'evt_purge_pending', 'purge.old', now(), 'https://receiver.example/purge',
+			        '{}'::jsonb, 'sealed', 'pending', 3)`,
+			h.tenantA, endpoint.ID)
+		require.NoError(t, err)
+		// The updated_at trigger fires on UPDATE, so disable it to age rows.
+		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries DISABLE TRIGGER trigger_webhook_deliveries_updated_at`)
+		require.NoError(t, err)
+		_, err = h.pool.Exec(ctx,
+			`UPDATE webhook_deliveries SET updated_at = now() - interval '40 days' WHERE event_id LIKE 'evt_purge_%'`)
+		require.NoError(t, err)
+		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries ENABLE TRIGGER trigger_webhook_deliveries_updated_at`)
+		require.NoError(t, err)
+
+		purged, err := h.repo.PurgeDeliveries(ctx, 30)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1500), purged, "every terminal row is purged across batches")
+		var pending int
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT count(*)::int FROM webhook_deliveries WHERE event_id LIKE 'evt_purge_%'`,
+		).Scan(&pending))
+		assert.Equal(t, 1, pending, "pending deliveries are never purged")
 	})
 }
 
-func (h *webhookHarness) doBytes(t *testing.T, method, path string, body []byte, headers map[string]string) (int, []byte, http.Header) {
+func (h *webhookHarness) doBytes(t *testing.T, method, path string, body []byte, headers map[string]string) (status int, payload []byte, header http.Header) {
 	t.Helper()
 	req, err := http.NewRequest(method, path, bytes.NewReader(body))
 	require.NoError(t, err)

@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -58,12 +59,32 @@ func moduleTestConfig() *config.Config {
 	}
 }
 
-func setupModuleApp(t *testing.T) (*fiber.App, *stubService) {
+// intentRecorder implements the Guard recorder contracts so required-mode
+// routes can write intent rows in tests.
+type intentRecorder struct {
+	intents     []audit.Event
+	completions []audit.Completion
+}
+
+func (r *intentRecorder) Record(context.Context, audit.Event) error { return nil }
+
+func (r *intentRecorder) RecordID(_ context.Context, event audit.Event) (int64, error) {
+	r.intents = append(r.intents, event)
+	return int64(len(r.intents)), nil
+}
+
+func (r *intentRecorder) Complete(_ context.Context, _ int64, completion audit.Completion) error {
+	r.completions = append(r.completions, completion)
+	return nil
+}
+
+func setupModuleApp(t *testing.T) (*fiber.App, *stubService, *intentRecorder) {
 	t.Helper()
 	svc := &stubService{}
-	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache()})
+	recorder := &intentRecorder{}
+	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache(), Audit: recorder})
 	application.Register(New(featureshandler.NewHandler(svc)))
-	return application.Fiber(), svc
+	return application.Fiber(), svc, recorder
 }
 
 func bearer(t *testing.T, userID int64, role string) string {
@@ -74,7 +95,7 @@ func bearer(t *testing.T, userID int64, role string) string {
 }
 
 func TestModuleRoutesRequireFeaturePermissions(t *testing.T) {
-	application, _ := setupModuleApp(t)
+	application, _, _ := setupModuleApp(t)
 
 	req, _ := http.NewRequest(http.MethodGet, "/api/v1/admin/features/flags", http.NoBody)
 	resp, err := application.Test(req)
@@ -95,7 +116,7 @@ func TestModuleRoutesRequireFeaturePermissions(t *testing.T) {
 }
 
 func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
-	application, svc := setupModuleApp(t)
+	application, svc, recorder := setupModuleApp(t)
 	body := []byte(`{"enabled":true,"killSwitch":false}`)
 
 	for i := 0; i < 2; i++ {
@@ -111,4 +132,25 @@ func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, svc.upserts, "replayed PUT must not call the service twice")
+	require.Len(t, recorder.intents, 1, "replay must not write a second intent row")
+	assert.Equal(t, "admin.feature_flag.updated", recorder.intents[0].Action)
+	assert.Equal(t, "feature_flag", recorder.intents[0].Resource)
+	require.Len(t, recorder.completions, 1)
+	assert.Equal(t, audit.OutcomeSucceeded, recorder.completions[0].Outcome)
+}
+
+func TestModuleMutationsFailClosedWithoutAuditStore(t *testing.T) {
+	svc := &stubService{}
+	// No Deps.Audit: the required Guard has no intent-capable recorder.
+	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache()})
+	application.Register(New(featureshandler.NewHandler(svc)))
+
+	req, _ := http.NewRequest(http.MethodPut, "/api/v1/admin/features/flags/file_uploads",
+		bytes.NewReader([]byte(`{"enabled":true,"killSwitch":false}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", bearer(t, 2, "admin"))
+	resp, err := application.Fiber().Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, 0, svc.upserts, "an unaudited mutation must not reach the service")
 }

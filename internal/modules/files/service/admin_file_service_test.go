@@ -10,8 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -131,7 +133,7 @@ func seedAdminFiles(repo *fakeAdminFileRepo, n int) {
 func TestAdminListFiles(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		repo := newFakeAdminFileRepo()
-		svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
+		svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 		seedAdminFiles(repo, 2)
 		repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
@@ -159,7 +161,7 @@ func TestAdminListFiles(t *testing.T) {
 	})
 
 	t.Run("empty list", func(t *testing.T) {
-		svc := NewAdminFileService(newFakeAdminFileRepo(), nil, nil, newFakeAdminStorage())
+		svc := NewAdminFileService(newFakeAdminFileRepo(), nil, audit.Noop{}, newFakeAdminStorage())
 
 		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
 		if err != nil {
@@ -177,7 +179,7 @@ func TestAdminListFiles(t *testing.T) {
 func TestAdminDownloadFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, nil, nil, store)
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, store)
 	seedAdminFiles(repo, 1)
 	store.data["uploads/file.txt"] = []byte("payload")
 
@@ -200,7 +202,7 @@ func TestAdminDownloadFile(t *testing.T) {
 
 func TestAdminDeleteFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	if err := svc.DeleteFile(context.Background(), 1); err != nil {
@@ -221,12 +223,12 @@ func TestAdminDeleteFile(t *testing.T) {
 
 func TestAdminRestoreFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	_, err := svc.RestoreFile(context.Background(), 1)
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Code != string(apperror.CodeFileNotDeleted) {
+	if !errors.As(err, &appErr) || appErr.Code != string(filescatalog.CodeFileNotDeleted) {
 		t.Fatalf("expected file.not_deleted, got %v", err)
 	}
 
@@ -245,7 +247,7 @@ func TestAdminRestoreFile(t *testing.T) {
 
 func TestAdminGetFileStats(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 	seedAdminFiles(repo, 3)
 	repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
@@ -264,7 +266,7 @@ func TestAdminGetFileStats(t *testing.T) {
 func TestAdminFileService_TenantIsolation(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, nil, nil, store)
+	svc := NewAdminFileService(repo, nil, audit.Noop{}, store)
 	seedAdminFiles(repo, 1) // tenant 1, file 1
 	repo.files[2] = &filesqlc.File{
 		ID:           2,

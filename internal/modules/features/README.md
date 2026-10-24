@@ -9,7 +9,10 @@ defaults/targets, and invalidates the local snapshot.
 
 All routes are under `/api/v1/admin/features`, require JWT authentication, and
 are rate limited. Reads use `admin:features:read`; writes use
-`admin:features:write` and accept `Idempotency-Key`.
+`admin:features:write`, accept `Idempotency-Key`, and run behind a required
+`audit.Guard`. `PUT`/`DELETE /flags/:key` change process-wide state and are
+limited to platform-tenant (id 1) admins; other tenants manage only their own
+targets.
 
 | Method | Path | Handler |
 | --- | --- | --- |
@@ -23,12 +26,15 @@ are rate limited. Reads use `admin:features:read`; writes use
 
 ## Tables
 
-- `feature_flags` — process-wide `flag_key`, `enabled`, `kill_switch`,
-  `description`. Owned by `internal/platform/features`; this module writes it
-  through its own sqlc queries for the admin API.
+- `feature_flags` — process-wide `flag_key`, nullable `enabled` (NULL = no
+  database default), `kill_switch`, `description`. Owned by
+  `internal/platform/features`; this module writes it through its own sqlc
+  queries for the admin API. Target upserts create a missing row with a NULL
+  default.
 - `feature_flag_targets` — tenant-owned `tenant_id` plus nullable `user_id`.
   The tenant always comes from the request context. A composite foreign key
-  `(tenant_id, user_id) -> users(tenant_id, id)` prevents cross-tenant targets.
+  `(tenant_id, user_id) -> users(tenant_id, id)` prevents cross-tenant targets;
+  `flag_key` references `feature_flags` with `ON DELETE RESTRICT`.
 
 ## Cross-module rules
 
@@ -40,8 +46,10 @@ evaluation logic.
 ## Tests
 
 - `service/`: catalog merge, tenant scoping, description semantics, idempotent
-  delete, invalid-key 404s, and evaluator invalidation.
-- `handler/`: request validation, audit metadata, response shapes, and errors.
-- `module_test.go`: permission enforcement and route-level idempotency.
+  delete, platform-tenant restriction, NULL defaults, audit domain events,
+  invalid-key 404s, and evaluator invalidation.
+- `handler/`: request validation, response shapes, and errors.
+- `module_test.go`: permission enforcement, route-level idempotency, and
+  fail-closed audit guards.
 - `test/integration/feature_flags_test.go`: SQL, tenant isolation, precedence,
   kill switch, and the full admin lifecycle.

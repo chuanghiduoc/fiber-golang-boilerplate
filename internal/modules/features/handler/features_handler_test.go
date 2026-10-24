@@ -13,20 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
-
-type recordingAudit struct {
-	events []audit.Event
-}
-
-func (r *recordingAudit) Record(_ context.Context, event audit.Event) error {
-	r.events = append(r.events, event)
-	return nil
-}
 
 type fakeService struct {
 	flags        []featuresdto.FlagResponse
@@ -79,7 +69,7 @@ func (f *fakeService) DeleteTarget(context.Context, string, int64) error {
 
 func int64Ptr(value int64) *int64 { return &value }
 
-func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService, *recordingAudit) {
+func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService) {
 	t.Helper()
 	svc := &fakeService{
 		flags: []featuresdto.FlagResponse{{Key: "file_uploads", Enabled: true, Effective: true, Source: "compiled_default"}},
@@ -91,11 +81,9 @@ func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService, *recordingAudi
 		upsertFlag:   featuresdto.FlagResponse{Key: "file_uploads", Enabled: false, KillSwitch: true, Configured: true, Source: "kill_switch"},
 		upsertTarget: featuresdto.TargetResponse{ID: 5, FlagKey: "file_uploads", TenantID: 2, UserID: int64Ptr(42), Enabled: true},
 	}
-	recorder := &recordingAudit{}
 	h := NewHandler(svc)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
-	app.Use(audit.Middleware(recorder))
 	app.Use(func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "user_id", 88)
 		c.SetContext(tenant.WithID(c.Context(), 2))
@@ -108,7 +96,7 @@ func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService, *recordingAudi
 	app.Get("/admin/features/flags/:key/targets", h.ListTargets)
 	app.Put("/admin/features/flags/:key/targets", h.UpsertTarget)
 	app.Delete("/admin/features/flags/:key/targets/:id", h.DeleteTarget)
-	return app, svc, recorder
+	return app, svc
 }
 
 func doRequest(t *testing.T, app *fiber.App, method, path string, body []byte) (resp *http.Response, respBody []byte) {
@@ -127,7 +115,7 @@ func doRequest(t *testing.T, app *fiber.App, method, path string, body []byte) (
 }
 
 func TestHandlerListAndGetFlags(t *testing.T) {
-	app, svc, _ := setupFeatureHandler(t)
+	app, svc := setupFeatureHandler(t)
 
 	resp, body := doRequest(t, app, http.MethodGet, "/admin/features/flags", nil)
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
@@ -152,8 +140,8 @@ func TestHandlerListAndGetFlags(t *testing.T) {
 	require.Equal(t, fiber.StatusOK, resp.StatusCode)
 }
 
-func TestHandlerUpsertFlagAddsAuditMetadata(t *testing.T) {
-	app, _, recorder := setupFeatureHandler(t)
+func TestHandlerUpsertFlag(t *testing.T) {
+	app, svc := setupFeatureHandler(t)
 	body, _ := json.Marshal(map[string]any{
 		"enabled":     false,
 		"killSwitch":  true,
@@ -165,18 +153,26 @@ func TestHandlerUpsertFlagAddsAuditMetadata(t *testing.T) {
 	var flag featuresdto.FlagResponse
 	require.NoError(t, json.Unmarshal(respBody, &flag))
 	assert.True(t, flag.KillSwitch)
+	require.NotNil(t, svc.lastRequest.Enabled)
+	assert.False(t, *svc.lastRequest.Enabled)
 
-	require.Len(t, recorder.events, 1)
-	event := recorder.events[0]
-	assert.Equal(t, "file_uploads", event.ResourceID)
-	assert.Equal(t, "file_uploads", event.Metadata["feature"])
-	assert.Equal(t, false, event.Metadata["enabled"])
-	assert.Equal(t, true, event.Metadata["killSwitch"])
-	assert.Equal(t, "kill_switch", event.Metadata["source"])
+	// enabled is optional: omitting it clears the database default.
+	resp, _ = doRequest(t, app, http.MethodPut, "/admin/features/flags/file_uploads", []byte(`{"killSwitch":false}`))
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	assert.Nil(t, svc.lastRequest.Enabled)
+}
+
+func TestHandlerUpsertFlagPropagatesPlatformDenial(t *testing.T) {
+	app, svc := setupFeatureHandler(t)
+	svc.deleteErr = apperror.NewCode(apperror.CodePermissionDenied, "global feature flag changes require a platform tenant administrator")
+
+	resp, body := doRequest(t, app, http.MethodPut, "/admin/features/flags/file_uploads", []byte(`{"enabled":true,"killSwitch":false}`))
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "permission.denied")
 }
 
 func TestHandlerUpsertFlagValidation(t *testing.T) {
-	app, _, _ := setupFeatureHandler(t)
+	app, _ := setupFeatureHandler(t)
 
 	resp, body := doRequest(t, app, http.MethodPut, "/admin/features/flags/file_uploads", []byte(`{"enabled":true}`))
 	assert.Equal(t, fiber.StatusUnprocessableEntity, resp.StatusCode)
@@ -187,7 +183,7 @@ func TestHandlerUpsertFlagValidation(t *testing.T) {
 }
 
 func TestHandlerUpsertAndDeleteTarget(t *testing.T) {
-	app, _, recorder := setupFeatureHandler(t)
+	app, _ := setupFeatureHandler(t)
 	body, _ := json.Marshal(map[string]any{"userId": 42, "enabled": true})
 
 	resp, respBody := doRequest(t, app, http.MethodPut, "/admin/features/flags/file_uploads/targets", body)
@@ -196,30 +192,30 @@ func TestHandlerUpsertAndDeleteTarget(t *testing.T) {
 	require.NoError(t, json.Unmarshal(respBody, &target))
 	assert.Equal(t, int64(5), target.ID)
 
-	require.Len(t, recorder.events, 1)
-	assert.Equal(t, int64(42), recorder.events[0].Metadata["userId"])
-
 	resp, _ = doRequest(t, app, http.MethodDelete, "/admin/features/flags/file_uploads/targets/5", nil)
 	require.Equal(t, fiber.StatusNoContent, resp.StatusCode)
-	require.Len(t, recorder.events, 2)
-	assert.Equal(t, "5", recorder.events[1].ResourceID)
-	assert.Equal(t, int64(5), recorder.events[1].Metadata["targetId"])
 
 	resp, _ = doRequest(t, app, http.MethodDelete, "/admin/features/flags/file_uploads/targets/not-a-number", nil)
 	assert.Equal(t, fiber.StatusBadRequest, resp.StatusCode)
 }
 
 func TestHandlerDeleteFlag(t *testing.T) {
-	app, _, recorder := setupFeatureHandler(t)
+	app, _ := setupFeatureHandler(t)
 
 	resp, _ := doRequest(t, app, http.MethodDelete, "/admin/features/flags/file_uploads", nil)
 	require.Equal(t, fiber.StatusNoContent, resp.StatusCode)
-	require.Len(t, recorder.events, 1)
-	assert.Equal(t, "file_uploads", recorder.events[0].Metadata["feature"])
+}
+
+func TestHandlerDeleteFlagConflict(t *testing.T) {
+	app, svc := setupFeatureHandler(t)
+	svc.deleteErr = apperror.NewConflict("feature flag has targets; delete them before deleting the flag")
+
+	resp, _ := doRequest(t, app, http.MethodDelete, "/admin/features/flags/file_uploads", nil)
+	assert.Equal(t, fiber.StatusConflict, resp.StatusCode)
 }
 
 func TestHandlerDeleteFlagNotFound(t *testing.T) {
-	app, svc, _ := setupFeatureHandler(t)
+	app, svc := setupFeatureHandler(t)
 	svc.deleteErr = apperror.NewNotFound("feature flag not found")
 
 	resp, _ := doRequest(t, app, http.MethodDelete, "/admin/features/flags/file_uploads", nil)

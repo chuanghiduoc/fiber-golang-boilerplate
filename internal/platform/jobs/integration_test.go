@@ -24,6 +24,46 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
+// TestStoreIntegrationReleaseGivesAttemptBack proves a shutdown release on the
+// final attempt requeues the job with its attempt restored, and that the
+// attempts fence still rejects a stale owner.
+func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
+	pool := setupIntegrationDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	id, err := NewQueue(pool).Enqueue(ctx, Job{Kind: "jobs.integration.release", MaxAttempts: 1})
+	require.NoError(t, err)
+
+	store := newPGStore(pool)
+	claimed, err := store.Claim(ctx, "release-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	require.Equal(t, 1, claimed[0].Attempts)
+
+	require.NoError(t, store.Release(ctx, id, "release-worker", 1, "jobs: interrupted by worker shutdown"))
+	var (
+		status   string
+		attempts int
+		lockedBy *string
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT status, attempts, locked_by FROM jobs WHERE id = $1`, id,
+	).Scan(&status, &attempts, &lockedBy))
+	assert.Equal(t, "queued", status, "a final-attempt release must not dead-letter")
+	assert.Zero(t, attempts)
+	assert.Nil(t, lockedBy)
+
+	assert.ErrorIs(t, store.Release(ctx, id, "release-worker", 1, "stale"), ErrLeaseLost,
+		"a released job is no longer owned")
+
+	// The job is claimable again with its full budget.
+	claimed, err = store.Claim(ctx, "release-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, 1, claimed[0].Attempts)
+}
+
 // TestWorkerIntegrationProcessesJob exercises Enqueue and Worker against a real
 // PostgreSQL server. Without TEST_DATABASE_URL it skips, so the default unit
 // test run stays Docker-free.
@@ -503,11 +543,11 @@ func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	const tenantTwo int64 = 2
-	_, err := pool.Exec(ctx,
-		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-once-tenant-2', 'Jobs Once Tenant 2')`,
-		tenantTwo,
-	)
+	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
+	var tenantTwo int64
+	err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('jobs-once-tenant-2', 'Jobs Once Tenant 2') RETURNING id`,
+	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
 	queue := NewQueue(pool)
@@ -606,11 +646,11 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	const tenantTwo int64 = 2
-	_, err := pool.Exec(ctx,
-		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-tenant-2', 'Jobs Tenant 2')`,
-		tenantTwo,
-	)
+	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
+	var tenantTwo int64
+	err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('jobs-tenant-2', 'Jobs Tenant 2') RETURNING id`,
+	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
 	tenantCtx := tenant.WithID(ctx, tenantTwo)
@@ -982,11 +1022,24 @@ func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 	require.NotNil(t, stored)
 	assert.Equal(t, traceparent, *stored)
 
+	// The deduplicated enqueue path persists the same traceparent.
+	onceID, created, err := queue.EnqueueOnce(enqueueCtx, Job{
+		Kind:           "jobs.integration.traced.once",
+		IdempotencyKey: "trace-once",
+	})
+	require.NoError(t, err)
+	require.True(t, created)
+	var onceStored *string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT trace_parent FROM jobs WHERE id = $1`, onceID).Scan(&onceStored))
+	require.NotNil(t, onceStored)
+	assert.Equal(t, traceparent, *onceStored)
+
 	worker := NewWorker(pool, "trace-integration-worker",
 		WithPollInterval(20*time.Millisecond),
 		WithTracerProvider(provider),
 	)
 	worker.Register("jobs.integration.traced", func(context.Context, json.RawMessage) error { return nil })
+	worker.Register("jobs.integration.traced.once", func(context.Context, json.RawMessage) error { return nil })
 	runIntegrationWorker(t, worker)
 
 	require.Eventually(t, func() bool {
