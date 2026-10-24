@@ -288,9 +288,11 @@ Rules:
   or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent), and
   `POST /admin/api-keys/:id/rotate` issues a new secret while the old key stays
   valid for 24 hours unless revoked.
-- All routes are tenant-scoped, return `404` for another tenant's key id,
-  accept `Idempotency-Key`, and attach `apiKeyId`/scope/rotation metadata to the
-  audit event (never the secret or hash).
+- All routes are tenant-scoped and return `404` for another tenant's key id.
+  Lifecycle mutations accept `Idempotency-Key`; create and rotate deliberately
+  omit it so a plaintext secret is never written to the shared response cache.
+  Audit metadata carries `apiKeyId`/scope/rotation state, never the secret or
+  hash.
 
 ## Notifications
 

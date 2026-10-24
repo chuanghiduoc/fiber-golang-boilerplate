@@ -29,10 +29,10 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	group := v1.Group("/admin/api-keys", auth, deps.Limiters.Normal)
 
 	group.Get("/", authz.Require(authz.PermissionAdminAPIKeysRead), m.handler.List)
-	group.Post("/", authz.Require(authz.PermissionAdminAPIKeysCreate), deps.Idempotency, m.handler.Create)
+	group.Post("/", authz.Require(authz.PermissionAdminAPIKeysCreate), m.handler.Create)
 	group.Get("/:id", authz.Require(authz.PermissionAdminAPIKeysRead), m.handler.Get)
 	group.Put("/:id", authz.Require(authz.PermissionAdminAPIKeysUpdate), deps.Idempotency, m.handler.Update)
 	group.Delete("/:id", authz.Require(authz.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.Revoke)
 	group.Post("/:id/revoke", authz.Require(authz.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.RevokeByPost)
-	group.Post("/:id/rotate", authz.Require(authz.PermissionAdminAPIKeysRotate), deps.Idempotency, m.handler.Rotate)
+	group.Post("/:id/rotate", authz.Require(authz.PermissionAdminAPIKeysRotate), m.handler.Rotate)
 }
