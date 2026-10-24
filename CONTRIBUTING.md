@@ -118,6 +118,10 @@ golang-migrate CLI's `force 1`) instead of re-running the file.
 
 ## Adding a New Module
 
+Run `scripts/new-module.sh <name>` and follow
+[`docs/module-template.md`](docs/module-template.md). The runtime behavior of
+the resulting module is covered by [`docs/operations.md`](docs/operations.md).
+
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`
    (`Name`, `RegisterRoutes`). Keep the module's handler/service/repository/DTO
    inside that directory.

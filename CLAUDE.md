@@ -51,8 +51,11 @@ deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)
 **Request flow:** `Client → app middleware → module route → handler → service → repository → sqlc → PostgreSQL`.
 
 **Design docs:** `docs/architecture.md` (module map, ownership, strangler
-status) and `docs/api-design.md` (API conventions, errors, pagination,
-idempotency, compatibility). Keep both current when routes/contracts change.
+status), `docs/api-design.md` (API conventions, errors, pagination,
+idempotency, compatibility), `docs/module-template.md` (canonical module
+layout, scaffold, routes/permissions/tables/contracts), and
+`docs/operations.md` (health, metrics, logs, jobs, idempotency, migrations,
+Kubernetes, incidents). Keep them current when routes/contracts change.
 
 **Dependency rules**
 - A module must not import another module's internals. Use `internal/contracts`
@@ -169,6 +172,8 @@ Offset helpers are for small admin/export tables only.
   GET/HEAD/OPTIONS.
 
 ## Adding a Module
+
+Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`.
 
 1. Create `internal/modules/<name>/module.go` implementing `app.Module`.
 2. Keep handler/service/repository/DTO inside the module.

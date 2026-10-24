@@ -265,8 +265,9 @@ If you must use `STORAGE_DRIVER=local`:
 `JWT_SECRET` is also used to derive the AES key that encrypts queued email job
 payloads. Rotating it has two effects:
 
-1. All existing access and refresh tokens become invalid; users must log in
-   again.
+1. All existing access tokens fail validation. Refresh tokens are opaque
+   database rows and remain valid unless revoked separately; revoke them (or
+   bump the token version) if a full re-login is required.
 2. Encrypted jobs already in the `jobs` table can no longer be decrypted. A
    rolling update where old and new replicas use different secrets can also
    produce jobs that the other replicas cannot open.

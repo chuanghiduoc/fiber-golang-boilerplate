@@ -94,6 +94,10 @@ cross-module reads.
 
 ## Extension checklist
 
+Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the canonical
+[Module Template](module-template.md) for the full layout, skeleton, and
+ownership rules. Short form:
+
 1. Create the module, tables, and queries; update the baseline for fresh
    installs (or add a numbered migration for deployed DBs).
 2. Add permissions and audit actions.
