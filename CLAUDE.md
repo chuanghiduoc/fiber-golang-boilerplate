@@ -99,8 +99,11 @@ Offset helpers are for small admin/export tables only.
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their
   `email.send` job in one transaction (`QueuedSender.SendTx`), so an enqueue
-  failure rolls the token back. A worker retries with backoff and dead-letters
-  after `max_attempts`.
+  failure rolls the token back. Registration is atomic too: `UserService.Register`
+  creates the user, verification token, and `email.send` job in one transaction,
+  so a failed outbox write rolls the account back (fail-closed). Resend and
+  email-change flows keep their separate post-commit token/email transaction.
+  A worker retries with backoff and dead-letters after `max_attempts`.
   Claim errors are retried in-process with backoff capped at 30s. Handlers have
   a 10m default timeout (`WithJobTimeout`, non-positive disables it), and
   unknown kinds retry until `max_attempts` before dead-lettering. Heartbeats

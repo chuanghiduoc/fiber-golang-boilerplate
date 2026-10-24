@@ -47,6 +47,14 @@ type UserService interface {
 	Delete(ctx context.Context, id int64) error
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
 	RevokeSessions(ctx context.Context, userID int64) error
+	// SetVerificationProvisioner wires registration email provisioning into the
+	// user-creation transaction. When unset, registration falls back to the
+	// handler's post-commit verification email.
+	SetVerificationProvisioner(p VerificationProvisioner)
+	// RegistrationEmailsTransactional reports whether Register commits the
+	// verification email with the user. Callers must not send a second email
+	// when it returns true.
+	RegistrationEmailsTransactional() bool
 }
 
 type userService struct {
@@ -56,6 +64,7 @@ type userService struct {
 	cache                    cache.Cache
 	txManager                *database.TxManager
 	sessions                 session.Store
+	verificationProvisioner  VerificationProvisioner
 }
 
 func NewUserService(
@@ -95,12 +104,56 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, err
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	var user *sqlc.User
+	if s.verificationProvisioner != nil && s.txManager != nil {
+		// Create the user, verification token, and email job in one transaction.
+		// A provisioning failure rolls the user back: registration fails closed
+		// rather than committing an account that cannot receive its link.
+		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, req.Password)
+			if createErr != nil {
+				return createErr
+			}
+			if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
+				slog.Error("failed to provision registration verification email",
+					slog.Int64("user_id", created.ID),
+					slog.String("email", created.Email),
+					slog.Any("error", provErr),
+				)
+				return provErr
+			}
+			user = created
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		user, err = s.createUser(ctx, s.repo, email, name, req.Password)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// A previous failed-login lockout must not survive registration.
+	_ = s.cache.Delete(ctx, loginAttemptPrefix+email)
+
+	return ToUserResponse(user), nil
+}
+
+// createUser creates a local account through repo, which may be backed by the
+// pool or by a caller-owned transaction.
+func (s *userService) createUser(
+	ctx context.Context,
+	repo repository.UserRepository,
+	email, name, password string,
+) (*sqlc.User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 
-	user, err := s.repo.Create(ctx, sqlc.CreateUserParams{
+	user, err := repo.Create(ctx, sqlc.CreateUserParams{
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -111,11 +164,15 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		}
 		return nil, apperror.NewInternal("failed to create user")
 	}
+	return user, nil
+}
 
-	// A previous failed-login lockout must not survive registration.
-	_ = s.cache.Delete(ctx, loginAttemptPrefix+email)
+func (s *userService) SetVerificationProvisioner(p VerificationProvisioner) {
+	s.verificationProvisioner = p
+}
 
-	return ToUserResponse(user), nil
+func (s *userService) RegistrationEmailsTransactional() bool {
+	return s.verificationProvisioner != nil && s.txManager != nil
 }
 
 func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {

@@ -93,6 +93,24 @@ func TestSendVerification(t *testing.T) {
 	})
 }
 
+func TestSendVerificationTxRequiresTransaction(t *testing.T) {
+	ur := newMockUserRepo()
+	vr := newMockEmailVerificationRepo()
+	es := newMockTransactionalEmailSender()
+	svc := NewEmailVerificationService(ur, vr, es, newMockCache(), "http://localhost:3000", nil)
+
+	err := svc.SendVerificationTx(context.Background(), nil, 1, "user@example.com")
+	if err == nil {
+		t.Fatal("expected error for nil transaction")
+	}
+	if len(vr.tokens) != 0 {
+		t.Errorf("no token may be created without a transaction, got %d", len(vr.tokens))
+	}
+	if es.SendTxCalls() != 0 || es.Sent() != 0 {
+		t.Errorf("no email may be queued without a transaction, got SendTx=%d Send=%d", es.SendTxCalls(), es.Sent())
+	}
+}
+
 func TestVerify(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		svc, ur, vr, _, _ := newEmailVerifServiceForTest()

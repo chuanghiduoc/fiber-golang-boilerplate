@@ -7,22 +7,27 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 // mockUserService is a manual mock for testing handlers.
 type mockUserService struct {
-	users   map[int64]*dto.UserResponse
-	hasMore bool
+	users                           map[int64]*dto.UserResponse
+	hasMore                         bool
+	registrationEmailsTransactional bool
 }
 
 func newMockService() *mockUserService {
@@ -98,6 +103,12 @@ func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password st
 	return apperror.NewBadRequest("current password is incorrect")
 }
 
+func (m *mockUserService) SetVerificationProvisioner(_ service.VerificationProvisioner) {}
+
+func (m *mockUserService) RegistrationEmailsTransactional() bool {
+	return m.registrationEmailsTransactional
+}
+
 // mockRefreshTokenService is a manual mock for testing handlers.
 type mockRefreshTokenService struct{}
 
@@ -137,10 +148,21 @@ func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ dto.ResetP
 }
 
 // mockEmailVerificationService is a manual mock for testing handlers.
-type mockEmailVerificationService struct{}
+type mockEmailVerificationService struct {
+	sendVerificationCalls atomic.Int64
+}
 
 func (m *mockEmailVerificationService) SendVerification(_ context.Context, _ int64, _ string) error {
+	m.sendVerificationCalls.Add(1)
 	return nil
+}
+
+func (m *mockEmailVerificationService) SendVerificationTx(_ context.Context, _ pgx.Tx, _ int64, _ string) error {
+	return nil
+}
+
+func (m *mockEmailVerificationService) SendVerificationCallCount() int {
+	return int(m.sendVerificationCalls.Load())
 }
 
 func (m *mockEmailVerificationService) Verify(_ context.Context, _ string) error {
@@ -156,13 +178,16 @@ func (m *mockEmailVerificationService) Invalidate(_ context.Context, _ int64) er
 }
 
 func setupApp(svc *mockUserService) *fiber.App {
+	return setupAppWithEmailService(svc, &mockEmailVerificationService{})
+}
+
+func setupAppWithEmailService(svc *mockUserService, emailVerifSvc *mockEmailVerificationService) *fiber.App {
 	app := fiber.New(fiber.Config{
 		ErrorHandler: apperror.FiberErrorHandler,
 	})
 
 	refreshSvc := &mockRefreshTokenService{}
 	resetSvc := &mockPasswordResetService{}
-	emailVerifSvc := &mockEmailVerificationService{}
 	authHandler := NewAuthHandler(svc, refreshSvc, resetSvc, emailVerifSvc, "test-secret", 24, false, nil)
 	userHandler := NewUserHandler(svc)
 
@@ -205,6 +230,48 @@ func TestRegisterHandler(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
+}
+
+func TestRegisterHandler_VerificationEmailDispatch(t *testing.T) {
+	register := func(t *testing.T, app *fiber.App) {
+		t.Helper()
+		body, _ := json.Marshal(dto.RegisterRequest{
+			Email:    "new@example.com",
+			Password: "Password1!",
+			Name:     "New User",
+		})
+		req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := app.Test(req)
+		require.NoError(t, err)
+		require.Equal(t, fiber.StatusCreated, resp.StatusCode)
+	}
+
+	t.Run("sends async verification when registration is not transactional", func(t *testing.T) {
+		svc := newMockService()
+		emailSvc := &mockEmailVerificationService{}
+		app := setupAppWithEmailService(svc, emailSvc)
+
+		register(t, app)
+
+		require.Eventually(t, func() bool {
+			return emailSvc.SendVerificationCallCount() == 1
+		}, time.Second, 5*time.Millisecond, "fallback registration must send one verification email")
+	})
+
+	t.Run("skips async verification when registration is transactional", func(t *testing.T) {
+		svc := newMockService()
+		svc.registrationEmailsTransactional = true
+		emailSvc := &mockEmailVerificationService{}
+		app := setupAppWithEmailService(svc, emailSvc)
+
+		register(t, app)
+
+		require.Never(t, func() bool {
+			return emailSvc.SendVerificationCallCount() > 0
+		}, 100*time.Millisecond, 5*time.Millisecond, "transactional registration must not send a duplicate email")
+	})
 }
 
 func TestLoginHandler(t *testing.T) {
