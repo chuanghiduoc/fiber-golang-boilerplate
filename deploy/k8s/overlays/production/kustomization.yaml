@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Production overlay. Resources keep their base names; environment isolation
+# comes from the namespace. Replace every example.com / REPLACE_* placeholder
+# before applying this overlay. Deploy only immutable image tags here (a full
+# semver release or sha-<full sha>); the deploy workflow enforces that rule.
+namespace: fiber-boilerplate-production
+
+resources:
+  # The reusable base is a sibling kustomization root. Referencing `../../`
+  # would make kustomize treat this overlay as nested inside the base and fail
+  # with a cycle error, so the app kustomization lives in ../../base.
+  - ../../base
+
+# The deploy workflow changes this tag in a temporary copy. For a manual
+# deploy, set newTag to an immutable Release workflow image tag.
+images:
+  - name: ghcr.io/OWNER/REPO
+    newName: ghcr.io/OWNER/REPO
+    newTag: REPLACE_WITH_IMAGE_TAG
+
+patches:
+  # The base Namespace is cluster-scoped, so the namespace transformer above
+  # does not rename it. Rename it explicitly to keep the namespace object and
+  # every namespaced resource in sync.
+  - target:
+      kind: Namespace
+      name: fiber-boilerplate
+    patch: |-
+      - op: replace
+        path: /metadata/name
+        value: fiber-boilerplate-production
+  - path: hpa-patch.yaml
+  - path: deployment-patch.yaml
+  - target:
+      kind: Ingress
+      name: fiber-boilerplate
+      namespace: fiber-boilerplate
+    path: ingress-patch.yaml
+
+components:
+  - ../components/production-config

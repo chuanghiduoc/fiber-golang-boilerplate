@@ -7,8 +7,8 @@ service levels.
 
 Related documents:
 
-- [Kubernetes deployment](../deploy/k8s/README.md) — manifests, migration Job
-  order, placeholders, rollback.
+- [Kubernetes deployment](../deploy/k8s/README.md) — manifests, staging/
+  production overlays, GitHub Actions CD, migration order, rollback.
 - [Architecture](architecture.md) — modules, dependency rules, data ownership.
 - [Module Template](module-template.md) — adding a module, routes, permissions,
   tables, and contracts.
@@ -425,28 +425,38 @@ kubectl -n <namespace> logs job/<migration-job>
 Follow [deploy/k8s/README.md](../deploy/k8s/README.md) for the full commands.
 The operational invariants:
 
-1. Apply namespace, ConfigMap, and Secret first.
-2. Delete the old migration Job, apply `migration-job.yaml`, wait for
+1. Apply the environment Namespace and ConfigMap first:
+   `kubectl apply -k deploy/k8s/overlays/<env>/prereqs`. This applies the
+   environment ConfigMap values before the migration Job.
+2. Create `fiber-boilerplate-secrets` in that namespace out of band (or through
+   External Secrets / Sealed Secrets / SOPS). It is never part of a
+   kustomization.
+3. Delete the old migration Job, apply
+   `kubectl apply -k deploy/k8s/overlays/<env>/migration`, wait for
    `condition=complete`, and read its logs.
-3. Only then apply the app kustomization. `kubectl apply -k` has no cross-
-   resource ordering guarantee, and the migration Job is deliberately excluded
-   from the kustomization.
-4. `kubectl apply -k deploy/k8s` does not include the Job or
-   `secret.example.yaml`.
+4. Only then apply the app overlay: `kubectl apply -k deploy/k8s/overlays/<env>`
+   and `kubectl -n <namespace> rollout status deployment/fiber-boilerplate`.
+   `kubectl apply -k` has no cross-resource ordering guarantee, and the
+   migration Job is deliberately excluded from every app overlay.
+5. The app overlay and `prereqs` overlay both use the same environment
+   ConfigMap component; keep `overlays/<env>` and
+   `overlays/<env>/migration` on the same image tag.
 
 Other caveats:
 
 - **HPA owns replicas.** The Deployment intentionally has no `spec.replicas`.
   Do not add it back or the HPA and Deployment controller will fight. The HPA
   needs metrics-server; `<unknown>` targets mean metrics are unavailable.
-- **PDB:** `minAvailable: 1`; with two replicas, node drains proceed one pod at
-  a time.
+  Staging scales 1–3 replicas; production scales 3–10.
+- **PDB:** `minAvailable: 1`; with the staging minimum of one replica, a node
+  drain waits for the HPA to add a second pod. Production drains one pod at a
+  time.
 - **NetworkPolicy probes are CNI-dependent.** Some CNIs allow kubelet probes
   regardless of policy; others drop them. If probes fail, use the commented
   node/node-pod CIDR rule, never `0.0.0.0/0`. A Prometheus scrape also needs an
   ingress rule for the monitoring namespace; it is commented in the manifest.
 - **Config changes are not hot-reloaded.** `envFrom` is read at container
-  start. After editing the ConfigMap or Secret, run
+  start. After editing the environment ConfigMap component or Secret, run
   `kubectl rollout restart deployment/<name>`.
 - **SMTP:** the app uses STARTTLS, normally port 587. Implicit TLS on port 465
   is not supported. Set `EMAIL_DRIVER=smtp`, `SMTP_HOST`, `SMTP_PORT`,
@@ -465,12 +475,50 @@ Other caveats:
   available) are required for shared rate limits, session invalidation, and
   idempotency across replicas. Memory cache is single-replica only.
 - **Database connections:** `DB_MAX_CONNS` is per pod. Keep
-  `DB_MAX_CONNS * maxReplicas` below the database limit; the template uses 10
-  with HPA max 10, for at most 100 connections.
-- **Migration Job:** its image tag is literal and outside the kustomization's
-  image transformer. Keep it in sync with the Deployment's release tag.
+  `DB_MAX_CONNS * maxReplicas` below the database limit; production uses 10
+  with HPA max 10, for at most 100 connections. Staging uses 5 with max 3.
+- **Migration Job:** its image is set by
+  `overlays/<env>/migration/kustomization.yaml`, separate from the app overlay.
+  Keep both on the same immutable release tag.
 - **Secrets:** never commit a rendered Secret. Use External Secrets, Sealed
   Secrets, SOPS, or the platform secret manager.
+
+### Continuous deployment (GitHub Actions)
+
+`.github/workflows/deploy.yml` is optional and does not deploy anywhere until
+you configure it. It supports manual `workflow_dispatch` for staging or
+production, automatic production deploys on `v*` tags, and a `dry_run` mode
+that only renders/uploads manifests. Deploys are serialized per environment with
+`cancel-in-progress: false`.
+
+Required GitHub configuration:
+
+- Environments `staging` and `production` with protection rules (required
+  reviewers, wait timers, deployment branches/tags) as appropriate.
+- Environment secret `KUBE_CONFIG`: raw kubeconfig YAML or base64-encoded
+  kubeconfig for that cluster. Base64 is recommended.
+- Optional environment/repository variable `GHCR_IMAGE` (a secret with the same
+  name also works): image repository such as `ghcr.io/acme/fiber`, without a
+  tag or digest. Defaults to `ghcr.io/${{ github.repository }}`.
+
+The workflow applies the prereqs, verifies the pre-created Secret exists, runs
+and awaits the migration Job, applies the app overlay, waits for the rollout,
+and smoke-checks `/healthz` and `/readyz` through a port-forward. Production
+requires a full semver tag or `sha-<40 hex>`; `latest`, branch names, and
+placeholders are rejected. Promotion means deploying the same image tag to
+staging and then production; the workflow does not rebuild the image.
+
+Rollback:
+
+```bash
+kubectl -n <namespace> rollout history deployment/fiber-boilerplate
+kubectl -n <namespace> rollout undo deployment/fiber-boilerplate
+kubectl -n <namespace> rollout status deployment/fiber-boilerplate --timeout=10m
+```
+
+The migration Job is not rolled back. If a release applied an incompatible
+migration, restore from a verified backup/PITR snapshot or ship a forward fix;
+do not blindly roll the image back onto a newer schema.
 
 ## 8. Incident checklist
 

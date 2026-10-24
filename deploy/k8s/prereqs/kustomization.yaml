@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Namespace + non-secret ConfigMap only. Deployments apply this before the
+# migration Job so the Job can start; the app overlay applies the same two
+# resources again as part of the rollout. The Secret is created out of band and
+# is never part of a kustomization.
+resources:
+  - namespace.yaml
+  - configmap.yaml

@@ -76,7 +76,7 @@ data:
   # Object storage (recommended for multi-replica production deployments)
   # ---------------------------------------------------------------------------
   STORAGE_DRIVER: "s3"
-  # Only used when STORAGE_DRIVER=local. See deployment.yaml for the
+  # Only used when STORAGE_DRIVER=local. See base/deployment.yaml for the
   # writable-volume caveat; S3 avoids a shared filesystem entirely.
   STORAGE_LOCAL_PATH: "/app/uploads"
   STORAGE_MAX_FILE_SIZE: "10485760"

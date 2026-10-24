@@ -1,0 +1,337 @@
+name: Deploy
+
+# Manual dispatch deploys a chosen environment. A v* tag push deploys
+# production with the tag's image (the Release workflow publishes the matching
+# semver tag). Neither path touches a cluster unless the GitHub Environment has
+# KUBE_CONFIG configured. See deploy/k8s/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        default: staging
+        options:
+          - staging
+          - production
+      image_tag:
+        description: "Image tag from the Release workflow (for example 1.4.2 or sha-<40 hex>). Required for manual runs; ignored for v* tag pushes."
+        type: string
+        required: false
+      dry_run:
+        description: Render manifests only; do not contact a cluster.
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      - "v*"
+
+# The cluster pulls the image; this workflow only needs repository read access.
+# Add id-token: write here if you switch KUBE_CONFIG to cloud OIDC federation.
+permissions:
+  contents: read
+
+# Serialize per environment; never cancel an in-flight migration or rollout.
+concurrency:
+  group: deploy-${{ github.event_name == 'push' && 'production' || inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  KUBECTL_VERSION: v1.31.4
+  KUSTOMIZE_VERSION: v5.8.1
+  APP_DEPLOYMENT: fiber-boilerplate
+  MIGRATION_JOB: fiber-boilerplate-migrate
+  APP_SECRET: fiber-boilerplate-secrets
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # GitHub Environment protection rules (required reviewers, wait timers,
+    # deployment branches) and environment secrets are enforced here. Both
+    # environments must exist before this workflow can run.
+    environment:
+      name: ${{ github.event_name == 'push' && 'production' || inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ENVIRONMENT: ${{ inputs.environment }}
+          INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          GHCR_IMAGE_VAR: ${{ vars.GHCR_IMAGE }}
+          GHCR_IMAGE_SECRET: ${{ secrets.GHCR_IMAGE }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "push" ]; then
+            ENVIRONMENT=production
+          else
+            ENVIRONMENT="${INPUT_ENVIRONMENT:-}"
+          fi
+          case "$ENVIRONMENT" in
+            staging) NAMESPACE=fiber-boilerplate-staging ;;
+            production) NAMESPACE=fiber-boilerplate-production ;;
+            *)
+              echo "::error::environment must be staging or production (got '$ENVIRONMENT')"
+              exit 1
+              ;;
+          esac
+
+          IMAGE_TAG="${INPUT_IMAGE_TAG:-}"
+          if [ -z "$IMAGE_TAG" ] && [ "$REF_TYPE" = "tag" ]; then
+            # Release workflow semver tags are v1.4.2 -> image tag 1.4.2.
+            IMAGE_TAG="${REF_NAME#v}"
+          fi
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "::error::image_tag is required for a manual deployment"
+            exit 1
+          fi
+          if ! printf '%s' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "::error::image_tag '$IMAGE_TAG' is not a valid container image tag"
+            exit 1
+          fi
+          case "$IMAGE_TAG" in
+            *REPLACE*|latest)
+              echo "::error::refusing placeholder or mutable 'latest' image tag '$IMAGE_TAG'"
+              exit 1
+              ;;
+          esac
+          if [ "$ENVIRONMENT" = "production" ] && \
+             ! printf '%s' "$IMAGE_TAG" | grep -Eq '^([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?|sha-[0-9a-f]{40})$'; then
+            echo "::error::production requires an immutable full semver or sha-<40 hex> tag; got '$IMAGE_TAG'"
+            exit 1
+          fi
+
+          # Optional repository/environment variable (or secret, for
+          # compatibility). Default to the repository's GHCR image.
+          IMAGE_REPOSITORY="${GHCR_IMAGE_VAR:-${GHCR_IMAGE_SECRET:-ghcr.io/$REPO}}"
+          case "$IMAGE_REPOSITORY" in
+            *" "*|*"@"*)
+              echo "::error::GHCR_IMAGE must be an image repository, without a tag or digest"
+              exit 1
+              ;;
+          esac
+
+          DRY_RUN="${INPUT_DRY_RUN:-false}"
+          {
+            echo "TARGET_ENV=$ENVIRONMENT"
+            echo "NAMESPACE=$NAMESPACE"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY"
+            echo "DRY_RUN=$DRY_RUN"
+            echo "RENDER_DIR=$RUNNER_TEMP/render"
+          } >> "$GITHUB_ENV"
+
+          echo "Target: $ENVIRONMENT / $NAMESPACE"
+          echo "Image: $IMAGE_REPOSITORY:$IMAGE_TAG"
+          echo "Dry run: $DRY_RUN"
+
+      - name: Install kubectl and kustomize
+        run: |
+          set -euo pipefail
+          kubectl_url="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSLo "${RUNNER_TEMP}/kubectl" "$kubectl_url"
+          curl -fsSLo "${RUNNER_TEMP}/kubectl.sha256" "${kubectl_url}.sha256"
+          expected="$(tr -d '[:space:]' < "${RUNNER_TEMP}/kubectl.sha256")"
+          actual="$(sha256sum "${RUNNER_TEMP}/kubectl" | awk '{print $1}')"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::kubectl checksum mismatch"
+            exit 1
+          fi
+          sudo install -m 0755 "${RUNNER_TEMP}/kubectl" /usr/local/bin/kubectl
+
+          curl -fsSLo "${RUNNER_TEMP}/kustomize.tar.gz" \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/kustomize.tar.gz" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/kustomize" /usr/local/bin/kustomize
+
+          kubectl version --client
+          kustomize version
+
+      - name: Render manifests
+        run: |
+          set -euo pipefail
+          rm -rf "$RENDER_DIR"
+          mkdir -p "$RENDER_DIR"
+          cp -R deploy/k8s "$RENDER_DIR/k8s"
+
+          # Edit a temporary copy only. The repository's placeholders stay
+          # untouched, and the same tag is injected into the app and migration
+          # kustomizations so the Job cannot run a different image.
+          for dir in \
+            "$RENDER_DIR/k8s/overlays/$TARGET_ENV" \
+            "$RENDER_DIR/k8s/overlays/$TARGET_ENV/migration"; do
+            (
+              cd "$dir"
+              kustomize edit set image "ghcr.io/OWNER/REPO=${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+            )
+          done
+
+          kustomize build "$RENDER_DIR/k8s/overlays/$TARGET_ENV" > "$RENDER_DIR/app.yaml"
+          kustomize build "$RENDER_DIR/k8s/overlays/$TARGET_ENV/prereqs" > "$RENDER_DIR/prereqs.yaml"
+          kustomize build "$RENDER_DIR/k8s/overlays/$TARGET_ENV/migration" > "$RENDER_DIR/migration.yaml"
+
+          # Guard the ordering invariant: the app overlay must never contain the
+          # Secret or the migration Job.
+          if grep -qx 'kind: Secret' "$RENDER_DIR/app.yaml"; then
+            echo "::error::the app overlay must not render a Secret"
+            exit 1
+          fi
+          if grep -q "name: ${MIGRATION_JOB}" "$RENDER_DIR/app.yaml"; then
+            echo "::error::the app overlay must not contain the migration Job"
+            exit 1
+          fi
+          if ! grep -Fq "image: ${IMAGE_REPOSITORY}:${IMAGE_TAG}" "$RENDER_DIR/app.yaml"; then
+            echo "::error::app overlay did not receive the requested image tag"
+            exit 1
+          fi
+          if ! grep -Fq "image: ${IMAGE_REPOSITORY}:${IMAGE_TAG}" "$RENDER_DIR/migration.yaml"; then
+            echo "::error::migration Job did not receive the requested image tag"
+            exit 1
+          fi
+
+          echo "Rendered $TARGET_ENV manifests into $RENDER_DIR"
+
+      - name: Show dry-run result
+        if: inputs.dry_run
+        run: |
+          set -euo pipefail
+          echo "Dry run: no cluster calls will be made."
+          for file in app prereqs migration; do
+            echo "--- ${file}.yaml"
+            grep -E '^kind:' "$RENDER_DIR/${file}.yaml" | sort | uniq -c
+          done
+
+      - name: Upload dry-run manifests
+        if: inputs.dry_run
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendered-${{ env.TARGET_ENV }}-${{ env.IMAGE_TAG }}
+          path: ${{ env.RENDER_DIR }}/*.yaml
+          if-no-files-found: error
+
+      - name: Configure kubectl
+        if: ${{ !inputs.dry_run }}
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KUBE_CONFIG:-}" ]; then
+            echo "::error::KUBE_CONFIG is not set on the '$TARGET_ENV' GitHub Environment"
+            exit 1
+          fi
+          install -d -m 0700 "$HOME/.kube"
+          if printf '%s' "$KUBE_CONFIG" | grep -q 'apiVersion:'; then
+            # Raw YAML (the value starts with apiVersion:).
+            printf '%s\n' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          else
+            # Base64-encoded kubeconfig (recommended: it survives YAML/multiline
+            # handling). Decode to a private file; never echo the value.
+            printf '%s' "$KUBE_CONFIG" | base64 --decode > "$HOME/.kube/config"
+          fi
+          chmod 0600 "$HOME/.kube/config"
+          if ! grep -q '^apiVersion:' "$HOME/.kube/config"; then
+            rm -f "$HOME/.kube/config"
+            echo "::error::KUBE_CONFIG is neither raw kubeconfig YAML nor valid base64-encoded kubeconfig"
+            exit 1
+          fi
+          kubectl version --client
+          kubectl get --raw=/version > /dev/null
+
+      - name: Apply namespace and ConfigMap
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl apply -f "$RENDER_DIR/prereqs.yaml"
+          if ! kubectl -n "$NAMESPACE" get secret "$APP_SECRET" > /dev/null 2>&1; then
+            echo "::error::Secret $APP_SECRET is missing in namespace $NAMESPACE."
+            echo "Create it out of band (or via External Secrets / Sealed Secrets) before deploying."
+            exit 1
+          fi
+
+      - name: Run migration Job
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # Jobs are immutable. Serialized concurrency keeps this workflow from
+          # racing itself; do not run a second deploy manually in parallel.
+          kubectl -n "$NAMESPACE" delete "job/$MIGRATION_JOB" --ignore-not-found
+          kubectl apply -f "$RENDER_DIR/migration.yaml"
+
+          if ! kubectl -n "$NAMESPACE" wait \
+            --for=condition=complete \
+            --timeout=15m \
+            "job/$MIGRATION_JOB"; then
+            echo "::error::Migration Job failed or timed out; the app was not rolled out."
+            kubectl -n "$NAMESPACE" describe "job/$MIGRATION_JOB" || true
+            kubectl -n "$NAMESPACE" logs "job/$MIGRATION_JOB" --all-containers=true || true
+            exit 1
+          fi
+          kubectl -n "$NAMESPACE" logs "job/$MIGRATION_JOB" --all-containers=true
+
+      - name: Apply application overlay
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl apply -f "$RENDER_DIR/app.yaml"
+          kubectl -n "$NAMESPACE" rollout status "deployment/$APP_DEPLOYMENT" --timeout=10m
+
+      - name: Smoke check
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          kubectl -n "$NAMESPACE" port-forward svc/fiber-boilerplate 18080:8080 \
+            > "$RENDER_DIR/port-forward.log" 2>&1 &
+          PF_PID=$!
+          cleanup() {
+            kill "$PF_PID" 2>/dev/null || true
+            wait "$PF_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          healthy=false
+          for _ in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/healthz > /dev/null 2>&1; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$healthy" != "true" ]; then
+            cat "$RENDER_DIR/port-forward.log" || true
+            echo "::error::/healthz did not respond through the service port-forward"
+            exit 1
+          fi
+          curl -fsS --max-time 5 http://127.0.0.1:18080/healthz
+          curl -fsS --max-time 5 http://127.0.0.1:18080/readyz
+
+      - name: Rollback instructions
+        if: failure()
+        run: |
+          set -euo pipefail
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            exit 0
+          fi
+          if [ -z "${TARGET_ENV:-}" ] || [ -z "${NAMESPACE:-}" ]; then
+            echo "::error::Deploy failed before the target was resolved; inspect the earlier step."
+            exit 0
+          fi
+          echo "::error::Deploy failed for $TARGET_ENV ($IMAGE_REPOSITORY:$IMAGE_TAG)."
+          echo "Inspect:"
+          echo "  kubectl -n $NAMESPACE get pods,deploy,jobs"
+          echo "  kubectl -n $NAMESPACE rollout history deployment/$APP_DEPLOYMENT"
+          echo "Roll back the image:"
+          echo "  kubectl -n $NAMESPACE rollout undo deployment/$APP_DEPLOYMENT"
+          echo "  kubectl -n $NAMESPACE rollout status deployment/$APP_DEPLOYMENT --timeout=10m"
+          echo "Migrations are forward-only: a previous image may be incompatible with the current schema."
+          kubectl -n "$NAMESPACE" get pods -o wide || true

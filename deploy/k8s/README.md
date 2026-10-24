@@ -13,21 +13,21 @@ rendered Secret.
 
 | File | Purpose |
 | --- | --- |
-| `namespace.yaml` | `fiber-boilerplate` namespace with `restricted` Pod Security labels |
-| `configmap.yaml` | Non-secret production defaults and hostname/bucket placeholders |
-| `secret.example.yaml` | Template for the real Secret; excluded from kustomize |
-| `migration-job.yaml` | One-shot `/app/migrate` Job; applied separately, before the app |
-| `deployment.yaml` | RollingUpdate Deployment (HPA owns replicas), probes, security context |
-| `service.yaml` | ClusterIP on port 8080 |
-| `hpa.yaml` | CPU-based HPA, min 2 / max 10 |
-| `pdb.yaml` | `minAvailable: 1` |
-| `networkpolicy.yaml` | Ingress from ingress-nginx; restricted egress; CNI probe caveat |
-| `ingress.yaml` | nginx Ingress with TLS host placeholder |
-| `kustomization.yaml` | App resources + image transformer; omits Job and `secret.example.yaml` |
+| `base/` | Application manifests: Deployment, Service, HPA, PDB, NetworkPolicy, Ingress |
+| `base/kustomization.yaml` | Reusable app base + image transformer; omits the Job and Secret |
+| `prereqs/` | Namespace + ConfigMap kustomization, applied before the migration Job |
+| `migration/job.yaml` | One-shot `/app/migrate` Job; applied separately, before the app |
+| `overlays/staging/` | Staging namespace, HPA, ConfigMap, Ingress, resources, image tag |
+| `overlays/production/` | Production namespace, HPA, ConfigMap, Ingress, resources, image tag |
+| `overlays/components/` | Environment ConfigMap patches shared by the app and prereqs builds |
+| `kustomization.yaml` | Convenience wrapper for `kubectl apply -k deploy/k8s` |
+| `secret.example.yaml` | Template for the real Secret; excluded from every kustomization |
 
 ## Prerequisites
 
 - Kubernetes 1.29+ and `kubectl` (with built-in kustomize).
+- `kustomize` v5.8.1+ for `kustomize edit set image` in the manual flow;
+  `kubectl kustomize` can render but has no `edit` subcommand.
 - A managed PostgreSQL 17 instance reachable over TLS. `DB_SSLMODE=require`
   (or `verify-full`) is mandatory because `APP_ENV=production`.
 - A managed Redis instance. Redis is required for correct session invalidation
@@ -41,24 +41,63 @@ rendered Secret.
 - metrics-server for the HPA.
 - cert-manager, or a pre-created TLS Secret for the Ingress host.
 - Access to the GHCR package. If it is private, create an image pull Secret.
+- For the optional GitHub Actions CD path: two GitHub Environments named
+  `staging` and `production`, each with protection rules and a `KUBE_CONFIG`
+  secret. See [Continuous deployment](#continuous-deployment-github-actions).
+
+## Environments and overlays
+
+The repository ships two overlays:
+
+| Overlay | Namespace | HPA | Notes |
+| --- | --- | --- | --- |
+| `overlays/staging` | `fiber-boilerplate-staging` | 1–3 replicas | Smaller CPU/memory requests, staging hosts and bucket |
+| `overlays/production` | `fiber-boilerplate-production` | 3–10 replicas | Immutable image tag required, production hosts and bucket |
+
+Both reference the reusable base (`../../base`), keep the same resource names,
+and isolate environments by namespace. `overlays/components/<env>-config`
+contains the environment ConfigMap patch; the app overlay and its `prereqs`
+sub-overlay both include it, so the migration Job and API read the same
+non-secret configuration. `overlays/<env>/migration` is a separate
+kustomization for the one-shot Job: the app overlay must never include it.
+
+The image tag in every overlay is the literal placeholder
+`REPLACE_WITH_IMAGE_TAG`. The deploy workflow replaces it in a temporary copy;
+for a manual deployment, set it in the app overlay **and** the migration
+overlay (see step 3). `base/` still uses `ghcr.io/OWNER/REPO:latest` for the
+legacy `kubectl apply -k deploy/k8s` path; do not use that path for production.
+
+Render an overlay without a cluster:
+
+```bash
+kubectl kustomize deploy/k8s/overlays/staging > /tmp/staging.yaml
+kubectl kustomize deploy/k8s/overlays/production > /tmp/production.yaml
+kubectl kustomize deploy/k8s/overlays/staging/prereqs > /tmp/staging-prereqs.yaml
+kubectl kustomize deploy/k8s/overlays/staging/migration > /tmp/staging-migration.yaml
+```
 
 ## 1. Configure the placeholders
 
 At minimum, replace:
 
-- `deployment.yaml`, `kustomization.yaml`, and `migration-job.yaml`:
-  `ghcr.io/OWNER/REPO:latest`. The app kustomization's `images:` transformer
-  rewrites the Deployment; the raw Job uses its literal line.
-- `ingress.yaml`: `api.example.com` and `fiber-boilerplate-tls`.
-- `configmap.yaml`: `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`,
-  `SMTP_HOST`, `EMAIL_FROM_ADDRESS`, `STORAGE_S3_BUCKET`, and the
-  `APP_TRUSTED_PROXIES`/S3 endpoint values for your platform. Keep
-  `Idempotency-Key` in `CORS_ALLOW_HEADERS` and
-  `Idempotent-Replayed` in `CORS_EXPOSE_HEADERS` for browser clients that use
-  idempotent mutations.
-- `secret.example.yaml` (copied outside the repo): every `REPLACE_*` value.
-- `networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
+- `base/kustomization.yaml`, `base/deployment.yaml`, `migration/job.yaml`, and
+  every overlay/migration `images:` entry: `ghcr.io/OWNER/REPO`. The overlay
+  transformer rewrites the Deployment; the migration overlay rewrites the Job.
+- `overlays/staging/ingress-patch.yaml` and
+  `overlays/production/ingress-patch.yaml`: API host and TLS Secret.
+- `overlays/components/staging-config/configmap-patch.yaml` and
+  `overlays/components/production-config/configmap-patch.yaml`:
+  `APP_FRONTEND_URL`, `CORS_ALLOW_ORIGINS`, `DB_HOST`, `SMTP_HOST`,
+  `EMAIL_FROM_ADDRESS`, and `STORAGE_S3_BUCKET`. Keep `Idempotency-Key` in
+  `CORS_ALLOW_HEADERS` and `Idempotent-Replayed` in `CORS_EXPOSE_HEADERS` for
+  browser clients that use idempotent mutations.
+- `prereqs/configmap.yaml`: shared defaults such as `APP_TRUSTED_PROXIES` and
+  the S3 endpoint. Keep environment-specific values in the overlay components.
+- `base/networkpolicy.yaml`: the DB/Redis CIDRs and SMTP ports/ranges if your
   managed services are not in `10.0.0.0/8` or use different ports.
+- The two overlay `namespace:` values and their Namespace rename patches, plus
+  the matching `prereqs`/`migration` overlays, if you rename an environment.
+- `secret.example.yaml` (copied outside the repo): every `REPLACE_*` value.
 
 Find the remaining placeholders with:
 
@@ -67,11 +106,12 @@ grep -RInE 'OWNER/REPO|example\.com|REPLACE_|10\.0\.0\.0/8' deploy/k8s
 ```
 
 Use an immutable release tag (for example `1.4.2`) in production, not
-`:latest`. The app kustomization's `images:` transformer is the single source
-for the Deployment image; the raw migration Job is outside that kustomization
-by design, so keep its literal image line in sync when pinning a release. Both
-manifests use `imagePullPolicy: Always` for the mutable `:latest` placeholder;
-switch to `IfNotPresent` after pinning an immutable tag.
+`:latest`. The app overlay's `images:` transformer updates the Deployment and
+the migration overlay's transformer updates the Job; the deploy workflow sets
+both from one input. Production uses `imagePullPolicy: IfNotPresent` because the
+tag is immutable; staging uses `Always` so a mutable staging tag is refreshed.
+The legacy raw base path still uses `:latest` and `Always`; do not use it for
+production.
 
 `APP_TRUSTED_PROXIES` must contain only the cluster pod/service CIDR that
 contains ingress-nginx. Setting it to `0.0.0.0/0` lets clients spoof
@@ -85,18 +125,24 @@ NetworkPolicy ingress port `8080`.
 ## 2. Create the namespace and Secret
 
 ```bash
-kubectl apply -f deploy/k8s/namespace.yaml
+export ENV=staging
+export NS=fiber-boilerplate-staging
+
+# Applies the environment Namespace and ConfigMap (with staging values).
+kubectl apply -k deploy/k8s/overlays/$ENV/prereqs
 
 cp deploy/k8s/secret.example.yaml /tmp/fiber-secret.yaml
-# Edit /tmp/fiber-secret.yaml with real values, then:
+# Edit metadata.namespace to $NS and replace every value, then:
 kubectl apply -f /tmp/fiber-secret.yaml
-
-kubectl apply -f deploy/k8s/configmap.yaml
 ```
+
+For production use `ENV=production` and
+`NS=fiber-boilerplate-production`. The `prereqs` kustomization contains only
+the Namespace and ConfigMap; the Secret is not part of any kustomization.
 
 Never commit the rendered Secret. For GitOps, use External Secrets, Sealed
 Secrets, SOPS, or your cloud secret manager; `secret.example.yaml` is
-deliberately not part of `kustomization.yaml`.
+deliberately not part of `base/kustomization.yaml` or any overlay.
 
 `JWT_SECRET`, `METRICS_AUTH_TOKEN`, and `ADMIN_PASSWORD` use short
 `REPLACE_ME` placeholders on purpose. The API's production validation rejects
@@ -109,11 +155,11 @@ optionally `ADMIN_NAME`); the password must be at least 12 characters. Setting
 only one of them makes the API fail production config validation.
 
 If the GHCR package is private, create a pull Secret and uncomment
-`imagePullSecrets` in `deployment.yaml` (and add it to the migration Job if
-that image is also private):
+`imagePullSecrets` in `base/deployment.yaml` (and add it to
+`migration/job.yaml` if that image is also private):
 
 ```bash
-kubectl -n fiber-boilerplate create secret docker-registry ghcr-pull \
+kubectl -n "$NS" create secret docker-registry ghcr-pull \
   --docker-server=ghcr.io \
   --docker-username=<github-user> \
   --docker-password=<PAT-with-read:packages>
@@ -124,35 +170,42 @@ kubectl -n fiber-boilerplate create secret docker-registry ghcr-pull \
 Only `cmd/migrate` is allowed to apply DDL. The API and seed commands never
 migrate, so API replicas do not race on schema changes.
 
-The app kustomization intentionally **excludes** `migration-job.yaml`, so
-`kubectl apply -k deploy/k8s` cannot create the Job before the Deployment.
-`kubectl apply -k` also has no cross-resource ordering guarantee. The only safe
-flow is to apply the namespace/configmap/secret, apply and await the Job, and
-only then apply the app kustomization:
+The app overlay intentionally **excludes** the migration Job, so
+`kubectl apply -k deploy/k8s/overlays/$ENV` cannot create the Job before the
+Deployment. `kubectl apply -k` also has no cross-resource ordering guarantee.
+The only safe flow is to apply the namespace/configmap/secret, apply and await
+the Job, and only then apply the app overlay:
 
 ```bash
-kubectl apply -f deploy/k8s/namespace.yaml
-kubectl apply -f deploy/k8s/configmap.yaml
-# Create and apply the real Secret first (step 2).
+export ENV=staging
+export NS=fiber-boilerplate-staging
+export IMAGE_REPO=ghcr.io/OWNER/REPO
+export IMAGE_TAG=1.4.2
 
-kubectl -n fiber-boilerplate delete job fiber-boilerplate-migrate --ignore-not-found
-kubectl apply -f deploy/k8s/migration-job.yaml
-kubectl -n fiber-boilerplate wait \
+# Pin the same immutable tag in the app and migration overlays. The CD workflow
+# does this in a temporary copy; these commands edit tracked files, so commit
+# the pin intentionally or revert it after the deploy.
+(cd deploy/k8s/overlays/$ENV && kustomize edit set image "$IMAGE_REPO=$IMAGE_REPO:$IMAGE_TAG")
+(cd deploy/k8s/overlays/$ENV/migration && kustomize edit set image "$IMAGE_REPO=$IMAGE_REPO:$IMAGE_TAG")
+
+kubectl -n "$NS" delete job fiber-boilerplate-migrate --ignore-not-found
+kubectl apply -k deploy/k8s/overlays/$ENV/migration
+kubectl -n "$NS" wait \
   --for=condition=complete \
   --timeout=15m \
   job/fiber-boilerplate-migrate
-kubectl -n fiber-boilerplate logs job/fiber-boilerplate-migrate
+kubectl -n "$NS" logs job/fiber-boilerplate-migrate
 ```
 
-Do not add the Job back to `kustomization.yaml`; that reintroduces the ordering
-ambiguity this split is meant to remove. The explicit `kubectl apply -f` path
-uses the Job's literal image tag, so keep it in sync with the app's `images:`
-transformer.
+Do not add the Job back to `base/kustomization.yaml` or an app overlay; that
+reintroduces the ordering ambiguity this split is meant to remove. The
+migration overlay and the app overlay must use the same image tag; the CD
+workflow sets both from one input and refuses mismatched renders.
 
 On failure:
 
 ```bash
-kubectl -n fiber-boilerplate describe job fiber-boilerplate-migrate
+kubectl -n "$NS" describe job fiber-boilerplate-migrate
 ```
 
 The Job has `restartPolicy: Never`, `backoffLimit: 3`, and
@@ -166,39 +219,40 @@ no migration is running; deleting a running Job can interrupt DDL.
 Once the migration Job has completed:
 
 ```bash
-kubectl apply -k deploy/k8s
-kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate --timeout=10m
+kubectl apply -k deploy/k8s/overlays/$ENV
+kubectl -n "$NS" rollout status deployment/fiber-boilerplate --timeout=10m
 ```
 
-This applies the Namespace, ConfigMap, Deployment, Service, HPA, PDB,
-NetworkPolicy, and Ingress. The migration Job and Secret are not part of this
-kustomization and are not re-applied here. If the Job was garbage-collected by
-its TTL after you ran it, rerun the Job apply/wait in step 3 before this step.
+This applies the environment Namespace, ConfigMap, Deployment, Service, HPA,
+PDB, NetworkPolicy, and Ingress. The migration Job and Secret are not part of
+the app overlay and are not re-applied here. If the Job was garbage-collected
+by its TTL after you ran it, rerun the Job apply/wait in step 3 before this
+step.
 
-The Deployment intentionally has no `spec.replicas`; the HPA's
-`minReplicas: 2` owns the replica count. Do not add `replicas` back to the
-Deployment, or the HPA and Deployment controllers will fight over it.
+The Deployment intentionally has no `spec.replicas`; the HPA owns the replica
+count (`minReplicas: 1` staging, `3` production). Do not add `replicas` back to
+the Deployment, or the HPA and Deployment controllers will fight over it.
 
 The Deployment uses `maxUnavailable: 0` and `maxSurge: 1`; a new pod must pass
 `/readyz` before an old pod is removed. The in-process job workers use a
-PostgreSQL queue with `SKIP LOCKED`, so running 2+ replicas is safe.
+PostgreSQL queue with `SKIP LOCKED`, so running multiple replicas is safe.
 
 ## 5. Verify
 
 ```bash
-kubectl -n fiber-boilerplate get deploy,rs,pods,svc,hpa,pdb
-kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate --timeout=5m
+kubectl -n "$NS" get deploy,rs,pods,svc,hpa,pdb
+kubectl -n "$NS" rollout status deployment/fiber-boilerplate --timeout=5m
 
-kubectl -n fiber-boilerplate port-forward svc/fiber-boilerplate 8080:8080
+kubectl -n "$NS" port-forward svc/fiber-boilerplate 8080:8080
 curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8080/readyz
 ```
 
-Through the Ingress (replace the host):
+Through the Ingress (replace the host with the overlay's host):
 
 ```bash
-curl -fsS https://api.example.com/healthz
-curl -fsS https://api.example.com/readyz
+curl -fsS https://api.staging.example.com/healthz
+curl -fsS https://api.staging.example.com/readyz
 ```
 
 `/healthz` is a process liveness check. `/readyz` also checks dependencies
@@ -212,15 +266,95 @@ container exits and restarts. Once startup succeeds, `/readyz` gates traffic. If
 ## 6. Rollback
 
 ```bash
-kubectl -n fiber-boilerplate rollout history deployment/fiber-boilerplate
-kubectl -n fiber-boilerplate rollout undo deployment/fiber-boilerplate
-kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate --timeout=10m
+kubectl -n "$NS" rollout history deployment/fiber-boilerplate
+kubectl -n "$NS" rollout undo deployment/fiber-boilerplate
+kubectl -n "$NS" rollout status deployment/fiber-boilerplate --timeout=10m
 ```
 
 Database migrations are forward-only in this setup. A previous image may not
 be compatible with a newer schema, so prefer backward-compatible migrations and
 test rollback before production. `cmd/migrate` has no automatic down step in
 the Kubernetes Job.
+
+## Continuous deployment (GitHub Actions)
+
+`.github/workflows/deploy.yml` implements a manual, environment-gated deploy
+path. It does **not** contact a cluster unless you configure the GitHub
+Environments and secrets below; there is no cluster bundled with this
+repository and no automatic deploy out of the box.
+
+### Triggers and environments
+
+- `workflow_dispatch` with `environment` (`staging` or `production`),
+  `image_tag`, and a boolean `dry_run`.
+- A push of a `v*` tag deploys `production` using the image tag produced by the
+  Release workflow (`v1.4.2` -> `1.4.2`). The Release workflow runs in parallel;
+  the migration Job's image pull and 15-minute wait give it time to publish, and
+  the app is only applied after the migration succeeds. Environment protection
+  rules still apply and can require manual approval.
+- `dry_run: true` renders the app, prereqs, and migration manifests and uploads
+  them as an artifact. It does not read `KUBE_CONFIG` or call `kubectl` against
+  a cluster, so it works with no environment secret (the GitHub Environment
+  still gates the job).
+- Concurrency is serialized per environment with `cancel-in-progress: false`,
+  so a migration or rollout is never cancelled by a second deploy.
+
+### Required GitHub configuration
+
+Create two GitHub Environments named `staging` and `production`. Add protection
+rules (required reviewers, wait timer, deployment branches/tags) as appropriate
+for your organization.
+
+In each environment:
+
+| Name | Required | Purpose |
+| --- | --- | --- |
+| `KUBE_CONFIG` (secret) | yes for real deploys | Kubeconfig for that environment's cluster. Raw YAML or base64; base64 is recommended. |
+| `GHCR_IMAGE` (variable, or secret) | no | Image repository, for example `ghcr.io/acme/fiber`. Defaults to `ghcr.io/${{ github.repository }}`. Do not include a tag or digest. |
+
+The workflow does not create the application Secret. Before the first deploy,
+create `fiber-boilerplate-secrets` in the target namespace out of band (or via
+External Secrets / Sealed Secrets / SOPS). The workflow fails early with a
+clear error if it is missing. The image is pulled by the cluster, so the
+workflow itself does not need `packages: read`; give the cluster pull
+credentials separately if the package is private.
+
+### Deploy sequence and image promotion
+
+1. Resolve `staging`/`production`, the namespace, and the image repository/tag.
+   Production rejects `latest`, branch names, and placeholder tags; use a full
+   semver release (`1.4.2`) or `sha-<40 hex>`.
+2. Render a temporary copy of the overlay with the same image tag injected into
+   both the app and migration kustomizations.
+3. Apply the overlay `prereqs` (Namespace + environment ConfigMap) and verify
+   the Secret exists.
+4. Delete any previous migration Job, apply the migration overlay, wait up to
+   15 minutes for completion, and print its logs. The app is not applied if the
+   Job fails.
+5. Apply the app overlay and wait for `rollout status`.
+6. Smoke-check `/healthz` and `/readyz` through a temporary service
+   port-forward. No ingress DNS or public URL is required.
+7. On failure, print the rollout history/undo commands and pod status; the
+   workflow does not auto-rollback because migrations are forward-only.
+
+Promote a release by deploying the same full semver image tag to staging, then
+to production. The workflow never rebuilds; it only promotes an image already
+published by `.github/workflows/release.yml`. To deploy from a workstation
+instead, use the manual flow in steps 1–4 with `kustomize edit set image` in the
+overlay and migration kustomization.
+
+### Rollback
+
+```bash
+kubectl -n "$NS" rollout history deployment/fiber-boilerplate
+kubectl -n "$NS" rollout undo deployment/fiber-boilerplate
+kubectl -n "$NS" rollout status deployment/fiber-boilerplate --timeout=10m
+```
+
+The migration Job is not rolled back. If the failed release applied an
+incompatible migration, restore the database from a verified backup/PITR
+snapshot or ship a forward fix instead of rolling the image back blindly. See
+[Operations](../operations.md#6-migrations-and-legacy-upgrade).
 
 ## Operational notes
 
@@ -231,13 +365,12 @@ TLS, automated backups/point-in-time recovery, and private networking.
 
 - `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_SCHEMA`, and
   `DB_SSLMODE` are in the ConfigMap; `DB_PASSWORD` is in the Secret.
-- `DB_MAX_CONNS` is per pod. With HPA `maxReplicas: 10`, keep
-  `DB_MAX_CONNS * 10` below the database connection limit. The template uses
-  10, for at most 100 connections.
+- `DB_MAX_CONNS` is per pod. Production uses 10 with HPA `maxReplicas: 10`,
+  so keep the database connection limit above 100. Staging uses 5 with max 3.
 - `CACHE_DRIVER=redis` and `REDIS_URL` are required for multi-replica session
   invalidation. Use `rediss://` when the provider supports TLS.
-- Update the Database/Redis CIDRs and ports in `networkpolicy.yaml` if they are
-  not private `10.0.0.0/8` endpoints. A migration Job blocked by the
+- Update the Database/Redis CIDRs and ports in `base/networkpolicy.yaml` if they
+  are not private `10.0.0.0/8` endpoints. A migration Job blocked by the
   NetworkPolicy will fail to connect.
 
 ### S3 versus local uploads
@@ -256,7 +389,7 @@ not upload storage and is safe to lose on restart.
 If you must use `STORAGE_DRIVER=local`:
 
 - Mount a writable PVC at `/app/uploads` in the Deployment (the commented
-  example in `deployment.yaml`).
+  example in `base/deployment.yaml`).
 - Use a ReadWriteMany volume (NFS/EFS/CephFS) so every replica sees the same
   files; `emptyDir` is node-local, is lost on restart, and is only suitable for
   a single replica.
@@ -293,8 +426,8 @@ Environment variables are injected with `envFrom`, so editing the ConfigMap or
 Secret does not update running pods. Restart the Deployment explicitly:
 
 ```bash
-kubectl -n fiber-boilerplate rollout restart deployment/fiber-boilerplate
-kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate
+kubectl -n "$NS" rollout restart deployment/fiber-boilerplate
+kubectl -n "$NS" rollout status deployment/fiber-boilerplate
 ```
 
 Changing the Deployment pod template (including the image tag) already triggers
@@ -302,9 +435,9 @@ a rollout.
 
 ### Ingress, TLS, and network policy
 
-- `ingress.yaml` assumes ingress-nginx. Replace `api.example.com`, provide the
-  `fiber-boilerplate-tls` Secret, or enable the commented cert-manager
-  annotation.
+- `base/ingress.yaml` assumes ingress-nginx. Replace the host and TLS Secret in
+  each `overlays/<env>/ingress-patch.yaml`, or enable the commented cert-manager
+  annotation in the base.
 - `proxy-body-size` is 16 MiB, above `APP_BODY_LIMIT` (12 MiB) and
   `STORAGE_MAX_FILE_SIZE` (10 MiB).
 - The NetworkPolicy allows ingress only from the `ingress-nginx` namespace. If
@@ -312,20 +445,21 @@ a rollout.
   for the `monitoring` namespace is included as a comment.
 - **Kubelet probes are CNI-dependent.** Many CNIs allow node-originated
   readiness/liveness probes to the pod regardless of NetworkPolicy; some enforce
-  policy and will drop them. `networkpolicy.yaml` includes a commented ingress
-  rule for the node/node-pod CIDR: uncomment and set it if your CNI blocks
-  probes. Do not widen it to `0.0.0.0/0`.
+  policy and will drop them. `base/networkpolicy.yaml` includes a commented
+  ingress rule for the node/node-pod CIDR: uncomment and set it if your CNI
+  blocks probes. Do not widen it to `0.0.0.0/0`.
 - Egress to HTTPS and SMTP is intentionally broad (`0.0.0.0/0`); tighten it
   with VPC endpoints/provider ranges. DB and Redis egress are limited to
   `10.0.0.0/8` by default.
 
 ### HPA and PDB
 
-The HPA requires metrics-server. It scales on CPU at 70% utilization from a
-minimum of 2 to a maximum of 10 replicas, and it owns the Deployment's replica
-count; the Deployment intentionally has no `spec.replicas`. The PDB keeps at
-least one API pod available during voluntary disruptions such as node drains.
-With exactly 2 replicas, node drains must proceed one pod at a time.
+The HPA requires metrics-server. Staging scales on CPU at 70% utilization from
+1 to 3 replicas; production scales from 3 to 10. The HPA owns the Deployment's
+replica count; the Deployment intentionally has no `spec.replicas`. The PDB
+keeps at least one API pod available during voluntary disruptions such as node
+drains. With the staging minimum of one replica, a drain is blocked until the
+HPA adds a second pod; production drains proceed one pod at a time.
 
 ### Release workflow and CI
 
@@ -342,9 +476,16 @@ With exactly 2 replicas, node drains must proceed one pod at a time.
 - pins actions to full commit SHAs (version comments alongside) verified on
   2026-10-24.
 
-The CI `Manifests` job runs `actionlint`, renders `deploy/k8s` with kustomize,
-and runs kubeconform strict against Kubernetes 1.29, including the raw
-migration Job and `secret.example.yaml`.
+The CI `Manifests` job runs `actionlint`, renders the base and both environment
+overlays (including their `prereqs` and `migration` kustomizations) with
+kustomize, checks that no app overlay contains the Secret or migration Job, and
+runs kubeconform strict against Kubernetes 1.29, including
+`migration/job.yaml` and `secret.example.yaml`.
+
+`.github/workflows/deploy.yml` is the optional CD path. It is manual for staging
+and for manual production runs, auto-deploys production on `v*` tags, and is
+gated by GitHub Environments; see
+[Continuous deployment](#continuous-deployment-github-actions).
 
 Example release:
 
@@ -365,27 +506,41 @@ docker buildx build \
 ```
 
 Pin the release by setting `images[].newTag` to `1.4.2` in
-`deploy/k8s/kustomization.yaml`; the transformer updates the Deployment. The
-migration Job is applied outside kustomize, so update its literal image tag to
-the same immutable version. Use the exact version tag in production; the
-major/minor and `latest` tags are mutable.
+`deploy/k8s/overlays/<env>/kustomization.yaml` and
+`deploy/k8s/overlays/<env>/migration/kustomization.yaml`; the transformers
+update the Deployment and Job. The deploy workflow does this in a temporary
+copy. Use the exact version tag in production; the major/minor and `latest`
+tags are mutable. The legacy `deploy/k8s/base/kustomization.yaml` still uses
+`:latest` for the raw `kubectl apply -k deploy/k8s` path; do not use that path
+for production.
 
 ## Validation
 
 ```bash
-# Parse every YAML file.
+# Parse every YAML file (Python 3 with PyYAML is only an example).
 python3 - <<'PY'
 import glob, yaml
-for path in glob.glob("deploy/k8s/*.yaml") + [".github/workflows/release.yml"]:
+for path in sorted(glob.glob("deploy/k8s/**/*.yaml", recursive=True)) + [
+    ".github/workflows/ci.yml",
+    ".github/workflows/deploy.yml",
+    ".github/workflows/release.yml",
+]:
     with open(path, encoding="utf-8") as f:
         list(yaml.safe_load_all(f))
     print("ok", path)
 PY
 
-# Render the kustomization (no cluster required).
+# Render the base and both overlays (no cluster required).
 kubectl kustomize deploy/k8s
+kubectl kustomize deploy/k8s/overlays/staging
+kubectl kustomize deploy/k8s/overlays/production
+kubectl kustomize deploy/k8s/overlays/staging/prereqs
+kubectl kustomize deploy/k8s/overlays/staging/migration
+
+# Lint both workflows (actionlint v1.7.12 is what CI uses).
+actionlint
 
 # With a reachable cluster, perform a client-side dry run. Without a cluster
 # this still needs API discovery and will fail to resolve built-in kinds.
-kubectl apply --dry-run=client -k deploy/k8s
+kubectl apply --dry-run=client -k deploy/k8s/overlays/staging
 ```

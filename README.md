@@ -123,14 +123,18 @@ the admin user on startup.
 
 ## Kubernetes Deployment
 
-Production-oriented manifests live in [`deploy/k8s`](deploy/k8s/README.md), and
+Production-oriented manifests live in [`deploy/k8s`](deploy/k8s/README.md) with
+staging and production overlays.
 [`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
-pushes multi-arch images to GHCR on `v*` tags. PostgreSQL and Redis are expected
-to be managed services; no stateful database is bundled in the app Deployment.
+pushes multi-arch images to GHCR on `v*` tags, and
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) is an optional,
+environment-gated CD path. PostgreSQL and Redis are expected to be managed
+services; no stateful database is bundled in the app Deployment.
 
-The migration Job is deliberately outside the app kustomization. Apply and
-await it before `kubectl apply -k deploy/k8s`; see the deploy README for the
-full ordered flow, placeholders, secret creation, verification, and rollback.
+The migration Job is deliberately outside every app overlay. Apply the
+environment prereqs, apply and await the migration overlay, then apply the app
+overlay; see the deploy README for the full ordered flow, placeholders, secret
+creation, promotion, verification, and rollback.
 
 ## Database & Migrations
 

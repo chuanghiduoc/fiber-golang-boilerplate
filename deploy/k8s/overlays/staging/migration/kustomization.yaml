@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The migration Job is intentionally applied separately, before the app
+# overlay. Keeping a dedicated kustomization gives it the same namespace and
+# image tag as the app without adding the Job to the main overlay.
+namespace: fiber-boilerplate-staging
+
+resources:
+  - ../../../migration
+
+# The deploy workflow changes this tag in a temporary copy. For a manual
+# deploy, set it to the same immutable image tag as the staging overlay.
+images:
+  - name: ghcr.io/OWNER/REPO
+    newName: ghcr.io/OWNER/REPO
+    newTag: REPLACE_WITH_IMAGE_TAG

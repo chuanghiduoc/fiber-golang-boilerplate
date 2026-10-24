@@ -104,16 +104,35 @@ jobs:
           rm kustomize.tar.gz
 
       - name: Render app manifests
-        run: kustomize build deploy/k8s > /tmp/app-manifests.yaml
+        run: |
+          kustomize build deploy/k8s > /tmp/app-manifests.yaml
+          for env in staging production; do
+            kustomize build "deploy/k8s/overlays/$env" > "/tmp/${env}-manifests.yaml"
+            kustomize build "deploy/k8s/overlays/$env/prereqs" > "/tmp/${env}-prereqs.yaml"
+            kustomize build "deploy/k8s/overlays/$env/migration" > "/tmp/${env}-migration.yaml"
+          done
 
       - name: Check excluded resources
         run: |
-          if grep -qx 'kind: Secret' /tmp/app-manifests.yaml; then
-            echo "::error::secret.example.yaml must not be part of the app kustomization"
+          for file in /tmp/app-manifests.yaml /tmp/staging-manifests.yaml /tmp/production-manifests.yaml; do
+            if grep -qx 'kind: Secret' "$file"; then
+              echo "::error::secret.example.yaml must not be part of an app kustomization ($file)"
+              exit 1
+            fi
+            if grep -q 'name: fiber-boilerplate-migrate' "$file"; then
+              echo "::error::migration/job.yaml must be applied separately, not via an app kustomization ($file)"
+              exit 1
+            fi
+          done
+
+      - name: Check overlay namespaces
+        run: |
+          if grep -qE '^  namespace: fiber-boilerplate$' /tmp/staging-manifests.yaml; then
+            echo "::error::staging overlay still contains base-namespace resources"
             exit 1
           fi
-          if grep -q 'name: fiber-boilerplate-migrate' /tmp/app-manifests.yaml; then
-            echo "::error::migration-job.yaml must be applied separately, not via the app kustomization"
+          if grep -qE '^  namespace: fiber-boilerplate$' /tmp/production-manifests.yaml; then
+            echo "::error::production overlay still contains base-namespace resources"
             exit 1
           fi
 
@@ -129,7 +148,13 @@ jobs:
         run: |
           kubeconform -strict -summary -kubernetes-version 1.29.0 \
             /tmp/app-manifests.yaml \
-            deploy/k8s/migration-job.yaml \
+            /tmp/staging-manifests.yaml \
+            /tmp/production-manifests.yaml \
+            /tmp/staging-prereqs.yaml \
+            /tmp/production-prereqs.yaml \
+            /tmp/staging-migration.yaml \
+            /tmp/production-migration.yaml \
+            deploy/k8s/migration/job.yaml \
             deploy/k8s/secret.example.yaml
 
   migrations:
