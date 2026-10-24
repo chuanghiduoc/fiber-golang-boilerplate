@@ -362,6 +362,13 @@ func (cfg *Config) Validate() error {
 	if cfg.App.TrustProxy && len(cfg.App.TrustedProxiesList()) == 0 {
 		return fmt.Errorf("APP_TRUSTED_PROXIES must list at least one IP/CIDR when APP_TRUST_PROXY=true")
 	}
+	if cfg.App.TrustProxy {
+		for _, proxy := range cfg.App.TrustedProxiesList() {
+			if proxy == "0.0.0.0/0" || proxy == "::/0" {
+				return fmt.Errorf("APP_TRUSTED_PROXIES must not trust every address (%s)", proxy)
+			}
+		}
+	}
 
 	if cfg.OAuth.GoogleClientID != "" && cfg.OAuth.GoogleClientSecret == "" {
 		return fmt.Errorf("GOOGLE_CLIENT_SECRET is required when GOOGLE_CLIENT_ID is set")
