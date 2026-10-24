@@ -1,9 +1,9 @@
 name: Deploy
 
-# Manual dispatch deploys a chosen environment. A v* tag push deploys
-# production with the tag's image (the Release workflow publishes the matching
-# semver tag). Neither path touches a cluster unless the GitHub Environment has
-# KUBE_CONFIG configured. See deploy/k8s/README.md.
+# Manual dispatch deploys a chosen environment. The workflow also runs after
+# the Release workflow completes, but only deploys production when that run
+# succeeded and was triggered by a v* tag. Neither path touches a cluster unless
+# the GitHub Environment has KUBE_CONFIG configured. See deploy/k8s/README.md.
 on:
   workflow_dispatch:
     inputs:
@@ -16,31 +16,44 @@ on:
           - staging
           - production
       image_tag:
-        description: "Image tag from the Release workflow (for example 1.4.2 or sha-<40 hex>). Required for manual runs; ignored for v* tag pushes."
+        description: "Image tag from the Release workflow (for example 1.4.2 or sha-<40 hex>). Staging also accepts branch tags; production requires an immutable tag."
         type: string
         required: false
+      image_preflight:
+        description: Verify the image exists in GHCR before deploying (requires packages read).
+        type: boolean
+        required: false
+        default: false
       dry_run:
         description: Render manifests only; do not contact a cluster.
         type: boolean
         required: false
         default: false
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows:
+      - Release
+    types:
+      - completed
 
 # The cluster pulls the image; this workflow only needs repository read access.
+# packages: read is used only by the optional GHCR image-existence preflight.
 # Add id-token: write here if you switch KUBE_CONFIG to cloud OIDC federation.
 permissions:
   contents: read
+  packages: read
 
 # Serialize per environment; never cancel an in-flight migration or rollout.
 concurrency:
-  group: deploy-${{ github.event_name == 'push' && 'production' || inputs.environment }}
+  group: deploy-${{ github.event_name == 'workflow_run' && 'production' || inputs.environment }}
   cancel-in-progress: false
 
 env:
   KUBECTL_VERSION: v1.31.4
   KUSTOMIZE_VERSION: v5.8.1
+  # Stable kustomize images[].name key. Keep this in sync with base/, overlays/,
+  # and migration/; set the real repository via newName. The workflow edits a
+  # copy with `kustomize edit set image` and validates the key is present.
+  SOURCE_IMAGE: ghcr.io/OWNER/REPO
   APP_DEPLOYMENT: fiber-boilerplate
   MIGRATION_JOB: fiber-boilerplate-migrate
   APP_SECRET: fiber-boilerplate-secrets
@@ -49,32 +62,50 @@ jobs:
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    # Manual dispatch is always eligible. A Release-triggered run must have
+    # succeeded and must be a v* tag build; failed releases never deploy.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     # GitHub Environment protection rules (required reviewers, wait timers,
     # deployment branches) and environment secrets are enforced here. Both
     # environments must exist before this workflow can run.
     environment:
-      name: ${{ github.event_name == 'push' && 'production' || inputs.environment }}
+      name: ${{ github.event_name == 'workflow_run' && 'production' || inputs.environment }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve target
+        timeout-minutes: 10
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_ENVIRONMENT: ${{ inputs.environment }}
           INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          INPUT_IMAGE_PREFLIGHT: ${{ inputs.image_preflight }}
+          WORKFLOW_RUN_BRANCH: ${{ github.event.workflow_run.head_branch }}
           REPO: ${{ github.repository }}
           GHCR_IMAGE_VAR: ${{ vars.GHCR_IMAGE }}
           GHCR_IMAGE_SECRET: ${{ secrets.GHCR_IMAGE }}
         run: |
           set -euo pipefail
 
-          if [ "$EVENT_NAME" = "push" ]; then
+          IMAGE_TAG="${INPUT_IMAGE_TAG:-}"
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
             ENVIRONMENT=production
+            case "$WORKFLOW_RUN_BRANCH" in
+              v*) IMAGE_TAG="${WORKFLOW_RUN_BRANCH#v}" ;;
+              *)
+                echo "::error::Release run was not triggered by a v* tag (got '$WORKFLOW_RUN_BRANCH')"
+                exit 1
+                ;;
+            esac
           else
             ENVIRONMENT="${INPUT_ENVIRONMENT:-}"
           fi
@@ -87,11 +118,6 @@ jobs:
               ;;
           esac
 
-          IMAGE_TAG="${INPUT_IMAGE_TAG:-}"
-          if [ -z "$IMAGE_TAG" ] && [ "$REF_TYPE" = "tag" ]; then
-            # Release workflow semver tags are v1.4.2 -> image tag 1.4.2.
-            IMAGE_TAG="${REF_NAME#v}"
-          fi
           if [ -z "$IMAGE_TAG" ]; then
             echo "::error::image_tag is required for a manual deployment"
             exit 1
@@ -112,31 +138,41 @@ jobs:
             exit 1
           fi
 
-          # Optional repository/environment variable (or secret, for
-          # compatibility). Default to the repository's GHCR image.
-          IMAGE_REPOSITORY="${GHCR_IMAGE_VAR:-${GHCR_IMAGE_SECRET:-ghcr.io/$REPO}}"
-          case "$IMAGE_REPOSITORY" in
-            *" "*|*"@"*)
-              echo "::error::GHCR_IMAGE must be an image repository, without a tag or digest"
-              exit 1
-              ;;
-          esac
+          # The Release workflow publishes only ghcr.io/<github.repository>.
+          # Enforce that source so a manual override cannot deploy an image the
+          # Release workflow never built/tested. Reject schemes, tags, digest
+          # references, ports, and any other registry.
+          REPO_LOWER="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+          DEFAULT_IMAGE_REPOSITORY="ghcr.io/$REPO_LOWER"
+          IMAGE_REPOSITORY="${GHCR_IMAGE_VAR:-${GHCR_IMAGE_SECRET:-$DEFAULT_IMAGE_REPOSITORY}}"
+          if ! printf '%s' "$IMAGE_REPOSITORY" | grep -Eq '^ghcr\.io/[a-z0-9]+([._-][a-z0-9]+)*/[a-z0-9]+([._-][a-z0-9]+)*$'; then
+            echo "::error::GHCR_IMAGE must be a bare lowercase GHCR repository (no scheme, tag, digest, or port); got '$IMAGE_REPOSITORY'"
+            exit 1
+          fi
+          if [ "$IMAGE_REPOSITORY" != "$DEFAULT_IMAGE_REPOSITORY" ]; then
+            echo "::error::GHCR_IMAGE must match the Release workflow image '$DEFAULT_IMAGE_REPOSITORY' (update release.yml together if you publish elsewhere)"
+            exit 1
+          fi
 
           DRY_RUN="${INPUT_DRY_RUN:-false}"
+          IMAGE_PREFLIGHT="${INPUT_IMAGE_PREFLIGHT:-false}"
           {
             echo "TARGET_ENV=$ENVIRONMENT"
             echo "NAMESPACE=$NAMESPACE"
             echo "IMAGE_TAG=$IMAGE_TAG"
             echo "IMAGE_REPOSITORY=$IMAGE_REPOSITORY"
             echo "DRY_RUN=$DRY_RUN"
+            echo "IMAGE_PREFLIGHT=$IMAGE_PREFLIGHT"
             echo "RENDER_DIR=$RUNNER_TEMP/render"
           } >> "$GITHUB_ENV"
 
           echo "Target: $ENVIRONMENT / $NAMESPACE"
           echo "Image: $IMAGE_REPOSITORY:$IMAGE_TAG"
           echo "Dry run: $DRY_RUN"
+          echo "Image preflight: $IMAGE_PREFLIGHT"
 
       - name: Install kubectl and kustomize
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           kubectl_url="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
@@ -159,11 +195,25 @@ jobs:
           kustomize version
 
       - name: Render manifests
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           rm -rf "$RENDER_DIR"
           mkdir -p "$RENDER_DIR"
           cp -R deploy/k8s "$RENDER_DIR/k8s"
+
+          # Images[].name is the stable source key shared by the base, overlays,
+          # and migration kustomization. Users change newName/newTag, not name.
+          # Fail early if a template was forked with a different key.
+          for dir in \
+            "$RENDER_DIR/k8s/overlays/$TARGET_ENV" \
+            "$RENDER_DIR/k8s/overlays/$TARGET_ENV/migration"; do
+            if ! grep -Eq "^[[:space:]]*-[[:space:]]+name:[[:space:]]+${SOURCE_IMAGE}$" "$dir/kustomization.yaml"; then
+              echo "::error::missing stable image source key '${SOURCE_IMAGE}' in $dir/kustomization.yaml"
+              echo "Keep images[].name stable and set the real repository in newName."
+              exit 1
+            fi
+          done
 
           # Edit a temporary copy only. The repository's placeholders stay
           # untouched, and the same tag is injected into the app and migration
@@ -173,7 +223,7 @@ jobs:
             "$RENDER_DIR/k8s/overlays/$TARGET_ENV/migration"; do
             (
               cd "$dir"
-              kustomize edit set image "ghcr.io/OWNER/REPO=${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+              kustomize edit set image "${SOURCE_IMAGE}=${IMAGE_REPOSITORY}:${IMAGE_TAG}"
             )
           done
 
@@ -202,8 +252,35 @@ jobs:
 
           echo "Rendered $TARGET_ENV manifests into $RENDER_DIR"
 
+      - name: Preflight image existence
+        if: ${{ !inputs.dry_run && inputs.image_preflight }}
+        timeout-minutes: 15
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # GHCR_IMAGE is validated to ghcr.io/<repo> above. Log in with the
+          # workflow token solely to check that the Release image exists.
+          if ! printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+            --username "$GITHUB_ACTOR" --password-stdin > /dev/null; then
+            echo "::error::GHCR login failed for the image preflight"
+            exit 1
+          fi
+          trap 'docker logout ghcr.io > /dev/null 2>&1 || true' EXIT
+
+          for _ in $(seq 1 60); do
+            if docker manifest inspect "$IMAGE_REPOSITORY:$IMAGE_TAG" > /dev/null 2>&1; then
+              echo "Image $IMAGE_REPOSITORY:$IMAGE_TAG is available in GHCR."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Image $IMAGE_REPOSITORY:$IMAGE_TAG was not found in GHCR after 5 minutes"
+          exit 1
+
       - name: Show dry-run result
         if: inputs.dry_run
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           echo "Dry run: no cluster calls will be made."
@@ -214,7 +291,8 @@ jobs:
 
       - name: Upload dry-run manifests
         if: inputs.dry_run
-        uses: actions/upload-artifact@v7
+        timeout-minutes: 5
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rendered-${{ env.TARGET_ENV }}-${{ env.IMAGE_TAG }}
           path: ${{ env.RENDER_DIR }}/*.yaml
@@ -222,6 +300,7 @@ jobs:
 
       - name: Configure kubectl
         if: ${{ !inputs.dry_run }}
+        timeout-minutes: 10
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
         run: |
@@ -250,6 +329,7 @@ jobs:
 
       - name: Apply namespace and ConfigMap
         if: ${{ !inputs.dry_run }}
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           kubectl apply -f "$RENDER_DIR/prereqs.yaml"
@@ -261,26 +341,59 @@ jobs:
 
       - name: Run migration Job
         if: ${{ !inputs.dry_run }}
+        timeout-minutes: 20
         run: |
           set -euo pipefail
-          # Jobs are immutable. Serialized concurrency keeps this workflow from
-          # racing itself; do not run a second deploy manually in parallel.
-          kubectl -n "$NAMESPACE" delete "job/$MIGRATION_JOB" --ignore-not-found
-          kubectl apply -f "$RENDER_DIR/migration.yaml"
 
-          if ! kubectl -n "$NAMESPACE" wait \
-            --for=condition=complete \
-            --timeout=15m \
-            "job/$MIGRATION_JOB"; then
-            echo "::error::Migration Job failed or timed out; the app was not rolled out."
+          fail_migration() {
+            echo "::error::$1"
             kubectl -n "$NAMESPACE" describe "job/$MIGRATION_JOB" || true
             kubectl -n "$NAMESPACE" logs "job/$MIGRATION_JOB" --all-containers=true || true
             exit 1
+          }
+
+          # Jobs are immutable. Refuse to delete one unless it is already
+          # Complete or Failed, so an externally started migration is never
+          # interrupted. Serialized concurrency keeps this workflow from racing
+          # itself.
+          if kubectl -n "$NAMESPACE" get "job/$MIGRATION_JOB" > /dev/null 2>&1; then
+            existing_conditions="$(kubectl -n "$NAMESPACE" get "job/$MIGRATION_JOB" \
+              -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true)"
+            if ! printf '%s' "$existing_conditions" | grep -qxE 'Complete=True|Failed=True'; then
+              echo "::error::Migration Job $MIGRATION_JOB is not complete or failed; refusing to delete it."
+              echo "Wait for it to finish or inspect/delete it manually before retrying."
+              exit 1
+            fi
+            kubectl -n "$NAMESPACE" delete "job/$MIGRATION_JOB" --wait=true
           fi
+
+          kubectl apply -f "$RENDER_DIR/migration.yaml"
+
+          # Poll instead of `kubectl wait`: a failed Job sets Failed=True rather
+          # than Complete=True, and we want to fail immediately, not after 15m.
+          deadline=$((SECONDS + 900))
+          while :; do
+            if ! conditions="$(kubectl -n "$NAMESPACE" get "job/$MIGRATION_JOB" \
+              -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null)"; then
+              fail_migration "Could not read migration Job status; the app was not rolled out."
+            fi
+            if printf '%s' "$conditions" | grep -qx 'Complete=True'; then
+              break
+            fi
+            if printf '%s' "$conditions" | grep -qx 'Failed=True'; then
+              fail_migration "Migration Job failed; the app was not rolled out."
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              fail_migration "Migration Job did not complete within 15 minutes; the app was not rolled out."
+            fi
+            sleep 5
+          done
+
           kubectl -n "$NAMESPACE" logs "job/$MIGRATION_JOB" --all-containers=true
 
       - name: Apply application overlay
         if: ${{ !inputs.dry_run }}
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           kubectl apply -f "$RENDER_DIR/app.yaml"
@@ -288,6 +401,7 @@ jobs:
 
       - name: Smoke check
         if: ${{ !inputs.dry_run }}
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           kubectl -n "$NAMESPACE" port-forward svc/fiber-boilerplate 18080:8080 \
@@ -317,6 +431,7 @@ jobs:
 
       - name: Rollback instructions
         if: failure()
+        timeout-minutes: 5
         run: |
           set -euo pipefail
           if [ "${DRY_RUN:-false}" = "true" ]; then

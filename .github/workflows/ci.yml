@@ -127,14 +127,29 @@ jobs:
 
       - name: Check overlay namespaces
         run: |
-          if grep -qE '^  namespace: fiber-boilerplate$' /tmp/staging-manifests.yaml; then
-            echo "::error::staging overlay still contains base-namespace resources"
-            exit 1
-          fi
-          if grep -qE '^  namespace: fiber-boilerplate$' /tmp/production-manifests.yaml; then
-            echo "::error::production overlay still contains base-namespace resources"
-            exit 1
-          fi
+          set -euo pipefail
+          for env in staging production; do
+            ns="fiber-boilerplate-${env}"
+            for file in "/tmp/${env}-manifests.yaml" "/tmp/${env}-prereqs.yaml"; do
+              if ! grep -qE "^  name: ${ns}$" "$file"; then
+                echo "::error::Namespace object was not renamed to $ns in $file"
+                exit 1
+              fi
+            done
+            for file in \
+              "/tmp/${env}-manifests.yaml" \
+              "/tmp/${env}-prereqs.yaml" \
+              "/tmp/${env}-migration.yaml"; do
+              if grep -qE '^  namespace: fiber-boilerplate$' "$file"; then
+                echo "::error::$file still contains base-namespace resources"
+                exit 1
+              fi
+              if ! grep -qE "^  namespace: ${ns}$" "$file"; then
+                echo "::error::$file has no resource in namespace $ns"
+                exit 1
+              fi
+            done
+          done
 
       - name: Install kubeconform
         run: |
@@ -293,7 +308,7 @@ jobs:
 
       - name: Upload coverage
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: coverage.out

@@ -51,7 +51,7 @@ The repository ships two overlays:
 
 | Overlay | Namespace | HPA | Notes |
 | --- | --- | --- | --- |
-| `overlays/staging` | `fiber-boilerplate-staging` | 1–3 replicas | Smaller CPU/memory requests, staging hosts and bucket |
+| `overlays/staging` | `fiber-boilerplate-staging` | 2–4 replicas | Smaller CPU/memory requests, staging hosts and bucket |
 | `overlays/production` | `fiber-boilerplate-production` | 3–10 replicas | Immutable image tag required, production hosts and bucket |
 
 Both reference the reusable base (`../../base`), keep the same resource names,
@@ -80,9 +80,12 @@ kubectl kustomize deploy/k8s/overlays/staging/migration > /tmp/staging-migration
 
 At minimum, replace:
 
-- `base/kustomization.yaml`, `base/deployment.yaml`, `migration/job.yaml`, and
-  every overlay/migration `images:` entry: `ghcr.io/OWNER/REPO`. The overlay
-  transformer rewrites the Deployment; the migration overlay rewrites the Job.
+- The real image repository in `images[].newName` in
+  `base/kustomization.yaml`, both app overlays, and both migration overlays.
+  Keep `images[].name` exactly `ghcr.io/OWNER/REPO`: it is the stable source
+  key used by the deploy workflow. Set `newTag` for manual deploys. The base
+  Deployment and raw Job image literals are placeholders rewritten by these
+  transformers.
 - `overlays/staging/ingress-patch.yaml` and
   `overlays/production/ingress-patch.yaml`: API host and TLS Secret.
 - `overlays/components/staging-config/configmap-patch.yaml` and
@@ -109,9 +112,15 @@ Use an immutable release tag (for example `1.4.2`) in production, not
 `:latest`. The app overlay's `images:` transformer updates the Deployment and
 the migration overlay's transformer updates the Job; the deploy workflow sets
 both from one input. Production uses `imagePullPolicy: IfNotPresent` because the
-tag is immutable; staging uses `Always` so a mutable staging tag is refreshed.
-The legacy raw base path still uses `:latest` and `Always`; do not use it for
-production.
+tag is immutable; staging uses `Always` so a mutable staging branch tag is
+refreshed. The legacy raw base path still uses `:latest` and `Always`; do not use
+it for production.
+
+Do not rename `images[].name` to your repository. Kustomize uses it only as the
+source key; the actual image is `newName:newTag`. If you must rename the key,
+change `SOURCE_IMAGE` in `.github/workflows/deploy.yml` and every base/overlay
+kustomization together. Changing only some of them makes the workflow fail its
+stable-key or rendered-image check.
 
 `APP_TRUSTED_PROXIES` must contain only the cluster pod/service CIDR that
 contains ingress-nginx. Setting it to `0.0.0.0/0` lets clients spoof
@@ -188,7 +197,15 @@ export IMAGE_TAG=1.4.2
 (cd deploy/k8s/overlays/$ENV && kustomize edit set image "$IMAGE_REPO=$IMAGE_REPO:$IMAGE_TAG")
 (cd deploy/k8s/overlays/$ENV/migration && kustomize edit set image "$IMAGE_REPO=$IMAGE_REPO:$IMAGE_TAG")
 
-kubectl -n "$NS" delete job fiber-boilerplate-migrate --ignore-not-found
+if kubectl -n "$NS" get job fiber-boilerplate-migrate > /dev/null 2>&1; then
+  existing="$(kubectl -n "$NS" get job fiber-boilerplate-migrate \
+    -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}' 2>/dev/null || true)"
+  if ! printf '%s' "$existing" | grep -qxE 'Complete=True|Failed=True'; then
+    echo "Refusing to delete a migration Job that is not complete or failed." >&2
+    exit 1
+  fi
+  kubectl -n "$NS" delete job fiber-boilerplate-migrate --wait=true
+fi
 kubectl apply -k deploy/k8s/overlays/$ENV/migration
 kubectl -n "$NS" wait \
   --for=condition=complete \
@@ -210,8 +227,9 @@ kubectl -n "$NS" describe job fiber-boilerplate-migrate
 
 The Job has `restartPolicy: Never`, `backoffLimit: 3`, and
 `activeDeadlineSeconds: 900`. Jobs are immutable: delete the old Job before
-applying a changed template. Only delete it after confirming it is complete and
-no migration is running; deleting a running Job can interrupt DDL.
+applying a changed template. Only delete it after confirming it is complete or
+failed and no migration is running; deleting a running Job can interrupt DDL.
+The deploy workflow refuses to delete a Job that is not `Complete` or `Failed`.
 `ttlSecondsAfterFinished: 86400` removes a completed Job after 24 hours.
 
 ## 4. Deploy the application
@@ -230,7 +248,7 @@ by its TTL after you ran it, rerun the Job apply/wait in step 3 before this
 step.
 
 The Deployment intentionally has no `spec.replicas`; the HPA owns the replica
-count (`minReplicas: 1` staging, `3` production). Do not add `replicas` back to
+count (`minReplicas: 2` staging, `3` production). Do not add `replicas` back to
 the Deployment, or the HPA and Deployment controllers will fight over it.
 
 The Deployment uses `maxUnavailable: 0` and `maxSurge: 1`; a new pod must pass
@@ -286,12 +304,18 @@ repository and no automatic deploy out of the box.
 ### Triggers and environments
 
 - `workflow_dispatch` with `environment` (`staging` or `production`),
-  `image_tag`, and a boolean `dry_run`.
-- A push of a `v*` tag deploys `production` using the image tag produced by the
-  Release workflow (`v1.4.2` -> `1.4.2`). The Release workflow runs in parallel;
-  the migration Job's image pull and 15-minute wait give it time to publish, and
-  the app is only applied after the migration succeeds. Environment protection
-  rules still apply and can require manual approval.
+  `image_tag`, optional `image_preflight`, and a boolean `dry_run`.
+- A `workflow_run` trigger fires when the Release workflow completes, but the
+  job only runs for a **successful** Release run that was triggered by a `v*`
+  tag. Failed or cancelled releases never deploy, and the Release run's tests
+  have already passed. The production image tag is derived from
+  `github.event.workflow_run.head_branch` (`v1.4.2` -> `1.4.2`). GitHub only
+  runs `workflow_run` workflows whose file exists on the default branch, so
+  merge this workflow before relying on tag-driven production.
+- `image_preflight` (manual dispatch only) logs in to GHCR with the workflow
+  token and waits up to five minutes for the exact image to exist. It requires
+  `packages: read`, which the workflow grants. Tag-driven deploys rely on the
+  successful Release run and skip the preflight.
 - `dry_run: true` renders the app, prereqs, and migration manifests and uploads
   them as an artifact. It does not read `KUBE_CONFIG` or call `kubectl` against
   a cluster, so it works with no environment secret (the GitHub Environment
@@ -310,27 +334,32 @@ In each environment:
 | Name | Required | Purpose |
 | --- | --- | --- |
 | `KUBE_CONFIG` (secret) | yes for real deploys | Kubeconfig for that environment's cluster. Raw YAML or base64; base64 is recommended. |
-| `GHCR_IMAGE` (variable, or secret) | no | Image repository, for example `ghcr.io/acme/fiber`. Defaults to `ghcr.io/${{ github.repository }}`. Do not include a tag or digest. |
+| `GHCR_IMAGE` (variable, or secret) | no | Bare lowercase image repository, for example `ghcr.io/acme/fiber`. It must equal the Release workflow image `ghcr.io/<owner>/<repo>`; otherwise the workflow fails. No scheme, tag, digest, port, or colon. Defaults to `ghcr.io/${{ github.repository }}`. |
 
 The workflow does not create the application Secret. Before the first deploy,
 create `fiber-boilerplate-secrets` in the target namespace out of band (or via
 External Secrets / Sealed Secrets / SOPS). The workflow fails early with a
-clear error if it is missing. The image is pulled by the cluster, so the
-workflow itself does not need `packages: read`; give the cluster pull
-credentials separately if the package is private.
+clear error if it is missing. The image is pulled by the cluster, so give the
+cluster pull credentials separately if the package is private. `packages: read`
+is granted only for the optional GHCR preflight; it is not used to pull into
+the cluster.
 
 ### Deploy sequence and image promotion
 
 1. Resolve `staging`/`production`, the namespace, and the image repository/tag.
-   Production rejects `latest`, branch names, and placeholder tags; use a full
-   semver release (`1.4.2`) or `sha-<40 hex>`.
-2. Render a temporary copy of the overlay with the same image tag injected into
-   both the app and migration kustomizations.
+   Staging accepts branch tags (and always pulls); production rejects `latest`,
+   branch names, and placeholder tags and requires a full semver release
+   (`1.4.2`) or `sha-<40 hex>`.
+2. Validate the stable `ghcr.io/OWNER/REPO` image source key, render a temporary
+   copy of the overlay, and inject the same `newName`/`newTag` into both the app
+   and migration kustomizations.
 3. Apply the overlay `prereqs` (Namespace + environment ConfigMap) and verify
    the Secret exists.
-4. Delete any previous migration Job, apply the migration overlay, wait up to
-   15 minutes for completion, and print its logs. The app is not applied if the
-   Job fails.
+4. Inspect any existing migration Job and refuse to delete one that is not
+   `Complete` or `Failed`; delete only a finished Job. Then apply the migration
+   overlay and poll for up to 15 minutes. A `Failed=True` condition fails the
+   step immediately, and the app is not applied if the Job fails. The workflow
+   job timeout is 60 minutes.
 5. Apply the app overlay and wait for `rollout status`.
 6. Smoke-check `/healthz` and `/readyz` through a temporary service
    port-forward. No ingress DNS or public URL is required.
@@ -354,7 +383,7 @@ kubectl -n "$NS" rollout status deployment/fiber-boilerplate --timeout=10m
 The migration Job is not rolled back. If the failed release applied an
 incompatible migration, restore the database from a verified backup/PITR
 snapshot or ship a forward fix instead of rolling the image back blindly. See
-[Operations](../operations.md#6-migrations-and-legacy-upgrade).
+[Operations](../../docs/operations.md#6-migrations-and-legacy-upgrade).
 
 ## Operational notes
 
@@ -366,7 +395,7 @@ TLS, automated backups/point-in-time recovery, and private networking.
 - `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_SCHEMA`, and
   `DB_SSLMODE` are in the ConfigMap; `DB_PASSWORD` is in the Secret.
 - `DB_MAX_CONNS` is per pod. Production uses 10 with HPA `maxReplicas: 10`,
-  so keep the database connection limit above 100. Staging uses 5 with max 3.
+  so keep the database connection limit above 100. Staging uses 5 with max 4.
 - `CACHE_DRIVER=redis` and `REDIS_URL` are required for multi-replica session
   invalidation. Use `rediss://` when the provider supports TLS.
 - Update the Database/Redis CIDRs and ports in `base/networkpolicy.yaml` if they
@@ -455,11 +484,11 @@ a rollout.
 ### HPA and PDB
 
 The HPA requires metrics-server. Staging scales on CPU at 70% utilization from
-1 to 3 replicas; production scales from 3 to 10. The HPA owns the Deployment's
+2 to 4 replicas; production scales from 3 to 10. The HPA owns the Deployment's
 replica count; the Deployment intentionally has no `spec.replicas`. The PDB
 keeps at least one API pod available during voluntary disruptions such as node
-drains. With the staging minimum of one replica, a drain is blocked until the
-HPA adds a second pod; production drains proceed one pod at a time.
+drains. Every environment runs at least two replicas, so drains proceed one pod
+at a time without deadlocking.
 
 ### Release workflow and CI
 
@@ -483,8 +512,9 @@ runs kubeconform strict against Kubernetes 1.29, including
 `migration/job.yaml` and `secret.example.yaml`.
 
 `.github/workflows/deploy.yml` is the optional CD path. It is manual for staging
-and for manual production runs, auto-deploys production on `v*` tags, and is
-gated by GitHub Environments; see
+and for manual production runs, and auto-deploys production only after a
+successful Release workflow run triggered by a `v*` tag. It is gated by GitHub
+Environments; see
 [Continuous deployment](#continuous-deployment-github-actions).
 
 Example release:

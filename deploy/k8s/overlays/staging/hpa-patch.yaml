@@ -1,10 +1,11 @@
-# Staging keeps a single warm replica to control cost. The HPA still owns the
-# replica count; the Deployment intentionally has no spec.replicas.
+# Staging keeps two warm replicas so the PDB (minAvailable: 1) does not block
+# node drains. The HPA owns the replica count; the Deployment intentionally has
+# no spec.replicas.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   namespace: fiber-boilerplate
   name: fiber-boilerplate
 spec:
-  minReplicas: 1
-  maxReplicas: 3
+  minReplicas: 2
+  maxReplicas: 4

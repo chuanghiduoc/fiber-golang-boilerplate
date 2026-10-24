@@ -13,8 +13,9 @@ resources:
   # with a cycle error, so the app kustomization lives in ../../base.
   - ../../base
 
-# The deploy workflow changes this tag in a temporary copy. For a manual
-# deploy, set newTag to an immutable Release workflow image tag.
+# The deploy workflow changes newName/newTag in a temporary copy. Keep `name`
+# exactly `ghcr.io/OWNER/REPO` (the stable source key); for a manual deploy set
+# newName to your repository and newTag to an immutable Release workflow tag.
 images:
   - name: ghcr.io/OWNER/REPO
     newName: ghcr.io/OWNER/REPO

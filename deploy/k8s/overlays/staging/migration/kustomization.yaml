@@ -9,8 +9,9 @@ namespace: fiber-boilerplate-staging
 resources:
   - ../../../migration
 
-# The deploy workflow changes this tag in a temporary copy. For a manual
-# deploy, set it to the same immutable image tag as the staging overlay.
+# The deploy workflow changes newName/newTag in a temporary copy. Keep `name`
+# exactly `ghcr.io/OWNER/REPO` (the stable source key); for a manual deploy set
+# it to the same image as the app overlay.
 images:
   - name: ghcr.io/OWNER/REPO
     newName: ghcr.io/OWNER/REPO

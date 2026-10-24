@@ -25,9 +25,11 @@ resources:
   - networkpolicy.yaml
   - ingress.yaml
 
-# Single source for the app image tag. Replace both name and newName with your
-# repository, and newTag with the release tag. The raw migration Job is outside
-# this kustomization by design; update its image line too when pinning a release.
+# Single source for the app image. `name` is the stable source key used by the
+# overlays and the deploy workflow: keep it exactly as-is, and set newName to
+# your repository plus newTag to the release tag. The raw migration Job is
+# outside this kustomization; overlays/<env>/migration/kustomization.yaml sets
+# its image with the same source key.
 images:
   - name: ghcr.io/OWNER/REPO
     newName: ghcr.io/OWNER/REPO
