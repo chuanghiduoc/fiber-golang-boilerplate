@@ -15,6 +15,16 @@ const (
 	MaxLimit = 100
 )
 
+// DBCursor carries decoded cursor-pagination parameters into repository
+// queries. Limit should already include the extra row used to detect the next
+// page.
+type DBCursor struct {
+	Limit     int32
+	HasCursor bool
+	CreatedAt time.Time
+	ID        int64
+}
+
 // NormalizeLimit clamps a requested page size into [1, MaxLimit], defaulting
 // to DefaultLimit when non-positive.
 func NormalizeLimit(limit int) int {

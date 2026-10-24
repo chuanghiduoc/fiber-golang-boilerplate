@@ -22,7 +22,7 @@ internal/platform
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-internal/handler|service|repository|dto|sqlc   legacy strangler layer
+internal/handler|service|repository|dto|sqlc   legacy strangler layer for remaining modules
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
 
@@ -81,11 +81,11 @@ client
 ## Strangler status
 
 The module wrappers own route tables. The `files` module now also owns its
-upload service and HTTP handler under `internal/modules/files/service` and
-`internal/modules/files/handler`; `internal/service` and `internal/handler`
-keep thin deprecated aliases and constructors so legacy call sites continue to
-compile. The files repository and DTOs still live in the legacy global
-packages.
+upload service, HTTP handler, and repository under
+`internal/modules/files/{service,handler,repository}`; `internal/service` and
+`internal/handler` keep thin deprecated aliases and constructors so legacy call
+sites continue to compile. The files DTOs still live in the legacy global
+`internal/dto` package.
 
 Other modules still keep their handler/service/repository/DTO internals in the
 legacy layer. Moving one module's internals at a time remains the next phase;

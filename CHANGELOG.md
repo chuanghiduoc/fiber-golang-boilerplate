@@ -29,6 +29,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - CI builds both binaries, runs `go vet`/`gofmt`, and includes a fresh-PostgreSQL migration job (baseline up/down + `cmd/migrate` twice)
 - README/CLAUDE/CONTRIBUTING document the module layout, dependency rules, schema ownership, and upgrade caveats
 - Moved the files upload service and HTTP handler into `internal/modules/files/{service,handler}`; `internal/service` and `internal/handler` keep deprecated aliases/wrappers so existing call sites compile, while the files repository and DTOs remain in the legacy layer
+- Moved the files repository and its SQL access into `internal/modules/files/repository`; `repository.Cursor` is now an alias of the neutral `pagination.DBCursor`, keeping existing global repository signatures and query behavior unchanged
 
 ### Fixed
 - `MemoryCache.Increment` now rejects non-integer values like Redis `INCR`, so an idempotency owner token is never mistaken for a free claim counter

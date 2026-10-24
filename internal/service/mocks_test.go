@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -370,6 +371,8 @@ type mockFileRepo struct {
 	files  map[int64]*sqlc.File
 	nextID int64
 }
+
+var _ filesrepo.FileRepository = (*mockFileRepo)(nil)
 
 func newMockFileRepo() *mockFileRepo {
 	return &mockFileRepo{files: make(map[int64]*sqlc.File), nextID: 1}

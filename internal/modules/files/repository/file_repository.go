@@ -2,21 +2,30 @@ package repository
 
 import (
 	"context"
+	"errors"
+	"strings"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
+// FileRepository is the files module's data access contract.
 type FileRepository interface {
 	Create(ctx context.Context, params sqlc.CreateFileParams) (*sqlc.File, error)
 	GetByID(ctx context.Context, id int64) (*sqlc.File, error)
 	GetByIDIncludingDeleted(ctx context.Context, id int64) (*sqlc.File, error)
 	ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]sqlc.File, error)
-	ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error)
+	ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error)
 	CountByUserID(ctx context.Context, userID int64) (int64, error)
 	Delete(ctx context.Context, id int64) (*sqlc.File, error)
 	Restore(ctx context.Context, id int64) (*sqlc.File, error)
 	AdminList(ctx context.Context, limit, offset int32) ([]sqlc.File, error)
-	AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error)
+	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error)
 	AdminCount(ctx context.Context) (int64, error)
 }
 
@@ -62,12 +71,12 @@ func (r *fileRepository) ListByUserID(ctx context.Context, userID int64, limit, 
 	})
 }
 
-func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur Cursor, includeDeleted bool) ([]sqlc.File, error) {
+func (r *fileRepository) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]sqlc.File, error) {
 	return r.q.ListFilesByUserCursor(ctx, sqlc.ListFilesByUserCursorParams{
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cursorCreatedAt(cur),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -100,10 +109,10 @@ func (r *fileRepository) AdminList(ctx context.Context, limit, offset int32) ([]
 	})
 }
 
-func (r *fileRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sqlc.File, error) {
+func (r *fileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
 	return r.q.AdminListFilesCursor(ctx, sqlc.AdminListFilesCursorParams{
 		HasCursor:       cur.HasCursor,
-		CursorCreatedAt: cur.createdAt(),
+		CursorCreatedAt: cursorCreatedAt(cur),
 		CursorID:        cur.ID,
 		RowLimit:        cur.Limit,
 	})
@@ -111,4 +120,29 @@ func (r *fileRepository) AdminListCursor(ctx context.Context, cur Cursor) ([]sql
 
 func (r *fileRepository) AdminCount(ctx context.Context) (int64, error) {
 	return r.q.AdminCountFiles(ctx)
+}
+
+func cursorCreatedAt(cur pagination.DBCursor) pgtype.Timestamptz {
+	return pgtype.Timestamptz{Time: cur.CreatedAt, Valid: cur.HasCursor}
+}
+
+// wrapErr translates pgx errors to app-level sentinel errors. Keeping it local
+// avoids the module depending on the legacy internal/repository package.
+func wrapErr(err error) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apperror.ErrNotFound
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "P0001" &&
+		strings.Contains(pgErr.Message, "last active admin") {
+		return apperror.NewConflict("cannot remove the last active admin")
+	}
+	return err
+}
+
+// IsUniqueViolation reports whether err is a PostgreSQL unique constraint
+// violation (SQLSTATE 23505).
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

@@ -411,8 +411,8 @@ already exists.
    `test/arch` rejects cross-module imports.
 8. Run `make swagger` and `make check` before opening a PR.
 
-> `files` owns its upload handler and service inside the module, while still
-> using the legacy repository/DTO layer. `identity` and `admin` still wrap the
+> `files` owns its upload handler, service, and repository inside the module,
+> while still using the legacy DTO layer. `identity` and `admin` still wrap the
 > global handler/service/repository packages. Moving the remaining internals is
 > the next strangler phase; new modules should start directly in the module
 > layout.
@@ -467,8 +467,8 @@ migration entrypoint exist. Remaining work:
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
 - Moving `internal/handler|service|repository|dto` internals into the module
-  directories (the strangler phase noted above). The files service and handler
-  have moved; the files repository and DTOs are still legacy.
+  directories (the strangler phase noted above). The files service, handler,
+  and repository have moved; the files DTOs are still legacy.
 
 ## Security notes
 
