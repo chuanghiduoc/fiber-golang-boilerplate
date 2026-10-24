@@ -46,9 +46,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: migrate
-          # Same repository as the Deployment. The raw apply path uses this
-          # literal; update it with deployment.yaml/kustomization.yaml's
-          # images transformer when you pin a release.
+          # This Job is applied outside kustomize, so the images transformer
+          # does not update it. Set the same immutable tag here that you set
+          # in kustomization.yaml when pinning a release.
           image: ghcr.io/OWNER/REPO:latest
           # Mutable placeholder tag: always pull. Switch to IfNotPresent after
           # pinning an immutable release tag.

@@ -167,9 +167,9 @@ kubectl apply -k deploy/k8s
 kubectl -n fiber-boilerplate rollout status deployment/fiber-boilerplate --timeout=10m
 ```
 
-This applies only the app resources: Deployment, Service, HPA, PDB,
-NetworkPolicy, and Ingress. The migration Job is not part of this
-kustomization and is not re-applied here. If the Job was garbage-collected by
+This applies the Namespace, ConfigMap, Deployment, Service, HPA, PDB,
+NetworkPolicy, and Ingress. The migration Job and Secret are not part of this
+kustomization and are not re-applied here. If the Job was garbage-collected by
 its TTL after you ran it, rerun the Job apply/wait in step 3 before this step.
 
 The Deployment intentionally has no `spec.replicas`; the HPA's
@@ -356,9 +356,11 @@ docker buildx build \
   --push .
 ```
 
-Then pin `ghcr.io/OWNER/REPO:1.4.2` in both the Deployment and migration Job,
-run the migration Job, and roll out. Use the exact version tag in production;
-the major/minor and `latest` tags are mutable.
+Pin the release by setting `images[].newTag` to `1.4.2` in
+`deploy/k8s/kustomization.yaml`; the transformer updates the Deployment. The
+migration Job is applied outside kustomize, so update its literal image tag to
+the same immutable version. Use the exact version tag in production; the
+major/minor and `latest` tags are mutable.
 
 ## Validation
 
