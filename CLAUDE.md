@@ -43,7 +43,6 @@ internal/app/               Fiber app, global middleware, Module registry
 internal/modules/           identity (+ admin seed), files, admin (route tables)
 internal/platform/          authz, audit, jobs, session, and future shared mechanics
 internal/handler|service|repository|dto|sqlc   current internals (strangler phase)
-internal/middleware
 pkg/                        apperror, response, database, cache, storage, email, ...
 migrations/000001_init_schema.*   single consolidated up/down schema
 deploy/k8s/                 Kubernetes manifests (see deploy/k8s/README.md)

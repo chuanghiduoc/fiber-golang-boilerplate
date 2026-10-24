@@ -21,7 +21,7 @@ internal/platform
   audit        audit recorder + mutating-request middleware
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
-internal/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
+internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
 internal/handler|service|repository|dto|sqlc   legacy strangler layer
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
