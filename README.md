@@ -86,29 +86,38 @@ assume the schema exists, so replicas never race on migrations. Fresh installs
 run the single `000001_init_schema.up.sql`; add new numbered migrations only
 after a database is deployed.
 
-## Multi-tenancy foundation
+## Multi-tenancy
 
-The schema and request pipeline are tenant-aware. One user belongs to exactly
-one tenant.
+The schema, request pipeline, and identity module are tenant-scoped. One user
+belongs to exactly one tenant, and no identity read or write crosses tenants.
 
 - The baseline seeds a `default` tenant with id `1`. Requests without
   `X-Tenant-Slug` resolve to `TENANT_DEFAULT_SLUG` (`default`), preserving the
-  previous single-tenant behavior.
-- `X-Tenant-Slug` selects the request tenant on `/api/v1` routes. Invalid or
-  unknown slugs return `404` `tenant not found`. Set
-  `TENANT_REQUIRE_HEADER=true` to reject requests that omit the header.
+  previous single-tenant behavior. Set `TENANT_REQUIRE_HEADER=true` to reject
+  requests that omit the header.
+- `X-Tenant-Slug` selects the request tenant on `/api/v1` routes. Invalid,
+  unknown, or suspended slugs return `404` `tenant not found`.
+- Public auth calls operate on the resolved tenant: registration, login,
+  forgot/reset password, resend/verify email, and refresh. A client that
+  registered in a non-default tenant must send the same header on those calls.
 - Access tokens carry a `tenant_id` claim. Authenticated requests use the
   claim; if an explicit `X-Tenant-Slug` resolves to a different tenant, the
   request fails with `403 permission.denied` (`tenant mismatch`).
+- All identity SQL is scoped by `tenant_id`: users by id, email, Google ID,
+  admin lists/stats, and refresh/reset/verification tokens. A cross-tenant id
+  or token behaves as not found (admin/user APIs return `404`, token flows
+  return `400`/`401`).
 - Emails and Google IDs are unique per tenant. The last-admin database trigger
-  protects each tenant independently.
-- **Current limitation:** existing SQL is not tenant-scoped yet. This branch is
-  the foundation (schema, resolution, JWT claim, config); query scoping,
-  tenant-aware registration/login, and per-tenant limits are the next
-  milestone. Do not treat it as data isolation.
-- Google OAuth start/callback does not propagate `X-Tenant-Slug` yet. Google
-  users follow the existing lookup/creation path and their JWT uses the stored
-  user tenant (currently the default tenant).
+  and the application check protect each tenant independently.
+- Google OAuth binds the tenant into the OAuth `state` (and the state cookie).
+  The callback uses that tenant, not `X-Tenant-Slug`, and refuses a tenant that
+  was suspended during the consent round-trip.
+- Tokens issued before multi-tenancy have no `tenant_id` claim and are rejected
+  fail-closed. Rotate access tokens after upgrading (users must log in again);
+  refresh/reset/verification rows default to tenant 1 and only work there.
+- The session validator compares the JWT `tenant_id` with the stored user
+  tenant and rejects suspended tenants. Tenant status changes propagate within
+  the 5-second session-cache TTL, like role and token-version changes.
 
 ## Quick Start
 
@@ -219,6 +228,13 @@ reviewed DDL manually) that:
 Keep the default tenant id 1 unless you also change the column defaults and
 backfill every row. Fresh installs get all of this from `000001`.
 
+Identity isolation needs no further schema change: the tenant columns and
+indexes already exist. After deploying it, expect existing access tokens
+(without a `tenant_id` claim) to be rejected with 401, so clients must log in
+again. Existing refresh/reset/verification rows were backfilled to tenant 1 and
+remain usable only through the default tenant; purge them if the deployment
+does not use tenant 1 as its default.
+
 If a fresh schema was created out-of-band and already matches `000001`,
 baseline it manually after verifying the objects (for example, set version 1
 with the golang-migrate CLI's `force 1`) instead of running the file over
@@ -227,8 +243,12 @@ populated tables. Never edit a shipped migration after deployment.
 ## API Endpoints
 
 Public and authenticated API requests may send `X-Tenant-Slug`; omitting it
-uses the configured default tenant. Authenticated requests must not send a
-tenant that differs from the JWT `tenant_id` claim.
+uses the configured default tenant. Login, registration, refresh, password
+reset, and email verification all resolve the tenant from this header (or the
+default), so clients of a non-default tenant must send it consistently.
+Authenticated requests must not send a tenant that differs from the JWT
+`tenant_id` claim. Google OAuth uses the tenant bound to its `state` instead of
+the header on the callback.
 
 ### Auth (public)
 | Method | Path | Description |
@@ -521,8 +541,10 @@ monolith, durable jobs, audit trail, permission-based authorization, single
 migration entrypoint, and tenant foundation (schema, resolution, JWT claim,
 config) exist. Remaining work:
 
-- Tenant isolation: tenant-scoped SQL and query enforcement/row-level security,
-  tenant-aware registration/login/OAuth, and per-tenant limits.
+- Tenant isolation is implemented in identity: tenant-scoped SQL for users,
+  admin lists/stats, refresh/reset/verification tokens, tenant-bound Google
+  OAuth state, and a tenant-aware session validator. Row-level security and
+  per-tenant rate limits are still future work.
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
@@ -539,7 +561,8 @@ no legacy handler/service/DTO/repository packages remain.
 - Access tokens carry `token_version`; password changes/resets, bans,
   unbans, and role changes invalidate them immediately.
 - Access tokens also carry `tenant_id`. A request whose explicit
-  `X-Tenant-Slug` resolves to a different tenant is rejected with 403.
+  `X-Tenant-Slug` resolves to a different tenant is rejected with 403; a token
+  without a tenant claim, or one for a suspended tenant, is rejected with 401.
 - Access tokens are validated against the current user record through a
   generation-keyed session cache. Use Redis in production so invalidation is
   shared across replicas.

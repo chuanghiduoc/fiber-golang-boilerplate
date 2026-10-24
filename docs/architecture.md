@@ -51,17 +51,25 @@ they never depend on the `tenants` table.
 ## Multi-tenant model
 
 - One user belongs to exactly one tenant. `tenants.id` 1 with slug `default`
-  is seeded by the baseline and preserves backward compatibility: no header,
-  no claim, and rows written before multi-tenancy all resolve to it.
+  is seeded by the baseline and preserves backward compatibility for header-less
+  requests and rows written before multi-tenancy.
 - `tenant_id` is present on `users`, `files`, and all identity/platform token,
   job, and audit tables, with `DEFAULT 1 REFERENCES tenants(id)`.
 - Emails and Google IDs are unique per tenant; the last-admin trigger counts
   only admins in the affected tenant.
-- **The foundation does not scope existing queries.** Repositories still read
-  across tenants; the isolation milestone adds `WHERE tenant_id = ...` (or RLS)
-  and tenant-aware registration/login. Do not treat this as data isolation.
-- Google OAuth start/callback does not carry the tenant header yet; Google
-  users use the existing lookup path and the stored user tenant.
+- Identity is tenant-isolated: every user/admin/stat and refresh/reset/
+  verification-token query is scoped by `tenant_id`, repositories derive it from
+  `tenant.EffectiveID(ctx)`, and cross-tenant ids or tokens behave as not found.
+  Public login/register/forgot/reset/resend/verify/refresh use the request
+  tenant; non-default tenants must send `X-Tenant-Slug` consistently. Files SQL
+  is not yet scoped, and RLS is future work.
+- Google OAuth binds the tenant into `state` and the state cookie. The callback
+  resolves that state tenant (and rejects suspended/unknown tenants) instead of
+  trusting `X-Tenant-Slug`.
+- JWTs without a `tenant_id` claim are rejected fail-closed. The session
+  validator compares the claim with the stored user tenant and tenant status,
+  so a suspended tenant cannot keep using an issued token beyond the 5-second
+  session-cache TTL.
 
 
 ## Dependency rules

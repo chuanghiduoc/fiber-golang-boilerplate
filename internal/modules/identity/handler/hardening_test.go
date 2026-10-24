@@ -22,7 +22,7 @@ func TestGetByID_OtherUserForbidden(t *testing.T) {
 	svc.users[2] = &dto.UserResponse{ID: 2, Email: "other@example.com", Name: "Other", Role: "user"}
 	app := setupApp(svc)
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 	req, _ := http.NewRequest("GET", "/users/2", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
@@ -33,7 +33,7 @@ func TestGetByID_OtherUserForbidden(t *testing.T) {
 
 func TestUpdateMe_EmailChangeRequiresPassword(t *testing.T) {
 	app := setupApp(newMockService())
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 
 	body, _ := json.Marshal(map[string]string{"email": "new@example.com"})
 	req, _ := http.NewRequest("PUT", "/users/me", bytes.NewReader(body))
@@ -77,7 +77,7 @@ func TestLogoutAll_RequiresAuth(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 	req, _ = http.NewRequest("POST", "/auth/logout-all", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	resp, err = app.Test(req)
@@ -91,7 +91,7 @@ func TestUserList_ReturnsNextCursor(t *testing.T) {
 	svc.users[1].CreatedAt = time.Now()
 	app := setupApp(svc)
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 	req, _ := http.NewRequest("GET", "/users/", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 

@@ -12,6 +12,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -21,8 +22,9 @@ type RefreshTokenService interface {
 	Verify(ctx context.Context, token string) (int64, error)
 	// Consume atomically validates and deletes a refresh token. Exactly one
 	// concurrent caller can succeed, which prevents replay/rotation races. The
-	// returned token version must match the user's current version.
-	Consume(ctx context.Context, token string) (userID int64, tokenVersion int32, err error)
+	// returned tenant ID must match both the request tenant and the user's
+	// stored tenant; the token version must match the user's current version.
+	Consume(ctx context.Context, token string) (userID, tenantID int64, tokenVersion int32, err error)
 	Revoke(ctx context.Context, token string) error
 	RevokeAllByUserID(ctx context.Context, userID int64) error
 }
@@ -50,7 +52,8 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVer
 
 	expiresAt := time.Now().Add(time.Duration(s.expireDays) * 24 * time.Hour)
 
-	_, err := s.repo.Create(ctx, identitysqlc.CreateRefreshTokenParams{
+	rt, err := s.repo.Create(ctx, identitysqlc.CreateRefreshTokenParams{
+		TenantID:     tenant.EffectiveID(ctx),
 		UserID:       userID,
 		Token:        hashToken(plainToken), // Store hash, not plaintext
 		ExpiresAt:    pgtype.Timestamptz{Time: expiresAt, Valid: true},
@@ -61,6 +64,9 @@ func (s *refreshTokenService) Create(ctx context.Context, userID int64, tokenVer
 			return "", apperror.NewUnauthorized("account is not active")
 		}
 		return "", apperror.NewInternal("failed to store refresh token")
+	}
+	if rt.TenantID != tenant.EffectiveID(ctx) {
+		return "", apperror.NewUnauthorized("account is not active")
 	}
 
 	return plainToken, nil // Return plaintext to client
@@ -79,24 +85,33 @@ func (s *refreshTokenService) Verify(ctx context.Context, token string) (int64, 
 		_ = s.repo.Delete(ctx, hashToken(token))
 		return 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "refresh token expired")
 	}
+	if rt.TenantID != tenant.EffectiveID(ctx) {
+		return 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
+	}
 
 	return rt.UserID, nil
 }
 
 // Consume removes the token in the same statement that reads it. A replay
 // attempt sees ErrNotFound and is rejected, even if two requests race.
-func (s *refreshTokenService) Consume(ctx context.Context, token string) (userID int64, tokenVersion int32, err error) {
+func (s *refreshTokenService) Consume(ctx context.Context, token string) (userID, tenantID int64, tokenVersion int32, err error) {
 	rt, err := s.repo.Consume(ctx, hashToken(token))
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
+			return 0, 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
 		}
-		return 0, 0, apperror.NewInternal("failed to consume refresh token")
+		return 0, 0, 0, apperror.NewInternal("failed to consume refresh token")
 	}
 	if rt.ExpiresAt.Time.Before(time.Now()) {
-		return 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "refresh token expired")
+		return 0, 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "refresh token expired")
 	}
-	return rt.UserID, rt.TokenVersion, nil
+	// The repository already scopes the delete by tenant. Keep the explicit
+	// check so a future repository change cannot silently enable cross-tenant
+	// refresh-token replay.
+	if rt.TenantID != tenant.EffectiveID(ctx) {
+		return 0, 0, 0, apperror.NewCode(apperror.CodeAuthRefreshInvalid, "invalid refresh token")
+	}
+	return rt.UserID, rt.TenantID, rt.TokenVersion, nil
 }
 
 func (s *refreshTokenService) Revoke(ctx context.Context, token string) error {

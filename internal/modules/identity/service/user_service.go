@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -148,7 +149,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	// A previous failed-login lockout must not survive registration.
-	_ = s.cache.Delete(ctx, loginAttemptPrefix+email)
+	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, email))
 
 	return ToUserResponse(user), nil
 }
@@ -162,6 +163,7 @@ func (s *userService) createUser(
 	hash []byte,
 ) (*identitysqlc.User, error) {
 	user, err := repo.Create(ctx, identitysqlc.CreateUserParams{
+		TenantID:     tenant.EffectiveID(ctx),
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -204,7 +206,7 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	}
 
 	// Check lockout (fail-closed: deny login if cache is unavailable)
-	cacheKey := loginAttemptPrefix + email
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, email)
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
 		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
@@ -306,6 +308,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 		}
 
 		newUser, err := repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
+			TenantID:     tenant.EffectiveID(ctx),
 			Email:        email,
 			Name:         name,
 			GoogleID:     pgtype.Text{String: googleID, Valid: true},
@@ -511,7 +514,7 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 		return apperror.NewBadRequest("current password is incorrect")
 	}
 
-	cacheKey := loginAttemptPrefix + normalizeEmail(user.Email)
+	cacheKey := scopedKey(ctx, loginAttemptPrefix, user.Email)
 	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
 	if cacheErr != nil {
 		return apperror.NewInternal("unable to verify login attempts, please try again later")
@@ -668,7 +671,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	if s.sessions != nil {
 		_ = s.sessions.Invalidate(ctx, userID)
 	}
-	_ = s.cache.Delete(ctx, loginAttemptPrefix+normalizeEmail(user.Email))
+	_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, user.Email))
 
 	return nil
 }

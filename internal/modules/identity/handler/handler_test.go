@@ -31,18 +31,18 @@ type mockUserService struct {
 func newMockService() *mockUserService {
 	return &mockUserService{
 		users: map[int64]*dto.UserResponse{
-			1: {ID: 1, Email: "test@example.com", Name: "Test User", Role: "user", HasPassword: true},
+			1: {ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user", HasPassword: true},
 		},
 	}
 }
 
 func (m *mockUserService) Register(_ context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	return &dto.UserResponse{ID: 2, Email: req.Email, Name: req.Name, Role: "user"}, nil
+	return &dto.UserResponse{ID: 2, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}, nil
 }
 
 func (m *mockUserService) Authenticate(_ context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
 	if req.Email == "test@example.com" && req.Password == "Password1!" {
-		return &dto.UserResponse{ID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
+		return &dto.UserResponse{ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
 }
@@ -83,7 +83,7 @@ func (m *mockUserService) Delete(_ context.Context, id int64) error {
 }
 
 func (m *mockUserService) FindOrCreateByGoogle(_ context.Context, _, email, name string) (*dto.UserResponse, error) {
-	return &dto.UserResponse{ID: 1, Email: email, Name: name, Role: "user"}, nil
+	return &dto.UserResponse{ID: 1, TenantID: 1, Email: email, Name: name, Role: "user"}, nil
 }
 
 func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.ChangePasswordRequest) error {
@@ -121,9 +121,9 @@ func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (in
 	return 0, apperror.NewUnauthorized("invalid refresh token")
 }
 
-func (m *mockRefreshTokenService) Consume(_ context.Context, tokenStr string) (userID int64, tokenVersion int32, err error) {
-	userID, err = m.Verify(context.Background(), tokenStr)
-	return userID, 0, err
+func (m *mockRefreshTokenService) Consume(ctx context.Context, tokenStr string) (userID, tenantID int64, tokenVersion int32, err error) {
+	userID, err = m.Verify(ctx, tokenStr)
+	return userID, 1, 0, err
 }
 
 func (m *mockRefreshTokenService) Revoke(_ context.Context, _ string) error {
@@ -321,7 +321,7 @@ func TestGetMe_Unauthorized(t *testing.T) {
 func TestGetMe_Authorized(t *testing.T) {
 	app := setupApp(newMockService())
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 
 	req, _ := http.NewRequest("GET", "/users/me", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -334,7 +334,7 @@ func TestGetMe_Authorized(t *testing.T) {
 func TestGetByID_NotFound(t *testing.T) {
 	app := setupApp(newMockService())
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 
 	req, _ := http.NewRequest("GET", "/users/999", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -348,7 +348,7 @@ func TestUpdate_Forbidden(t *testing.T) {
 	app := setupApp(newMockService())
 
 	// User 1 trying to update user 2
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 
 	body, _ := json.Marshal(dto.UpdateUserRequest{})
 	req, _ := http.NewRequest("PUT", "/users/2", bytes.NewReader(body))
@@ -364,7 +364,7 @@ func TestUpdate_AdminBypass(t *testing.T) {
 	app := setupApp(newMockService())
 
 	// Admin trying to update user 1
-	accessToken, _ := token.Generate(2, "admin@example.com", "admin", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(2, 1, "admin@example.com", "admin", "test-secret", 24)
 
 	name := "Updated Name"
 	body, _ := json.Marshal(dto.UpdateUserRequest{Name: &name})
@@ -381,7 +381,7 @@ func TestDelete_Forbidden(t *testing.T) {
 	app := setupApp(newMockService())
 
 	// User 1 trying to delete user 2
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 
 	req, _ := http.NewRequest("DELETE", "/users/2", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -395,7 +395,7 @@ func TestDelete_AdminBypass(t *testing.T) {
 	app := setupApp(newMockService())
 
 	// Admin trying to delete user 1
-	accessToken, _ := token.Generate(2, "admin@example.com", "admin", "test-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(2, 1, "admin@example.com", "admin", "test-secret", 24)
 
 	req, _ := http.NewRequest("DELETE", "/users/1", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -528,7 +528,7 @@ func TestResendVerificationHandler(t *testing.T) {
 }
 
 func userToken() string {
-	t, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	t, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 	return t
 }
 

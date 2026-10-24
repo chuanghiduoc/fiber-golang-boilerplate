@@ -101,7 +101,7 @@ func TestJWTAuth_ValidToken(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -121,7 +121,7 @@ func TestJWTAuth_WrongSecret(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "test@example.com", "user", "wrong-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "wrong-secret", 24)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -215,7 +215,7 @@ func TestJWTAuth_TenantHeaderMatchAccepted(t *testing.T) {
 	}
 }
 
-func TestJWTAuth_LegacyTokenKeepsHeaderTenant(t *testing.T) {
+func TestJWTAuth_LegacyTokenWithoutTenantRejected(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
 	app.Get("/protected", tenantLocal(3, "other"), JWTAuth(secret), func(c fiber.Ctx) error {
@@ -231,12 +231,8 @@ func TestJWTAuth_LegacyTokenKeepsHeaderTenant(t *testing.T) {
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"tenant_id":3`) {
-		t.Fatalf("body = %s, want header tenant_id 3", body)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a token without tenant_id", resp.StatusCode)
 	}
 }
 
@@ -251,7 +247,7 @@ func TestRequireRole_Allowed(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "admin@example.com", "admin", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "admin@example.com", "admin", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -272,7 +268,7 @@ func TestRequireRole_Forbidden(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -293,7 +289,7 @@ func TestRequireRole_MultipleRoles(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
 
 	req, _ := http.NewRequest("GET", "/shared", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)

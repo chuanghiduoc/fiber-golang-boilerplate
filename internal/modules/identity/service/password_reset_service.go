@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -72,7 +73,7 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 	// Rate limit before the lookup, for every address. Increment is atomic and
 	// sets the TTL on the first request. Returning the same generic success
 	// response for known/unknown/limited addresses avoids an enumeration oracle.
-	cacheKey := "password_reset:" + emailAddr
+	cacheKey := scopedKey(ctx, "password_reset:", emailAddr)
 	if s.cache != nil {
 		if n, err := s.cache.Increment(ctx, cacheKey, 1*time.Minute); err == nil && n > 1 {
 			return nil
@@ -113,6 +114,7 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 			return apperror.NewInternal("failed to clear old reset tokens")
 		}
 		_, err := resetRepo.Create(ctx, identitysqlc.CreatePasswordResetTokenParams{
+			TenantID:  tenant.EffectiveID(ctx),
 			UserID:    user.ID,
 			Token:     hashToken(token),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(1 * time.Hour), Valid: true},
@@ -177,6 +179,9 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 				return apperror.NewBadRequest("invalid or expired reset token")
 			}
 			return apperror.NewInternal("failed to verify reset token")
+		}
+		if rt.TenantID != tenant.EffectiveID(ctx) {
+			return apperror.NewBadRequest("invalid or expired reset token")
 		}
 
 		if rt.ExpiresAt.Time.Before(time.Now()) {
@@ -247,7 +252,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		// can actually sign in with the new password.
 		if s.cache != nil {
 			if user, err := s.userRepo.GetByID(ctx, resetUserID); err == nil {
-				_ = s.cache.Delete(ctx, loginAttemptPrefix+normalizeEmail(user.Email))
+				_ = s.cache.Delete(ctx, scopedKey(ctx, loginAttemptPrefix, user.Email))
 			}
 		}
 		if s.sessions != nil {

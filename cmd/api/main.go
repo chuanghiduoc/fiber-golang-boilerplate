@@ -158,13 +158,14 @@ func main() {
 		pool.Close()
 		fail("default tenant (id 1) is missing; run cmd/migrate", err)
 	}
-	if _, err := tenantResolver.Resolve(startupCtx, cfg.Tenant.DefaultSlug); err != nil {
+	defaultTenant, err := tenantResolver.Resolve(startupCtx, cfg.Tenant.DefaultSlug)
+	if err != nil {
 		pool.Close()
 		fail("configured default tenant is not available; run cmd/migrate or fix TENANT_DEFAULT_SLUG", err)
 	}
 
-	// Auto-seed admin user (idempotent)
-	if err := seed.Admin(startupCtx, cfg.Admin, userRepo); err != nil {
+	// Auto-seed admin user (idempotent) in the configured default tenant.
+	if err := seed.Admin(startupCtx, cfg.Admin, userRepo, defaultTenant.ID); err != nil {
 		pool.Close()
 		fail("failed to seed admin user", err)
 	}
@@ -198,7 +199,7 @@ func main() {
 
 	authHandler := identityhandler.NewAuthHandler(
 		userSvc, refreshSvc, passwordResetSvc, emailVerifSvc,
-		cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.App.RequireEmailVerification, googleOAuth,
+		cfg.JWT.Secret, cfg.JWT.ExpireHour, cfg.App.RequireEmailVerification, googleOAuth, tenantRepo,
 	)
 	userHandler := identityhandler.NewUserHandler(userSvc, emailVerifSvc)
 

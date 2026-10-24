@@ -14,6 +14,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -191,6 +192,7 @@ func (s *emailVerificationService) persistVerification(
 	// Create with 24 hour expiry. Store only the hash; the plaintext token
 	// is delivered to the user via email so a DB leak cannot be replayed.
 	_, err := verifRepo.Create(ctx, identitysqlc.CreateEmailVerificationTokenParams{
+		TenantID:  tenant.EffectiveID(ctx),
 		UserID:    userID,
 		Email:     userEmail,
 		Token:     tokenHash,
@@ -228,6 +230,9 @@ func (s *emailVerificationService) Verify(ctx context.Context, token string) err
 		}
 		return apperror.NewInternal("failed to verify token")
 	}
+	if vt.TenantID != tenant.EffectiveID(ctx) {
+		return apperror.NewBadRequest("invalid or expired verification token")
+	}
 
 	if vt.ExpiresAt.Time.Before(time.Now()) {
 		return apperror.NewBadRequest("verification token has expired")
@@ -262,7 +267,7 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 
 	// Rate limit before user lookup so the response cannot reveal whether the
 	// address exists. Increment is atomic and sets the TTL on first use.
-	cacheKey := "email_verification:" + emailAddr
+	cacheKey := scopedKey(ctx, "email_verification:", emailAddr)
 	if s.cache != nil {
 		if n, err := s.cache.Increment(ctx, cacheKey, 1*time.Minute); err == nil && n > 1 {
 			return nil
@@ -285,7 +290,10 @@ func (s *emailVerificationService) ResendVerification(ctx context.Context, email
 	// Send asynchronously so response timing does not reveal whether the
 	// address exists or whether a message was actually delivered.
 	async.Go(func() {
-		if err := s.SendVerification(context.Background(), user.ID, user.Email); err != nil {
+		// The fire-and-forget goroutine does not inherit the request context.
+		// Carry the user's tenant explicitly so token writes stay scoped.
+		sendCtx := tenant.WithID(context.Background(), user.TenantID)
+		if err := s.SendVerification(sendCtx, user.ID, user.Email); err != nil {
 			slog.Error("failed to resend verification email",
 				slog.Int64("user_id", user.ID),
 				slog.String("email", user.Email),

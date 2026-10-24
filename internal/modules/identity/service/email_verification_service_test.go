@@ -74,7 +74,7 @@ func TestSendVerification(t *testing.T) {
 		svc, _, vr, _, _ := newEmailVerifServiceForTest()
 
 		// Pre-populate an old token
-		vr.tokens["old-token"] = &identitysqlc.EmailVerificationToken{
+		vr.tokens["old-token"] = &identitysqlc.EmailVerificationToken{TenantID: 1,
 			ID:     1,
 			UserID: 1,
 			Token:  "old-token",
@@ -173,7 +173,7 @@ func TestVerify(t *testing.T) {
 		svc, ur, vr, _, _ := newEmailVerifServiceForTest()
 
 		// Create a user
-		ur.users[1] = &identitysqlc.User{
+		ur.users[1] = &identitysqlc.User{TenantID: 1,
 			ID:        1,
 			Email:     "user@example.com",
 			CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -182,7 +182,7 @@ func TestVerify(t *testing.T) {
 
 		// Create a valid token — the repo stores only the hash, so the mock is
 		// keyed by hashToken(plaintext) just like the real service writes it.
-		vr.tokens[hashToken("valid-token")] = &identitysqlc.EmailVerificationToken{
+		vr.tokens[hashToken("valid-token")] = &identitysqlc.EmailVerificationToken{TenantID: 1,
 			ID:        1,
 			UserID:    1,
 			Email:     "user@example.com",
@@ -225,7 +225,7 @@ func TestVerify(t *testing.T) {
 	t.Run("expired token", func(t *testing.T) {
 		svc, _, vr, _, _ := newEmailVerifServiceForTest()
 
-		vr.tokens[hashToken("expired")] = &identitysqlc.EmailVerificationToken{
+		vr.tokens[hashToken("expired")] = &identitysqlc.EmailVerificationToken{TenantID: 1,
 			ID:        1,
 			UserID:    1,
 			Email:     "user@example.com",
@@ -256,7 +256,7 @@ func TestResendVerification(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		svc, ur, vr, es, _ := newEmailVerifServiceForTest()
 
-		ur.users[1] = &identitysqlc.User{
+		ur.users[1] = &identitysqlc.User{TenantID: 1,
 			ID:        1,
 			Email:     "user@example.com",
 			CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -280,7 +280,7 @@ func TestResendVerification(t *testing.T) {
 		svc, _, _, es, mc := newEmailVerifServiceForTest()
 
 		// Pre-set rate limit cache key
-		mc.items["email_verification:user@example.com"] = []byte("1")
+		mc.items["email_verification:user@example.com:tenant=1"] = []byte("1")
 
 		err := svc.ResendVerification(context.Background(), "user@example.com")
 		if err != nil {
@@ -303,7 +303,7 @@ func TestResendVerification(t *testing.T) {
 	t.Run("already verified returns nil", func(t *testing.T) {
 		svc, ur, _, es, _ := newEmailVerifServiceForTest()
 
-		ur.users[1] = &identitysqlc.User{
+		ur.users[1] = &identitysqlc.User{TenantID: 1,
 			ID:              1,
 			Email:           "user@example.com",
 			EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},

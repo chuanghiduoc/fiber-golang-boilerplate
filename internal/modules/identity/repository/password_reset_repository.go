@@ -24,6 +24,7 @@ func NewPasswordResetRepository(db identitysqlc.DBTX) PasswordResetRepository {
 }
 
 func (r *passwordResetRepository) Create(ctx context.Context, params identitysqlc.CreatePasswordResetTokenParams) (*identitysqlc.PasswordResetToken, error) {
+	params.TenantID = tenantID(ctx)
 	rt, err := r.q.CreatePasswordResetToken(ctx, params)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -32,7 +33,10 @@ func (r *passwordResetRepository) Create(ctx context.Context, params identitysql
 }
 
 func (r *passwordResetRepository) GetByToken(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
-	rt, err := r.q.GetPasswordResetTokenByToken(ctx, token)
+	rt, err := r.q.GetPasswordResetTokenByToken(ctx, identitysqlc.GetPasswordResetTokenByTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -40,7 +44,10 @@ func (r *passwordResetRepository) GetByToken(ctx context.Context, token string) 
 }
 
 func (r *passwordResetRepository) GetByTokenForUpdate(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
-	rt, err := r.q.GetPasswordResetTokenByTokenForUpdate(ctx, token)
+	rt, err := r.q.GetPasswordResetTokenByTokenForUpdate(ctx, identitysqlc.GetPasswordResetTokenByTokenForUpdateParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -48,7 +55,10 @@ func (r *passwordResetRepository) GetByTokenForUpdate(ctx context.Context, token
 }
 
 func (r *passwordResetRepository) Consume(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
-	rt, err := r.q.ConsumePasswordResetToken(ctx, token)
+	rt, err := r.q.ConsumePasswordResetToken(ctx, identitysqlc.ConsumePasswordResetTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -56,9 +66,15 @@ func (r *passwordResetRepository) Consume(ctx context.Context, token string) (*i
 }
 
 func (r *passwordResetRepository) Delete(ctx context.Context, token string) error {
-	return r.q.DeletePasswordResetToken(ctx, token)
+	return r.q.DeletePasswordResetToken(ctx, identitysqlc.DeletePasswordResetTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 }
 
 func (r *passwordResetRepository) DeleteByUserID(ctx context.Context, userID int64) error {
-	return r.q.DeletePasswordResetTokensByUserID(ctx, userID)
+	return r.q.DeletePasswordResetTokensByUserID(ctx, identitysqlc.DeletePasswordResetTokensByUserIDParams{
+		UserID:   userID,
+		TenantID: tenantID(ctx),
+	})
 }

@@ -77,7 +77,7 @@ func (m *mockUploadService) Restore(_ context.Context, id, _ int64) (*dto.FileRe
 }
 
 func userToken() string {
-	t, _ := token.Generate(1, "test@example.com", "user", "test-secret", 24)
+	t, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
 	return t
 }
 

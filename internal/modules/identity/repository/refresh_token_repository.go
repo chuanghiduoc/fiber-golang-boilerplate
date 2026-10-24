@@ -25,6 +25,7 @@ func NewRefreshTokenRepository(db identitysqlc.DBTX) RefreshTokenRepository {
 }
 
 func (r *refreshTokenRepository) Create(ctx context.Context, params identitysqlc.CreateRefreshTokenParams) (*identitysqlc.RefreshToken, error) {
+	params.TenantID = tenantID(ctx)
 	rt, err := r.q.CreateRefreshToken(ctx, params)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -33,7 +34,10 @@ func (r *refreshTokenRepository) Create(ctx context.Context, params identitysqlc
 }
 
 func (r *refreshTokenRepository) GetByToken(ctx context.Context, token string) (*identitysqlc.RefreshToken, error) {
-	rt, err := r.q.GetRefreshTokenByToken(ctx, token)
+	rt, err := r.q.GetRefreshTokenByToken(ctx, identitysqlc.GetRefreshTokenByTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -41,7 +45,10 @@ func (r *refreshTokenRepository) GetByToken(ctx context.Context, token string) (
 }
 
 func (r *refreshTokenRepository) Consume(ctx context.Context, token string) (*identitysqlc.RefreshToken, error) {
-	rt, err := r.q.ConsumeRefreshToken(ctx, token)
+	rt, err := r.q.ConsumeRefreshToken(ctx, identitysqlc.ConsumeRefreshTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
@@ -49,9 +56,15 @@ func (r *refreshTokenRepository) Consume(ctx context.Context, token string) (*id
 }
 
 func (r *refreshTokenRepository) Delete(ctx context.Context, token string) error {
-	return r.q.DeleteRefreshToken(ctx, token)
+	return r.q.DeleteRefreshToken(ctx, identitysqlc.DeleteRefreshTokenParams{
+		Token:    token,
+		TenantID: tenantID(ctx),
+	})
 }
 
 func (r *refreshTokenRepository) DeleteByUserID(ctx context.Context, userID int64) error {
-	return r.q.DeleteRefreshTokensByUserID(ctx, userID)
+	return r.q.DeleteRefreshTokensByUserID(ctx, identitysqlc.DeleteRefreshTokensByUserIDParams{
+		UserID:   userID,
+		TenantID: tenantID(ctx),
+	})
 }

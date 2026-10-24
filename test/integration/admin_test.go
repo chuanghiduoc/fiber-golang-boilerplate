@@ -118,7 +118,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	respBody, _ := io.ReadAll(resp.Body)
 	var regular identitydto.UserResponse
 	require.NoError(t, json.Unmarshal(respBody, &regular))
-	regularToken, err := token.GenerateWithVersion(regular.ID, regular.Email, regular.Role, regular.TokenVersion, "integration-secret", 24)
+	regularToken, err := token.GenerateWithVersionAndTenant(regular.ID, 1, regular.Email, regular.Role, regular.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	// Create a real admin so the session validator has a current role/version
@@ -136,7 +136,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 		Role: identitydto.RoleAdmin,
 	})
 	require.NoError(t, err)
-	adminToken, err := token.GenerateWithVersion(admin.ID, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
+	adminToken, err := token.GenerateWithVersionAndTenant(admin.ID, 1, admin.Email, admin.Role, admin.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	// Get stats.
@@ -184,7 +184,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	// A token issued for the restored version works.
 	restored, err := userRepo.GetByID(context.Background(), regular.ID)
 	require.NoError(t, err)
-	restoredToken, err := token.GenerateWithVersion(restored.ID, restored.Email, restored.Role, restored.TokenVersion, "integration-secret", 24)
+	restoredToken, err := token.GenerateWithVersionAndTenant(restored.ID, 1, restored.Email, restored.Role, restored.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 	req, _ = http.NewRequest("GET", "/users/me", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+restoredToken)
@@ -218,7 +218,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	var other identitydto.UserResponse
 	respBody, _ = io.ReadAll(resp.Body)
 	require.NoError(t, json.Unmarshal(respBody, &other))
-	userToken, err := token.GenerateWithVersion(other.ID, other.Email, other.Role, other.TokenVersion, "integration-secret", 24)
+	userToken, err := token.GenerateWithVersionAndTenant(other.ID, 1, other.Email, other.Role, other.TokenVersion, "integration-secret", 24)
 	require.NoError(t, err)
 
 	req, _ = http.NewRequest("GET", "/admin/stats", http.NoBody)

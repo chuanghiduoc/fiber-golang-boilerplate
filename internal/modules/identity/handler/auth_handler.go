@@ -6,13 +6,17 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
@@ -21,6 +25,25 @@ import (
 )
 
 const oauthStateCookieName = "oauth_state"
+
+// encodeOAuthState binds the OAuth state nonce to the tenant that started the
+// flow. The callback must use this tenant instead of X-Tenant-Slug, otherwise
+// an attacker could start a flow for tenant A and complete it under tenant B.
+func encodeOAuthState(nonce string, tenantID int64) string {
+	return nonce + "." + strconv.FormatInt(tenantID, 10)
+}
+
+func decodeOAuthState(state string) (nonce string, tenantID int64, ok bool) {
+	sep := strings.LastIndexByte(state, '.')
+	if sep <= 0 || sep == len(state)-1 {
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(state[sep+1:], 10, 64)
+	if err != nil || id <= 0 {
+		return "", 0, false
+	}
+	return state[:sep], id, true
+}
 
 type AuthHandler struct {
 	userSvc                  service.UserService
@@ -31,6 +54,10 @@ type AuthHandler struct {
 	jwtExpireHour            int
 	requireEmailVerification bool
 	googleOAuth              *oauth.GoogleOAuth
+	// tenants is optional for source compatibility with handler tests and
+	// minimal deployments. Production wiring supplies it so the Google
+	// callback can prove the tenant carried through OAuth state is active.
+	tenants repository.TenantRepository
 }
 
 func NewAuthHandler(
@@ -42,7 +69,12 @@ func NewAuthHandler(
 	jwtExpireHour int,
 	requireEmailVerification bool,
 	googleOAuth *oauth.GoogleOAuth,
+	tenants ...repository.TenantRepository,
 ) *AuthHandler {
+	var tenantRepo repository.TenantRepository
+	if len(tenants) > 0 {
+		tenantRepo = tenants[0]
+	}
 	return &AuthHandler{
 		userSvc:                  userSvc,
 		refreshSvc:               refreshSvc,
@@ -52,6 +84,7 @@ func NewAuthHandler(
 		jwtExpireHour:            jwtExpireHour,
 		requireEmailVerification: requireEmailVerification,
 		googleOAuth:              googleOAuth,
+		tenants:                  tenantRepo,
 	}
 }
 
@@ -83,8 +116,16 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 	// registration transaction, sending here would duplicate it. Fall back to
 	// the post-commit send only when registration was not transactional.
 	if h.emailVerifSvc != nil && !h.userSvc.RegistrationEmailsTransactional() {
+		// Carry the registration tenant into the fire-and-forget send. A bare
+		// background context would fall back to the default tenant and write
+		// the verification token to the wrong tenant.
+		tenantID := tenant.EffectiveID(c.Context())
+		if user.TenantID != 0 {
+			tenantID = user.TenantID
+		}
 		async.Go(func() {
-			_ = h.emailVerifSvc.SendVerification(context.Background(), user.ID, user.Email)
+			ctx := tenant.WithID(context.Background(), tenantID)
+			_ = h.emailVerifSvc.SendVerification(ctx, user.ID, user.Email)
 		})
 	}
 
@@ -117,6 +158,11 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	user, err := h.userSvc.Authenticate(c.Context(), req)
 	if err != nil {
 		return err
+	}
+	// Authenticate is tenant-scoped, but keep the invariant explicit: a token
+	// must never be minted for a user outside the request tenant.
+	if user.TenantID != tenant.EffectiveID(c.Context()) {
+		return apperror.NewCode(apperror.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 
 	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
@@ -160,9 +206,15 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 
 	// Consume atomically: a replayed or concurrent refresh token can only be
 	// used once, even if two requests arrive at the same time.
-	userID, tokenVersion, err := h.refreshSvc.Consume(c.Context(), req.RefreshToken)
+	userID, tokenTenantID, tokenVersion, err := h.refreshSvc.Consume(c.Context(), req.RefreshToken)
 	if err != nil {
 		return err
+	}
+	// Refresh tokens are scoped to the request tenant. A token issued by
+	// tenant A can never be replayed against tenant B (or the default tenant
+	// when the caller omitted the header).
+	if tokenTenantID != tenant.EffectiveID(c.Context()) {
+		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
 
 	user, err := h.userSvc.GetByID(c.Context(), userID)
@@ -171,6 +223,9 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 			return apperror.NewUnauthorized("account is not active")
 		}
 		return err
+	}
+	if user.TenantID != tokenTenantID {
+		return apperror.NewUnauthorized("refresh token is no longer valid")
 	}
 	// A token issued before a password change/reset, ban, or role change must
 	// not be allowed to mint a new session.
@@ -358,7 +413,11 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	if _, err := rand.Read(b); err != nil {
 		return apperror.NewInternal("failed to generate state")
 	}
-	state := hex.EncodeToString(b)
+	tenantID := tenant.EffectiveID(c.Context())
+	if tenantID <= 0 {
+		return apperror.NewInternal("tenant context is required")
+	}
+	state := encodeOAuthState(hex.EncodeToString(b), tenantID)
 
 	c.Cookie(&fiber.Cookie{
 		Name:     oauthStateCookieName,
@@ -389,13 +448,29 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return apperror.NewNotFound("Google OAuth not configured")
 	}
 
-	// Verify CSRF state
+	// Verify CSRF state. The state also carries the tenant that started the
+	// flow; the callback ignores X-Tenant-Slug and scopes every lookup to it.
 	state := c.Query("state")
 	cookieState := c.Cookies(oauthStateCookieName)
 	if state == "" || cookieState == "" ||
 		subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
 		return apperror.NewBadRequest("invalid oauth state")
 	}
+	_, tenantID, ok := decodeOAuthState(state)
+	if !ok {
+		return apperror.NewBadRequest("invalid oauth state")
+	}
+	if h.tenants == nil {
+		return apperror.NewInternal("oauth tenant validation is not configured")
+	}
+	// GetByID only returns active tenants, so a tenant suspended during the
+	// consent round-trip cannot complete the login.
+	if _, err := h.tenants.GetByID(c.Context(), tenantID); err != nil {
+		return apperror.NewBadRequest("invalid oauth state")
+	}
+	fiber.Locals[int64](c, "tenant_id", tenantID)
+	c.SetContext(tenant.WithID(c.Context(), tenantID))
+	ctx := c.Context()
 
 	// Clear state cookie
 	c.Cookie(&fiber.Cookie{
@@ -414,14 +489,17 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return apperror.NewBadRequest("missing authorization code")
 	}
 
-	info, err := h.googleOAuth.Exchange(c.Context(), code)
+	info, err := h.googleOAuth.Exchange(ctx, code)
 	if err != nil {
 		return apperror.NewBadRequest("failed to exchange authorization code")
 	}
 
-	user, err := h.userSvc.FindOrCreateByGoogle(c.Context(), info.ID, info.Email, info.Name)
+	user, err := h.userSvc.FindOrCreateByGoogle(ctx, info.ID, info.Email, info.Name)
 	if err != nil {
 		return err
+	}
+	if user.TenantID != tenantID {
+		return apperror.NewUnauthorized("account is not active")
 	}
 
 	accessToken, err := token.GenerateWithVersionAndTenant(user.ID, user.TenantID, user.Email, user.Role, user.TokenVersion, h.jwtSecret, h.jwtExpireHour)
@@ -429,7 +507,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return apperror.NewInternal("failed to generate token")
 	}
 
-	refreshToken, err := h.refreshSvc.Create(c.Context(), user.ID, user.TokenVersion)
+	refreshToken, err := h.refreshSvc.Create(ctx, user.ID, user.TokenVersion)
 	if err != nil {
 		return apperror.NewInternal("failed to generate refresh token")
 	}

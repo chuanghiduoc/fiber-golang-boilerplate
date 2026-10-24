@@ -92,9 +92,10 @@ Rules:
 
 - `Authorization: Bearer <jwt>` for protected routes.
 - JWT pins HS256, requires `exp`/`iat`/`aud`/`iss`, and carries `token_version`
-  plus `tenant_id` (tokens minted before multi-tenancy omit `tenant_id`).
-- Access tokens are short-lived; refresh tokens rotate atomically and are
-  single-use/version-bound.
+  plus `tenant_id`. Tokens minted before multi-tenancy omit `tenant_id` and are
+  rejected with 401; clients must log in again after the upgrade.
+- Access tokens are short-lived; refresh tokens rotate atomically, are
+  single-use/version-bound, and are scoped to the tenant that issued them.
 - Permissions live in `internal/platform/authz`; route middleware uses
   `authz.Require`. Never check role strings ad hoc in handlers.
 - `POST /auth/logout-all` revokes all refresh tokens and bumps the token
@@ -105,14 +106,21 @@ Rules:
 - `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) selects the request tenant on
   `/api/v1` routes. Omitting it resolves to `TENANT_DEFAULT_SLUG` (`default`),
   preserving pre-multi-tenant behavior.
-- Invalid or unknown slugs return `404` with detail `tenant not found`.
-  `TENANT_REQUIRE_HEADER=true` rejects header-less requests the same way.
+- Invalid, unknown, or suspended slugs return `404` with detail
+  `tenant not found`. `TENANT_REQUIRE_HEADER=true` rejects header-less requests
+  the same way.
 - Authenticated requests use the JWT `tenant_id` claim. If an explicit
   `X-Tenant-Slug` resolves to a different tenant, the request fails with
   `403 permission.denied` and detail `tenant mismatch`.
 - One user belongs to one tenant; emails and Google IDs are unique per tenant.
-- **Not yet isolated:** existing queries are not scoped by tenant. Treat this
-  as a foundation, not an isolation boundary.
+  Login, registration, refresh, password reset, and email verification use the
+  resolved request tenant, so non-default tenants must send `X-Tenant-Slug` on
+  every call. Cross-tenant user ids return 404 and cross-tenant tokens fail as
+  invalid.
+- Google OAuth binds the tenant into `state`; the callback uses that tenant
+  rather than the header and rejects a tenant suspended mid-flow.
+- `UserResponse` includes an additive `tenantId` field. Tokens without a
+  `tenant_id` claim are rejected (fail-closed).
 
 ## Headers
 

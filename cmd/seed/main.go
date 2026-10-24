@@ -51,7 +51,12 @@ func run() error {
 		return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set for seeding")
 	}
 
-	if err := seed.Admin(ctx, cfg.Admin, userRepo); err != nil {
+	defaultTenant, err := tenantRepo.ResolveBySlug(ctx, cfg.Tenant.DefaultSlug)
+	if err != nil {
+		return fmt.Errorf("configured default tenant %q is not available: %w", cfg.Tenant.DefaultSlug, err)
+	}
+
+	if err := seed.Admin(ctx, cfg.Admin, userRepo, defaultTenant.ID); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
 

@@ -235,7 +235,7 @@ func TestAuthenticate(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		// User created via OAuth — no password hash
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID:           1,
 			Email:        "oauth@example.com",
 			Name:         "OAuth User",
@@ -266,7 +266,7 @@ func TestGetByID(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("p"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			Role:         "user",
@@ -307,8 +307,8 @@ func TestList(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
 		repo.nextID = 3
 
 		users, hasMore, err := svc.List(context.Background(), 10, "")
@@ -327,8 +327,8 @@ func TestList(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "a@example.com", Name: "A", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "b@example.com", Name: "B", Role: "user"}
 		repo.nextID = 3
 
 		// Request a page smaller than the dataset.
@@ -354,7 +354,7 @@ func TestUpdate(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "old@example.com", Name: "Old Name", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "old@example.com", Name: "Old Name", Role: "user"}
 		repo.nextID = 2
 
 		newName := "New Name"
@@ -371,8 +371,8 @@ func TestUpdate(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "user1@example.com", Name: "User 1", Role: "user"}
-		repo.users[2] = &identitysqlc.User{ID: 2, Email: "user2@example.com", Name: "User 2", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "user1@example.com", Name: "User 1", Role: "user"}
+		repo.users[2] = &identitysqlc.User{TenantID: 1, ID: 2, Email: "user2@example.com", Name: "User 2", Role: "user"}
 		repo.nextID = 3
 
 		taken := "user2@example.com"
@@ -413,7 +413,7 @@ func TestDelete(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
+		repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "test@example.com", Name: "Test", Role: "user"}
 
 		err := svc.Delete(context.Background(), 1)
 		if err != nil {
@@ -448,7 +448,7 @@ func TestChangePassword(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test", Role: "user",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		}
@@ -473,7 +473,7 @@ func TestChangePassword(t *testing.T) {
 		svc := newTestUserService(repo, false)
 
 		hash, _ := bcrypt.GenerateFromPassword([]byte("OldPass1!"), bcrypt.MinCost)
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "test@example.com", Name: "Test", Role: "user",
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		}
@@ -494,7 +494,7 @@ func TestChangePassword(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "oauth@example.com", Name: "OAuth", Role: "user",
 			PasswordHash: pgtype.Text{Valid: false}, // No password (OAuth)
 			AuthProvider: "google",
@@ -537,7 +537,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "google@example.com", Name: "Google User",
 			GoogleID:     pgtype.Text{String: "google-123", Valid: true},
 			AuthProvider: "google", Role: "user",
@@ -557,7 +557,7 @@ func TestFindOrCreateByGoogle(t *testing.T) {
 		repo := newMockUserRepo()
 		svc := newTestUserService(repo, false)
 
-		repo.users[1] = &identitysqlc.User{
+		repo.users[1] = &identitysqlc.User{TenantID: 1,
 			ID: 1, Email: "existing@example.com", Name: "Existing",
 			AuthProvider: "local", Role: "user",
 			EmailVerifiedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
@@ -610,7 +610,7 @@ func TestUpdate_EmailChangeSuccess(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
 
-	repo.users[1] = &identitysqlc.User{ID: 1, Email: "old@example.com", Name: "User", Role: "user"}
+	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "old@example.com", Name: "User", Role: "user"}
 	repo.nextID = 2
 
 	newEmail := "new@example.com"
@@ -627,7 +627,7 @@ func TestUpdate_SameEmail(t *testing.T) {
 	repo := newMockUserRepo()
 	svc := newTestUserService(repo, false)
 
-	repo.users[1] = &identitysqlc.User{ID: 1, Email: "same@example.com", Name: "User", Role: "user"}
+	repo.users[1] = &identitysqlc.User{TenantID: 1, ID: 1, Email: "same@example.com", Name: "User", Role: "user"}
 	repo.nextID = 2
 
 	sameEmail := "same@example.com"

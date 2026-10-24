@@ -13,10 +13,21 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
+
+// mockTenant mirrors repository tenant scoping so service tests can prove that
+// two tenants never see each other's rows.
+func mockTenant(ctx context.Context) int64 {
+	return tenant.EffectiveID(ctx)
+}
+
+func inMockTenant(ctx context.Context, tenantID int64) bool {
+	return tenantID == mockTenant(ctx)
+}
 
 // cursorLess reports whether (ts1,id1) sorts before (ts2,id2) in the
 // (created_at DESC, id DESC) order used by cursor pagination.
@@ -40,53 +51,53 @@ func newMockUserRepo() *mockUserRepo {
 	return &mockUserRepo{users: make(map[int64]*identitysqlc.User), nextID: 1}
 }
 
-func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*identitysqlc.User, error) {
+func (m *mockUserRepo) GetByID(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	return u, nil
 }
 
-func (m *mockUserRepo) GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, err error) {
-	u, err := m.GetByID(ctx, id)
-	if err != nil {
-		return "", 0, err
+func (m *mockUserRepo) GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, tenantID int64, tenantStatus string, err error) {
+	u, ok := m.users[id]
+	if !ok || u.DeletedAt.Valid {
+		return "", 0, 0, "", apperror.ErrNotFound
 	}
-	return u.Role, u.TokenVersion, nil
+	return u.Role, u.TokenVersion, u.TenantID, "active", nil
 }
 
-func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*identitysqlc.User, error) {
+func (m *mockUserRepo) GetByEmail(ctx context.Context, addr string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, addr) {
+		if !u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) && strings.EqualFold(u.Email, addr) {
 			return u, nil
 		}
 	}
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*identitysqlc.User, error) {
+func (m *mockUserRepo) GetByGoogleID(ctx context.Context, googleID string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid && u.GoogleID.Valid && u.GoogleID.String == googleID {
+		if !u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) && u.GoogleID.Valid && u.GoogleID.String == googleID {
 			return u, nil
 		}
 	}
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) GetBannedByEmail(_ context.Context, addr string) (*identitysqlc.User, error) {
+func (m *mockUserRepo) GetBannedByEmail(ctx context.Context, addr string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
-		if u.BannedAt.Valid && strings.EqualFold(u.Email, addr) {
+		if u.BannedAt.Valid && inMockTenant(ctx, u.TenantID) && strings.EqualFold(u.Email, addr) {
 			return u, nil
 		}
 	}
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]identitysqlc.User, error) {
+func (m *mockUserRepo) List(ctx context.Context, limit, offset int32) ([]identitysqlc.User, error) {
 	all := make([]identitysqlc.User, 0, len(m.users))
 	for _, u := range m.users {
-		if u.DeletedAt.Valid {
+		if u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 			continue
 		}
 		all = append(all, *u)
@@ -102,17 +113,20 @@ func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]identitys
 	return all[start:end], nil
 }
 
-func (m *mockUserRepo) ListCursor(_ context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
-	return m.listCursor(cur, false), nil
+func (m *mockUserRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
+	return m.listCursor(ctx, cur, false), nil
 }
 
-func (m *mockUserRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
-	return m.listCursor(cur, true), nil
+func (m *mockUserRepo) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
+	return m.listCursor(ctx, cur, true), nil
 }
 
-func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) []identitysqlc.User {
+func (m *mockUserRepo) listCursor(ctx context.Context, cur pagination.DBCursor, includeDeleted bool) []identitysqlc.User {
 	all := make([]identitysqlc.User, 0, len(m.users))
 	for _, u := range m.users {
+		if !inMockTenant(ctx, u.TenantID) {
+			continue
+		}
 		if u.DeletedAt.Valid && !includeDeleted {
 			continue
 		}
@@ -135,24 +149,26 @@ func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) 
 	return out
 }
 
-func (m *mockUserRepo) Count(_ context.Context) (int64, error) {
+func (m *mockUserRepo) Count(ctx context.Context) (int64, error) {
 	var count int64
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid {
+		if !u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func (m *mockUserRepo) Create(_ context.Context, params identitysqlc.CreateUserParams) (*identitysqlc.User, error) {
-	// Enforce active, case-insensitive email uniqueness like the real schema.
+func (m *mockUserRepo) Create(ctx context.Context, params identitysqlc.CreateUserParams) (*identitysqlc.User, error) {
+	tid := mockTenant(ctx)
+	// Enforce active, case-insensitive email uniqueness inside the tenant.
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
-			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
+		if !u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) && strings.EqualFold(u.Email, params.Email) {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_tenant_email_lower_active\"")
 		}
 	}
 	u := &identitysqlc.User{
+		TenantID:     tid,
 		ID:           m.nextID,
 		Email:        params.Email,
 		PasswordHash: params.PasswordHash,
@@ -167,14 +183,16 @@ func (m *mockUserRepo) Create(_ context.Context, params identitysqlc.CreateUserP
 	return u, nil
 }
 
-func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params identitysqlc.CreateOAuthUserParams) (*identitysqlc.User, error) {
-	// Enforce active, case-insensitive email uniqueness like the real schema.
+func (m *mockUserRepo) CreateOAuthUser(ctx context.Context, params identitysqlc.CreateOAuthUserParams) (*identitysqlc.User, error) {
+	tid := mockTenant(ctx)
+	// Enforce active, case-insensitive email uniqueness inside the tenant.
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
-			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
+		if !u.DeletedAt.Valid && inMockTenant(ctx, u.TenantID) && strings.EqualFold(u.Email, params.Email) {
+			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_tenant_email_lower_active\"")
 		}
 	}
 	u := &identitysqlc.User{
+		TenantID:     tid,
 		ID:           m.nextID,
 		Email:        params.Email,
 		Name:         params.Name,
@@ -189,9 +207,9 @@ func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params identitysqlc.Cr
 	return u, nil
 }
 
-func (m *mockUserRepo) Update(_ context.Context, params identitysqlc.UpdateUserParams) (*identitysqlc.User, error) {
+func (m *mockUserRepo) Update(ctx context.Context, params identitysqlc.UpdateUserParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.Name = params.Name
@@ -206,9 +224,9 @@ func (m *mockUserRepo) Update(_ context.Context, params identitysqlc.UpdateUserP
 	return u, nil
 }
 
-func (m *mockUserRepo) UpdatePassword(_ context.Context, params identitysqlc.UpdateUserPasswordParams) (*identitysqlc.User, error) {
+func (m *mockUserRepo) UpdatePassword(ctx context.Context, params identitysqlc.UpdateUserPasswordParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.PasswordHash = params.PasswordHash
@@ -217,18 +235,18 @@ func (m *mockUserRepo) UpdatePassword(_ context.Context, params identitysqlc.Upd
 	return u, nil
 }
 
-func (m *mockUserRepo) RevokeSessions(_ context.Context, id int64) (*identitysqlc.User, error) {
+func (m *mockUserRepo) RevokeSessions(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.TokenVersion++
 	return u, nil
 }
 
-func (m *mockUserRepo) UpdateRole(_ context.Context, params identitysqlc.UpdateUserRoleParams) (*identitysqlc.User, error) {
+func (m *mockUserRepo) UpdateRole(ctx context.Context, params identitysqlc.UpdateUserRoleParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.Role = params.Role
@@ -236,18 +254,18 @@ func (m *mockUserRepo) UpdateRole(_ context.Context, params identitysqlc.UpdateU
 	return u, nil
 }
 
-func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64, addr string) (*identitysqlc.User, error) {
+func (m *mockUserRepo) VerifyEmail(ctx context.Context, id int64, addr string) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || !strings.EqualFold(u.Email, addr) {
+	if !ok || !inMockTenant(ctx, u.TenantID) || !strings.EqualFold(u.Email, addr) {
 		return nil, apperror.ErrNotFound
 	}
 	u.EmailVerifiedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	return u, nil
 }
 
-func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params identitysqlc.LinkGoogleAccountParams) (*identitysqlc.User, error) {
+func (m *mockUserRepo) LinkGoogleAccount(ctx context.Context, params identitysqlc.LinkGoogleAccountParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
-	if !ok {
+	if !ok || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.GoogleID = params.GoogleID
@@ -255,9 +273,9 @@ func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params identitysqlc.
 	return u, nil
 }
 
-func (m *mockUserRepo) Delete(_ context.Context, id int64) (*identitysqlc.User, error) {
+func (m *mockUserRepo) Delete(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
@@ -266,9 +284,9 @@ func (m *mockUserRepo) Delete(_ context.Context, id int64) (*identitysqlc.User, 
 	return u, nil
 }
 
-func (m *mockUserRepo) Ban(_ context.Context, id int64) (*identitysqlc.User, error) {
+func (m *mockUserRepo) Ban(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || u.DeletedAt.Valid {
+	if !ok || u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
@@ -279,9 +297,9 @@ func (m *mockUserRepo) Ban(_ context.Context, id int64) (*identitysqlc.User, err
 	return u, nil
 }
 
-func (m *mockUserRepo) Restore(_ context.Context, id int64) (*identitysqlc.User, error) {
+func (m *mockUserRepo) Restore(ctx context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
-	if !ok || !u.DeletedAt.Valid {
+	if !ok || !u.DeletedAt.Valid || !inMockTenant(ctx, u.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	u.DeletedAt = pgtype.Timestamptz{}
@@ -295,23 +313,32 @@ func (m *mockUserRepo) AdminList(ctx context.Context, limit, offset int32) ([]id
 	return m.List(ctx, limit, offset)
 }
 
-func (m *mockUserRepo) AdminCount(_ context.Context) (int64, error) {
-	return int64(len(m.users)), nil
-}
-
-func (m *mockUserRepo) CountActiveAdmins(_ context.Context) (int64, error) {
+func (m *mockUserRepo) AdminCount(ctx context.Context) (int64, error) {
 	var count int64
 	for _, u := range m.users {
-		if !u.DeletedAt.Valid && u.Role == "admin" {
+		if inMockTenant(ctx, u.TenantID) {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func (m *mockUserRepo) AdminUserStats(_ context.Context) (identitysqlc.AdminUserStatsRow, error) {
+func (m *mockUserRepo) CountActiveAdmins(ctx context.Context) (int64, error) {
+	var count int64
+	for _, u := range m.users {
+		if !u.DeletedAt.Valid && u.Role == "admin" && inMockTenant(ctx, u.TenantID) {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (m *mockUserRepo) AdminUserStats(ctx context.Context) (identitysqlc.AdminUserStatsRow, error) {
 	var active, deleted int64
 	for _, u := range m.users {
+		if !inMockTenant(ctx, u.TenantID) {
+			continue
+		}
 		if u.DeletedAt.Valid {
 			deleted++
 		} else {
@@ -334,8 +361,9 @@ func newMockRefreshTokenRepo() *mockRefreshTokenRepo {
 	return &mockRefreshTokenRepo{tokens: make(map[string]*identitysqlc.RefreshToken)}
 }
 
-func (m *mockRefreshTokenRepo) Create(_ context.Context, params identitysqlc.CreateRefreshTokenParams) (*identitysqlc.RefreshToken, error) {
+func (m *mockRefreshTokenRepo) Create(ctx context.Context, params identitysqlc.CreateRefreshTokenParams) (*identitysqlc.RefreshToken, error) {
 	rt := &identitysqlc.RefreshToken{
+		TenantID:     mockTenant(ctx),
 		UserID:       params.UserID,
 		Token:        params.Token,
 		ExpiresAt:    params.ExpiresAt,
@@ -345,32 +373,34 @@ func (m *mockRefreshTokenRepo) Create(_ context.Context, params identitysqlc.Cre
 	return rt, nil
 }
 
-func (m *mockRefreshTokenRepo) GetByToken(_ context.Context, token string) (*identitysqlc.RefreshToken, error) {
+func (m *mockRefreshTokenRepo) GetByToken(ctx context.Context, token string) (*identitysqlc.RefreshToken, error) {
 	rt, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, rt.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	return rt, nil
 }
 
-func (m *mockRefreshTokenRepo) Consume(_ context.Context, token string) (*identitysqlc.RefreshToken, error) {
+func (m *mockRefreshTokenRepo) Consume(ctx context.Context, token string) (*identitysqlc.RefreshToken, error) {
 	rt, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, rt.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	delete(m.tokens, token)
 	return rt, nil
 }
 
-func (m *mockRefreshTokenRepo) Delete(_ context.Context, token string) error {
-	delete(m.tokens, token)
+func (m *mockRefreshTokenRepo) Delete(ctx context.Context, token string) error {
+	if rt, ok := m.tokens[token]; ok && inMockTenant(ctx, rt.TenantID) {
+		delete(m.tokens, token)
+	}
 	return nil
 }
 
-func (m *mockRefreshTokenRepo) DeleteByUserID(_ context.Context, userID int64) error {
+func (m *mockRefreshTokenRepo) DeleteByUserID(ctx context.Context, userID int64) error {
 	m.deletedUserIDs = append(m.deletedUserIDs, userID)
 	for k, v := range m.tokens {
-		if v.UserID == userID {
+		if v.UserID == userID && inMockTenant(ctx, v.TenantID) {
 			delete(m.tokens, k)
 		}
 	}
@@ -390,8 +420,9 @@ func newMockEmailVerificationRepo() *mockEmailVerificationRepo {
 	return &mockEmailVerificationRepo{tokens: make(map[string]*identitysqlc.EmailVerificationToken), nextID: 1}
 }
 
-func (m *mockEmailVerificationRepo) Create(_ context.Context, params identitysqlc.CreateEmailVerificationTokenParams) (*identitysqlc.EmailVerificationToken, error) {
+func (m *mockEmailVerificationRepo) Create(ctx context.Context, params identitysqlc.CreateEmailVerificationTokenParams) (*identitysqlc.EmailVerificationToken, error) {
 	t := &identitysqlc.EmailVerificationToken{
+		TenantID:  mockTenant(ctx),
 		ID:        m.nextID,
 		UserID:    params.UserID,
 		Email:     params.Email,
@@ -404,31 +435,33 @@ func (m *mockEmailVerificationRepo) Create(_ context.Context, params identitysql
 	return t, nil
 }
 
-func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
+func (m *mockEmailVerificationRepo) GetByToken(ctx context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
 	t, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, t.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	return t, nil
 }
 
-func (m *mockEmailVerificationRepo) Consume(_ context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
+func (m *mockEmailVerificationRepo) Consume(ctx context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
 	t, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, t.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	delete(m.tokens, token)
 	return t, nil
 }
 
-func (m *mockEmailVerificationRepo) Delete(_ context.Context, token string) error {
-	delete(m.tokens, token)
+func (m *mockEmailVerificationRepo) Delete(ctx context.Context, token string) error {
+	if t, ok := m.tokens[token]; ok && inMockTenant(ctx, t.TenantID) {
+		delete(m.tokens, token)
+	}
 	return nil
 }
 
-func (m *mockEmailVerificationRepo) DeleteByUserID(_ context.Context, userID int64) error {
+func (m *mockEmailVerificationRepo) DeleteByUserID(ctx context.Context, userID int64) error {
 	for k, v := range m.tokens {
-		if v.UserID == userID {
+		if v.UserID == userID && inMockTenant(ctx, v.TenantID) {
 			delete(m.tokens, k)
 		}
 	}
@@ -448,8 +481,9 @@ func newMockPasswordResetRepo() *mockPasswordResetRepo {
 	return &mockPasswordResetRepo{tokens: make(map[string]*identitysqlc.PasswordResetToken), nextID: 1}
 }
 
-func (m *mockPasswordResetRepo) Create(_ context.Context, params identitysqlc.CreatePasswordResetTokenParams) (*identitysqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) Create(ctx context.Context, params identitysqlc.CreatePasswordResetTokenParams) (*identitysqlc.PasswordResetToken, error) {
 	t := &identitysqlc.PasswordResetToken{
+		TenantID:  mockTenant(ctx),
 		ID:        m.nextID,
 		UserID:    params.UserID,
 		Token:     params.Token,
@@ -461,9 +495,9 @@ func (m *mockPasswordResetRepo) Create(_ context.Context, params identitysqlc.Cr
 	return t, nil
 }
 
-func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) GetByToken(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
 	t, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, t.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	return t, nil
@@ -473,23 +507,25 @@ func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token s
 	return m.GetByToken(ctx, token)
 }
 
-func (m *mockPasswordResetRepo) Consume(_ context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) Consume(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
 	t, ok := m.tokens[token]
-	if !ok {
+	if !ok || !inMockTenant(ctx, t.TenantID) {
 		return nil, apperror.ErrNotFound
 	}
 	delete(m.tokens, token)
 	return t, nil
 }
 
-func (m *mockPasswordResetRepo) Delete(_ context.Context, token string) error {
-	delete(m.tokens, token)
+func (m *mockPasswordResetRepo) Delete(ctx context.Context, token string) error {
+	if t, ok := m.tokens[token]; ok && inMockTenant(ctx, t.TenantID) {
+		delete(m.tokens, token)
+	}
 	return nil
 }
 
-func (m *mockPasswordResetRepo) DeleteByUserID(_ context.Context, userID int64) error {
+func (m *mockPasswordResetRepo) DeleteByUserID(ctx context.Context, userID int64) error {
 	for k, v := range m.tokens {
-		if v.UserID == userID {
+		if v.UserID == userID && inMockTenant(ctx, v.TenantID) {
 			delete(m.tokens, k)
 		}
 	}
@@ -577,6 +613,16 @@ func (m *mockEmailSender) Sent() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.sent
+}
+
+// Messages returns a copy of the delivered messages under the sender lock so
+// tests can inspect bodies without racing an asynchronous send.
+func (m *mockEmailSender) Messages() []email.Message {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]email.Message, len(m.messages))
+	copy(out, m.messages)
+	return out
 }
 
 // WaitFor waits for asynchronously sent mail to arrive without sleeping in the

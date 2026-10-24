@@ -81,14 +81,19 @@ Kubernetes, incidents). Keep them current when routes/contracts change.
   `tenant_id`.
 - The baseline seeds `tenants` id 1 (`default`). Keep id 1 as the compatibility
   tenant; the `users` last-admin trigger is scoped per tenant.
-- The multi-tenant foundation is schema + request resolution + JWT claim only.
-  Existing SQL is not tenant-scoped yet; add `tenant_id` predicates to query
-  files and repository methods in the isolation milestone. Do not claim
-  isolation before that lands.
+- The multi-tenant identity isolation is implemented: identity queries and
+  repositories scope users, admin lists/stats, and refresh/reset/verification
+  tokens by `tenant_id`; public auth flows resolve the request tenant; Google
+  OAuth binds the tenant into `state`; the session validator rejects tenant
+  mismatches and suspended tenants. Files SQL is not yet tenant-scoped.
+- Tokens without a `tenant_id` claim are rejected fail-closed; rotate them after
+  upgrading. Keep `tenant_id` predicates in every new identity query and index
+  tenant-owned tables with `tenant_id` first.
 
 **Scope:** this is a boilerplate, not a finished multi-tenant SaaS platform.
-Tenant query isolation/RLS, tenant-aware registration/login/OAuth, distributed
-tracing, and environment promotion/rollout automation remain future work.
+Row-level security for every table, files query isolation, per-tenant limits,
+distributed tracing, and environment promotion/rollout automation remain future
+work.
 `identity`, `files`, and `admin` own all of
 their DTOs, repositories, services, and handlers under
 `internal/modules/<name>`; `admin` depends only on the stdlib-only
@@ -126,12 +131,14 @@ Offset helpers are for small admin/export tables only.
 
 ## Key Patterns
 
-- **Auth/session:** JWT carries `token_version` and (for tokens minted after
-  multi-tenancy) `tenant_id`; `session.Store` validates the version with
+- **Auth/session:** JWT carries `token_version` and `tenant_id`;
+  `session.Store` validates the version, tenant, and tenant status with
   generation-keyed invalidation. `tenant.Middleware` resolves `X-Tenant-Slug`
-  (empty -> `TENANT_DEFAULT_SLUG`), and `JWTAuth` rejects an explicit header
-  that conflicts with the claim. Refresh tokens are atomic single-use and
-  version-bound. `pkg/token` pins HS256 and requires `exp`.
+  (empty -> `TENANT_DEFAULT_SLUG`), `JWTAuth` rejects tokens without a tenant and
+  an explicit header that conflicts with the claim, and identity repositories
+  scope every query with `tenant.EffectiveID(ctx)`. Refresh tokens are atomic
+  single-use, tenant-scoped, and version-bound. `pkg/token` pins HS256 and
+  requires `exp`.
 - **Jobs:** `internal/platform/jobs` is the durable queue; delivery is
   at-least-once, so handlers must be idempotent. Services enqueue email/webhook
   work; password-reset and verification tokens are committed with their

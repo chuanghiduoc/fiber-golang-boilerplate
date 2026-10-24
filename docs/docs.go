@@ -2180,6 +2180,10 @@ const docTemplate = `{
                 "role": {
                     "type": "string"
                 },
+                "tenantId": {
+                    "description": "TenantID identifies the owning tenant. It is additive and read-only.",
+                    "type": "integer"
+                },
                 "updatedAt": {
                     "type": "string"
                 }
