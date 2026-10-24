@@ -14,7 +14,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -60,7 +60,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		return nil, apperror.NewInternal("failed to store file")
 	}
 
-	file, err := s.repo.Create(ctx, sqlc.CreateFileParams{
+	file, err := s.repo.Create(ctx, filesqlc.CreateFileParams{
 		UserID:       userID,
 		OriginalName: originalName,
 		StoragePath:  storagePath,
@@ -233,7 +233,7 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 	return s.toFileResponse(restored), nil
 }
 
-func (s *uploadService) toFileResponse(file *sqlc.File) *dto.FileResponse {
+func (s *uploadService) toFileResponse(file *filesqlc.File) *dto.FileResponse {
 	resp := &dto.FileResponse{
 		ID:           file.ID,
 		UserID:       file.UserID,

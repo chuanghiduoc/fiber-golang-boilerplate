@@ -15,8 +15,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -112,7 +112,7 @@ func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.Forgo
 		if err := resetRepo.DeleteByUserID(ctx, user.ID); err != nil {
 			return apperror.NewInternal("failed to clear old reset tokens")
 		}
-		_, err := resetRepo.Create(ctx, sqlc.CreatePasswordResetTokenParams{
+		_, err := resetRepo.Create(ctx, identitysqlc.CreatePasswordResetTokenParams{
 			UserID:    user.ID,
 			Token:     hashToken(token),
 			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(1 * time.Hour), Valid: true},
@@ -207,7 +207,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 			return apperror.NewInternal("failed to hash password")
 		}
 
-		_, err = userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
+		_, err = userRepo.UpdatePassword(ctx, identitysqlc.UpdateUserPasswordParams{
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			ID:           rt.UserID,
 		})

@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -32,15 +32,15 @@ func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
 // ---------------------------------------------------------------------------
 
 type mockUserRepo struct {
-	users  map[int64]*sqlc.User
+	users  map[int64]*identitysqlc.User
 	nextID int64
 }
 
 func newMockUserRepo() *mockUserRepo {
-	return &mockUserRepo{users: make(map[int64]*sqlc.User), nextID: 1}
+	return &mockUserRepo{users: make(map[int64]*identitysqlc.User), nextID: 1}
 }
 
-func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -48,7 +48,15 @@ func (m *mockUserRepo) GetByID(_ context.Context, id int64) (*sqlc.User, error) 
 	return u, nil
 }
 
-func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*sqlc.User, error) {
+func (m *mockUserRepo) GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, err error) {
+	u, err := m.GetByID(ctx, id)
+	if err != nil {
+		return "", 0, err
+	}
+	return u.Role, u.TokenVersion, nil
+}
+
+func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
 		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, addr) {
 			return u, nil
@@ -57,7 +65,7 @@ func (m *mockUserRepo) GetByEmail(_ context.Context, addr string) (*sqlc.User, e
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*sqlc.User, error) {
+func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
 		if !u.DeletedAt.Valid && u.GoogleID.Valid && u.GoogleID.String == googleID {
 			return u, nil
@@ -66,7 +74,7 @@ func (m *mockUserRepo) GetByGoogleID(_ context.Context, googleID string) (*sqlc.
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) GetBannedByEmail(_ context.Context, addr string) (*sqlc.User, error) {
+func (m *mockUserRepo) GetBannedByEmail(_ context.Context, addr string) (*identitysqlc.User, error) {
 	for _, u := range m.users {
 		if u.BannedAt.Valid && strings.EqualFold(u.Email, addr) {
 			return u, nil
@@ -75,8 +83,8 @@ func (m *mockUserRepo) GetBannedByEmail(_ context.Context, addr string) (*sqlc.U
 	return nil, apperror.ErrNotFound
 }
 
-func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User, error) {
-	all := make([]sqlc.User, 0, len(m.users))
+func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]identitysqlc.User, error) {
+	all := make([]identitysqlc.User, 0, len(m.users))
 	for _, u := range m.users {
 		if u.DeletedAt.Valid {
 			continue
@@ -94,16 +102,16 @@ func (m *mockUserRepo) List(_ context.Context, limit, offset int32) ([]sqlc.User
 	return all[start:end], nil
 }
 
-func (m *mockUserRepo) ListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
+func (m *mockUserRepo) ListCursor(_ context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
 	return m.listCursor(cur, false), nil
 }
 
-func (m *mockUserRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.User, error) {
+func (m *mockUserRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]identitysqlc.User, error) {
 	return m.listCursor(cur, true), nil
 }
 
-func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) []sqlc.User {
-	all := make([]sqlc.User, 0, len(m.users))
+func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) []identitysqlc.User {
+	all := make([]identitysqlc.User, 0, len(m.users))
 	for _, u := range m.users {
 		if u.DeletedAt.Valid && !includeDeleted {
 			continue
@@ -114,7 +122,7 @@ func (m *mockUserRepo) listCursor(cur pagination.DBCursor, includeDeleted bool) 
 	sort.Slice(all, func(i, j int) bool {
 		return cursorLess(all[j].CreatedAt.Time, all[j].ID, all[i].CreatedAt.Time, all[i].ID)
 	})
-	out := make([]sqlc.User, 0, len(all))
+	out := make([]identitysqlc.User, 0, len(all))
 	for _, u := range all {
 		if cur.HasCursor && !cursorLess(u.CreatedAt.Time, u.ID, cur.CreatedAt, cur.ID) {
 			continue
@@ -137,14 +145,14 @@ func (m *mockUserRepo) Count(_ context.Context) (int64, error) {
 	return count, nil
 }
 
-func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (*sqlc.User, error) {
+func (m *mockUserRepo) Create(_ context.Context, params identitysqlc.CreateUserParams) (*identitysqlc.User, error) {
 	// Enforce active, case-insensitive email uniqueness like the real schema.
 	for _, u := range m.users {
 		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
 			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
 		}
 	}
-	u := &sqlc.User{
+	u := &identitysqlc.User{
 		ID:           m.nextID,
 		Email:        params.Email,
 		PasswordHash: params.PasswordHash,
@@ -159,14 +167,14 @@ func (m *mockUserRepo) Create(_ context.Context, params sqlc.CreateUserParams) (
 	return u, nil
 }
 
-func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params sqlc.CreateOAuthUserParams) (*sqlc.User, error) {
+func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params identitysqlc.CreateOAuthUserParams) (*identitysqlc.User, error) {
 	// Enforce active, case-insensitive email uniqueness like the real schema.
 	for _, u := range m.users {
 		if !u.DeletedAt.Valid && strings.EqualFold(u.Email, params.Email) {
 			return nil, fmt.Errorf("duplicate key value violates unique constraint \"idx_users_email_lower_active\"")
 		}
 	}
-	u := &sqlc.User{
+	u := &identitysqlc.User{
 		ID:           m.nextID,
 		Email:        params.Email,
 		Name:         params.Name,
@@ -181,7 +189,7 @@ func (m *mockUserRepo) CreateOAuthUser(_ context.Context, params sqlc.CreateOAut
 	return u, nil
 }
 
-func (m *mockUserRepo) Update(_ context.Context, params sqlc.UpdateUserParams) (*sqlc.User, error) {
+func (m *mockUserRepo) Update(_ context.Context, params identitysqlc.UpdateUserParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -198,7 +206,7 @@ func (m *mockUserRepo) Update(_ context.Context, params sqlc.UpdateUserParams) (
 	return u, nil
 }
 
-func (m *mockUserRepo) UpdatePassword(_ context.Context, params sqlc.UpdateUserPasswordParams) (*sqlc.User, error) {
+func (m *mockUserRepo) UpdatePassword(_ context.Context, params identitysqlc.UpdateUserPasswordParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -209,7 +217,7 @@ func (m *mockUserRepo) UpdatePassword(_ context.Context, params sqlc.UpdateUserP
 	return u, nil
 }
 
-func (m *mockUserRepo) RevokeSessions(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) RevokeSessions(_ context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -218,7 +226,7 @@ func (m *mockUserRepo) RevokeSessions(_ context.Context, id int64) (*sqlc.User, 
 	return u, nil
 }
 
-func (m *mockUserRepo) UpdateRole(_ context.Context, params sqlc.UpdateUserRoleParams) (*sqlc.User, error) {
+func (m *mockUserRepo) UpdateRole(_ context.Context, params identitysqlc.UpdateUserRoleParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -228,7 +236,7 @@ func (m *mockUserRepo) UpdateRole(_ context.Context, params sqlc.UpdateUserRoleP
 	return u, nil
 }
 
-func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64, addr string) (*sqlc.User, error) {
+func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64, addr string) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || !strings.EqualFold(u.Email, addr) {
 		return nil, apperror.ErrNotFound
@@ -237,7 +245,7 @@ func (m *mockUserRepo) VerifyEmail(_ context.Context, id int64, addr string) (*s
 	return u, nil
 }
 
-func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params sqlc.LinkGoogleAccountParams) (*sqlc.User, error) {
+func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params identitysqlc.LinkGoogleAccountParams) (*identitysqlc.User, error) {
 	u, ok := m.users[params.ID]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -247,7 +255,7 @@ func (m *mockUserRepo) LinkGoogleAccount(_ context.Context, params sqlc.LinkGoog
 	return u, nil
 }
 
-func (m *mockUserRepo) Delete(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) Delete(_ context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -258,7 +266,7 @@ func (m *mockUserRepo) Delete(_ context.Context, id int64) (*sqlc.User, error) {
 	return u, nil
 }
 
-func (m *mockUserRepo) Ban(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) Ban(_ context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -271,7 +279,7 @@ func (m *mockUserRepo) Ban(_ context.Context, id int64) (*sqlc.User, error) {
 	return u, nil
 }
 
-func (m *mockUserRepo) Restore(_ context.Context, id int64) (*sqlc.User, error) {
+func (m *mockUserRepo) Restore(_ context.Context, id int64) (*identitysqlc.User, error) {
 	u, ok := m.users[id]
 	if !ok || !u.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -283,7 +291,7 @@ func (m *mockUserRepo) Restore(_ context.Context, id int64) (*sqlc.User, error) 
 	return u, nil
 }
 
-func (m *mockUserRepo) AdminList(ctx context.Context, limit, offset int32) ([]sqlc.User, error) {
+func (m *mockUserRepo) AdminList(ctx context.Context, limit, offset int32) ([]identitysqlc.User, error) {
 	return m.List(ctx, limit, offset)
 }
 
@@ -301,7 +309,7 @@ func (m *mockUserRepo) CountActiveAdmins(_ context.Context) (int64, error) {
 	return count, nil
 }
 
-func (m *mockUserRepo) AdminUserStats(_ context.Context) (sqlc.AdminUserStatsRow, error) {
+func (m *mockUserRepo) AdminUserStats(_ context.Context) (identitysqlc.AdminUserStatsRow, error) {
 	var active, deleted int64
 	for _, u := range m.users {
 		if u.DeletedAt.Valid {
@@ -310,7 +318,7 @@ func (m *mockUserRepo) AdminUserStats(_ context.Context) (sqlc.AdminUserStatsRow
 			active++
 		}
 	}
-	return sqlc.AdminUserStatsRow{ActiveUsers: active, DeletedUsers: deleted}, nil
+	return identitysqlc.AdminUserStatsRow{ActiveUsers: active, DeletedUsers: deleted}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -318,16 +326,16 @@ func (m *mockUserRepo) AdminUserStats(_ context.Context) (sqlc.AdminUserStatsRow
 // ---------------------------------------------------------------------------
 
 type mockRefreshTokenRepo struct {
-	tokens         map[string]*sqlc.RefreshToken
+	tokens         map[string]*identitysqlc.RefreshToken
 	deletedUserIDs []int64
 }
 
 func newMockRefreshTokenRepo() *mockRefreshTokenRepo {
-	return &mockRefreshTokenRepo{tokens: make(map[string]*sqlc.RefreshToken)}
+	return &mockRefreshTokenRepo{tokens: make(map[string]*identitysqlc.RefreshToken)}
 }
 
-func (m *mockRefreshTokenRepo) Create(_ context.Context, params sqlc.CreateRefreshTokenParams) (*sqlc.RefreshToken, error) {
-	rt := &sqlc.RefreshToken{
+func (m *mockRefreshTokenRepo) Create(_ context.Context, params identitysqlc.CreateRefreshTokenParams) (*identitysqlc.RefreshToken, error) {
+	rt := &identitysqlc.RefreshToken{
 		UserID:       params.UserID,
 		Token:        params.Token,
 		ExpiresAt:    params.ExpiresAt,
@@ -337,7 +345,7 @@ func (m *mockRefreshTokenRepo) Create(_ context.Context, params sqlc.CreateRefre
 	return rt, nil
 }
 
-func (m *mockRefreshTokenRepo) GetByToken(_ context.Context, token string) (*sqlc.RefreshToken, error) {
+func (m *mockRefreshTokenRepo) GetByToken(_ context.Context, token string) (*identitysqlc.RefreshToken, error) {
 	rt, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -345,7 +353,7 @@ func (m *mockRefreshTokenRepo) GetByToken(_ context.Context, token string) (*sql
 	return rt, nil
 }
 
-func (m *mockRefreshTokenRepo) Consume(_ context.Context, token string) (*sqlc.RefreshToken, error) {
+func (m *mockRefreshTokenRepo) Consume(_ context.Context, token string) (*identitysqlc.RefreshToken, error) {
 	rt, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -374,16 +382,16 @@ func (m *mockRefreshTokenRepo) DeleteByUserID(_ context.Context, userID int64) e
 // ---------------------------------------------------------------------------
 
 type mockEmailVerificationRepo struct {
-	tokens map[string]*sqlc.EmailVerificationToken
+	tokens map[string]*identitysqlc.EmailVerificationToken
 	nextID int64
 }
 
 func newMockEmailVerificationRepo() *mockEmailVerificationRepo {
-	return &mockEmailVerificationRepo{tokens: make(map[string]*sqlc.EmailVerificationToken), nextID: 1}
+	return &mockEmailVerificationRepo{tokens: make(map[string]*identitysqlc.EmailVerificationToken), nextID: 1}
 }
 
-func (m *mockEmailVerificationRepo) Create(_ context.Context, params sqlc.CreateEmailVerificationTokenParams) (*sqlc.EmailVerificationToken, error) {
-	t := &sqlc.EmailVerificationToken{
+func (m *mockEmailVerificationRepo) Create(_ context.Context, params identitysqlc.CreateEmailVerificationTokenParams) (*identitysqlc.EmailVerificationToken, error) {
+	t := &identitysqlc.EmailVerificationToken{
 		ID:        m.nextID,
 		UserID:    params.UserID,
 		Email:     params.Email,
@@ -396,7 +404,7 @@ func (m *mockEmailVerificationRepo) Create(_ context.Context, params sqlc.Create
 	return t, nil
 }
 
-func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) (*sqlc.EmailVerificationToken, error) {
+func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
 	t, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -404,7 +412,7 @@ func (m *mockEmailVerificationRepo) GetByToken(_ context.Context, token string) 
 	return t, nil
 }
 
-func (m *mockEmailVerificationRepo) Consume(_ context.Context, token string) (*sqlc.EmailVerificationToken, error) {
+func (m *mockEmailVerificationRepo) Consume(_ context.Context, token string) (*identitysqlc.EmailVerificationToken, error) {
 	t, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -432,16 +440,16 @@ func (m *mockEmailVerificationRepo) DeleteByUserID(_ context.Context, userID int
 // ---------------------------------------------------------------------------
 
 type mockPasswordResetRepo struct {
-	tokens map[string]*sqlc.PasswordResetToken
+	tokens map[string]*identitysqlc.PasswordResetToken
 	nextID int64
 }
 
 func newMockPasswordResetRepo() *mockPasswordResetRepo {
-	return &mockPasswordResetRepo{tokens: make(map[string]*sqlc.PasswordResetToken), nextID: 1}
+	return &mockPasswordResetRepo{tokens: make(map[string]*identitysqlc.PasswordResetToken), nextID: 1}
 }
 
-func (m *mockPasswordResetRepo) Create(_ context.Context, params sqlc.CreatePasswordResetTokenParams) (*sqlc.PasswordResetToken, error) {
-	t := &sqlc.PasswordResetToken{
+func (m *mockPasswordResetRepo) Create(_ context.Context, params identitysqlc.CreatePasswordResetTokenParams) (*identitysqlc.PasswordResetToken, error) {
+	t := &identitysqlc.PasswordResetToken{
 		ID:        m.nextID,
 		UserID:    params.UserID,
 		Token:     params.Token,
@@ -453,7 +461,7 @@ func (m *mockPasswordResetRepo) Create(_ context.Context, params sqlc.CreatePass
 	return t, nil
 }
 
-func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*sqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
 	t, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -461,11 +469,11 @@ func (m *mockPasswordResetRepo) GetByToken(_ context.Context, token string) (*sq
 	return t, nil
 }
 
-func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token string) (*sqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) GetByTokenForUpdate(ctx context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
 	return m.GetByToken(ctx, token)
 }
 
-func (m *mockPasswordResetRepo) Consume(_ context.Context, token string) (*sqlc.PasswordResetToken, error) {
+func (m *mockPasswordResetRepo) Consume(_ context.Context, token string) (*identitysqlc.PasswordResetToken, error) {
 	t, ok := m.tokens[token]
 	if !ok {
 		return nil, apperror.ErrNotFound

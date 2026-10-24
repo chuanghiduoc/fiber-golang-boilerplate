@@ -8,12 +8,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 )
 
 func seedAdminUsers(repo *mockUserRepo, n int) {
 	for i := 0; i < n; i++ {
-		repo.users[repo.nextID] = &sqlc.User{
+		repo.users[repo.nextID] = &identitysqlc.User{
 			ID:        repo.nextID,
 			Email:     "user@example.com",
 			Name:      "User",
@@ -113,7 +113,7 @@ func TestAdminBanUser(t *testing.T) {
 		seedAdminUsers(ur, 1)
 
 		// Create a refresh token for the user.
-		rtr.tokens["hash1"] = &sqlc.RefreshToken{UserID: 1, Token: "hash1"}
+		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash1"}
 
 		err := svc.BanUser(context.Background(), 1)
 		if err != nil {
@@ -146,7 +146,7 @@ func TestAdminUnbanUser(t *testing.T) {
 		svc, ur, rtr := newAdminUserServiceForTest()
 		seedAdminUsers(ur, 1)
 		ur.users[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
-		rtr.tokens["hash1"] = &sqlc.RefreshToken{UserID: 1, Token: "hash1"}
+		rtr.tokens["hash1"] = &identitysqlc.RefreshToken{UserID: 1, Token: "hash1"}
 
 		user, err := svc.UnbanUser(context.Background(), 1)
 		if err != nil {
@@ -184,7 +184,7 @@ func TestAdminUnbanUser(t *testing.T) {
 
 func TestAdmin_CannotRemoveLastAdmin(t *testing.T) {
 	svc, repo, _ := newAdminUserServiceForTest()
-	repo.users[1] = &sqlc.User{
+	repo.users[1] = &identitysqlc.User{
 		ID: 1, Email: "admin@example.com", Name: "Admin", Role: dto.RoleAdmin,
 		CreatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		UpdatedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},

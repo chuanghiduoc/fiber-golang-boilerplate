@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -190,7 +190,7 @@ func (s *emailVerificationService) persistVerification(
 
 	// Create with 24 hour expiry. Store only the hash; the plaintext token
 	// is delivered to the user via email so a DB leak cannot be replayed.
-	_, err := verifRepo.Create(ctx, sqlc.CreateEmailVerificationTokenParams{
+	_, err := verifRepo.Create(ctx, identitysqlc.CreateEmailVerificationTokenParams{
 		UserID:    userID,
 		Email:     userEmail,
 		Token:     tokenHash,

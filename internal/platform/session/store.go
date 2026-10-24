@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
@@ -34,9 +33,10 @@ type snapshot struct {
 }
 
 // userStore is the narrow read contract the session validator needs. Keeping
-// it local prevents platform code from depending on a business module.
+// it local prevents platform code from depending on a business module or its
+// generated SQL types.
 type userStore interface {
-	GetByID(ctx context.Context, id int64) (*sqlc.User, error)
+	GetSessionState(ctx context.Context, id int64) (role string, tokenVersion int32, err error)
 }
 
 type store struct {
@@ -90,7 +90,7 @@ func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVe
 		}
 	}
 
-	user, err := s.users.GetByID(ctx, userID)
+	currentRole, currentTokenVersion, err := s.users.GetSessionState(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewUnauthorized("account is not active")
@@ -98,7 +98,7 @@ func (s *store) Validate(ctx context.Context, userID int64, role string, tokenVe
 		return apperror.NewInternal("failed to validate session")
 	}
 
-	snap := snapshot{Role: user.Role, TokenVersion: user.TokenVersion}
+	snap := snapshot{Role: currentRole, TokenVersion: currentTokenVersion}
 	if s.cache != nil {
 		if data, err := json.Marshal(snap); err == nil {
 			if err := s.cache.Set(ctx, key, data, cacheTTL); err != nil {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -89,11 +89,11 @@ type failingFileRepo struct {
 	failCreate bool
 }
 
-func (r *failingFileRepo) Create(_ context.Context, _ sqlc.CreateFileParams) (*sqlc.File, error) {
+func (r *failingFileRepo) Create(_ context.Context, _ filesqlc.CreateFileParams) (*filesqlc.File, error) {
 	if r.failCreate {
 		return nil, fmt.Errorf("db error")
 	}
-	return r.mockFileRepo.Create(context.Background(), sqlc.CreateFileParams{})
+	return r.mockFileRepo.Create(context.Background(), filesqlc.CreateFileParams{})
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +106,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -143,7 +143,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -172,7 +172,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -207,7 +207,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -236,7 +236,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -278,7 +278,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -302,7 +302,7 @@ func TestUploadDownload(t *testing.T) {
 		store.getErr = fmt.Errorf("storage unavailable")
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{
+		repo.files[1] = &filesqlc.File{
 			ID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -324,9 +324,9 @@ func TestUploadList(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &sqlc.File{ID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
-		repo.files[2] = &sqlc.File{ID: 2, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
-		repo.files[3] = &sqlc.File{ID: 3, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
+		repo.files[1] = &filesqlc.File{ID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
+		repo.files[2] = &filesqlc.File{ID: 2, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
+		repo.files[3] = &filesqlc.File{ID: 3, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
 		files, hasMore, err := svc.List(context.Background(), 10, 10, "", false)

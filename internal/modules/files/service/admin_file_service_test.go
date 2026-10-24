@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
@@ -19,15 +19,15 @@ import (
 
 type fakeAdminFileRepo struct {
 	filesrepo.FileRepository // unused methods fail loudly if called
-	files                    map[int64]*sqlc.File
+	files                    map[int64]*filesqlc.File
 	nextID                   int64
 }
 
 func newFakeAdminFileRepo() *fakeAdminFileRepo {
-	return &fakeAdminFileRepo{files: make(map[int64]*sqlc.File), nextID: 1}
+	return &fakeAdminFileRepo{files: make(map[int64]*filesqlc.File), nextID: 1}
 }
 
-func (m *fakeAdminFileRepo) GetByID(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *fakeAdminFileRepo) GetByID(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok || f.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -35,7 +35,7 @@ func (m *fakeAdminFileRepo) GetByID(_ context.Context, id int64) (*sqlc.File, er
 	return f, nil
 }
 
-func (m *fakeAdminFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *fakeAdminFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -43,8 +43,8 @@ func (m *fakeAdminFileRepo) GetByIDIncludingDeleted(_ context.Context, id int64)
 	return f, nil
 }
 
-func (m *fakeAdminFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]sqlc.File, error) {
-	all := make([]sqlc.File, 0, len(m.files))
+func (m *fakeAdminFileRepo) AdminListCursor(_ context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
+	all := make([]filesqlc.File, 0, len(m.files))
 	for _, f := range m.files {
 		all = append(all, *f)
 	}
@@ -54,7 +54,7 @@ func (m *fakeAdminFileRepo) AdminListCursor(_ context.Context, cur pagination.DB
 	return all, nil
 }
 
-func (m *fakeAdminFileRepo) Delete(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *fakeAdminFileRepo) Delete(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok || f.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -63,7 +63,7 @@ func (m *fakeAdminFileRepo) Delete(_ context.Context, id int64) (*sqlc.File, err
 	return f, nil
 }
 
-func (m *fakeAdminFileRepo) Restore(_ context.Context, id int64) (*sqlc.File, error) {
+func (m *fakeAdminFileRepo) Restore(_ context.Context, id int64) (*filesqlc.File, error) {
 	f, ok := m.files[id]
 	if !ok || !f.DeletedAt.Valid {
 		return nil, apperror.ErrNotFound
@@ -72,8 +72,8 @@ func (m *fakeAdminFileRepo) Restore(_ context.Context, id int64) (*sqlc.File, er
 	return f, nil
 }
 
-func (m *fakeAdminFileRepo) AdminFileStats(_ context.Context) (sqlc.AdminFileStatsRow, error) {
-	var stats sqlc.AdminFileStatsRow
+func (m *fakeAdminFileRepo) AdminFileStats(_ context.Context) (filesqlc.AdminFileStatsRow, error) {
+	var stats filesqlc.AdminFileStatsRow
 	for _, f := range m.files {
 		if f.DeletedAt.Valid {
 			continue
@@ -107,7 +107,7 @@ func (s *fakeAdminStorage) Get(_ context.Context, path string) (io.ReadCloser, e
 
 func seedAdminFiles(repo *fakeAdminFileRepo, n int) {
 	for i := 0; i < n; i++ {
-		repo.files[repo.nextID] = &sqlc.File{
+		repo.files[repo.nextID] = &filesqlc.File{
 			ID:           repo.nextID,
 			UserID:       1,
 			OriginalName: "file.txt",

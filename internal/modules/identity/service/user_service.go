@@ -15,8 +15,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -112,7 +112,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 
-	var user *sqlc.User
+	var user *identitysqlc.User
 	if s.verificationProvisioner != nil &&
 		s.txManager != nil &&
 		s.verificationProvisioner.SupportsTransactionalEnqueue() {
@@ -160,8 +160,8 @@ func (s *userService) createUser(
 	repo repository.UserRepository,
 	email, name string,
 	hash []byte,
-) (*sqlc.User, error) {
-	user, err := repo.Create(ctx, sqlc.CreateUserParams{
+) (*identitysqlc.User, error) {
+	user, err := repo.Create(ctx, identitysqlc.CreateUserParams{
 		Email:        email,
 		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 		Name:         name,
@@ -266,10 +266,10 @@ func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email,
 	return ToUserResponse(user), nil
 }
 
-func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
+func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*identitysqlc.User, error) {
 	email = normalizeEmail(email)
 
-	findOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
+	findOrCreate := func(repo repository.UserRepository) (*identitysqlc.User, error) {
 		user, err := repo.GetByGoogleID(ctx, googleID)
 		if err == nil {
 			return user, nil
@@ -286,7 +286,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			if !existing.EmailVerifiedAt.Valid {
 				return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
 			}
-			linked, linkErr := repo.LinkGoogleAccount(ctx, sqlc.LinkGoogleAccountParams{
+			linked, linkErr := repo.LinkGoogleAccount(ctx, identitysqlc.LinkGoogleAccountParams{
 				GoogleID: pgtype.Text{String: googleID, Valid: true},
 				ID:       existing.ID,
 			})
@@ -305,7 +305,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 			return nil, err
 		}
 
-		newUser, err := repo.CreateOAuthUser(ctx, sqlc.CreateOAuthUserParams{
+		newUser, err := repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
 			Email:        email,
 			Name:         name,
 			GoogleID:     pgtype.Text{String: googleID, Valid: true},
@@ -318,7 +318,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 	}
 
 	if s.txManager != nil {
-		var result *sqlc.User
+		var result *identitysqlc.User
 		txErr := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			txUserRepo := repository.NewUserRepository(tx)
 			var err error
@@ -360,7 +360,7 @@ func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, em
 
 // retryOAuthLookup handles the concurrent-create race. It returns a user when
 // another request won, or nil to let the caller surface the original error.
-func (s *userService) retryOAuthLookup(ctx context.Context, googleID, email string, cause error) (*sqlc.User, error) {
+func (s *userService) retryOAuthLookup(ctx context.Context, googleID, email string, cause error) (*identitysqlc.User, error) {
 	if !database.IsUniqueViolation(cause) {
 		return nil, cause
 	}
@@ -443,8 +443,8 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 
 	emailChanged := normalizeEmail(existing.Email) != normalizeEmail(email)
 
-	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*sqlc.User, error) {
-		user, err := userRepo.Update(ctx, sqlc.UpdateUserParams{
+	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*identitysqlc.User, error) {
+		user, err := userRepo.Update(ctx, identitysqlc.UpdateUserParams{
 			ID:          id,
 			Name:        name,
 			Email:       email,
@@ -465,7 +465,7 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		return user, nil
 	}
 
-	var user *sqlc.User
+	var user *identitysqlc.User
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			var updateErr error
@@ -641,7 +641,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	}
 
 	doChange := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
-		if _, err := userRepo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
+		if _, err := userRepo.UpdatePassword(ctx, identitysqlc.UpdateUserPasswordParams{
 			PasswordHash: pgtype.Text{String: string(hash), Valid: true},
 			ID:           userID,
 		}); err != nil {
@@ -673,7 +673,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 	return nil
 }
 
-func ToUserResponse(user *sqlc.User) *dto.UserResponse {
+func ToUserResponse(user *identitysqlc.User) *dto.UserResponse {
 	resp := &dto.UserResponse{
 		ID:            user.ID,
 		Email:         user.Email,

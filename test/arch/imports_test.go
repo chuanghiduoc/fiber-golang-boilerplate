@@ -48,6 +48,48 @@ func TestModuleBoundaries(t *testing.T) {
 		checkNoBusinessImports(t, filepath.Join(root, dir))
 	}
 
+	t.Run("modules use only their own generated sqlc package", func(t *testing.T) {
+		// sqlc output is module-scoped. Importing another module's generated
+		// package would leak its persistence model across a boundary, even
+		// when the import would otherwise look like any module subpackage.
+		err := filepath.WalkDir(modulesDir, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".go") {
+				return nil
+			}
+			rel, err := filepath.Rel(modulesDir, path)
+			if err != nil {
+				return err
+			}
+			owner := strings.Split(rel, string(filepath.Separator))[0]
+			const prefix = "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/"
+			for _, imp := range parseImports(t, path) {
+				if !strings.HasPrefix(imp, prefix) {
+					continue
+				}
+				parts := strings.Split(strings.TrimPrefix(imp, prefix), "/")
+				if len(parts) == 2 && parts[1] == "sqlc" && parts[0] != owner {
+					t.Errorf("%s: module %q imports module %q generated sqlc package", rel, owner, parts[0])
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk modules: %v", err)
+		}
+	})
+
+	t.Run("shared sqlc package is removed", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(root, "internal", "sqlc")); !os.IsNotExist(err) {
+			t.Errorf("internal/sqlc must not exist; generated code is module-scoped")
+		}
+		for _, dir := range []string{"internal", "pkg", "cmd", "test"} {
+			checkForbiddenImports(t, filepath.Join(root, dir), []string{"internal/sqlc"})
+		}
+	})
+
 	t.Run("modules do not use deleted legacy packages", func(t *testing.T) {
 		// These packages no longer exist. The rule documents the target layout
 		// so a future module does not reintroduce a shared legacy layer.

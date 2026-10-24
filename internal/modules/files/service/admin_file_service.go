@@ -8,7 +8,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -63,7 +63,7 @@ func (s *adminFileService) ListFiles(ctx context.Context, limit int, startingAft
 	return responses, hasMore, nil
 }
 
-func (s *adminFileService) toAdminFileResponse(file *sqlc.File) *dto.FileResponse {
+func (s *adminFileService) toAdminFileResponse(file *filesqlc.File) *dto.FileResponse {
 	resp := &dto.FileResponse{
 		ID:           file.ID,
 		UserID:       file.UserID,

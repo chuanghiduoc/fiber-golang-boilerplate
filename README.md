@@ -47,9 +47,11 @@ cmd/seed/main.go                    Standalone admin seeder (schema must exist)
 internal/app/                       Composition root: Fiber, global middleware, module registry
 internal/modules/
   identity/                         Auth, users, sessions, tokens
-                                    (dto + repository + service + handler + admin seed)
+                                    (dto + repository + service + handler + adapter
+                                     + queries + generated sqlc + admin seed)
   files/                            Upload, download, soft delete, restore
-                                    (dto + repository + service + handler + adapter)
+                                    (dto + repository + service + handler + adapter
+                                     + queries + generated sqlc)
   admin/                            Back-office facade
                                     (dto + service + handler, contracts-only)
 internal/contracts/                 Narrow cross-module identity/files admin interfaces (stdlib only)
@@ -58,7 +60,6 @@ internal/platform/
   audit/                            Audit event recorder + mutating-request middleware
   jobs/                             Durable PostgreSQL jobs, worker, leases, retries, dead-letter
   session/                          Token-version/session validation
-internal/sqlc/                      Generated code (DO NOT EDIT — `make sqlc-generate`)
 internal/platform/middleware/      JWT, rate limit, logger, recovery, security headers, metrics, idempotency
 pkg/
   apperror/                         RFC 9457 errors + typed error catalog
@@ -66,7 +67,6 @@ pkg/
   database/                         Pool, TxManager, migration runner
   validator/ token/ cache/ storage/ email/ pagination/ logger/ health/ oauth/ metrics/ async/
 migrations/000001_init_schema.*     Single consolidated init schema (up/down)
-queries/                            sqlc query files
 docs/                               Swagger + architecture/API/module/ops docs
 deploy/k8s/                         Kubernetes production manifests (see deploy/k8s/README.md)
 ```
@@ -411,8 +411,9 @@ checklist.
    `authz.Require(...)`. The legacy exceptions are documented in the
    [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
    do not copy them.
-4. Write queries in a module-scoped `queries/<name>.sql` file and run
-   `make sqlc-generate`.
+4. Write queries in the module-scoped
+   `internal/modules/<name>/queries/<name>.sql` file, add a sqlc block in
+   `sqlc.yaml` for the module, and run `make sqlc-generate`.
 5. For a deployed database, add a numbered migration. For this boilerplate's
    fresh installs, update the single `000001_init_schema` file.
 6. Register the module once in `cmd/api/main.go`.
@@ -423,8 +424,9 @@ checklist.
 > `identity`, `files`, and `admin` own all of their DTOs, repositories,
 > services, and handlers under `internal/modules/<name>`. `admin` reaches
 > identity/files only through the stdlib-only `internal/contracts` interfaces
-> implemented by the owner modules' adapters. `internal/sqlc` is the only
-> shared generated package; there are no legacy handler/service/DTO packages.
+> implemented by the owner modules' adapters. Generated sqlc code is
+> module-scoped under `internal/modules/<name>/sqlc`; there is no shared
+> generated package, and no module imports another module's sqlc types.
 
 ## Environment Variables
 
@@ -471,14 +473,14 @@ migration entrypoint exist. Remaining work:
 
 - Tenant isolation: tenant-scoped data, query enforcement/row-level security,
   and per-tenant limits.
-- Per-module sqlc generation: `internal/sqlc` is still one shared package.
 - Distributed tracing, plus environment promotion/rollout automation: metrics,
   Kubernetes manifests (`deploy/k8s`), and the GHCR release workflow exist, but
   tracing and a full CD platform do not.
 
-All bounded-context internals are module-owned under `internal/modules`; the
-only shared generated package is `internal/sqlc`, and `admin` composes through
-`internal/contracts`. No legacy handler/service/DTO/repository packages remain.
+All bounded-context internals are module-owned under `internal/modules`;
+identity and files own their `queries/` and generated `sqlc/` packages, and
+`admin` composes through `internal/contracts`. No shared generated package and
+no legacy handler/service/DTO/repository packages remain.
 
 ## Security notes
 

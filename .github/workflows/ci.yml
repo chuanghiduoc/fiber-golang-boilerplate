@@ -54,8 +54,8 @@ jobs:
       - name: Check sqlc generated code is up to date
         run: |
           sqlc generate
-          git add -N internal/sqlc/
-          git diff --exit-code internal/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
+          git add -N internal/modules/identity/sqlc/ internal/modules/files/sqlc/
+          git diff --exit-code internal/modules/identity/sqlc/ internal/modules/files/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
 
   build:
     name: Build

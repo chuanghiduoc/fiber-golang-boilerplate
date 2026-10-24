@@ -347,7 +347,8 @@ and fill in this file before shipping.
 
 1. Add permissions to `internal/platform/authz/permissions.go`.
 2. Add the table/index migration (baseline only for an undeployed upstream,
-   otherwise the next numbered migration) and `queries/__MODULE__.sql`.
+   otherwise the next numbered migration) and
+   `internal/modules/__MODULE__/queries/__MODULE__.sql`.
 3. Implement repository -> service -> handler and add routes in `module.go`.
 4. Wire dependencies and register `__MODULE__.New(...)` in `cmd/api/main.go`.
 5. Add tests and run `go fmt ./internal/modules/__MODULE__/...`, `make arch`, `make check`,

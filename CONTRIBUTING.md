@@ -129,7 +129,8 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
    `authz.Require(...)`. The legacy exceptions are documented in the
    [module template](docs/module-template.md#legacy-exceptions-do-not-copy);
    do not copy them.
-3. Add queries in `queries/<name>.sql` and run `make sqlc-generate`.
+3. Add queries in `internal/modules/<name>/queries/<name>.sql`, add the module
+   block to `sqlc.yaml`, and run `make sqlc-generate`.
 4. For a deployed DB, add a numbered migration; for this boilerplate's fresh
    installs, update the single init schema.
 5. Register the module once in `cmd/api/main.go`.
@@ -141,8 +142,9 @@ the resulting module is covered by [`docs/operations.md`](docs/operations.md).
 > `identity`, `files`, and `admin` own all of their DTOs, repositories,
 > services, and handlers under `internal/modules/<name>`. `admin` consumes
 > identity/files only through `internal/contracts`; it does not import their
-> internals. `internal/sqlc` is the only shared generated package, and no
-> legacy handler/service/DTO/repository packages remain.
+> internals. Each module owns its generated `sqlc/` package; never import
+> another module's sqlc types, and no legacy handler/service/DTO/repository
+> packages remain.
 
 ## Code Style
 

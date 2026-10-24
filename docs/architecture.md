@@ -13,8 +13,10 @@ cmd/seed       standalone admin seeder (schema must already exist)
 
 internal/app   composition root: Fiber, middleware, infra routes, module registry
 internal/modules
-  identity     auth, users, sessions, tokens, admin seed (dto/repository/service/handler + adapter)
-  files        upload, metadata, download, soft delete, restore (dto/repository/service/handler + adapter)
+  identity     auth, users, sessions, tokens, admin seed
+               (dto/repository/service/handler + adapter + queries + generated sqlc)
+  files        upload, metadata, download, soft delete, restore
+               (dto/repository/service/handler + adapter + queries + generated sqlc)
   admin        back-office facade (dto/service/handler, contracts-only)
 internal/contracts  narrow cross-module identity/files admin interfaces (stdlib only)
 internal/platform
@@ -23,7 +25,6 @@ internal/platform
   jobs         durable PostgreSQL queue, worker, leases, retention
   session      token-version/session cache
 internal/platform/middleware   HTTP middleware (JWT, rate limit, logger, idempotency, ...)
-internal/sqlc  shared generated SQL (the only shared generated package)
 pkg            reusable infrastructure (errors, response, database, cache, ...)
 ```
 
@@ -47,8 +48,8 @@ client
 - One module owns each table. Cross-module reads go through a read model or
   contract, never another module's repository.
 - Module DTOs, repositories, services, and handlers stay inside the owning
-  module. `internal/sqlc` is the only shared generated package; per-module sqlc
-  generation remains future work.
+  module. Each module owns its `queries/` and generated `sqlc/` package; a
+  module must never import another module's generated SQL types.
 - Modules must not import the deleted shared legacy handler/service/DTO/
   repository packages; the architecture test enforces this so the layer cannot
   return.
@@ -101,8 +102,10 @@ module, its repository, generated SQL, storage, database transactions, or
 session store. Identity and files each own their half of the dashboard stats
 (`AdminUserStats` / `AdminFileStats`), so no cross-module SQL remains.
 
-`internal/sqlc` is the only shared generated package. New code should start in
-`internal/modules/<name>/` and use contracts for cross-module reads.
+`identity` and `files` own module-scoped `queries/` and generated `sqlc/`
+packages; `sqlc.yaml` has one block per module. There is no shared generated
+package, and no module imports another module's sqlc types. New code should
+start in `internal/modules/<name>/` and use contracts for cross-module reads.
 
 ## Extension checklist
 
@@ -110,8 +113,9 @@ Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the canonical
 [Module Template](module-template.md) for the full layout, skeleton, and
 ownership rules. Short form:
 
-1. Create the module, tables, and queries; update the baseline for fresh
-   installs (or add a numbered migration for deployed DBs).
+1. Create the module, its `queries/` directory and sqlc block, plus tables;
+   update the baseline for fresh installs (or add a numbered migration for
+   deployed DBs).
 2. Add permissions and audit actions.
 3. Add handler/service/repository/DTO in the module directory.
 4. Register routes and the module in `cmd/api/main.go`.
