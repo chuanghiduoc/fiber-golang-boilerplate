@@ -43,7 +43,7 @@ func setupIntegrationApp(t *testing.T) *fiber.App {
 
 	userRepo := identityrepo.NewUserRepository(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, nil, sessionStore)
 	userHandler := NewUserHandler(userSvc)
 
 	app := fiber.New(fiber.Config{

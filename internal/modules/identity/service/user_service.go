@@ -16,6 +16,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -65,6 +66,7 @@ type userService struct {
 	requireEmailVerification bool
 	cache                    cache.Cache
 	txManager                *database.TxManager
+	audit                    audit.TxRecorder
 	sessions                 session.Store
 	verificationProvisioner  VerificationProvisioner
 }
@@ -75,6 +77,7 @@ func NewUserService(
 	requireEmailVerification bool,
 	appCache cache.Cache,
 	txManager *database.TxManager,
+	auditRecorder audit.TxRecorder,
 	sessions ...session.Store,
 ) UserService {
 	var sessionStore session.Store
@@ -87,6 +90,7 @@ func NewUserService(
 		requireEmailVerification: requireEmailVerification,
 		cache:                    appCache,
 		txManager:                txManager,
+		audit:                    auditRecorder,
 		sessions:                 sessionStore,
 	}
 }
@@ -114,26 +118,36 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	var user *identitysqlc.User
-	if s.verificationProvisioner != nil &&
-		s.txManager != nil &&
-		s.verificationProvisioner.SupportsTransactionalEnqueue() {
-		// Create the user, verification token, and email job in one transaction.
-		// A provisioning failure rolls the user back: registration fails closed
-		// rather than committing an account that cannot receive its link.
+	if s.txManager != nil {
+		// Create the user, optional verification provisioning, and the audit
+		// row in one transaction. Any failure rolls the account back: a
+		// successful registration must never exist without its audit record.
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			created, createErr := s.createUser(ctx, repository.NewUserRepository(tx), email, name, hash)
 			if createErr != nil {
 				return createErr
 			}
-			if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
-				slog.Error("failed to provision registration verification email",
-					slog.Int64("user_id", created.ID),
-					slog.String("email", created.Email),
-					slog.Any("error", provErr),
-				)
-				// Provisioning details (including context deadlines) are for the
-				// logs only. Keep the public registration contract at 500.
-				return apperror.NewInternal("failed to create user")
+			if s.verificationProvisioner != nil && s.verificationProvisioner.SupportsTransactionalEnqueue() {
+				if provErr := s.verificationProvisioner.SendVerificationTx(ctx, tx, created.ID, created.Email); provErr != nil {
+					slog.Error("failed to provision registration verification email",
+						slog.Int64("user_id", created.ID),
+						slog.String("email", created.Email),
+						slog.Any("error", provErr),
+					)
+					// Provisioning details (including context deadlines) are for
+					// the logs only. Keep the public registration contract at 500.
+					return apperror.NewInternal("failed to create user")
+				}
+			}
+			event := audit.NewServiceEvent(ctx, "auth.registered", "user")
+			event.ResourceID = strconv.FormatInt(created.ID, 10)
+			event.ActorID = created.ID
+			event.ActorType = audit.ActorTypeUser
+			event.Metadata = map[string]any{
+				"email_verification_required": s.requireEmailVerification,
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, event); auditErr != nil {
+				return auditWriteError(auditErr)
 			}
 			user = created
 			return nil
@@ -145,6 +159,16 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		user, err = s.createUser(ctx, s.repo, email, name, hash)
 		if err != nil {
 			return nil, err
+		}
+		event := audit.NewServiceEvent(ctx, "auth.registered", "user")
+		event.ResourceID = strconv.FormatInt(user.ID, 10)
+		event.ActorID = user.ID
+		event.ActorType = audit.ActorTypeUser
+		event.Metadata = map[string]any{
+			"email_verification_required": s.requireEmailVerification,
+		}
+		if auditErr := audit.RecordInTx(ctx, s.audit, nil, event); auditErr != nil {
+			return nil, auditWriteError(auditErr)
 		}
 	}
 
@@ -445,6 +469,7 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 	}
 
 	emailChanged := normalizeEmail(existing.Email) != normalizeEmail(email)
+	nameChanged := req.Name != nil && strings.TrimSpace(*req.Name) != existing.Name
 
 	doUpdate := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) (*identitysqlc.User, error) {
 		user, err := userRepo.Update(ctx, identitysqlc.UpdateUserParams{
@@ -468,15 +493,36 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		return user, nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.profile_updated", "user")
+		event.ResourceID = strconv.FormatInt(id, 10)
+		event.Metadata = map[string]any{
+			"email_changed": emailChanged,
+			"name_changed":  nameChanged,
+		}
+		return event
+	}
+
 	var user *identitysqlc.User
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			var updateErr error
 			user, updateErr = doUpdate(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
-			return updateErr
+			if updateErr != nil {
+				return updateErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		user, err = doUpdate(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return nil, auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -568,12 +614,29 @@ func (s *userService) Delete(ctx context.Context, id int64) error {
 		return nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.deleted", "user")
+		event.ResourceID = strconv.FormatInt(id, 10)
+		return event
+	}
+
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			if deleteErr := doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); deleteErr != nil {
+				return deleteErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		err = doDelete(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return err
@@ -657,12 +720,29 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.
 		return nil
 	}
 
+	auditEvent := func() audit.Event {
+		event := audit.NewServiceEvent(ctx, "user.password_changed", "user")
+		event.ResourceID = strconv.FormatInt(userID, 10)
+		return event
+	}
+
 	if s.txManager != nil {
 		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			return doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+			if changeErr := doChange(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx)); changeErr != nil {
+				return changeErr
+			}
+			if auditErr := audit.RecordInTx(ctx, s.audit, tx, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+			return nil
 		})
 	} else {
 		err = doChange(s.repo, s.refreshTokenRepo)
+		if err == nil {
+			if auditErr := audit.RecordInTx(ctx, s.audit, nil, auditEvent()); auditErr != nil {
+				return auditWriteError(auditErr)
+			}
+		}
 	}
 	if err != nil {
 		return err

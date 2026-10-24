@@ -85,7 +85,15 @@ func TestPostgresRecorderRejectsInvalidEventBeforeTouchingPool(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidEvent)
 }
 
-func TestPostgresRecorderRejectsUnmarshalableMetadataBeforeTouchingPool(t *testing.T) {
+func TestPostgresRecorderSanitizesUnsupportedMetadataBeforeTouchingPool(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := MarshalMetadata(map[string]any{"bad": make(chan int)})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"bad":"[unsupported]"}`, string(encoded))
+}
+
+func TestPostgresRecorderRejectsStartedOutcomeBeforeTouchingPool(t *testing.T) {
 	t.Parallel()
 
 	recorder := NewPostgresRecorder(nil)
@@ -93,10 +101,25 @@ func TestPostgresRecorderRejectsUnmarshalableMetadataBeforeTouchingPool(t *testi
 	err := recorder.Record(context.Background(), Event{
 		Action:   "user.login",
 		Resource: "user",
-		Metadata: map[string]any{"bad": make(chan int)},
+		Outcome:  OutcomeStarted,
 	})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "marshal metadata")
+	assert.ErrorIs(t, err, ErrInvalidEvent)
+}
+
+func TestPostgresRecorderRejectsStartedOutcomeInTx(t *testing.T) {
+	t.Parallel()
+
+	recorder := NewPostgresRecorder(nil)
+
+	err := recorder.RecordTx(context.Background(), nil, Event{
+		Action:   "user.login",
+		Resource: "user",
+		Outcome:  OutcomeStarted,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrTxRequired)
+
 }
 
 func TestMarshalMetadata(t *testing.T) {
@@ -118,7 +141,7 @@ func TestMarshalMetadata(t *testing.T) {
 		assert.JSONEq(t, `{}`, string(encoded))
 	})
 
-	t.Run("values are preserved", func(t *testing.T) {
+	t.Run("safe values are preserved and PII is redacted", func(t *testing.T) {
 		t.Parallel()
 
 		encoded, err := MarshalMetadata(map[string]any{
@@ -126,15 +149,19 @@ func TestMarshalMetadata(t *testing.T) {
 			"admin":  true,
 			"count":  float64(3),
 			"labels": []string{"a", "b"},
+			"note":   "contact admin@example.com",
+			"url":    "https://example.com/path",
 		})
 		require.NoError(t, err)
 
 		var decoded map[string]any
 		require.NoError(t, json.Unmarshal(encoded, &decoded))
-		assert.Equal(t, "user@example.com", decoded["email"])
+		assert.Equal(t, "[redacted]", decoded["email"])
 		assert.Equal(t, true, decoded["admin"])
 		assert.Equal(t, float64(3), decoded["count"])
 		assert.Equal(t, []any{"a", "b"}, decoded["labels"])
+		assert.Equal(t, "[redacted]", decoded["note"], "email-shaped values are redacted regardless of key")
+		assert.Equal(t, "[redacted]", decoded["url"], "URL-shaped values are redacted regardless of key")
 	})
 }
 

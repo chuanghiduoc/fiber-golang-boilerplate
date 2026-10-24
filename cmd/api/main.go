@@ -143,8 +143,10 @@ func main() {
 		slog.Info("Google OAuth enabled")
 	}
 
-	// Transaction manager
+	// Transaction manager and the process-wide audit recorder. Tier 1 services
+	// write through the transaction; Tier 2 routes use it for intent rows.
 	txManager := database.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(pool)
 
 	// Dependency injection
 	userRepo := identityrepository.NewUserRepository(pool)
@@ -172,7 +174,7 @@ func main() {
 	cancelStartup()
 
 	refreshTokenRepo := identityrepository.NewRefreshTokenRepository(pool)
-	userSvc := identityservice.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager, sessionStore)
+	userSvc := identityservice.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification, appCache, txManager, auditRecorder, sessionStore)
 
 	refreshSvc := identityservice.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
@@ -209,8 +211,8 @@ func main() {
 
 	// Admin composes narrow identity/files contracts; it never imports those
 	// modules' repositories, SQL, storage, or session internals.
-	identityAdminSvc := identityservice.NewAdminUserService(userRepo, refreshTokenRepo, txManager, sessionStore)
-	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, store)
+	identityAdminSvc := identityservice.NewAdminUserService(userRepo, refreshTokenRepo, txManager, auditRecorder, sessionStore)
+	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, txManager, auditRecorder, store)
 	adminSvc := adminservice.NewService(
 		identityadapter.NewAdminIdentity(identityAdminSvc),
 		filesadapter.NewAdminFiles(filesAdminSvc),
@@ -226,7 +228,7 @@ func main() {
 		Cache:          appCache,
 		Sessions:       sessionStore,
 		Health:         healthChecker,
-		Audit:          audit.NewPostgresRecorder(pool),
+		Audit:          auditRecorder,
 		TenantResolver: tenantResolver,
 	})
 	application.Register(

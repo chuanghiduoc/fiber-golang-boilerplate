@@ -5,6 +5,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -69,6 +70,14 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 		fiber.Locals[int64](c, "user_id", claims.UserID)
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
+
+		// Tier 1 services write their audit rows inside the mutation
+		// transaction; they need the actor and request metadata in the
+		// context passed to the service.
+		ctx := audit.WithActor(c.Context(), claims.UserID, claims.Role)
+		ctx = audit.WithRequestMeta(ctx,
+			fiber.Locals[string](c, "request_id"), c.IP(), c.Get("User-Agent"))
+		c.SetContext(ctx)
 
 		return c.Next()
 	}

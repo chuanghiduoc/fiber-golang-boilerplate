@@ -184,8 +184,14 @@ Offset helpers are for small admin/export tables only.
   instead of misreading them, so deploy the new worker to drain the queue.
   Rotating `JWT_SECRET` invalidates queued encrypted jobs, so drain the queue
   first.
-- **Audit:** `platform/audit.Middleware` records successful mutating requests;
-  use `audit.Recorder` for explicit domain events.
+- **Audit:** privileged mutations are fail-closed. Tier 1 services call
+  `audit.TxRecorder.RecordTx` in the mutation transaction (failure rolls back
+  and returns `503 system.audit_unavailable`); Tier 2 routes use
+  `audit.Guard` after idempotency to write a started intent row and complete it
+  as succeeded/failed/denied. `platform/audit.Middleware` remains a fallback
+  and skips routes that set `audit_guarded`. Use
+  `audit.NewServiceEvent` for domain events; never place secrets or PII in
+  metadata.
 - **Authz:** permissions live in `platform/authz`; roles map to permissions.
   Protect routes with `authz.Require(authz.PermissionX)`.
 - **Transactions:** `database.TxManager.WithTx` scopes a transaction to one

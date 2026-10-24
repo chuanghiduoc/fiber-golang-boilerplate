@@ -131,7 +131,7 @@ func seedAdminFiles(repo *fakeAdminFileRepo, n int) {
 func TestAdminListFiles(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		repo := newFakeAdminFileRepo()
-		svc := NewAdminFileService(repo, newFakeAdminStorage())
+		svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
 		seedAdminFiles(repo, 2)
 		repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
@@ -159,7 +159,7 @@ func TestAdminListFiles(t *testing.T) {
 	})
 
 	t.Run("empty list", func(t *testing.T) {
-		svc := NewAdminFileService(newFakeAdminFileRepo(), newFakeAdminStorage())
+		svc := NewAdminFileService(newFakeAdminFileRepo(), nil, nil, newFakeAdminStorage())
 
 		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
 		if err != nil {
@@ -177,7 +177,7 @@ func TestAdminListFiles(t *testing.T) {
 func TestAdminDownloadFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, store)
+	svc := NewAdminFileService(repo, nil, nil, store)
 	seedAdminFiles(repo, 1)
 	store.data["uploads/file.txt"] = []byte("payload")
 
@@ -200,7 +200,7 @@ func TestAdminDownloadFile(t *testing.T) {
 
 func TestAdminDeleteFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	if err := svc.DeleteFile(context.Background(), 1); err != nil {
@@ -221,7 +221,7 @@ func TestAdminDeleteFile(t *testing.T) {
 
 func TestAdminRestoreFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	_, err := svc.RestoreFile(context.Background(), 1)
@@ -245,7 +245,7 @@ func TestAdminRestoreFile(t *testing.T) {
 
 func TestAdminGetFileStats(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, nil, nil, newFakeAdminStorage())
 	seedAdminFiles(repo, 3)
 	repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
@@ -264,7 +264,7 @@ func TestAdminGetFileStats(t *testing.T) {
 func TestAdminFileService_TenantIsolation(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, store)
+	svc := NewAdminFileService(repo, nil, nil, store)
 	seedAdminFiles(repo, 1) // tenant 1, file 1
 	repo.files[2] = &filesqlc.File{
 		ID:           2,

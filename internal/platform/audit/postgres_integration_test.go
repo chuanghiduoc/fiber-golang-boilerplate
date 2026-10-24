@@ -49,8 +49,8 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 
 	recorder := NewPostgresRecorder(pool)
 	wantMetadata := map[string]any{
-		"email": "user@example.com",
-		"admin": true,
+		"reason": "admin-request",
+		"admin":  true,
 	}
 	wantCreatedAt := time.Now().UTC().Truncate(time.Microsecond)
 
@@ -231,4 +231,146 @@ func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 	assert.Nil(t, userAgent)
 	assert.JSONEq(t, `{}`, string(metadata))
 	assert.WithinDuration(t, before, createdAt, 2*time.Minute)
+}
+
+// TestPostgresRecorderRecordTxRollback proves a transactional audit write
+// disappears with the mutation when the transaction rolls back.
+func TestPostgresRecorderRecordTxRollback(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	require.NoError(t, pool.Ping(ctx))
+
+	var tableExists bool
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT to_regclass('audit_events') IS NOT NULL`).Scan(&tableExists))
+	if !tableExists {
+		t.Skip("audit_events table not found; run cmd/migrate first")
+	}
+
+	requestID := fmt.Sprintf("audit-tx-rollback-%d", time.Now().UnixNano())
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	require.NoError(t, NewPostgresRecorder(pool).RecordTx(ctx, tx, Event{
+		Action:    "user.role_changed",
+		Resource:  "user",
+		Source:    SourceService,
+		Outcome:   OutcomeSucceeded,
+		RequestID: requestID,
+	}))
+	require.NoError(t, tx.Rollback(ctx))
+
+	var count int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM audit_events WHERE request_id = $1`, requestID).Scan(&count))
+	assert.Zero(t, count, "a rolled-back transaction must leave no audit row")
+}
+
+// TestPostgresRecorderCompleteOnce covers intent creation, completion fields,
+// one-shot semantics, and the completion-only trigger.
+func TestPostgresRecorderCompleteOnce(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	require.NoError(t, pool.Ping(ctx))
+
+	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx,
+			`DELETE FROM audit_events WHERE request_id IN ($1, $2)`, requestID, requestID+"-service")
+	})
+
+	recorder := NewPostgresRecorder(pool)
+	id, err := recorder.RecordID(ctx, Event{
+		ActorType:  ActorTypeAnonymous,
+		Action:     "auth.login",
+		Resource:   "auth",
+		RequestID:  requestID,
+		Source:     SourceHTTP,
+		Outcome:    OutcomeStarted,
+		StatusCode: 0,
+	})
+	require.NoError(t, err)
+	require.Positive(t, id)
+
+	var (
+		outcome     string
+		completedAt *time.Time
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT outcome, completed_at FROM audit_events WHERE id = $1`, id).
+		Scan(&outcome, &completedAt))
+	assert.Equal(t, OutcomeStarted, outcome)
+	assert.Nil(t, completedAt)
+
+	require.NoError(t, recorder.Complete(ctx, id, Completion{
+		ActorID:    42,
+		ActorType:  ActorTypeAdmin,
+		ActorRole:  "admin",
+		Outcome:    OutcomeSucceeded,
+		StatusCode: 200,
+	}))
+
+	var (
+		actorID    *int64
+		actorType  string
+		actorRole  *string
+		statusCode *int16
+	)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT outcome, completed_at, actor_id, actor_type, actor_role, status_code
+		 FROM audit_events WHERE id = $1`, id).
+		Scan(&outcome, &completedAt, &actorID, &actorType, &actorRole, &statusCode))
+	assert.Equal(t, OutcomeSucceeded, outcome)
+	require.NotNil(t, completedAt)
+	require.NotNil(t, actorID)
+	assert.Equal(t, int64(42), *actorID)
+	assert.Equal(t, ActorTypeAdmin, actorType)
+	require.NotNil(t, actorRole)
+	assert.Equal(t, "admin", *actorRole)
+	require.NotNil(t, statusCode)
+	assert.Equal(t, int16(200), *statusCode)
+
+	err = recorder.Complete(ctx, id, Completion{Outcome: OutcomeFailed, StatusCode: 500})
+	require.ErrorIs(t, err, ErrAlreadyCompleted, "completion must happen at most once")
+
+	_, err = pool.Exec(ctx,
+		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, id)
+	require.Error(t, err, "completed rows must reject non-completion updates")
+
+	// A terminal service row is not a completable HTTP intent.
+	require.NoError(t, recorder.Record(ctx, Event{
+		Action:    "user.updated",
+		Resource:  "user",
+		RequestID: requestID + "-service",
+		Source:    SourceService,
+		Outcome:   OutcomeSucceeded,
+	}))
+	var serviceID int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT id FROM audit_events WHERE request_id = $1`, requestID+"-service").Scan(&serviceID))
+	err = recorder.Complete(ctx, serviceID, Completion{Outcome: OutcomeFailed, StatusCode: 500})
+	require.ErrorIs(t, err, ErrAlreadyCompleted)
+
+	_, err = pool.Exec(ctx,
+		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, serviceID)
+	require.Error(t, err, "terminal rows must reject updates")
 }

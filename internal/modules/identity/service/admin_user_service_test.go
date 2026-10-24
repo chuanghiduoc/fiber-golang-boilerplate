@@ -28,7 +28,7 @@ func seedAdminUsers(repo *mockUserRepo, n int) {
 func newAdminUserServiceForTest() (*adminUserService, *mockUserRepo, *mockRefreshTokenRepo) {
 	ur := newMockUserRepo()
 	rtr := newMockRefreshTokenRepo()
-	svc := NewAdminUserService(ur, rtr, nil).(*adminUserService)
+	svc := NewAdminUserService(ur, rtr, nil, nil).(*adminUserService)
 	return svc, ur, rtr
 }
 

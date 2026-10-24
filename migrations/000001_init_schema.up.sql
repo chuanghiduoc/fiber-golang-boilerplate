@@ -236,7 +236,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_kind_status
 CREATE TABLE IF NOT EXISTS audit_events (
     id BIGSERIAL PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    parent_id BIGINT,
     actor_id BIGINT,
+    actor_type TEXT NOT NULL DEFAULT 'unknown'
+        CHECK (actor_type IN ('user', 'admin', 'service', 'job', 'system', 'anonymous', 'unknown')),
+    actor_role TEXT,
     action TEXT NOT NULL,
     resource TEXT NOT NULL,
     resource_id TEXT,
@@ -244,6 +248,14 @@ CREATE TABLE IF NOT EXISTS audit_events (
     ip TEXT,
     user_agent TEXT,
     request_id TEXT,
+    source TEXT NOT NULL DEFAULT 'http'
+        CHECK (source IN ('http', 'service', 'job', 'system')),
+    outcome TEXT NOT NULL DEFAULT 'succeeded'
+        CHECK (outcome IN ('started', 'succeeded', 'failed', 'denied', 'unknown')),
+    status_code SMALLINT,
+    error_code TEXT,
+    idempotency_key_hash TEXT,
+    completed_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
@@ -261,3 +273,53 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_action_created
     ON audit_events (tenant_id, action, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_tenant_resource
     ON audit_events (tenant_id, resource, resource_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_request_id
+    ON audit_events (request_id)
+    WHERE request_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_parent_id
+    ON audit_events (parent_id)
+    WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_audit_events_started
+    ON audit_events (tenant_id, created_at)
+    WHERE outcome = 'started';
+
+-- Audit rows are append-only. Only a pre-write intent row (source http,
+-- outcome started) may transition to a terminal outcome, and only completion
+-- fields may change. This makes a successful mutation's audit row immutable.
+CREATE OR REPLACE FUNCTION audit_events_completion_guard() RETURNS trigger AS $$
+BEGIN
+    IF OLD.source <> 'http' OR OLD.outcome <> 'started' THEN
+        RAISE EXCEPTION 'audit_events rows are immutable after completion';
+    END IF;
+    IF NEW.source <> 'http' THEN
+        RAISE EXCEPTION 'audit completion cannot change source';
+    END IF;
+    IF NEW.outcome NOT IN ('succeeded', 'failed', 'denied', 'unknown') THEN
+        RAISE EXCEPTION 'audit completion requires a terminal outcome';
+    END IF;
+    IF NEW.completed_at IS NULL THEN
+        RAISE EXCEPTION 'audit completion requires completed_at';
+    END IF;
+    IF NEW.id IS DISTINCT FROM OLD.id
+        OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+        OR NEW.parent_id IS DISTINCT FROM OLD.parent_id
+        OR NEW.action IS DISTINCT FROM OLD.action
+        OR NEW.resource IS DISTINCT FROM OLD.resource
+        OR NEW.resource_id IS DISTINCT FROM OLD.resource_id
+        OR NEW.metadata IS DISTINCT FROM OLD.metadata
+        OR NEW.ip IS DISTINCT FROM OLD.ip
+        OR NEW.user_agent IS DISTINCT FROM OLD.user_agent
+        OR NEW.request_id IS DISTINCT FROM OLD.request_id
+        OR NEW.idempotency_key_hash IS DISTINCT FROM OLD.idempotency_key_hash
+        OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'audit completion may only change completion fields';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_audit_events_completion ON audit_events;
+CREATE TRIGGER trigger_audit_events_completion
+    BEFORE UPDATE ON audit_events
+    FOR EACH ROW
+    EXECUTE FUNCTION audit_events_completion_guard();

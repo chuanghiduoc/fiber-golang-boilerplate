@@ -2,14 +2,15 @@ package audit
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // insertEventSQL inserts one audit row. Empty optional values are stored as
@@ -17,7 +18,10 @@ import (
 const insertEventSQL = `
 INSERT INTO audit_events (
     tenant_id,
+    parent_id,
     actor_id,
+    actor_type,
+    actor_role,
     action,
     resource,
     resource_id,
@@ -25,33 +29,69 @@ INSERT INTO audit_events (
     ip,
     user_agent,
     request_id,
+    source,
+    outcome,
+    status_code,
+    error_code,
+    idempotency_key_hash,
+    completed_at,
     created_at
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`
+
+const completeEventSQL = `
+UPDATE audit_events
+SET outcome = $2,
+    status_code = $3,
+    error_code = $4,
+    completed_at = $5,
+    actor_id = COALESCE($6, actor_id),
+    actor_type = COALESCE(NULLIF($7, ''), actor_type),
+    actor_role = COALESCE(NULLIF($8, ''), actor_role)
+WHERE id = $1
+  AND source = 'http'
+  AND outcome = 'started'`
 
 // PostgresRecorder writes audit events to the audit_events table.
 type PostgresRecorder struct {
 	pool *pgxpool.Pool
 }
 
-var _ Recorder = (*PostgresRecorder)(nil)
+var (
+	_ Recorder           = (*PostgresRecorder)(nil)
+	_ TxRecorder         = (*PostgresRecorder)(nil)
+	_ IDRecorder         = (*PostgresRecorder)(nil)
+	_ CompletionRecorder = (*PostgresRecorder)(nil)
+)
 
 // NewPostgresRecorder returns a recorder backed by pool.
 func NewPostgresRecorder(pool *pgxpool.Pool) *PostgresRecorder {
 	return &PostgresRecorder{pool: pool}
 }
 
-// Record validates event, marshals its metadata, and inserts it.
-//
-// It returns an error wrapping [ErrInvalidEvent] when Action or Resource is
-// empty, and a wrapped marshaling error when Metadata cannot be encoded.
-func (r *PostgresRecorder) Record(ctx context.Context, event Event) error {
-	if err := event.Validate(); err != nil {
-		return err
-	}
+type eventValues struct {
+	tenantID   int64
+	parentID   *int64
+	actorID    *int64
+	actorType  string
+	actorRole  *string
+	metadata   []byte
+	resourceID *string
+	ip         *string
+	userAgent  *string
+	requestID  *string
+	source     string
+	outcome    string
+	statusCode *int16
+	errorCode  *string
+	idemHash   *string
+	completed  *time.Time
+	createdAt  time.Time
+}
 
+func (r *PostgresRecorder) values(ctx context.Context, event Event) (eventValues, error) {
 	metadata, err := MarshalMetadata(event.Metadata)
 	if err != nil {
-		return err
+		return eventValues{}, err
 	}
 
 	createdAt := event.CreatedAt
@@ -67,46 +107,145 @@ func (r *PostgresRecorder) Record(ctx context.Context, event Event) error {
 		tenantID = tenant.DefaultID
 	}
 
-	_, err = r.pool.Exec(ctx, insertEventSQL,
-		tenantID,
-		nullableInt64(event.ActorID),
-		event.Action,
-		event.Resource,
-		nullableString(event.ResourceID),
-		metadata,
-		nullableString(event.IP),
-		nullableString(event.UserAgent),
-		nullableString(event.RequestID),
-		createdAt,
-	)
+	return eventValues{
+		tenantID:   tenantID,
+		parentID:   nullableInt64(event.ParentID),
+		actorID:    nullableInt64(event.ActorID),
+		actorType:  event.EffectiveActorType(),
+		actorRole:  nullableString(event.ActorRole),
+		metadata:   metadata,
+		resourceID: nullableString(event.ResourceID),
+		ip:         nullableString(event.IP),
+		userAgent:  nullableString(event.UserAgent),
+		requestID:  nullableString(event.RequestID),
+		source:     event.EffectiveSource(),
+		outcome:    event.EffectiveOutcome(),
+		statusCode: nullableStatusCode(event.StatusCode),
+		errorCode:  nullableString(event.ErrorCode),
+		idemHash:   nullableString(event.IdempotencyKeyHash),
+		completed:  nullableTime(event.CompletedAt),
+		createdAt:  createdAt,
+	}, nil
+}
+
+// Record validates event, sanitizes its metadata, and inserts it through the
+// pool.
+//
+// It returns an error wrapping [ErrInvalidEvent] for an invalid event,
+// including a non-terminal outcome, and a wrapped marshaling error when
+// Metadata cannot be encoded.
+func (r *PostgresRecorder) Record(ctx context.Context, event Event) error {
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	values, err := r.values(ctx, event)
+	if err != nil {
+		return err
+	}
+	_, err = r.pool.Exec(ctx, insertEventSQL, insertArgs(event, values)...)
 	if err != nil {
 		return fmt.Errorf("audit: insert event: %w", err)
 	}
 	return nil
 }
 
-// Validate reports whether the event has the fields required by the schema.
-func (e Event) Validate() error {
-	if strings.TrimSpace(e.Action) == "" {
-		return fmt.Errorf("%w: action is required", ErrInvalidEvent)
+// RecordTx is Record on a caller-owned transaction. A nil transaction is
+// rejected with [ErrTxRequired]; the mutation must roll back in that case.
+func (r *PostgresRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event Event) error {
+	if tx == nil {
+		metrics.AuditTxMissingTotal.Inc()
+		return ErrTxRequired
 	}
-	if strings.TrimSpace(e.Resource) == "" {
-		return fmt.Errorf("%w: resource is required", ErrInvalidEvent)
+	if err := event.Validate(); err != nil {
+		return err
+	}
+	values, err := r.values(ctx, event)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, insertEventSQL, insertArgs(event, values)...); err != nil {
+		return fmt.Errorf("audit: insert event in transaction: %w", err)
 	}
 	return nil
 }
 
-// MarshalMetadata encodes metadata for a JSONB column. A nil map becomes an
-// empty JSON object so the NOT NULL column keeps its documented default shape.
-func MarshalMetadata(metadata map[string]any) ([]byte, error) {
-	if len(metadata) == 0 {
-		return []byte("{}"), nil
+// RecordID inserts a pre-write intent row (source=http, outcome=started) and
+// returns its ID. It is used by [Guard] before a Tier 2 handler runs.
+func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (int64, error) {
+	if err := event.validateIntent(); err != nil {
+		return 0, err
 	}
-	encoded, err := json.Marshal(metadata)
+	event.Outcome = OutcomeStarted
+	values, err := r.values(ctx, event)
 	if err != nil {
-		return nil, fmt.Errorf("audit: marshal metadata: %w", err)
+		return 0, err
 	}
-	return encoded, nil
+	var id int64
+	if err := r.pool.QueryRow(ctx, insertEventSQL+`
+ RETURNING id`, insertArgs(event, values)...).Scan(&id); err != nil {
+		return 0, fmt.Errorf("audit: insert intent event: %w", err)
+	}
+	return id, nil
+}
+
+// Complete transitions a started HTTP intent row to a terminal outcome. Rows
+// that are already completed, were not started, or are not HTTP events return
+// [ErrAlreadyCompleted]; completions are immutable and happen at most once.
+func (r *PostgresRecorder) Complete(ctx context.Context, id int64, completion Completion) error {
+	if id <= 0 {
+		return fmt.Errorf("%w: invalid event id", ErrInvalidEvent)
+	}
+	if err := completion.Validate(); err != nil {
+		return err
+	}
+	if completion.Outcome == "" {
+		completion.Outcome = OutcomeSucceeded
+	}
+	completedAt := completion.CompletedAt
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	}
+	tag, err := r.pool.Exec(ctx, completeEventSQL,
+		id,
+		completion.Outcome,
+		nullableStatusCode(completion.StatusCode),
+		nullableString(completion.ErrorCode),
+		completedAt,
+		nullableInt64(completion.ActorID),
+		completion.ActorType,
+		completion.ActorRole,
+	)
+	if err != nil {
+		return fmt.Errorf("audit: complete event: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrAlreadyCompleted
+	}
+	return nil
+}
+
+func insertArgs(event Event, values eventValues) []any {
+	return []any{
+		values.tenantID,
+		values.parentID,
+		values.actorID,
+		values.actorType,
+		values.actorRole,
+		event.Action,
+		event.Resource,
+		values.resourceID,
+		values.metadata,
+		values.ip,
+		values.userAgent,
+		values.requestID,
+		values.source,
+		values.outcome,
+		values.statusCode,
+		values.errorCode,
+		values.idemHash,
+		values.completed,
+		values.createdAt,
+	}
 }
 
 func nullableInt64(value int64) *int64 {
@@ -121,4 +260,29 @@ func nullableString(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+func nullableStatusCode(value int) *int16 {
+	if value == 0 {
+		return nil
+	}
+	if value < 1 || value > 599 {
+		return nil
+	}
+	//nolint:gosec // HTTP status codes are validated to 100..599, which fits int16.
+	v := int16(value)
+	return &v
+}
+
+func nullableTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
+}
+
+// IsAlreadyCompleted reports whether err means the intent row was not in a
+// completable state.
+func IsAlreadyCompleted(err error) bool {
+	return errors.Is(err, ErrAlreadyCompleted)
 }

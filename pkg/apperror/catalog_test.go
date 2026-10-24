@@ -23,6 +23,7 @@ var requiredCodes = []Code{
 	CodeSystemInternal,
 	CodeSystemTimeout,
 	CodeSystemUnavailable,
+	CodeSystemAuditUnavailable,
 }
 
 func TestCatalogSpecs(t *testing.T) {
