@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -44,9 +45,40 @@ func TestMiddleware_RecordsSuccessfulMutation(t *testing.T) {
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	require.Len(t, recorder.events, 1)
 	assert.Equal(t, int64(42), recorder.events[0].ActorID)
+	assert.Equal(t, tenant.DefaultID, recorder.events[0].TenantID,
+		"requests without tenant middleware must use the compatibility tenant")
 	assert.Equal(t, "POST /admin/users/:id/ban", recorder.events[0].Action)
 	assert.Equal(t, "7", recorder.events[0].ResourceID)
 	assert.Equal(t, "req-1", recorder.events[0].RequestID)
+}
+
+type tenantResolverFunc func(context.Context, string) (tenant.Tenant, error)
+
+func (f tenantResolverFunc) Resolve(ctx context.Context, slug string) (tenant.Tenant, error) {
+	return f(ctx, slug)
+}
+
+func TestMiddleware_RecordsResolvedTenant(t *testing.T) {
+	recorder := &recordingRecorder{}
+	resolver := tenantResolverFunc(func(_ context.Context, slug string) (tenant.Tenant, error) {
+		return tenant.Tenant{ID: 2, Slug: slug, Name: "Tenant Two"}, nil
+	})
+
+	app := fiber.New()
+	app.Use(tenant.Middleware(resolver, "default"))
+	app.Use(Middleware(recorder))
+	app.Post("/tenant/things/:id", func(c fiber.Ctx) error {
+		return c.SendStatus(fiber.StatusNoContent)
+	})
+
+	req, _ := http.NewRequest("POST", "/tenant/things/9", http.NoBody)
+	req.Header.Set(tenant.Header, "acme")
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
+	require.Len(t, recorder.events, 1)
+	assert.Equal(t, int64(2), recorder.events[0].TenantID)
+	assert.Equal(t, "9", recorder.events[0].ResourceID)
 }
 
 func TestMiddleware_SkipsReadsAndFailures(t *testing.T) {

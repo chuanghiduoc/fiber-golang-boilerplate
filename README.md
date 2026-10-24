@@ -114,6 +114,9 @@ belongs to exactly one tenant, and no identity read or write crosses tenants.
   read/write, admin list/stats, download, delete, and restore filters the
   request tenant. Cross-tenant ids behave as `404`. Uploaded blobs use
   `<tenantID>/<userID>/<uuid>.<ext>`.
+- Durable jobs and audit events carry `tenant_id`: enqueue records the request
+  tenant, the worker restores tenant context for handlers, and audit rows are
+  tenant-scoped.
 - Google OAuth binds the tenant into the OAuth `state` (and state cookie); the
   callback uses that tenant, not `X-Tenant-Slug`, and refuses a tenant suspended
   during consent.
@@ -402,6 +405,15 @@ post-commit verification email. Resend-verification and email-change flows
 still create their token and email in a separate transaction after the account
 already exists.
 
+- Jobs are tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` write
+  `jobs.tenant_id` resolved from the context (`tenant.EffectiveID`, default
+  tenant 1); an explicit positive `Job.TenantID` is kept. The claim query
+  returns the column and the worker installs `tenant.WithID(ctx, tenantID)`
+  before calling the handler, so email and audit handlers see the same tenant
+  as the request that enqueued the work. Rows written before multi-tenancy
+  default to tenant 1. Retention and Prometheus labels stay global
+  (tenant-agnostic); use the `(tenant_id, status, run_at)` and
+  `(tenant_id, kind, status)` indexes when inspecting per-tenant work.
 - Claims use `FOR UPDATE SKIP LOCKED`; `attempts` is incremented at claim time.
   Failures retry with exponential backoff (1s doubling up to 1h) until
   `max_attempts` (default 10), then move to `dead`. An unregistered job kind is

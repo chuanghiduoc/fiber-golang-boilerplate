@@ -162,16 +162,30 @@ is echoed on the response and included in RFC 9457 problem responses as
 grep 'request_id=<id>' app.log
 ```
 
-Audit events carry the same request ID. The generic audit middleware records
-successful mutating requests; idempotent replays are skipped so a replay does
-not duplicate the trail. See [Module Template](module-template.md#5-audit) for
-explicit domain events.
+Audit events carry the same request ID and the resolved tenant ID. The generic
+audit middleware records successful mutating requests; idempotent replays are
+skipped so a replay does not duplicate the trail. When no tenant middleware ran
+(for example an internal call or a pre-tenant test), the event uses the
+compatibility tenant id 1. See [Module Template](module-template.md#5-audit)
+for explicit domain events; set `Event.TenantID` there or let the recorder
+resolve it from the context.
 
 ## 4. Background jobs
 
 `internal/platform/jobs` is a PostgreSQL-backed durable queue. The API hosts
 the worker in-process; every replica runs a worker with concurrency 4. Claims
 use `FOR UPDATE SKIP LOCKED`, so multiple replicas are safe.
+
+Every job is tenant-owned. `Queue.Enqueue` and `Queue.EnqueueTx` resolve
+`jobs.tenant_id` from the context with `tenant.EffectiveID` (default tenant 1);
+an explicit positive `Job.TenantID` is kept. The claim query returns the column
+and the worker installs `tenant.WithID(ctx, job.TenantID)` before invoking the
+handler, so email and audit handlers run with the tenant that enqueued the job.
+A claimed row with no tenant falls back to tenant 1 for compatibility. The
+`(tenant_id, status, run_at)` and `(tenant_id, kind, status)` indexes support
+tenant-first inspection. Retention and Prometheus labels are deliberately
+global: terminal jobs are purged by age regardless of tenant, and the metric
+labels stay `kind` only to avoid cardinality growth.
 
 ### Lifecycle and retries
 
@@ -243,15 +257,15 @@ the user flow, not requeueing the old row. See
 ### Inspecting jobs
 
 ```sql
--- Backlog by kind and state
-SELECT kind, status, count(*), min(run_at), max(updated_at)
+-- Backlog by tenant, kind, and state
+SELECT tenant_id, kind, status, count(*), min(run_at), max(updated_at)
 FROM jobs
 WHERE status IN ('queued', 'running')
-GROUP BY kind, status
+GROUP BY tenant_id, kind, status
 ORDER BY count(*) DESC;
 
 -- Recent failures and dead letters
-SELECT id, kind, status, attempts, max_attempts, last_error, updated_at
+SELECT id, tenant_id, kind, status, attempts, max_attempts, last_error, updated_at
 FROM jobs
 WHERE status IN ('running', 'dead')
 ORDER BY updated_at DESC
@@ -407,19 +421,19 @@ reviewed DDL manually) that:
 
 Keep tenant id 1 as the compatibility anchor unless you also change the column
 defaults and backfill every row. After the upgrade, run `cmd/migrate`; it
-verifies the tenant table/columns/indexes and the default tenant row.
+verifies the tenant table/columns/indexes, `tenant_id` on `jobs` and
+`audit_events`, and the default tenant row.
 
 `TENANT_DEFAULT_SLUG` (default `default`) controls which tenant header-less
 requests resolve to; `TENANT_REQUIRE_HEADER=true` rejects requests that omit
 `X-Tenant-Slug`. Roll out the latter only after all clients send the header.
-Files queries and admin file lists/stats are tenant-scoped. Files isolation
-needs no schema change: existing rows default to tenant 1, and their old
+Identity, files, jobs, and audit now carry/propagate `tenant_id`; identity and
+files queries are tenant-scoped. Existing rows default to tenant 1 and their old
 `<userID>/<uuid>.<ext>` storage keys remain valid because downloads read
 `files.storage_path`. New uploads use
-`<tenantID>/<userID>/<uuid>.<ext>`; if you migrate existing blobs to that
-layout, copy first and update `files.storage_path` in the same operation.
-Identity query isolation and RLS are separate milestones; see the README scope
-note.
+`<tenantID>/<userID>/<uuid>.<ext>`; if you migrate existing blobs, copy first and
+update `files.storage_path` in the same operation. RLS and per-tenant limits are
+future work; see the README scope note.
 
 `cmd/migrate` checks for a dirty migration state before running, and after
 migrating verifies required tables, columns, and unique indexes. A legacy

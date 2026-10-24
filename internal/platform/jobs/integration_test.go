@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -488,6 +489,82 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	assert.Equal(t, "queued", status)
 	assert.Equal(t, DefaultMaxAttempts, maxAttempts)
 	assert.JSONEq(t, `{"ok":true}`, string(payload))
+}
+
+// TestQueueIntegrationPropagatesTenant covers tenant resolution at enqueue,
+// claim, and handler time: an explicit context tenant is stored on the row and
+// restored by the worker, while an empty context falls back to the default
+// tenant.
+func TestQueueIntegrationPropagatesTenant(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	const tenantTwo int64 = 2
+	_, err := pool.Exec(ctx,
+		`INSERT INTO tenants (id, slug, name) VALUES ($1, 'jobs-tenant-2', 'Jobs Tenant 2')`,
+		tenantTwo,
+	)
+	require.NoError(t, err)
+
+	tenantCtx := tenant.WithID(ctx, tenantTwo)
+	queue := NewQueue(pool)
+	store := newPGStore(pool)
+
+	// Transactional enqueue inherits the context tenant.
+	tx, err := pool.Begin(tenantCtx)
+	require.NoError(t, err)
+	txID, err := queue.EnqueueTx(tenantCtx, tx, Job{Kind: "jobs.integration.tenant.tx"})
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(tenantCtx))
+
+	var storedTenant int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT tenant_id FROM jobs WHERE id = $1`, txID).Scan(&storedTenant))
+	assert.Equal(t, tenantTwo, storedTenant)
+
+	// Claim returns the tenant so the worker can restore it.
+	claimed, err := store.Claim(tenantCtx, "tenant-claim-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, txID, claimed[0].ID)
+	assert.Equal(t, tenantTwo, claimed[0].TenantID)
+	require.NoError(t, store.Succeed(tenantCtx, txID, "tenant-claim-worker", claimed[0].Attempts))
+
+	// An empty context falls back to the compatibility tenant.
+	defaultID, err := queue.Enqueue(ctx, Job{Kind: "jobs.integration.tenant.default"})
+	require.NoError(t, err)
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT tenant_id FROM jobs WHERE id = $1`, defaultID).Scan(&storedTenant))
+	assert.Equal(t, tenant.DefaultID, storedTenant)
+
+	claimed, err = store.Claim(ctx, "default-claim-worker", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+	assert.Equal(t, defaultID, claimed[0].ID)
+	assert.Equal(t, tenant.DefaultID, claimed[0].TenantID)
+	require.NoError(t, store.Succeed(ctx, defaultID, "default-claim-worker", claimed[0].Attempts))
+
+	// The worker runs the handler with the job's tenant in context.
+	const kind = "jobs.integration.tenant.handler"
+	received := make(chan int64, 1)
+	worker := NewWorker(pool, "tenant-integration-worker", WithPollInterval(20*time.Millisecond))
+	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
+		received <- tenant.IDFromContext(ctx)
+		return nil
+	})
+	runIntegrationWorker(t, worker)
+
+	_, err = queue.Enqueue(tenantCtx, Job{Kind: kind, MaxAttempts: 3})
+	require.NoError(t, err)
+
+	select {
+	case got := <-received:
+		assert.Equal(t, tenantTwo, got, "handler must see the claimed job tenant")
+	case <-ctx.Done():
+		t.Fatal("handler was not invoked")
+	}
 }
 
 // TestPurgeTerminalIntegration covers the retention delete: only succeeded and

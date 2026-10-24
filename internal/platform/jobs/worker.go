@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -46,6 +47,7 @@ type store interface {
 
 type claimedJob struct {
 	ID          int64
+	TenantID    int64
 	Kind        string
 	Payload     json.RawMessage
 	Attempts    int
@@ -340,10 +342,18 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	if !ok {
 		handlerErr = fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	} else {
-		handlerCtx := ctx
+		// Restore the tenant that owns the job so handlers (email, audit, and
+		// future work) see the same context they would inside a request. Rows
+		// written before multi-tenancy, and test doubles, may omit the column;
+		// those jobs run under the compatibility tenant.
+		tenantID := job.TenantID
+		if tenantID == 0 {
+			tenantID = tenant.DefaultID
+		}
+		handlerCtx := tenant.WithID(ctx, tenantID)
 		var cancel context.CancelFunc
 		if w.jobTimeout > 0 {
-			handlerCtx, cancel = context.WithTimeout(ctx, w.jobTimeout)
+			handlerCtx, cancel = context.WithTimeout(handlerCtx, w.jobTimeout)
 		}
 
 		stopHeartbeat := w.startHeartbeat(ctx, job.ID, job.Attempts)
