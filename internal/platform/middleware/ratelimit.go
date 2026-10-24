@@ -7,6 +7,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/limiter"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -16,8 +17,13 @@ func NewLimiter(maxRequests, windowSecs int, prefix string, storages ...fiber.St
 		Expiration: time.Duration(windowSecs) * time.Second,
 		KeyGenerator: func(c fiber.Ctx) string {
 			// Namespace by tier (strict/normal/relaxed) so one bucket cannot
-			// consume another tier's quota. Authenticated routes are limited per
-			// user so clients behind a shared NAT do not exhaust each other.
+			// consume another tier's quota. API keys get their own bucket so
+			// rotating or revoking one key cannot exhaust another key's quota;
+			// authenticated routes are otherwise limited per user so clients
+			// behind a shared NAT do not exhaust each other.
+			if id := fiber.Locals[int64](c, apikey.LocalAPIKeyID); id != 0 {
+				return prefix + ":apikey:" + strconv.FormatInt(id, 10)
+			}
 			if id := fiber.Locals[int64](c, "user_id"); id != 0 {
 				return prefix + ":user:" + strconv.FormatInt(id, 10)
 			}

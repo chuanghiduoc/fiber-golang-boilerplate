@@ -210,7 +210,13 @@ jobs:
           psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
             -f migrations/000001_init_schema.up.sql
 
+<<<<<<< HEAD
           expected_tables="users refresh_tokens password_reset_tokens email_verification_tokens files jobs audit_events webhook_endpoints webhook_endpoint_secrets webhook_deliveries webhook_delivery_attempts webhook_inbound_sources webhook_inbound_events"
+||||||| bbdb17b
+          expected_tables="users refresh_tokens password_reset_tokens email_verification_tokens files jobs audit_events"
+=======
+          expected_tables="users refresh_tokens password_reset_tokens email_verification_tokens api_keys files jobs audit_events"
+>>>>>>> feat/api-keys-abac
           existing_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
           for table in $expected_tables; do
@@ -236,9 +242,19 @@ jobs:
           go run ./cmd/migrate
 
           migrated_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+<<<<<<< HEAD
             "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'files', 'jobs', 'audit_events', 'webhook_endpoints', 'webhook_endpoint_secrets', 'webhook_deliveries', 'webhook_delivery_attempts', 'webhook_inbound_sources', 'webhook_inbound_events')")
           if [ "$migrated_tables" -ne 13 ]; then
             echo "::error::expected 13 tables after cmd/migrate, found $migrated_tables"
+||||||| bbdb17b
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'files', 'jobs', 'audit_events')")
+          if [ "$migrated_tables" -ne 7 ]; then
+            echo "::error::expected 7 tables after cmd/migrate, found $migrated_tables"
+=======
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'api_keys', 'files', 'jobs', 'audit_events')")
+          if [ "$migrated_tables" -ne 8 ]; then
+            echo "::error::expected 8 tables after cmd/migrate, found $migrated_tables"
+>>>>>>> feat/api-keys-abac
             exit 1
           fi
 

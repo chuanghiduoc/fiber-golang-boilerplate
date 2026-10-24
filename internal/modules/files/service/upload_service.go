@@ -15,6 +15,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -54,6 +55,9 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	tenantID := tenant.EffectiveID(ctx)
 	if tenantID <= 0 {
 		return nil, apperror.NewInternal("tenant context is required")
+	}
+	if err := authorizeUserResource(ctx, authz.PermissionFilesWrite, tenantID, userID); err != nil {
+		return nil, err
 	}
 
 	originalName := cleanOriginalName(filename)
@@ -132,6 +136,9 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 		}
 		return nil, apperror.NewInternal("failed to get file")
 	}
+	if err := authorizeFile(ctx, authz.PermissionFilesRead, file); err != nil {
+		return nil, err
+	}
 
 	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		// Do not reveal that another tenant's file ID exists.
@@ -150,6 +157,9 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 		return nil, nil, apperror.NewInternal("failed to get file")
 	}
 
+	if err := authorizeFile(ctx, authz.PermissionFilesRead, file); err != nil {
+		return nil, nil, err
+	}
 	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
@@ -169,6 +179,9 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]dto.FileResponse, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
+		return nil, false, err
+	}
+	if err := authorizeUserResource(ctx, authz.PermissionFilesRead, tenant.EffectiveID(ctx), userID); err != nil {
 		return nil, false, err
 	}
 
@@ -199,6 +212,9 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		return apperror.NewInternal("failed to get file")
 	}
 
+	if err := authorizeFile(ctx, authz.PermissionFilesDelete, file); err != nil {
+		return err
+	}
 	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return apperror.NewNotFound("file not found")
 	}
@@ -226,6 +242,9 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 			return nil, apperror.NewNotFound("file not found")
 		}
 		return nil, apperror.NewInternal("failed to get file")
+	}
+	if err := authorizeFile(ctx, authz.PermissionFilesRestore, file); err != nil {
+		return nil, err
 	}
 	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, apperror.NewNotFound("file not found")

@@ -13,9 +13,10 @@ const (
 	PermissionProfileRead  Permission = "profile:read"
 	PermissionProfileWrite Permission = "profile:write"
 
-	PermissionFilesRead   Permission = "files:read"
-	PermissionFilesWrite  Permission = "files:write"
-	PermissionFilesDelete Permission = "files:delete"
+	PermissionFilesRead    Permission = "files:read"
+	PermissionFilesWrite   Permission = "files:write"
+	PermissionFilesDelete  Permission = "files:delete"
+	PermissionFilesRestore Permission = "files:restore"
 
 	PermissionSessionsRevoke Permission = "sessions:revoke"
 
@@ -31,6 +32,12 @@ const (
 	PermissionAdminStatsRead     Permission = "admin:stats:read"
 	PermissionAdminFeaturesRead  Permission = "admin:features:read"
 	PermissionAdminFeaturesWrite Permission = "admin:features:write"
+
+	PermissionAdminAPIKeysRead   Permission = "admin:api_keys:read"
+	PermissionAdminAPIKeysCreate Permission = "admin:api_keys:create"
+	PermissionAdminAPIKeysUpdate Permission = "admin:api_keys:update"
+	PermissionAdminAPIKeysRevoke Permission = "admin:api_keys:revoke"
+	PermissionAdminAPIKeysRotate Permission = "admin:api_keys:rotate"
 )
 
 // Role identifiers. Kept local so authz does not import module DTOs.
@@ -47,6 +54,7 @@ var allPermissions = []Permission{
 	PermissionFilesRead,
 	PermissionFilesWrite,
 	PermissionFilesDelete,
+	PermissionFilesRestore,
 	PermissionSessionsRevoke,
 	PermissionWebhooksRead,
 	PermissionWebhooksWrite,
@@ -59,6 +67,11 @@ var allPermissions = []Permission{
 	PermissionAdminStatsRead,
 	PermissionAdminFeaturesRead,
 	PermissionAdminFeaturesWrite,
+	PermissionAdminAPIKeysRead,
+	PermissionAdminAPIKeysCreate,
+	PermissionAdminAPIKeysUpdate,
+	PermissionAdminAPIKeysRevoke,
+	PermissionAdminAPIKeysRotate,
 }
 
 // rolePermissions is the built-in role catalog. An unknown role has no
@@ -77,6 +90,7 @@ func buildRolePermissions() map[string]map[Permission]struct{} {
 		PermissionFilesRead:      {},
 		PermissionFilesWrite:     {},
 		PermissionFilesDelete:    {},
+		PermissionFilesRestore:   {},
 		PermissionSessionsRevoke: {},
 	}
 
@@ -102,4 +116,24 @@ func PermissionsForRole(role string) map[Permission]struct{} {
 func Has(role string, p Permission) bool {
 	_, ok := rolePermissions[role][p]
 	return ok
+}
+
+// IsKnownPermission reports whether p is part of the published catalog. It is
+// used by API-key creation to reject unknown scopes instead of silently
+// creating a key that can never pass an authz.Require check.
+func IsKnownPermission(p Permission) bool {
+	for _, known := range allPermissions {
+		if known == p {
+			return true
+		}
+	}
+	return false
+}
+
+// AllPermissions returns a copy of the canonical permission catalog in
+// declaration order.
+func AllPermissions() []Permission {
+	out := make([]Permission, len(allPermissions))
+	copy(out, allPermissions)
+	return out
 }

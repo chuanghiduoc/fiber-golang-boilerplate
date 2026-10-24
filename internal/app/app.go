@@ -17,6 +17,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
@@ -116,6 +117,9 @@ type Deps struct {
 	// Modules depend on the stdlib-only contracts interface; a nil value is
 	// replaced with a no-op dispatcher.
 	Webhooks webhookcontracts.Dispatcher
+	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
+	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
+	APIKeyVerifier *apikey.Verifier
 }
 
 type App struct {

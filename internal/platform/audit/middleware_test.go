@@ -58,6 +58,31 @@ func (f tenantResolverFunc) Resolve(ctx context.Context, slug string) (tenant.Te
 	return f(ctx, slug)
 }
 
+func TestMiddleware_MergesHandlerMetadata(t *testing.T) {
+	recorder := &recordingRecorder{}
+	app := fiber.New()
+	app.Use(Middleware(recorder))
+	app.Post("/admin/api-keys", func(c fiber.Ctx) error {
+		fiber.Locals[map[string]any](c, MetadataLocalKey, map[string]any{
+			"apiKeyId":   int64(5),
+			"apiKeyName": "deploy",
+			"scopes":     []string{"files:read"},
+		})
+		return c.SendStatus(fiber.StatusCreated)
+	})
+
+	req, _ := http.NewRequest("POST", "/admin/api-keys", http.NoBody)
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusCreated, resp.StatusCode)
+	require.Len(t, recorder.events, 1)
+	assert.Equal(t, int64(5), recorder.events[0].Metadata["apiKeyId"])
+	assert.Equal(t, "deploy", recorder.events[0].Metadata["apiKeyName"])
+	assert.Equal(t, []string{"files:read"}, recorder.events[0].Metadata["scopes"])
+	assert.Equal(t, fiber.StatusCreated, recorder.events[0].Metadata["status"],
+		"generic metadata must survive the merge")
+}
+
 func TestMiddleware_RecordsResolvedTenant(t *testing.T) {
 	recorder := &recordingRecorder{}
 	resolver := tenantResolverFunc(func(_ context.Context, slug string) (tenant.Tenant, error) {

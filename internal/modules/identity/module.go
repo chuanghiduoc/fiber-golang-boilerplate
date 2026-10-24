@@ -5,6 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
@@ -48,12 +49,15 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	auth.Get("/google", rl.Normal, m.auth.GoogleRedirect)
 	auth.Get("/google/callback", rl.Normal, guard("auth.google_login", "auth"), m.auth.GoogleCallback)
 
-	users := v1.Group("/users", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions))
-	users.Get("/me", rl.Relaxed, m.users.GetMe)
-	users.Put("/me", rl.Normal, deps.Idempotency, m.users.UpdateMe)
-	users.Put("/me/password", rl.Normal, deps.Idempotency, m.users.ChangePassword)
-	users.Get("/:id", rl.Relaxed, m.users.GetByID)
+	users := v1.Group("/users", apikey.Authenticate(
+		middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions),
+		deps.APIKeyVerifier,
+	))
+	users.Get("/me", rl.Relaxed, authz.Require(authz.PermissionProfileRead), m.users.GetMe)
+	users.Put("/me", rl.Normal, authz.Require(authz.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
+	users.Put("/me/password", rl.Normal, authz.Require(authz.PermissionProfileWrite), deps.Idempotency, m.users.ChangePassword)
+	users.Get("/:id", rl.Relaxed, authz.Require(authz.PermissionProfileRead), m.users.GetByID)
 	users.Get("/", rl.Relaxed, authz.Require(authz.PermissionAdminUsersRead), m.users.List)
-	users.Put("/:id", rl.Normal, deps.Idempotency, m.users.Update)
-	users.Delete("/:id", rl.Normal, deps.Idempotency, m.users.Delete)
+	users.Put("/:id", rl.Normal, authz.Require(authz.PermissionProfileWrite), deps.Idempotency, m.users.Update)
+	users.Delete("/:id", rl.Normal, authz.Require(authz.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
 }

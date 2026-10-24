@@ -6,6 +6,10 @@
 // @in header
 // @name Authorization
 // @description Enter your bearer token in the format: Bearer {token}
+// @securityDefinitions.apikey ApiKeyAuth
+// @in header
+// @name Authorization
+// @description Enter an API key in the format: ApiKey {prefix}_{secret}
 package main
 
 import (
@@ -24,6 +28,11 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys"
+	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
+	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
+	apikeyrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
+	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
 	featuresrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/repository"
@@ -43,6 +52,7 @@ import (
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
@@ -329,6 +339,14 @@ func main() {
 	webhookHandler := webhookshandler.New(webhookSvc)
 	webhookDispatcher := webhookservice.NewDispatcher(webhookRepo)
 
+	// API keys: the verifier only needs a hash lookup plus the identity
+	// principal adapter; the admin service owns lifecycle and rotation.
+	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
+	principalReader := identityadapter.NewPrincipalReader(userRepo)
+	apiKeyVerifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
+	apiKeySvc := apikeyservice.NewService(apiKeyRepo, principalReader, txManager)
+	apiKeyHandler := apikeyhandler.NewHandler(apiKeySvc)
+
 	// Health checker
 	healthChecker := health.NewChecker(pool, appCache)
 
@@ -347,6 +365,7 @@ func main() {
 		Jobs:           worker,
 		Schedules:      scheduleRegistry,
 		Webhooks:       webhookDispatcher,
+		APIKeyVerifier: apiKeyVerifier,
 	})
 	// Module providers register routes, event subscriptions, job handlers, and
 	// schedules. The bus turns durable subscriptions into worker handlers once
@@ -357,6 +376,7 @@ func main() {
 		admin.New(adminHandler),
 		features.New(featureHandler),
 		webhooks.New(webhookHandler),
+		apikeys.New(apiKeyHandler),
 	)
 
 	// Durable email worker. It shares the pool but runs outside the request

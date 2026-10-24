@@ -133,6 +133,12 @@ type CompletionRecorder interface {
 	Complete(ctx context.Context, id int64, completion Completion) error
 }
 
+// MetadataLocalKey is the Fiber locals key handlers may set to a
+// map[string]any. The audit middleware merges it into the event metadata for
+// successful mutations. Values must be JSON-marshalable and must never contain
+// secrets such as plaintext tokens or API keys.
+const MetadataLocalKey = "audit_metadata"
+
 // Noop discards every event. It is useful in tests and when auditing is
 // disabled by configuration.
 //

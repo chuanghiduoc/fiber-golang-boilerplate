@@ -63,6 +63,136 @@ definitions:
       updatedAt:
         type: string
     type: object
+  apikeydto.APIKeyResponse:
+    properties:
+      createdAt:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      lastUsedAt:
+        type: string
+      name:
+        type: string
+      prefix:
+        type: string
+      revokedAt:
+        type: string
+      rotatedAt:
+        type: string
+      rotationGraceUntil:
+        type: string
+      scopes:
+        items:
+          type: string
+        type: array
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
+  apikeydto.CreateRequest:
+    properties:
+      expiresAt:
+        type: string
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      scopes:
+        items:
+          type: string
+        maxItems: 100
+        minItems: 1
+        type: array
+      userId:
+        type: integer
+    required:
+    - name
+    - scopes
+    type: object
+  apikeydto.KeyWithSecretResponse:
+    properties:
+      createdAt:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      key:
+        type: string
+      lastUsedAt:
+        type: string
+      name:
+        type: string
+      prefix:
+        type: string
+      revokedAt:
+        type: string
+      rotatedAt:
+        type: string
+      rotationGraceUntil:
+        type: string
+      scopes:
+        items:
+          type: string
+        type: array
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
+  apikeydto.RotateResponse:
+    properties:
+      createdAt:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      key:
+        type: string
+      lastUsedAt:
+        type: string
+      name:
+        type: string
+      prefix:
+        type: string
+      previousKeyId:
+        type: integer
+      previousKeyValidUntil:
+        type: string
+      revokedAt:
+        type: string
+      rotatedAt:
+        type: string
+      rotationGraceUntil:
+        type: string
+      scopes:
+        items:
+          type: string
+        type: array
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
+  apikeydto.UpdateRequest:
+    properties:
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      scopes:
+        items:
+          type: string
+        maxItems: 100
+        minItems: 1
+        type: array
+    required:
+    - scopes
+    type: object
   apperror.FieldError:
     properties:
       code:
@@ -607,6 +737,299 @@ info:
   title: Fiber Golang Boilerplate API
   version: "1.0"
 paths:
+  /admin/api-keys:
+    get:
+      description: List the request tenant's API keys, including revoked and rotated
+        keys. Secrets are never returned.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/apikeydto.APIKeyResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: List API keys
+      tags:
+      - Admin API Keys
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant-scoped API key. The plaintext key is returned once
+        and never stored.
+      parameters:
+      - description: API key creation request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/apikeydto.CreateRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/apikeydto.KeyWithSecretResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Create an API key
+      tags:
+      - Admin API Keys
+  /admin/api-keys/{id}:
+    delete:
+      description: Revoke an API key immediately. Revocation is idempotent.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Revoke an API key
+      tags:
+      - Admin API Keys
+    get:
+      description: Get API-key metadata by id for the request tenant.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apikeydto.APIKeyResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Get an API key
+      tags:
+      - Admin API Keys
+    put:
+      consumes:
+      - application/json
+      description: Update an API key's name and/or scopes. Scopes must remain within
+        the owner's role.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: API key update request
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/apikeydto.UpdateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apikeydto.APIKeyResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Update an API key
+      tags:
+      - Admin API Keys
+  /admin/api-keys/{id}/revoke:
+    post:
+      description: Revoke an API key immediately through an explicit action route.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Revoke an API key (POST)
+      tags:
+      - Admin API Keys
+  /admin/api-keys/{id}/rotate:
+    post:
+      description: Issue a replacement key. The previous key remains valid for the
+        rotation grace window unless revoked.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/apikeydto.RotateResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      - ApiKeyAuth: []
+      summary: Rotate an API key
+      tags:
+      - Admin API Keys
   /admin/features/flags:
     get:
       description: List every compile-time feature flag with its database default,
@@ -2844,6 +3267,11 @@ paths:
       tags:
       - Webhooks
 securityDefinitions:
+  ApiKeyAuth:
+    description: 'Enter an API key in the format: ApiKey {prefix}_{secret}'
+    in: header
+    name: Authorization
+    type: apiKey
   BearerAuth:
     description: 'Enter your bearer token in the format: Bearer {token}'
     in: header

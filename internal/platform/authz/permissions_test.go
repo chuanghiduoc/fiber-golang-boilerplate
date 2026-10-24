@@ -24,6 +24,7 @@ func TestPermissionsForRole_User(t *testing.T) {
 		PermissionFilesRead,
 		PermissionFilesWrite,
 		PermissionFilesDelete,
+		PermissionFilesRestore,
 		PermissionSessionsRevoke,
 	}
 	if len(got) != len(want) {
@@ -45,6 +46,11 @@ func TestPermissionsForRole_User(t *testing.T) {
 		PermissionAdminStatsRead,
 		PermissionAdminFeaturesRead,
 		PermissionAdminFeaturesWrite,
+		PermissionAdminAPIKeysRead,
+		PermissionAdminAPIKeysCreate,
+		PermissionAdminAPIKeysUpdate,
+		PermissionAdminAPIKeysRevoke,
+		PermissionAdminAPIKeysRotate,
 	}
 	for _, permission := range denied {
 		if _, ok := got[permission]; ok {

@@ -5,7 +5,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -77,6 +79,9 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 		fiber.Locals[int64](c, "user_id", claims.UserID)
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
+		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
+		authz.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role))
+
 		// Services publish events with the request context, so the actor must
 		// be available there too, not only in Fiber locals.
 		c.SetContext(requestctx.WithActorID(c.Context(), claims.UserID))

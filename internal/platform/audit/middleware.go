@@ -110,6 +110,14 @@ func Middleware(recorder Recorder) fiber.Handler {
 		} else if event.ActorType == ActorTypeUnknown {
 			event.ActorType = ActorTypeUser
 		}
+		// Handlers may attach domain facts (key id, scopes, previous key id)
+		// without duplicating the generic request metadata. Never put secrets
+		// here: metadata is persisted verbatim.
+		if extra := fiber.Locals[map[string]any](c, MetadataLocalKey); len(extra) > 0 {
+			for key, value := range extra {
+				event.Metadata[key] = value
+			}
+		}
 
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), 2*time.Second)
 		defer cancel()

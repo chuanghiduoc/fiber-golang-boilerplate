@@ -24,6 +24,8 @@ import (
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -124,7 +126,7 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 	txManager := database.NewTxManager(pool)
 	sender := &recordingEmailSender{}
 
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager)
+	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, audit.NewPostgresRecorder(pool), session.NewStore(userRepo, appCache))
 	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
 	resetSvc := identityservice.NewPasswordResetService(
 		userRepo, resetRepo, refreshRepo, sender, appCache, "https://frontend.example.test", txManager,

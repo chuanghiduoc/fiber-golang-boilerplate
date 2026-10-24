@@ -13,6 +13,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -62,6 +63,9 @@ func (s *adminFileService) ListFiles(ctx context.Context, limit int, startingAft
 	if err != nil {
 		return nil, false, err
 	}
+	if err := authorizeTenant(ctx, authz.PermissionAdminFilesRead, tenant.EffectiveID(ctx)); err != nil {
+		return nil, false, err
+	}
 
 	files, err := s.repo.AdminListCursor(ctx, cur)
 	if err != nil {
@@ -108,6 +112,9 @@ func (s *adminFileService) Download(ctx context.Context, id int64) (*dto.FileRes
 		}
 		return nil, nil, apperror.NewInternal("failed to get file")
 	}
+	if err := authorizeTenant(ctx, authz.PermissionAdminFilesRead, file.TenantID); err != nil {
+		return nil, nil, err
+	}
 	if file.TenantID != tenant.EffectiveID(ctx) {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
@@ -120,6 +127,17 @@ func (s *adminFileService) Download(ctx context.Context, id int64) (*dto.FileRes
 }
 
 func (s *adminFileService) DeleteFile(ctx context.Context, id int64) error {
+	existing, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("file not found or already deleted")
+		}
+		return apperror.NewInternal("failed to get file")
+	}
+	if err := authorizeTenant(ctx, authz.PermissionAdminFilesDelete, existing.TenantID); err != nil {
+		return err
+	}
+
 	deleteFile := func(repo repository.FileRepository) error {
 		if _, err := repo.Delete(ctx, id); err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -163,6 +181,9 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.File
 			return nil, apperror.NewNotFound("file not found")
 		}
 		return nil, apperror.NewInternal("failed to get file")
+	}
+	if err := authorizeTenant(ctx, authz.PermissionAdminFilesRestore, existing.TenantID); err != nil {
+		return nil, err
 	}
 	if existing.TenantID != tenant.EffectiveID(ctx) {
 		return nil, apperror.NewNotFound("file not found")
@@ -218,6 +239,9 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*dto.File
 }
 
 func (s *adminFileService) GetFileStats(ctx context.Context) (FileStats, error) {
+	if err := authorizeTenant(ctx, authz.PermissionAdminStatsRead, tenant.EffectiveID(ctx)); err != nil {
+		return FileStats{}, err
+	}
 	stats, err := s.repo.AdminFileStats(ctx)
 	if err != nil {
 		return FileStats{}, apperror.NewInternal("failed to get file stats")

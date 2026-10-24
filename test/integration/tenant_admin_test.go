@@ -32,6 +32,7 @@ import (
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -98,15 +99,16 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	txManager := database.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(pool)
 	sessionStore := session.NewStore(userRepo, appCache)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 
 	identityAdmin := identityadapter.NewAdminIdentity(
-		identityservice.NewAdminUserService(userRepo, identityrepo.NewRefreshTokenRepository(pool), txManager, sessionStore),
+		identityservice.NewAdminUserService(userRepo, identityrepo.NewRefreshTokenRepository(pool), txManager, auditRecorder, sessionStore),
 	)
 	filesRepo := filesrepo.NewFileRepository(pool)
-	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, store))
+	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, txManager, auditRecorder, store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
 	cfg := &config.Config{
