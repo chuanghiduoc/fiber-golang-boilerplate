@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
+	adminsvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
@@ -21,31 +22,31 @@ import (
 
 // mockAdminService is a manual mock for testing admin handlers.
 type mockAdminService struct {
-	users []admindto.UserResponse
-	files []admindto.FileResponse
-	stats *admindto.AdminStatsResponse
+	users []adminsvc.User
+	files []adminsvc.File
+	stats *adminsvc.Stats
 }
 
 func newMockAdminService() *mockAdminService {
 	return &mockAdminService{
-		users: []admindto.UserResponse{
-			{ID: 1, Email: "user1@example.com", Name: "User 1", Role: "user"},
-			{ID: 2, Email: "user2@example.com", Name: "User 2", Role: "admin"},
+		users: []adminsvc.User{
+			{ID: 1, Email: "user1@example.com", Name: "User 1", Role: adminsvc.RoleUser},
+			{ID: 2, Email: "user2@example.com", Name: "User 2", Role: adminsvc.RoleAdmin},
 		},
-		files: []admindto.FileResponse{
-			{ID: 1, OriginalName: "file.txt", MimeType: "text/plain", Size: 1024, URL: "http://localhost/files/1"},
+		files: []adminsvc.File{
+			{ID: 1, OriginalName: "file.txt", MimeType: "text/plain", Size: 1024},
 		},
-		stats: &admindto.AdminStatsResponse{
+		stats: &adminsvc.Stats{
 			ActiveUsers: 10, DeletedUsers: 2, TotalFiles: 5, TotalFileSize: 50000,
 		},
 	}
 }
 
-func (m *mockAdminService) ListUsers(_ context.Context, _ int, _ string) ([]admindto.UserResponse, bool, error) {
+func (m *mockAdminService) ListUsers(_ context.Context, _ int, _ string) ([]adminsvc.User, bool, error) {
 	return m.users, false, nil
 }
 
-func (m *mockAdminService) UpdateRole(_ context.Context, id int64, role string) (*admindto.UserResponse, error) {
+func (m *mockAdminService) UpdateRole(_ context.Context, id int64, role string) (*adminsvc.User, error) {
 	for i, u := range m.users {
 		if u.ID == id {
 			m.users[i].Role = role
@@ -64,7 +65,7 @@ func (m *mockAdminService) BanUser(_ context.Context, id int64) error {
 	return apperror.NewNotFound("user not found")
 }
 
-func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (*admindto.UserResponse, error) {
+func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (*adminsvc.User, error) {
 	for _, u := range m.users {
 		if u.ID == id {
 			return &u, nil
@@ -73,11 +74,11 @@ func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (*admindto.Use
 	return nil, apperror.NewNotFound("user not found")
 }
 
-func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]admindto.FileResponse, bool, error) {
+func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]adminsvc.File, bool, error) {
 	return m.files, false, nil
 }
 
-func (m *mockAdminService) Download(_ context.Context, id int64) (*admindto.FileResponse, io.ReadCloser, error) {
+func (m *mockAdminService) Download(_ context.Context, id int64) (*adminsvc.File, io.ReadCloser, error) {
 	for i := range m.files {
 		if m.files[i].ID == id {
 			return &m.files[i], io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(m.files[i].Size)))), nil
@@ -95,7 +96,7 @@ func (m *mockAdminService) DeleteFile(_ context.Context, id int64) error {
 	return apperror.NewNotFound("file not found")
 }
 
-func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (*admindto.FileResponse, error) {
+func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (*adminsvc.File, error) {
 	for i := range m.files {
 		if m.files[i].ID == id {
 			return &m.files[i], nil
@@ -104,7 +105,7 @@ func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (*admindto.F
 	return nil, apperror.NewNotFound("file not found or not deleted")
 }
 
-func (m *mockAdminService) GetStats(_ context.Context) (*admindto.AdminStatsResponse, error) {
+func (m *mockAdminService) GetStats(_ context.Context) (*adminsvc.Stats, error) {
 	return m.stats, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/repository"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 )
 
@@ -12,5 +13,9 @@ import (
 // shared admin:* permissions declared in internal/platform/authz because the
 // identity and files services enforce the same permissions.
 func Build(identity identitycontracts.IdentityAdmin, files filescontracts.FilesAdmin) *Module {
-	return New(adminhandler.NewHandler(adminservice.NewService(identity, files)))
+	service := adminservice.NewService(
+		adminrepository.NewIdentityAdmin(identity),
+		adminrepository.NewFilesAdmin(files),
+	)
+	return New(adminhandler.NewHandler(service))
 }
