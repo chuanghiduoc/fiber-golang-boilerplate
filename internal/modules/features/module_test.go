@@ -12,8 +12,8 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	featuresservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -24,27 +24,27 @@ type stubService struct {
 	upserts int
 }
 
-func (s *stubService) ListFlags(context.Context, features.Subject) ([]featuresdto.FlagResponse, error) {
-	return []featuresdto.FlagResponse{{Key: "file_uploads", Enabled: true}}, nil
+func (s *stubService) ListFlags(context.Context, features.Subject) ([]featuresservice.Flag, error) {
+	return []featuresservice.Flag{{Key: "file_uploads", Enabled: true}}, nil
 }
 
-func (s *stubService) GetFlag(context.Context, string, features.Subject) (*featuresdto.FlagDetailResponse, error) {
-	return &featuresdto.FlagDetailResponse{Flag: featuresdto.FlagResponse{Key: "file_uploads"}}, nil
+func (s *stubService) GetFlag(context.Context, string, features.Subject) (*featuresservice.FlagDetail, error) {
+	return &featuresservice.FlagDetail{Flag: featuresservice.Flag{Key: "file_uploads"}}, nil
 }
 
-func (s *stubService) UpsertFlag(context.Context, string, featuresdto.UpsertFlagRequest, features.Subject) (*featuresdto.FlagResponse, error) {
+func (s *stubService) UpsertFlag(context.Context, string, featuresservice.UpsertFlagInput, features.Subject) (*featuresservice.Flag, error) {
 	s.upserts++
-	return &featuresdto.FlagResponse{Key: "file_uploads", Configured: true}, nil
+	return &featuresservice.Flag{Key: "file_uploads", Configured: true}, nil
 }
 
 func (s *stubService) DeleteFlag(context.Context, string) error { return nil }
 
-func (s *stubService) ListTargets(context.Context, string) ([]featuresdto.TargetResponse, error) {
-	return []featuresdto.TargetResponse{}, nil
+func (s *stubService) ListTargets(context.Context, string) ([]featuresservice.Target, error) {
+	return []featuresservice.Target{}, nil
 }
 
-func (s *stubService) UpsertTarget(context.Context, string, featuresdto.UpsertTargetRequest) (*featuresdto.TargetResponse, error) {
-	return &featuresdto.TargetResponse{ID: 1}, nil
+func (s *stubService) UpsertTarget(context.Context, string, featuresservice.UpsertTargetInput) (*featuresservice.Target, error) {
+	return &featuresservice.Target{ID: 1}, nil
 }
 
 func (s *stubService) DeleteTarget(context.Context, string, int64) error { return nil }
