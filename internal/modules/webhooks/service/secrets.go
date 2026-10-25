@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -34,37 +33,35 @@ func (s *service) newSealedSecret(label string) (secret, ciphertext string, err 
 
 // RotateEndpointSecret makes a fresh secret active for new deliveries. The
 // delivery worker keeps dual-signing pending retries during the rotation grace.
-func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (*dto.EndpointSecretResponse, error) {
+func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (*Endpoint, string, error) {
 	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	endpoint, err := s.endpoints.RotateEndpointSecret(ctx, id, ciphertext)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("webhook endpoint not found")
+			return nil, "", apperror.NewNotFound("webhook endpoint not found")
 		}
-		return nil, apperror.NewInternal("failed to rotate webhook secret")
+		return nil, "", apperror.NewInternal("failed to rotate webhook secret")
 	}
 	s.recordAudit(ctx, actorID, "webhook.endpoint.secret_rotated", "webhook_endpoint", id, nil)
-	resp := toEndpointResponse(endpoint)
-	return &dto.EndpointSecretResponse{EndpointResponse: resp, Secret: secret}, nil
+	return endpoint, secret, nil
 }
 
 // RotateInboundSourceSecret replaces the secret the sender signs with.
-func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*dto.InboundSourceSecretResponse, error) {
+func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*InboundSource, string, error) {
 	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	source, err := s.inbound.RotateInboundSourceSecret(ctx, id, ciphertext)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("inbound source not found")
+			return nil, "", apperror.NewNotFound("inbound source not found")
 		}
-		return nil, apperror.NewInternal("failed to rotate inbound secret")
+		return nil, "", apperror.NewInternal("failed to rotate inbound secret")
 	}
 	s.recordAudit(ctx, actorID, "webhook.inbound_source.secret_rotated", "webhook_inbound_source", id, nil)
-	resp := toInboundSourceResponse(source)
-	return &dto.InboundSourceSecretResponse{InboundSourceResponse: resp, Secret: secret}, nil
+	return source, secret, nil
 }

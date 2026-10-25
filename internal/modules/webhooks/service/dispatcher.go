@@ -8,7 +8,6 @@ import (
 	"math"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 )
@@ -27,12 +26,12 @@ const maxDataVersion = math.MaxInt32
 // (tenant, endpoint, event ID) is unique, so a retried subscriber job only
 // creates the deliveries still missing.
 type Dispatcher struct {
-	store repository.DispatchStore
+	store DispatchStore
 	now   func() time.Time
 }
 
 // NewDispatcher returns a dispatcher backed by store.
-func NewDispatcher(store repository.DispatchStore) *Dispatcher {
+func NewDispatcher(store DispatchStore) *Dispatcher {
 	return &Dispatcher{
 		store: store,
 		now:   func() time.Time { return time.Now().UTC() },
@@ -69,7 +68,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event events.Event) (int, err
 		if !Matches(endpoint.EventTypes, event.Type) {
 			continue
 		}
-		_, inserted, err := d.store.CreateDeliveryWithJob(ctx, repository.DeliveryDraft{
+		_, inserted, err := d.store.CreateDeliveryWithJob(ctx, DeliveryDraft{
 			TenantID:         event.TenantID,
 			EndpointID:       endpoint.ID,
 			EventID:          event.ID,

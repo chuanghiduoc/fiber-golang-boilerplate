@@ -49,11 +49,11 @@ func (h *Handler) CreateEndpoint(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	result, err := h.service.CreateEndpoint(c.Context(), httpx.AuthUserID(c), req)
+	result, secret, err := h.service.CreateEndpoint(c.Context(), httpx.AuthUserID(c), createEndpointInput(req))
 	if err != nil {
 		return err
 	}
-	return response.Created(c, result)
+	return response.Created(c, toEndpointSecretResponse(result, secret))
 }
 
 // ListEndpoints godoc
@@ -78,7 +78,8 @@ func (h *Handler) ListEndpoints(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, pagination.NextCursor(items, func(e dto.EndpointResponse) (time.Time, int64) { return e.CreatedAt, e.ID }))
+	out := toEndpointResponses(items)
+	return response.List(c, out, hasMore, pagination.NextCursor(out, func(e dto.EndpointResponse) (time.Time, int64) { return e.CreatedAt, e.ID }))
 }
 
 // GetEndpoint godoc
@@ -103,7 +104,7 @@ func (h *Handler) GetEndpoint(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, endpoint)
+	return response.Success(c, toEndpointResponse(endpoint))
 }
 
 // UpdateEndpoint godoc
@@ -131,11 +132,11 @@ func (h *Handler) UpdateEndpoint(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	endpoint, err := h.service.UpdateEndpoint(c.Context(), httpx.AuthUserID(c), id, req)
+	endpoint, err := h.service.UpdateEndpoint(c.Context(), httpx.AuthUserID(c), id, updateEndpointInput(req))
 	if err != nil {
 		return err
 	}
-	return response.Success(c, endpoint)
+	return response.Success(c, toEndpointResponse(endpoint))
 }
 
 // DeleteEndpoint godoc
@@ -179,11 +180,11 @@ func (h *Handler) RotateEndpointSecret(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	result, err := h.service.RotateEndpointSecret(c.Context(), httpx.AuthUserID(c), id)
+	result, secret, err := h.service.RotateEndpointSecret(c.Context(), httpx.AuthUserID(c), id)
 	if err != nil {
 		return err
 	}
-	return response.Success(c, result)
+	return response.Success(c, toEndpointSecretResponse(result, secret))
 }
 
 // ListDeliveries godoc
@@ -217,7 +218,8 @@ func (h *Handler) ListDeliveries(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, pagination.NextCursor(items, func(d dto.DeliveryResponse) (time.Time, int64) { return d.CreatedAt, d.ID }))
+	out := toDeliveryResponses(items)
+	return response.List(c, out, hasMore, pagination.NextCursor(out, func(d dto.DeliveryResponse) (time.Time, int64) { return d.CreatedAt, d.ID }))
 }
 
 // GetDelivery godoc
@@ -242,7 +244,7 @@ func (h *Handler) GetDelivery(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, delivery)
+	return response.Success(c, toDeliveryResponse(delivery, true))
 }
 
 // ListDeliveryAttempts godoc
@@ -267,7 +269,7 @@ func (h *Handler) ListDeliveryAttempts(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, false)
+	return response.List(c, toAttemptResponses(items), false)
 }
 
 // ReplayDelivery godoc
@@ -293,7 +295,7 @@ func (h *Handler) ReplayDelivery(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Created(c, delivery)
+	return response.Created(c, toDeliveryResponse(delivery, true))
 }
 
 // CreateInboundSource godoc
@@ -316,11 +318,11 @@ func (h *Handler) CreateInboundSource(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	result, err := h.service.CreateInboundSource(c.Context(), httpx.AuthUserID(c), req)
+	result, secret, err := h.service.CreateInboundSource(c.Context(), httpx.AuthUserID(c), createInboundSourceInput(req))
 	if err != nil {
 		return err
 	}
-	return response.Created(c, result)
+	return response.Created(c, toInboundSourceSecretResponse(result, secret))
 }
 
 // ListInboundSources godoc
@@ -345,7 +347,8 @@ func (h *Handler) ListInboundSources(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, pagination.NextCursor(items, func(s dto.InboundSourceResponse) (time.Time, int64) { return s.CreatedAt, s.ID }))
+	out := toInboundSourceResponses(items)
+	return response.List(c, out, hasMore, pagination.NextCursor(out, func(s dto.InboundSourceResponse) (time.Time, int64) { return s.CreatedAt, s.ID }))
 }
 
 // GetInboundSource godoc
@@ -370,7 +373,7 @@ func (h *Handler) GetInboundSource(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, source)
+	return response.Success(c, toInboundSourceResponse(source))
 }
 
 // UpdateInboundSource godoc
@@ -399,11 +402,11 @@ func (h *Handler) UpdateInboundSource(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	source, err := h.service.UpdateInboundSource(c.Context(), httpx.AuthUserID(c), id, req)
+	source, err := h.service.UpdateInboundSource(c.Context(), httpx.AuthUserID(c), id, updateInboundSourceInput(req))
 	if err != nil {
 		return err
 	}
-	return response.Success(c, source)
+	return response.Success(c, toInboundSourceResponse(source))
 }
 
 // DeleteInboundSource godoc
@@ -447,11 +450,11 @@ func (h *Handler) RotateInboundSourceSecret(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	result, err := h.service.RotateInboundSourceSecret(c.Context(), httpx.AuthUserID(c), id)
+	result, secret, err := h.service.RotateInboundSourceSecret(c.Context(), httpx.AuthUserID(c), id)
 	if err != nil {
 		return err
 	}
-	return response.Success(c, result)
+	return response.Success(c, toInboundSourceSecretResponse(result, secret))
 }
 
 // ListInboundEvents godoc
@@ -482,7 +485,8 @@ func (h *Handler) ListInboundEvents(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, pagination.NextCursor(items, func(e dto.InboundEventResponse) (time.Time, int64) { return e.ReceivedAt, e.ID }))
+	out := toInboundEventResponses(items)
+	return response.List(c, out, hasMore, pagination.NextCursor(out, func(e dto.InboundEventResponse) (time.Time, int64) { return e.ReceivedAt, e.ID }))
 }
 
 // ReceiveInbound godoc
@@ -527,5 +531,5 @@ func (h *Handler) ReceiveInbound(c fiber.Ctx) error {
 	if receipt.Duplicate {
 		status = fiber.StatusOK
 	}
-	return c.Status(status).JSON(receipt)
+	return c.Status(status).JSON(toInboundReceipt(receipt))
 }

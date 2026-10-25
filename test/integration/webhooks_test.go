@@ -447,7 +447,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.Equal(t, 1, created)
 
 		deliveryID := h.deliveryID(t, successEvent.ID)
-		payload, _ := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: deliveryID})
+		payload, _ := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", deliveryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
@@ -487,7 +487,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), badEvent)
 		require.NoError(t, err)
 		badID := h.deliveryID(t, badEvent.ID)
-		payload, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: badID})
+		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: badID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", badID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
@@ -501,7 +501,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), retryEvent)
 		require.NoError(t, err)
 		retryID := h.deliveryID(t, retryEvent.ID)
-		payload, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: retryID})
+		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: retryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", retryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
@@ -722,13 +722,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			`UPDATE webhook_deliveries SET attempts = max_attempts, next_attempt_at = now() - interval '1 second' WHERE id = $1`,
 			exhausted)
 		require.NoError(t, err)
-		job, _ := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: exhausted})
+		job, _ := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: exhausted})
 		require.NoError(t, h.worker.Handle(tenantCtx, job))
 
 		// A disabled endpoint stops receiving retries.
 		_, err = h.pool.Exec(ctx, `UPDATE webhook_endpoints SET status = 'disabled' WHERE id = $1`, endpoint.ID)
 		require.NoError(t, err)
-		job, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: disabled})
+		job, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: disabled})
 		require.NoError(t, h.worker.Handle(tenantCtx, job))
 
 		for id, reason := range map[int64]string{
@@ -929,11 +929,11 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	require.Equal(t, int32(2), current.Attempts)
 
 	// Every outcome write from the stale attempt is discarded.
-	require.ErrorIs(t, h.repo.MarkDeliverySucceeded(ctx, id, stale.Attempts, http.StatusOK), webhookrepo.ErrDeliveryLeaseLost)
-	require.ErrorIs(t, h.repo.MarkDeliveryDead(ctx, id, stale.Attempts, http.StatusBadRequest, "stale"), webhookrepo.ErrDeliveryLeaseLost)
-	require.ErrorIs(t, h.repo.RescheduleDeliveryWithJob(ctx, webhookrepo.RetryDraft{
+	require.ErrorIs(t, h.repo.MarkDeliverySucceeded(ctx, id, stale.Attempts, http.StatusOK), webhookservice.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.MarkDeliveryDead(ctx, id, stale.Attempts, http.StatusBadRequest, "stale"), webhookservice.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.RescheduleDeliveryWithJob(ctx, webhookservice.RetryDraft{
 		DeliveryID: id, Attempt: stale.Attempts, NextAttemptAt: time.Now().Add(time.Hour),
-	}), webhookrepo.ErrDeliveryLeaseLost)
+	}), webhookservice.ErrDeliveryLeaseLost)
 	got, err := h.repo.GetDelivery(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, "pending", got.Status)
@@ -942,7 +942,7 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	// The current attempt is interrupted by shutdown: it is given back and
 	// immediately claimable again with the same attempt number.
 	require.NoError(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts))
-	require.ErrorIs(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts), webhookrepo.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts), webhookservice.ErrDeliveryLeaseLost)
 	reclaimed, err := h.repo.ClaimDelivery(ctx, id, time.Minute)
 	require.NoError(t, err, "a released claim must be claimable without waiting for the lease")
 	assert.Equal(t, int32(2), reclaimed.Attempts)

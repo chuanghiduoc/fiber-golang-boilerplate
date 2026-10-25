@@ -2,20 +2,16 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-func (s *service) ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]dto.DeliveryResponse, bool, error) {
-	if status != "" && status != dto.DeliveryPending && status != dto.DeliverySucceeded && status != dto.DeliveryDead {
+func (s *service) ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]Delivery, bool, error) {
+	if status != "" && status != DeliveryPending && status != DeliverySucceeded && status != DeliveryDead {
 		return nil, false, apperror.NewBadRequest("status must be one of: pending, succeeded, dead")
 	}
 	if endpointID < 0 {
@@ -25,7 +21,7 @@ func (s *service) ListDeliveries(ctx context.Context, endpointID int64, status s
 	if err != nil {
 		return nil, false, err
 	}
-	deliveries, err := s.deliveries.ListDeliveries(ctx, repository.ListDeliveriesParams{
+	deliveries, err := s.deliveries.ListDeliveries(ctx, ListDeliveriesParams{
 		EndpointID: endpointID,
 		Status:     status,
 		Cursor:     cur,
@@ -37,14 +33,10 @@ func (s *service) ListDeliveries(ctx context.Context, endpointID int64, status s
 	if hasMore {
 		deliveries = deliveries[:pageSize]
 	}
-	out := make([]dto.DeliveryResponse, len(deliveries))
-	for i := range deliveries {
-		out[i] = toDeliveryResponse(&deliveries[i], false)
-	}
-	return out, hasMore, nil
+	return deliveries, hasMore, nil
 }
 
-func (s *service) GetDelivery(ctx context.Context, id int64) (*dto.DeliveryResponse, error) {
+func (s *service) GetDelivery(ctx context.Context, id int64) (*Delivery, error) {
 	delivery, err := s.deliveries.GetDelivery(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -52,11 +44,10 @@ func (s *service) GetDelivery(ctx context.Context, id int64) (*dto.DeliveryRespo
 		}
 		return nil, apperror.NewInternal("failed to get webhook delivery")
 	}
-	resp := toDeliveryResponse(delivery, true)
-	return &resp, nil
+	return delivery, nil
 }
 
-func (s *service) ListDeliveryAttempts(ctx context.Context, id int64) ([]dto.DeliveryAttemptResponse, error) {
+func (s *service) ListDeliveryAttempts(ctx context.Context, id int64) ([]DeliveryAttempt, error) {
 	if _, err := s.deliveries.GetDelivery(ctx, id); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("webhook delivery not found")
@@ -67,16 +58,12 @@ func (s *service) ListDeliveryAttempts(ctx context.Context, id int64) ([]dto.Del
 	if err != nil {
 		return nil, apperror.NewInternal("failed to list webhook delivery attempts")
 	}
-	out := make([]dto.DeliveryAttemptResponse, len(attempts))
-	for i := range attempts {
-		out[i] = toAttemptResponse(&attempts[i])
-	}
-	return out, nil
+	return attempts, nil
 }
 
 // ReplayDelivery creates a new delivery of the original payload to the
 // endpoint's current URL and active secret, linked to the original.
-func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.DeliveryResponse, error) {
+func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*Delivery, error) {
 	original, err := s.deliveries.GetDelivery(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -91,7 +78,7 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 		}
 		return nil, apperror.NewInternal("failed to get webhook endpoint")
 	}
-	if endpoint.Status != dto.StatusActive {
+	if endpoint.Status != StatusActive {
 		return nil, apperror.NewConflict("webhook endpoint is disabled")
 	}
 	ciphertext, err := s.endpoints.ActiveEndpointSecret(ctx, endpoint.ID)
@@ -108,7 +95,7 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 	if err != nil {
 		return nil, apperror.NewInternal("failed to replay webhook delivery")
 	}
-	newID, created, err := s.deliveries.CreateDeliveryWithJob(ctx, repository.DeliveryDraft{
+	newID, created, err := s.deliveries.CreateDeliveryWithJob(ctx, DeliveryDraft{
 		TenantID:         tenant.EffectiveID(ctx),
 		EndpointID:       endpoint.ID,
 		EventID:          eventID.String(),
@@ -117,11 +104,11 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 		ActorType:        original.ActorType,
 		ActorID:          original.ActorID,
 		EventCreatedAt:   s.now(),
-		URL:              endpoint.Url,
-		Payload:          json.RawMessage(original.Payload),
+		URL:              endpoint.URL,
+		Payload:          original.Payload,
 		SecretCiphertext: ciphertext,
 		MaxAttempts:      original.MaxAttempts,
-		TimeoutMS:        endpoint.TimeoutMs,
+		TimeoutMS:        endpoint.TimeoutMS,
 		RunAt:            s.now(),
 		ReplayedFromID:   original.ID,
 	})
@@ -140,59 +127,5 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 		"endpointId":         endpoint.ID,
 		"eventType":          original.EventType,
 	})
-	resp := toDeliveryResponse(delivery, true)
-	return &resp, nil
-}
-
-func toDeliveryResponse(delivery *repository.Delivery, includePayload bool) dto.DeliveryResponse {
-	resp := dto.DeliveryResponse{
-		ID:            delivery.ID,
-		TenantID:      delivery.TenantID,
-		EndpointID:    delivery.EndpointID,
-		EventID:       delivery.EventID,
-		EventType:     delivery.EventType,
-		Status:        delivery.Status,
-		Attempts:      delivery.Attempts,
-		MaxAttempts:   delivery.MaxAttempts,
-		NextAttemptAt: delivery.NextAttemptAt.Time.UTC(),
-		CreatedAt:     delivery.CreatedAt.Time.UTC(),
-		UpdatedAt:     delivery.UpdatedAt.Time.UTC(),
-	}
-	if delivery.LastStatusCode.Valid {
-		code := int(delivery.LastStatusCode.Int32)
-		resp.LastStatusCode = &code
-	}
-	if delivery.LastError.Valid {
-		resp.LastError = delivery.LastError.String
-	}
-	if delivery.DeliveredAt.Valid {
-		at := delivery.DeliveredAt.Time.UTC()
-		resp.DeliveredAt = &at
-	}
-	if delivery.ReplayedFromID.Valid {
-		id := delivery.ReplayedFromID.Int64
-		resp.ReplayedFromID = &id
-	}
-	if includePayload {
-		resp.Payload = json.RawMessage(delivery.Payload)
-	}
-	return resp
-}
-
-func toAttemptResponse(attempt *webhooksqlc.WebhookDeliveryAttempt) dto.DeliveryAttemptResponse {
-	resp := dto.DeliveryAttemptResponse{
-		ID:         attempt.ID,
-		DeliveryID: attempt.DeliveryID,
-		Attempt:    attempt.Attempt,
-		DurationMS: attempt.DurationMs,
-		CreatedAt:  attempt.CreatedAt.Time.UTC(),
-	}
-	if attempt.StatusCode.Valid {
-		code := int(attempt.StatusCode.Int32)
-		resp.StatusCode = &code
-	}
-	if attempt.Error.Valid {
-		resp.Error = attempt.Error.String
-	}
-	return resp
+	return delivery, nil
 }

@@ -88,7 +88,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	ciphertext, err := codec.Seal([]byte(wireSecret))
 	require.NoError(t, err)
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	_, err = webhookrepo.New(pool, queue).CreateEndpoint(tenantCtx, webhookrepo.CreateEndpointDraft{
+	_, err = webhookrepo.New(pool, queue).CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
 		URL:              server.URL + "/hook",
 		EventTypes:       []string{"file.*"},
 		Status:           "active",

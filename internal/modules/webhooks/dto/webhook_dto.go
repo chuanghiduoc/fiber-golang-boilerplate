@@ -6,20 +6,6 @@ import (
 	"time"
 )
 
-const (
-	// StatusActive enables an endpoint or inbound source.
-	StatusActive = "active"
-	// StatusDisabled pauses deliveries/source ingestion without deleting data.
-	StatusDisabled = "disabled"
-
-	// DeliveryPending is queued or between attempts.
-	DeliveryPending = "pending"
-	// DeliverySucceeded means a 2xx response was received.
-	DeliverySucceeded = "succeeded"
-	// DeliveryDead is terminal after permanent failure or exhausted retries.
-	DeliveryDead = "dead"
-)
-
 // CreateEndpointRequest creates an outbound endpoint. The response includes a
 // signing secret, so the route is not wrapped in idempotency caching.
 type CreateEndpointRequest struct {

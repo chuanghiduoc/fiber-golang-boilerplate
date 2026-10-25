@@ -8,31 +8,30 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 type fakeDispatchStore struct {
-	endpoints  map[int64][]repository.ActiveEndpoint
-	deliveries map[string]repository.DeliveryDraft
+	endpoints  map[int64][]ActiveEndpoint
+	deliveries map[string]DeliveryDraft
 	callErr    error
 }
 
-func (f *fakeDispatchStore) ActiveEndpoints(_ context.Context, tenantID int64) ([]repository.ActiveEndpoint, error) {
+func (f *fakeDispatchStore) ActiveEndpoints(_ context.Context, tenantID int64) ([]ActiveEndpoint, error) {
 	if f.callErr != nil {
 		return nil, f.callErr
 	}
 	return f.endpoints[tenantID], nil
 }
 
-func (f *fakeDispatchStore) CreateDeliveryWithJob(_ context.Context, draft repository.DeliveryDraft) (deliveryID int64, created bool, err error) {
+func (f *fakeDispatchStore) CreateDeliveryWithJob(_ context.Context, draft DeliveryDraft) (deliveryID int64, created bool, err error) {
 	if f.callErr != nil {
 		return 0, false, f.callErr
 	}
 	if f.deliveries == nil {
-		f.deliveries = make(map[string]repository.DeliveryDraft)
+		f.deliveries = make(map[string]DeliveryDraft)
 	}
 	key := fmt.Sprintf("%d/%d/%s", draft.TenantID, draft.EndpointID, draft.EventID)
 	if _, ok := f.deliveries[key]; ok {
@@ -42,8 +41,8 @@ func (f *fakeDispatchStore) CreateDeliveryWithJob(_ context.Context, draft repos
 	return int64(len(f.deliveries)), true, nil
 }
 
-func activeEndpoint(id, tenantID int64, patterns ...string) repository.ActiveEndpoint {
-	return repository.ActiveEndpoint{
+func activeEndpoint(id, tenantID int64, patterns ...string) ActiveEndpoint {
+	return ActiveEndpoint{
 		ID:               id,
 		TenantID:         tenantID,
 		URL:              fmt.Sprintf("https://receiver.example/%d", id),
@@ -68,7 +67,7 @@ func testEvent(id, eventType string, tenantID int64, occurredAt time.Time) event
 
 func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	store := &fakeDispatchStore{
-		endpoints: map[int64][]repository.ActiveEndpoint{
+		endpoints: map[int64][]ActiveEndpoint{
 			tenant.DefaultID: {
 				activeEndpoint(1, tenant.DefaultID, "file.*"),
 				activeEndpoint(2, tenant.DefaultID, "file.uploaded"),
@@ -124,7 +123,7 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 // The tenant comes from the envelope, never from the job context.
 func TestDispatcher_UsesEnvelopeTenant(t *testing.T) {
 	store := &fakeDispatchStore{
-		endpoints: map[int64][]repository.ActiveEndpoint{
+		endpoints: map[int64][]ActiveEndpoint{
 			42: {activeEndpoint(9, 42, "*")},
 			1:  {activeEndpoint(10, 1, "*")},
 		},

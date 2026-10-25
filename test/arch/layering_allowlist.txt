@@ -8,12 +8,3 @@ identity/service/password_reset_service.go -> github.com/chuanghiduoc/fiber-gola
 identity/service/profile.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
 identity/service/registration.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
 identity/service/user_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-webhooks/service/deliveries.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/deliveries.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
-webhooks/service/endpoints.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/inbound_receive.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/inbound_receive.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
-webhooks/service/inbound_sources.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/inbound_sources.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
-webhooks/service/secrets.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto

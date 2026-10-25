@@ -7,65 +7,59 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // CreateEndpoint validates configuration, seals a fresh signing secret, and
 // returns the plaintext secret exactly once.
-func (s *service) CreateEndpoint(ctx context.Context, actorID int64, req dto.CreateEndpointRequest) (*dto.EndpointSecretResponse, error) {
-	if err := s.validateURL(req.URL); err != nil {
-		return nil, err
+func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEndpointInput) (*Endpoint, string, error) {
+	if err := s.validateURL(in.URL); err != nil {
+		return nil, "", err
 	}
-	eventTypes, err := normalizeEventTypes(req.EventTypes)
+	eventTypes, err := normalizeEventTypes(in.EventTypes)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	maxAttempts := s.maxAttempts(req.MaxAttempts)
-	timeoutMS := s.timeoutMS(req.TimeoutMS)
-
-	endpoint, err := s.endpoints.CreateEndpoint(ctx, repository.CreateEndpointDraft{
-		URL:              req.URL,
-		Description:      req.Description,
+	endpoint, err := s.endpoints.CreateEndpoint(ctx, CreateEndpointDraft{
+		URL:              in.URL,
+		Description:      in.Description,
 		EventTypes:       eventTypes,
-		Status:           dto.StatusActive,
-		MaxAttempts:      maxAttempts,
-		TimeoutMS:        timeoutMS,
+		Status:           StatusActive,
+		MaxAttempts:      s.maxAttempts(in.MaxAttempts),
+		TimeoutMS:        s.timeoutMS(in.TimeoutMS),
 		SecretCiphertext: ciphertext,
 	})
 	if err != nil {
-		return nil, apperror.NewInternal("failed to create webhook endpoint")
+		return nil, "", apperror.NewInternal("failed to create webhook endpoint")
 	}
 
 	s.recordAudit(ctx, actorID, "webhook.endpoint.created", "webhook_endpoint", endpoint.ID, endpointAuditMetadata(endpoint))
-	resp := toEndpointResponse(endpoint)
-	return &dto.EndpointSecretResponse{EndpointResponse: resp, Secret: secret}, nil
+	return endpoint, secret, nil
 }
 
-func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, req dto.UpdateEndpointRequest) (*dto.EndpointResponse, error) {
-	if err := s.validateURL(req.URL); err != nil {
+func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, in UpdateEndpointInput) (*Endpoint, error) {
+	if err := s.validateURL(in.URL); err != nil {
 		return nil, err
 	}
-	eventTypes, err := normalizeEventTypes(req.EventTypes)
+	eventTypes, err := normalizeEventTypes(in.EventTypes)
 	if err != nil {
 		return nil, err
 	}
-	if !validStatus(req.Status) {
+	if !validStatus(in.Status) {
 		return nil, apperror.NewBadRequest("status must be one of: active, disabled")
 	}
-	endpoint, err := s.endpoints.UpdateEndpoint(ctx, repository.UpdateEndpointDraft{
+	endpoint, err := s.endpoints.UpdateEndpoint(ctx, UpdateEndpointDraft{
 		ID:          id,
-		URL:         req.URL,
-		Description: req.Description,
+		URL:         in.URL,
+		Description: in.Description,
 		EventTypes:  eventTypes,
-		Status:      req.Status,
-		MaxAttempts: s.maxAttempts(req.MaxAttempts),
-		TimeoutMS:   s.timeoutMS(req.TimeoutMS),
+		Status:      in.Status,
+		MaxAttempts: s.maxAttempts(in.MaxAttempts),
+		TimeoutMS:   s.timeoutMS(in.TimeoutMS),
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -74,8 +68,7 @@ func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, req dto
 		return nil, apperror.NewInternal("failed to update webhook endpoint")
 	}
 	s.recordAudit(ctx, actorID, "webhook.endpoint.updated", "webhook_endpoint", id, endpointAuditMetadata(endpoint))
-	resp := toEndpointResponse(endpoint)
-	return &resp, nil
+	return endpoint, nil
 }
 
 func (s *service) DeleteEndpoint(ctx context.Context, actorID, id int64) error {
@@ -89,7 +82,7 @@ func (s *service) DeleteEndpoint(ctx context.Context, actorID, id int64) error {
 	return nil
 }
 
-func (s *service) GetEndpoint(ctx context.Context, id int64) (*dto.EndpointResponse, error) {
+func (s *service) GetEndpoint(ctx context.Context, id int64) (*Endpoint, error) {
 	endpoint, err := s.endpoints.GetEndpoint(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -97,11 +90,10 @@ func (s *service) GetEndpoint(ctx context.Context, id int64) (*dto.EndpointRespo
 		}
 		return nil, apperror.NewInternal("failed to get webhook endpoint")
 	}
-	resp := toEndpointResponse(endpoint)
-	return &resp, nil
+	return endpoint, nil
 }
 
-func (s *service) ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]dto.EndpointResponse, bool, error) {
+func (s *service) ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]Endpoint, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -114,11 +106,7 @@ func (s *service) ListEndpoints(ctx context.Context, limit int, startingAfter st
 	if hasMore {
 		endpoints = endpoints[:pageSize]
 	}
-	out := make([]dto.EndpointResponse, len(endpoints))
-	for i := range endpoints {
-		out[i] = toEndpointResponse(&endpoints[i])
-	}
-	return out, hasMore, nil
+	return endpoints, hasMore, nil
 }
 
 func (s *service) validateURL(raw string) error {
@@ -188,35 +176,12 @@ func normalizeEventTypes(types []string) ([]string, error) {
 
 // endpointAuditMetadata is the non-secret configuration recorded when an
 // endpoint is created or updated.
-func endpointAuditMetadata(endpoint *repository.Endpoint) map[string]any {
+func endpointAuditMetadata(endpoint *Endpoint) map[string]any {
 	return map[string]any{
-		"url":         endpoint.Url,
+		"url":         endpoint.URL,
 		"eventTypes":  endpoint.EventTypes,
 		"status":      endpoint.Status,
 		"maxAttempts": endpoint.MaxAttempts,
-		"timeoutMs":   endpoint.TimeoutMs,
+		"timeoutMs":   endpoint.TimeoutMS,
 	}
-}
-
-func toEndpointResponse(endpoint *repository.Endpoint) dto.EndpointResponse {
-	resp := dto.EndpointResponse{
-		ID:          endpoint.ID,
-		TenantID:    endpoint.TenantID,
-		URL:         endpoint.Url,
-		Description: endpoint.Description,
-		EventTypes:  endpoint.EventTypes,
-		Status:      endpoint.Status,
-		MaxAttempts: endpoint.MaxAttempts,
-		TimeoutMS:   endpoint.TimeoutMs,
-		CreatedAt:   endpoint.CreatedAt.Time.UTC(),
-		UpdatedAt:   endpoint.UpdatedAt.Time.UTC(),
-	}
-	if resp.EventTypes == nil {
-		resp.EventTypes = []string{}
-	}
-	if endpoint.DeletedAt.Valid {
-		deletedAt := endpoint.DeletedAt.Time.UTC()
-		resp.DeletedAt = &deletedAt
-	}
-	return resp
 }
