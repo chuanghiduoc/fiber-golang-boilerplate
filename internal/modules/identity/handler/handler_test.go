@@ -18,8 +18,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -204,7 +206,7 @@ func setupApp(svc *mockUserService) *fiber.App {
 
 func setupAppWithEmailService(svc *mockUserService, emailVerifSvc *mockEmailVerificationService) *fiber.App {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	refreshSvc := &mockRefreshTokenService{}
@@ -804,11 +806,11 @@ func TestCrossUserAccess_ScopedAPIKeyCannotUseOwnerRole(t *testing.T) {
 	svc := newMockService()
 	userHandler := NewUserHandler(svc)
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	users := app.Group("/users", func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "user_id", 2)
 		fiber.Locals[string](c, "role", authz.RoleAdmin)
-		authz.SetSubject(c, authz.NewSubjectWithPermissions(2, 1, authz.RoleAdmin,
+		authzhttp.SetSubject(c, authz.NewSubjectWithPermissions(2, 1, authz.RoleAdmin,
 			identitycatalog.PermissionProfileRead, identitycatalog.PermissionProfileWrite))
 		return c.Next()
 	})

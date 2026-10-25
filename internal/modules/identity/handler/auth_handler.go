@@ -24,6 +24,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
@@ -223,7 +224,7 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 	}
 
 	// Attribute the audit event to the newly registered user. The key matches
-	// middleware.JWTAuth and is read by audit.Middleware after the response.
+	// middleware.JWTAuth and is read by audithttp.Middleware after the response.
 	fiber.Locals(c, "user_id", user.ID)
 
 	return response.Created(c, user)
@@ -532,8 +533,8 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	// validated `tenant` query parameter lets browser navigation start a
 	// non-default flow. Header/resolved context always wins; an explicit
 	// conflicting header therefore cannot be overridden by the query.
-	tenantID := tenant.ID(c)
-	tenantSlug := tenant.Slug(c)
+	tenantID := tenanthttp.ID(c)
+	tenantSlug := tenanthttp.Slug(c)
 	if tenantID == 0 {
 		slug := strings.TrimSpace(c.Query(tenant.QueryParam))
 		if slug != "" {

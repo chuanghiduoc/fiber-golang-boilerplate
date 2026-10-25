@@ -1,5 +1,7 @@
+# Base images are pinned by digest (tag kept for readability); Dependabot
+# (docker ecosystem) proposes digest bumps.
 # ---- Build stage ----
-FROM golang:1.27.3-alpine AS build
+FROM golang:1.27.3-alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c AS build
 
 # No git: modules come from GOPROXY and -buildvcs=false skips VCS stamping.
 WORKDIR /app
@@ -22,7 +24,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o migrate ./cmd/migrate
 
 # ---- Production stage ----
-FROM alpine:3.24 AS prod
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS prod
 
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S appgroup && \

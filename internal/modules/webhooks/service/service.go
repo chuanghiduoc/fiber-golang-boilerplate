@@ -146,7 +146,7 @@ func (s *service) recordAudit(ctx context.Context, actorID int64, action, resour
 		Metadata:   metadata,
 		CreatedAt:  s.now(),
 	}
-	// Link the domain event to the route's audit.Guard intent row, if any.
+	// Link the domain event to the route's audithttp.Guard intent row, if any.
 	// The tenant stays the service's effective tenant: the public receiver
 	// resolves it from the source, not from the request.
 	if info := audit.RequestInfoFromContext(ctx); info != nil {

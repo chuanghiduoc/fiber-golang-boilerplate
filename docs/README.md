@@ -2,6 +2,7 @@
 
 | Document | Covers |
 |---|---|
+| [Architecture Decisions](adr/README.md) | ADRs: why the layering, RBAC, tenancy, migration, API, webhook, MFA, and event decisions were made |
 | [Architecture](architecture.md) | Module map and dependency rules, request lifecycle, cross-module communication, tenant model, authorization, transactions/outbox, migration policy |
 | [Data Model](data-model.md) | ER diagrams of the baseline schema, table ownership, keys, and FK delete actions |
 | [API Design System](api-design.md) | URLs/versioning, JSON conventions, success/error (RFC 9457) shapes, pagination, JWT vs API-key auth, tenants, headers, rate limits, idempotency, compatibility rules |

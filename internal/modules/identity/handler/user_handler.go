@@ -10,6 +10,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -246,13 +247,13 @@ func (h *UserHandler) refuseDelegatedEmailChange(c fiber.Ctx, targetID int64, re
 	return nil
 }
 
-// authenticatedWithAPIKey reports whether apikey.Authenticate authenticated
+// authenticatedWithAPIKey reports whether apikeyhttp.Authenticate authenticated
 // the request. Either marker is enough to deny.
 func authenticatedWithAPIKey(c fiber.Ctx) bool {
 	if fiber.Locals[string](c, apikey.LocalAuthMethod) == apikey.AuthMethodAPIKey {
 		return true
 	}
-	subject, ok := authz.SubjectFromFiber(c)
+	subject, ok := authzhttp.SubjectFromFiber(c)
 	return ok && subject.Attribute(authz.AttributeAuthMethod) == apikey.AuthMethodAPIKey
 }
 

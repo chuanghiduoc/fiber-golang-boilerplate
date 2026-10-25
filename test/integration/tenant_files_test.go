@@ -30,10 +30,13 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
@@ -119,8 +122,8 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
-	api := app.Group("/api/v1", tenant.Middleware(
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	api := app.Group("/api/v1", tenanthttp.Middleware(
 		identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
 		tenant.DefaultSlug,
 	))
@@ -212,7 +215,7 @@ func (h *tenantFilesHarness) adminFiles(t *testing.T, bearer string) []dto.FileR
 }
 
 func tenantFilesCtx(id int64) context.Context {
-	return tenant.WithID(context.Background(), id)
+	return authz.SystemContext(tenant.WithID(context.Background(), id))
 }
 
 func TestTenantFiles_Isolation(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
@@ -37,7 +38,7 @@ func AuthUserID(c fiber.Ctx) int64 {
 // instead of comparing the "role" local: the subject honors API-key scopes, so
 // a key an admin issued with only profile scopes cannot act on other users.
 func Can(c fiber.Ctx, permission authz.Permission) bool {
-	subject, ok := authz.SubjectFromFiber(c)
+	subject, ok := authzhttp.SubjectFromFiber(c)
 	return ok && subject.Has(permission)
 }
 

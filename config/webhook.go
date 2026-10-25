@@ -24,14 +24,18 @@ const (
 // SecretEncryptionKey; when that is empty the JWT secret is used as a
 // compatibility fallback (never in production).
 type WebhookConfig struct {
-	SecretEncryptionKey       string `env:"WEBHOOK_SECRET_ENCRYPTION_KEY"`
-	ConnectTimeoutSeconds     int    `env:"WEBHOOK_CONNECT_TIMEOUT_SECS" envDefault:"5"`
-	RequestTimeoutSeconds     int    `env:"WEBHOOK_REQUEST_TIMEOUT_SECS" envDefault:"10"`
-	RetryBaseSeconds          int    `env:"WEBHOOK_RETRY_BASE_SECS" envDefault:"5"`
-	RetryMaxSeconds           int    `env:"WEBHOOK_RETRY_MAX_SECS" envDefault:"3600"`
-	MaxAttempts               int    `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"8"`
-	RetentionDays             int    `env:"WEBHOOK_RETENTION_DAYS" envDefault:"30"`
-	TimestampToleranceSeconds int    `env:"WEBHOOK_TIMESTAMP_TOLERANCE_SECS" envDefault:"300"`
+	SecretEncryptionKey string `env:"WEBHOOK_SECRET_ENCRYPTION_KEY"`
+	// SecretEncryptionPreviousKeys are comma-separated decryption-only keys:
+	// stored secrets keep the key that sealed them until they are rotated, so
+	// a retired key must stay listed while any row still uses it.
+	SecretEncryptionPreviousKeys string `env:"WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS"`
+	ConnectTimeoutSeconds        int    `env:"WEBHOOK_CONNECT_TIMEOUT_SECS" envDefault:"5"`
+	RequestTimeoutSeconds        int    `env:"WEBHOOK_REQUEST_TIMEOUT_SECS" envDefault:"10"`
+	RetryBaseSeconds             int    `env:"WEBHOOK_RETRY_BASE_SECS" envDefault:"5"`
+	RetryMaxSeconds              int    `env:"WEBHOOK_RETRY_MAX_SECS" envDefault:"3600"`
+	MaxAttempts                  int    `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"8"`
+	RetentionDays                int    `env:"WEBHOOK_RETENTION_DAYS" envDefault:"30"`
+	TimestampToleranceSeconds    int    `env:"WEBHOOK_TIMESTAMP_TOLERANCE_SECS" envDefault:"300"`
 	// SSRFAllowlist permits private/loopback targets for trusted receivers.
 	// Entries are comma-separated IPs, CIDRs, or exact hostnames. Empty keeps
 	// the default deny for every non-public address.
@@ -45,6 +49,12 @@ func (w WebhookConfig) ResolvedSecretKey(jwtSecret string) string {
 		return key
 	}
 	return jwtSecret
+}
+
+// PreviousSecretKeyList returns the parsed
+// WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS entries.
+func (w WebhookConfig) PreviousSecretKeyList() []string {
+	return splitCSV(w.SecretEncryptionPreviousKeys)
 }
 
 // SSRFAllowlistEntries returns the parsed allowlist entries.
@@ -147,6 +157,14 @@ func (w WebhookConfig) validateSecretKey(appEnv, jwtSecret string) error {
 	}
 	if strings.TrimSpace(w.ResolvedSecretKey(jwtSecret)) == "" {
 		return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_KEY or JWT_SECRET must be set")
+	}
+	for _, previous := range w.PreviousSecretKeyList() {
+		if previous == w.ResolvedSecretKey(jwtSecret) {
+			return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS must not contain the active key")
+		}
+		if !usesSampleSecrets(appEnv) && len(previous) < minWebhookEncryptionKeyLength {
+			return fmt.Errorf("WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS entries must be at least %d characters", minWebhookEncryptionKeyLength)
+		}
 	}
 	return nil
 }

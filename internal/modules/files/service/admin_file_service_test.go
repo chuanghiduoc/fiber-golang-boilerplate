@@ -138,7 +138,7 @@ func TestAdminListFiles(t *testing.T) {
 		seedAdminFiles(repo, 2)
 		repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
-		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
+		files, hasMore, err := svc.ListFiles(systemCtx(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -164,7 +164,7 @@ func TestAdminListFiles(t *testing.T) {
 	t.Run("empty list", func(t *testing.T) {
 		svc := NewAdminFileService(newFakeAdminFileRepo(), nil, audit.Noop{}, newFakeAdminStorage())
 
-		files, hasMore, err := svc.ListFiles(context.Background(), 10, "")
+		files, hasMore, err := svc.ListFiles(systemCtx(), 10, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -184,7 +184,7 @@ func TestAdminDownloadFile(t *testing.T) {
 	seedAdminFiles(repo, 1)
 	store.data["uploads/file.txt"] = []byte("payload")
 
-	file, reader, err := svc.Download(context.Background(), 1)
+	file, reader, err := svc.Download(systemCtx(), 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -208,14 +208,14 @@ func TestAdminDownloadFile_MissingBlobIsNotFound(t *testing.T) {
 	svc := NewAdminFileService(repo, nil, audit.Noop{}, store)
 	seedAdminFiles(repo, 1)
 
-	_, _, err := svc.Download(context.Background(), 1)
+	_, _, err := svc.Download(systemCtx(), 1)
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 404 {
 		t.Fatalf("expected 404 for a missing blob, got %v", err)
 	}
 
 	store.getErr = errors.New("storage unavailable")
-	_, _, err = svc.Download(context.Background(), 1)
+	_, _, err = svc.Download(systemCtx(), 1)
 	if !errors.As(err, &appErr) || appErr.Status != 500 {
 		t.Fatalf("expected 500 for a storage failure, got %v", err)
 	}
@@ -226,13 +226,13 @@ func TestAdminDeleteFile(t *testing.T) {
 	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
-	if err := svc.DeleteFile(context.Background(), 1); err != nil {
+	if err := svc.DeleteFile(systemCtx(), 1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !repo.files[1].DeletedAt.Valid {
 		t.Error("file should be soft-deleted")
 	}
-	if err := svc.DeleteFile(context.Background(), 999); err == nil {
+	if err := svc.DeleteFile(systemCtx(), 999); err == nil {
 		t.Fatal("expected not found error")
 	} else {
 		var appErr *apperror.AppError
@@ -247,14 +247,14 @@ func TestAdminRestoreFile(t *testing.T) {
 	svc := NewAdminFileService(repo, nil, audit.Noop{}, newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
-	_, err := svc.RestoreFile(context.Background(), 1)
+	_, err := svc.RestoreFile(systemCtx(), 1)
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Code != string(filescatalog.CodeFileNotDeleted) {
 		t.Fatalf("expected file.not_deleted, got %v", err)
 	}
 
 	repo.files[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	file, err := svc.RestoreFile(context.Background(), 1)
+	file, err := svc.RestoreFile(systemCtx(), 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestAdminGetFileStats(t *testing.T) {
 	seedAdminFiles(repo, 3)
 	repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
-	stats, err := svc.GetFileStats(context.Background())
+	stats, err := svc.GetFileStats(systemCtx())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

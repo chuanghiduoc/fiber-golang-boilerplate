@@ -1,12 +1,13 @@
+// Package storage defines the object-storage interface and the local
+// filesystem driver. The S3 driver lives in pkg/storage/s3store and the
+// config-driven selection in pkg/storage/drivers, so packages that only need
+// the interface do not link the AWS SDK.
 package storage
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
 // ErrNotFound is returned (wrapped) by Get when no object exists at the path.
@@ -17,15 +18,4 @@ type Storage interface {
 	Get(ctx context.Context, path string) (io.ReadCloser, error)
 	Delete(ctx context.Context, path string) error
 	URL(path string) string
-}
-
-func NewStorage(cfg config.StorageConfig) (Storage, error) {
-	switch cfg.Driver {
-	case "local":
-		return NewLocalStorage(cfg.LocalPath)
-	case DriverS3, DriverSeaweedFS:
-		return NewS3Storage(cfg)
-	default:
-		return nil, fmt.Errorf("unsupported storage driver: %s", cfg.Driver)
-	}
 }

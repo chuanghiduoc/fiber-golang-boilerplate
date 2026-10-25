@@ -29,7 +29,7 @@ The scaffold creates a compile-safe vertical slice:
 | --- | --- |
 | Catalog | permissions, error codes, en/vi strings |
 | Constructor | `Build(app.Infra)`; no I/O |
-| Route | one `deps.Authenticate()` + `authz.Require` protected sample route |
+| Route | one `deps.Authenticate()` + `authzhttp.Require` protected sample route |
 | Tests | module test (catalog registration/localization + route through `app.New`) |
 | SQL | `queries/<name>.sql` placeholder and the module's `sqlc.yaml` block |
 | Docs | module `README.md` (ownership and next steps) |
@@ -66,7 +66,6 @@ flowchart TB
     APP -. "RegisterCatalogs: Permissions /<br/>ErrorCodes / Locales / FeatureFlags" .-> CAT
     MOD --> H --> S --> R --> Q --> PG
     H --> D
-    S --> D
     S -- "consumes" --> C
     H & S & R --> CAT
 ```
@@ -75,7 +74,7 @@ flowchart TB
 
 | Path | Responsibility |
 | --- | --- |
-| `module.go` | `package <name>`: `app.Module`, `Build(app.Infra)`, catalog providers, route table |
+| `module.go` | `package <name>`: `app.Module`, `Build(app.Infra)` (plus a `Settings` struct when the module owns configuration), catalog providers, route table |
 | `module_test.go` | catalog registration/localization and a route test through `app.New` |
 | `README.md` | ownership, routes, permissions, tables, jobs, contracts |
 | `catalog/catalog.go` | `Owner` (== `Module.Name()`), `Register()`, `Locales()` (embedded) |
@@ -122,10 +121,19 @@ the worker (`events.RegisterJobs`).
 | --- | --- | --- | --- |
 | `module.go` | identity, `Build`, catalog providers, routes | `internal/app`, own subpackages, `internal/contracts/*`, `platform`, `pkg` | another module |
 | `catalog` | permissions, error codes, flags, en/vi strings | `platform/authz`, `platform/features`, `pkg/apperror`, stdlib | anything else (leaf, so every layer may import it) |
-| `handler` | HTTP binding, validation, status/response shape | own `dto`, own `service`, `platform/httpx`, `pkg` | own `repository`, SQL |
-| `service` | rules, authorization decisions, transactions, jobs | own `dto`, own repository interface, `platform`, `pkg` | Fiber handlers |
-| `repository` | SQL, sqlc rows, persistence errors | own `dto`/domain types, own `sqlc`, `pkg/database` | own `handler`, Fiber, another module's `sqlc` |
+| `handler` | HTTP binding, validation, status/response shape, mapping service types to DTOs | own `dto`, own `service`, `platform/httpx`, `*http` adapters, `pkg` | own `repository`, sqlc, pgx |
+| `service` | rules, authorization decisions (`authz.Authorize`), transactions, jobs | own service types and repository/port interfaces, `internal/contracts`, framework-free `platform`/`pkg` cores | Fiber/fasthttp (even transitively), sqlc, pgx, own `dto`/`handler` |
+| `repository` | SQL, sqlc rows, persistence errors, mapping rows to service types | own `sqlc`, own service/domain types (existing code also uses `dto`), `pkg/database`, pgx | own `handler`, Fiber, another module's `sqlc` |
 | `dto` | transport structs, validation tags | stdlib (or `pkg/pagination`) | repository, sqlc, Fiber |
+
+`test/arch/layering_test.go` enforces the `service`/`handler` bans
+([ADR 0002](adr/0002-module-layering.md)); violations that predate the rule
+are frozen in `test/arch/layering_allowlist.txt`. New code must not add to
+it, and fixing one means deleting its line. `test/arch/framework_free_test.go`
+walks the transitive imports of every `service`/`repository` and of the core
+platform packages and fails on Fiber or fasthttp. Fiber code goes in
+`handler/` or a platform `<pkg>http` adapter (`authzhttp`, `audithttp`,
+`tenanthttp`, `featureshttp`, `apikeyhttp`, `apperrorhttp`).
 
 Why a `catalog` subpackage: the module root imports its handler and service, so
 a handler referencing a root constant would be an import cycle. The leaf can be
@@ -171,7 +179,7 @@ func (m *Module) Locales() fs.FS { return widgetscatalog.Locales() }
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	group := v1.Group("/widgets", deps.Authenticate())
-	group.Get("/health", deps.Limiters.Relaxed, authz.Require(widgetscatalog.PermissionRead), m.handler.Health)
+	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.Health)
 }
 ```
 
@@ -188,6 +196,26 @@ type Service struct{ repository Repository }
 func New(repository Repository) *Service { return &Service{repository: repository} }
 
 func (s *Service) Ping(ctx context.Context) error { return s.repository.Ping(ctx) }
+```
+
+### Module-owned configuration
+
+`app.Infra` carries infrastructure plus only the shared configuration in
+`Infra.Platform` (`App`, `JWT`, `Tenant`). A module that needs its own
+`config` section declares a `Settings` struct and takes it as a `Build`
+parameter; `bootstrap.Build(cfg, infra)` fills it, so no module can read
+another module's settings (identity, files, and webhooks do this):
+
+```go
+// Settings is the widgets module's own configuration.
+type Settings struct {
+	MaxItems int
+}
+
+func Build(infra app.Infra, settings Settings) *Module {
+	repo := widgetsrepository.New(infra.Pool)
+	return New(widgetshandler.New(widgetsservice.New(repo, settings.MaxItems)))
+}
 ```
 
 `repository/repository.go` holds the pool (wrap the generated `sqlc.Queries`
@@ -232,21 +260,21 @@ module's routes. Recommended per-route chain:
 ```mermaid
 flowchart LR
     A["deps.Authenticate()<br/>(group)"] --> B["rate limit tier<br/>Strict / Normal / Relaxed"]
-    B --> C["authz.Require(perm)"]
+    B --> C["authzhttp.Require(perm)"]
     C --> D["deps.Idempotency<br/>(safe mutations only)"]
-    D --> E["audit.Guard<br/>(Tier 2 privileged)"]
+    D --> E["audithttp.Guard<br/>(Tier 2 privileged)"]
     E --> F[handler]
 ```
 
 | Rule | Detail |
 | --- | --- |
-| One auth chain | `deps.Authenticate()`: `Authorization: ApiKey` is verified by `deps.APIKeyVerifier` (nil → API-key attempts get 401), everything else by JWT + session validation. API-key scopes become the subject's permissions, so `authz.Require` gates both. Plain `middleware.JWTAuth` only with a commented security reason (today only `POST /auth/logout-all`, which revokes login sessions an API key does not have). |
+| One auth chain | `deps.Authenticate()`: `Authorization: ApiKey` is verified by `deps.APIKeyVerifier` (nil → API-key attempts get 401), everything else by JWT + session validation. API-key scopes become the subject's permissions, so `authzhttp.Require` gates both. Plain `middleware.JWTAuth` only with a commented security reason (today only `POST /auth/logout-all`, which revokes login sessions an API key does not have). |
 | Where auth goes | On the module group (or per route for mixed public/private groups), never the root app. Do not capture a second config copy; `deps.Config`/`deps.Sessions` are already wired in. |
 | Rate-limit tier | `Strict` for credential/token endpoints, `Normal` for mutations and uploads, `Relaxed` for reads. |
 | Permissions | Every route, even reads. Public routes are an explicit product decision and still get a rate limit. |
 | Idempotency | Only on mutating routes safe to replay. Never on login, refresh, logout, forgot/reset/verify, OAuth callbacks, or routes returning a plaintext secret/token (API-key create/rotate, webhook endpoint/source create and `rotate-secret`) — the replay cache would store it for 24h. |
-| Audit | Privileged mutations are Tier 1 (`audit.TxRecorder` in the service transaction) or carry `audit.Guard` with `audit.ModeRequired` after idempotency. |
-| Order | `test/arch` requires `authz.Require` and `audit.Guard` to come before the final handler (a check after it never runs first), and `audit.Guard` after `deps.Idempotency`. |
+| Audit | Privileged mutations are Tier 1 (`audit.TxRecorder` in the service transaction) or carry `audithttp.Guard` with `audithttp.ModeRequired` after idempotency. |
+| Order | `test/arch` requires `authzhttp.Require` and `audithttp.Guard` to come before the final handler (a check after it never runs first), and `audithttp.Guard` after `deps.Idempotency`. |
 | Errors/responses | Return `*apperror.AppError`; use `pkg/response`, never raw `c.JSON`. |
 | Static paths | Metrics and audit use `c.Route().Path` as the template; generated paths create high-cardinality labels and a poor audit trail. |
 
@@ -256,11 +284,11 @@ Reference route table:
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	group := v1.Group("/widgets", deps.Authenticate())
 
-	group.Get("/", deps.Limiters.Relaxed, authz.Require(widgetscatalog.PermissionRead), m.handler.List)
-	group.Get("/:id", deps.Limiters.Relaxed, authz.Require(widgetscatalog.PermissionRead), m.handler.Get)
-	group.Post("/", deps.Limiters.Normal, authz.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Create)
-	group.Put("/:id", deps.Limiters.Normal, authz.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Update)
-	group.Delete("/:id", deps.Limiters.Normal, authz.Require(widgetscatalog.PermissionDelete), deps.Idempotency, m.handler.Delete)
+	group.Get("/", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.List)
+	group.Get("/:id", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.Get)
+	group.Post("/", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Create)
+	group.Put("/:id", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Update)
+	group.Delete("/:id", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionDelete), deps.Idempotency, m.handler.Delete)
 }
 ```
 
@@ -273,8 +301,8 @@ permission and keep the module's routes together.
 
 | Exception | Today | Target |
 | --- | --- | --- |
-| Public routes | The `publicRoutes` allowlist in `test/arch/routes_test.go` (anonymous/token-possession auth flows and the HMAC-authenticated webhook receiver) is the complete list of `/api/v1` routes without `authz.Require`. Every other route, including all `files` routes and `POST /auth/logout-all` (`sessions:revoke`), requires a permission. | Adding to the list is a reviewed product decision. |
-| Fallback-audited mutations | Only the public webhook receiver and the caller's own notification state (`read-all`, `:id/read`, preferences) are neither Tier 1 nor `audit.Guard`ed; the best-effort global middleware records them (`fallbackAudited` in `test/arch/audit_routes_test.go`). Webhook administration and `POST /notifications/send` are guarded. | Never extend the list with privileged mutations. |
+| Public routes | The `publicRoutes` allowlist in `test/arch/routes_test.go` (anonymous/token-possession auth flows and the HMAC-authenticated webhook receiver) is the complete list of `/api/v1` routes without `authzhttp.Require`. Every other route, including all `files` routes and `POST /auth/logout-all` (`sessions:revoke`), requires a permission. | Adding to the list is a reviewed product decision. |
+| Fallback-audited mutations | Only the public webhook receiver and the caller's own notification state (`read-all`, `:id/read`, preferences) are neither Tier 1 nor `audithttp.Guard`ed; the best-effort global middleware records them (`fallbackAudited` in `test/arch/audit_routes_test.go`). Webhook administration and `POST /notifications/send` are guarded. | Never extend the list with privileged mutations. |
 | `identity` user reads/updates | `GET/PUT/DELETE /users/:id` require `profile:read`/`profile:write`, then allow another user's id only if the caller also holds the matching `admin:users:*` permission (`httpx.Can` in the handler). | Keep the route permission; move row-level ownership into the service. |
 | `users` references from other modules | `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` keep `(tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE RESTRICT`. Users are soft-deleted, so the key only guarantees same-tenant ownership and never cascades across the module boundary. | No new cross-module foreign keys; core identity references need explicit owner approval. |
 
@@ -322,7 +350,7 @@ Permission checklist:
 
 1. Add constants and `Grant`s in `catalog/permissions.go`.
 2. Grant `user` only when end users need the capability.
-3. Protect every route with `authz.Require` (or `RequireAny` for a documented
+3. Protect every route with `authzhttp.Require` (or `RequireAny` for a documented
    union); `test/arch` fails on an unprotected route.
 4. Add a role-matrix assertion in `module_test.go` if grants are non-trivial.
 5. Mention the permission names in the module README.
@@ -344,8 +372,8 @@ code renders as 500 `system.internal` and logs an error.
 | Tier | Mechanism | On audit write failure |
 | --- | --- | --- |
 | Tier 1 (privileged, in-transaction) | service calls `audit.TxRecorder.RecordTx` in the mutation transaction | transaction rolls back; `503 system.audit_unavailable` |
-| Tier 2 (privileged route) | `audit.Guard` after idempotency (the zero `audit.Policy` mode is `ModeRequired`; best-effort must be set explicitly with `ModeBestEffort`, and any other value is treated as required) writes a started intent row, then completes it as succeeded/failed/denied | request fails with `system.audit_unavailable` |
-| Fallback | global `platform/audit.Middleware` | logged and counted in `audit_write_failures_total`; request succeeds |
+| Tier 2 (privileged route) | `audithttp.Guard` after idempotency (the zero `audithttp.Policy` mode is `ModeRequired`; best-effort must be set explicitly with `ModeBestEffort`, and any other value is treated as required) writes a started intent row, then completes it as succeeded/failed/denied | request fails with `system.audit_unavailable` |
+| Fallback | global `audithttp.Middleware` | logged and counted in `audit_write_failures_total`; request succeeds |
 
 The fallback middleware records a successful (2xx) POST/PUT/PATCH/DELETE with
 actor, route template, request ID, IP, user agent, and status. It skips routes
@@ -617,13 +645,15 @@ Rules:
 | any `internal/modules/<a>` | `internal/modules/<b>` (any package) |
 | `internal/platform/*`, `pkg/*` | any `internal/modules/*` |
 | a module handler | its own repository, another module, Fiber global setup |
-| a module service | Fiber context/handlers, another module |
+| a module service | Fiber/fasthttp (even transitively), sqlc, pgx, its own `dto`/`handler`, another module |
+| a module repository | Fiber/fasthttp (even transitively), another module's `sqlc` |
 | `internal/contracts/*` | any module implementation, repository, DTO, sqlc, storage, database, session, or Fiber |
 | `cmd/api`, `internal/bootstrap` | module internals other than `Build`/`Provides` |
 | anything but `cmd/*`/`test/*` | `internal/bootstrap` |
 
 `test/arch/imports_test.go` fails the build on cross-module and
-platform/pkg-to-module imports. Run `make arch` after adding a module. Do not
+platform/pkg-to-module imports; `framework_free_test.go` and
+`layering_test.go` enforce the service/repository rows. Run `make arch` after adding a module. Do not
 weaken the test to make a shortcut compile; introduce a contract instead.
 
 ## 10. Tests
@@ -639,7 +669,7 @@ weaken the test to make a shortcut compile; introduce a contract instead.
 A handler test should not need PostgreSQL:
 
 ```go
-app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 app.Post("/api/v1/widgets", handler.Create)
 
 req, _ := http.NewRequest(http.MethodPost, "/api/v1/widgets", strings.NewReader(`{"name":"demo"}`))
@@ -691,7 +721,7 @@ no further edits):
 flowchart LR
     A[config] --> B[database pool] --> C[storage] --> D[cache] --> E[email]
     E --> F["app.Infra<br/>pool · tx · cache · audit ·<br/>queue · queued email · storage · flags"]
-    F --> G[bootstrap.Build] --> H[app.RegisterCatalogs] --> I["validate FEATURE_FLAGS<br/>against catalog"]
+    F --> G["bootstrap.Build(cfg, infra)"] --> H[app.RegisterCatalogs] --> I["validate FEATURE_FLAGS<br/>against catalog"]
     I --> J["i18n.New(LocaleSources)"] --> K[Modules.Startup] --> L["app.New +<br/>Register(List...)"] --> M[worker + Listen]
 ```
 
@@ -702,12 +732,17 @@ Rules:
 
 - `Build` must not perform I/O; startup checks that need the database go in a
   method exposed as `Modules.Startup` (see identity).
-- Keep module-specific dependencies in `Build`; do not grow `app.Infra` or
+- Keep module-specific dependencies and settings in `Build` (a `Settings`
+  struct for configuration); do not grow `app.Infra`, `Infra.Platform`, or
   `app.Deps` for one module.
 - Register before `Listen`. Duplicate paths are a programming error; a catalog
   conflict fails `app.RegisterCatalogs` (and panics in `Register`).
 - Durable work: implement `RegisterJobs(jobs.Registrar)` as webhooks does for
-  `webhook.delivery` and `webhook.dispatch`. Job kinds use a
+  `webhook.delivery` and `webhook.dispatch`. The registrar runs every handler
+  (and every durable event handler) under `authz.SystemContext`, so service
+  calls without a subject pass `authz.Authorize`; outside a job, a subject-less
+  service call is `403`. Wrap an undecodable or invalid payload error with
+  `jobs.Permanent` so it dead-letters instead of retrying. Job kinds use a
   `<module>.<action>` prefix; slow kinds can move to a dedicated worker with
   `jobs.WithKinds`/`WithExcludeKinds`.
 - Do not enqueue work during `RegisterRoutes`; a request or an explicit startup

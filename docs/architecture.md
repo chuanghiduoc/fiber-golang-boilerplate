@@ -56,6 +56,8 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `admin` never imports identity/files, sqlc, `pkg/storage`, `pkg/database`, or the session store. | admin check |
 | The deleted shared `internal/{handler,service,dto,repository}` and `internal/sqlc` packages cannot return. | legacy-package checks |
 | Module SQL touches only owned tables (or platform tables). | `test/arch/table_ownership_test.go` |
+| Core packages (`pkg/apperror`, `pkg/storage`, `platform/authz`, `tenant`, `audit`, `apikey`, `features`) and every module `service`/`repository` never import Fiber/fasthttp, even transitively; `pkg/storage` and `files/service` never import the AWS SDK. | `test/arch/framework_free_test.go` |
+| Inside a module, `service/` never imports sqlc, pgx, Fiber, or its own `dto/`/`handler/`; `handler/` never imports `repository/`, sqlc, or pgx ([ADR 0002](adr/0002-module-layering.md)). Existing violations are frozen in `layering_allowlist.txt`, which only shrinks. | `test/arch/layering_test.go` |
 
 ### Packages
 
@@ -65,7 +67,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `cmd/migrate` | The only DDL entrypoint |
 | `cmd/seed` | Standalone admin seeder (schema must already exist) |
 | `config` | Env parsing, one file per concern (`app.go`, `auth.go`, `database.go`, `webhook.go`, ...); `Config.Validate` runs the section validators in a fixed order and reports the first error |
-| `internal/app` | Fiber app, global middleware, infra routes, module registry + provider hooks, `app.Infra` |
+| `internal/app` | Fiber app, global middleware, infra routes, module registry + provider hooks, `app.Infra` (shared config in `Infra.Platform`: App, JWT, Tenant), system-context job registrar |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (used by `cmd/api` and `test/arch`) |
 | `internal/contracts/<provider>` | Stdlib-only contracts grouped by providing module: `identity` (admin, principal reader, notification recipient), `files` (admin), `notifications` (notifier), `webhooks` (event/dispatcher) |
 | `internal/platform/*` | Cross-cutting mechanics (table below) |
@@ -84,17 +86,17 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 
 | Platform package | Responsibility |
 |---|---|
-| `apikey` | Key generation/hash, verifier, rotation grace, `ApiKey` middleware |
-| `authz` | Subject/policies, permission catalog, ABAC + route middleware |
-| `audit` | Audit recorder, `Guard`, fallback mutating-request middleware |
+| `apikey` | Key generation/hash, verifier, rotation grace; `apikeyhttp.Authenticate` is the `ApiKey` middleware |
+| `authz` | Subject/policies, permission catalog, ABAC, `Authorize`, `SystemContext`; route middleware in `authzhttp` (`Require`, `RequireAny`, `SetSubject`, `SubjectFromFiber`) |
+| `audit` | Audit recorder and Tier 1 `TxRecorder`; `audithttp` holds `Guard`, `Policy`/`Mode*`, `AddMetadata`, and the fallback mutating-request middleware |
 | `events` | Typed in-process bus + durable job-backed subscriptions |
-| `features` | Compile-time flag catalog, evaluator, snapshot cache, DB store |
+| `features` | Compile-time flag catalog, evaluator, snapshot cache, DB store; route gate in `featureshttp` |
 | `i18n` | Embedded `en`/`vi` catalogs, `Accept-Language` negotiation, localization |
 | `jobs` | Durable PostgreSQL queue, worker, leases, retention |
 | `requestctx` | Request ID + actor propagation through context |
 | `scheduler` | PostgreSQL-leader interval/cron scheduler + unique run ledger |
 | `session` | Token-version/session cache |
-| `tenant` | Request tenant resolver + locals helpers (`X-Tenant-Slug`) |
+| `tenant` | Request tenant resolver and context helpers; `tenanthttp` holds the `X-Tenant-Slug` middleware and `ID`/`Slug` readers for `fiber.Ctx` |
 | `tracing` | OpenTelemetry provider (no-op when disabled) |
 | `versioning` | V1/V2 policy, `Accept-Version` assertions, deprecation headers |
 
@@ -106,7 +108,7 @@ sequenceDiagram
     participant C as Client
     participant G as Global middleware
     participant V as /api versioning
-    participant T as tenant.Middleware
+    participant T as tenanthttp.Middleware
     participant A as Authenticate
     participant R as Route chain
     participant H as Handler
@@ -122,7 +124,7 @@ sequenceDiagram
     T->>A: per-IP auth limiter, then ApiKey or Bearer JWT
     Note over A: 429, 401 bad credential,<br/>403 tenant mismatch
     A->>R: route limiter (strict/normal/relaxed)
-    Note over R: authz.Require (403) then optional feature gate (404)<br/>then Idempotency (replay or 409) then audit.Guard (503)
+    Note over R: authzhttp.Require (403) then optional feature gate (404)<br/>then Idempotency (replay or 409) then audithttp.Guard (503)
     R->>H: c.Next()
     H->>S: validated DTO
     S->>DB: query scoped by tenant.EffectiveID(ctx)
@@ -133,15 +135,15 @@ sequenceDiagram
 
 | Stage | Mounted on | Notes |
 |---|---|---|
-| Global middleware | every route, in the order shown | `i18n.Middleware` runs right after request ID so every response, errors included, carries the negotiated locale. `audit.Middleware` is a fallback and skips routes guarded by `audit.Guard`. |
+| Global middleware | every route, in the order shown | `i18n.Middleware` runs right after request ID so every response, errors included, carries the negotiated locale. `audithttp.Middleware` is a fallback and skips routes guarded by `audithttp.Guard`. |
 | `versioning.Guard` | `/api` | Rejects unknown `/api/vN` before routing. |
-| `versioning.Middleware` + `tenant.Middleware` | `/api/v1` and `/api/v2` groups | v2 exists only when a module implements `app.V2Module`. Probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution. |
-| `deps.Authenticate()` | module group or route | Per-IP `auth` limiter first, then `apikey.Authenticate` wrapping `JWTAuth`. |
-| Route chain | each route | `limiter → authz.Require → [features gate] → deps.Idempotency → audit.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
+| `versioning.Middleware` + `tenanthttp.Middleware` | `/api/v1` and `/api/v2` groups | v2 exists only when a module implements `app.V2Module`. Probes (`/healthz`, `/readyz`, `/metrics`) stay outside tenant resolution. |
+| `deps.Authenticate()` | module group or route | Per-IP `auth` limiter first, then `apikeyhttp.Authenticate` wrapping `JWTAuth`. |
+| Route chain | each route | `limiter → authzhttp.Require → [features gate] → deps.Idempotency → audithttp.Guard → handler`. Idempotency replays short-circuit before the guard, so replays are never re-audited. |
 
 ### Tenant and credential resolution
 
-- `tenant.Middleware` validates `[a-z0-9-]{1,63}` and resolves the slug: header;
+- `tenanthttp.Middleware` validates `[a-z0-9-]{1,63}` and resolves the slug: header;
   validated `?tenant=` fallback only on `/auth/google`, `/auth/reset-password`,
   and `/auth/verify-email`; otherwise `TENANT_DEFAULT_SLUG`
   (`TENANT_REQUIRE_HEADER=true` disables the default). It stores
@@ -241,21 +243,33 @@ future work.
 ## Authorization
 
 - Routes are protected by permissions, never role strings:
-  `authz.Require(authz.Permission...)` (every route; enforced by `test/arch`).
+  `authzhttp.Require(authz.Permission...)` (every route; enforced by `test/arch`).
   API-key subjects use their explicit scopes; JWT subjects derive them from the
   role catalog.
 - Services add object-level checks with `authz.Authorize`: an RBAC pre-check,
   then a deny-overrides `PolicySet` over a `Resource` that fails closed when
   empty. `TenantPolicy` allows only the subject's tenant (or a `CrossTenant`
   platform subject); `OwnerPolicy` only the owner.
+- `authz.Authorize` is the single service-level path and fails closed: a
+  subject is evaluated against permission + policies; a context marked with
+  `authz.SystemContext` (job handlers via `internal/app`'s registrar wrapper,
+  the admin seeder) is allowed when it carries no subject; anything else is
+  `403`. Never derive a system context from an HTTP request.
+- Framework split: core packages (`pkg/apperror`, `platform/authz`, `tenant`,
+  `audit`, `apikey`, `features`) and every module `service`/`repository` are
+  Fiber-free; Fiber adapters live in `*http` subpackages (`apperrorhttp`,
+  `authzhttp`, `tenanthttp`, `audithttp`, `apikeyhttp`, `featureshttp`).
+  `test/arch/framework_free_test.go` enforces it, and keeps the AWS SDK in
+  `pkg/storage/s3store` (driver selection: `pkg/storage/drivers`).
 
 | Decision | HTTP |
 |---|---|
-| Missing permission (`authz.Require`) or explicit deny | `403 permission.denied` |
+| Missing permission (`authzhttp.Require`) or explicit deny | `403 permission.denied` |
 | Boundary mismatch (`Conceal`, other tenant/owner) | `404` |
 
-Files use tenant + owner policies; admin files use the tenant policy only;
-direct trusted callers without a subject keep repository-scoped checks.
+Files use tenant + owner policies; admin files use the tenant policy only. A
+call without a subject is allowed only under `authz.SystemContext` and still
+keeps the repository's tenant scoping.
 
 ## Data and transactions
 
@@ -270,8 +284,10 @@ direct trusted callers without a subject keep repository-scoped checks.
   coordination point.
 - Email delivery and durable events are at-least-once; handlers must be
   idempotent. Terminal jobs clear their payload and are purged after a global
-  retention window. Email payloads are AES-256-GCM sealed with a key derived
-  from `JWT_SECRET` (HKDF); rotate the secret only after draining the queue.
+  retention window. Email and password-reset payloads are AES-256-GCM sealed
+  with a key derived (HKDF) from `DATA_ENCRYPTION_KEY`; envelopes name their
+  key, so it rotates in two phases through `DATA_ENCRYPTION_PREVIOUS_KEYS`
+  ([Key rotation](operations.md#key-rotation)).
 - **Outbound webhooks.** Identity registration, file upload/delete (user and
   admin), and file restore emit `user.registered`, `file.uploaded`,
   `file.deleted`, and `file.restored` with `DispatchTx` inside the mutation's
@@ -315,7 +331,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Concern | Convention |
 |---|---|
 | Authorization | Module permissions live in `catalog/permissions.go` and register through `app.PermissionProvider`; only shared back-office permissions stay in `internal/platform/authz`. Notification routes use `notifications:read`/`notifications:write`; sending to another user needs admin-only `notifications:send`. Legacy exceptions: [Module Template](module-template.md#legacy-exceptions-do-not-copy). |
-| Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audit.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
+| Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |
 | API versions | `/api/v1` always; opt-in `/api/v2` via `app.V2Module`. `Accept-Version` must match the path (406 `api.version_unsupported`). Responses carry `API-Version`, `Vary: Accept-Version`, and configured deprecation metadata. Swagger stays on v1. |
@@ -328,7 +344,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 ```mermaid
 flowchart TD
     cfg["config.Load<br/>(FEATURE_FLAGS syntax only)"] --> infra["Infra: tracing, pool, storage, cache,<br/>flag evaluator, email, tx, audit, job queue/worker,<br/>event bus, queued email sender"]
-    infra --> build["bootstrap.Build(infra)<br/>every module's Build + contract wiring"]
+    infra --> build["bootstrap.Build(cfg, infra)<br/>every module's Build + Settings<br/>+ contract wiring"]
     build --> cat["app.RegisterCatalogs<br/>permissions, error codes, flags"]
     cat --> keys["cfg.FeatureFlags.ValidateKnownKeys<br/>unknown FEATURE_FLAGS keys fail here"]
     keys --> i18n["i18n.New(locale, app.LocaleSources)<br/>merge + parity check"]
@@ -350,6 +366,16 @@ flowchart TD
   modules. `test/arch` uses the same `bootstrap.Build`, so route authorization,
   audit coverage, group-middleware overlap, and SQL table ownership are
   checked for every registered module.
+- `app.Infra` carries process-wide infrastructure and only the shared
+  configuration (`Infra.Platform`: App, JWT, Tenant). Module-owned sections
+  reach a module only through its `Settings` struct: `bootstrap.Build(cfg,
+  infra)` passes OAuth/admin seed to identity, storage limits to files, and
+  webhook delivery plus secret keys to webhooks, so no module reads another's
+  settings.
+- `APP_ROLE` selects what the process runs: `all` registers routes and runs
+  the worker; `api` registers routes only; `worker` registers module jobs,
+  events, and schedules without routes (`app.RegisterBackground`) and serves
+  only probes and metrics.
 
 ## Strangler status
 

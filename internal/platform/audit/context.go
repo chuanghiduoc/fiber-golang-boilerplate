@@ -2,6 +2,8 @@ package audit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"time"
 
@@ -133,4 +135,14 @@ func NewServiceEvent(ctx context.Context, action, resource string) Event {
 	event.UserAgent = info.UserAgent
 	event.IdempotencyKeyHash = info.IdempotencyKeyHash
 	return event
+}
+
+// HashIdempotencyKey returns a stable SHA-256 digest for an Idempotency-Key.
+// The raw key is client-controlled and must never be stored in the trail.
+func HashIdempotencyKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
 }

@@ -9,9 +9,11 @@ import (
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features/featureshttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -46,8 +48,8 @@ func (m *Module) Locales() fs.FS { return filescatalog.Locales() }
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters
 	guard := func(action string) fiber.Handler {
-		return audit.Guard(deps.Audit, audit.Policy{
-			Mode:     audit.ModeRequired,
+		return audithttp.Guard(deps.Audit, audithttp.Policy{
+			Mode:     audithttp.ModeRequired,
 			Action:   action,
 			Resource: "file",
 		})
@@ -58,10 +60,10 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// the metadata transaction.
 	// The file_uploads gate runs after auth (so user targets apply) and before
 	// idempotency/audit, so a disabled upload writes no intent row.
-	files.Post("/upload", rl.Normal, authz.Require(filescatalog.PermissionFilesWrite), features.Middleware(deps.Flags, filescatalog.KeyFileUploads), deps.Idempotency, guard("file.uploaded"), m.upload.Upload)
-	files.Get("/", rl.Relaxed, authz.Require(filescatalog.PermissionFilesRead), m.upload.List)
-	files.Get("/:id/download", rl.Relaxed, authz.Require(filescatalog.PermissionFilesRead), m.upload.Download)
-	files.Get("/:id", rl.Relaxed, authz.Require(filescatalog.PermissionFilesRead), m.upload.GetInfo)
-	files.Delete("/:id", rl.Normal, authz.Require(filescatalog.PermissionFilesDelete), deps.Idempotency, guard("file.deleted"), m.upload.Delete)
-	files.Post("/:id/restore", rl.Normal, authz.Require(filescatalog.PermissionFilesRestore), deps.Idempotency, guard("file.restored"), m.upload.Restore)
+	files.Post("/upload", rl.Normal, authzhttp.Require(filescatalog.PermissionFilesWrite), featureshttp.Middleware(deps.Flags, filescatalog.KeyFileUploads), deps.Idempotency, guard("file.uploaded"), m.upload.Upload)
+	files.Get("/", rl.Relaxed, authzhttp.Require(filescatalog.PermissionFilesRead), m.upload.List)
+	files.Get("/:id/download", rl.Relaxed, authzhttp.Require(filescatalog.PermissionFilesRead), m.upload.Download)
+	files.Get("/:id", rl.Relaxed, authzhttp.Require(filescatalog.PermissionFilesRead), m.upload.GetInfo)
+	files.Delete("/:id", rl.Normal, authzhttp.Require(filescatalog.PermissionFilesDelete), deps.Idempotency, guard("file.deleted"), m.upload.Delete)
+	files.Post("/:id/restore", rl.Normal, authzhttp.Require(filescatalog.PermissionFilesRestore), deps.Idempotency, guard("file.restored"), m.upload.Restore)
 }

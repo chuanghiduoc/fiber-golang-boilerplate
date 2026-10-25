@@ -22,11 +22,14 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey/apikeyhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 const apiKeyIntegrationSecret = "api-key-integration-secret"
@@ -40,6 +43,12 @@ type apiKeyHarness struct {
 	other  int64
 	user   int64
 	userB  int64
+}
+
+// systemTenantCtx is a trusted system-caller context for tenantID; these
+// tests drive the API-key service directly, without an HTTP subject.
+func systemTenantCtx(tenantID int64) context.Context {
+	return authz.SystemContext(tenant.WithID(context.Background(), tenantID))
 }
 
 func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
@@ -73,12 +82,12 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
 	svc := apikeyservice.NewService(apiKeyRepo, principalReader, nil, audit.Noop{})
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
-	api := app.Group("/api/v1", tenant.Middleware(
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	api := app.Group("/api/v1", tenanthttp.Middleware(
 		identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
 		tenant.DefaultSlug,
 	))
-	protected := api.Group("/protected", apikey.Authenticate(
+	protected := api.Group("/protected", apikeyhttp.Authenticate(
 		middleware.JWTAuth(apiKeyIntegrationSecret),
 		verifier,
 	))
@@ -122,7 +131,7 @@ func (h *apiKeyHarness) request(t *testing.T, key, slug string) (res *http.Respo
 func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	h := setupAPIKeyHarness(t)
 
-	created, err := h.svc.Create(tenant.WithID(context.Background(), h.tenant), h.user, apikeydto.CreateRequest{
+	created, err := h.svc.Create(systemTenantCtx(h.tenant), h.user, apikeydto.CreateRequest{
 		Name:   "integration",
 		Scopes: []string{"files:read"},
 	})
@@ -159,7 +168,7 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode, "tenant mismatch")
 
 	// Rotation keeps the old key valid during grace and issues a working new key.
-	rotated, err := h.svc.Rotate(tenant.WithID(context.Background(), h.tenant), created.ID)
+	rotated, err := h.svc.Rotate(systemTenantCtx(h.tenant), created.ID)
 	require.NoError(t, err)
 	resp, _ = h.request(t, created.Key, "")
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "old key within rotation grace")
@@ -167,7 +176,7 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "new key after rotation")
 
 	// Revocation is immediate.
-	require.NoError(t, h.svc.Revoke(tenant.WithID(context.Background(), h.tenant), rotated.ID))
+	require.NoError(t, h.svc.Revoke(systemTenantCtx(h.tenant), rotated.ID))
 	resp, _ = h.request(t, rotated.Key, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode, "revoked key")
 }
@@ -175,7 +184,7 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	h := setupAPIKeyHarness(t)
 
-	keyB, err := h.svc.Create(tenant.WithID(context.Background(), h.other), h.userB, apikeydto.CreateRequest{
+	keyB, err := h.svc.Create(systemTenantCtx(h.other), h.userB, apikeydto.CreateRequest{
 		Name:   "tenant-b",
 		Scopes: []string{"files:read"},
 	})

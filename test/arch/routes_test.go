@@ -10,6 +10,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 )
 
 // publicRoutes are the deliberate exceptions to "every /api/v1 route checks a
@@ -32,13 +33,13 @@ var publicRoutes = map[string]string{
 
 // authzPackage and authzFuncs identify the permission middleware
 // constructors by full import path (runtime.FuncForPC names their closures
-// "<module>/internal/platform/authz.Require.func1").
-const authzPackage = "internal/platform/authz"
+// "<module>/internal/platform/authz/authzhttp.Require.func1").
+const authzPackage = "internal/platform/authz/authzhttp"
 
 var authzFuncs = []string{"Require", "RequireAny"}
 
 // TestEveryProtectedRouteRequiresAPermission fails when a route under
-// /api/v1 or /api/v2 has no authz.Require/RequireAny in its handler chain and
+// /api/v1 or /api/v2 has no authzhttp.Require/RequireAny in its handler chain and
 // is not an explicitly listed public route. It runs over every module in
 // internal/bootstrap, so a new module is checked without editing this test.
 func TestEveryProtectedRouteRequiresAPermission(t *testing.T) {
@@ -66,7 +67,7 @@ func TestEveryProtectedRouteRequiresAPermission(t *testing.T) {
 }
 
 // authzRouteProblem returns why route breaks the permission rule, or "". A
-// protected route needs authz.Require/RequireAny before its final handler:
+// protected route needs authzhttp.Require/RequireAny before its final handler:
 // Fiber runs the chain in order and the last handler is the endpoint, so a
 // check placed after it never guards it. A public route checks no permission.
 func authzRouteProblem(route fiber.Route, public bool) string {
@@ -77,15 +78,15 @@ func authzRouteProblem(route fiber.Route, public bool) string {
 	case public:
 		return ""
 	case !hasAuthz:
-		return "has no authz.Require in its handler chain; protect it or add it to publicRoutes with a reason"
+		return "has no authzhttp.Require in its handler chain; protect it or add it to publicRoutes with a reason"
 	case !handlerBeforeFinal(route, authzPackage, authzFuncs...):
-		return "runs authz.Require only after its final handler; move it before the handler"
+		return "runs authzhttp.Require only after its final handler; move it before the handler"
 	}
 	return ""
 }
 
 func TestAuthzRouteProblem(t *testing.T) {
-	require := authz.Require(authz.PermissionAdminUsersRead)
+	require := authzhttp.Require(authz.PermissionAdminUsersRead)
 	cases := map[string]struct {
 		handlers []fiber.Handler
 		public   bool

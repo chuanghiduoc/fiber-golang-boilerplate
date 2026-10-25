@@ -20,7 +20,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey/apikeyhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
@@ -30,9 +32,11 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/versioning"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 )
@@ -214,14 +218,14 @@ const authLimiterTier = "auth"
 // routes: `Authorization: ApiKey` is verified by APIKeyVerifier and everything
 // else by the JWT/session middleware. A nil verifier keeps JWT behavior and
 // rejects API-key attempts with 401. Route permissions still come from
-// authz.Require, which sees an API key's scopes as the subject permissions.
+// authzhttp.Require, which sees an API key's scopes as the subject permissions.
 //
 // A per-client-IP limit (RATE_LIMIT_AUTH_*) runs first, because the caller
 // is unknown until authentication succeeds and the per-user tiers mounted
 // after it cannot throttle floods of bogus credentials, each of which would
 // otherwise cost an API-key lookup or session check.
 func (d Deps) Authenticate() fiber.Handler {
-	authenticate := apikey.Authenticate(middleware.JWTAuth(d.Config.JWT.Secret, d.Sessions), d.APIKeyVerifier)
+	authenticate := apikeyhttp.Authenticate(middleware.JWTAuthKeys(d.Config.JWT.Keyring(), d.Sessions), d.APIKeyVerifier)
 	guard := d.authGuard
 	if guard == nil {
 		return authenticate
@@ -262,7 +266,7 @@ func New(cfg *config.Config, deps Deps) *App {
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
-		ErrorHandler: apperror.FiberErrorHandlerWithLocalizer(deps.I18n),
+		ErrorHandler: apperrorhttp.FiberErrorHandlerWithLocalizer(deps.I18n),
 		BodyLimit:    cfg.App.BodyLimit,
 		ReadTimeout:  60 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -330,7 +334,7 @@ func (a *App) setupGlobalMiddleware() {
 	// Fiber's BodyLimit is the multipart upload ceiling; every other body is
 	// capped here before auth, rate limiting, or decoding run.
 	a.fiber.Use(middleware.BodyLimit(a.cfg.App.EffectiveJSONBodyLimit()))
-	a.fiber.Use(audit.Middleware(a.deps.Audit))
+	a.fiber.Use(audithttp.Middleware(a.deps.Audit))
 	requestTimeout := time.Duration(a.cfg.App.RequestTimeout) * time.Second
 	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
 		slog.Warn("APP_REQUEST_TIMEOUT plus post-handler work exceeds the shutdown drain window; in-flight requests may be cut off on shutdown",
@@ -435,7 +439,7 @@ func (a *App) Register(modules ...Module) {
 	if a.cfg.Tenant.RequireHeader {
 		defaultSlug = ""
 	}
-	tenantMiddleware := tenant.Middleware(a.deps.TenantResolver, defaultSlug)
+	tenantMiddleware := tenanthttp.Middleware(a.deps.TenantResolver, defaultSlug)
 
 	v1 := a.fiber.Group("/api/v1",
 		versioning.Middleware(versioning.V1, a.deps.Versioning),
@@ -444,28 +448,9 @@ func (a *App) Register(modules ...Module) {
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		m.RegisterRoutes(v1, a.deps)
-
-		// Optional capabilities are type assertions: a module that only serves
-		// routes does not need any event/job/schedule plumbing. Nil deps make
-		// each hook a no-op for tests and minimal deployments.
-		if provider, ok := m.(ScheduleProvider); ok && a.deps.Schedules != nil {
-			provider.RegisterSchedules(a.deps.Schedules)
-		}
-		if provider, ok := m.(EventProvider); ok && a.deps.Events != nil {
-			provider.RegisterEvents(a.deps.Events)
-		}
-		if provider, ok := m.(JobProvider); ok && a.deps.Jobs != nil {
-			provider.RegisterJobs(a.deps.Jobs)
-		}
+		a.registerProviders(m)
 	}
-
-	// Durable event subscriptions become worker handlers only after every
-	// module has had a chance to subscribe. RegisterJobs is idempotent.
-	if a.deps.Events != nil && a.deps.Jobs != nil {
-		if err := a.deps.Events.RegisterJobs(a.deps.Jobs); err != nil {
-			slog.Warn("failed to register durable event job handlers", slog.Any("error", err))
-		}
-	}
+	a.registerDurableEvents()
 
 	if !hasV2 {
 		return
@@ -477,6 +462,48 @@ func (a *App) Register(modules ...Module) {
 	for _, m := range modules {
 		if v2Module, ok := m.(V2Module); ok {
 			v2Module.RegisterV2Routes(v2, a.deps)
+		}
+	}
+}
+
+// RegisterBackground registers module catalogs and the schedule, event, and
+// job providers without mounting any /api route. APP_ROLE=worker uses it:
+// the process serves only the infrastructure routes (health, metrics) while
+// its worker runs every module's handlers. Call it instead of Register.
+func (a *App) RegisterBackground(modules ...Module) {
+	if err := RegisterCatalogs(modules...); err != nil {
+		panic(fmt.Sprintf("app: register module catalogs: %v", err))
+	}
+	for _, m := range modules {
+		a.modules = append(a.modules, m)
+		a.registerProviders(m)
+	}
+	a.registerDurableEvents()
+}
+
+// registerProviders invokes m's optional capabilities. They are type
+// assertions: a module that only serves routes does not need any
+// event/job/schedule plumbing. Nil deps make each hook a no-op for tests and
+// minimal deployments.
+func (a *App) registerProviders(m Module) {
+	if provider, ok := m.(ScheduleProvider); ok && a.deps.Schedules != nil {
+		provider.RegisterSchedules(a.deps.Schedules)
+	}
+	if provider, ok := m.(EventProvider); ok && a.deps.Events != nil {
+		provider.RegisterEvents(a.deps.Events)
+	}
+	if provider, ok := m.(JobProvider); ok && a.deps.Jobs != nil {
+		provider.RegisterJobs(systemRegistrar{next: a.deps.Jobs})
+	}
+}
+
+// registerDurableEvents turns durable event subscriptions into worker
+// handlers. It runs only after every module has had a chance to subscribe;
+// RegisterJobs is idempotent.
+func (a *App) registerDurableEvents() {
+	if a.deps.Events != nil && a.deps.Jobs != nil {
+		if err := a.deps.Events.RegisterJobs(systemRegistrar{next: a.deps.Jobs}); err != nil {
+			slog.Warn("failed to register durable event job handlers", slog.Any("error", err))
 		}
 	}
 }

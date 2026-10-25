@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -174,5 +175,45 @@ func TestAdminFileService_ABACTenantPolicy(t *testing.T) {
 	_, _, err = svc.Download(noScopes, 1)
 	requireStatus(t, err, 403)
 	_, err = svc.GetFileStats(noScopes)
+	requireStatus(t, err, 403)
+}
+
+// systemCtx is the trusted background-caller context. Tests that exercise
+// service mechanics rather than authorization use it, because a context with
+// neither a subject nor the system marker is denied.
+func systemCtx() context.Context {
+	return authz.SystemContext(context.Background())
+}
+
+func TestFileServices_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
+	repo := newMockFileRepo()
+	store := newMockStorage()
+	seedABACFiles(repo, store)
+	svc := NewUploadService(repo, store)
+	ctx := tenant.WithID(context.Background(), 1)
+
+	_, err := svc.Upload(ctx, 10, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+	requireStatus(t, err, 403)
+	if repo.nextID != 4 {
+		t.Fatal("a denied upload must not create a file row")
+	}
+	_, err = svc.GetFileInfo(ctx, 1, 10)
+	requireStatus(t, err, 403)
+	_, _, err = svc.Download(ctx, 1, 10)
+	requireStatus(t, err, 403)
+	_, _, err = svc.List(ctx, 10, 10, "", false)
+	requireStatus(t, err, 403)
+	requireStatus(t, svc.Delete(ctx, 1, 10), 403)
+	if repo.files[1].DeletedAt.Valid {
+		t.Fatal("a denied delete must not soft-delete the file")
+	}
+
+	adminRepo := newFakeAdminFileRepo()
+	seedAdminFiles(adminRepo, 1)
+	admin := NewAdminFileService(adminRepo, nil, audit.Noop{}, newFakeAdminStorage())
+	_, _, err = admin.ListFiles(ctx, 10, "")
+	requireStatus(t, err, 403)
+	requireStatus(t, admin.DeleteFile(ctx, 1), 403)
+	_, err = admin.GetFileStats(ctx)
 	requireStatus(t, err, 403)
 }

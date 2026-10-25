@@ -15,6 +15,7 @@ import (
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -109,7 +110,7 @@ func (m *mockAdminService) GetStats(_ context.Context) (*admindto.AdminStatsResp
 
 func setupAdminApp() *fiber.App {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	adminSvc := newMockAdminService()

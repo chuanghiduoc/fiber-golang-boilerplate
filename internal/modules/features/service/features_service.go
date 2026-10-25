@@ -23,7 +23,7 @@ import (
 )
 
 // Audit actions for the domain events written after each mutation. The
-// route-level audit.Guard intent row is the fail-closed record; these events
+// route-level audithttp.Guard intent row is the fail-closed record; these events
 // carry the flag-specific metadata and link to it through ParentID.
 const (
 	actionFlagUpdated   = "admin.feature_flag.updated"
@@ -285,7 +285,7 @@ func (s *service) invalidate(ctx context.Context) {
 
 // recordEvent writes the post-commit domain event. It cannot roll the
 // committed write back, so a failure is logged; the route's required
-// audit.Guard intent row still records the mutation and its outcome.
+// audithttp.Guard intent row still records the mutation and its outcome.
 func (s *service) recordEvent(ctx context.Context, action, resource, resourceID string, metadata map[string]any) {
 	event := audit.NewServiceEvent(ctx, action, resource)
 	event.ResourceID = resourceID

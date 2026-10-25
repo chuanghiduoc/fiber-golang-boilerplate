@@ -13,6 +13,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -106,9 +107,13 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	if err := w.checkConfigured(); err != nil {
 		return err
 	}
+	// An undecodable payload or a missing delivery id can never succeed.
 	var job repository.DeliveryJobPayload
-	if err := json.Unmarshal(payload, &job); err != nil || job.DeliveryID <= 0 {
-		return fmt.Errorf("webhooks: invalid delivery job payload: %w", err)
+	if err := json.Unmarshal(payload, &job); err != nil {
+		return jobs.Permanent(fmt.Errorf("webhooks: invalid delivery job payload: %w", err))
+	}
+	if job.DeliveryID <= 0 {
+		return jobs.Permanent(errors.New("webhooks: invalid delivery job payload: missing delivery id"))
 	}
 
 	delivery, err := w.store.ClaimDelivery(ctx, job.DeliveryID, w.opts.Lease)

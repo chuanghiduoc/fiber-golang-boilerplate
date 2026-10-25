@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -45,7 +46,9 @@ func Admin(ctx context.Context, cfg config.AdminConfig, userRepo repository.User
 	if len(tenantIDs) > 0 && tenantIDs[0] > 0 {
 		tenantID = tenantIDs[0]
 	}
-	ctx = tenant.WithID(ctx, tenantID)
+	// The seeder is a trusted system caller: it acts for the platform with no
+	// request subject, so mark it for any authz.Authorize on this path.
+	ctx = authz.SystemContext(tenant.WithID(ctx, tenantID))
 
 	email := strings.ToLower(strings.TrimSpace(cfg.Email))
 	name := strings.TrimSpace(cfg.Name)

@@ -532,9 +532,12 @@ func normalizeName(raw string) (string, error) {
 func ensureCallerCanGrant(ctx context.Context, scopes []authz.Permission) error {
 	subject, ok := authz.SubjectFromContext(ctx)
 	if !ok {
-		// Trusted direct callers (background jobs, tests) have no HTTP subject;
-		// the route layer has already performed the permission check.
-		return nil
+		// Fail closed: only a context marked by authz.SystemContext (a trusted
+		// background caller) may mint scopes without a subject to bound them.
+		if authz.IsSystemContext(ctx) {
+			return nil
+		}
+		return apperror.NewCode(apperror.CodePermissionDenied, "insufficient permissions")
 	}
 	for _, scope := range scopes {
 		if !subject.Has(scope) {

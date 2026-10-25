@@ -12,6 +12,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 func TestParseAcceptVersion(t *testing.T) {
@@ -70,7 +71,7 @@ func decodeProblem(t *testing.T, raw []byte) map[string]any {
 }
 
 func TestMiddlewareEchoesVersionAndVary(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(Middleware(V1, nil))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -91,7 +92,7 @@ func TestMiddlewareEchoesVersionAndVary(t *testing.T) {
 }
 
 func TestMiddlewareRejectsMismatchedAcceptVersion(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(Middleware(V1, nil))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -116,7 +117,7 @@ func TestMiddlewareRejectsMismatchedAcceptVersion(t *testing.T) {
 }
 
 func TestMiddlewareV2Fixture(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(Middleware(V2, nil))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString("v2") })
 
@@ -143,7 +144,7 @@ func TestMiddlewareDeprecationHeaders(t *testing.T) {
 			},
 		},
 	}
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(Middleware(V1, cfg))
 	app.Get("/x", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -184,7 +185,7 @@ func TestMiddlewareFutureDeprecationHasNoHeaders(t *testing.T) {
 }
 
 func TestGuardUnsupportedVersion(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use("/api", Guard(V1, V2))
 	app.Get("/api/v1/x", func(c fiber.Ctx) error { return c.SendString("v1") })
 	app.Get("/api/v2/x", func(c fiber.Ctx) error { return c.SendString("v2") })
@@ -215,7 +216,7 @@ func TestGuardUnsupportedVersion(t *testing.T) {
 }
 
 func TestGuardOnlySupportsMountedVersions(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use("/api", Guard(V1))
 	app.Get("/api/v1/x", func(c fiber.Ctx) error { return c.SendString("v1") })
 

@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
 
@@ -34,7 +35,7 @@ func tenantTargetFlags(key features.Key, disabledTenant int64) features.Evaluato
 }
 
 func gateTestApp(authHandler *AuthHandler, tenantID int64) *fiber.App {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		c.SetContext(tenant.WithID(c.Context(), tenantID))
 		return c.Next()

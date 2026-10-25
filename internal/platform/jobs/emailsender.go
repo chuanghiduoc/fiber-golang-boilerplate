@@ -137,11 +137,18 @@ func EmailHandler(sender email.Sender, opts ...EmailHandlerOption) Handler {
 		}
 	}
 
+	// A malformed envelope, undecodable JSON, or a message without recipients
+	// is a property of the job and can never succeed, so it dead-letters
+	// immediately. Decryption failures stay retryable: a worker may be missing
+	// a key another replica already seals with until the rollout completes.
 	return func(ctx context.Context, payload json.RawMessage) error {
 		decoded := []byte(payload)
 		if cfg.codec != nil {
 			var err error
 			decoded, err = cfg.codec.Open(payload)
+			if errors.Is(err, ErrInvalidPayloadEnvelope) {
+				return Permanent(fmt.Errorf("jobs: open email payload: %w", err))
+			}
 			if err != nil {
 				return fmt.Errorf("jobs: open email payload: %w", err)
 			}
@@ -151,10 +158,10 @@ func EmailHandler(sender email.Sender, opts ...EmailHandlerOption) Handler {
 
 		var msg email.Message
 		if err := json.Unmarshal(decoded, &msg); err != nil {
-			return fmt.Errorf("jobs: decode email payload: %w", err)
+			return Permanent(fmt.Errorf("jobs: decode email payload: %w", err))
 		}
 		if len(msg.To) == 0 {
-			return ErrEmailNoRecipients
+			return Permanent(ErrEmailNoRecipients)
 		}
 		return sender.Send(ctx, msg)
 	}

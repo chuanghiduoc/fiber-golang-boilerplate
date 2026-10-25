@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +29,7 @@ func TestUploadList_IncludeDeleted(t *testing.T) {
 	repo.files[2] = &filesqlc.File{ID: 2, TenantID: 1, UserID: 1, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: now}
 	repo.nextID = 3
 
-	activeOnly, _, err := svc.List(context.Background(), 1, 10, "", false)
+	activeOnly, _, err := svc.List(systemCtx(), 1, 10, "", false)
 	if err != nil {
 		t.Fatalf("list active: %v", err)
 	}
@@ -38,7 +37,7 @@ func TestUploadList_IncludeDeleted(t *testing.T) {
 		t.Fatalf("active list = %+v, want only file 1", activeOnly)
 	}
 
-	withDeleted, _, err := svc.List(context.Background(), 1, 10, "", true)
+	withDeleted, _, err := svc.List(systemCtx(), 1, 10, "", true)
 	if err != nil {
 		t.Fatalf("list with deleted: %v", err)
 	}

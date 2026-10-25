@@ -8,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
 
 func tempDir(t *testing.T) string {
@@ -115,24 +113,6 @@ func TestLocalStorage_SafePath_PathTraversal(t *testing.T) {
 	_, err := ls.safePath("../../etc/passwd")
 	if err == nil {
 		t.Error("safePath should reject path traversal")
-	}
-}
-
-func TestNewStorage_Local(t *testing.T) {
-	dir := tempDir(t)
-	s, err := NewStorage(config.StorageConfig{Driver: "local", LocalPath: dir})
-	if err != nil {
-		t.Fatalf("NewStorage(local) failed: %v", err)
-	}
-	if s == nil {
-		t.Fatal("expected non-nil Storage")
-	}
-}
-
-func TestNewStorage_Unsupported(t *testing.T) {
-	_, err := NewStorage(config.StorageConfig{Driver: "gcs"})
-	if err == nil {
-		t.Error("NewStorage should fail for unsupported driver")
 	}
 }
 

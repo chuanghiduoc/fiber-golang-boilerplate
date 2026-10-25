@@ -17,7 +17,7 @@ import (
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
 	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -69,7 +69,7 @@ func (s *fakeService) Rotate(context.Context, int64) (*apikeydto.RotateResponse,
 
 func newModuleTestApp(t *testing.T, svc apikeysvc.Service) *fiber.App {
 	t.Helper()
-	application := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	application := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	pass := func(c fiber.Ctx) error { return c.Next() }
 	deps := app.Deps{
 		Config:      &config.Config{JWT: config.JWTConfig{Secret: moduleTestSecret}},

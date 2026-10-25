@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -146,7 +147,7 @@ func httpSpanName(method, route string) string {
 }
 
 func requestTenantID(c fiber.Ctx) int64 {
-	if id := tenant.ID(c); id != 0 {
+	if id := tenanthttp.ID(c); id != 0 {
 		return id
 	}
 	return tenant.IDFromContext(c.Context())

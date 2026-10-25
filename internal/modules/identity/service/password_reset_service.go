@@ -164,13 +164,15 @@ func (s *passwordResetService) HandleResetRequestJob(ctx context.Context, payloa
 		}
 		raw = opened
 	}
+	// A payload that does not decode or has no address can never succeed, so
+	// it dead-letters immediately; decryption errors above stay retryable.
 	var req resetRequestPayload
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return fmt.Errorf("decode password reset request: %w", err)
+		return jobs.Permanent(fmt.Errorf("decode password reset request: %w", err))
 	}
 	emailAddr := NormalizeEmail(req.Email)
 	if emailAddr == "" {
-		return errors.New("password reset request has no email")
+		return jobs.Permanent(errors.New("password reset request has no email"))
 	}
 	// The worker restores the job's tenant ID; the slug only shapes the link.
 	return s.processResetRequest(tenant.WithSlug(ctx, req.TenantSlug), emailAddr)

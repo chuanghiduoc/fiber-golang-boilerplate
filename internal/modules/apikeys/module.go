@@ -6,7 +6,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 )
 
 // Module owns tenant-scoped API-key administration. Keys authenticate through
@@ -28,11 +28,11 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// does not itself hold, so a key cannot mint a broader key.
 	group := v1.Group("/admin/api-keys", deps.Authenticate(), deps.Limiters.Normal)
 
-	group.Get("/", authz.Require(apikeyscatalog.PermissionAdminAPIKeysRead), m.handler.List)
-	group.Post("/", authz.Require(apikeyscatalog.PermissionAdminAPIKeysCreate), m.handler.Create)
-	group.Get("/:id", authz.Require(apikeyscatalog.PermissionAdminAPIKeysRead), m.handler.Get)
-	group.Put("/:id", authz.Require(apikeyscatalog.PermissionAdminAPIKeysUpdate), deps.Idempotency, m.handler.Update)
-	group.Delete("/:id", authz.Require(apikeyscatalog.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.Revoke)
-	group.Post("/:id/revoke", authz.Require(apikeyscatalog.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.RevokeByPost)
-	group.Post("/:id/rotate", authz.Require(apikeyscatalog.PermissionAdminAPIKeysRotate), m.handler.Rotate)
+	group.Get("/", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysRead), m.handler.List)
+	group.Post("/", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysCreate), m.handler.Create)
+	group.Get("/:id", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysRead), m.handler.Get)
+	group.Put("/:id", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysUpdate), deps.Idempotency, m.handler.Update)
+	group.Delete("/:id", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.Revoke)
+	group.Post("/:id/revoke", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysRevoke), deps.Idempotency, m.handler.RevokeByPost)
+	group.Post("/:id/rotate", authzhttp.Require(apikeyscatalog.PermissionAdminAPIKeysRotate), m.handler.Rotate)
 }

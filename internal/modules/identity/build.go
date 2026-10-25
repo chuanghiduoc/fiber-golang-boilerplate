@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
@@ -37,14 +38,22 @@ type Provides struct {
 	TenantActive func(ctx context.Context, tenantID int64) (bool, error)
 }
 
+// Settings are the configuration sections identity owns. The composition
+// root passes them explicitly; shared settings come from infra.Platform.
+type Settings struct {
+	OAuth config.OAuthConfig
+	// Admin is the optional seed admin created at startup.
+	Admin config.AdminConfig
+}
+
 // Build constructs identity's repositories, services, and handlers from infra.
 // It performs no I/O; call Module.Startup for the tenant/admin-seed checks.
-func Build(infra app.Infra) (*Module, Provides, error) {
-	cfg := infra.Config
+func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
+	cfg := infra.Platform
 
 	var googleOAuth *oauth.GoogleOAuth
-	if cfg.OAuth.GoogleClientID != "" {
-		googleOAuth = oauth.NewGoogleOAuth(cfg.OAuth)
+	if settings.OAuth.GoogleClientID != "" {
+		googleOAuth = oauth.NewGoogleOAuth(settings.OAuth)
 		if err := googleOAuth.ValidateFrontendURL(); err != nil {
 			return nil, Provides{}, fmt.Errorf("invalid OAuth frontend URL: %w", err)
 		}
@@ -75,13 +84,12 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 	)
 	// Forgot-password requests run as durable jobs so the public endpoint has
 	// the same cost and failure modes for registered and unknown addresses.
-	// The address in the payload is sealed like email jobs (JWT_SECRET key).
+	// The address in the payload is sealed like email jobs (DATA_ENCRYPTION_KEY).
 	if infra.Queue != nil {
-		resetCodec, err := jobs.NewPayloadCodec(cfg.JWT.Secret)
-		if err != nil {
-			return nil, Provides{}, fmt.Errorf("password reset job payload encryption: %w", err)
+		if infra.PayloadCodec == nil {
+			return nil, Provides{}, errors.New("password reset job payload encryption: infra.PayloadCodec is required with a job queue")
 		}
-		identityservice.AttachResetRequestQueue(passwordResetSvc, infra.Queue, resetCodec)
+		identityservice.AttachResetRequestQueue(passwordResetSvc, infra.Queue, infra.PayloadCodec)
 	}
 
 	emailVerifRepo := identityrepository.NewEmailVerificationRepository(infra.Pool)
@@ -105,7 +113,7 @@ func Build(infra app.Infra) (*Module, Provides, error) {
 	m.resetSvc = passwordResetSvc
 	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
 	m.startup = func(ctx context.Context) error {
-		return startup(ctx, infra, userRepo, tenantRepo)
+		return startup(ctx, infra.Platform, settings.Admin, userRepo, tenantRepo)
 	}
 
 	return m, Provides{
@@ -177,8 +185,9 @@ func (m *Module) Startup(ctx context.Context) error {
 	return m.startup(ctx)
 }
 
-func startup(ctx context.Context, infra app.Infra, userRepo identityrepository.UserRepository, tenantRepo identityrepository.TenantRepository) error {
-	cfg := infra.Config
+func startup(ctx context.Context, cfg app.PlatformConfig, admin config.AdminConfig,
+	userRepo identityrepository.UserRepository, tenantRepo identityrepository.TenantRepository,
+) error {
 	// The baseline seeds tenant id 1. Startup checks existence, not request
 	// eligibility: a suspended configured/default tenant must not crash the
 	// process. Its requests still return 404 until it is reactivated.
@@ -197,7 +206,7 @@ func startup(ctx context.Context, infra app.Infra, userRepo identityrepository.U
 	}
 
 	// Auto-seed admin user (idempotent) in the configured default tenant.
-	if err := seed.Admin(ctx, cfg.Admin, userRepo, defaultTenant.ID); err != nil {
+	if err := seed.Admin(ctx, admin, userRepo, defaultTenant.ID); err != nil {
 		return fmt.Errorf("failed to seed admin user: %w", err)
 	}
 	return nil

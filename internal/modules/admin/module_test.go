@@ -11,7 +11,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 // TestAdminRoutesDoNotWrapSiblingModules guards against registering auth or
@@ -29,7 +29,7 @@ func TestAdminRoutesDoNotWrapSiblingModules(t *testing.T) {
 		Idempotency: func(c fiber.Ctx) error { return c.Next() },
 	}
 
-	fiberApp := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	fiberApp := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	v1 := fiberApp.Group("/api/v1")
 	admin.New(adminhandler.NewHandler(nil)).RegisterRoutes(v1, deps)
 	// Stand-ins for the features and apikeys modules, registered after admin

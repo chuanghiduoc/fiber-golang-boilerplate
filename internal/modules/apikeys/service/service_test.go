@@ -144,8 +144,29 @@ func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) 
 	return user, nil
 }
 
+// testContext is a trusted system-caller context for tenantID. Tests that
+// model an HTTP caller wrap it with authz.WithSubject; the subject wins.
 func testContext(tenantID int64) context.Context {
-	return tenant.WithID(context.Background(), tenantID)
+	return authz.SystemContext(tenant.WithID(context.Background(), tenantID))
+}
+
+func TestService_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	svc := newTestService(repo, principals)
+
+	_, err := svc.Create(tenant.WithID(context.Background(), 1), 10, apikeydto.CreateRequest{
+		Name: "x", Scopes: []string{"files:read"},
+	})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 403 || appErr.Code != string(apperror.CodePermissionDenied) {
+		t.Fatalf("error = %v, want 403 permission.denied", err)
+	}
+	if len(repo.keys) != 0 {
+		t.Fatal("a denied create must not persist a key")
+	}
 }
 
 func newTestService(repo *fakeRepo, principals identitycontracts.PrincipalReader) Service {

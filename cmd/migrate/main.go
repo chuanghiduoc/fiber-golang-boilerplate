@@ -220,6 +220,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load database config: %w", err)
 	}
+	// golang-migrate holds a session advisory lock for the whole run, so a
+	// transaction-mode pooler in front of the API must be bypassed here
+	// (DB_MIGRATE_HOST / DB_MIGRATE_PORT).
+	dbCfg = dbCfg.ForMigration()
 
 	logger.Setup(os.Getenv("APP_ENV"), os.Getenv("LOG_LEVEL"))
 

@@ -140,6 +140,31 @@ func TestAuthorize_MapsDecisions(t *testing.T) {
 	})
 }
 
+func TestAuthorize_SystemContext(t *testing.T) {
+	resource := Resource{TenantID: 1, OwnerID: 1}
+
+	t.Run("no subject and no marker is denied", func(t *testing.T) {
+		if IsSystemContext(context.Background()) {
+			t.Fatal("a plain context must not be a system context")
+		}
+		err := Authorize(context.Background(), PermissionAdminUsersRead, resource, TenantPolicy{}, OwnerPolicy{})
+		requirePermissionDenied(t, err)
+	})
+
+	t.Run("system marker without subject is allowed", func(t *testing.T) {
+		ctx := SystemContext(context.Background())
+		if err := Authorize(ctx, PermissionAdminUsersRead, resource, TenantPolicy{}, OwnerPolicy{}); err != nil {
+			t.Fatalf("authorize system context: %v", err)
+		}
+	})
+
+	t.Run("subject wins over the system marker", func(t *testing.T) {
+		ctx := SystemContext(WithSubject(context.Background(), NewSubject(2, 2, RoleUser)))
+		requirePermissionDenied(t, Authorize(ctx, PermissionAdminUsersRead, resource, TenantPolicy{}))
+		requireNotFound(t, Authorize(ctx, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{}))
+	})
+}
+
 func requirePermissionDenied(t *testing.T, err error) {
 	t.Helper()
 	var appErr *apperror.AppError

@@ -20,6 +20,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 func newTracingTestApp(t *testing.T) (*fiber.App, *tracetest.SpanRecorder) {
@@ -32,7 +33,7 @@ func newTracingTestApp(t *testing.T) (*fiber.App, *tracetest.SpanRecorder) {
 	)
 	t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
 	app.Use(Tracing(provider, []string{"/healthz", "/readyz", "/health", "/metrics"}, true))
 	return app, recorder
@@ -125,7 +126,7 @@ func TestTracingMiddlewareIgnoresUntrustedTraceParent(t *testing.T) {
 			)
 			t.Cleanup(func() { require.NoError(t, provider.Shutdown(context.Background())) })
 
-			tc.cfg.ErrorHandler = apperror.FiberErrorHandler
+			tc.cfg.ErrorHandler = apperrorhttp.FiberErrorHandler
 			app := fiber.New(tc.cfg)
 			app.Use(Tracing(provider, nil, tc.trustIncoming))
 			app.Get("/traced", func(c fiber.Ctx) error { return c.SendString("ok") })
@@ -256,7 +257,7 @@ func TestTracingMiddlewareUnmatchedRouteDoesNotUseRawPath(t *testing.T) {
 }
 
 func TestTracingMiddlewareNilProviderIsSafe(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
 	app.Use(Tracing(nil, nil, false))
 	app.Get("/ok", func(c fiber.Ctx) error { return c.SendString("ok") })
@@ -300,7 +301,7 @@ func TestLoggerAddsTraceIdentifiers(t *testing.T) {
 	slog.SetDefault(slog.New(capture))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
 	app.Use(Tracing(provider, nil, false))
 	app.Use(Logger())

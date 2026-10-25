@@ -13,7 +13,8 @@ import (
 
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 // recordingAuditRecorder captures audit events so handler-level tests can
@@ -31,7 +32,7 @@ func (r *recordingAuditRecorder) Record(_ context.Context, event audit.Event) er
 // so successful mutations are recorded exactly as they are in production.
 func setupAuthAuditApp(recorder audit.Recorder) *fiber.App {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	authHandler := NewAuthHandler(
@@ -45,7 +46,7 @@ func setupAuthAuditApp(recorder audit.Recorder) *fiber.App {
 		nil,
 	)
 
-	app.Use(audit.Middleware(recorder))
+	app.Use(audithttp.Middleware(recorder))
 	app.Post("/auth/login", authHandler.Login)
 	app.Post("/auth/register", authHandler.Register)
 	app.Post("/auth/refresh", authHandler.Refresh)
@@ -119,7 +120,7 @@ func TestAuthAudit_ActorAttribution(t *testing.T) {
 // sets the auth local nor produces an audit event.
 func TestAuthAudit_FailedLoginIsNotAttributed(t *testing.T) {
 	recorder := &recordingAuditRecorder{}
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 
 	authHandler := NewAuthHandler(
 		newMockService(),
@@ -133,7 +134,7 @@ func TestAuthAudit_FailedLoginIsNotAttributed(t *testing.T) {
 	)
 
 	var actorAfterHandler int64 = -1
-	app.Use(audit.Middleware(recorder))
+	app.Use(audithttp.Middleware(recorder))
 	app.Use(func(c fiber.Ctx) error {
 		err := c.Next()
 		actorAfterHandler = fiber.Locals[int64](c, "user_id")

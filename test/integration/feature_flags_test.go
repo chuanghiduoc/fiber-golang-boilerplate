@@ -37,7 +37,7 @@ import (
 const featureSecret = "feature-flags-integration-secret"
 
 // featureAudit records domain events and implements the intent/completion
-// contracts required by the routes' required-mode audit.Guard.
+// contracts required by the routes' required-mode audithttp.Guard.
 type featureAudit struct {
 	events  []audit.Event
 	intents []audit.Event

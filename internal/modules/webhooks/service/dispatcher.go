@@ -105,12 +105,14 @@ func (d *Dispatcher) DispatchTx(ctx context.Context, tx pgx.Tx, events ...webhoo
 // DispatchJobKind. It is idempotent: deliveries are unique per endpoint and
 // event ID, so a retried job only creates the deliveries still missing.
 func (d *Dispatcher) HandleDispatchJob(ctx context.Context, payload json.RawMessage) error {
+	// A payload that does not decode or lacks its event id/tenant can never
+	// dispatch, so it dead-letters without spending the retry budget.
 	var job dispatchJobPayload
 	if err := json.Unmarshal(payload, &job); err != nil {
-		return fmt.Errorf("webhooks: invalid dispatch job payload: %w", err)
+		return jobs.Permanent(fmt.Errorf("webhooks: invalid dispatch job payload: %w", err))
 	}
 	if job.ID == "" || job.TenantID <= 0 {
-		return fmt.Errorf("%w: dispatch job requires an event id and tenant", webhookcontracts.ErrInvalidEvent)
+		return jobs.Permanent(fmt.Errorf("%w: dispatch job requires an event id and tenant", webhookcontracts.ErrInvalidEvent))
 	}
 	_, err := d.Dispatch(ctx, webhookcontracts.Event{
 		ID:         job.ID,

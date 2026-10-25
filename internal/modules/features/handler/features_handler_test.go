@@ -16,6 +16,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 type fakeService struct {
@@ -83,7 +84,7 @@ func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService) {
 	}
 	h := NewHandler(svc)
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "user_id", 88)
 		c.SetContext(tenant.WithID(c.Context(), 2))

@@ -6,6 +6,26 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Breaking (P0 foundation)
+- Production requires `DATA_ENCRYPTION_KEY` (32+ characters, different from `JWT_SECRET`) for job payload encryption. Upgrade: set the new key and put the current `JWT_SECRET` value in `DATA_ENCRYPTION_PREVIOUS_KEYS` (same HKDF derivation, so queued v1 envelopes still open) until those jobs drain; outside production an empty key still falls back to `JWT_SECRET`.
+- Job payloads and webhook secrets are sealed in envelope v2 (with `kid`); workers from earlier releases cannot open v2 and retry until `max_attempts`. Roll out every worker (including a separate worker Deployment) before relying on newly sealed jobs or creating/rotating webhook secrets. v1 envelopes still decrypt.
+- `authz.Authorize` fails closed: a service call with neither a subject nor `authz.SystemContext` is `403`. apikeys `ensureCallerCanGrant` now denies callers without a subject. Module job handlers and durable event handlers run under `SystemContext` automatically; other in-process callers must mark their context.
+- Fiber adapters moved to `<pkg>http` subpackages: `apperror.FiberErrorHandler`/`Localizer` → `apperrorhttp`; `tenant.Middleware`/`ID`/`Slug` → `tenanthttp`; `authz.Require`/`RequireAny`/`SetSubject`/`SubjectFromFiber` → `authzhttp`; `audit.Guard`/`Middleware`/`Policy`/`Mode*`/`AddMetadata` → `audithttp`; `features.Middleware` → `featureshttp`; `apikey.Authenticate` → `apikeyhttp`. `pkg/storage` keeps the interface and local driver; S3/SeaweedFS moved to `pkg/storage/s3store` and the factory `storage.NewStorage` to `pkg/storage/drivers.New`.
+- `app.Infra.Config` is replaced by `Infra.Platform` (App, JWT, Tenant); identity, files, and webhooks take a module `Settings` struct in `Build`, and `bootstrap.Build` takes `(cfg, infra)`.
+
+### Added (P0 foundation)
+- `APP_ROLE=api|worker|all` (default `all`): `worker` runs jobs, the scheduler, and background loops with only `/healthz`, `/readyz`, `/metrics`; `api` serves HTTP without claiming jobs. `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` configure bulkhead workers. Optional Kubernetes component `deploy/k8s/base/worker/` (enabled by no overlay).
+- Key rotation without downtime: JWTs carry a `kid` derived from the secret and `JWT_PREVIOUS_SECRETS` verifies retired keys (tokens without `kid` verify against the active key); `DATA_ENCRYPTION_PREVIOUS_KEYS` and `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` decrypt with retired keys. Rotation is two-phase (add as previous everywhere, then promote).
+- `<NAME>_FILE` for secret settings (`JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`); setting both forms fails startup.
+- `jobs.Permanent(err)` dead-letters a job immediately (`last_error` prefix `permanent failure (not retried): `, counted in `jobs_dead_total`); used for undecodable/invalid email, password-reset, and webhook payloads. Decryption failures still retry.
+- `DB_QUERY_EXEC_MODE` (`cache_statement` default, `cache_describe`, `describe_exec`; `exec`/`simple_protocol` rejected) and `DB_MIGRATE_HOST`/`DB_MIGRATE_PORT` so `cmd/migrate` can bypass a transaction-mode PgBouncer; PgBouncer `search_path` handling documented.
+- Architecture tests: `test/arch/framework_free_test.go` (cores and module service/repository packages never import Fiber/fasthttp; `pkg/storage` and `files/service` never import the AWS SDK) and `test/arch/layering_test.go` with the shrink-only `layering_allowlist.txt` (ADR 0002).
+- ADRs in `docs/adr/` (index `docs/adr/README.md`), `.github/CODEOWNERS`, cosign keyless signing in `release.yml` with `cosign verify` in `deploy.yml` (when the image preflight runs), and digest-pinned Dockerfile base images.
+
+### Changed (P0 foundation)
+- Job payloads (email and password-reset) are sealed with `DATA_ENCRYPTION_KEY` instead of a `JWT_SECRET`-derived key, so rotating `JWT_SECRET` no longer requires draining the queue. Google OAuth `state` is still derived from the active `JWT_SECRET`.
+- Identity service tests use `bcrypt.MinCost` through `service/main_test.go`; production cost stays 12.
+
 ### Fixed
 - Jobs: each row stores `lease_expires_at` (now() + the owning worker's lease, set on claim and every heartbeat) and is reclaimed only when it is past, so workers with different `WithLeaseDuration` no longer reclaim each other's healthy jobs; a `CHECK` requires a lease on `running` rows.
 - Webhooks: `WEBHOOK_CONNECT_TIMEOUT_SECS` now bounds the TLS handshake as well as the TCP dial.

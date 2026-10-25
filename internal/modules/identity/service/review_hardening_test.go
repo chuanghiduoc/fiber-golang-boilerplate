@@ -279,5 +279,7 @@ func TestHandleResetRequestJobCreatesTokenAndEmailIdempotently(t *testing.T) {
 	assert.True(t, strings.Contains(last.HTML, "tenant=acme"), "the link keeps the request tenant slug")
 
 	var malformed json.RawMessage = []byte(`{"email":""}`)
-	assert.Error(t, svc.HandleResetRequestJob(workerCtx, malformed), "a job without an address fails loudly")
+	err = svc.HandleResetRequestJob(workerCtx, malformed)
+	assert.Error(t, err, "a job without an address fails loudly")
+	assert.True(t, jobs.IsPermanent(err), "a job without an address is dead-lettered without retries")
 }

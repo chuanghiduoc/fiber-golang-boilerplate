@@ -16,7 +16,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
-const bcryptCost = 12
+// bcryptCost is the production password-hashing cost. It is a variable only
+// so this package's tests can lower it in TestMain (main_test.go).
+var bcryptCost = 12
 
 // UserService owns the account lifecycle. Its methods are split by
 // responsibility across this package: registration.go, authentication.go and

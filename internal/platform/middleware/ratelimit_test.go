@@ -17,11 +17,12 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 func TestNewLimiter_KeysAPIKeysSeparately(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		switch c.Get("X-Test-Key") {
 		case "one":
@@ -62,7 +63,7 @@ func TestNewLimiter_KeysAPIKeysSeparately(t *testing.T) {
 }
 
 func TestNewLimiter_HeadersAndProblem(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/", NewLimiter(2, 60, "normal", cache.NewMemoryCache()), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
@@ -124,7 +125,7 @@ func TestNewLimiter_ConcurrentRequestsNeverExceedLimit(t *testing.T) {
 	shared := cache.NewMemoryCache()
 	defer func() { _ = shared.Close() }()
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	ok := func(c fiber.Ctx) error { return c.SendString("ok") }
 	app.Get("/a", NewLimiter(limit, 3600, "normal", shared), ok)
 	app.Get("/b", NewLimiter(limit, 3600, "normal", shared), ok)
@@ -201,7 +202,7 @@ func (b *blackholeCache) Ping(ctx context.Context) error { return b.wait(ctx) }
 
 func TestNewLimiter_FailsOpenFastOnHangingCache(t *testing.T) {
 	counter := &blackholeCache{}
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/", NewLimiter(1, 60, "normal", counter), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
@@ -225,7 +226,7 @@ func TestNewLimiter_FailsOpenFastOnHangingCache(t *testing.T) {
 }
 
 func TestNewLimiter_FailsOpenOnCacheError(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/", NewLimiter(1, 60, "normal", failingCounter{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})

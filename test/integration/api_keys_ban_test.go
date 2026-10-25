@@ -3,7 +3,6 @@
 package integration_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
@@ -12,7 +11,6 @@ import (
 
 	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 // TestIntegration_APIKeyBanRevokesAndUnbanDoesNotRevive proves a key issued
@@ -20,7 +18,7 @@ import (
 // while a key issued after the unban works.
 func TestIntegration_APIKeyBanRevokesAndUnbanDoesNotRevive(t *testing.T) {
 	h := setupAPIKeyHarness(t)
-	ctx := tenant.WithID(context.Background(), h.tenant)
+	ctx := systemTenantCtx(h.tenant)
 
 	var ownerID int64
 	require.NoError(t, h.pool.QueryRow(ctx,

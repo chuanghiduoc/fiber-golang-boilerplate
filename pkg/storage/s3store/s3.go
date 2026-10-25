@@ -1,4 +1,7 @@
-package storage
+// Package s3store is the S3-compatible storage.Storage driver (AWS S3 and
+// the SeaweedFS S3 gateway). It lives apart from pkg/storage so packages that
+// only need the interface do not link the AWS SDK.
+package s3store
 
 import (
 	"bytes"
@@ -17,22 +20,26 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
-// Storage driver names backed by S3Storage.
+// Storage driver names backed by Storage.
 const (
 	DriverS3        = "s3"
 	DriverSeaweedFS = "seaweedfs"
 )
 
-type S3Storage struct {
+var _ storage.Storage = (*Storage)(nil)
+
+// Storage stores objects in an S3-compatible bucket.
+type Storage struct {
 	client   *s3.Client
 	bucket   string
 	endpoint string
 	useSSL   bool
 }
 
-// NewS3Storage builds an S3 client for AWS S3 (driver "s3") or the SeaweedFS
+// New builds an S3 client for AWS S3 (driver "s3") or the SeaweedFS
 // S3 gateway (driver "seaweedfs") and ensures the bucket exists.
 //
 // Only AWS endpoints (*.amazonaws.com with driver "s3") keep the SDK
@@ -41,7 +48,7 @@ type S3Storage struct {
 // previous minio-go auto lookup) and checksums only when an operation
 // requires them: since service/s3 v1.73 the SDK adds CRC32 checksums to every
 // request, which S3-compatible servers may not implement.
-func NewS3Storage(cfg config.StorageConfig) (*S3Storage, error) {
+func New(cfg config.StorageConfig) (*Storage, error) {
 	scheme := "http"
 	if cfg.S3UseSSL {
 		scheme = "https"
@@ -69,7 +76,7 @@ func NewS3Storage(cfg config.StorageConfig) (*S3Storage, error) {
 		return nil, err
 	}
 
-	return &S3Storage{
+	return &Storage{
 		client:   client,
 		bucket:   cfg.S3Bucket,
 		endpoint: cfg.S3Endpoint,
@@ -114,7 +121,7 @@ func ensureBucket(ctx context.Context, client *s3.Client, bucket, region string)
 	return nil
 }
 
-func (s *S3Storage) Put(ctx context.Context, path string, reader io.Reader, size int64, contentType string) error {
+func (s *Storage) Put(ctx context.Context, path string, reader io.Reader, size int64, contentType string) error {
 	// The SDK signs the payload hash, which needs a seekable body over plain
 	// HTTP. Multipart uploads are already seekable; other readers are buffered,
 	// bounded by the caller-supplied size.
@@ -141,7 +148,7 @@ func (s *S3Storage) Put(ctx context.Context, path string, reader io.Reader, size
 	return nil
 }
 
-func (s *S3Storage) Get(ctx context.Context, path string) (io.ReadCloser, error) {
+func (s *Storage) Get(ctx context.Context, path string) (io.ReadCloser, error) {
 	// The response body is streamed after the handler returns, so the request
 	// deadline is no longer suitable. Bound the stream independently and cancel
 	// it when the caller closes the body. GetObject fails before any body is
@@ -155,7 +162,7 @@ func (s *S3Storage) Get(ctx context.Context, path string) (io.ReadCloser, error)
 	if err != nil {
 		cancel()
 		if isS3NotFound(err) {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, path)
+			return nil, fmt.Errorf("%w: %s", storage.ErrNotFound, path)
 		}
 		return nil, fmt.Errorf("failed to get from S3: %w", err)
 	}
@@ -194,7 +201,7 @@ func (c *cancelReadCloser) Close() error {
 	return err
 }
 
-func (s *S3Storage) Delete(ctx context.Context, path string) error {
+func (s *Storage) Delete(ctx context.Context, path string) error {
 	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(path),
@@ -205,7 +212,7 @@ func (s *S3Storage) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
-func (s *S3Storage) URL(path string) string {
+func (s *Storage) URL(path string) string {
 	scheme := "http"
 	if s.useSSL {
 		scheme = "https"

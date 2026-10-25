@@ -10,6 +10,7 @@ package bootstrap
 import (
 	"context"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
@@ -47,15 +48,29 @@ type Modules struct {
 }
 
 // Build constructs every module from infra in dependency order and wires the
-// cross-module contracts. It performs no I/O. To add a module: build it here
-// (passing only contracts from earlier modules) and append it to List.
-func Build(infra app.Infra) (*Modules, error) {
-	identityModule, identityProvides, err := identity.Build(infra)
+// cross-module contracts. It performs no I/O. cfg supplies each module's own
+// configuration section, passed explicitly so no module reads another's. To
+// add a module: build it here (passing only contracts from earlier modules
+// and its own settings) and append it to List.
+func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
+	identityModule, identityProvides, err := identity.Build(infra, identity.Settings{
+		OAuth: cfg.OAuth,
+		Admin: cfg.Admin,
+	})
 	if err != nil {
 		return nil, err
 	}
-	filesModule, filesProvides := files.Build(infra)
-	webhooksModule, webhooksProvides, err := webhooks.Build(infra, identityProvides.TenantActive)
+	filesModule, filesProvides := files.Build(infra, files.Settings{
+		MaxFileSize:  cfg.Storage.MaxFileSize,
+		AllowedTypes: cfg.Storage.AllowedTypes(),
+	})
+	webhooksModule, webhooksProvides, err := webhooks.Build(infra, webhooks.Settings{
+		Webhook: cfg.Webhook,
+		// JWT_SECRET is the local/test-only fallback; production requires
+		// the dedicated key (config validation).
+		SecretKey:          cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret),
+		PreviousSecretKeys: cfg.Webhook.PreviousSecretKeyList(),
+	}, identityProvides.TenantActive)
 	if err != nil {
 		return nil, err
 	}

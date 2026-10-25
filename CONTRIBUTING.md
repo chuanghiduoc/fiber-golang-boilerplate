@@ -13,7 +13,18 @@ flowchart LR
 ```
 
 `main` is protected. CI must pass: Lint, Build, Manifests, Migrations, Test,
-Integration, Security, and Docker.
+Integration, Security, and Docker. [`.github/CODEOWNERS`](.github/CODEOWNERS)
+assigns reviewers per platform area and per module (code, contracts, and
+migrations); add your module's paths there when you create one.
+
+## Architecture decisions
+
+Decisions that change a boundary (layering, tenancy, authorization,
+migrations, API or event contracts) are recorded as ADRs in
+[`docs/adr/`](docs/adr/README.md). Copy
+[`docs/adr/template.md`](docs/adr/template.md), take the next number, and
+link the ADR from the PR. Accepted ADRs are not rewritten; supersede them with
+a new one.
 
 ## Commit Convention
 
@@ -134,15 +145,18 @@ covered by [`docs/operations.md`](docs/operations.md).
    `catalog/` (permissions, error codes, en/vi strings), the layers, queries,
    the `sqlc.yaml` block, and a module test. Keep everything in that directory.
 2. Adjust `catalog/permissions.go` and protect every route with
-   `authz.Require(...)` (`test/arch` enforces it). Do not copy the
+   `authzhttp.Require(...)` (`test/arch` enforces it). Do not copy the
    [legacy exceptions](docs/module-template.md#legacy-exceptions-do-not-copy).
 3. Replace `internal/modules/<name>/queries/<name>.sql` and run
    `make sqlc-generate`.
 4. For a deployed DB, `make migrate-create module=<name> name=<purpose>`; for
    this boilerplate's fresh installs, update the single init schema.
-5. Register the module once in `internal/bootstrap/modules.go`.
+5. Register the module once in `internal/bootstrap/modules.go`; pass
+   module-owned configuration as a `Settings` struct filled there.
 6. Add unit tests plus an integration test; `test/arch` rejects cross-module
-   imports.
+   imports, Fiber in `service`/`repository` packages, and new
+   [ADR 0002](docs/adr/0002-module-layering.md) layering violations (never add
+   lines to `test/arch/layering_allowlist.txt`; delete the ones you fix).
 7. Run `make swagger`, `make check`, and `go test -race ./...`.
 8. Update `CHANGELOG.md`.
 
@@ -158,7 +172,8 @@ types.
 | Errors | Return `*apperror.AppError` via the typed catalog (`apperror.NewCode(...)`) | Raw errors or magic strings |
 | Responses | `pkg/response` helpers | `c.JSON()` |
 | Roles | The owning module's constants (`identity/dto` or `admin/dto`) | Magic strings |
-| Permissions | `authz.Require` with catalog permissions | Ad-hoc role checks |
+| Permissions | `authzhttp.Require` with catalog permissions on routes; `authz.Authorize` in services | Ad-hoc role checks; `authz.SystemContext` derived from a request |
+| Layering | Services return service types; handlers map them to DTOs; Fiber only in `handler/` and `*http` adapters | sqlc, pgx, Fiber, or `dto/` imports in `service/` |
 | Int conversion | `pkg/pagination` helpers (they clamp to `int32`) | Direct `int32()` casts |
 | Durable work | Enqueue in `internal/platform/jobs` | `async.Go` for work that must survive a restart |
 | Tests | Stdlib `testing`; `testify` where it improves assertions | Docker in unit tests |

@@ -13,6 +13,10 @@ data:
   # ---------------------------------------------------------------------------
   APP_ENV: "production"
   APP_PORT: "8080"
+  # all = API + job worker + scheduler in every pod. The optional worker
+  # component (base/worker) overrides this per Deployment: api for the API
+  # pods, worker for a separate worker Deployment.
+  APP_ROLE: "all"
   # APP_BODY_LIMIT must stay above STORAGE_MAX_FILE_SIZE: multipart framing
   # adds overhead before the upload handler can enforce the file limit.
   APP_BODY_LIMIT: "12582912"

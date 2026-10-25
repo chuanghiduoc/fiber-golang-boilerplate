@@ -1,4 +1,4 @@
-package audit
+package audithttp
 
 import (
 	"context"
@@ -7,7 +7,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -19,7 +21,7 @@ func AddMetadata(c fiber.Ctx, metadata map[string]any) {
 	if len(metadata) == 0 {
 		return
 	}
-	existing := fiber.Locals[map[string]any](c, MetadataLocalKey)
+	existing := fiber.Locals[map[string]any](c, audit.MetadataLocalKey)
 	merged := make(map[string]any, len(existing)+len(metadata))
 	for key, value := range existing {
 		merged[key] = value
@@ -27,7 +29,7 @@ func AddMetadata(c fiber.Ctx, metadata map[string]any) {
 	for key, value := range metadata {
 		merged[key] = value
 	}
-	fiber.Locals[map[string]any](c, MetadataLocalKey, merged)
+	fiber.Locals[map[string]any](c, audit.MetadataLocalKey, merged)
 }
 
 // Middleware records successful mutating requests (POST/PUT/PATCH/DELETE) with
@@ -38,19 +40,19 @@ func AddMetadata(c fiber.Ctx, metadata map[string]any) {
 // so one mutation never produces two independent audit records. Idempotent
 // replays and failed requests are also skipped; Guard owns the outcome trail
 // for Tier 2 routes.
-func Middleware(recorder Recorder) fiber.Handler {
+func Middleware(recorder audit.Recorder) fiber.Handler {
 	if recorder == nil {
-		recorder = Noop{}
+		recorder = audit.Noop{}
 	}
 
 	return func(c fiber.Ctx) error {
 		// Install the request's RequestInfo up front so JWT auth enriches it
 		// (WithActor/WithRequestMeta reuse an existing pointer) and a Tier 1
 		// service's RecordInTx can mark it as already audited.
-		info := RequestInfoFromContext(c.Context())
+		info := audit.RequestInfoFromContext(c.Context())
 		if info == nil {
-			info = &RequestInfo{RequestID: fiber.Locals[string](c, "request_id")}
-			c.SetContext(WithRequestInfo(c.Context(), info))
+			info = &audit.RequestInfo{RequestID: fiber.Locals[string](c, "request_id")}
+			c.SetContext(audit.WithRequestInfo(c.Context(), info))
 		}
 
 		if err := c.Next(); err != nil {
@@ -66,7 +68,7 @@ func Middleware(recorder Recorder) fiber.Handler {
 
 // needsFallbackRecord reports whether the request is a successful mutation
 // that no other audit path has recorded.
-func needsFallbackRecord(c fiber.Ctx, info *RequestInfo) bool {
+func needsFallbackRecord(c fiber.Ctx, info *audit.RequestInfo) bool {
 	switch {
 	case fiber.Locals[bool](c, auditGuardedLocal):
 		// Guard already wrote and completed an intent row.
@@ -91,16 +93,16 @@ func needsFallbackRecord(c fiber.Ctx, info *RequestInfo) bool {
 // fallbackEvent describes the completed mutation from the request: actor,
 // route template, target id, and handler-supplied metadata. Never put secrets
 // in that metadata: it is persisted after sanitization.
-func fallbackEvent(c fiber.Ctx) Event {
+func fallbackEvent(c fiber.Ctx) audit.Event {
 	actorID := fiber.Locals[int64](c, "user_id")
 	role := fiber.Locals[string](c, "role")
-	tenantID := tenant.ID(c)
+	tenantID := tenanthttp.ID(c)
 	if tenantID == 0 {
 		tenantID = tenant.EffectiveID(c.Context())
 	}
 	status := c.Response().StatusCode()
 
-	extra := fiber.Locals[map[string]any](c, MetadataLocalKey)
+	extra := fiber.Locals[map[string]any](c, audit.MetadataLocalKey)
 	metadata := make(map[string]any, len(extra)+2)
 	for key, value := range extra {
 		metadata[key] = value
@@ -109,10 +111,10 @@ func fallbackEvent(c fiber.Ctx) Event {
 	metadata["path"] = c.Path()
 
 	now := time.Now().UTC()
-	event := Event{
+	event := audit.Event{
 		TenantID:    tenantID,
 		ActorID:     actorID,
-		ActorType:   ActorTypeForRole(role),
+		ActorType:   audit.ActorTypeForRole(role),
 		ActorRole:   role,
 		Action:      c.Method() + " " + c.Route().Path,
 		Resource:    c.Route().Path,
@@ -121,24 +123,24 @@ func fallbackEvent(c fiber.Ctx) Event {
 		IP:          c.IP(),
 		UserAgent:   c.Get("User-Agent"),
 		RequestID:   fiber.Locals[string](c, "request_id"),
-		Source:      SourceHTTP,
-		Outcome:     OutcomeSucceeded,
+		Source:      audit.SourceHTTP,
+		Outcome:     audit.OutcomeSucceeded,
 		StatusCode:  status,
 		CompletedAt: now,
 		CreatedAt:   now,
 	}
 	if actorID == 0 {
-		event.ActorType = ActorTypeAnonymous
-	} else if event.ActorType == ActorTypeUnknown {
-		event.ActorType = ActorTypeUser
+		event.ActorType = audit.ActorTypeAnonymous
+	} else if event.ActorType == audit.ActorTypeUnknown {
+		event.ActorType = audit.ActorTypeUser
 	}
 	return event
 }
 
 // recordFallback writes the event on a detached, bounded context. The
 // response is already final, so a failure is counted and logged only.
-func recordFallback(c fiber.Ctx, recorder Recorder, event Event) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), WriteTimeout)
+func recordFallback(c fiber.Ctx, recorder audit.Recorder, event audit.Event) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
 	if err := recorder.Record(ctx, event); err != nil {
 		metrics.AuditWriteFailuresTotal.Inc()
