@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
@@ -236,7 +237,9 @@ func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, memb
 	tenantSlug := tenant.SlugFromContext(ctx)
 	async.Go(func() {
 		sendCtx := tenant.WithIdentity(context.Background(), member.Membership.TenantID, tenantSlug)
-		_ = h.emailVerifSvc.SendVerification(sendCtx, member.User.ID, member.User.Email)
+		if err := h.emailVerifSvc.SendVerification(sendCtx, member.User.ID, member.User.Email); err != nil {
+			slog.Error("post-commit verification email failed", slog.Int64("user_id", member.User.ID), slog.Any("error", err))
+		}
 	})
 }
 

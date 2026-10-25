@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -245,7 +246,9 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		tenantSlug := tenant.SlugFromContext(c.Context())
 		async.Go(func() {
 			ctx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
-			_ = h.emailVerifSvc.SendVerification(ctx, member.User.ID, member.User.Email)
+			if err := h.emailVerifSvc.SendVerification(ctx, member.User.ID, member.User.Email); err != nil {
+				slog.Error("post-commit verification email failed", slog.Int64("user_id", member.User.ID), slog.Any("error", err))
+			}
 		})
 	}
 
