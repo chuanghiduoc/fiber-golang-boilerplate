@@ -31,9 +31,25 @@ func createdTables(sql string) []string {
 	return tables
 }
 
+// ownerMarker starts a section owned by another owner inside one migration
+// file; the single init migration (ADR 0012) has one per owner.
+var ownerMarker = regexp.MustCompile(`(?m)^-- owner: ([a-z0-9_]+)$`)
+
+// ownerSections splits a migration into owner -> SQL. Text before the first
+// marker belongs to the file's owner.
+func ownerSections(sql, fileOwner string) map[string]string {
+	sections := map[string]string{}
+	owner, start := fileOwner, 0
+	for _, loc := range ownerMarker.FindAllStringSubmatchIndex(sql, -1) {
+		sections[owner] += sql[start:loc[0]]
+		owner, start = sql[loc[2]:loc[3]], loc[1]
+	}
+	sections[owner] += sql[start:]
+	return sections
+}
+
 // timestampLayout is the golang-migrate -format used by make migrate-create
-// and cmd/gen. Every migration, the per-owner baseline included (ADR 0005),
-// uses it: there are no sequential versions.
+// and cmd/gen. Every migration, the init included, uses it.
 const timestampLayout = "20060102150405"
 
 // migrationOwners are the non-module owners allowed as a migration name
@@ -63,10 +79,10 @@ func TestMigrationFilesArePairedAndUnique(t *testing.T) {
 	}
 }
 
-// TestMigrationsCreateOnlyOwnedTables fails when a migration creates a table
-// that belongs to another owner: a module's file may only create its own
-// tables (tableOwners / naming convention), and platform files only platform
-// tables. This keeps the per-owner split honest.
+// TestMigrationsCreateOnlyOwnedTables fails when a migration (or an
+// `-- owner:` section of one) creates a table that belongs to another owner:
+// a module may only create its own tables (tableOwners / naming convention),
+// and platform only platform tables.
 func TestMigrationsCreateOnlyOwnedTables(t *testing.T) {
 	root := repoRoot(t)
 	owners := migrationOwnerSet(t, root)
@@ -81,18 +97,23 @@ func TestMigrationsCreateOnlyOwnedTables(t *testing.T) {
 		if match == nil {
 			continue // reported by TestMigrationFilesArePairedAndUnique
 		}
-		fileOwner := ownerPrefix(match[2], owners)
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		for _, tableName := range createdTables(string(raw)) {
-			owner := tableOwner(tableName, modules)
-			if strings.HasPrefix(owner, "platform/") {
-				owner = "platform"
+		for sectionOwner, sql := range ownerSections(string(raw), ownerPrefix(match[2], owners)) {
+			if !owners[sectionOwner] {
+				t.Errorf("migrations/%s: unknown owner %q", name, sectionOwner)
+				continue
 			}
-			if owner != fileOwner {
-				t.Errorf("migrations/%s creates %s, which is owned by %q, not %q", name, tableName, owner, fileOwner)
+			for _, tableName := range createdTables(sql) {
+				owner := tableOwner(tableName, modules)
+				if strings.HasPrefix(owner, "platform/") {
+					owner = "platform"
+				}
+				if owner != sectionOwner {
+					t.Errorf("migrations/%s creates %s in the %q section, but it is owned by %q", name, tableName, sectionOwner, owner)
+				}
 			}
 		}
 	}
@@ -103,8 +124,7 @@ func TestMigrationsCreateOnlyOwnedTables(t *testing.T) {
 func TestMigrationCheckRejectsBadSets(t *testing.T) {
 	owners := map[string]bool{"files": true, "platform": true, "api_keys": true}
 	baseline := []string{
-		"20260101000000_platform_functions.up.sql", "20260101000000_platform_functions.down.sql",
-		"20260101000100_files_init.up.sql", "20260101000100_files_init.down.sql",
+		"20260101000000_platform_init_schema.up.sql", "20260101000000_platform_init_schema.down.sql",
 	}
 	cases := map[string]struct {
 		files []string
@@ -286,6 +306,17 @@ func moduleNames(t *testing.T, root string) map[string]bool {
 // TestCreatedTablesParser pins the CREATE TABLE forms the ownership check must
 // recognize, so a migration cannot hide another owner's table behind a schema
 // qualifier, quotes, modifiers, or line breaks.
+func TestOwnerSections(t *testing.T) {
+	sql := "CREATE TABLE jobs ();\n-- owner: files\nCREATE TABLE files ();\n-- owner: platform\nCREATE TABLE audit_events ();\n"
+	got := ownerSections(sql, "platform")
+	if tables := createdTables(got["files"]); strings.Join(tables, ",") != "files" {
+		t.Errorf("files section creates %v, want [files]", tables)
+	}
+	if tables := createdTables(got["platform"]); strings.Join(tables, ",") != "jobs,audit_events" {
+		t.Errorf("platform sections create %v, want [jobs audit_events]", tables)
+	}
+}
+
 func TestCreatedTablesParser(t *testing.T) {
 	cases := map[string][]string{
 		"CREATE TABLE files (id BIGINT);":                            {"files"},

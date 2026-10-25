@@ -86,7 +86,7 @@ flowchart LR
 | `internal/contracts/<provider>` | Stdlib-only cross-module interfaces, one package per providing module |
 | `internal/platform` | `authz`, `audit`, `events`, `features`, `i18n`, `jobs`, `requestctx`, `scheduler`, `session`, `tenant`, `tracing`, `versioning`, `middleware` (JWT, rate limit, logger, recovery, security headers, metrics, idempotency) |
 | `pkg` | `apperror` (RFC 9457 + catalog), `response`, `database` (pool, TxManager, migrations), `webhook` (HMAC + SSRF-safe client), `validator`, `token`, `cache`, `storage`, `email`, `pagination`, `logger`, `health`, `oauth`, `metrics`, `async` |
-| `migrations` | Per-owner `<UTC ts>_<owner>_<purpose>` baseline (ADR 0005); later migrations use the same naming |
+| `migrations` | One init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later migrations are `<UTC ts>_<owner>_<purpose>` |
 | `deploy/k8s` | Kubernetes production manifests |
 
 Every module follows the same layered slice (`handler → service → repository →
@@ -113,7 +113,7 @@ split and the [ADR 0002](docs/adr/0002-module-layering.md) layering ratchet.
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
-run the per-owner baseline files in timestamp order; add timestamped migrations
+run the single init migration; add timestamped migrations
 (`make migrate-create`) only after a database is deployed.
 
 ## Quick Start
@@ -286,11 +286,11 @@ actionable error on a legacy partial schema.
 
 ### Upgrading an existing database
 
-The per-owner baseline (`20260101000000`–`20260101000900`, ADR 0005; see
+The init migration (`20260101000000`, ADR 0012; see
 [Data Model](docs/data-model.md)) is a **fresh-install baseline**. It replaces
 the old shipped migrations `000001`–`000003` and the former consolidated
 `000001_init_schema`. A database that applied any of those (recorded at a
-sequential version) must never be pointed at the new files.
+sequential version) must never be pointed at it.
 
 The repository ships no sequential migrations at all:
 `test/arch/migrations_test.go` rejects any version that is not a UTC
@@ -301,7 +301,7 @@ upgrade is a one-time, reviewed manual step:
 ```mermaid
 flowchart LR
     A["1. Verified backup<br/>or PITR snapshot"] --> B["2. Apply missing DDL<br/>with psql in one transaction"]
-    B --> C["3. migrate force 20260101000900<br/>(only after schema matches)"]
+    B --> C["3. migrate force 20260101000000<br/>(only after schema matches)"]
     C --> D["4. Run cmd/migrate<br/>(newer migrations + verification)"]
     D -->|missing objects| B
 ```
@@ -309,8 +309,8 @@ flowchart LR
 1. Take a verified backup/PITR snapshot.
 2. Apply the missing DDL with `psql` in one transaction (tables, columns,
    indexes, triggers, and the default tenant) so the schema matches
-   the baseline `migrations/20260101000*.up.sql` files.
-3. Record the baseline: `migrate -path migrations -database "$DSN" force 20260101000900`.
+   `migrations/20260101000000_platform_init_schema.up.sql`.
+3. Record the baseline: `migrate -path migrations -database "$DSN" force 20260101000000`.
    This rewrites the version, not the schema; never use it to skip DDL that
    was not applied.
 4. Run `cmd/migrate`. It applies newer timestamped migrations, then verifies
@@ -355,7 +355,7 @@ to tenant 1 and usable only there. New uploads use
 atomically.
 
 A fresh schema created out-of-band that already matches the baseline can be
-baselined with `force 20260101000900` after verifying the objects, instead of running the
+baselined with `force 20260101000000` after verifying the objects, instead of running the
 file over populated tables. Never edit a shipped migration after deployment.
 
 ## API Endpoints

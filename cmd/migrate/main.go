@@ -21,7 +21,7 @@ import (
 )
 
 // maxSequentialVersion is the largest pre-timestamp (6-digit -seq) version.
-// Every migration, including the per-owner baseline (ADR 0005), uses a UTC
+// Every migration, including the init (ADR 0012), uses a UTC
 // timestamp version, so a database recorded at 1..999999 is a legacy
 // sequential history (the old 000001 baseline or 000001-000003) whose source
 // files no longer exist in this repository.
@@ -38,7 +38,7 @@ const (
 
 // requiredTables lists the schema objects the application assumes exist. The
 // check catches a database whose recorded version is current but whose schema
-// predates the per-owner baseline (for example one baselined by hand), which
+// predates the init (for example one baselined by hand), which
 // golang-migrate alone would treat as current.
 var requiredTables = []string{
 	"tenants",
@@ -290,7 +290,7 @@ func run() error {
 		if hasHistory && version >= 1 && version <= maxSequentialVersion {
 			return fmt.Errorf(
 				"run migrations from legacy version %d: %w; this repository ships only timestamped "+
-					"migrations (the per-owner baseline replaced 000001), so apply the reviewed upgrade DDL manually, "+
+					"migrations (the init replaced 000001), so apply the reviewed upgrade DDL manually, "+
 					"verify the schema, then baseline it as described in README.md section %q",
 				version, err, "Upgrading an existing database",
 			)

@@ -6,12 +6,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed (ADR 0012 single init migration)
+- `migrations/` holds one init pair, `20260101000000_platform_init_schema.{up,down}.sql`, with an `-- owner: <module|platform>` marker per section; ADR 0012 supersedes ADR 0005's file layout. `test/arch` checks table ownership per section. Every later change is a `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>` migration. A legacy database is recorded with `force 20260101000000` after manual DDL. No deployed database exists, so recreate local databases.
+
 ### Added (P3b API compatibility and data retention)
 - CI `API compatibility` job (ADR 0006, pull requests only): `cmd/openapi3` (kin-openapi v0.149.0 `openapi2conv`) converts the base branch's and the PR's `docs/swagger.json` to OpenAPI 3, and `oasdiff breaking --fail-on ERR` (oasdiff v1.33.0) fails the PR on breaking changes. Editing `docs/api-breaking-changes.md` in the same PR acknowledges an intentional break (the report is still printed).
-- `files.trash.purge` (hourly, `files` `ScheduleProvider`/`JobProvider`): files soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (default 30, 1..3650) ago are permanently removed across tenants, blob first and then the row, in 100-row `FOR UPDATE SKIP LOCKED` batches (a concurrent restore waits, then gets 404). A missing blob counts as deleted; a failed blob delete keeps its row and fails the job after the rest commits. No domain event or webhook is emitted.
+- `files.trash.purge` (hourly, `files` `ScheduleProvider`/`JobProvider`): files soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (default 30, 1..3650) ago are permanently removed across tenants, in 100-row batches: a committed `purge_started_at` claim first (restore of a claimed row gets 404, even if the purge later fails), then the blob, then the row. A missing blob counts as deleted; a failed blob delete keeps its row and fails the job after the rest commits. No domain event or webhook is emitted.
 - `notifications.retention.purge` (hourly): notifications **read** more than `NOTIFICATIONS_RETENTION_DAYS` (default 180, 1..3650) ago are deleted across tenants in 1,000-row batches; unread notifications are never purged.
 - Both purges require `SCHEDULER_ENABLED=true` (like `identity.tokens.purge_expired`); without it nothing is purged.
-- Migrations `20261025112300_files_trash_purge_index` (partial `idx_files_deleted_at`) and `20261025112400_notifications_retention_index` (partial `idx_notifications_read_at`), both `CREATE INDEX CONCURRENTLY`.
+- Init schema: `files.purge_started_at`, partial `idx_files_deleted_at`, and partial `idx_notifications_read_at`.
 - `notifications.Build` takes `notifications.Settings`; `files.Settings` gains `TrashRetentionDays`; `config.RetentionConfig` (`cfg.Retention`).
 
 ### Breaking (P2c event envelope, Standard Webhooks, idempotency 422)
@@ -55,7 +58,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - Row-level security (ADR 0007) and MFA (ADR 0010).
 
 ### Breaking (P2a per-owner baseline and normalization)
-- ADR 0005: `migrations/000001_init_schema.*` is split into ten per-owner baseline files `20260101000000_platform_functions` … `20260101000900_webhooks_init` (shared functions, identity, platform jobs/scheduler/audit, then apikeys, files, features, notifications, webhooks). There are no sequential versions any more; `test/arch` rejects them and also rejects a migration that creates another owner's table. A database recorded at version 1 is a legacy history: `cmd/migrate` refuses it with the upgrade guidance (`force 20260101000900` after manual DDL). No deployed database exists, so recreate local databases.
+- ADR 0005: `migrations/000001_init_schema.*` is split into ten per-owner baseline files `20260101000000_platform_functions` … `20260101000900_webhooks_init` (shared functions, identity, platform jobs/scheduler/audit, then apikeys, files, features, notifications, webhooks). There are no sequential versions any more; `test/arch` rejects them and also rejects a migration that creates another owner's table. A database recorded at version 1 is a legacy history: `cmd/migrate` refuses it with the upgrade guidance (`force 20260101000000` after manual DDL). No deployed database exists, so recreate local databases.
 - `api_keys.scopes JSONB` → `api_key_scopes(api_key_id, permission_key)` (CASCADE, format `CHECK`; the RBAC phase adds the `permissions` FK). The API still returns a sorted `scopes` array.
 - `webhook_endpoints.event_types TEXT[]` → `webhook_endpoint_subscriptions(tenant_id, endpoint_id, pattern)`; matching is unchanged, and `eventTypes` is now returned sorted.
 - Webhook payloads are stored once in `webhook_events(tenant_id, event_id, event_type, occurred_at, payload)`; `webhook_deliveries` drops `event_type`/`event_created_at`/`payload` and references the event (RESTRICT). Retention deletes unreferenced events after terminal deliveries. Signed requests are byte-identical (`TestWebhookDeliveryWireFormatIsStable`).

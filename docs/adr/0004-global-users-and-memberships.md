@@ -29,7 +29,7 @@ detection per RFC 9700). The tenant of a request is selected explicitly
 
 ## Implementation notes (P2b-1)
 
-- Schema lives in `migrations/20260101000100_identity_init.up.sql`; see
+- Schema lives in the `identity` section of `migrations/20260101000000_platform_init_schema.up.sql`; see
   [Data Model](../data-model.md#tenants-identity-and-credentials).
 - `memberships.status` is `active | suspended | removed`; there is no
   `invited` state because a pending invite is an `invitations` row (it can

@@ -73,7 +73,7 @@ module, and `platform`/`pkg` never import modules.
 | `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
-| `migrations` | per-owner `<UTC ts>_<owner>_<purpose>.{up,down}.sql` (baseline: `20260101000000`–`20260101000900`, platform → identity → platform tables → modules; ADR 0005) |
+| `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
 
 **Request flow:** client → global middleware (request ID, i18n, tracing,
 metrics, logger, audit fallback, timeout) → `/api/vN` guard → tenant
@@ -133,17 +133,18 @@ migrations) to its owners; keep it current when adding a module.
   must not be named like another owner's table.
 - Migrations: every version is a 14-digit UTC timestamp, owners are real
   modules or `platform`, two spellings of one version are duplicates, and an
-  owner's file may only create that owner's tables
+  owner's file or `-- owner:` section may only create that owner's tables
   (`TestMigrationsCreateOnlyOwnedTables`).
 
 **Schema ownership**
 - Only `cmd/migrate` applies DDL; API/seed assume the schema exists.
   `cmd/migrate` uses `config.LoadDatabase` (DB_* only; no JWT/admin/SMTP
   secrets).
-- Fresh installs apply the per-owner baseline files in timestamp order
-  (shared functions, identity, platform jobs/scheduler/audit, then modules).
-  There is still no deployed database, so the baseline is edited in place
-  until the first release; after that, only add migrations.
+- Fresh installs apply the single init migration (ADR 0012), whose
+  `-- owner: <module|platform>` sections run shared functions, identity,
+  platform jobs/scheduler/audit, then modules. There is still no deployed
+  database, so the init is edited in place until the first release; after
+  that, only add migrations.
 - New migrations: `make migrate-create module=<owner> name=<purpose>` (or
   `make gen`) → `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`.
   `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp

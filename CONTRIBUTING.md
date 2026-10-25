@@ -95,16 +95,16 @@ When releasing, move `[Unreleased]` entries under a version header such as
 |------|--------|
 | One DDL entrypoint | Only `cmd/migrate` applies DDL. `make migrate-run` runs it, `make run`/`make seed` migrate first, Compose runs `migrate` before `app`. `cmd/api`/`cmd/seed` assume the schema exists, so replicas never race. |
 | Migrate config | `config.LoadDatabase` needs only `DB_*`; `DB_SSLMODE=disable\|allow\|prefer` is rejected in production. It verifies required tables, indexes, and triggers after migrating. |
-| Fresh installs | The per-owner baseline (ADR 0005): `migrations/20260101000*_<owner>_*.{up,down}.sql`, applied in version order (see `docs/data-model.md`). |
-| Deployed databases | Never edit a shipped migration. Add one with `make migrate-create module=<owner> name=<purpose>` → `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch` rejects duplicate versions, missing up/down pairs, and non-timestamp versions. |
+| Fresh installs | The single init (ADR 0012): `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:` section per owner (see `docs/data-model.md`). |
+| Deployed databases | Never edit a shipped migration. Add one with `make migrate-create module=<owner> name=<purpose>` → `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp versions, and tables created outside their owner. |
 | Ownership | One module owns each table; cross-module access goes through a contract or read model, never another module's repository. |
-| Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Emails and Google IDs are unique per tenant. |
-| Last admin | The `users` last-admin trigger is per tenant; application checks must use the same scope. |
+| Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Users are global (ADR 0004): emails and Google subjects are unique across tenants, and a user joins a tenant through `memberships`. |
+| Last admin | The `memberships` last-admin trigger is per tenant; application checks must use the same scope. |
 | Scoped queries | Repositories derive the tenant from `tenant.EffectiveID(ctx)` (tenant-1 fallback is for jobs/internal/tests only, never a substitute for HTTP resolution). Public auth flows resolve the tenant, Google `state` carries it, reset/verify links carry `?tenant=<slug>`, uploads use `<tenantID>/<userID>/<uuid>.<ext>`, idempotency keys include the tenant, and logout revokes by possession. RLS and per-tenant limits are future work; do not describe the application as fully isolated. |
 
 ### Upgrading an existing database
 
-The per-owner baseline (`20260101000000`–`20260101000900`, ADR 0005) is a
+The init migration (`20260101000000`, ADR 0012) is a
 fresh-install baseline that replaces the old `000001`–`000003` files and the
 former consolidated `000001`. Never run it against a database recorded at one
 of those sequential versions, and never reset `schema_migrations` to force it.
@@ -116,19 +116,19 @@ the README's [Upgrading an existing database](README.md#upgrading-an-existing-da
 
 1. Take a verified backup/PITR snapshot.
 2. Apply the missing DDL with `psql` in one transaction so the schema matches
-   the baseline files (tenants and default tenant, `tenant_id` columns,
+   the init (tenants and default tenant, `tenant_id` columns,
    tenant-leading indexes, per-tenant last-admin trigger, API-key scope,
    feature-flag, notification, and webhook tables, every `ON CONFLICT` unique
    index, audit triggers).
 3. Only after the schema matches, record the baseline:
-   `migrate -path migrations -database "$DSN" force 20260101000900`. This
+   `migrate -path migrations -database "$DSN" force 20260101000000`. This
    rewrites the version, not the schema; never use it to skip DDL that was not
    applied.
 4. Run `cmd/migrate`. It applies newer timestamped migrations and verifies the
    schema, listing anything step 2 missed.
 
 A fresh schema created out-of-band that already matches the baseline can be
-baselined the same way (`force 20260101000900` after verification) instead of
+baselined the same way (`force 20260101000000` after verification) instead of
 re-running the files.
 
 After the upgrade, legacy access tokens without `tenant_id` are rejected (users

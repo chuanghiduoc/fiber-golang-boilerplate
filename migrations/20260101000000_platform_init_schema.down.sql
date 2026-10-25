@@ -1,0 +1,56 @@
+-- Drops everything the init migration creates, owners in reverse order.
+
+-- owner: webhooks
+DROP TABLE IF EXISTS webhook_inbound_events;
+DROP TABLE IF EXISTS webhook_inbound_sources;
+DROP TABLE IF EXISTS webhook_delivery_attempts;
+DROP TABLE IF EXISTS webhook_deliveries;
+DROP TABLE IF EXISTS webhook_events;
+DROP TABLE IF EXISTS webhook_endpoint_secrets;
+DROP TABLE IF EXISTS webhook_endpoint_subscriptions;
+DROP TABLE IF EXISTS webhook_endpoints;
+
+-- owner: notifications
+DROP TABLE IF EXISTS notification_preferences;
+DROP TABLE IF EXISTS notifications;
+
+-- owner: features
+DROP TABLE IF EXISTS feature_flag_targets;
+DROP TABLE IF EXISTS feature_flags;
+
+-- owner: files
+DROP TABLE IF EXISTS files;
+
+-- owner: apikeys
+DROP TABLE IF EXISTS api_key_scopes;
+DROP TABLE IF EXISTS api_keys;
+
+-- owner: platform
+-- Dropping the table drops its triggers; the trigger functions go after it.
+DROP TABLE IF EXISTS audit_events;
+DROP FUNCTION IF EXISTS audit_events_append_only();
+DROP FUNCTION IF EXISTS audit_events_completion_guard();
+
+-- owner: platform
+DROP TABLE IF EXISTS scheduler_runs;
+DROP TABLE IF EXISTS scheduler_leases;
+
+-- owner: platform
+DROP TABLE IF EXISTS jobs;
+
+-- owner: identity
+DROP TABLE IF EXISTS email_verification_tokens;
+DROP TABLE IF EXISTS password_reset_tokens;
+DROP TABLE IF EXISTS refresh_tokens;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS invitations;
+DROP TABLE IF EXISTS memberships;
+DROP FUNCTION IF EXISTS protect_last_admin();
+DROP TABLE IF EXISTS user_identities;
+DROP TABLE IF EXISTS user_passwords;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS tenant_settings;
+DROP TABLE IF EXISTS tenants;
+
+-- owner: platform
+DROP FUNCTION IF EXISTS update_updated_at();

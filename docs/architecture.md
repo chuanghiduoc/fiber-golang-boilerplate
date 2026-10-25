@@ -346,9 +346,10 @@ keeps the repository's tenant scoping.
 - Only `cmd/migrate` applies DDL. The API and seed assume the schema exists;
   `cmd/migrate` also verifies required tenant tables/columns/indexes and that
   the `default` tenant exists with id 1.
-- Fresh installs apply the per-owner baseline (ADR 0005): timestamped
-  `migrations/20260101000*_<owner>_*.{up,down}.sql` files, shared functions
-  first, then identity, platform tables, and modules in FK order.
+- Fresh installs apply the single init (ADR 0012):
+  `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:`
+  section per owner, shared functions first, then identity, platform tables,
+  and modules in FK order.
 - Once a database is deployed, add timestamped migrations
   (`make migrate-create module=<owner> name=<purpose>`); never edit a shipped
   migration. Legacy databases keep their recorded history (see README).

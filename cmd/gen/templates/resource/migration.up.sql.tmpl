@@ -2,7 +2,7 @@
 CREATE TABLE IF NOT EXISTS {{.R.Table}} (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     -- tenants is the only cross-module foreign key a module may declare
-    -- (ADR 0005). RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
+    -- (ADR 0012). RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants (id) ON DELETE RESTRICT,
     name VARCHAR(255) NOT NULL CHECK (btrim(name) <> ''),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),

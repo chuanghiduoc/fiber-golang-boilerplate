@@ -1,1 +1,0 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_files_deleted_at;

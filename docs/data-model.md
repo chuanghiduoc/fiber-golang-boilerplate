@@ -1,24 +1,25 @@
 # Data Model
 
-The fresh-install schema is a per-owner baseline (ADR 0005) applied only by
-`cmd/migrate`, in timestamp order:
+The fresh-install schema is one init migration (ADR 0012),
+`migrations/20260101000000_platform_init_schema.{up,down}.sql`, applied only by
+`cmd/migrate`. Its `-- owner:` sections, in order:
 
-| Version | File | Creates |
-|---|---|---|
-| `20260101000000` | `platform_functions` | `update_updated_at()` trigger function |
-| `20260101000100` | `identity_init` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
-| `20260101000200` | `platform_jobs` | `jobs` |
-| `20260101000300` | `platform_scheduler` | `scheduler_leases`, `scheduler_runs` |
-| `20260101000400` | `platform_audit` | `audit_events` and its append-only triggers |
-| `20260101000500` | `apikeys_init` | `api_keys`, `api_key_scopes` |
-| `20260101000600` | `files_init` | `files` |
-| `20260101000700` | `features_init` | `feature_flags`, `feature_flag_targets` |
-| `20260101000800` | `notifications_init` | `notifications`, `notification_preferences` |
-| `20260101000900` | `webhooks_init` | every `webhook_*` table |
+| Section owner | Creates |
+|---|---|
+| `platform` | `update_updated_at()` trigger function |
+| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `platform` | `jobs` |
+| `platform` | `scheduler_leases`, `scheduler_runs` |
+| `platform` | `audit_events` and its append-only triggers |
+| `apikeys` | `api_keys`, `api_key_scopes` |
+| `files` | `files` |
+| `features` | `feature_flags`, `feature_flag_targets` |
+| `notifications` | `notifications`, `notification_preferences` |
+| `webhooks` | every `webhook_*` table |
 
-Each `.down.sql` drops exactly what its `.up.sql` created; applying every down
-file in reverse order leaves an empty schema. Every table has exactly one
-owner, and a migration file may only create its owner's tables; modules read
+The down file drops exactly what the up file created, leaving an empty schema.
+Every table has exactly one owner, and a migration file or section may only
+create its owner's tables; modules read
 other modules' data through contracts, never through SQL (both enforced by
 `test/arch`). See [Architecture](architecture.md#schema-ownership) for the
 migration policy.

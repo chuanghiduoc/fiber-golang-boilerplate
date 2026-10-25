@@ -472,10 +472,8 @@ Without the scheduler, trashed files keep their blobs and stay restorable
 indefinitely, and notifications are never deleted. The two retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
 every tenant; they are partial, so live files and unread notifications are not
-indexed. They ship as `CREATE INDEX CONCURRENTLY` migrations
-(`20261025112300_files_trash_purge_index`,
-`20261025112400_notifications_retention_index`); the purge claim column
-`files.purge_started_at` ships as `20261025112500_files_trash_purge_claim`.
+indexed. Both indexes and the purge claim column `files.purge_started_at`
+are part of the init migration.
 
 #### Files trash purge
 
@@ -1005,12 +1003,12 @@ uses a separate Job (see [section 8](#8-kubernetes-deployment-notes)).
 ```mermaid
 flowchart TD
     start([Which database?]) --> fresh{Empty database?}
-    fresh -- yes --> base[cmd/migrate applies<br/>the per-owner baseline]
+    fresh -- yes --> base[cmd/migrate applies<br/>the init migration]
     fresh -- no --> hist{schema_migrations version}
     hist -- "a timestamp" --> newer[Add a timestamped migration<br/>make migrate-create, then cmd/migrate]
     hist -- "legacy 1, 2, or 3" --> manual[Backup, apply missing DDL<br/>manually in one transaction]
     hist -- "none, schema created<br/>out of band" --> verify[Verify objects match the baseline]
-    manual --> force[migrate force 20260101000900]
+    manual --> force[migrate force 20260101000000]
     verify --> force
     force --> run[cmd/migrate: newer migrations<br/>plus schema verification]
     base --> run
@@ -1029,8 +1027,8 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 
 ### Fresh installs vs deployed databases
 
-- A fresh install applies the per-owner baseline (ADR 0005): the
-  `migrations/20260101000*_<owner>_*.up.sql` files in version order (see
+- A fresh install applies the single init (ADR 0012):
+  `migrations/20260101000000_platform_init_schema.up.sql` (see
   [Data Model](data-model.md)).
 - Once a database is deployed, never edit a migration it applied. Add one with
   only the new objects: `make migrate-create module=<owner> name=<purpose>`
@@ -1040,8 +1038,8 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
   versions above the recorded one, so a branch migration older than main's
   newest must be regenerated before merge. `test/arch/migrations_test.go`
   (part of `make test`/CI) rejects duplicate versions, missing up/down pairs,
-  non-timestamp versions, unknown owners, and files that create another
-  owner's table.
+  non-timestamp versions, unknown owners, and files or `-- owner:` sections
+  that create another owner's table.
 - A database recorded at a sequential version (the old `000001`–`000003`
   history, or the former consolidated `000001`) keeps it, but those files are
   **not** restored into `migrations/` (the architecture test rejects
@@ -1052,15 +1050,15 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
   2. apply the missing DDL (see below and the README upgrade section) with
      `psql` in one transaction so the schema matches the baseline;
   3. record the baseline with
-     `migrate -path migrations -database "$DSN" force 20260101000900` only
+     `migrate -path migrations -database "$DSN" force 20260101000000` only
      after the schema matches; it rewrites the version, not the schema;
   4. run `cmd/migrate`, which applies newer timestamped migrations and verifies
      the schema, failing with the missing objects if step 2 was incomplete.
 
-  Never point an old database at the baseline files without that manual DDL,
+  Never point an old database at the init without that manual DDL,
   and never reset `schema_migrations` to force it through.
 - If a fresh schema was created out of band and already matches the baseline,
-  verify the objects and `force 20260101000900` instead of applying the files
+  verify the objects and `force 20260101000000` instead of applying the files
   over populated tables.
 
 ### Multi-tenant foundation upgrade

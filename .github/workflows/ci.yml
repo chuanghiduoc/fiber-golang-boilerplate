@@ -270,10 +270,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The baseline is split per owner (ADR 0005): apply every up file in
-      # version order, then every down file in reverse, then up again, so each
-      # down drops exactly what its up created.
-      - name: Apply baseline migrations up, down, and up again with psql
+      # Apply every up file in version order (the init, ADR 0012, then later
+      # migrations), every down file in reverse, then up again, so each down
+      # drops exactly what its up created.
+      - name: Apply migrations up, down, and up again with psql
         run: |
           expected_tables="tenants users refresh_tokens password_reset_tokens email_verification_tokens api_keys api_key_scopes files feature_flags feature_flag_targets notifications notification_preferences jobs scheduler_leases scheduler_runs audit_events webhook_endpoints webhook_endpoint_subscriptions webhook_endpoint_secrets webhook_events webhook_deliveries webhook_delivery_attempts webhook_inbound_sources webhook_inbound_events"
           apply() {

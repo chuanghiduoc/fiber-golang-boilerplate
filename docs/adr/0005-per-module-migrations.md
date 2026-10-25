@@ -1,6 +1,6 @@
 # 0005. Per-module baseline migrations
 
-- Status: Accepted
+- Status: Superseded by [0012](0012-single-init-migration.md) (file layout); ownership rules still apply
 - Date: 2026-10-25
 
 ## Context

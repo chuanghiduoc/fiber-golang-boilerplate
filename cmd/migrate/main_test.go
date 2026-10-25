@@ -57,7 +57,7 @@ func readBaseline(t *testing.T) string {
 }
 
 // TestRequiredObjectsMatchBaseline catches drift between the post-migration
-// guard and the per-owner baseline files: a table added to the schema but not
+// guard and the migration files: a table added to the schema but not
 // verified, or a verified index/trigger that was renamed or dropped.
 func TestRequiredObjectsMatchBaseline(t *testing.T) {
 	baseline := readBaseline(t)

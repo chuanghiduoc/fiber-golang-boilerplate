@@ -138,7 +138,7 @@ fall back to the defaults (useful for tests that build `Config` literals).
 
 ## Database
 
-Both tables are created by the fresh-install baseline file `migrations/20260101000700_features_init.up.sql`:
+Both tables are created by the `features` section of the init migration `migrations/20260101000000_platform_init_schema.up.sql`:
 
 - `feature_flags` is process-wide configuration: `flag_key` primary key,
   nullable `enabled` (database default; NULL = none), `kill_switch`,
