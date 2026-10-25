@@ -148,7 +148,7 @@ func randomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
-func toDeliveryResponse(delivery *webhooksqlc.WebhookDelivery, includePayload bool) dto.DeliveryResponse {
+func toDeliveryResponse(delivery *repository.Delivery, includePayload bool) dto.DeliveryResponse {
 	resp := dto.DeliveryResponse{
 		ID:            delivery.ID,
 		TenantID:      delivery.TenantID,

@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
@@ -51,8 +50,8 @@ type DeliveryEnvelope struct {
 
 // WorkerStore is the narrow persistence surface for delivery attempts.
 type WorkerStore interface {
-	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error)
-	GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error)
+	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*repository.Delivery, error)
+	GetDelivery(ctx context.Context, id int64) (*repository.Delivery, error)
 	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
 	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
 	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
@@ -166,7 +165,7 @@ func (w *DeliveryWorker) checkConfigured() error {
 // prepare opens the snapshotted secret and builds the signed envelope. A
 // non-empty unsendable reason means retrying cannot help: the delivery is
 // dead-lettered without sending anything.
-func (w *DeliveryWorker) prepare(delivery *webhooksqlc.WebhookDelivery) (secret, body []byte, unsendable string) {
+func (w *DeliveryWorker) prepare(delivery *repository.Delivery) (secret, body []byte, unsendable string) {
 	secret, err := w.codec.Open(delivery.SecretCiphertext)
 	if err != nil {
 		slog.Error("webhooks: delivery secret decryption failed",
@@ -178,7 +177,7 @@ func (w *DeliveryWorker) prepare(delivery *webhooksqlc.WebhookDelivery) (secret,
 	body, err = json.Marshal(DeliveryEnvelope{
 		ID:        delivery.EventID,
 		Type:      delivery.EventType,
-		CreatedAt: delivery.EventCreatedAt.Time.UTC(),
+		CreatedAt: delivery.OccurredAt.Time.UTC(),
 		Data:      json.RawMessage(delivery.Payload),
 	})
 	if err != nil {
@@ -189,7 +188,7 @@ func (w *DeliveryWorker) prepare(delivery *webhooksqlc.WebhookDelivery) (secret,
 
 // deadLetterUnsendable records the failed attempt and dead-letters a
 // delivery that could not even be built.
-func (w *DeliveryWorker) deadLetterUnsendable(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, reason string) error {
+func (w *DeliveryWorker) deadLetterUnsendable(ctx context.Context, delivery *repository.Delivery, reason string) error {
 	if err := w.recordAttempt(ctx, delivery, attemptResult{outcome: webhook.OutcomePermanent, reason: reason}); err != nil {
 		return err
 	}
@@ -199,7 +198,7 @@ func (w *DeliveryWorker) deadLetterUnsendable(ctx context.Context, delivery *web
 
 // requestHeaders builds the delivery headers, including the timestamped
 // signature over the exact body that will be sent.
-func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, secret, body []byte) http.Header {
+func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *repository.Delivery, secret, body []byte) http.Header {
 	timestamp := w.now()
 	headers := http.Header{}
 	headers.Set(webhook.HeaderID, delivery.EventID)
@@ -215,7 +214,7 @@ func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *webhooksq
 // send performs the single HTTP request of this attempt. The endpoint timeout
 // (snapshotted on the delivery) can only shorten the client's global request
 // timeout.
-func (w *DeliveryWorker) send(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, headers http.Header, body []byte) sentRequest {
+func (w *DeliveryWorker) send(ctx context.Context, delivery *repository.Delivery, headers http.Header, body []byte) sentRequest {
 	reqCtx, cancel := context.WithTimeout(ctx, deliveryTimeout(delivery.TimeoutMs))
 	defer cancel()
 	started := time.Now()
@@ -237,7 +236,7 @@ type sentRequest struct {
 // within the at-least-once contract (receivers deduplicate). Returning the job
 // context's error lets the jobs worker requeue the job without consuming its
 // attempt when it is shutting down.
-func (w *DeliveryWorker) releaseInterrupted(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, jobErr error) error {
+func (w *DeliveryWorker) releaseInterrupted(ctx context.Context, delivery *repository.Delivery, jobErr error) error {
 	if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
 		if !errors.Is(err, repository.ErrDeliveryLeaseLost) {
 			return fmt.Errorf("webhooks: release interrupted delivery %d: %w", delivery.ID, err)
@@ -283,7 +282,7 @@ func classifyAttempt(sent sentRequest) attemptResult {
 
 // recordAttempt appends the attempt to the delivery log before the delivery
 // row changes state.
-func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, attempt attemptResult) error {
+func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *repository.Delivery, attempt attemptResult) error {
 	if err := w.store.CreateDeliveryAttempt(ctx, repository.AttemptDraft{
 		DeliveryID: delivery.ID,
 		Attempt:    delivery.Attempts,
@@ -298,7 +297,7 @@ func (w *DeliveryWorker) recordAttempt(ctx context.Context, delivery *webhooksql
 
 // finish applies the attempt outcome to the delivery row: succeeded, dead, or
 // rescheduled with Retry-After/backoff while attempts remain.
-func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, attempt attemptResult) error {
+func (w *DeliveryWorker) finish(ctx context.Context, delivery *repository.Delivery, attempt attemptResult) error {
 	statusCode, reason := attempt.statusCode, attempt.reason
 	switch attempt.outcome {
 	case webhook.OutcomeSuccess:
@@ -334,7 +333,7 @@ func (w *DeliveryWorker) finish(ctx context.Context, delivery *webhooksqlc.Webho
 // claim lease expired and a newer attempt (or a terminal state) owns the row;
 // the stale result is discarded with a warning rather than retried, because a
 // retry would hit the same fence forever.
-func (w *DeliveryWorker) fenced(delivery *webhooksqlc.WebhookDelivery, action string, err error) error {
+func (w *DeliveryWorker) fenced(delivery *repository.Delivery, action string, err error) error {
 	if errors.Is(err, repository.ErrDeliveryLeaseLost) {
 		slog.Warn("webhooks: discarded stale delivery outcome; claim lease lost",
 			slog.Int64("delivery_id", delivery.ID),
@@ -354,7 +353,7 @@ func (w *DeliveryWorker) fenced(delivery *webhooksqlc.WebhookDelivery, action st
 // during secretRotationGrace (receivers accept either "v1=" value), and with
 // the current secret alone after it. A failed lookup falls back to the
 // snapshot signature, which is what the delivery was created with.
-func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *webhooksqlc.WebhookDelivery, snapshot []byte, timestamp time.Time, body []byte) string {
+func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *repository.Delivery, snapshot []byte, timestamp time.Time, body []byte) string {
 	sign := func(secret []byte) string {
 		return webhook.SignatureHeader(webhook.Sign(secret, delivery.EventID, delivery.EventType, timestamp, body))
 	}

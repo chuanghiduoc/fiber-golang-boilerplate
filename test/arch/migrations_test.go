@@ -15,14 +15,12 @@ import (
 // migrationFile matches <version>_<name>.<up|down>.sql.
 var migrationFile = regexp.MustCompile(`^(\d+)_([a-z0-9_]+)\.(up|down)\.sql$`)
 
-// baselineVersion is the consolidated fresh-install schema. Every later
-// migration uses a UTC timestamp version (make migrate-create).
-const baselineVersion = 1
+// migrationCreateTable finds the tables a migration creates.
+var migrationCreateTable = regexp.MustCompile(`(?i)\bCREATE TABLE (?:IF NOT EXISTS )?([a-z_][a-z0-9_]*)`)
 
-// baselineSpelling is the only accepted spelling of the baseline version.
-const baselineSpelling = "000001"
-
-// timestampLayout is the golang-migrate -format used by make migrate-create.
+// timestampLayout is the golang-migrate -format used by make migrate-create
+// and cmd/gen. Every migration, the per-owner baseline included (ADR 0005),
+// uses it: there are no sequential versions.
 const timestampLayout = "20060102150405"
 
 // migrationOwners are the non-module owners allowed as a migration name
@@ -31,8 +29,8 @@ var migrationOwners = []string{"platform"}
 
 // TestMigrationFilesArePairedAndUnique fails when two migrations share a
 // version (golang-migrate refuses to start), when an up or down file is
-// missing, or when a new migration does not follow
-// <UTC timestamp>_<owner>_<purpose>. It needs no database.
+// missing, or when a migration does not follow <UTC timestamp>_<owner>_<purpose>.
+// It needs no database.
 func TestMigrationFilesArePairedAndUnique(t *testing.T) {
 	root := repoRoot(t)
 	entries, err := os.ReadDir(filepath.Join(root, "migrations"))
@@ -52,11 +50,50 @@ func TestMigrationFilesArePairedAndUnique(t *testing.T) {
 	}
 }
 
+// TestMigrationsCreateOnlyOwnedTables fails when a migration creates a table
+// that belongs to another owner: a module's file may only create its own
+// tables (tableOwners / naming convention), and platform files only platform
+// tables. This keeps the per-owner split honest.
+func TestMigrationsCreateOnlyOwnedTables(t *testing.T) {
+	root := repoRoot(t)
+	owners := migrationOwnerSet(t, root)
+	modules := moduleNames(t, root)
+	paths, err := filepath.Glob(filepath.Join(root, "migrations", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("list migrations: %v", err)
+	}
+	for _, path := range paths {
+		name := filepath.Base(path)
+		match := migrationFile.FindStringSubmatch(name)
+		if match == nil {
+			continue // reported by TestMigrationFilesArePairedAndUnique
+		}
+		fileOwner := ownerPrefix(match[2], owners)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for _, table := range migrationCreateTable.FindAllStringSubmatch(string(raw), -1) {
+			tableName := strings.ToLower(table[1])
+			owner := tableOwner(tableName, modules)
+			if strings.HasPrefix(owner, "platform/") {
+				owner = "platform"
+			}
+			if owner != fileOwner {
+				t.Errorf("migrations/%s creates %s, which is owned by %q, not %q", name, tableName, owner, fileOwner)
+			}
+		}
+	}
+}
+
 // TestMigrationCheckRejectsBadSets keeps the checker honest: each broken set
 // must produce at least one problem, and the good set none.
 func TestMigrationCheckRejectsBadSets(t *testing.T) {
 	owners := map[string]bool{"files": true, "platform": true, "api_keys": true}
-	baseline := []string{"000001_init_schema.up.sql", "000001_init_schema.down.sql"}
+	baseline := []string{
+		"20260101000000_platform_functions.up.sql", "20260101000000_platform_functions.down.sql",
+		"20260101000100_files_init.up.sql", "20260101000100_files_init.down.sql",
+	}
 	cases := map[string]struct {
 		files []string
 		ok    bool
@@ -68,6 +105,7 @@ func TestMigrationCheckRejectsBadSets(t *testing.T) {
 			"20261024101501_api_keys_add_label.up.sql",
 			"20261024101501_api_keys_add_label.down.sql",
 		}, baseline...)},
+		"empty":        {files: nil},
 		"missing down": {files: append([]string{"20261024101500_files_add_checksum.up.sql"}, baseline...)},
 		"duplicate version": {files: append([]string{
 			"20261024101500_files_add_checksum.up.sql",
@@ -79,23 +117,23 @@ func TestMigrationCheckRejectsBadSets(t *testing.T) {
 			"000002_files_add_checksum.up.sql",
 			"000002_files_add_checksum.down.sql",
 		}, baseline...)},
+		"old sequential baseline": {files: []string{
+			"000001_init_schema.up.sql",
+			"000001_init_schema.down.sql",
+		}},
 		"unknown owner": {files: append([]string{
 			"20261024101500_orders_add_total.up.sql",
 			"20261024101500_orders_add_total.down.sql",
+		}, baseline...)},
+		"owner without purpose": {files: append([]string{
+			"20261024101500_files.up.sql",
+			"20261024101500_files.down.sql",
 		}, baseline...)},
 		"invalid timestamp": {files: append([]string{
 			"20261399101500_files_add_checksum.up.sql",
 			"20261399101500_files_add_checksum.down.sql",
 		}, baseline...)},
 		"bad file name": {files: append([]string{"20261024101500_files.sql"}, baseline...)},
-		"no baseline":   {files: []string{"20261024101500_files_x.up.sql", "20261024101500_files_x.down.sql"}},
-		"baseline with extra zero": {files: []string{
-			"0000001_init_schema.up.sql",
-			"0000001_init_schema.down.sql",
-		}},
-		"version spelled twice": {files: append([]string{
-			"0000001_init_schema.up.sql",
-		}, baseline...)},
 		"timestamp spelled twice": {files: append([]string{
 			"20261024101500_files_add_checksum.up.sql",
 			"020261024101500_files_add_checksum.down.sql",
@@ -121,6 +159,9 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 		directions map[string]bool
 	}
 	var problems []string
+	if len(files) == 0 {
+		return []string{"migrations/ contains no migrations"}
+	}
 	byVersion := map[uint64]*migration{}
 	for _, file := range files {
 		match := migrationFile.FindStringSubmatch(file)
@@ -140,8 +181,8 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 			existing = &migration{spelling: match[1], name: name, directions: map[string]bool{}}
 			byVersion[version] = existing
 		}
-		// golang-migrate compares versions numerically, so 000001 and
-		// 0000001 are the same version: a second spelling is a duplicate.
+		// golang-migrate compares versions numerically, so a zero-padded
+		// second spelling of a version is a duplicate.
 		if existing.spelling != match[1] {
 			problems = append(problems, fmt.Sprintf(
 				"migrations/%s: version %d is also spelled %q; golang-migrate sees a duplicate version",
@@ -156,13 +197,6 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 		}
 		existing.directions[direction] = true
 
-		if version == baselineVersion {
-			if match[1] != baselineSpelling {
-				problems = append(problems, fmt.Sprintf(
-					"migrations/%s: the baseline version must be spelled %s", file, baselineSpelling))
-			}
-			continue
-		}
 		if len(match[1]) != len(timestampLayout) {
 			problems = append(problems, fmt.Sprintf(
 				"migrations/%s: version must be a %d-digit UTC timestamp (make migrate-create)",
@@ -179,9 +213,6 @@ func migrationProblems(files []string, owners map[string]bool) []string {
 		}
 	}
 
-	if _, ok := byVersion[baselineVersion]; !ok {
-		problems = append(problems, fmt.Sprintf("baseline migration %06d_*.sql is missing", baselineVersion))
-	}
 	versions := make([]uint64, 0, len(byVersion))
 	for version := range byVersion {
 		versions = append(versions, version)
@@ -217,6 +248,16 @@ func ownerPrefix(name string, owners map[string]bool) string {
 // non-module owners.
 func migrationOwnerSet(t *testing.T, root string) map[string]bool {
 	t.Helper()
+	out := moduleNames(t, root)
+	for _, owner := range migrationOwners {
+		out[owner] = true
+	}
+	return out
+}
+
+// moduleNames is every internal/modules/<name> directory.
+func moduleNames(t *testing.T, root string) map[string]bool {
+	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(root, "internal", "modules"))
 	if err != nil {
 		t.Fatalf("read modules: %v", err)
@@ -226,9 +267,6 @@ func migrationOwnerSet(t *testing.T, root string) map[string]bool {
 		if entry.IsDir() {
 			out[entry.Name()] = true
 		}
-	}
-	for _, owner := range migrationOwners {
-		out[owner] = true
 	}
 	return out
 }

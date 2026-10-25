@@ -16,21 +16,38 @@ var (
 	baselineTrigger = regexp.MustCompile(`(?is)\bCREATE TRIGGER ([a-z_][a-z0-9_]*)\s+(?:BEFORE|AFTER|INSTEAD OF)\b[^;]*?\bON ([a-z_][a-z0-9_]*)`)
 )
 
-// implicitUniqueIndexes are created by a column-level UNIQUE constraint, so
+// implicitUniqueIndexes are created by a UNIQUE or PRIMARY KEY constraint, so
 // their names never appear as CREATE INDEX statements in the baseline.
-var implicitUniqueIndexes = map[string]bool{"tenants_slug_key": true}
+var implicitUniqueIndexes = map[string]bool{
+	"tenants_slug_key":                    true,
+	"api_key_scopes_pkey":                 true,
+	"webhook_endpoint_subscriptions_pkey": true,
+	"webhook_events_pkey":                 true,
+}
 
+// readBaseline concatenates every up migration in version order: together
+// they are the schema the guard verifies.
 func readBaseline(t *testing.T) string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("..", "..", "migrations", "000001_init_schema.up.sql"))
-	if err != nil {
-		t.Fatalf("read baseline: %v", err)
+	paths, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.up.sql"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("list up migrations: %v (found %d)", err, len(paths))
 	}
-	return string(raw)
+	sort.Strings(paths)
+	var schema strings.Builder
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		schema.Write(raw)
+		schema.WriteString("\n")
+	}
+	return schema.String()
 }
 
 // TestRequiredObjectsMatchBaseline catches drift between the post-migration
-// guard and the consolidated baseline: a table added to the schema but not
+// guard and the per-owner baseline files: a table added to the schema but not
 // verified, or a verified index/trigger that was renamed or dropped.
 func TestRequiredObjectsMatchBaseline(t *testing.T) {
 	baseline := readBaseline(t)
@@ -143,7 +160,7 @@ func contains(values []string, target string) bool {
 }
 
 func TestJobsRequireTraceParentColumn(t *testing.T) {
-	// Fresh installs get jobs.trace_parent from the consolidated baseline.
+	// Fresh installs get jobs.trace_parent from the baseline.
 	// cmd/migrate must verify it so an older schema cannot silently break
 	// queue inserts after deployment.
 	found := false

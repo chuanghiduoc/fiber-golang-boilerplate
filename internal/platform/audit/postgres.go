@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -116,7 +117,7 @@ func (r *PostgresRecorder) values(ctx context.Context, event Event) (eventValues
 		actorRole:  nullableString(event.ActorRole),
 		metadata:   metadata,
 		resourceID: nullableString(event.ResourceID),
-		ip:         nullableString(event.IP),
+		ip:         nullableIP(event.IP),
 		userAgent:  nullableString(event.UserAgent),
 		requestID:  nullableString(event.RequestID),
 		source:     event.EffectiveSource(),
@@ -272,6 +273,21 @@ func nullableString(value string) *string {
 		return nil
 	}
 	return &value
+}
+
+// nullableIP returns the canonical form of an IP address for the INET column,
+// or nil when value is empty or not an address. The IP comes from the
+// request (and, behind a trusted proxy, from a client-controlled header), so
+// a malformed value must neither fail the insert (an audit write failure is a
+// 503 for guarded routes) nor be stored raw. An IPv6 zone ("fe80::1%eth0")
+// is dropped because INET cannot hold it.
+func nullableIP(value string) *string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return nil
+	}
+	canonical := addr.WithZone("").String()
+	return &canonical
 }
 
 func nullableStatusCode(value int) *int16 {

@@ -138,7 +138,7 @@ fall back to the defaults (useful for tests that build `Config` literals).
 
 ## Database
 
-Both tables are created by the fresh-install baseline `000001_init_schema`:
+Both tables are created by the fresh-install baseline file `migrations/20260101000700_features_init.up.sql`:
 
 - `feature_flags` is process-wide configuration: `flag_key` primary key,
   nullable `enabled` (database default; NULL = none), `kill_switch`,
@@ -153,16 +153,15 @@ Both tables are created by the fresh-install baseline `000001_init_schema`:
   missing, with `enabled = NULL`, so a tenant can target a flag no platform
   admin has configured without forcing a default on every other tenant.
 
-Partial unique indexes allow one tenant-wide target and one target per user per
-flag:
+One unique index allows one tenant-wide target and one target per user per
+flag: `idx_feature_flag_targets_tenant_flag_user` is `UNIQUE NULLS NOT DISTINCT
+(tenant_id, flag_key, user_id)`, so the tenant-wide target (`user_id` NULL)
+collides with itself and both upserts share one `ON CONFLICT` target. It is
+also the tenant-leading index of the admin list query; `(flag_key)` is indexed
+separately for the `RESTRICT` check on flag delete.
 
-- `idx_feature_flag_targets_tenant_target` on `(flag_key, tenant_id)` where
-  `user_id IS NULL`;
-- `idx_feature_flag_targets_user_target` on `(flag_key, tenant_id, user_id)`
-  where `user_id IS NOT NULL`.
-
-`cmd/migrate` verifies both tables, their tenant/key columns, and these unique
-indexes (plus `users(tenant_id, id)`, which backs the composite foreign key).
+`cmd/migrate` verifies both tables, their tenant/key columns, and this unique
+index (plus `users(tenant_id, id)`, which backs the composite foreign key).
 
 ## Cache and invalidation
 

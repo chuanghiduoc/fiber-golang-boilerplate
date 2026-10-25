@@ -13,10 +13,7 @@ type WebhookDelivery struct {
 	TenantID         int64              `json:"tenant_id"`
 	EndpointID       int64              `json:"endpoint_id"`
 	EventID          string             `json:"event_id"`
-	EventType        string             `json:"event_type"`
-	EventCreatedAt   pgtype.Timestamptz `json:"event_created_at"`
 	Url              string             `json:"url"`
-	Payload          []byte             `json:"payload"`
 	SecretCiphertext string             `json:"secret_ciphertext"`
 	Status           string             `json:"status"`
 	Attempts         int32              `json:"attempts"`
@@ -47,7 +44,6 @@ type WebhookEndpoint struct {
 	TenantID    int64              `json:"tenant_id"`
 	Url         string             `json:"url"`
 	Description string             `json:"description"`
-	EventTypes  []string           `json:"event_types"`
 	Status      string             `json:"status"`
 	MaxAttempts int32              `json:"max_attempts"`
 	TimeoutMs   int32              `json:"timeout_ms"`

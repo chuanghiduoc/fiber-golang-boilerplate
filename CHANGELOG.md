@@ -6,6 +6,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Breaking (P2a per-owner baseline and normalization)
+- ADR 0005: `migrations/000001_init_schema.*` is split into ten per-owner baseline files `20260101000000_platform_functions` … `20260101000900_webhooks_init` (shared functions, identity, platform jobs/scheduler/audit, then apikeys, files, features, notifications, webhooks). There are no sequential versions any more; `test/arch` rejects them and also rejects a migration that creates another owner's table. A database recorded at version 1 is a legacy history: `cmd/migrate` refuses it with the upgrade guidance (`force 20260101000900` after manual DDL). No deployed database exists, so recreate local databases.
+- `api_keys.scopes JSONB` → `api_key_scopes(api_key_id, permission_key)` (CASCADE, format `CHECK`; the RBAC phase adds the `permissions` FK). The API still returns a sorted `scopes` array.
+- `webhook_endpoints.event_types TEXT[]` → `webhook_endpoint_subscriptions(tenant_id, endpoint_id, pattern)`; matching is unchanged, and `eventTypes` is now returned sorted.
+- Webhook payloads are stored once in `webhook_events(tenant_id, event_id, event_type, occurred_at, payload)`; `webhook_deliveries` drops `event_type`/`event_created_at`/`payload` and references the event (RESTRICT). Retention deletes unreferenced events after terminal deliveries. Signed requests are byte-identical (`TestWebhookDeliveryWireFormatIsStable`).
+- `webhook_delivery_attempts` references `(tenant_id, delivery_id)`; `audit_events.ip` is `INET` (non-addresses stored as NULL), `actor_type` no longer allows `admin` (admins are `user` + `actor_role = 'admin'`; `audit.ActorTypeAdmin` is removed), and `parent_id` references `audit_events(id)`.
+- `feature_flag_targets` uses one `UNIQUE NULLS NOT DISTINCT (tenant_id, flag_key, user_id)` index; new `CHECK`s: `jobs_running_has_owner`, `api_keys_rotation_grace_matches_rotated`, `files.size >= 0`.
+
 ### Added (P1a generator)
 - `cmd/gen` (`make gen module=|resource=|command=|query=`, `dry_run=1`, `no_http=1`): Go stdlib generator for ADR 0002 code. `module` creates the skeleton (`Build(infra, Settings) (*Module, Provides, error)`, catalog, `service/ports.go`, repository/handler/dto, sqlc config, tests, `<ts>_<module>_init` migrations) and registers it once in `internal/bootstrap/modules.go`; `resource` adds a tenant-scoped CRUD slice (migration, cursor queries, repository row mapping, service over ports, guarded routes, permissions, error code, en/vi strings, fake-based unit tests, a PostgreSQL integration test); `command`/`query` add `service/{command,query}_<name>.go` with an HTTP stub. Each run verifies with sqlc, `go build ./...`, `go vet` (with and without `-tags=integration`), the module tests, and `test/arch`, and restores every written file on failure. `scripts/new-module.sh` is now a wrapper for `go run ./cmd/gen module`.
 

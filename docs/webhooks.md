@@ -108,7 +108,7 @@ sequenceDiagram
     D->>DB: load tenant's active endpoints + active sealed secret
     D->>D: filter by eventTypes
     loop each matching endpoint
-        D->>DB: one tx: INSERT webhook_deliveries (snapshot)<br/>+ enqueue webhook.delivery job
+        D->>DB: one tx: INSERT webhook_events (first time)<br/>+ webhook_deliveries (snapshot) + webhook.delivery job
         Note over D,DB: unique (tenant, endpoint, event):<br/>a retried fan-out only adds missing rows
     end
     JW->>W: claim webhook.delivery
@@ -131,9 +131,11 @@ Step by step, the fan-out:
 1. Resolves/validates the tenant, event ID, type, timestamp, and JSON body.
 2. Loads the tenant's active endpoints with their active sealed secret and
    filters by `eventTypes`.
-3. Inserts a `webhook_deliveries` row and a `webhook.delivery` job in **one
-   transaction**. The delivery snapshots the payload, event timestamp,
-   endpoint URL, secret ciphertext, max attempts, and timeout.
+3. Inserts the `webhook_events` row (first endpoint only), a
+   `webhook_deliveries` row, and a `webhook.delivery` job in **one
+   transaction**. The event row holds the payload, type, and event timestamp
+   once; the delivery snapshots the endpoint URL, secret ciphertext, max
+   attempts, and timeout.
 4. Returns the number of newly created deliveries; re-dispatching the same
    event is a no-op.
 
@@ -268,7 +270,7 @@ the window, a receiver still on the intermediate secret rejects the request.
 | Field | Meaning |
 |---|---|
 | `url` | Absolute `http(s)` URL, snapshotted per delivery. |
-| `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. |
+| `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. Stored as a set and returned sorted. |
 | `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried. |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
 | `timeoutMs` | Per-attempt HTTP timeout, 100-120000 ms, snapshotted per delivery; can only shorten `WEBHOOK_REQUEST_TIMEOUT_SECS`. |
@@ -443,7 +445,9 @@ Idempotency:
 | Table | Role |
 |---|---|
 | `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active). |
-| `webhook_deliveries` | Outbox + snapshot + state. |
+| `webhook_endpoint_subscriptions` | One row per `eventTypes` pattern of an endpoint. |
+| `webhook_events` | Each dispatched event once: id, type, occurrence time, payload (the signed envelope). |
+| `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret ciphertext, timeout, max attempts) + state. |
 | `webhook_delivery_attempts` | One row per attempt. |
 | `webhook_inbound_sources` | Inbound receivers and sealed secrets. |
 | `webhook_inbound_events` | Received events, unique per source and external event ID. |
@@ -451,12 +455,15 @@ Idempotency:
 - All tables carry `tenant_id` with tenant-leading indexes; there are no
   cross-module foreign keys.
 - Module-internal FKs are tenant-composite (`(tenant_id, endpoint_id)`,
-  `(tenant_id, source_id)`). Secrets cascade with their endpoint and attempts
-  with their delivery; deliveries and inbound events are history and
-  `RESTRICT` deletion of their endpoint/source.
+  `(tenant_id, event_id)`, `(tenant_id, delivery_id)`, `(tenant_id,
+  source_id)`). Subscriptions and secrets cascade with their endpoint and
+  attempts with their delivery; deliveries and inbound events are history and
+  `RESTRICT` deletion of their endpoint/event/source.
 - A retention loop runs hourly (first pass at startup) and deletes
-  `succeeded`/`dead` deliveries and inbound events older than
-  `WEBHOOK_RETENTION_DAYS`. Pending deliveries are never purged.
+  `succeeded`/`dead` deliveries older than `WEBHOOK_RETENTION_DAYS`, then
+  outbound events older than the window that no delivery references any more,
+  then inbound events older than the window. Pending deliveries (and their
+  events) are never purged.
 - Each purge deletes in batches of at most 1,000 rows (`FOR UPDATE SKIP
   LOCKED`) until a batch is short, bounded by a 30s pass.
 - Retention is cross-tenant, so its supporting indexes

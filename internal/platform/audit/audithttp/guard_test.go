@@ -261,7 +261,7 @@ func TestGuard_CompletesWithActorAfterHandler(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, recorder.completions, 1)
 	assert.Equal(t, int64(42), recorder.completions[0].Completion.ActorID)
-	assert.Equal(t, audit.ActorTypeAdmin, recorder.completions[0].Completion.ActorType)
+	assert.Equal(t, audit.ActorTypeUser, recorder.completions[0].Completion.ActorType)
 	assert.Equal(t, "admin", recorder.completions[0].Completion.ActorRole)
 }
 

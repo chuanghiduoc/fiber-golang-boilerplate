@@ -896,12 +896,12 @@ uses a separate Job (see [section 8](#8-kubernetes-deployment-notes)).
 ```mermaid
 flowchart TD
     start([Which database?]) --> fresh{Empty database?}
-    fresh -- yes --> base[cmd/migrate applies<br/>000001_init_schema]
+    fresh -- yes --> base[cmd/migrate applies<br/>the per-owner baseline]
     fresh -- no --> hist{schema_migrations version}
-    hist -- "1 or a timestamp" --> newer[Add a timestamped migration<br/>make migrate-create, then cmd/migrate]
-    hist -- "legacy 2 or 3" --> manual[Backup, apply missing DDL<br/>manually in one transaction]
+    hist -- "a timestamp" --> newer[Add a timestamped migration<br/>make migrate-create, then cmd/migrate]
+    hist -- "legacy 1, 2, or 3" --> manual[Backup, apply missing DDL<br/>manually in one transaction]
     hist -- "none, schema created<br/>out of band" --> verify[Verify objects match the baseline]
-    manual --> force[migrate force 1]
+    manual --> force[migrate force 20260101000900]
     verify --> force
     force --> run[cmd/migrate: newer migrations<br/>plus schema verification]
     base --> run
@@ -920,34 +920,39 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 
 ### Fresh installs vs deployed databases
 
-- A fresh install uses `migrations/000001_init_schema.up.sql`.
-- Once a database is deployed, never edit `000001`. Add a migration with only
-  the new objects: `make migrate-create module=<owner> name=<purpose>` writes
-  `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql` (golang-migrate
-  `-format 20060102150405 -tz UTC`). Timestamp versions do not collide when
-  branches each add a migration and are always above legacy versions 1..3.
-  golang-migrate only applies versions above the recorded one, so a branch
-  migration older than main's newest must be regenerated before merge.
-  `test/arch/migrations_test.go` (part of `make test`/CI) rejects duplicate
-  versions, missing up/down pairs, non-timestamp versions, and unknown owners.
-- A database that applied the old `000001`–`000003` history keeps it, but the
-  old files are **not** restored into `migrations/` (the architecture test
-  rejects sequential versions above 1, and a fresh install would run them after
-  the baseline). golang-migrate cannot advance a recorded version missing from
-  the source, so upgrade it once, manually:
+- A fresh install applies the per-owner baseline (ADR 0005): the
+  `migrations/20260101000*_<owner>_*.up.sql` files in version order (see
+  [Data Model](data-model.md)).
+- Once a database is deployed, never edit a migration it applied. Add one with
+  only the new objects: `make migrate-create module=<owner> name=<purpose>`
+  writes `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`
+  (golang-migrate `-format 20060102150405 -tz UTC`). Timestamp versions do not
+  collide when branches each add a migration. golang-migrate only applies
+  versions above the recorded one, so a branch migration older than main's
+  newest must be regenerated before merge. `test/arch/migrations_test.go`
+  (part of `make test`/CI) rejects duplicate versions, missing up/down pairs,
+  non-timestamp versions, unknown owners, and files that create another
+  owner's table.
+- A database recorded at a sequential version (the old `000001`–`000003`
+  history, or the former consolidated `000001`) keeps it, but those files are
+  **not** restored into `migrations/` (the architecture test rejects
+  sequential versions). golang-migrate cannot advance a recorded version
+  missing from the source (`cmd/migrate` reports "legacy version"), so upgrade
+  it once, manually:
   1. take a verified backup/PITR snapshot;
   2. apply the missing DDL (see below and the README upgrade section) with
      `psql` in one transaction so the schema matches the baseline;
-  3. record the baseline with `migrate -path migrations -database "$DSN" force 1`
-     only after the schema matches; it rewrites the version, not the schema;
+  3. record the baseline with
+     `migrate -path migrations -database "$DSN" force 20260101000900` only
+     after the schema matches; it rewrites the version, not the schema;
   4. run `cmd/migrate`, which applies newer timestamped migrations and verifies
      the schema, failing with the missing objects if step 2 was incomplete.
 
-  Never point an old database at the consolidated `000001` without that manual
-  DDL, and never reset `schema_migrations` to force it through.
+  Never point an old database at the baseline files without that manual DDL,
+  and never reset `schema_migrations` to force it through.
 - If a fresh schema was created out of band and already matches the baseline,
-  verify the objects and `force 1` instead of applying the file over populated
-  tables.
+  verify the objects and `force 20260101000900` instead of applying the files
+  over populated tables.
 
 ### Multi-tenant foundation upgrade
 

@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"sort"
 	"strings"
 
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -80,7 +80,7 @@ func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, req dto
 }
 
 func (s *service) DeleteEndpoint(ctx context.Context, actorID, id int64) error {
-	if _, err := s.endpoints.DeleteEndpoint(ctx, id); err != nil {
+	if err := s.endpoints.DeleteEndpoint(ctx, id); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("webhook endpoint not found")
 		}
@@ -156,6 +156,7 @@ func (s *service) timeoutMS(value *int) int32 {
 	return int32(*value) // #nosec G115 -- validated 100..120000
 }
 
+// normalizeEventTypes trims, validates, de-duplicates, and sorts the patterns.
 func normalizeEventTypes(types []string) ([]string, error) {
 	if len(types) == 0 {
 		return []string{"*"}, nil
@@ -179,12 +180,16 @@ func normalizeEventTypes(types []string) ([]string, error) {
 	if len(out) == 0 {
 		return nil, apperror.NewBadRequest("eventTypes must not be empty")
 	}
+	// Subscriptions are a set (webhook_endpoint_subscriptions); sorting here
+	// makes the create/update response match every later read, which returns
+	// them in the same byte order.
+	sort.Strings(out)
 	return out, nil
 }
 
 // endpointAuditMetadata is the non-secret configuration recorded when an
 // endpoint is created or updated.
-func endpointAuditMetadata(endpoint *webhooksqlc.WebhookEndpoint) map[string]any {
+func endpointAuditMetadata(endpoint *repository.Endpoint) map[string]any {
 	return map[string]any{
 		"url":         endpoint.Url,
 		"eventTypes":  endpoint.EventTypes,
@@ -194,7 +199,7 @@ func endpointAuditMetadata(endpoint *webhooksqlc.WebhookEndpoint) map[string]any
 	}
 }
 
-func toEndpointResponse(endpoint *webhooksqlc.WebhookEndpoint) dto.EndpointResponse {
+func toEndpointResponse(endpoint *repository.Endpoint) dto.EndpointResponse {
 	resp := dto.EndpointResponse{
 		ID:          endpoint.ID,
 		TenantID:    endpoint.TenantID,

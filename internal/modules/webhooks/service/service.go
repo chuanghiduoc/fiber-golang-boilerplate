@@ -85,7 +85,7 @@ type Service interface {
 	ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]dto.InboundEventResponse, bool, error)
 	ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*dto.InboundReceipt, error)
 
-	PurgeRetention(ctx context.Context, retentionDays int32) (deliveries, events int64, err error)
+	PurgeRetention(ctx context.Context, retentionDays int32) (RetentionResult, error)
 }
 
 type service struct {

@@ -80,11 +80,11 @@ watch:
 # these are for authoring and for disposable local databases only.
 DSN ?= postgres://$(DB_USERNAME):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_DATABASE)?sslmode=$(DB_SSLMODE)&search_path=$(DB_SCHEMA)
 
-# Roll back every migration. The baseline down migration DROPS THE WHOLE
-# SCHEMA and all data, so it requires CONFIRM=yes.
+# Roll back every migration. The per-owner baseline down migrations DROP THE
+# WHOLE SCHEMA and all data, so it requires CONFIRM=yes.
 migrate-down:
 	@if [ "$(CONFIRM)" != "yes" ]; then \
-		echo "WARNING: migrate-down runs every down migration, including 000001_init_schema.down.sql,"; \
+		echo "WARNING: migrate-down runs every down migration, including the baseline *_init/platform_* files,"; \
 		echo "         which DROPS THE WHOLE SCHEMA AND ALL DATA in $(DB_DATABASE) on $(DB_HOST):$(DB_PORT)."; \
 		echo "Re-run with 'make migrate-down CONFIRM=yes' only against a disposable database."; \
 		exit 1; \

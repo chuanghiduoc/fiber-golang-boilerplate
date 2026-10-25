@@ -54,6 +54,22 @@ type DeliveryJobPayload struct {
 	DeliveryID int64 `json:"deliveryId"`
 }
 
+// Endpoint is an endpoint row plus its subscribed event-type patterns (rows
+// of webhook_endpoint_subscriptions, sorted).
+type Endpoint struct {
+	webhooksqlc.WebhookEndpoint
+	EventTypes []string
+}
+
+// Delivery is a delivery row plus the event it delivers (webhook_events).
+// Payload is nil on list reads, which never return it.
+type Delivery struct {
+	webhooksqlc.WebhookDelivery
+	EventType  string
+	OccurredAt pgtype.Timestamptz
+	Payload    []byte
+}
+
 // ActiveEndpoint is the snapshot needed to fan an event out to one endpoint.
 type ActiveEndpoint struct {
 	ID               int64
@@ -88,6 +104,8 @@ type UpdateEndpointDraft struct {
 }
 
 // DeliveryDraft creates one delivery row and its first durable job atomically.
+// EventType, EventCreatedAt, and Payload describe the event: they are written
+// to webhook_events by the first delivery of EventID and ignored afterwards.
 type DeliveryDraft struct {
 	TenantID         int64
 	EndpointID       int64
@@ -156,12 +174,12 @@ type InboundEventDraft struct {
 
 // EndpointStore covers endpoint CRUD and secret snapshots.
 type EndpointStore interface {
-	CreateEndpoint(ctx context.Context, draft CreateEndpointDraft) (*webhooksqlc.WebhookEndpoint, error)
-	GetEndpoint(ctx context.Context, id int64) (*webhooksqlc.WebhookEndpoint, error)
-	ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]webhooksqlc.WebhookEndpoint, error)
-	UpdateEndpoint(ctx context.Context, draft UpdateEndpointDraft) (*webhooksqlc.WebhookEndpoint, error)
-	DeleteEndpoint(ctx context.Context, id int64) (*webhooksqlc.WebhookEndpoint, error)
-	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*webhooksqlc.WebhookEndpoint, error)
+	CreateEndpoint(ctx context.Context, draft CreateEndpointDraft) (*Endpoint, error)
+	GetEndpoint(ctx context.Context, id int64) (*Endpoint, error)
+	ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]Endpoint, error)
+	UpdateEndpoint(ctx context.Context, draft UpdateEndpointDraft) (*Endpoint, error)
+	DeleteEndpoint(ctx context.Context, id int64) error
+	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*Endpoint, error)
 	ActiveEndpoints(ctx context.Context, tenantID int64) ([]ActiveEndpoint, error)
 	ActiveEndpointSecret(ctx context.Context, endpointID int64) (string, error)
 	ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error)
@@ -177,9 +195,9 @@ type SigningSecret struct {
 // DeliveryStore covers the outbox, attempts, claims, and retention.
 type DeliveryStore interface {
 	CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraft) (deliveryID int64, created bool, err error)
-	GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error)
-	ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]webhooksqlc.WebhookDelivery, error)
-	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error)
+	GetDelivery(ctx context.Context, id int64) (*Delivery, error)
+	ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]Delivery, error)
+	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*Delivery, error)
 	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
 	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
 	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
@@ -188,6 +206,7 @@ type DeliveryStore interface {
 	CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error
 	ListDeliveryAttempts(ctx context.Context, deliveryID int64) ([]webhooksqlc.WebhookDeliveryAttempt, error)
 	PurgeDeliveries(ctx context.Context, retentionDays int32) (int64, error)
+	PurgeOrphanEvents(ctx context.Context, retentionDays int32) (int64, error)
 }
 
 // InboundStore covers inbound source CRUD and deduplicated events.

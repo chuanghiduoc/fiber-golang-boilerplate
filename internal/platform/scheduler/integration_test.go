@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -284,7 +286,7 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 		_, _ = admin.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE")
 	})
 
-	migration, err := os.ReadFile(schedulerIntegrationMigrationPath(t))
+	migration, err := integrationSchema(t)
 	require.NoError(t, err)
 
 	conn, err := admin.Acquire(ctx)
@@ -293,8 +295,8 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 
 	_, err = conn.Exec(ctx, "SET search_path TO "+schemaIdent)
 	require.NoError(t, err)
-	if _, err := conn.Conn().PgConn().Exec(ctx, string(migration)).ReadAll(); err != nil {
-		t.Fatalf("apply migrations/000001_init_schema.up.sql: %v", err)
+	if _, err := conn.Conn().PgConn().Exec(ctx, migration).ReadAll(); err != nil {
+		t.Fatalf("apply migrations/*.up.sql: %v", err)
 	}
 
 	poolCfg, err := pgxpool.ParseConfig(dsn)
@@ -308,10 +310,27 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func schedulerIntegrationMigrationPath(t *testing.T) string {
+// integrationSchema returns every up migration concatenated in version
+// order, which is what golang-migrate applies to a fresh database.
+func integrationSchema(t *testing.T) (string, error) {
 	t.Helper()
 
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok, "resolve test file path")
-	return filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "000001_init_schema.up.sql")
+	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
+	if err != nil {
+		return "", err
+	}
+	require.NotEmpty(t, paths, "no up migrations found")
+	sort.Strings(paths)
+	var schema strings.Builder
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		schema.Write(raw)
+		schema.WriteString("\n")
+	}
+	return schema.String(), nil
 }

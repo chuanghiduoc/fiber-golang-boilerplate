@@ -221,30 +221,50 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Apply initial schema up and down with psql
+      # The baseline is split per owner (ADR 0005): apply every up file in
+      # version order, then every down file in reverse, then up again, so each
+      # down drops exactly what its up created.
+      - name: Apply baseline migrations up, down, and up again with psql
         run: |
-          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
-            -f migrations/000001_init_schema.up.sql
-
-          expected_tables="tenants users refresh_tokens password_reset_tokens email_verification_tokens api_keys files feature_flags feature_flag_targets notifications notification_preferences jobs scheduler_leases scheduler_runs audit_events webhook_endpoints webhook_endpoint_secrets webhook_deliveries webhook_delivery_attempts webhook_inbound_sources webhook_inbound_events"
-          existing_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
-          for table in $expected_tables; do
-            if ! grep -qx "$table" <<< "$existing_tables"; then
-              echo "::error::missing table after up migration: $table"
-              exit 1
-            fi
-          done
-
-          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
-            -f migrations/000001_init_schema.down.sql
-
-          remaining_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
-            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
-          if [ "$remaining_tables" -ne 0 ]; then
-            echo "::error::down migration left $remaining_tables table(s) behind"
+          expected_tables="tenants users refresh_tokens password_reset_tokens email_verification_tokens api_keys api_key_scopes files feature_flags feature_flag_targets notifications notification_preferences jobs scheduler_leases scheduler_runs audit_events webhook_endpoints webhook_endpoint_subscriptions webhook_endpoint_secrets webhook_events webhook_deliveries webhook_delivery_attempts webhook_inbound_sources webhook_inbound_events"
+          apply() {
+            for file in "$@"; do
+              echo "applying $file"
+              psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 -q -f "$file"
+            done
+          }
+          check_tables() {
+            existing_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+              "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+            for table in $expected_tables; do
+              if ! grep -qx "$table" <<< "$existing_tables"; then
+                echo "::error::missing table after up migrations: $table"
+                exit 1
+              fi
+            done
+          }
+          mapfile -t up_files < <(find migrations -maxdepth 1 -name '*.up.sql' | sort)
+          mapfile -t down_files < <(find migrations -maxdepth 1 -name '*.down.sql' | sort -r)
+          if [ "${#up_files[@]}" -eq 0 ] || [ "${#up_files[@]}" -ne "${#down_files[@]}" ]; then
+            echo "::error::expected matching up/down migrations, found ${#up_files[@]} up and ${#down_files[@]} down"
             exit 1
           fi
+
+          apply "${up_files[@]}"
+          check_tables
+
+          apply "${down_files[@]}"
+          remaining=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public')
+                  + (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public')")
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::down migrations left $remaining relation(s)/function(s) behind"
+            exit 1
+          fi
+
+          apply "${up_files[@]}"
+          check_tables
+          apply "${down_files[@]}"
 
       - name: Run cmd/migrate twice against a clean database
         run: |
@@ -252,9 +272,9 @@ jobs:
           go run ./cmd/migrate
 
           migrated_tables=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
-            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('tenants', 'users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'api_keys', 'files', 'feature_flags', 'feature_flag_targets', 'notifications', 'notification_preferences', 'jobs', 'scheduler_leases', 'scheduler_runs', 'audit_events', 'webhook_endpoints', 'webhook_endpoint_secrets', 'webhook_deliveries', 'webhook_delivery_attempts', 'webhook_inbound_sources', 'webhook_inbound_events')")
-          if [ "$migrated_tables" -ne 21 ]; then
-            echo "::error::expected 21 tables after cmd/migrate, found $migrated_tables"
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('tenants', 'users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'api_keys', 'api_key_scopes', 'files', 'feature_flags', 'feature_flag_targets', 'notifications', 'notification_preferences', 'jobs', 'scheduler_leases', 'scheduler_runs', 'audit_events', 'webhook_endpoints', 'webhook_endpoint_subscriptions', 'webhook_endpoint_secrets', 'webhook_events', 'webhook_deliveries', 'webhook_delivery_attempts', 'webhook_inbound_sources', 'webhook_inbound_events')")
+          if [ "$migrated_tables" -ne 24 ]; then
+            echo "::error::expected 24 tables after cmd/migrate, found $migrated_tables"
             exit 1
           fi
 
@@ -270,7 +290,7 @@ jobs:
             echo "::error::legacy schema unexpectedly passed migration verification"
             exit 1
           fi
-          grep -q "schema is incomplete" /tmp/legacy-migrate.log || {
+          grep -q "run migrations from legacy version 1" /tmp/legacy-migrate.log || {
             echo "::error::legacy schema failed without the expected actionable error"
             cat /tmp/legacy-migrate.log
             exit 1
@@ -358,9 +378,12 @@ jobs:
           go-version-file: go.mod
 
       # The audit integration tests query the public schema directly; the
-      # handler/jobs tests create their own isolated schemas from the same file.
+      # handler/jobs tests create their own isolated schemas from the same files.
       - name: Apply schema to integration database
-        run: psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/000001_init_schema.up.sql
+        run: |
+          for file in $(find migrations -maxdepth 1 -name '*.up.sql' | sort); do
+            psql "$TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$file"
+          done
 
       - name: Run integration tests (PostgreSQL service)
         run: go test -tags=integration -race -count=1 -timeout=10m ./...
