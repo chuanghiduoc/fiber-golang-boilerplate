@@ -101,7 +101,7 @@ func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
 		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
-		authzhttp.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role))
+		authzhttp.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role).WithAMR(claims.AMR))
 
 		// Services publish events with the request context, so the actor must
 		// be available there too, not only in Fiber locals.

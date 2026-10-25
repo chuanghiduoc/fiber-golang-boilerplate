@@ -28,6 +28,7 @@ func toSession(row identitysqlc.Session) identityservice.Session {
 		TokenVersion:  row.TokenVersion,
 		UserAgent:     row.UserAgent.String,
 		IP:            ipString(row.Ip),
+		AMR:           row.Amr,
 		LastUsedAt:    row.LastUsedAt.Time,
 		CreatedAt:     row.CreatedAt.Time,
 		RevokedAt:     timePtr(row.RevokedAt),
@@ -42,6 +43,7 @@ func (r *SessionRepository) Create(ctx context.Context, session identityservice.
 		TokenVersion: session.TokenVersion,
 		UserAgent:    optionalText(session.UserAgent),
 		Ip:           ipAddr(session.IP),
+		Amr:          session.AMR,
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -104,6 +106,17 @@ func (r *SessionRepository) RevokeAllInTenant(ctx context.Context, userID int64,
 func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID int64, why identityservice.RevokeReason) error {
 	if err := r.q.RevokeAllUserSessions(ctx, identitysqlc.RevokeAllUserSessionsParams{
 		UserID: userID,
+		Reason: optionalText(string(why)),
+	}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
+}
+
+func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID, keepID int64, why identityservice.RevokeReason) error {
+	if err := r.q.RevokeOtherUserSessions(ctx, identitysqlc.RevokeOtherUserSessionsParams{
+		UserID: userID,
+		KeepID: keepID,
 		Reason: optionalText(string(why)),
 	}); err != nil {
 		return wrapErr(err)

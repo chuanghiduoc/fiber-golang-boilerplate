@@ -26,6 +26,13 @@ type tier1Audit struct {
 // must not also carry a route-level Guard intent row.
 var tier1Mutations = map[string]tier1Audit{
 	"POST /api/v1/auth/register": {"identity", "auth.registered"},
+	// MFA management and two-step login verification record in the service
+	// transaction.
+	"POST /api/v1/auth/mfa/totp/enroll":               {"identity", "auth.mfa_enrollment_started"},
+	"POST /api/v1/auth/mfa/totp/confirm":              {"identity", "auth.mfa_enabled"},
+	"POST /api/v1/auth/mfa/disable":                   {"identity", "auth.mfa_disabled"},
+	"POST /api/v1/auth/mfa/recovery-codes/regenerate": {"identity", "auth.mfa_recovery_codes_regenerated"},
+	"POST /api/v1/auth/mfa/verify":                    {"identity", "auth.mfa_login"},
 	// Signed-state tenant: UserService records auth.google_login in the
 	// sign-in transaction with the state tenant and the signed-in user.
 	"GET /api/v1/auth/google/callback": {"identity", "auth.google_login"},

@@ -21,6 +21,7 @@ var publicRoutes = map[string]string{
 	"POST /api/v1/auth/register":            "anonymous sign-up (feature-flag gated)",
 	"POST /api/v1/auth/invitations/signup":  "invitation-token possession",
 	"POST /api/v1/auth/login":               "credential check",
+	"POST /api/v1/auth/mfa/verify":          "single-use sealed challenge plus TOTP/recovery code",
 	"POST /api/v1/auth/refresh":             "refresh-token possession",
 	"POST /api/v1/auth/logout":              "refresh-token possession",
 	"POST /api/v1/auth/forgot-password":     "anonymous, non-enumerating",

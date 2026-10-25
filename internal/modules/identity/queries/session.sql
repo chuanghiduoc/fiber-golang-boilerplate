@@ -2,8 +2,8 @@
 -- A session is only created for an active member whose token version still
 -- equals the one the caller authenticated at. This closes the bcrypt-length
 -- window where a password change commits after the password check.
-INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip)
-SELECT m.tenant_id, m.user_id, u.token_version, @user_agent, @ip
+INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip, amr)
+SELECT m.tenant_id, m.user_id, u.token_version, @user_agent, @ip, @amr
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = @tenant_id AND m.user_id = @user_id
@@ -40,6 +40,13 @@ WHERE tenant_id = @tenant_id AND user_id = @user_id AND revoked_at IS NULL;
 UPDATE sessions
 SET revoked_at = NOW(), revoked_reason = @reason
 WHERE user_id = @user_id AND revoked_at IS NULL;
+
+-- name: RevokeOtherUserSessions :exec
+-- An MFA change ends every other sign-in (every tenant) but keeps the session
+-- that performed it.
+UPDATE sessions
+SET revoked_at = NOW(), revoked_reason = @reason
+WHERE user_id = @user_id AND id <> @keep_id AND revoked_at IS NULL;
 
 -- name: RevokeSessionByRefreshToken :one
 -- Possession-based (logout and refresh-token reuse): presenting the opaque

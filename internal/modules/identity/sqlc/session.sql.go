@@ -13,19 +13,20 @@ import (
 )
 
 const createSession = `-- name: CreateSession :one
-INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip)
-SELECT m.tenant_id, m.user_id, u.token_version, $1, $2
+INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip, amr)
+SELECT m.tenant_id, m.user_id, u.token_version, $1, $2, $3
 FROM memberships m
 JOIN users u ON u.id = m.user_id
-WHERE m.tenant_id = $3 AND m.user_id = $4
+WHERE m.tenant_id = $4 AND m.user_id = $5
   AND m.status = 'active' AND u.status = 'active'
-  AND u.token_version = $5
-RETURNING id, tenant_id, user_id, token_version, user_agent, ip, last_used_at, revoked_at, revoked_reason, created_at, updated_at
+  AND u.token_version = $6
+RETURNING id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at
 `
 
 type CreateSessionParams struct {
 	UserAgent    pgtype.Text `json:"user_agent"`
 	Ip           *netip.Addr `json:"ip"`
+	Amr          []string    `json:"amr"`
 	TenantID     int64       `json:"tenant_id"`
 	UserID       int64       `json:"user_id"`
 	TokenVersion int32       `json:"token_version"`
@@ -38,6 +39,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 	row := q.db.QueryRow(ctx, createSession,
 		arg.UserAgent,
 		arg.Ip,
+		arg.Amr,
 		arg.TenantID,
 		arg.UserID,
 		arg.TokenVersion,
@@ -50,6 +52,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.TokenVersion,
 		&i.UserAgent,
 		&i.Ip,
+		&i.Amr,
 		&i.LastUsedAt,
 		&i.RevokedAt,
 		&i.RevokedReason,
@@ -60,7 +63,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, tenant_id, user_id, token_version, user_agent, ip, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
+SELECT id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1 AND id = $2
 `
 
@@ -79,6 +82,7 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 		&i.TokenVersion,
 		&i.UserAgent,
 		&i.Ip,
+		&i.Amr,
 		&i.LastUsedAt,
 		&i.RevokedAt,
 		&i.RevokedReason,
@@ -132,7 +136,7 @@ func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams
 }
 
 const listLiveSessionsCursor = `-- name: ListLiveSessionsCursor :many
-SELECT id, tenant_id, user_id, token_version, user_agent, ip, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
+SELECT id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1::bigint AND user_id = $2::bigint
   AND revoked_at IS NULL
   AND (created_at, id) < ($3::timestamptz, $4::bigint)
@@ -170,6 +174,7 @@ func (q *Queries) ListLiveSessionsCursor(ctx context.Context, arg ListLiveSessio
 			&i.TokenVersion,
 			&i.UserAgent,
 			&i.Ip,
+			&i.Amr,
 			&i.LastUsedAt,
 			&i.RevokedAt,
 			&i.RevokedReason,
@@ -235,6 +240,25 @@ type RevokeAllUserSessionsParams struct {
 // logout-all, account deletion) end the user's sessions in every tenant.
 func (q *Queries) RevokeAllUserSessions(ctx context.Context, arg RevokeAllUserSessionsParams) error {
 	_, err := q.db.Exec(ctx, revokeAllUserSessions, arg.Reason, arg.UserID)
+	return err
+}
+
+const revokeOtherUserSessions = `-- name: RevokeOtherUserSessions :exec
+UPDATE sessions
+SET revoked_at = NOW(), revoked_reason = $1
+WHERE user_id = $2 AND id <> $3 AND revoked_at IS NULL
+`
+
+type RevokeOtherUserSessionsParams struct {
+	Reason pgtype.Text `json:"reason"`
+	UserID int64       `json:"user_id"`
+	KeepID int64       `json:"keep_id"`
+}
+
+// An MFA change ends every other sign-in (every tenant) but keeps the session
+// that performed it.
+func (q *Queries) RevokeOtherUserSessions(ctx context.Context, arg RevokeOtherUserSessionsParams) error {
+	_, err := q.db.Exec(ctx, revokeOtherUserSessions, arg.Reason, arg.UserID, arg.KeepID)
 	return err
 }
 

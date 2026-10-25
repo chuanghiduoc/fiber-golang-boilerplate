@@ -81,11 +81,11 @@ func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	first, err := sessions.Issue(ctx, user.ID, user.TokenVersion)
+	first, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 	require.Positive(t, first.SessionID)
 	require.Len(t, signed, 1)
-	assert.Equal(t, AccessClaims{UserID: user.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com", Role: RoleUser}, signed[0])
+	assert.Equal(t, AccessClaims{UserID: user.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com", Role: RoleUser, AMR: []string{AMRPassword}}, signed[0])
 
 	rotated, err := sessions.Refresh(ctx, first.RefreshToken, nil)
 	require.NoError(t, err)
@@ -108,7 +108,7 @@ func TestSessions_CrossTenantRefreshHasNoSideEffects(t *testing.T) {
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion)
+	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 
 	_, err = sessions.Refresh(tenant.WithID(ctx, 2), pair.RefreshToken, nil)
@@ -126,7 +126,7 @@ func TestSessions_AdmissionRefusalDoesNotConsume(t *testing.T) {
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion)
+	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 
 	refuse := func(context.Context, *Member) error { return apperror.NewForbidden("not yet") }
@@ -144,14 +144,14 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion)
+	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 
 	// logout-all bumps the version and revokes every session.
 	require.NoError(t, svc.RevokeSessions(ctx, user.ID))
 	_, err = sessions.Refresh(ctx, pair.RefreshToken, nil)
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err))
-	_, err = sessions.Issue(ctx, user.ID, user.TokenVersion)
+	_, err = sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err), "a password checked at the old version cannot open a session")
 }
 
@@ -166,9 +166,9 @@ func TestAdmin_BanIsPerTenantAndProtectsLastAdmin(t *testing.T) {
 
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	inDefault, err := sessions.Issue(ctx, member, 0)
+	inDefault, err := sessions.Issue(ctx, member, 0, nil)
 	require.NoError(t, err)
-	inAcme, err := sessions.Issue(tenant.WithID(ctx, 2), member, 0)
+	inAcme, err := sessions.Issue(tenant.WithID(ctx, 2), member, 0, nil)
 	require.NoError(t, err)
 
 	adminSvc := NewAdminUserService(st, memTx{db}, nil)

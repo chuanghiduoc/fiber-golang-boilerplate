@@ -99,7 +99,21 @@ const (
 	RevokeCredentialsChanged RevokeReason = "credentials_changed"
 	RevokeMembershipChanged  RevokeReason = "membership_changed"
 	RevokeAccountDeleted     RevokeReason = "account_deleted"
+	// RevokeMFAChanged ends the user's other sessions after an MFA factor or
+	// recovery-code set changes.
+	RevokeMFAChanged RevokeReason = "mfa_changed"
 )
+
+// MFA method values recorded in access-token amr claims (RFC 8176).
+const (
+	AMRPassword     = "pwd"
+	AMRGoogle       = "google"
+	AMROTP          = "otp"
+	AMRRecoveryCode = "rc"
+)
+
+// MFA factor types (mfa_factors.type).
+const MFAFactorTOTP = "totp"
 
 // External identity providers (user_identities.provider).
 const ProviderGoogle = "google"
@@ -196,6 +210,7 @@ type Session struct {
 	TokenVersion  int32
 	UserAgent     string
 	IP            string
+	AMR           []string
 	LastUsedAt    time.Time
 	CreatedAt     time.Time
 	RevokedAt     *time.Time
@@ -210,6 +225,8 @@ type NewSession struct {
 	TokenVersion int32
 	UserAgent    string
 	IP           string
+	// AMR is the authentication-method reference set (pwd, google, otp, rc).
+	AMR []string
 }
 
 // SessionState is everything the access-token validator compares.
@@ -304,6 +321,69 @@ type TenantSettings struct {
 	Timezone string
 }
 
+// MFAFactor is one MFA factor of a global user (mfa_factors). SecretCiphertext
+// is sealed with the data encryption keyring; only the service opens it.
+type MFAFactor struct {
+	ID               int64
+	UserID           int64
+	Type             string
+	SecretCiphertext string
+	ConfirmedAt      *time.Time
+	LastUsedStep     int64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// Confirmed reports whether the factor completed enrollment.
+func (f *MFAFactor) Confirmed() bool { return f.ConfirmedAt != nil }
+
+// MFAStatus is the public state of a user's MFA configuration.
+type MFAStatus struct {
+	Enabled                bool
+	ConfirmedAt            *time.Time
+	RecoveryCodesRemaining int64
+}
+
+// MFAEnrollment is a pending TOTP enrollment. The otpauth URI is the only time
+// the secret is exposed.
+type MFAEnrollment struct {
+	OtpauthURI string
+}
+
+// MFALogin is a completed two-step sign-in.
+type MFALogin struct {
+	Tokens TokenPair
+	Member *Member
+}
+
+// MFARepository stores per-user MFA factors and recovery codes.
+type MFARepository interface {
+	// GetTOTP returns the user's TOTP factor (confirmed or pending); the
+	// service distinguishes them through ConfirmedAt.
+	GetTOTP(ctx context.Context, userID int64) (*MFAFactor, error)
+	GetConfirmedTOTP(ctx context.Context, userID int64) (*MFAFactor, error)
+	// UpsertUnconfirmedTOTP replaces a pending enrollment.
+	UpsertUnconfirmedTOTP(ctx context.Context, userID int64, secretCiphertext string) (*MFAFactor, error)
+	// ConfirmTOTP marks a pending factor confirmed and records step as used.
+	ConfirmTOTP(ctx context.Context, id, userID, step int64) (bool, error)
+	// ConsumeTOTPStep records step only when it is newer than last_used_step,
+	// which makes concurrent uses of one code unable to both succeed.
+	ConsumeTOTPStep(ctx context.Context, userID, step int64) (bool, error)
+	DeleteTOTP(ctx context.Context, userID int64) error
+	DeleteRecoveryCodes(ctx context.Context, userID int64) error
+	CreateRecoveryCodes(ctx context.Context, userID int64, hashes []string) error
+	// UseRecoveryCode claims an unused code; the first concurrent caller wins.
+	UseRecoveryCode(ctx context.Context, userID int64, hash string) (bool, error)
+	CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int64, error)
+}
+
+// SecretSealer seals and opens MFA secrets and challenge tokens at rest. The
+// composition root binds it to jobs.PayloadCodec (DATA_ENCRYPTION_KEY).
+type SecretSealer interface {
+	Seal(plaintext []byte) ([]byte, error)
+	Open(sealed []byte) ([]byte, error)
+}
+
 // UserRepository stores global users and their credentials.
 type UserRepository interface {
 	// GetByID / GetByEmail return a non-deleted user (any other status).
@@ -373,6 +453,9 @@ type SessionRepository interface {
 	// RevokeAllForUser revokes the user's sessions in every tenant
 	// (deliberately cross-tenant: global credential events).
 	RevokeAllForUser(ctx context.Context, userID int64, reason RevokeReason) error
+	// RevokeOtherUserSessions revokes the user's sessions in every tenant
+	// except keepID (an MFA change keeps the session that performed it).
+	RevokeOtherUserSessions(ctx context.Context, userID, keepID int64, reason RevokeReason) error
 	// RevokeByRefreshToken revokes the session owning a refresh-token hash,
 	// by possession (no tenant predicate). revoked is false when the token is
 	// unknown or its session was already revoked.
@@ -461,6 +544,7 @@ type Stores struct {
 	Verifications VerificationRepository
 	Invitations   InvitationRepository
 	Tenants       TenantRepository
+	MFA           MFARepository
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction.

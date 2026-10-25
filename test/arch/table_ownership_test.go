@@ -32,6 +32,8 @@ var tableOwners = map[string]string{
 	"refresh_tokens":                 "identity",
 	"password_reset_tokens":          "identity",
 	"email_verification_tokens":      "identity",
+	"mfa_factors":                    "identity",
+	"mfa_recovery_codes":             "identity",
 	"files":                          "files",
 	"feature_flags":                  "features",
 	"feature_flag_targets":           "features",

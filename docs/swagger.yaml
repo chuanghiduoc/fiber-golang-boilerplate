@@ -568,10 +568,81 @@ definitions:
     properties:
       accessToken:
         type: string
+      mfaChallengeToken:
+        description: MFAChallengeToken is a five-minute, single-use, tenant-bound
+          challenge.
+        type: string
+      mfaRequired:
+        description: |-
+          MFARequired is true when the password or Google sign-in succeeded but a
+          second factor is needed. Tokens are empty in that case; the caller
+          completes the sign-in with MFAChallengeToken at /auth/mfa/verify.
+        type: boolean
       refreshToken:
         type: string
       user:
         $ref: '#/definitions/dto.UserResponse'
+    type: object
+  dto.MFAConfirmRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFADisableRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFAEnrollResponse:
+    properties:
+      otpauthUri:
+        type: string
+      type:
+        enum:
+        - totp
+        type: string
+    type: object
+  dto.MFARecoveryCodesResponse:
+    properties:
+      recoveryCodes:
+        items:
+          type: string
+        type: array
+    type: object
+  dto.MFARegenerateRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFAStatusResponse:
+    properties:
+      confirmedAt:
+        type: string
+      enabled:
+        type: boolean
+      recoveryCodesRemaining:
+        type: integer
+    type: object
+  dto.MFAVerifyRequest:
+    properties:
+      challenge:
+        maxLength: 4096
+        type: string
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - challenge
+    - code
     type: object
   dto.NotificationResponse:
     properties:
@@ -2114,6 +2185,227 @@ paths:
       security:
       - BearerAuth: []
       summary: Log out everywhere
+      tags:
+      - Auth
+  /auth/mfa/disable:
+    post:
+      consumes:
+      - application/json
+      description: Remove the TOTP factor and recovery codes after proving a current
+        TOTP or recovery code. The user's other sessions are revoked.
+      parameters:
+      - description: TOTP or recovery code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFADisableRequest'
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: auth.mfa_not_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Disable MFA
+      tags:
+      - Auth
+  /auth/mfa/recovery-codes/regenerate:
+    post:
+      consumes:
+      - application/json
+      description: Replace all recovery codes after proving a current TOTP or recovery
+        code. The new codes are returned once and the old set stops working.
+      parameters:
+      - description: TOTP or recovery code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFARegenerateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Regenerate recovery codes
+      tags:
+      - Auth
+  /auth/mfa/status:
+    get:
+      description: Return whether TOTP is enabled and how many recovery codes are
+        unused.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFAStatusResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: MFA status
+      tags:
+      - Auth
+  /auth/mfa/totp/confirm:
+    post:
+      consumes:
+      - application/json
+      description: Verify the first TOTP code, enable the factor, and return ten single-use
+        recovery codes. This is the only time the recovery codes are shown.
+      parameters:
+      - description: TOTP code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAConfirmRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Confirm TOTP enrollment
+      tags:
+      - Auth
+  /auth/mfa/totp/enroll:
+    post:
+      description: Generate a TOTP secret and return its otpauth provisioning URI.
+        The secret is never returned again; re-enrolling before confirmation replaces
+        it.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFAEnrollResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: auth.mfa_already_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Start TOTP enrollment
+      tags:
+      - Auth
+  /auth/mfa/verify:
+    post:
+      consumes:
+      - application/json
+      description: Exchange a two-step login challenge plus a TOTP or recovery code
+        for the normal access and refresh token pair.
+      parameters:
+      - description: Challenge and MFA code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAVerifyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.LoginResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      summary: Complete MFA login
       tags:
       - Auth
   /auth/refresh:

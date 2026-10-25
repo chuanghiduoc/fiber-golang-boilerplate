@@ -38,12 +38,18 @@ type GoogleSignIn struct {
 	// sign-in is never audited as a success. A nil Complete admits every
 	// resolved member.
 	Complete func(ctx context.Context, user *dto.UserResponse) error
+	// MFARequired runs inside the same transaction after Complete. When it
+	// reports true, the first factor succeeded but no session is issued; the
+	// caller starts a two-step login challenge. A nil hook never requires MFA.
+	MFARequired func(ctx context.Context, member *Member) (bool, error)
 }
 
-// GoogleSignInResult is the signed-in member and the issued session.
+// GoogleSignInResult is the signed-in member and the issued session. When
+// MFARequired is set, Tokens is empty and the caller must start a challenge.
 type GoogleSignInResult struct {
-	User   *dto.UserResponse
-	Tokens TokenPair
+	User        *dto.UserResponse
+	Tokens      TokenPair
+	MFARequired bool
 }
 
 // SignInWithGoogle resolves the Google identity to a global user (existing
@@ -82,14 +88,25 @@ func (s *userService) completeGoogleSignIn(ctx context.Context, req GoogleSignIn
 				return err
 			}
 		}
-		tokens, err := s.Sessions.issueTx(ctx, tx.Stores, member.User.ID, member.User.TokenVersion)
-		if err != nil {
+		mfaRequired := false
+		if req.MFARequired != nil {
+			required, err := req.MFARequired(ctx, member)
+			if err != nil {
+				return err
+			}
+			mfaRequired = required
+		}
+		var tokens TokenPair
+		if !mfaRequired {
+			tokens, err = s.Sessions.issueTx(ctx, tx.Stores, member.User.ID, member.User.TokenVersion, []string{AMRGoogle})
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.recordGoogleLogin(ctx, tx, member, account, mfaRequired); err != nil {
 			return err
 		}
-		if err := s.recordGoogleLogin(ctx, tx, member, account); err != nil {
-			return err
-		}
-		result = &GoogleSignInResult{User: user, Tokens: tokens}
+		result = &GoogleSignInResult{User: user, Tokens: tokens, MFARequired: mfaRequired}
 		return nil
 	})
 	return result, err
@@ -202,7 +219,7 @@ func createGoogleAccount(ctx context.Context, st Stores, req GoogleSignIn) (*Mem
 // callback skips tenant middleware (its tenant comes from the signed state),
 // so the event takes its tenant and actor from the signed-in member rather
 // than from request-level audit state.
-func (s *userService) recordGoogleLogin(ctx context.Context, tx TxRepos, member *Member, account string) error {
+func (s *userService) recordGoogleLogin(ctx context.Context, tx TxRepos, member *Member, account string, mfaRequired bool) error {
 	event := audit.NewServiceEvent(ctx, "auth.google_login", "auth")
 	event.TenantID = member.Membership.TenantID
 	event.ResourceID = strconv.FormatInt(member.User.ID, 10)
@@ -215,6 +232,7 @@ func (s *userService) recordGoogleLogin(ctx context.Context, tx TxRepos, member 
 	event.Metadata = map[string]any{
 		"account":        account,
 		"email_verified": member.User.EmailVerified(),
+		"mfa_required":   mfaRequired,
 	}
 	return checkAudit(tx.Audit.RecordTx(ctx, event))
 }

@@ -26,6 +26,9 @@ type Subject struct {
 	Permissions map[Permission]struct{}
 	CrossTenant bool
 	Attributes  map[string]string
+	// AMR is the access token's authentication-methods set (pwd, google,
+	// otp, rc). Tokens without it have an empty set.
+	AMR []string
 }
 
 // NewSubject builds a subject whose permissions derive from role.
@@ -77,6 +80,23 @@ func (s Subject) WithAttribute(name, value string) Subject {
 	attrs[name] = value
 	s.Attributes = attrs
 	return s
+}
+
+// WithAMR returns a copy carrying the access token's authentication methods.
+func (s Subject) WithAMR(amr []string) Subject {
+	s.AMR = append([]string(nil), amr...)
+	return s
+}
+
+// HasMFA reports whether the subject authenticated with an MFA method: a
+// TOTP code (otp) or a recovery code (rc).
+func (s Subject) HasMFA() bool {
+	for _, method := range s.AMR {
+		if method == "otp" || method == "rc" {
+			return true
+		}
+	}
+	return false
 }
 
 type subjectContextKey struct{}

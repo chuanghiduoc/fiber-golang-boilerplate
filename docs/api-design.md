@@ -231,11 +231,38 @@ flowchart TD
   shared back-office permissions in `internal/platform/authz/permissions.go`;
   routes use `authzhttp.Require`. Never check role strings ad hoc in handlers.
 - Object-level checks use `authz.Subject` (explicit permissions, tenant, owner,
-  cross-tenant flag, attributes) with `Policy`/`PolicySet`, `TenantPolicy`, and
+  cross-tenant flag, attributes, `amr`) with `Policy`/`PolicySet`, `TenantPolicy`, and
   `OwnerPolicy`. `Authorize` runs an RBAC pre-check, then deny-overrides
   evaluation: deny is `403 permission.denied`, conceal is `404`. With no
   subject, only an `authz.SystemContext` (trusted background caller) is
   allowed; any other subject-less call is `403` (fail closed).
+
+## MFA (ADR 0010)
+
+TOTP (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step) and single-use recovery codes
+are available per global user, not per tenant.
+
+| Endpoint | Auth | Behavior |
+|---|---|---|
+| `POST /auth/mfa/totp/enroll` | JWT, `mfa:write` | Start or restart a pending enrollment; returns `{type, otpauthUri}`. The secret is only inside the URI. |
+| `POST /auth/mfa/totp/confirm` | JWT, `mfa:write` | Verify a code, enable the factor, revoke the user's other sessions, and return ten recovery codes once. |
+| `POST /auth/mfa/disable` | JWT, `mfa:write` | Require a current TOTP or recovery code, delete the factor and codes, revoke other sessions. |
+| `POST /auth/mfa/recovery-codes/regenerate` | JWT, `mfa:write` | Require a code and return a fresh set of ten; the old set stops working. |
+| `GET /auth/mfa/status` | JWT, `mfa:read` | `{enabled, confirmedAt?, recoveryCodesRemaining}`. |
+| `POST /auth/mfa/verify` | public | `{challenge, code}` → the normal login response. The challenge is sealed, tenant-bound, five minutes old at most, and single use. |
+
+With a confirmed factor, `POST /auth/login` and the Google callback do not
+issue tokens. Login returns `200` with the user, `mfaRequired: true`, and
+`mfaChallengeToken`; the Google callback redirects with `mfa_required=true`
+and `mfa_challenge` in the URL fragment. Complete either with
+`POST /auth/mfa/verify`; a wrong code counts toward the existing login lockout
+(per email/address and global per email). When MFA is off, the login response
+keeps its original shape (`mfaRequired`/`mfaChallengeToken` are omitted).
+
+Access tokens carry `amr` (`pwd`, `google`, `otp`, `rc`); refresh preserves the
+session's set. `authzhttp.RequireMFA()` returns `403 auth.mfa_required` when
+the token lacks `otp`/`rc`; which roles must use it is a later RBAC decision.
+Token-minting endpoints never take `Idempotency-Key`.
 
 ## Tenants
 

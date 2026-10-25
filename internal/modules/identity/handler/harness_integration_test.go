@@ -127,3 +127,7 @@ func (f *fakeGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) str
 	return "https://frontend.example.test/auth/callback#access_token=" + accessToken +
 		"&refresh_token=" + refreshToken
 }
+
+func (f *fakeGoogleOAuth) BuildMFACallbackURL(challenge string) string {
+	return "https://frontend.example.test/auth/callback#mfa_required=true&mfa_challenge=" + challenge
+}
