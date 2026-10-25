@@ -4,6 +4,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Supply-chain cooldown: only propose releases at least 14 days old, so a
+    # yanked or compromised version is usually caught before it lands here.
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(deps):"
     labels:
@@ -30,6 +34,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Supply-chain cooldown: only propose releases at least 14 days old, so a
+    # yanked or compromised version is usually caught before it lands here.
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "ci(deps):"
     labels:
@@ -42,6 +50,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Supply-chain cooldown: only propose releases at least 14 days old, so a
+    # yanked or compromised version is usually caught before it lands here.
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(deps):"
     labels:
@@ -55,6 +67,10 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Supply-chain cooldown: only propose releases at least 14 days old, so a
+    # yanked or compromised version is usually caught before it lands here.
+    cooldown:
+      default-days: 14
     commit-message:
       prefix: "chore(deps):"
     labels:
