@@ -1,0 +1,28 @@
+package catalog
+
+import (
+	"net/http"
+
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// Error codes owned by {{.M.Name}}. Each one needs an
+// errors.<code>.title entry in locales/en.json and locales/vi.json.
+const (
+	// CodeNotImplemented is returned by a generated command or query until
+	// its behavior is written, so an unfinished use case fails loudly.
+	CodeNotImplemented apperror.Code = "{{.M.Name}}.not_implemented"
+	// gen:codes
+)
+
+// ErrorCodes returns the module's error catalog for app.ErrorProvider.
+func ErrorCodes() map[apperror.Code]apperror.Spec {
+	return map[apperror.Code]apperror.Spec{
+		CodeNotImplemented: {
+			Status:  http.StatusNotImplemented,
+			Title:   "Not implemented",
+			DocPath: "/errors/{{.M.Route}}-not-implemented",
+		},
+		// gen:specs
+	}
+}

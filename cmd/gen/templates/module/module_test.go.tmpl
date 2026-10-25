@@ -1,0 +1,144 @@
+package {{.M.Name}}
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gofiber/fiber/v3"
+
+	"{{.M.ModulePath}}/config"
+	"{{.M.ModulePath}}/internal/app"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/internal/platform/i18n"
+	"{{.M.ModulePath}}/pkg/apperror"
+	"{{.M.ModulePath}}/pkg/cache"
+	"{{.M.ModulePath}}/pkg/token"
+)
+
+const testJWTSecret = "{{.M.Name}}-module-test-secret"
+
+func testConfig() *config.Config {
+	return &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		JWT:       config.JWTConfig{Secret: testJWTSecret},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 600, NormalWindow: 60, RelaxedMax: 600, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+}
+
+// testApp builds the full middleware stack around a module built with deps.
+func testApp(t *testing.T, infra app.Infra, deps app.Deps) *fiber.App {
+	t.Helper()
+	m, _, err := Build(infra, Settings{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if deps.Cache == nil {
+		deps.Cache = cache.NewMemoryCache()
+	}
+	application := app.New(testConfig(), deps)
+	application.Register(m)
+	return application.Fiber()
+}
+
+// bearer mints an access token for userID with role in tenantID.
+func bearer(t *testing.T, userID, tenantID int64, role string) string {
+	t.Helper()
+	tok, err := token.GenerateWithTenant(userID, tenantID, "user@example.com", role, testJWTSecret, 1)
+	if err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	return "Bearer " + tok
+}
+
+// do sends one JSON request (body may be empty) and returns status and body.
+func do(t *testing.T, fiberApp *fiber.App, method, target, authorization, body string) (status int, payload string) {
+	t.Helper()
+	var reader io.Reader = http.NoBody
+	if body != "" {
+		reader = strings.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, reader)
+	if body != "" {
+		req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	}
+	if authorization != "" {
+		req.Header.Set(fiber.HeaderAuthorization, authorization)
+	}
+	resp, err := fiberApp.Test(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, target, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, string(raw)
+}
+
+func TestCatalogRegistersAndLocalizes(t *testing.T) {
+	m, _, err := Build(app.Infra{}, Settings{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if m.Name() != {{.M.Ident}}catalog.Owner {
+		t.Fatalf("Name() = %q, want %q", m.Name(), {{.M.Ident}}catalog.Owner)
+	}
+	if err := app.RegisterCatalogs(m); err != nil {
+		t.Fatalf("RegisterCatalogs: %v", err)
+	}
+	for _, grant := range {{.M.Ident}}catalog.Permissions() {
+		if !authz.IsKnownPermission(grant.Permission) {
+			t.Errorf("%s is not registered", grant.Permission)
+		}
+	}
+	bundle, err := i18n.New("en", app.LocaleSources(m)...)
+	if err != nil {
+		t.Fatalf("locales: %v", err)
+	}
+	for code := range {{.M.Ident}}catalog.ErrorCodes() {
+		if _, ok := apperror.SpecFor(code); !ok {
+			t.Errorf("%s is not registered", code)
+		}
+		for _, locale := range bundle.SupportedLocales() {
+			if key := "errors." + string(code) + ".title"; !bundle.Has(locale, key) {
+				t.Errorf("%s is missing %q", locale, key)
+			}
+		}
+	}
+}
+
+// TestEveryRouteRequiresAuthentication walks the module's route table, so a
+// route added later (by cmd/gen or by hand) is covered automatically.
+func TestEveryRouteRequiresAuthentication(t *testing.T) {
+	fiberApp := testApp(t, app.Infra{}, app.Deps{})
+	prefix := "/api/v1/{{.M.Route}}"
+	seen := 0
+	for _, route := range fiberApp.GetRoutes(true) {
+		if route.Path != prefix && !strings.HasPrefix(route.Path, prefix+"/") {
+			continue
+		}
+		seen++
+		target := strings.ReplaceAll(route.Path, ":id", "1")
+		if status, body := do(t, fiberApp, route.Method, target, "", ""); status != http.StatusUnauthorized {
+			t.Errorf("%s %s without a token = %d %s, want 401", route.Method, route.Path, status, body)
+		}
+	}
+	if seen == 0 {
+		t.Fatalf("no routes under %s", prefix)
+	}
+}
+
+func TestHealthRequiresPermission(t *testing.T) {
+	fiberApp := testApp(t, app.Infra{}, app.Deps{})
+	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", bearer(t, 7, 1, authz.RoleUser), "")
+	if status != http.StatusForbidden {
+		t.Fatalf("GET health as a user = %d %s, want 403 ({{.M.Name}}:read is admin-only)", status, body)
+	}
+}

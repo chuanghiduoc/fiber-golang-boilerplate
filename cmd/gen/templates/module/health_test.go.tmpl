@@ -1,0 +1,36 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+type fakeHealthChecker struct{ err error }
+
+func (f fakeHealthChecker) Ping(context.Context) error { return f.err }
+
+func TestHealthCheck(t *testing.T) {
+	if err := NewHealthService(fakeHealthChecker{}).Check(adminContext(1)); err != nil {
+		t.Fatalf("Check = %v, want nil", err)
+	}
+
+	down := errors.New("connection refused")
+	if err := NewHealthService(fakeHealthChecker{err: down}).Check(adminContext(1)); !errors.Is(err, down) {
+		t.Fatalf("Check = %v, want the wrapped ping error", err)
+	}
+}
+
+func TestHealthCheckFailsClosed(t *testing.T) {
+	svc := NewHealthService(fakeHealthChecker{})
+	for name, ctx := range map[string]context.Context{
+		"no subject":         context.Background(),
+		"missing permission": userContext(1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			requireCode(t, svc.Check(ctx), apperror.CodePermissionDenied)
+		})
+	}
+}

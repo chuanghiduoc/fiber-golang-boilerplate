@@ -1,0 +1,60 @@
+// Package {{.M.Name}} owns the {{.M.Name}} business capability.
+//
+// The layout follows ADR 0002 (docs/adr/0002-module-layering.md): service/
+// holds the use cases and the ports they need (service/ports.go),
+// repository/ implements those ports with sqlc, handler/ and dto/ are the
+// HTTP adapter, and catalog/ holds the public identifiers (permissions, error
+// codes, locales). cmd/gen inserts new slices above the "gen:" marker
+// comments; keep them.
+package {{.M.Name}}
+
+import (
+	"io/fs"
+
+	"github.com/gofiber/fiber/v3"
+
+	"{{.M.ModulePath}}/internal/app"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	{{.M.Ident}}handler "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/handler"
+	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/internal/platform/authz/authzhttp"
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// Handlers are the module's HTTP adapters. Build fills every field; tests
+// may build handlers over fakes and pass them to New.
+type Handlers struct {
+	Health *{{.M.Ident}}handler.HealthHandler
+	// gen:handlers
+}
+
+// Module wires the {{.M.Name}} HTTP surface into the application.
+type Module struct {
+	handlers Handlers
+}
+
+// New builds the module from its handlers. Production code uses Build.
+func New(handlers Handlers) *Module {
+	return &Module{handlers: handlers}
+}
+
+// Name identifies the module in the registry and owns its catalog entries.
+func (m *Module) Name() string { return {{.M.Ident}}catalog.Owner }
+
+// Permissions implements app.PermissionProvider.
+func (m *Module) Permissions() []authz.Grant { return {{.M.Ident}}catalog.Permissions() }
+
+// ErrorCodes implements app.ErrorProvider.
+func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return {{.M.Ident}}catalog.ErrorCodes() }
+
+// Locales implements app.LocaleProvider.
+func (m *Module) Locales() fs.FS { return {{.M.Ident}}catalog.Locales() }
+
+// RegisterRoutes mounts the module below /api/v1/{{.M.Route}}. Every route runs
+// rate limit -> authzhttp.Require -> idempotency (writes) -> audithttp.Guard
+// (mutations) -> handler; test/arch enforces the permission and audit order.
+func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
+	group := v1.Group("/{{.M.Route}}", deps.Authenticate())
+	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require({{.M.Ident}}catalog.PermissionRead), m.handlers.Health.Health)
+	// gen:routes
+}

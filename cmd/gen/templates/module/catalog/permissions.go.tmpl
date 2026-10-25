@@ -1,0 +1,25 @@
+package catalog
+
+import "{{.M.ModulePath}}/internal/platform/authz"
+
+// Permissions owned by {{.M.Name}}. They are also API-key scopes, so never
+// rename one once released.
+const (
+	// PermissionRead allows reading module-level state ({{.M.Route}} health and
+	// generated queries).
+	PermissionRead authz.Permission = "{{.M.Name}}:read"
+	// PermissionWrite allows running generated commands.
+	PermissionWrite authz.Permission = "{{.M.Name}}:write"
+	// gen:permissions
+)
+
+// Permissions returns the module's grants for app.PermissionProvider. Admins
+// hold every registered permission implicitly; grant other roles
+// deliberately, for example Roles: []string{authz.RoleUser}.
+func Permissions() []authz.Grant {
+	return []authz.Grant{
+		{Permission: PermissionRead},
+		{Permission: PermissionWrite},
+		// gen:grants
+	}
+}

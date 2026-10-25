@@ -1,0 +1,21 @@
+-- {{.R.Table}}: tenant-scoped {{.R.HumanPlural}} owned by the {{.M.Name}} module.
+CREATE TABLE IF NOT EXISTS {{.R.Table}} (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    -- tenants is the only cross-module foreign key a module may declare
+    -- (ADR 0005). RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants (id) ON DELETE RESTRICT,
+    name VARCHAR(255) NOT NULL CHECK (btrim(name) <> ''),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- Serves the tenant-scoped cursor list: WHERE tenant_id = $1 AND
+-- (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC.
+CREATE INDEX IF NOT EXISTS idx_{{.R.Table}}_tenant_created
+    ON {{.R.Table}} (tenant_id, created_at DESC, id DESC);
+
+DROP TRIGGER IF EXISTS trigger_{{.R.Table}}_updated_at ON {{.R.Table}};
+CREATE TRIGGER trigger_{{.R.Table}}_updated_at
+    BEFORE UPDATE ON {{.R.Table}}
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();

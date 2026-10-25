@@ -53,7 +53,23 @@ jobs:
 
       - name: Check sqlc generated code is up to date
         run: |
-          sqlc generate
+          # Each module owns internal/modules/<name>/sqlc.yaml. A module with
+          # queries/ but no config would silently skip generation, so fail.
+          shopt -s nullglob
+          for queries in internal/modules/*/queries; do
+            module_dir=$(dirname "$queries")
+            if [ ! -f "$module_dir/sqlc.yaml" ]; then
+              echo "::error::$module_dir has queries/ but no sqlc.yaml" && exit 1
+            fi
+          done
+          configs=(internal/modules/*/sqlc.yaml)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::no internal/modules/*/sqlc.yaml found" && exit 1
+          fi
+          for config in "${configs[@]}"; do
+            echo "sqlc generate -f $config"
+            sqlc generate -f "$config"
+          done
           git add -N internal/modules/*/sqlc/
           git diff --exit-code internal/modules/*/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
 

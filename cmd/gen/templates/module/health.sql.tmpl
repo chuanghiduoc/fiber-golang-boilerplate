@@ -1,0 +1,6 @@
+-- sqlc source owned by the {{.M.Name}} module. Reference only tables this
+-- module owns ({{.M.Name}} or {{.M.Name}}_*); test/arch rejects SQL that touches
+-- another module's tables. Regenerate with `make sqlc-generate`.
+
+-- name: Ping :one
+SELECT 1::int AS ok;

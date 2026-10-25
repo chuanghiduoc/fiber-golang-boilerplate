@@ -1,0 +1,30 @@
+-- {{.R.HumanPlural}} queries owned by the {{.M.Name}} module. Every query
+-- filters by tenant_id; the repository binds tenant.EffectiveID(ctx).
+
+-- name: Create{{.R.Pascal}} :one
+INSERT INTO {{.R.Table}} (tenant_id, name)
+VALUES (@tenant_id::bigint, @name::text)
+RETURNING *;
+
+-- name: Get{{.R.Pascal}} :one
+SELECT * FROM {{.R.Table}}
+WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;
+
+-- name: List{{.R.PluralPascal}} :many
+-- Index-friendly cursor page (see pkg/pagination): the first page binds
+-- ('infinity', MaxInt64), so the row comparison is always an index condition.
+SELECT * FROM {{.R.Table}}
+WHERE tenant_id = @tenant_id::bigint
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
+-- name: Update{{.R.Pascal}} :one
+UPDATE {{.R.Table}}
+SET name = @name::text
+WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint
+RETURNING *;
+
+-- name: Delete{{.R.Pascal}} :execrows
+DELETE FROM {{.R.Table}}
+WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;

@@ -1,0 +1,31 @@
+// Package repository is the {{.M.Name}} PostgreSQL adapter (ADR 0002). It
+// implements the ports declared in service/ports.go with the module's sqlc
+// queries and maps sqlc rows to service types, so no row type leaves this
+// package. Every tenant-owned query is scoped by tenant.EffectiveID(ctx).
+package repository
+
+import (
+	"context"
+
+	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
+	{{.M.Ident}}sqlc "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/sqlc"
+)
+
+// HealthRepository implements {{.M.Ident}}service.HealthChecker.
+type HealthRepository struct {
+	q *{{.M.Ident}}sqlc.Queries
+}
+
+var _ {{.M.Ident}}service.HealthChecker = (*HealthRepository)(nil)
+
+// NewHealthRepository returns a HealthRepository over db (a pool or a
+// transaction).
+func NewHealthRepository(db {{.M.Ident}}sqlc.DBTX) *HealthRepository {
+	return &HealthRepository{q: {{.M.Ident}}sqlc.New(db)}
+}
+
+// Ping runs a trivial query.
+func (r *HealthRepository) Ping(ctx context.Context) error {
+	_, err := r.q.Ping(ctx)
+	return err
+}

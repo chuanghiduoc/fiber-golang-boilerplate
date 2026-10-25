@@ -6,43 +6,57 @@ rules) and [Operations](operations.md) (runtime behavior).
 
 ## Quick start
 
+`cmd/gen` (Go stdlib `text/template` + `embed`) generates code in the
+[ADR 0002](adr/0002-module-layering.md) layout, so `test/arch` (including the
+layering ratchet) passes for generated code with no allowlist entries.
+
 ```bash
-scripts/new-module.sh widgets
-scripts/new-module.sh --dry-run widgets   # print paths, write nothing
+make gen module=billing                              # module skeleton + bootstrap entry
+make gen resource=invoice module=billing             # tenant-scoped CRUD slice
+make gen command=IssueInvoice module=billing         # service/command_issue_invoice.go + POST route
+make gen query=ListOverdueInvoices module=billing    # service/query_list_overdue_invoices.go + GET route
+make gen module=billing dry_run=1                    # print a unified diff, write nothing
+make gen command=IssueInvoice module=billing no_http=1   # use case only, no handler/route
 ```
+
+The targets call `go run ./cmd/gen <module|resource|command|query> [--dry-run]
+[--no-http] [--plural <plural>] [--module <module>] <name>` (flags may follow
+the name; `go run ./cmd/gen -h` prints the usage). `scripts/new-module.sh
+<name>` remains as a thin wrapper for `go run ./cmd/gen module <name>`.
 
 ```mermaid
 flowchart LR
-    A["scripts/new-module.sh &lt;name&gt;"] --> B["go build / vet / test<br/>on the new module"]
-    B -- fails --> X["remove module dir<br/>and sqlc.yaml block"]
-    B -- passes --> C["add Build(infra) to the<br/>bootstrap module list"]
-    C --> D["make migrate-create<br/>module=&lt;name&gt; name=&lt;purpose&gt;"]
-    D --> E["write queries/&lt;name&gt;.sql<br/>make sqlc-generate"]
-    E --> F["repository → service →<br/>handler → routes"]
-    F --> G["make swagger"]
-    G --> H["make check<br/>go test -race ./..."]
+    A["make gen ..."] --> B["render every file in memory<br/>(gofmt, marker edits)"]
+    B -- "dry_run=1" --> D["print unified diff"]
+    B --> C["write files"]
+    C --> E["sqlc generate (module/resource)<br/>go build ./...<br/>go vet (+ -tags=integration)<br/>go test module + test/arch"]
+    E -- fails --> X["restore/remove every file<br/>this run wrote (incl. sqlc/)"]
+    E -- passes --> F["review migration, grants, vi strings<br/>make migrate-run · make swagger"]
 ```
 
-The scaffold creates a compile-safe vertical slice:
+| Command | Creates | Edits (at `gen:` markers) |
+| --- | --- | --- |
+| `module=<name>` | `module.go`, `build.go`, `generate.go`, `sqlc.yaml`, `README.md`, `module_test.go`, `catalog/` (permissions, errors, en/vi), `service/{ports,authorize,health}.go`, `repository/health.go`, `handler/health.go`, `dto/dto.go`, `queries/health.sql`, unit tests, `migrations/<UTC ts>_<name>_init.{up,down}.sql` | `internal/bootstrap/modules.go` (import, `Build`, `List`; idempotent) |
+| `resource=<r> module=<m>` | `migrations/<UTC ts>_<m>_create_<plural>.{up,down}.sql`, `queries/<r>.sql`, `service/<r>.go`, `repository/<r>.go` (+ shared `repository/errors.go`), `handler/<r>.go`, `dto/<r>.go`, `routes_<r>.go`, service/handler tests with hand-written fakes, `<r>_integration_test.go` | `service/ports.go`, `module.go`, `build.go`, `catalog/{permissions,errors}.go`, `catalog/locales/{en,vi}.json`, `README.md` |
+| `command=<Name>` / `query=<Name>` | `service/{command,query}_<name>.go` (+ test); unless `no_http=1`: `handler/`, `dto/`, `routes_*.go` (+ handler test) | `module.go`, `build.go`, `README.md` |
 
-| Generated | Content |
-| --- | --- |
-| Catalog | permissions, error codes, en/vi strings |
-| Constructor | `Build(app.Infra)`; no I/O |
-| Route | one `deps.Authenticate()` + `authzhttp.Require` protected sample route |
-| Tests | module test (catalog registration/localization + route through `app.New`) |
-| SQL | `queries/<name>.sql` placeholder and the module's `sqlc.yaml` block |
-| Docs | module `README.md` (ownership and next steps) |
+Rules the generator enforces:
 
-It runs `go build`, `go vet`, and `go test` on `./internal/modules/<name>/...`
-before reporting success and removes everything (including the `sqlc.yaml`
-block) if any step fails. It then prints the remaining steps; the only central
-edit is adding the module to the bootstrap module list
-(`internal/bootstrap/modules.go`).
+- Module and resource names are lower_snake_case (Go keywords, layout names,
+  `vendor`/`testdata` rejected); use-case names are PascalCase with at least
+  two words. Nothing is ever overwritten.
+- `resource`, `command`, and `query` only extend a module created by `cmd/gen`
+  (its `module.go` carries the `// gen:routes` marker); keep the `gen:`
+  marker comments in generated files and in `internal/bootstrap/modules.go`.
+- A migration version is a UTC timestamp newer than every existing migration,
+  so `module` then `resource` in the same second never collide.
+- The resource table is `<module>_<plural>` (`--plural` for irregular
+  nouns); sqlc's model is the singularized table name.
 
-`<name>` must be lower_snake_case; the script rejects Go keywords, reserved
-package names, and Go-reserved directories such as `vendor` and `testdata`. Do
-not commit a probe module created only to test the script.
+Generated code is admin-only until you grant roles in `catalog/permissions.go`,
+and commands/queries return `501 <module>.not_implemented` until their
+`Handle` is written, so an unfinished use case never reports success. Do not
+commit a probe module created only to try the generator.
 
 ## 1. Module anatomy
 
@@ -74,7 +88,9 @@ flowchart TB
 
 | Path | Responsibility |
 | --- | --- |
-| `module.go` | `package <name>`: `app.Module`, `Build(app.Infra)` (plus a `Settings` struct when the module owns configuration), catalog providers, route table |
+| `module.go` | `package <name>`: `app.Module`, catalog providers, route table |
+| `build.go` | `Build(infra app.Infra, settings Settings) (*Module, Provides, error)`, the module's `Settings` and `Provides` (see [section 2](#2-scaffold-skeleton) for the variants in existing modules) |
+| `generate.go`, `sqlc.yaml` | `//go:generate sqlc generate -f sqlc.yaml`; the module's own sqlc configuration (paths relative to the file) |
 | `module_test.go` | catalog registration/localization and a route test through `app.New` |
 | `README.md` | ownership, routes, permissions, tables, jobs, contracts |
 | `catalog/catalog.go` | `Owner` (== `Module.Name()`), `Register()`, `Locales()` (embedded) |
@@ -84,11 +100,11 @@ flowchart TB
 | `catalog/locales/{en,vi}.json` | keys `<name>.*` or `errors.<code>.*` |
 | `dto/` | request/response transport types; no HTTP or SQL |
 | `handler/` | bind/validate HTTP, call service, write responses |
-| `service/` | business rules, ownership checks, orchestration |
-| `repository/` | SQL/sqlc, transactions, row mapping; no HTTP |
-| `queries/<name>.sql` | sqlc source owned by this module |
+| `service/` | use cases, authorization (`authz.Authorize`), ownership checks; `ports.go` declares the interfaces it needs; `command_*.go` / `query_*.go` for CQRS slices |
+| `repository/` | implements the service ports with sqlc and maps rows to service types; no HTTP |
+| `queries/*.sql` | sqlc source owned by this module |
 | `sqlc/` | generated by `make sqlc-generate` (do not edit) |
-| `migrations/<UTC timestamp>_<name>_<purpose>.{up,down}.sql` | repository-level; additive schema for a deployed database |
+| `migrations/<UTC timestamp>_<name>_<purpose>.{up,down}.sql` | repository-level, owned by the module (`test/arch` checks the owner prefix and up/down pairs) |
 
 When one service grows large, split it into files by responsibility inside
 the same package rather than into new packages. The identity user service is
@@ -189,111 +205,102 @@ package.
 
 ## 2. Scaffold skeleton
 
-The generated files are intentionally minimal. Replace the `Ping`/`Health`
-placeholders with real use cases; keep the package boundaries.
+`make gen module=billing` produces this composition (excerpts; the
+generated files carry full comments). Health is the skeleton's only use case:
+it gives sqlc a query to compile (sqlc fails on an empty `queries/`) and is a
+real, permission-protected database probe for the module.
 
-`module.go`:
+`build.go` uses the most complete constructor form of the existing modules
+(identity's), so a module can grow settings, contracts, and fallible setup
+without changing its signature or the bootstrap call:
 
 ```go
-package widgets
+type Settings struct{} // the module's own config section, filled by internal/bootstrap
+type Provides struct{} // internal/contracts values for modules built later
 
-type Module struct {
-	handler *widgetshandler.Handler
+func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
+	handlers := Handlers{
+		Health: billinghandler.NewHealthHandler(billingservice.NewHealthService(billingrepository.NewHealthRepository(infra.Pool))),
+		// gen:build
+	}
+	return New(handlers), Provides{}, nil
 }
+```
 
-// New builds the module from its handler (tests). Production uses Build.
-func New(handler *widgetshandler.Handler) *Module {
-	return &Module{handler: handler}
+| Existing module | `Build` signature today |
+| --- | --- |
+| identity | `Build(infra, Settings) (*Module, Provides, error)` (generated modules use this form) |
+| webhooks | `Build(infra, Settings, tenantActive) (*Module, Provides, error)`: contracts follow `settings` |
+| files | `Build(infra, Settings, webhooks) (*Module, Provides)`: the webhooks contract follows `settings` |
+| apikeys | `Build(infra, principals) (*Module, Provides)` |
+| notifications, features | `Build(infra, ...) *Module` |
+| admin | `Build(identity, files) *Module` (contracts only) |
+
+`module.go` keeps one `Handlers` struct and the route table; generated slices
+add a field and a `register<Slice>Routes` call at the markers:
+
+```go
+type Handlers struct {
+	Health   *billinghandler.HealthHandler
+	Invoices *billinghandler.InvoiceHandler // added by gen resource
+	// gen:handlers
 }
-
-// Build constructs repository, service, and handler. No I/O. Another module's
-// capability arrives only as an internal/contracts interface parameter, wired
-// in the bootstrap module list.
-func Build(infra app.Infra) *Module {
-	repo := widgetsrepository.New(infra.Pool)
-	return New(widgetshandler.New(widgetsservice.New(repo)))
-}
-
-func (m *Module) Name() string { return widgetscatalog.Owner }
-
-// Catalog providers: registered by app.RegisterCatalogs at startup.
-func (m *Module) Permissions() []authz.Grant { return widgetscatalog.Permissions() }
-func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return widgetscatalog.ErrorCodes() }
-func (m *Module) Locales() fs.FS { return widgetscatalog.Locales() }
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	group := v1.Group("/widgets", deps.Authenticate())
-	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.Health)
+	group := v1.Group("/billing", deps.Authenticate())
+	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require(billingcatalog.PermissionRead), m.handlers.Health.Health)
+	m.registerInvoiceRoutes(group, deps) // added by gen resource
+	// gen:routes
 }
 ```
 
-`service/service.go` declares the narrow repository interface it needs, so
-tests can fake it:
+`service/ports.go` declares what the use cases need; `repository/` implements
+it and asserts the match at compile time
+(`var _ billingservice.InvoiceRepository = (*InvoiceRepository)(nil)`):
 
 ```go
-type Repository interface {
-	Ping(ctx context.Context) error
+type InvoiceRepository interface {
+	CreateInvoice(ctx context.Context, in InvoiceInput) (Invoice, error)
+	GetInvoice(ctx context.Context, id int64) (Invoice, error)
+	ListInvoices(ctx context.Context, cursor pagination.DBCursor) ([]Invoice, error)
+	UpdateInvoice(ctx context.Context, id int64, in InvoiceInput) (Invoice, error)
+	DeleteInvoice(ctx context.Context, id int64) error
 }
-
-type Service struct{ repository Repository }
-
-func New(repository Repository) *Service { return &Service{repository: repository} }
-
-func (s *Service) Ping(ctx context.Context) error { return s.repository.Ping(ctx) }
 ```
+
+### Generated resource slice
+
+`make gen resource=invoice module=billing`:
+
+| Layer | Generated behavior |
+| --- | --- |
+| Migration | `billing_invoices`: `BIGINT GENERATED ALWAYS AS IDENTITY` PK, `tenant_id ... REFERENCES tenants (id) ON DELETE RESTRICT`, `name VARCHAR(255)` with a non-blank `CHECK`, `created_at`/`updated_at` (`update_updated_at()` trigger), index `(tenant_id, created_at DESC, id DESC)`; the down file drops the table |
+| Queries | `Create`/`Get`/`List`/`Update`/`Delete` with a `tenant_id` predicate each; `List` uses `(created_at, id) < (@cursor_created_at, @cursor_id)` |
+| Repository | binds `tenant.EffectiveID(ctx)`, maps `pgx.ErrNoRows`/zero deleted rows to `apperror.ErrNotFound`, maps sqlc rows to `service.Invoice` |
+| Service | `authz.Authorize` first (fail closed), input normalization (422), a row from another tenant is `404 billing.invoice_not_found`, a row escaping the tenant filter in a list fails loudly; imports no sqlc, pgx, Fiber, or `dto` |
+| Handler/DTO | `httpx.BindAndValidate`, `httpx.ParamID`, `httpx.CursorQuery`, `pkg/response`, `Location` on create, Swagger annotations |
+| Routes | `rl.Relaxed → authzhttp.Require(read)` for reads; `rl.Normal → authzhttp.Require(write/delete) → deps.Idempotency → audithttp.Guard(ModeRequired)` for writes |
+| Catalog | `billing:invoices:{read,write,delete}` (admin-only), `billing.invoice_not_found` with en/vi titles |
+| Tests | service test over a fake repository (CRUD, validation, tenant isolation, pagination, fail-closed), handler test over a fake service, `invoice_integration_test.go` (`-tags=integration`) running the routes through `app.New` on PostgreSQL: CRUD, cross-tenant id → 404, three succeeded audit rows |
+
+Commands and queries (`make gen command=IssueInvoice module=billing`) get
+`IssueInvoiceInput`/`IssueInvoiceResult` and an `IssueInvoiceHandler` in
+`service/command_issue_invoice.go` that authorizes (`billing:write`; queries
+use `billing:read`) and returns `501 billing.not_implemented` until written.
+The HTTP adapter (`handler/`, `dto/`, `routes_command_issue_invoice.go`) is a
+`POST` for a command (idempotency + required audit guard) and a `GET` for a
+query; `no_http=1` skips it.
+
+The generated `README.md` records ownership and lists every generated slice;
+keep it current, it is the first file the next team reads.
 
 ### Module-owned configuration
 
 `app.Infra` carries infrastructure plus only the shared configuration in
 `Infra.Platform` (`App`, `JWT`, `Tenant`). A module that needs its own
-`config` section declares a `Settings` struct and takes it as a `Build`
-parameter; `bootstrap.Build(cfg, infra)` fills it, so no module can read
-another module's settings (identity, files, and webhooks do this):
-
-```go
-// Settings is the widgets module's own configuration.
-type Settings struct {
-	MaxItems int
-}
-
-func Build(infra app.Infra, settings Settings) *Module {
-	repo := widgetsrepository.New(infra.Pool)
-	return New(widgetshandler.New(widgetsservice.New(repo, settings.MaxItems)))
-}
-```
-
-`repository/repository.go` holds the pool (wrap the generated `sqlc.Queries`
-after `make sqlc-generate`); handlers and services never reach the database:
-
-```go
-type Repository struct{ pool *pgxpool.Pool }
-
-func New(pool *pgxpool.Pool) *Repository { return &Repository{pool: pool} }
-
-func (r *Repository) Ping(ctx context.Context) error {
-	if r.pool == nil {
-		return nil
-	}
-	return r.pool.Ping(ctx)
-}
-```
-
-`handler/handler.go` binds, calls the service, and answers through
-`pkg/response`:
-
-```go
-func (h *Handler) Health(c fiber.Ctx) error {
-	if err := h.service.Ping(c.Context()); err != nil {
-		return err
-	}
-	return response.Success(c, widgetsdto.HealthResponse{Module: "widgets", Status: "ok"})
-}
-```
-
-`dto/dto.go` contains placeholder `Item`, `CreateItemRequest`
-(`validate:"required,max=255"`), and `HealthResponse` types. The generated
-`README.md` records ownership and next steps; keep it current, it is the first
-file the next team reads.
+`config` section adds fields to `Settings`; `bootstrap.Build(cfg, infra)`
+fills it, so no module can read another module's settings (identity, files,
+and webhooks do this).
 
 ## 3. Route wiring
 
@@ -602,24 +609,31 @@ CREATE TRIGGER trigger_widgets_updated_at
 
 ### Queries and sqlc
 
-Put SQL in `internal/modules/<name>/queries/<name>.sql`. Each module has its
-own generation block in `sqlc.yaml` (the scaffold appends it):
+Put SQL in `internal/modules/<name>/queries/*.sql`. Each module owns its sqlc
+configuration in `internal/modules/<name>/sqlc.yaml` (there is no root
+`sqlc.yaml`); paths are relative to that file, and `generate.go` carries
+`//go:generate sqlc generate -f sqlc.yaml`:
 
 ```yaml
+version: "2"
+sql:
   - engine: "postgresql"
-    queries: "internal/modules/<name>/queries/"
-    schema: "migrations/"
+    queries: "queries/"
+    schema: "../../../migrations/"
     gen:
       go:
         package: "sqlc"
-        out: "internal/modules/<name>/sqlc"
+        out: "sqlc"
         sql_package: "pgx/v5"
         emit_json_tags: true
         emit_empty_slices: true
         omit_unused_structs: true
 ```
 
-Then run `make sqlc-generate`. Generated code lands only in the module's own
+Then run `make sqlc-generate` (every `internal/modules/*/sqlc.yaml`) or
+`go generate ./internal/modules/<name>/`. CI regenerates every module config
+and fails on drift, and also fails when a module has `queries/` but no
+`sqlc.yaml`. Generated code lands only in the module's own
 `sqlc/` package; prefix query names (`ListWidgetsByOwner`, `CreateWidget`) and
 never import another module's generated types (the architecture test enforces
 it). sqlc is not a substitute for a migration: the schema must be applied
@@ -739,19 +753,26 @@ make swagger   # if route annotations changed
 
 ## 11. Register in the composition root
 
-`internal/bootstrap/modules.go` holds the single ordered module list. Add the
-module there, passing only contracts from modules built earlier:
+`internal/bootstrap/modules.go` holds the single ordered module list.
+`make gen module=<name>` inserts the module above the `// gen:module-build`
+and `// gen:module-list` markers (exactly once; a second run is a no-op). Pass
+only contracts from modules built earlier:
 
 ```go
-widgetsModule := widgets.Build(infra)                            // no contracts needed
-ordersModule := orders.Build(infra, identityProvides.Principals) // consumes a contract
+billingModule, _, err := billing.Build(infra, billing.Settings{}) // inserted by cmd/gen
+if err != nil {
+	return nil, err
+}
+// a module that consumes a contract takes it after its settings:
+// ordersModule, _, err := orders.Build(infra, orders.Settings{}, identityProvides.Principals)
+// gen:module-build
 
 return &Modules{
 	List: []app.Module{
 		identityModule,
 		// ...
-		widgetsModule,
-		ordersModule,
+		billingModule,
+		// gen:module-list
 	},
 	// ...
 }, nil
@@ -794,19 +815,21 @@ Rules:
 
 ## 12. Add-a-module checklist
 
-1. `scripts/new-module.sh <name>`; keep the generated README and fill in
-   ownership.
-2. Adjust permissions, error codes, flags, and en/vi strings in `catalog/`.
-3. Add the migration (baseline only for an undeployed upstream; otherwise
-   `make migrate-create module=<name> name=<purpose>`), replace
-   `queries/<name>.sql`, and run `make sqlc-generate`.
-4. Implement repository → service → handler, keeping transport, rules, and SQL
-   in their packages.
-5. Add routes in `module.go`: authenticate, rate limit, permission,
-   idempotency where appropriate, audit guard for privileged mutations, then
-   handler.
-6. Add the module to the bootstrap module list; implement
-   `RegisterJobs`/`RegisterEvents`/`RegisterSchedules` for durable work.
+1. `make gen module=<name>` (registers it in the bootstrap list); keep the
+   generated README and fill in ownership.
+2. `make gen resource=<r> module=<name>` per CRUD resource and
+   `make gen command=<Name>` / `query=<Name>` per use case; review the
+   generated migration columns, then add real fields to the queries, service
+   types, repository mapping, and DTOs.
+3. Adjust grants, error codes, flags, and en/vi strings in `catalog/`
+   (generated permissions are admin-only and the vi titles need review).
+4. Other schema changes: `make migrate-create module=<name> name=<purpose>`,
+   then `make sqlc-generate`.
+5. Keep transport, rules, and SQL in their packages; hand-written routes
+   follow the same chain (authenticate, rate limit, permission, idempotency
+   where appropriate, audit guard for privileged mutations, then handler).
+6. Implement `RegisterJobs`/`RegisterEvents`/`RegisterSchedules` for durable
+   work.
 7. Add unit, handler, and integration tests; run `make arch`.
 8. Update the module README, [Architecture](architecture.md) if the module map
    changes, and Swagger annotations if routes were added.

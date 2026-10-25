@@ -6,6 +6,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added (P1a generator)
+- `cmd/gen` (`make gen module=|resource=|command=|query=`, `dry_run=1`, `no_http=1`): Go stdlib generator for ADR 0002 code. `module` creates the skeleton (`Build(infra, Settings) (*Module, Provides, error)`, catalog, `service/ports.go`, repository/handler/dto, sqlc config, tests, `<ts>_<module>_init` migrations) and registers it once in `internal/bootstrap/modules.go`; `resource` adds a tenant-scoped CRUD slice (migration, cursor queries, repository row mapping, service over ports, guarded routes, permissions, error code, en/vi strings, fake-based unit tests, a PostgreSQL integration test); `command`/`query` add `service/{command,query}_<name>.go` with an HTTP stub. Each run verifies with sqlc, `go build ./...`, `go vet` (with and without `-tags=integration`), the module tests, and `test/arch`, and restores every written file on failure. `scripts/new-module.sh` is now a wrapper for `go run ./cmd/gen module`.
+
+### Changed (P1a generator)
+- sqlc configuration is per module: `internal/modules/<name>/sqlc.yaml` (paths relative to it, `//go:generate sqlc generate -f sqlc.yaml` in `generate.go`) replaces the root `sqlc.yaml`. `make sqlc-generate` and the CI drift check run every module config; CI also fails when a module has `queries/` but no `sqlc.yaml`. Generated code is unchanged.
+
 ### Breaking (P0 foundation)
 - Production requires `DATA_ENCRYPTION_KEY` (32+ characters, different from `JWT_SECRET`) for job payload encryption. Upgrade: set the new key and put the current `JWT_SECRET` value in `DATA_ENCRYPTION_PREVIOUS_KEYS` (same HKDF derivation, so queued v1 envelopes still open) until those jobs drain; outside production an empty key still falls back to `JWT_SECRET`.
 - Job payloads and webhook secrets are sealed in envelope v2 (with `kid`); workers from earlier releases cannot open v2 and retry until `max_attempts`. Roll out every worker (including a separate worker Deployment) before relying on newly sealed jobs or creating/rotating webhook secrets. v1 envelopes still decrypt.

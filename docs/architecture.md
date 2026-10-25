@@ -381,22 +381,25 @@ flowchart TD
 
 The migration is complete. Every module owns its DTOs, repositories,
 services, and handlers under `internal/modules/<name>`; each module with SQL
-owns its `queries/` and generated `sqlc/` package (one `sqlc.yaml` block per
-module; `admin` is contract-only). There is no shared legacy layer, no shared
+owns its `queries/` and generated `sqlc/` package (configured by its own
+`internal/modules/<name>/sqlc.yaml`; `admin` is contract-only). There is no shared legacy layer, no shared
 generated package, and no cross-module SQL: identity and files each own their
 half of the admin dashboard stats (`AdminUserStats` / `AdminFileStats`).
 
 ## Extension checklist
 
-Use [`scripts/new-module.sh`](../scripts/new-module.sh) and the
+Use the generator [`cmd/gen`](../cmd/gen/main.go) and the
 [Module Template](module-template.md). Short form:
 
-1. `scripts/new-module.sh <name>`: module.go (`Build` + providers), catalog
-   (permissions, error codes, en/vi strings), layers, `queries/`, sqlc block,
-   module test, README.
-2. Add the module to `internal/bootstrap/modules.go` (the only central edit).
-3. Add tables: update the baseline for fresh installs, or
-   `make migrate-create module=<name> name=<purpose>` for deployed DBs.
+1. `make gen module=<name>`: module.go/build.go (`Build` + providers),
+   catalog (permissions, error codes, en/vi strings), ADR 0002 layers with
+   `service/ports.go`, `queries/` + the module's `sqlc.yaml`, tests, README,
+   an init migration pair, and the `internal/bootstrap/modules.go` entry (the
+   only central edit).
+2. `make gen resource=<r> module=<name>` for tenant-scoped CRUD (migration,
+   queries, repository, service, handler, routes, permissions, tests);
+   `make gen command=<Name>` / `query=<Name>` for CQRS use cases.
+3. Other tables or columns: `make migrate-create module=<name> name=<purpose>`.
 4. Add handler/service/repository/DTO and protected routes in the module.
 5. Implement the optional `app.EventProvider`, `app.JobProvider`,
    `app.ScheduleProvider`, or `app.FlagProvider` hooks instead of wiring work

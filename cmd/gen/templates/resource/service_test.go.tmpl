@@ -1,0 +1,199 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/tenant"
+	"{{.M.ModulePath}}/pkg/apperror"
+	"{{.M.ModulePath}}/pkg/pagination"
+)
+
+// fake{{.R.Pascal}}Repository is an in-memory {{.R.Pascal}}Repository that
+// scopes rows by tenant like the SQL does. leakTenant simulates a broken
+// query that returns another tenant's row.
+type fake{{.R.Pascal}}Repository struct {
+	rows       []{{.R.Pascal}}
+	nextID     int64
+	leakTenant bool
+	err        error
+}
+
+func (f *fake{{.R.Pascal}}Repository) visible(ctx context.Context, item {{.R.Pascal}}) bool {
+	return f.leakTenant || item.TenantID == tenant.EffectiveID(ctx)
+}
+
+func (f *fake{{.R.Pascal}}Repository) Create{{.R.Pascal}}(ctx context.Context, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+	if f.err != nil {
+		return {{.R.Pascal}}{}, f.err
+	}
+	f.nextID++
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(f.nextID) * time.Second)
+	item := {{.R.Pascal}}{ID: f.nextID, TenantID: tenant.EffectiveID(ctx), Name: in.Name, CreatedAt: now, UpdatedAt: now}
+	f.rows = append(f.rows, item)
+	return item, nil
+}
+
+func (f *fake{{.R.Pascal}}Repository) Get{{.R.Pascal}}(ctx context.Context, id int64) ({{.R.Pascal}}, error) {
+	if f.err != nil {
+		return {{.R.Pascal}}{}, f.err
+	}
+	for _, item := range f.rows {
+		if item.ID == id && f.visible(ctx, item) {
+			return item, nil
+		}
+	}
+	return {{.R.Pascal}}{}, apperror.ErrNotFound
+}
+
+func (f *fake{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Context, cursor pagination.DBCursor) ([]{{.R.Pascal}}, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []{{.R.Pascal}}
+	for i := len(f.rows) - 1; i >= 0 && len(out) < int(cursor.Limit); i-- {
+		item := f.rows[i]
+		if !f.visible(ctx, item) || (cursor.HasCursor && item.ID >= cursor.ID) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
+func (f *fake{{.R.Pascal}}Repository) Update{{.R.Pascal}}(ctx context.Context, id int64, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+	if f.err != nil {
+		return {{.R.Pascal}}{}, f.err
+	}
+	for i, item := range f.rows {
+		if item.ID == id && f.visible(ctx, item) {
+			f.rows[i].Name = in.Name
+			return f.rows[i], nil
+		}
+	}
+	return {{.R.Pascal}}{}, apperror.ErrNotFound
+}
+
+func (f *fake{{.R.Pascal}}Repository) Delete{{.R.Pascal}}(ctx context.Context, id int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	for i, item := range f.rows {
+		if item.ID == id && f.visible(ctx, item) {
+			f.rows = append(f.rows[:i], f.rows[i+1:]...)
+			return nil
+		}
+	}
+	return apperror.ErrNotFound
+}
+
+func Test{{.R.Pascal}}ServiceCRUD(t *testing.T) {
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	ctx := adminContext(1)
+
+	created, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: "  first  "})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if created.Name != "first" || created.TenantID != 1 {
+		t.Fatalf("Create = %+v, want trimmed name in tenant 1", created)
+	}
+	got, err := svc.Get(ctx, created.ID)
+	if err != nil || got.ID != created.ID {
+		t.Fatalf("Get = %+v, %v", got, err)
+	}
+	updated, err := svc.Update(ctx, created.ID, {{.R.Pascal}}Input{Name: "renamed"})
+	if err != nil || updated.Name != "renamed" {
+		t.Fatalf("Update = %+v, %v", updated, err)
+	}
+	if err := svc.Delete(ctx, created.ID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	_, err = svc.Get(ctx, created.ID)
+	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+}
+
+func Test{{.R.Pascal}}ServiceValidates(t *testing.T) {
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	for name, input := range map[string]string{"blank": "   ", "too long": strings.Repeat("x", max{{.R.Pascal}}NameLength+1)} {
+		_, err := svc.Create(adminContext(1), {{.R.Pascal}}Input{Name: input})
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) || appErr.Status != 422 {
+			t.Errorf("%s: Create = %v, want 422", name, err)
+		}
+	}
+}
+
+func Test{{.R.Pascal}}ServiceTenantIsolation(t *testing.T) {
+	repo := &fake{{.R.Pascal}}Repository{}
+	svc := New{{.R.Pascal}}Service(repo)
+	created, err := svc.Create(adminContext(1), {{.R.Pascal}}Input{Name: "tenant one"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	other := adminContext(2)
+	_, err = svc.Get(other, created.ID)
+	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	_, err = svc.Update(other, created.ID, {{.R.Pascal}}Input{Name: "stolen"})
+	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	requireCode(t, svc.Delete(other, created.ID), {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	page, err := svc.List(other, 10, "")
+	if err != nil || len(page.Items) != 0 {
+		t.Fatalf("List in tenant 2 = %+v, %v; want empty", page, err)
+	}
+
+	// Defense in depth: a row that escapes the SQL tenant filter is still
+	// hidden by the service.
+	repo.leakTenant = true
+	_, err = svc.Get(other, created.ID)
+	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	if _, err := svc.List(other, 10, ""); err == nil {
+		t.Fatal("List must fail loudly when a row escapes the tenant filter")
+	}
+}
+
+func Test{{.R.Pascal}}ServicePaginates(t *testing.T) {
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	ctx := adminContext(1)
+	for _, name := range []string{"a", "b", "c"} {
+		if _, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: name}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	first, err := svc.List(ctx, 2, "")
+	if err != nil || len(first.Items) != 2 || !first.HasMore || first.NextCursor == "" {
+		t.Fatalf("first page = %+v, %v", first, err)
+	}
+	second, err := svc.List(ctx, 2, first.NextCursor)
+	if err != nil || len(second.Items) != 1 || second.HasMore || second.Items[0].Name != "a" {
+		t.Fatalf("second page = %+v, %v", second, err)
+	}
+	if _, err := svc.List(ctx, 2, "not-a-cursor"); err == nil {
+		t.Fatal("an invalid cursor must be rejected")
+	}
+}
+
+func Test{{.R.Pascal}}ServiceFailsClosed(t *testing.T) {
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{})
+	for name, ctx := range map[string]context.Context{"no subject": context.Background(), "missing permission": userContext(1)} {
+		t.Run(name, func(t *testing.T) {
+			_, err := svc.Create(ctx, {{.R.Pascal}}Input{Name: "x"})
+			requireCode(t, err, apperror.CodePermissionDenied)
+			_, err = svc.List(ctx, 10, "")
+			requireCode(t, err, apperror.CodePermissionDenied)
+		})
+	}
+}
+
+func Test{{.R.Pascal}}ServiceWrapsRepositoryErrors(t *testing.T) {
+	boom := errors.New("connection reset")
+	svc := New{{.R.Pascal}}Service(&fake{{.R.Pascal}}Repository{err: boom})
+	if _, err := svc.Get(adminContext(1), 1); !errors.Is(err, boom) {
+		t.Fatalf("Get = %v, want the wrapped repository error", err)
+	}
+}

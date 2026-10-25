@@ -1,0 +1,15 @@
+// Package service holds the {{.M.Name}} use cases (ADR 0002). It is
+// transport- and persistence-agnostic: it must not import sqlc, pgx, Fiber,
+// or the module's dto/handler packages. What a use case needs from the
+// outside world is declared here as a port; repository/ (or an adapter)
+// implements it and build.go wires the two together.
+package service
+
+import (
+	"context"
+)
+
+// HealthChecker reports whether the module's database is reachable.
+type HealthChecker interface {
+	Ping(ctx context.Context) error
+}

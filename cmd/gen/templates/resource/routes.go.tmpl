@@ -1,0 +1,35 @@
+package {{.M.Name}}
+
+import (
+	"github.com/gofiber/fiber/v3"
+
+	"{{.M.ModulePath}}/internal/app"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/audit/audithttp"
+	"{{.M.ModulePath}}/internal/platform/authz/authzhttp"
+)
+
+// register{{.R.Pascal}}Routes mounts the {{.R.Human}} CRUD routes on the module
+// group (already authenticated). Mutations are Tier 2 audited: a required
+// intent row is written after idempotency and before the handler, so an
+// unavailable audit store rejects the change with 503.
+func (m *Module) register{{.R.Pascal}}Routes(group fiber.Router, deps app.Deps) {
+	h := m.handlers.{{.R.PluralPascal}}
+	rl := deps.Limiters
+	guard := func(action string) fiber.Handler {
+		return audithttp.Guard(deps.Audit, audithttp.Policy{
+			Mode:     audithttp.ModeRequired,
+			Action:   action,
+			Resource: "{{.R.Table}}",
+		})
+	}
+	read := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read)
+	write := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write)
+	remove := authzhttp.Require({{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete)
+
+	group.Get("/{{.R.PluralRoute}}", rl.Relaxed, read, h.List)
+	group.Get("/{{.R.PluralRoute}}/:id", rl.Relaxed, read, h.Get)
+	group.Post("/{{.R.PluralRoute}}", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.created"), h.Create)
+	group.Put("/{{.R.PluralRoute}}/:id", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.updated"), h.Update)
+	group.Delete("/{{.R.PluralRoute}}/:id", rl.Normal, remove, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.deleted"), h.Delete)
+}

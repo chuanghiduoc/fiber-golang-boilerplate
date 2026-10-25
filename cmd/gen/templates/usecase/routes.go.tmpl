@@ -1,0 +1,35 @@
+package {{.M.Name}}
+
+import (
+	"github.com/gofiber/fiber/v3"
+
+	"{{.M.ModulePath}}/internal/app"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+{{- if .U.IsCommand}}
+	"{{.M.ModulePath}}/internal/platform/audit/audithttp"
+{{- end}}
+	"{{.M.ModulePath}}/internal/platform/authz/authzhttp"
+)
+
+{{if .U.IsCommand -}}
+// register{{.U.Name}}Route mounts the {{.U.Name}} command. It is a Tier 2
+// audited mutation: idempotency first, then a required intent row.
+func (m *Module) register{{.U.Name}}Route(group fiber.Router, deps app.Deps) {
+	group.Post("/{{.U.Route}}", deps.Limiters.Normal,
+		authzhttp.Require({{.M.Ident}}catalog.{{.U.Permission}}),
+		deps.Idempotency,
+		audithttp.Guard(deps.Audit, audithttp.Policy{
+			Mode:     audithttp.ModeRequired,
+			Action:   "{{.M.Name}}.{{.U.Snake}}",
+			Resource: "{{.M.Name}}",
+		}),
+		m.handlers.{{.U.Name}}.Handle)
+}
+{{- else -}}
+// register{{.U.Name}}Route mounts the {{.U.Name}} query.
+func (m *Module) register{{.U.Name}}Route(group fiber.Router, deps app.Deps) {
+	group.Get("/{{.U.Route}}", deps.Limiters.Relaxed,
+		authzhttp.Require({{.M.Ident}}catalog.{{.U.Permission}}),
+		m.handlers.{{.U.Name}}.Handle)
+}
+{{- end}}
