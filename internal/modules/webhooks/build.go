@@ -9,6 +9,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
+	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -81,6 +82,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 		RetryMax:  cfg.RetryMax(),
 	})
 	m.retentionDays = int32(cfg.RetentionDays) // #nosec G115 -- validated 1..3650 days
+	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.Pool))
 	return m, nil
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -50,7 +51,7 @@ type Settings struct {
 
 // Build constructs identity's repositories, services, and handlers from infra.
 // It performs no I/O; call Module.Startup for the tenant/admin-seed checks.
-func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
+func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts.Registry) (*Module, Provides, error) {
 	cfg := infra.Platform
 
 	var googleOAuth *oauth.GoogleOAuth
@@ -69,7 +70,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	}
 	// The transactor binds the event bus so user.registered commits with the
 	// account (events.Bus.PublishTx); webhooks subscribe durably to it.
-	transactor := identityrepository.NewTransactor(infra.Tx, infra.Audit, mail, infra.Events)
+	transactor := identityrepository.NewTransactorWithQueue(infra.Tx, infra.Audit, mail, infra.Events, infra.Queue)
 
 	// Every /api/v1 request resolves its tenant before rate limiting, so the
 	// slug lookup is cached in-process. A suspension reaches header-resolved
@@ -131,6 +132,15 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	m.invitations = identityhandler.NewInvitationHandler(invitationSvc)
 	m.resetSvc = passwordResetSvc
 	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
+	m.privacySvc = identityservice.NewPrivacyService(identityservice.PrivacyDeps{
+		Stores:       stores,
+		Tx:           transactor,
+		Storage:      infra.Storage,
+		Registry:     privacyRegistry,
+		Verifier:     userSvc,
+		SessionCache: sessionStore,
+	})
+	m.privacy = identityhandler.NewPrivacyHandler(m.privacySvc)
 	m.startup = func(ctx context.Context) error {
 		return startup(ctx, infra.Platform, settings.Admin, stores, transactor)
 	}
@@ -186,6 +196,12 @@ func (m *Module) RegisterJobs(registrar jobs.Registrar) {
 	if m.tokenPurger != nil {
 		registrar.Register(identityservice.TokenPurgeJobKind, m.tokenPurger.HandleJob)
 	}
+	if m.privacySvc != nil {
+		registrar.Register(identityservice.JobKindDataExport, m.privacySvc.HandleExportJob)
+		registrar.Register(identityservice.JobKindErase, m.privacySvc.HandleEraseJob)
+		registrar.Register(identityservice.JobKindEraseFinalize, m.privacySvc.HandleFinalizeJob)
+		registrar.Register(identityservice.JobKindExportPurge, m.privacySvc.HandlePurgeJob)
+	}
 }
 
 // tokenPurgeSchedule enqueues the expired-token purge. The scheduler is
@@ -197,14 +213,25 @@ var tokenPurgeSchedule = scheduler.Spec{
 	Kind:     identityservice.TokenPurgeJobKind,
 }
 
+// exportPurgeSchedule removes expired data exports and their blobs hourly.
+var exportPurgeSchedule = scheduler.Spec{
+	Name:     identityservice.JobKindExportPurge,
+	Interval: identityservice.ExportPurgeInterval,
+	Kind:     identityservice.JobKindExportPurge,
+}
+
 // RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
 // so a registration error is a programming error and fails startup loudly.
 func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
-	if m.tokenPurger == nil {
-		return
+	if m.tokenPurger != nil {
+		if err := registry.Register(tokenPurgeSchedule); err != nil {
+			panic(fmt.Sprintf("identity: register %s schedule: %v", tokenPurgeSchedule.Name, err))
+		}
 	}
-	if err := registry.Register(tokenPurgeSchedule); err != nil {
-		panic(fmt.Sprintf("identity: register %s schedule: %v", tokenPurgeSchedule.Name, err))
+	if m.privacySvc != nil {
+		if err := registry.Register(exportPurgeSchedule); err != nil {
+			panic(fmt.Sprintf("identity: register %s schedule: %v", exportPurgeSchedule.Name, err))
+		}
 	}
 }
 

@@ -4,8 +4,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
+	apikeysprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 )
 
@@ -14,13 +16,24 @@ import (
 // their lifecycle.
 type Module struct {
 	handler *apikeyhandler.Handler
+	privacy *apikeysprivacy.Provider
 }
+
+var _ app.PrivacyProvider = (*Module)(nil)
 
 func New(handler *apikeyhandler.Handler) *Module {
 	return &Module{handler: handler}
 }
 
 func (m *Module) Name() string { return apikeyscatalog.Owner }
+
+// RegisterPrivacy implements app.PrivacyProvider.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacy == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "apikeys", Exporter: m.privacy, Eraser: m.privacy})
+}
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// API-key callers may manage keys: the admin:api_keys:* scopes gate each

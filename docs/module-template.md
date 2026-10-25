@@ -494,7 +494,7 @@ One module owns each table:
 
 | Owner | Tables |
 | --- | --- |
-| `identity` | `tenants`, `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants`, `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
 | `files` | `files` |
 | `features` | `feature_flags`, `feature_flag_targets` |
 | `notifications` | `notifications`, `notification_preferences` |

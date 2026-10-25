@@ -69,14 +69,14 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `config` | Env parsing, one file per concern (`app.go`, `auth.go`, `database.go`, `webhook.go`, ...); `Config.Validate` runs the section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, infra routes, module registry + provider hooks, `app.Infra` (shared config in `Infra.Platform`: App, JWT, Tenant), system-context job registrar |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (used by `cmd/api` and `test/arch`) |
-| `internal/contracts/<provider>` | Stdlib-only contracts grouped by providing module: `identity` (admin, principal reader, notification recipient), `files` (admin), `notifications` (notifier), `webhooks` (event/dispatcher) |
+| `internal/contracts/<provider>` | Stdlib-only contracts grouped by providing module: `identity` (admin, principal reader, notification recipient), `files` (admin), `notifications` (notifier), `privacy` (exporter/eraser registry), `webhooks` (event/dispatcher) |
 | `internal/platform/*` | Cross-cutting mechanics (table below) |
 | `internal/platform/middleware` | HTTP middleware: JWT, rate limit, logger, idempotency, ... |
 | `pkg/*` | Reusable infrastructure: errors, response, database, cache, storage, email, webhook client, ... |
 
 | Module | Owns |
 |---|---|
-| `identity` | Auth, global users, memberships, invitations, sessions, tokens, tenant lifecycle, admin seed (dto/repository/service/handler + adapter + queries/sqlc) |
+| `identity` | Auth, global users, memberships, invitations, sessions, tokens, data exports/erasure, tenant lifecycle, admin seed (dto/repository/service/handler + adapter + queries/sqlc) |
 | `files` | Upload, metadata, download, soft delete, restore (+ adapter + queries/sqlc) |
 | `features` | Admin feature-flag catalogue surface (+ queries/sqlc) |
 | `notifications` | In-app feed, channel preferences, durable email channel (+ queries/sqlc) |
@@ -217,6 +217,7 @@ flowchart LR
 | Mechanism | Use when | Guarantees |
 |---|---|---|
 | **Contract** (`internal/contracts/<provider>`) | A module must read or act on another module's data now. | Stdlib-only interface; provider implements it in its `adapter` package; `internal/bootstrap` passes it to the consumer. No shared transaction. |
+| **Privacy contract** (`internal/contracts/privacy`) | A GDPR export or erasure must reach every module holding per-user data. | Modules register an exporter/eraser through `app.PrivacyProvider`; identity orchestrates through the registry, so no module imports another. |
 | **Outbox** (`jobs` table) | A side effect must exist if and only if the business change commits. | Job row commits with the business row (`EnqueueTx`/`EnqueueOnceTx`); delivery is at-least-once, so handlers are idempotent. |
 | **Durable event** (`events.PublishTx` + `SubscribeDurable`) | Several independent reactions to one fact. | One job per subscription, key `event:<type>:<id>:<handler>:<tenantId>`; at-least-once. |
 | **Local event** (`Subscribe`) | In-process reactions that may fail with the request. | Runs synchronously before commit; panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
@@ -239,8 +240,11 @@ flowchart LR
 
 Arrows read "provider supplies X to consumer". Notifications exposes
 `notifications.Notifier` (`internal/contracts/notifications`) for other
-modules and never imports identity or reads `users`; no other module consumes
-it yet.
+modules and never imports identity or reads `users`; the identity export job
+consumes it through a late-bound `SetNotifier` after both modules are built.
+The privacy registry is wired the same way: each module implements
+`app.PrivacyProvider`, `bootstrap` owns the `privacy.Registry`, and identity's
+export/erase jobs call the registered exporters/erasers.
 
 ## Multi-tenant model
 
@@ -357,7 +361,8 @@ keeps the repository's tenant scoping.
   `scheduler_runs` are tenant-independent with no foreign keys; identity's
   `users`, `user_passwords`, `user_identities`, and reset/verification tokens
   are global per-user rows (ADR 0004). Everything else is tenant-owned with
-  tenant-leading indexes.
+  tenant-leading indexes. `data_exports` (identity) is tenant-owned and
+  references `(tenant_id, user_id) → memberships`.
 - `api_keys.key_hash` is globally unique; it is the only lookup made before a
   request tenant can be trusted.
 - `files.storage_path` is the authoritative blob key; moving a blob without
@@ -370,6 +375,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Concern | Convention |
 |---|---|
 | Authorization | Module permissions live in `catalog/permissions.go` and register through `app.PermissionProvider`; only shared back-office permissions stay in `internal/platform/authz`. Notification routes use `notifications:read`/`notifications:write`; sending to another user needs admin-only `notifications:send`. Legacy exceptions: [Module Template](module-template.md#legacy-exceptions-do-not-copy). |
+| Privacy | `internal/contracts/privacy` exporters/erasers are registered by every module with per-user data; identity owns `data_exports` and orchestrates export/erasure jobs (ADR 0013). Export documents live 7 days; erasure anonymizes the global user after every membership is removed. |
 | Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, invitations create/revoke/accept/sign-up, tenant lifecycle, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |

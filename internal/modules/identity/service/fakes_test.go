@@ -390,8 +390,16 @@ func (r memMemberships) GetPrincipal(context.Context, int64) (*Principal, error)
 	return nil, errFakeNotImplemented
 }
 
-func (r memMemberships) LockPrincipal(context.Context, int64) (*Principal, error) {
-	return nil, errFakeNotImplemented
+func (r memMemberships) LockPrincipal(ctx context.Context, userID int64) (*Principal, error) {
+	m, err := r.GetActive(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &Principal{
+		UserID: m.User.ID, TenantID: m.Membership.TenantID,
+		Email: m.User.Email, Name: m.User.Name, Role: m.Membership.Role,
+		TenantStatus: TenantStatusActive,
+	}, nil
 }
 
 type memSessions struct{ db *memDB }

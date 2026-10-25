@@ -413,6 +413,7 @@ func (rt *runtime) composeApplication() {
 		Jobs:           rt.worker,
 		Schedules:      rt.schedules,
 		APIKeyVerifier: rt.modules.APIKeyVerifier,
+		Privacy:        rt.modules.Privacy,
 	})
 	// Module providers register routes, event subscriptions, job handlers
 	// (for example webhook delivery/dispatch), and schedules. The bus turns

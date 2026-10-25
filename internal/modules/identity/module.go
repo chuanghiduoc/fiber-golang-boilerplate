@@ -7,6 +7,8 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -26,17 +28,20 @@ type Module struct {
 	// WithInvitations); their routes are mounted only when present.
 	sessions    *identityhandler.SessionHandler
 	invitations *identityhandler.InvitationHandler
+	privacy     *identityhandler.PrivacyHandler
 
 	// The job, schedule, and startup collaborators are set by Build; a module
 	// built with New (tests) has none.
 	resetSvc    identityservice.PasswordResetService
 	tokenPurger *identityservice.TokenPurger
+	privacySvc  *identityservice.PrivacyService
 	startup     func(ctx context.Context) error
 }
 
 var (
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
+	_ app.PrivacyProvider  = (*Module)(nil)
 )
 
 // New builds the module from its handlers. Production uses Build.
@@ -103,6 +108,9 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	if m.invitations != nil {
 		m.registerInvitationRoutes(v1, auth, jwtOnly, deps)
 	}
+	if m.privacy != nil {
+		m.registerPrivacyRoutes(v1, deps, jwtOnly, guard)
+	}
 
 	users := v1.Group("/users", deps.Authenticate())
 	users.Get("/me", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
@@ -112,6 +120,42 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
 	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
 	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+}
+
+// registerPrivacyRoutes mounts the caller's exports/erasure and the admin
+// erasure variant. Erasure is Tier 1 (the service records in the mutation
+// transaction); export creation is Tier 2.
+func (m *Module) registerPrivacyRoutes(v1 fiber.Router, deps app.Deps, jwtOnly fiber.Handler, guard func(string, string) fiber.Handler) {
+	rl := deps.Limiters
+	me := v1.Group("/me", deps.Authenticate())
+	me.Post("/data-exports", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileRead), deps.Idempotency, guard("data_export.requested", "data_export"), m.privacy.CreateExport)
+	me.Get("/data-exports", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.ListExports)
+	me.Get("/data-exports/:id", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.GetExport)
+	me.Get("/data-exports/:id/download", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.DownloadExport)
+	me.Post("/erasure", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.privacy.EraseMe)
+
+	// /admin is shared with the admin module, so middleware stays per route
+	// (a group middleware would run on the other module's admin routes).
+	// Global account erasure is JWT-only, like self-deletion: a tenant-scoped
+	// API key must not end access in every tenant.
+	admin := v1.Group("/admin")
+	admin.Post("/users/:id/erasure", jwtOnly, rl.Normal, authzhttp.Require(authz.PermissionAdminUsersDelete), deps.Idempotency, m.privacy.EraseUser)
+}
+
+// RegisterPrivacy implements app.PrivacyProvider: identity's own exporter and
+// eraser participate in the fan-out.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacySvc == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: m.privacySvc, Eraser: m.privacySvc})
+}
+
+// SetNotifier wires the export-ready notification after notifications.Build.
+func (m *Module) SetNotifier(notifier notificationcontracts.Notifier) {
+	if m.privacySvc != nil {
+		m.privacySvc.SetNotifier(notifier)
+	}
 }
 
 // registerInvitationRoutes mounts the invitation flow. Create, revoke,

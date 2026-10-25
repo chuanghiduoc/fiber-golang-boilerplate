@@ -52,6 +52,7 @@ var requiredTables = []string{
 	"refresh_tokens",
 	"password_reset_tokens",
 	"email_verification_tokens",
+	"data_exports",
 	"api_keys",
 	"api_key_scopes",
 	"files",
@@ -92,6 +93,7 @@ var requiredColumns = map[string][]string{
 	"refresh_tokens":            {"tenant_id", "session_id", "token_hash", "used_at"},
 	"password_reset_tokens":     {"user_id", "token_hash"},
 	"email_verification_tokens": {"user_id", "email", "token_hash"},
+	"data_exports":              {"tenant_id", "user_id", "status", "storage_path", "expires_at"},
 	"files":                     {"tenant_id", "updated_at"},
 	"api_keys": {
 		"tenant_id", "user_id", "key_hash", "expires_at",
@@ -132,6 +134,7 @@ var requiredColumns = map[string][]string{
 var requiredUniqueIndexes = []string{
 	"tenants_slug_key",
 	"idx_users_email_live",
+	"idx_data_exports_active",
 	"uq_user_identities_provider_subject",
 	"uq_user_identities_user_provider",
 	"uq_memberships_tenant_user",
@@ -164,7 +167,8 @@ var requiredUniqueIndexes = []string{
 // requiredTriggers are the database-level invariants the application relies
 // on: the per-tenant last-admin guard and the audit append-only guards.
 var requiredTriggers = map[string][]string{
-	"memberships": {"trigger_protect_last_admin"},
+	"memberships":  {"trigger_protect_last_admin"},
+	"data_exports": {"trigger_data_exports_updated_at"},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",
@@ -191,6 +195,9 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	},
 	"sessions": {
 		"idx_sessions_tenant_user_created_at",
+	},
+	"data_exports": {
+		"idx_data_exports_tenant_user_created_at_id",
 	},
 	"refresh_tokens": {
 		"idx_refresh_tokens_tenant_session_id",

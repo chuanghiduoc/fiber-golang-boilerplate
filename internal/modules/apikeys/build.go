@@ -6,6 +6,7 @@ import (
 	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
+	apikeysprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/privacy"
 	apikeyrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
@@ -25,7 +26,9 @@ func Build(infra app.Infra, principals identitycontracts.PrincipalReader) (*Modu
 	repo := apikeyrepo.NewAPIKeyRepository(infra.Pool)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(repo), principals)
 	svc := apikeyservice.NewService(repo, principals, infra.Tx, infra.Audit)
-	return New(apikeyhandler.NewHandler(svc)), Provides{Verifier: verifier}
+	m := New(apikeyhandler.NewHandler(svc))
+	m.privacy = apikeysprivacy.New(apikeyrepo.NewPrivacyStore(infra.Pool))
+	return m, Provides{Verifier: verifier}
 }
 
 // Permissions implements app.PermissionProvider.

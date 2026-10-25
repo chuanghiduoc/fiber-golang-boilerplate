@@ -7,6 +7,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
@@ -450,6 +451,61 @@ type TokenPurgeRepository interface {
 	PurgeStaleSessions(ctx context.Context, revokedBefore, idleBefore time.Time, batchSize int32) (int64, error)
 }
 
+// DataExportStatus is the lifecycle of a data-export request.
+type DataExportStatus string
+
+const (
+	DataExportQueued  DataExportStatus = "queued"
+	DataExportRunning DataExportStatus = "running"
+	DataExportReady   DataExportStatus = "ready"
+	DataExportFailed  DataExportStatus = "failed"
+	DataExportExpired DataExportStatus = "expired"
+)
+
+// DataExport is one tenant/user export request and its stored document.
+type DataExport struct {
+	ID          int64
+	TenantID    int64
+	UserID      int64
+	Status      DataExportStatus
+	StoragePath string
+	ExpiresAt   *time.Time
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// ErrDataExportInProgress means the membership already has a queued or running
+// export (idx_data_exports_active).
+var ErrDataExportInProgress = errors.New("identity: a data export is already in progress")
+
+// DataExportRepository stores export requests, the export purge, and the
+// cross-table reads/writes the identity eraser and finalizer need. Every
+// method except ListPurgeableDataExports is tenant/user scoped.
+type DataExportRepository interface {
+	Create(ctx context.Context, userID int64) (*DataExport, error)
+	Get(ctx context.Context, userID, id int64) (*DataExport, error)
+	ListForUser(ctx context.Context, userID int64) ([]DataExport, error)
+	ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor) ([]DataExport, error)
+	MarkRunning(ctx context.Context, userID, id int64) (bool, error)
+	MarkReady(ctx context.Context, userID, id int64, storagePath string, expiresAt time.Time) (bool, error)
+	MarkFailed(ctx context.Context, userID, id int64) error
+	ExpireForUser(ctx context.Context, userID int64) ([]DataExport, error)
+	DeleteForUser(ctx context.Context, userID int64) error
+	Purgeable(ctx context.Context, limit int32) ([]DataExport, error)
+	Delete(ctx context.Context, id int64) error
+	ListSessions(ctx context.Context, userID int64) ([]Session, error)
+	AnonymizeUser(ctx context.Context, userID int64, email string) (*User, error)
+	DeleteCredentialsAndIdentities(ctx context.Context, userID int64) error
+	DeleteSessionsInTenant(ctx context.Context, userID int64) error
+	DeleteSessionsForUser(ctx context.Context, userID int64) error
+}
+
+// JobEnqueuer enqueues a job on the caller's transaction. The repository
+// transactor binds it to the open pgx.Tx, so services never see pgx.
+type JobEnqueuer interface {
+	Enqueue(ctx context.Context, job jobs.Job) (int64, error)
+}
+
 // Stores are the identity repositories bound to one database handle (the
 // pool, or one transaction inside Transactor.InTx).
 type Stores struct {
@@ -461,6 +517,7 @@ type Stores struct {
 	Verifications VerificationRepository
 	Invitations   InvitationRepository
 	Tenants       TenantRepository
+	Privacy       DataExportRepository
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction.
@@ -489,6 +546,9 @@ type TxRepos struct {
 	// Mail is nil when the wired email sender cannot enqueue on the
 	// transaction; callers then send after commit.
 	Mail Mailer
+	// Jobs is never nil in production; privacy requests enqueue their durable
+	// job in the same transaction as the row.
+	Jobs JobEnqueuer
 }
 
 // Transactor runs fn in one transaction: when fn returns an error every write

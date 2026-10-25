@@ -62,6 +62,18 @@ type WebhookEndpointSecret struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
+type WebhookEvent struct {
+	TenantID    int64              `json:"tenant_id"`
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	DataVersion int32              `json:"data_version"`
+	ActorType   string             `json:"actor_type"`
+	ActorID     pgtype.Text        `json:"actor_id"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	Payload     []byte             `json:"payload"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type WebhookInboundEvent struct {
 	ID              int64              `json:"id"`
 	TenantID        int64              `json:"tenant_id"`

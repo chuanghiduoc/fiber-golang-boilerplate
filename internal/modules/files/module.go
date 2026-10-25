@@ -6,6 +6,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
@@ -19,13 +20,16 @@ import (
 
 // Module owns file upload, metadata, download, soft delete, and restore.
 type Module struct {
-	upload      *fileshandler.UploadHandler
-	trashPurger *filesvc.TrashPurger
+	upload          *fileshandler.UploadHandler
+	trashPurger     *filesvc.TrashPurger
+	privacyExporter *filesvc.PrivacyExporter
+	privacyEraser   *filesvc.PrivacyEraser
 }
 
 var (
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
+	_ app.PrivacyProvider  = (*Module)(nil)
 )
 
 // New builds the module from its handler. Production uses Build.
@@ -34,6 +38,16 @@ func New(upload *fileshandler.UploadHandler) *Module {
 }
 
 func (m *Module) Name() string { return filescatalog.Owner }
+
+// RegisterPrivacy implements app.PrivacyProvider.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacyExporter == nil || m.privacyEraser == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{
+		Name: "files", Exporter: m.privacyExporter, Eraser: m.privacyEraser,
+	})
+}
 
 // Permissions implements app.PermissionProvider.
 func (m *Module) Permissions() []authz.Grant { return filescatalog.Permissions() }

@@ -9,6 +9,7 @@ import (
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
@@ -24,6 +25,7 @@ func NewStores(db identitysqlc.DBTX) identityservice.Stores {
 		Verifications: NewVerificationRepository(db),
 		Invitations:   NewInvitationRepository(db),
 		Tenants:       NewTenantRepository(db),
+		Privacy:       NewDataExportRepository(db),
 	}
 }
 
@@ -41,15 +43,21 @@ type Transactor struct {
 	audit     audit.TxRecorder
 	mail      TxEmailSender
 	bus       *events.Bus
+	queue     *jobs.Queue
 }
 
 var _ identityservice.Transactor = (*Transactor)(nil)
 
-// NewTransactor wires the transaction-bound collaborators. mail may be nil
-// (TxRepos.Mail is then nil and services send after commit). A nil bus (unit
-// tests, the seeder) publishes nothing.
+// NewTransactor wires the transaction-bound collaborators without a job queue.
 func NewTransactor(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus) *Transactor {
-	return &Transactor{txManager: txManager, audit: recorder, mail: mail, bus: bus}
+	return NewTransactorWithQueue(txManager, recorder, mail, bus, nil)
+}
+
+// NewTransactorWithQueue also binds the job outbox, so privacy requests enqueue
+// their durable work in the same transaction. mail may be nil (TxRepos.Mail is
+// then nil and services send after commit). A nil bus publishes nothing.
+func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxRecorder, mail TxEmailSender, bus *events.Bus, queue *jobs.Queue) *Transactor {
+	return &Transactor{txManager: txManager, audit: recorder, mail: mail, bus: bus, queue: queue}
 }
 
 // MailTransactional reports whether TxRepos.Mail is set.
@@ -64,6 +72,9 @@ func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx i
 		}
 		if t.mail != nil {
 			repos.Mail = txMail{sender: t.mail, tx: tx}
+		}
+		if t.queue != nil {
+			repos.Jobs = txJobs{queue: t.queue, tx: tx}
 		}
 		return fn(ctx, repos)
 	})
@@ -102,4 +113,14 @@ type txMail struct {
 
 func (m txMail) Send(ctx context.Context, msg email.Message) error {
 	return m.sender.SendTx(ctx, m.tx, msg)
+}
+
+// txJobs enqueues privacy jobs through the open transaction.
+type txJobs struct {
+	queue *jobs.Queue
+	tx    pgx.Tx
+}
+
+func (j txJobs) Enqueue(ctx context.Context, job jobs.Job) (int64, error) {
+	return j.queue.EnqueueTx(ctx, j.tx, job)
 }

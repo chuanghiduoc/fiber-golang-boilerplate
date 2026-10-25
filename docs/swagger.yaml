@@ -288,6 +288,31 @@ definitions:
     - name
     - slug
     type: object
+  dto.DataExportResponse:
+    properties:
+      createdAt:
+        type: string
+      downloadUrl:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      status:
+        enum:
+        - queued
+        - running
+        - ready
+        - failed
+        - expired
+        type: string
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
+      userId:
+        type: integer
+    type: object
   dto.DeliveryAttemptResponse:
     properties:
       attempt:
@@ -395,6 +420,18 @@ definitions:
         type: string
       url:
         type: string
+    type: object
+  dto.ErasureAccepted:
+    properties:
+      status:
+        type: string
+    type: object
+  dto.ErasureRequest:
+    properties:
+      currentPassword:
+        type: string
+    required:
+    - currentPassword
     type: object
   dto.FileResponse:
     properties:
@@ -1751,6 +1788,53 @@ paths:
       summary: Ban a user
       tags:
       - Admin
+  /admin/users/{id}/erasure:
+    post:
+      description: Queue erasure of every tenant membership's data and the global
+        account for a member of the request tenant. The last active admin cannot be
+        erased.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/dto.ErasureAccepted'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.last_admin
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Erase a member and their global account
+      tags:
+      - Admin
   /admin/users/{id}/role:
     put:
       consumes:
@@ -2735,6 +2819,193 @@ paths:
       summary: Revoke an invitation
       tags:
       - Invitations
+  /me/data-exports:
+    get:
+      description: List the caller's export requests in the request tenant, newest
+        first.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.DataExportResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List data exports
+      tags:
+      - Privacy
+    post:
+      description: Queue a JSON export of the caller's data in the request tenant.
+        At most one queued or running export exists per membership.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.DataExportResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: data_export.in_progress
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Request a data export
+      tags:
+      - Privacy
+  /me/data-exports/{id}:
+    get:
+      description: Status of one of the caller's exports. Another user's or tenant's
+        id is not found.
+      parameters:
+      - description: Export ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.DataExportResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a data export
+      tags:
+      - Privacy
+  /me/data-exports/{id}/download:
+    get:
+      description: Stream the caller's ready JSON export. Other users and tenants
+        get 404; an expired export is 410.
+      parameters:
+      - description: Export ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: data_export.not_ready
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "410":
+          description: data_export.expired
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Download a data export
+      tags:
+      - Privacy
+  /me/erasure:
+    post:
+      consumes:
+      - application/json
+      description: Re-authenticate with the current password, then queue erasure of
+        every tenant membership's data and the global account. Refused while the caller
+        is the last active admin of a tenant.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Current password
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.ErasureRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/dto.ErasureAccepted'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.last_admin
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Erase the caller's account data
+      tags:
+      - Privacy
   /notification-preferences:
     get:
       description: List explicit channel preferences for the authenticated user. Missing
