@@ -10,7 +10,7 @@ import (
 // global user. DeletedAt is the membership removal or the account deletion.
 func toUserResponse(member *service.Member) dto.UserResponse {
 	user, membership := member.User, member.Membership
-	resp := dto.UserResponse{
+	return dto.UserResponse{
 		ID:               user.ID,
 		Email:            user.Email,
 		Name:             user.Name,
@@ -20,22 +20,13 @@ func toUserResponse(member *service.Member) dto.UserResponse {
 		EmailVerified:    user.EmailVerified(),
 		HasPassword:      user.HasPassword,
 		CreatedAt:        user.CreatedAt,
-		UpdatedAt:        user.UpdatedAt,
+		UpdatedAt:        member.UpdatedAt(),
 		JoinedAt:         membership.CreatedAt,
+		DeletedAt:        member.DeletedAt(),
 		BannedAt:         membership.BannedAt,
 		TokenVersion:     user.TokenVersion,
 		TenantID:         membership.TenantID,
 	}
-	if membership.UpdatedAt.After(resp.UpdatedAt) {
-		resp.UpdatedAt = membership.UpdatedAt
-	}
-	switch {
-	case membership.RemovedAt != nil:
-		resp.DeletedAt = membership.RemovedAt
-	case user.DeletedAt != nil:
-		resp.DeletedAt = user.DeletedAt
-	}
-	return resp
 }
 
 func toUserResponses(members []service.Member) []dto.UserResponse {

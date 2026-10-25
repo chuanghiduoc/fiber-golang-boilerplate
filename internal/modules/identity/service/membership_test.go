@@ -197,3 +197,18 @@ func seedMember(t *testing.T, db *memDB, tenantID int64, email, role string) int
 	require.NoError(t, err)
 	return user.ID
 }
+
+func TestMemberUpdatedAtAndDeletedAt(t *testing.T) {
+	early, late := time.Unix(100, 0), time.Unix(200, 0)
+	removed, deleted := time.Unix(300, 0), time.Unix(400, 0)
+	m := Member{User: User{UpdatedAt: early}, Membership: Membership{UpdatedAt: late}}
+	assert.Equal(t, late, m.UpdatedAt(), "the later of user and membership")
+	m.User.UpdatedAt, m.Membership.UpdatedAt = late, early
+	assert.Equal(t, late, m.UpdatedAt())
+
+	assert.Nil(t, m.DeletedAt())
+	m.User.DeletedAt = &deleted
+	assert.Equal(t, &deleted, m.DeletedAt(), "account deletion when still a member")
+	m.Membership.RemovedAt = &removed
+	assert.Equal(t, &removed, m.DeletedAt(), "leaving the tenant wins")
+}

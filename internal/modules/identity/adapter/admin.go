@@ -5,7 +5,6 @@ package adapter
 
 import (
 	"context"
-	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -67,17 +66,6 @@ func (a *AdminIdentity) GetUserStats(ctx context.Context) (identitycontracts.Use
 
 func toUser(member *service.Member) identitycontracts.User {
 	user, membership := member.User, member.Membership
-	updatedAt := user.UpdatedAt
-	if membership.UpdatedAt.After(updatedAt) {
-		updatedAt = membership.UpdatedAt
-	}
-	var deletedAt *time.Time
-	switch {
-	case membership.RemovedAt != nil:
-		deletedAt = membership.RemovedAt
-	case user.DeletedAt != nil:
-		deletedAt = user.DeletedAt
-	}
 	return identitycontracts.User{
 		ID:               user.ID,
 		Email:            user.Email,
@@ -88,9 +76,9 @@ func toUser(member *service.Member) identitycontracts.User {
 		EmailVerified:    user.EmailVerified(),
 		HasPassword:      user.HasPassword,
 		CreatedAt:        user.CreatedAt,
-		UpdatedAt:        updatedAt,
+		UpdatedAt:        member.UpdatedAt(),
 		JoinedAt:         membership.CreatedAt,
-		DeletedAt:        deletedAt,
+		DeletedAt:        member.DeletedAt(),
 		BannedAt:         membership.BannedAt,
 	}
 }

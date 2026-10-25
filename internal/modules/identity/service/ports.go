@@ -182,6 +182,23 @@ type Member struct {
 	Membership Membership
 }
 
+// UpdatedAt is the later of the user's and the membership's last change.
+func (m *Member) UpdatedAt() time.Time {
+	if m.Membership.UpdatedAt.After(m.User.UpdatedAt) {
+		return m.Membership.UpdatedAt
+	}
+	return m.User.UpdatedAt
+}
+
+// DeletedAt is when the member left the tenant, or else when the global
+// account was deleted; nil while both exist.
+func (m *Member) DeletedAt() *time.Time {
+	if m.Membership.RemovedAt != nil {
+		return m.Membership.RemovedAt
+	}
+	return m.User.DeletedAt
+}
+
 // Active reports whether the member may act in the tenant.
 func (m *Member) Active() bool {
 	return m.User.Status == UserStatusActive && m.Membership.Status == MembershipStatusActive
