@@ -545,10 +545,13 @@ handler/service/DTO/repository package.
   `data_exports` and the routes: `POST/GET /me/data-exports`,
   `GET /me/data-exports/:id[/download]`, `POST /me/erasure`, and
   `POST /admin/users/:id/erasure` (`admin:users:delete`). Export jobs write one
-  JSON document per tenant/user for 7 days; erasure fans out one
+  JSON document per tenant/user for 7 days (blobs embedded up to 64 MiB, later
+  files marked `contentOmitted`); erasure fans out one
   `privacy.erase` job per membership plus a retryable finalizer that
   anonymizes the global user only after every membership is `removed`. Self
-  erasure re-authenticates with the current password (no MFA exists yet); both
+  erasure re-authenticates with the current password (an MFA user's session
+  already passed the second factor); the finalizer also deletes the MFA factor
+  and recovery codes; both
   erasure routes are JWT-only. The last active admin is refused before enqueue
   and re-checked at job time. Audit rows keep only IDs. The hourly purge also
   removes failed/stale export rows after one day.

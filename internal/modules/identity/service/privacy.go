@@ -655,6 +655,14 @@ func (s *PrivacyService) cleanupUser(ctx context.Context, tx TxRepos, userID int
 	if err := tx.Privacy.DeleteSessionsForUser(ctx, userID); err != nil {
 		return false, apperror.NewInternal("failed to delete sessions")
 	}
+	// The user row is anonymized, not deleted, so the MFA tables' cascade
+	// never fires: remove the sealed TOTP secret and recovery codes here.
+	if err := tx.MFA.DeleteTOTP(ctx, userID); err != nil {
+		return false, apperror.NewInternal("failed to delete MFA factor")
+	}
+	if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
+		return false, apperror.NewInternal("failed to delete recovery codes")
+	}
 	if err := tx.Resets.DeleteByUser(ctx, userID); err != nil {
 		return false, apperror.NewInternal("failed to delete reset tokens")
 	}

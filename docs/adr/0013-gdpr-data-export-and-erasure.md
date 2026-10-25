@@ -41,7 +41,8 @@ mechanism.
   retryable `privacy.erase.finalize` job. The per-tenant job re-checks the
   last-admin rule before any eraser and then runs every eraser; the finalizer
   anonymizes the global user (`erased+<id>@invalid`, empty name,
-  `status = deleted`), deletes credentials, external identities, sessions, and
+  `status = deleted`), deletes credentials, MFA factors and recovery codes,
+  external identities, sessions, and
   tokens, and only succeeds once every membership is `removed`. It also
   upgrades an account deleted by the older self-service path, which left
   credentials and PII behind. The admin variant

@@ -331,6 +331,13 @@ func TestPrivacy_ErasureIsIdempotentAndAnonymizes(t *testing.T) {
 	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-erase@example.com", testutil.MemberOptions{})
 	h.seed(t, tenant.DefaultID, user.UserID)
 	h.seed(t, tenantB, user.UserID)
+	// A confirmed TOTP factor and recovery codes: the user row is anonymized,
+	// not deleted, so the cascade cannot remove them.
+	_, err := h.pool.Exec(ctx, `INSERT INTO mfa_factors (user_id, type, secret_ciphertext, confirmed_at)
+		VALUES ($1, 'totp', 'sealed', now())`, user.UserID)
+	require.NoError(t, err)
+	_, err = h.pool.Exec(ctx, `INSERT INTO mfa_recovery_codes (user_id, code_hash) VALUES ($1, 'h1'), ($1, 'h2')`, user.UserID)
+	require.NoError(t, err)
 	token := testutil.SessionToken(t, ctx, h.pool, user, privacyIntegrationSecret)
 	bToken := testutil.SessionToken(t, ctx, h.pool,
 		testutil.Member{UserID: user.UserID, TenantID: tenantB, Email: user.Email, Role: "user"}, privacyIntegrationSecret)
@@ -421,7 +428,7 @@ func assertUserErased(t *testing.T, h *privacyHarness, tenantB, userID int64) {
 	assert.Empty(t, name)
 	assert.Equal(t, "deleted", status)
 
-	for _, table := range []string{"user_passwords", "user_identities", "sessions", "password_reset_tokens", "email_verification_tokens"} {
+	for _, table := range []string{"user_passwords", "user_identities", "sessions", "password_reset_tokens", "email_verification_tokens", "mfa_factors", "mfa_recovery_codes"} {
 		var count int
 		require.NoError(t, h.pool.QueryRow(ctx, `SELECT count(*) FROM `+table+` WHERE user_id = $1`, userID).Scan(&count))
 		assert.Zero(t, count, table)

@@ -332,7 +332,9 @@ All routes are in the request tenant; another user's or tenant's export id is
 
 The export document is `{userId, tenantId, generatedAt, sections: {identity,
 files, notifications, apikeys, features, webhooks}}`. Files include metadata
-plus base64 content; apikeys include metadata and scopes, never a hash;
+plus base64 content up to 64 MiB of blobs per export (the document is built
+in memory); files past that budget carry `contentOmitted: true` and stay
+downloadable through the files API; apikeys include metadata and scopes, never a hash;
 features include only user targets; webhooks include user-attributed event
 payloads and delivery summaries. The document is deleted at expiry (7 days),
 and failed/stuck builds are cleaned by the same hourly

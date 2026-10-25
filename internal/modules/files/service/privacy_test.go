@@ -98,3 +98,32 @@ func mustDecode(t *testing.T, s string) []byte {
 	require.NoError(t, err)
 	return b
 }
+
+func TestFilesExporterOmitsContentPastTheInlineBudget(t *testing.T) {
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	ctx := context.Background()
+	repo := &fakePrivacyFiles{}
+	for i, body := range []string{"12345", "678", "9"} {
+		path := fmt.Sprintf("1/10/%d.txt", i)
+		require.NoError(t, store.Put(ctx, path, strings.NewReader(body), int64(len(body)), "text/plain"))
+		// Size is understated on purpose: the budget must count real bytes.
+		repo.files = append(repo.files, File{ID: int64(i + 1), TenantID: 1, UserID: 10, StoragePath: path, Size: 1})
+	}
+	exporter := NewPrivacyExporter(repo, store)
+	exporter.inlineLimit = 6
+
+	section, err := exporter.Export(ctx, 1, 10)
+	require.NoError(t, err)
+	var out struct {
+		Files []struct {
+			Content string `json:"contentBase64"`
+			Omitted bool   `json:"contentOmitted"`
+		} `json:"files"`
+	}
+	require.NoError(t, json.Unmarshal(section.Data, &out))
+	require.Len(t, out.Files, 3)
+	assert.Equal(t, "12345", string(mustDecode(t, out.Files[0].Content)))
+	assert.True(t, out.Files[1].Omitted, "5+3 bytes exceed the 6-byte budget")
+	assert.Equal(t, "9", string(mustDecode(t, out.Files[2].Content)), "a later file that still fits is embedded")
+}
