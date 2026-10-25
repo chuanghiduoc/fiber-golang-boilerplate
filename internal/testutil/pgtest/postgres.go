@@ -37,15 +37,8 @@ func OpenAppPool(ctx context.Context, adminDSN, schema string) (*pgxpool.Pool, e
 	defer admin.Close()
 
 	role := pgx.Identifier{AppRole}.Sanitize()
-	if _, err := admin.Exec(ctx, `DO $$ BEGIN
-		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+AppRole+`') THEN
-			CREATE ROLE `+role+` LOGIN;
-		END IF;
-	END $$;`); err != nil {
-		return nil, fmt.Errorf("create app role: %w", err)
-	}
-	if _, err := admin.Exec(ctx, `ALTER ROLE `+role+` WITH LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD '`+appPassword+`'`); err != nil {
-		return nil, fmt.Errorf("configure app role: %w", err)
+	if err := ensureAppRole(ctx, admin, role); err != nil {
+		return nil, err
 	}
 
 	ident := pgx.Identifier{schema}.Sanitize()
@@ -84,4 +77,35 @@ func OpenAppPool(ctx context.Context, adminDSN, schema string) (*pgxpool.Pool, e
 		return nil, fmt.Errorf("ping as app role: %w", err)
 	}
 	return pool, nil
+}
+
+// appRoleLockKey serializes app role creation: roles are cluster-wide, and
+// test packages running in parallel otherwise race on the same pg_authid row
+// ("tuple concurrently updated").
+const appRoleLockKey = 727274
+
+func ensureAppRole(ctx context.Context, admin *pgxpool.Pool, role string) error {
+	conn, err := admin.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire admin connection: %w", err)
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, appRoleLockKey); err != nil {
+		return fmt.Errorf("lock app role setup: %w", err)
+	}
+	// A failed unlock is harmless: OpenAppPool closes the admin pool right
+	// after, which ends the session and releases the lock.
+	defer func() { _, _ = conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, appRoleLockKey) }()
+
+	if _, err := conn.Exec(ctx, `DO $$ BEGIN
+		IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '`+AppRole+`') THEN
+			CREATE ROLE `+role+` LOGIN;
+		END IF;
+	END $$;`); err != nil {
+		return fmt.Errorf("create app role: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `ALTER ROLE `+role+` WITH LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD '`+appPassword+`'`); err != nil {
+		return fmt.Errorf("configure app role: %w", err)
+	}
+	return nil
 }
