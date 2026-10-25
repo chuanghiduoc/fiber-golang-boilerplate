@@ -15,8 +15,21 @@ import (
 // migrationFile matches <version>_<name>.<up|down>.sql.
 var migrationFile = regexp.MustCompile(`^(\d+)_([a-z0-9_]+)\.(up|down)\.sql$`)
 
-// migrationCreateTable finds the tables a migration creates.
-var migrationCreateTable = regexp.MustCompile(`(?i)\bCREATE TABLE (?:IF NOT EXISTS )?([a-z_][a-z0-9_]*)`)
+// migrationCreateTable finds the tables a migration creates. It tolerates any
+// whitespace (including newlines) between keywords, TEMP/UNLOGGED modifiers,
+// IF NOT EXISTS, quoted identifiers, and an optional schema qualifier, whose
+// name is skipped so `public.users` yields `users`.
+var migrationCreateTable = regexp.MustCompile(`(?is)\bCREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:(?:TEMP|TEMPORARY|UNLOGGED)\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"?[a-z_][a-z0-9_]*"?\s*\.\s*)?"?([a-z_][a-z0-9_]*)"?`)
+
+// createdTables returns the lower-cased table names a migration creates.
+func createdTables(sql string) []string {
+	matches := migrationCreateTable.FindAllStringSubmatch(sql, -1)
+	tables := make([]string, 0, len(matches))
+	for _, match := range matches {
+		tables = append(tables, strings.ToLower(match[1]))
+	}
+	return tables
+}
 
 // timestampLayout is the golang-migrate -format used by make migrate-create
 // and cmd/gen. Every migration, the per-owner baseline included (ADR 0005),
@@ -73,8 +86,7 @@ func TestMigrationsCreateOnlyOwnedTables(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
-		for _, table := range migrationCreateTable.FindAllStringSubmatch(string(raw), -1) {
-			tableName := strings.ToLower(table[1])
+		for _, tableName := range createdTables(string(raw)) {
 			owner := tableOwner(tableName, modules)
 			if strings.HasPrefix(owner, "platform/") {
 				owner = "platform"
@@ -269,4 +281,26 @@ func moduleNames(t *testing.T, root string) map[string]bool {
 		}
 	}
 	return out
+}
+
+// TestCreatedTablesParser pins the CREATE TABLE forms the ownership check must
+// recognize, so a migration cannot hide another owner's table behind a schema
+// qualifier, quotes, modifiers, or line breaks.
+func TestCreatedTablesParser(t *testing.T) {
+	cases := map[string][]string{
+		"CREATE TABLE files (id BIGINT);":                            {"files"},
+		"create table if not exists files (id bigint);":              {"files"},
+		"CREATE TABLE public.users (id BIGINT);":                     {"users"},
+		"CREATE TABLE \"public\".\"users\" (id BIGINT);":             {"users"},
+		"CREATE\nTABLE\n  IF NOT EXISTS\n  public . users (id INT);": {"users"},
+		"CREATE UNLOGGED TABLE scratch (id INT);":                    {"scratch"},
+		"CREATE TEMP TABLE tmp_rows (id INT);":                       {"tmp_rows"},
+		"CREATE INDEX idx ON users (id);":                            nil,
+	}
+	for sql, want := range cases {
+		got := createdTables(sql)
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("createdTables(%q) = %v, want %v", sql, got, want)
+		}
+	}
 }
