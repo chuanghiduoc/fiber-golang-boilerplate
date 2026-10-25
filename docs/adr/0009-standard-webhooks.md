@@ -21,3 +21,10 @@ string. Multiple signatures remain supported during secret rotation.
 
 Breaking change for existing receivers; shipped together with the event
 envelope change and documented in `docs/webhooks.md` and the CHANGELOG.
+
+Secrets adopt the Standard Webhooks format for endpoints and inbound sources
+alike (`whsec_` + standard base64 of 32 random bytes; the HMAC key is the
+decoded bytes), so the official libraries accept them unchanged. Secrets
+created earlier (`whsec_`/`whin_` + URL-safe base64, used as raw keys) are not
+converted: they must be rotated, and deliveries signed with one dead-letter
+with an explicit reason.

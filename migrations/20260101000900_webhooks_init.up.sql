@@ -91,10 +91,20 @@ CREATE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_tenant_endpoint
 -- change a queued delivery's signed request. event_id is deduplicated per
 -- endpoint so re-dispatching the same domain event is safe.
 -- ---------------------------------------------------------------------------
+-- The columns are the versioned event envelope (ADR 0011): event_id (UUIDv7),
+-- event_type, data_version, occurred_at, tenant_id, actor_type/actor_id, and
+-- payload (the envelope's data). The delivery worker rebuilds the signed
+-- JSON body from them.
 CREATE TABLE IF NOT EXISTS webhook_events (
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     event_id VARCHAR(128) NOT NULL,
     event_type VARCHAR(128) NOT NULL,
+    data_version INTEGER NOT NULL CHECK (data_version > 0),
+    actor_type VARCHAR(20) NOT NULL
+        CHECK (actor_type IN ('user', 'service', 'system')),
+    -- A system actor has no id; user and service actors always have one.
+    actor_id VARCHAR(128)
+        CHECK ((actor_type = 'system') = (actor_id IS NULL)),
     occurred_at TIMESTAMP WITH TIME ZONE NOT NULL,
     payload JSONB NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),

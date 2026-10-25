@@ -12,7 +12,6 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
@@ -35,7 +34,6 @@ type Modules struct {
 	Sessions       session.Store
 	TenantResolver tenant.Resolver
 	APIKeyVerifier *apikey.Verifier
-	Webhooks       webhookcontracts.Dispatcher
 
 	// Startup runs one-time checks that need the database (tenant
 	// existence, admin seed) inside the caller's startup deadline.
@@ -60,7 +58,7 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	if err != nil {
 		return nil, err
 	}
-	webhooksModule, webhooksProvides, err := webhooks.Build(infra, webhooks.Settings{
+	webhooksModule, err := webhooks.Build(infra, webhooks.Settings{
 		Webhook: cfg.Webhook,
 		// JWT_SECRET is the local/test-only fallback; production requires
 		// the dedicated key (config validation).
@@ -70,14 +68,13 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	if err != nil {
 		return nil, err
 	}
-	// User registration enqueues webhook events inside its own transaction;
-	// identity is built before webhooks (which needs TenantActive), so the
-	// dispatcher is attached afterwards. Files takes it at construction.
-	identityModule.AttachWebhooks(webhooksProvides.Dispatcher)
+	// Identity and files publish domain events on infra.Events inside their
+	// transactions; webhooks subscribes to them (app.EventProvider), so no
+	// producer is wired to the webhooks module.
 	filesModule, filesProvides := files.Build(infra, files.Settings{
 		MaxFileSize:  cfg.Storage.MaxFileSize,
 		AllowedTypes: cfg.Storage.AllowedTypes(),
-	}, webhooksProvides.Dispatcher)
+	})
 
 	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
 
@@ -99,7 +96,6 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 		Sessions:       identityProvides.Sessions,
 		TenantResolver: identityProvides.TenantResolver,
 		APIKeyVerifier: apikeysProvides.Verifier,
-		Webhooks:       webhooksProvides.Dispatcher,
 		Startup:        identityModule.Startup,
 		Background:     []func(context.Context){webhooksModule.RunRetention},
 		Close:          []func(){webhooksModule.Close},

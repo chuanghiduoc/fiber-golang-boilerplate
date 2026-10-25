@@ -67,7 +67,7 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, identityrepo.UserRepository)
 	identityAdmin := identityadapter.NewAdminIdentity(
 		identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, auditRecorder, sessionStore),
 	)
-	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store, nil))
+	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
 	app := fiber.New(fiber.Config{

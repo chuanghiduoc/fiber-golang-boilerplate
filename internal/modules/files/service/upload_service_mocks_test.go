@@ -6,8 +6,8 @@ import (
 	"sort"
 	"time"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -33,36 +33,40 @@ func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
 type fakeTx struct {
 	files  FileRepository
 	audit  AuditWriter
-	outbox Outbox
+	events *recordingPublisher
 }
 
 var _ Transactor = (*fakeTx)(nil)
 
-// newFakeTx builds a transactor with a no-op audit writer and no outbox, so
-// webhooks fall back to post-commit dispatch.
+// newFakeTx builds a transactor with a no-op audit writer and a recording
+// event publisher.
 func newFakeTx(files FileRepository) *fakeTx {
-	return &fakeTx{files: files, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil })}
+	return &fakeTx{
+		files:  files,
+		audit:  auditWriterFunc(func(context.Context, audit.Event) error { return nil }),
+		events: &recordingPublisher{},
+	}
 }
 
 func (f *fakeTx) InTx(ctx context.Context, fn func(ctx context.Context, tx TxRepos) error) error {
-	return fn(ctx, TxRepos{Files: f.files, Audit: f.audit, Outbox: f.outbox})
+	return fn(ctx, TxRepos{Files: f.files, Audit: f.audit, Events: f.events})
 }
 
 type auditWriterFunc func(ctx context.Context, event audit.Event) error
 
 func (f auditWriterFunc) RecordTx(ctx context.Context, event audit.Event) error { return f(ctx, event) }
 
-// recordingOutbox records transactional webhook enqueues.
-type recordingOutbox struct {
-	events []webhookcontracts.Event
+// recordingPublisher records events published in the transaction.
+type recordingPublisher struct {
+	events []events.Event
 	err    error
 }
 
-func (o *recordingOutbox) Enqueue(_ context.Context, events ...webhookcontracts.Event) error {
-	if o.err != nil {
-		return o.err
+func (p *recordingPublisher) Publish(_ context.Context, event events.Event) error {
+	if p.err != nil {
+		return p.err
 	}
-	o.events = append(o.events, events...)
+	p.events = append(p.events, event)
 	return nil
 }
 

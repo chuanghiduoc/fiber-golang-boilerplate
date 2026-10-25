@@ -3608,31 +3608,28 @@ paths:
     post:
       consumes:
       - application/json
-      description: Public HMAC-authenticated receiver. Deduplicates on X-Webhook-Id
-        per source.
+      description: Public Standard Webhooks receiver (HMAC-SHA256 over "id.timestamp.body").
+        Deduplicates on webhook-id per source; the event type is the body's top-level
+        "type" member ("inbound" when absent).
       parameters:
       - description: Inbound source ID
         in: path
         name: id
         required: true
         type: integer
-      - description: External event ID
+      - description: Message ID (deduplication key)
         in: header
-        name: X-Webhook-Id
+        name: webhook-id
         required: true
-        type: string
-      - description: Event type
-        in: header
-        name: X-Webhook-Event
         type: string
       - description: Unix seconds used in the signature
         in: header
-        name: X-Webhook-Timestamp
+        name: webhook-timestamp
         required: true
         type: string
-      - description: v1=<hex HMAC-SHA256>
+      - description: Space-separated v1,<base64 HMAC-SHA256> signatures
         in: header
-        name: X-Webhook-Signature
+        name: webhook-signature
         required: true
         type: string
       produces:

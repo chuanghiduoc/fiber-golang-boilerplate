@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"strconv"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -28,27 +27,15 @@ type AdminFileService interface {
 }
 
 type adminFileService struct {
-	repo     FileRepository
-	tx       Transactor
-	storage  storage.Storage
-	webhooks webhookcontracts.Dispatcher
+	repo    FileRepository
+	tx      Transactor
+	storage storage.Storage
 }
 
 // NewAdminFileService builds the admin file service. Takedowns and restores
-// run through tx with their Tier 1 audit row and webhook outbox job; webhooks
-// is the post-commit fallback used when tx offers no outbox (nil disables it).
-func NewAdminFileService(
-	repo FileRepository,
-	tx Transactor,
-	store storage.Storage,
-	webhooks webhookcontracts.Dispatcher,
-) AdminFileService {
-	return &adminFileService{
-		repo:     repo,
-		tx:       tx,
-		storage:  store,
-		webhooks: webhooks,
-	}
+// run through tx with their Tier 1 audit row and domain event.
+func NewAdminFileService(repo FileRepository, tx Transactor, store storage.Storage) AdminFileService {
+	return &adminFileService{repo: repo, tx: tx, storage: store}
 }
 
 func (s *adminFileService) ListFiles(ctx context.Context, limit int, startingAfter string) ([]File, bool, error) {
@@ -107,9 +94,11 @@ func (s *adminFileService) DeleteFile(ctx context.Context, id int64) error {
 	}
 
 	_, err = s.commitAdminMutation(ctx, adminFileMutation{
-		id:           id,
-		auditAction:  "admin.file.deleted",
-		webhookEvent: webhookcontracts.EventFileDeleted,
+		id:          id,
+		auditAction: "admin.file.deleted",
+		eventType:   filescontracts.EventFileDeleted,
+		dataVersion: filescontracts.FileDeletedVersion,
+		eventData:   func(file *File) any { return fileDeleted(file) },
 		apply: func(ctx context.Context, repo FileRepository) (*File, error) {
 			file, err := repo.Delete(ctx, id)
 			if err != nil {
@@ -126,21 +115,19 @@ func (s *adminFileService) DeleteFile(ctx context.Context, id int64) error {
 
 // adminFileMutation is one audited admin change to a file row.
 type adminFileMutation struct {
-	id           int64
-	auditAction  string
-	webhookEvent string
-	apply        func(context.Context, FileRepository) (*File, error)
+	id          int64
+	auditAction string
+	eventType   string
+	dataVersion int
+	eventData   func(*File) any
+	apply       func(context.Context, FileRepository) (*File, error)
 }
 
-// commitAdminMutation applies m with its Tier 1 audit row and webhook. The row
-// change, audit row, and webhook outbox job commit together (an audit or
-// enqueue failure rolls the change back); without an outbox the webhook is
-// dispatched after commit.
+// commitAdminMutation applies m with its Tier 1 audit row and domain event.
+// The row change, audit row, and event commit together: an audit or publish
+// failure rolls the change back.
 func (s *adminFileService) commitAdminMutation(ctx context.Context, m adminFileMutation) (*File, error) {
-	var (
-		changed *File
-		queued  bool
-	)
+	var changed *File
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		file, applyErr := m.apply(ctx, tx.Files)
 		if applyErr != nil {
@@ -151,25 +138,14 @@ func (s *adminFileService) commitAdminMutation(ctx context.Context, m adminFileM
 		if auditErr := tx.Audit.RecordTx(ctx, event); auditErr != nil {
 			return filesAuditWriteError(auditErr)
 		}
-		if tx.Outbox != nil {
-			if hookErr := enqueueWebhook(ctx, tx.Outbox, m.webhookEvent, file.TenantID, fileEventData(file)); hookErr != nil {
-				slog.Error("failed to enqueue admin file webhook",
-					slog.String("event", m.webhookEvent),
-					slog.Int64("file_id", file.ID),
-					slog.Any("error", hookErr),
-				)
-				return apperror.NewInternal("failed to enqueue file webhook")
-			}
-			queued = true
+		if pubErr := publishEvent(ctx, tx.Events, m.eventType, m.dataVersion, file.TenantID, m.eventData(file)); pubErr != nil {
+			return apperror.NewInternal("failed to publish file event")
 		}
 		changed = file
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	if !queued {
-		dispatchWebhookAfterCommit(ctx, s.webhooks, m.webhookEvent, changed.TenantID, fileEventData(changed))
 	}
 	return changed, nil
 }
@@ -193,9 +169,11 @@ func (s *adminFileService) RestoreFile(ctx context.Context, id int64) (*File, er
 	}
 
 	return s.commitAdminMutation(ctx, adminFileMutation{
-		id:           id,
-		auditAction:  "admin.file.restored",
-		webhookEvent: webhookcontracts.EventFileRestored,
+		id:          id,
+		auditAction: "admin.file.restored",
+		eventType:   filescontracts.EventFileRestored,
+		dataVersion: filescontracts.FileRestoredVersion,
+		eventData:   func(file *File) any { return fileRestored(file) },
 		apply: func(ctx context.Context, repo FileRepository) (*File, error) {
 			file, err := repo.Restore(ctx, id)
 			if err != nil {

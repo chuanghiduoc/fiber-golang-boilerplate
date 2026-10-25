@@ -124,7 +124,7 @@ sequenceDiagram
     T->>A: per-IP auth limiter, then ApiKey or Bearer JWT
     Note over A: 429, 401 bad credential,<br/>403 tenant mismatch
     A->>R: route limiter (strict/normal/relaxed)
-    Note over R: authzhttp.Require (403) then optional feature gate (404)<br/>then Idempotency (replay or 409) then audithttp.Guard (503)
+    Note over R: authzhttp.Require (403) then optional feature gate (404)<br/>then Idempotency (replay, 409 in progress, 422 key mismatch) then audithttp.Guard (503)
     R->>H: c.Next()
     H->>S: validated DTO
     S->>DB: query scoped by tenant.EffectiveID(ctx)
@@ -173,8 +173,8 @@ flowchart LR
         nt[notifications] -->|NotificationRecipientLookup| ad2
     end
     subgraph outbox["2 - Transactional outbox"]
-        prod["identity / files service<br/>business tx"] -->|DispatchTx in same tx| j1[("jobs<br/>webhook.dispatch")]
-        j1 -->|worker| wh["webhooks fan-out<br/>delivery rows + webhook.delivery jobs"]
+        svc["service<br/>business tx"] -->|EnqueueTx / EnqueueOnceTx| j1[("jobs<br/>email.send, ...")]
+        j1 -->|worker| h1["job handler"]
     end
     subgraph bus["3 - Domain events"]
         pub["producer"] -->|PublishTx| j2[("jobs<br/>one per durable subscriber")]
@@ -183,11 +183,42 @@ flowchart LR
     end
 ```
 
+### Event backbone
+
+Domain events (ADR 0011) are the only way a producer triggers work in another
+module asynchronously. Every event is one versioned envelope
+(`events.Event`: `id` UUIDv7, `type`, `dataVersion`, `occurredAt`,
+`tenantId`, `actor`, `data`), with the payload struct and version owned by the
+producer in `internal/contracts/<producer>`. Producers publish with
+`PublishTx` in their own transaction; subscribers register through
+`app.EventProvider` and run on the shared jobs worker.
+
+```mermaid
+flowchart LR
+    subgraph producers["Producers (own tx)"]
+        idn["identity<br/>user.registered"]
+        fil["files<br/>file.uploaded / deleted / restored"]
+    end
+    idn & fil -->|"events.Bus.PublishTx<br/>(envelope, same pgx.Tx)"| jobs[("jobs<br/>events.&lt;type&gt;.&lt;handler&gt;<br/>key event:&lt;type&gt;:&lt;id&gt;:&lt;handler&gt;:&lt;tenant&gt;")]
+    jobs -->|"jobs worker<br/>(at-least-once)"| whs["webhooks subscriber<br/>Dispatcher.HandleEvent"]
+    jobs -.->|"future"| more["notifications / broker relay<br/>(CloudEvents)"]
+    whs -->|"webhook_events + deliveries<br/>+ webhook.delivery jobs"| pg[(PostgreSQL)]
+    pg -->|"delivery worker"| rx["Standard Webhooks<br/>receiver"]
+```
+
+- An event exists if and only if the producer's change commits; a publish
+  failure rolls the change back.
+- Producers do not know their subscribers: adding a subscriber is a new
+  `SubscribeDurable` call, never a producer change.
+- Payloads evolve additively; a breaking change gets a new `dataVersion` or a
+  new type. Webhook bodies are the envelope itself, so REST DTO changes cannot
+  leak into webhook contracts.
+
 | Mechanism | Use when | Guarantees |
 |---|---|---|
 | **Contract** (`internal/contracts/<provider>`) | A module must read or act on another module's data now. | Stdlib-only interface; provider implements it in its `adapter` package; `internal/bootstrap` passes it to the consumer. No shared transaction. |
 | **Outbox** (`jobs` table) | A side effect must exist if and only if the business change commits. | Job row commits with the business row (`EnqueueTx`/`EnqueueOnceTx`); delivery is at-least-once, so handlers are idempotent. |
-| **Durable event** (`events.PublishTx` + `SubscribeDurable`) | Several independent reactions to one fact. | One job per subscription, key `event:<name>:<id>:<handler>:<tenantId>`; at-least-once. |
+| **Durable event** (`events.PublishTx` + `SubscribeDurable`) | Several independent reactions to one fact. | One job per subscription, key `event:<type>:<id>:<handler>:<tenantId>`; at-least-once. |
 | **Local event** (`Subscribe`) | In-process reactions that may fail with the request. | Runs synchronously before commit; panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
 
 Contract wiring performed by `internal/bootstrap`:
@@ -289,18 +320,19 @@ keeps the repository's tenant scoping.
   key, so it rotates in two phases through `DATA_ENCRYPTION_PREVIOUS_KEYS`
   ([Key rotation](operations.md#key-rotation)).
 - **Outbound webhooks.** Identity registration, file upload/delete (user and
-  admin), and file restore emit `user.registered`, `file.uploaded`,
-  `file.deleted`, and `file.restored` with `DispatchTx` inside the mutation's
-  transaction: one `webhook.dispatch` job per event, so an enqueue failure
-  rolls the mutation back (fail-closed; only an unwired deployment falls back
-  to a logged post-commit dispatch). The dispatch job fans out to matching
-  endpoints, committing each delivery row with its first `webhook.delivery`
-  job. Deliveries snapshot URL, payload, event timestamp, max attempts, and
-  sealed secret. Retries schedule new jobs (honoring `Retry-After`) and every
-  attempt is kept. Receivers deduplicate on `X-Webhook-Delivery`.
-- **Inbound webhooks.** The tenant comes from the source row; HMAC covers
-  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`; deduplication is
-  unique per `(tenant, source, external_event_id)`. See [Webhooks](webhooks.md).
+  admin), and file restore publish `user.registered`, `file.uploaded`,
+  `file.deleted`, and `file.restored` with `events.PublishTx` inside the
+  mutation's transaction, so a publish failure rolls the mutation back
+  (fail-closed). The webhooks durable subscription fans out to matching
+  endpoints, storing the envelope once in `webhook_events` and committing each
+  delivery row with its first `webhook.delivery` job. Deliveries snapshot URL,
+  max attempts, timeout, and sealed secret. Retries schedule new jobs
+  (honoring `Retry-After`) and every attempt is kept. Requests follow Standard
+  Webhooks; receivers deduplicate on `webhook-id`.
+- **Inbound webhooks.** The tenant comes from the source row; the Standard
+  Webhooks HMAC covers `<webhook-id>.<webhook-timestamp>.<raw-body>`;
+  deduplication is unique per `(tenant, source, external_event_id)`. See
+  [Webhooks](webhooks.md).
 - **Notifications.** With the email channel enabled, the in-app row and its
   email job commit or roll back together. A suppressed notification (both
   channels disabled) writes nothing. Without transactional sender support the

@@ -107,8 +107,8 @@ func TestSchemaConstraints(t *testing.T) {
 	// failing insert can only fail on the constraint the subtest targets.
 	insertDelivery := func(tenantID int64, eventID string) (int64, error) {
 		if _, err := pool.Exec(ctx,
-			`INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload)
-			 VALUES ($1, $2, 'test.event', NOW(), '{}') ON CONFLICT DO NOTHING`, tenantID, eventID); err != nil {
+			`INSERT INTO webhook_events (tenant_id, event_id, event_type, data_version, actor_type, occurred_at, payload)
+			 VALUES ($1, $2, 'test.event', 1, 'system', NOW(), '{}') ON CONFLICT DO NOTHING`, tenantID, eventID); err != nil {
 			return 0, err
 		}
 		var id int64

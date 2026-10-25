@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
@@ -18,7 +17,7 @@ import (
 )
 
 const (
-	// defaultInboundEventType is used when the sender omits X-Webhook-Event.
+	// defaultInboundEventType is used when the signed body has no "type" member.
 	defaultInboundEventType = "inbound"
 	// maxStoredSignatureLen bounds the signature header kept for forensics.
 	maxStoredSignatureLen = 255
@@ -31,7 +30,7 @@ const (
 //
 // The steps run in a fixed order: validate the body, resolve an active source
 // of an active tenant, validate the event id, verify the signature, validate
-// the event type, then store the event once per (source, X-Webhook-Id).
+// the event type, then store the event once per (source, webhook-id).
 func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*dto.InboundReceipt, error) {
 	if err := validateInboundBody(body); err != nil {
 		return nil, err
@@ -49,7 +48,7 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 	if err := s.verifyInboundSignature(source, headers, body); err != nil {
 		return nil, err
 	}
-	eventType, err := inboundEventType(headers)
+	eventType, err := inboundEventType(body)
 	if err != nil {
 		return nil, err
 	}
@@ -116,16 +115,17 @@ func inboundEventID(headers http.Header) (string, error) {
 	externalID := headers.Get(webhook.HeaderID)
 	trimmed := strings.TrimSpace(externalID)
 	if trimmed == "" {
-		return "", apperror.NewBadRequest("X-Webhook-Id is required")
+		return "", apperror.NewBadRequest("webhook-id is required")
 	}
 	if externalID != trimmed || len(externalID) > maxEventIDLen || hasControl(externalID) {
-		return "", apperror.NewBadRequest("X-Webhook-Id is invalid")
+		return "", apperror.NewBadRequest("webhook-id is invalid")
 	}
 	return externalID, nil
 }
 
-// verifyInboundSignature checks the HMAC and timestamp with the source's
-// secret and maps each failure class to a public 401 detail.
+// verifyInboundSignature checks the Standard Webhooks signature and timestamp
+// with the source's secret and maps each failure class to a public 401
+// detail.
 func (s *service) verifyInboundSignature(source *webhooksqlc.WebhookInboundSource, headers http.Header, body []byte) error {
 	secret, err := s.codec.Open(source.SecretCiphertext)
 	if err != nil {
@@ -135,7 +135,17 @@ func (s *service) verifyInboundSignature(source *webhooksqlc.WebhookInboundSourc
 		)
 		return apperror.NewInternal("failed to verify inbound signature")
 	}
-	err = webhook.VerifyRequest(secret, headers, body, s.opts.TimestampTolerance, s.now())
+	key, err := webhook.DecodeSecret(string(secret))
+	if err != nil {
+		// A source created before Standard Webhooks has a secret no standard
+		// sender can sign with. The sender only learns the signature failed.
+		slog.Error("webhooks: inbound source secret predates Standard Webhooks; rotate it",
+			slog.Int64("source_id", source.ID),
+			slog.Any("error", err),
+		)
+		return apperror.NewUnauthorized("webhook signature is invalid")
+	}
+	err = webhook.VerifyRequest(key, headers, body, s.opts.TimestampTolerance, s.now())
 	switch {
 	case err == nil:
 		return nil
@@ -148,13 +158,23 @@ func (s *service) verifyInboundSignature(source *webhooksqlc.WebhookInboundSourc
 	}
 }
 
-func inboundEventType(headers http.Header) (string, error) {
-	eventType := headers.Get(webhook.HeaderEvent)
-	if eventType == "" {
-		eventType = defaultInboundEventType
+// inboundEventType reads the event type from the verified body: Standard
+// Webhooks payloads carry it as a top-level "type" member, not a header. A
+// body that is not an object, or has no type, is stored as
+// defaultInboundEventType; a type that is present but not a concrete event
+// name is rejected.
+func inboundEventType(body []byte) (string, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(body, &members); err != nil {
+		return defaultInboundEventType, nil
 	}
-	if !webhookcontracts.ValidType(eventType) || strings.Contains(eventType, "*") {
-		return "", apperror.NewBadRequest("X-Webhook-Event is invalid")
+	raw, ok := members["type"]
+	if !ok {
+		return defaultInboundEventType, nil
+	}
+	var eventType string
+	if err := json.Unmarshal(raw, &eventType); err != nil || !ValidType(eventType) || strings.Contains(eventType, "*") {
+		return "", apperror.NewBadRequest("payload type is invalid")
 	}
 	return eventType, nil
 }

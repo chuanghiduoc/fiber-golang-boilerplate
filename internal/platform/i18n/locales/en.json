@@ -26,6 +26,8 @@
   "errors.system.audit_unavailable.title": "Audit logging unavailable",
   "errors.api.version_unsupported.title": "Unsupported API version",
   "errors.api.version_unsupported.detail": "API version {version} is not supported.",
+  "errors.idempotency.key_mismatch.title": "Idempotency key reused with a different request",
+  "errors.idempotency.key_mismatch.detail": "This Idempotency-Key was already used with a different request body. Use a new key for a new request.",
   "validation.required": "The {path} field is required.",
   "validation.invalid_email": "The {path} field must be a valid email address.",
   "validation.too_short": "The {path} field must be at least {min} characters.",

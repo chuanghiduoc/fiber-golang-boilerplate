@@ -27,7 +27,7 @@ const (
 	idempotencyMaxBodyHashSize   = 1 << 20 // 1 MiB
 	idempotencyLockTTL           = 2 * time.Minute
 	idempotencyResponseTTL       = 24 * time.Hour
-	idempotencyBodyMismatchError = "idempotency key was used with a different request body"
+	idempotencyBodyMismatchError = "This Idempotency-Key was already used with a different request body. Use a new key for a new request."
 	idempotencyInProgressError   = "request with this idempotency key is already in progress"
 
 	// idempotencyCacheReadTimeout bounds each cache call made before the
@@ -71,7 +71,8 @@ const (
 // Idempotency-Key header. The first request claims an atomic owner-token lock,
 // executes the handler, and stores any 2xx response for 24 hours. Retries with
 // the same key replay that response; concurrent retries while the first is
-// still running get 409. The scope includes the resolved tenant so identical
+// still running get 409; reusing a key with a different body gets 422
+// idempotency.key_mismatch (ADR 0008). The scope includes the resolved tenant so identical
 // keys from two tenants never share a replay. Requests without the header, and
 // GET/HEAD/OPTIONS requests, are untouched.
 //
@@ -287,7 +288,8 @@ func (r idempotentRequest) loadResponse() (*cachedResponse, bool) {
 // different request body.
 func (r idempotentRequest) replay(cached *cachedResponse) error {
 	if cached.BodyHash != "" && r.bodyHash != "" && cached.BodyHash != r.bodyHash {
-		return apperror.NewConflict(idempotencyBodyMismatchError)
+		return apperror.NewCode(apperror.CodeIdempotencyKeyMismatch, idempotencyBodyMismatchError).
+			WithDetailKey("errors.idempotency.key_mismatch.detail", nil)
 	}
 
 	fiber.Locals[bool](r.c, idempotencyReplayedLocal, true)

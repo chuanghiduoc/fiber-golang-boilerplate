@@ -80,7 +80,7 @@ flowchart LR
 | `internal/modules/files` | Upload, download, soft delete, restore |
 | `internal/modules/admin` | Back-office facade over identity/files contracts (no SQL) |
 | `internal/modules/features` | Feature-flag admin API |
-| `internal/modules/webhooks` | Outbound endpoints/deliveries, inbound sources/events, public HMAC receiver |
+| `internal/modules/webhooks` | Outbound endpoints/deliveries, inbound sources/events, public Standard Webhooks receiver, durable subscriber of domain events |
 | `internal/modules/apikeys` | Tenant-scoped API keys with permission scopes |
 | `internal/modules/notifications` | In-app feed, channel preferences, email channel |
 | `internal/contracts/<provider>` | Stdlib-only cross-module interfaces, one package per providing module |
@@ -486,7 +486,7 @@ characters, `[A-Za-z0-9._:-]`). The decision flowchart lives in
 | First request | Runs and holds an owner-token lock for 2 minutes (above the 60-second HTTP write timeout); only the owner releases it |
 | Concurrent duplicate while the lock is held | `409 Conflict` |
 | Retry after a 2xx | Replays the cached status, body, and `Content-Type`/`Location`/`ETag` for 24 hours with `Idempotent-Replayed: true`, without running the handler |
-| Same key, different body | `409 Conflict` (`idempotency key was used with a different request body`) — non-multipart bodies up to 1 MiB are bound to a SHA-256 of the body; multipart and larger bodies are not |
+| Same key, different body | `422 Unprocessable Entity`, code `idempotency.key_mismatch` (ADR 0008) — non-multipart bodies up to 1 MiB are bound to a SHA-256 of the body; multipart and larger bodies are not |
 | Non-2xx response | Not cached |
 | Cache error | Fails open: the request runs normally |
 
@@ -502,7 +502,7 @@ excluded; `PUT /users/me/password` is covered because it is a normal
 authenticated mutation.
 
 Registration is IP-scoped because no user exists yet: two users behind one NAT
-should use distinct keys (a different body returns `409`, never another user's
+should use distinct keys (a different body returns `422`, never another user's
 response). Cached 2xx bodies may contain personal data for 24 hours; size
 Redis accordingly. Evicted entries simply let a later retry execute again. Use
 `CACHE_DRIVER=redis` so locks and replays work across replicas.
@@ -588,7 +588,7 @@ sequenceDiagram
 | Inspection | `jobs` stores run time, lease ownership, `attempts`, and `last_error`. Succeeded and dead jobs have `payload` cleared, so reset/verification links are not retained after delivery. |
 | Encrypted payloads | Email and password-reset job payloads are sealed by a `jobs.PayloadCodec`: AES-256-GCM with keys derived by HKDF-SHA256 (`jobs/payload/v1` context) from `DATA_ENCRYPTION_KEY` (required in production and different from `JWT_SECRET`; outside production an empty key falls back to `JWT_SECRET`) plus decrypt-only `DATA_ENCRYPTION_PREVIOUS_KEYS`. `jobs.payload` holds a versioned envelope: v2 (`v`, `kid`, `nonce`, `data`) names the sealing key; v1 (no `kid`) still opens by trying every key. Dumps, backups, and replication streams do not expose links. Encrypted email uses kind `email.send.encrypted`; workers register both kinds and legacy plaintext jobs still deliver. A decryption failure (for example a replica missing a key) retries; a malformed envelope is permanent. Workers older than v2 cannot open v2 envelopes, so finish rolling out every worker promptly. Rotation: [docs/operations.md](docs/operations.md#key-rotation). |
 | Retention | `succeeded` and `dead` rows whose `updated_at` is older than 30 days are purged hourly, first pass at worker start (`WithRetention`, default `30*24h`, non-positive disables; `WithPurgeInterval`, default `1h`, non-positive ignored). Queued and running jobs are never deleted. Each pass uses a detached 5s context and batches of at most 1,000 rows; failures retry next interval. |
-| Webhook delivery | Kind `webhook.delivery`. The delivery row and first job commit atomically; each attempt schedules the next as a **new** job with webhook backoff or `Retry-After`. Permanent 3xx/4xx (except `408`, `425`, `429`) mark the delivery `dead`. Receivers deduplicate on `X-Webhook-Delivery`; every attempt is kept in `webhook_delivery_attempts`. An hourly loop deletes terminal deliveries and old inbound events after `WEBHOOK_RETENTION_DAYS`. |
+| Webhook delivery | Kind `webhook.delivery`. The delivery row and first job commit atomically; each attempt schedules the next as a **new** job with webhook backoff or `Retry-After`. Permanent 3xx/4xx (except `408`, `425`, `429`) mark the delivery `dead`. Domain events reach it through the `events.<type>.webhooks` durable subscription. Requests follow Standard Webhooks; receivers deduplicate on `webhook-id`. Every attempt is kept in `webhook_delivery_attempts`. An hourly loop deletes terminal deliveries and old inbound events after `WEBHOOK_RETENTION_DAYS`. |
 | Shutdown | On SIGINT/SIGTERM the scheduler stops, then the worker stops claiming and cancels running handlers. HTTP, workers, and async work drain in parallel within a **15s** window inside a single **20s** shutdown budget; the remaining 5s covers the tracing flush and closing cache/DB. Handlers must honor cancellation: a non-cooperative handler keeps heartbeating until it returns and can overrun the drain window. See [docs/operations.md](docs/operations.md). |
 
 **Job metrics:** `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
@@ -638,7 +638,7 @@ flowchart LR
 |-------|----------|
 | Building | `events.NewEvent(name, data)` gives a fresh UUID and UTC timestamp. Metadata: `id`, `name`, `tenantId`, `requestId`, `actorId`, `occurredAt`, JSON `data`; missing tenant/request/actor come from the context, explicit values win. |
 | Publishing | `PublishLocal` runs subscribers synchronously; `Publish` also enqueues durable subscriptions; `PublishTx` uses the caller's transaction so the business row and fan-out commit together. |
-| Subscribing | `Subscribe` registers a local handler. `SubscribeDurable` registers a named handler and job kind (default `events.<event>.<handler>`); each event enqueues one job per durable handler with idempotency key `event:<name>:<id>:<handler>:<tenantId>`. Durable handlers reinstall tenant/request/actor. |
+| Subscribing | `Subscribe` registers a local handler. `SubscribeDurable` registers a named handler and job kind (default `events.<event>.<handler>`); each event enqueues one job per durable handler with idempotency key `event:<type>:<id>:<handler>:<tenantId>`. Durable handlers reinstall tenant/request/actor; an undecodable or invalid payload dead-letters (`jobs.Permanent`). |
 | Failures | Panics are recovered per handler and errors combined with `errors.Join`; one failing subscriber never skips the others. |
 | Wiring | The app calls `RegisterJobs` after modules register; modules implement `app.EventProvider`/`app.JobProvider` only when needed. All provider hooks are nil-safe. |
 
@@ -782,7 +782,7 @@ migration entrypoint, and tenant foundation exist.
 | Emails | Normalized and unique case-insensitively among active accounts within a tenant. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. Banned emails cannot re-register or use Google login; self-deleted accounts can re-register. |
 | Logout | `POST /auth/logout` revokes one refresh token by possession; `/auth/logout-all` bumps the token version and invalidates access tokens. |
 | Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
-| Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. HMAC-SHA256 signing with a per-endpoint secret and timestamp; receivers deduplicate on `X-Webhook-Delivery`. |
+| Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
 | Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [docs/operations.md](docs/operations.md#key-rotation). |
 | Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |

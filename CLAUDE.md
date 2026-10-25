@@ -66,7 +66,7 @@ module, and `platform`/`pkg` never import modules.
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
-| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient), files (admin), notifications (notifier), webhooks (event/dispatcher) |
+| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
 | `migrations` | per-owner `<UTC ts>_<owner>_<purpose>.{up,down}.sql` (baseline: `20260101000000`–`20260101000900`, platform → identity → platform tables → modules; ADR 0005) |
@@ -378,26 +378,39 @@ handler/service/DTO/repository package.
   parameter: with PgBouncer either `track_extra_parameters = search_path` or
   `ignore_startup_parameters = search_path` plus
   `ALTER ROLE ... SET search_path`.
-- **Webhooks** (`docs/webhooks.md`): identity registration and file
-  upload/delete/restore emit through `internal/contracts/webhooks.Dispatcher`
-  (`app.Deps.Webhooks`). Dispatch writes a tenant-scoped delivery row plus a
-  `webhook.delivery` job in one transaction, snapshotting URL/payload/secret
-  ciphertext. The worker signs
-  `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>` with HMAC-SHA256,
+- **Webhooks** (`docs/webhooks.md`, ADR 0009/0011): producers never call
+  webhooks. Identity registration and file upload/delete/restore publish
+  domain events with `events.PublishTx` in their transaction; the webhooks
+  module subscribes durably (`app.EventProvider`, types in
+  `webhooks/catalog.SubscribedEvents`) and its dispatcher stores the envelope
+  once in `webhook_events` plus a delivery row (URL/secret/timeout snapshot)
+  and `webhook.delivery` job per matching endpoint in one transaction. The
+  worker sends Standard Webhooks requests: `webhook-id` (event id; receivers
+  deduplicate on it), `webhook-timestamp`, `webhook-signature: v1,<base64
+  HMAC-SHA256 of id.timestamp.body>` (space-separated co-signatures during
+  the 24h rotation grace); the envelope body carries `type`/`dataVersion`. It
   sends via `pkg/webhook.Client` (private/loopback/link-local blocked unless
   allowlisted, no redirects, no proxy, DNS pinned), records every attempt, and
   retries 408/425/429/5xx with backoff or `Retry-After`; other 3xx/4xx are
-  dead. Receivers deduplicate on `X-Webhook-Delivery`. Secrets are sealed with
+  dead. Secrets are `whsec_<base64 32 bytes>` (HMAC key = decoded bytes;
+  pre-Standard secrets must be rotated), sealed with
   `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key in
   production) and returned only on create/rotate. `POST /webhooks/inbound/:id`
-  uses the source tenant and HMAC and deduplicates `(source, X-Webhook-Id)`.
-- **Events:** typed in-process bus; `Event` carries
-  id/name/tenant/request/actor/timestamp/data, missing metadata resolved from
-  context. `Subscribe` is synchronous local delivery; `SubscribeDurable`
-  enqueues one job per event and handler with key
-  `event:<name>:<id>:<handler>:<tenantId>`; `PublishTx` keeps it atomic with
-  the business transaction. Panics are recovered per handler, errors joined;
-  durable handlers must be idempotent.
+  verifies the same scheme with the source secret, takes the type from the
+  body, and deduplicates `(source, webhook-id)`.
+- **Events** (ADR 0011): typed bus over one versioned envelope `events.Event`
+  {`id` UUIDv7, `type`, `dataVersion`, `occurredAt`, `tenantId`, `actor`
+  {type user|service|system, id}, `data`} (1:1 with CloudEvents attributes;
+  internal `requestId` is never sent out). Payload structs and versions live
+  in `internal/contracts/<producer>`, never REST DTOs; evolve additively, a
+  breaking change gets a new `dataVersion` or type. Missing metadata is
+  resolved from context. `Subscribe` is synchronous local delivery;
+  `SubscribeDurable` enqueues one job per event and handler (kind
+  `events.<type>.<handler>`, key `event:<type>:<id>:<handler>:<tenantId>`);
+  `PublishTx` keeps it atomic with the business transaction (files via its
+  tx-bound `EventPublisher` port; `app.Infra.Events`). Invalid durable
+  payloads dead-letter (`jobs.Permanent`). Panics are recovered per handler,
+  errors joined; durable handlers must be idempotent.
 - **Scheduler:** optional (`SCHEDULER_ENABLED`, default false), global. One
   process holds `scheduler_leases`; the `scheduler_runs` row and job enqueue
   share a transaction. Intervals align to epoch boundaries; cron is 5-field UTC
@@ -406,7 +419,8 @@ handler/service/DTO/repository package.
   Payload has `schedule`/`scheduledFor`/`data`; key `scheduler:<name>:<slot>`.
 - **Module hooks:** `app.EventProvider`/`JobProvider`/`ScheduleProvider` run
   only when the dependency is non-nil, then durable event handlers register
-  (webhooks registers `webhook.delivery`/`webhook.dispatch` this way); both
+  (webhooks registers `webhook.delivery` and its `events.*.webhooks`
+  subscriptions this way); both
   go through a registrar that wraps every handler in `authz.SystemContext`. Catalog
   hooks (`PermissionProvider`, `ErrorProvider`, `FlagProvider`,
   `LocaleProvider`) are registered by `app.RegisterCatalogs`, which `cmd/api`
@@ -458,7 +472,8 @@ handler/service/DTO/repository package.
 - **Idempotency** (`docs/operations.md` flowchart): opt-in `Idempotency-Key`
   via `deps.Idempotency`, scoped by method/path/tenant ID+slug/caller (user, or
   IP for public routes). 2xx replays for 24h; non-multipart bodies ≤1 MiB are
-  body-bound (different body → 409). The 2m lock is an atomic owner-token
+  body-bound (different body → 422 `idempotency.key_mismatch`, ADR 0008). The
+  2m lock is an atomic owner-token
   claim (`cache.Cache.SetNX` → `SET NX PX`, UUID token): concurrent duplicates
   get 409. On a lost reply the key is re-read (own token ⇒ held; other ⇒ 409;
   missing/read error ⇒ fail open), and compare-and-delete releases it even

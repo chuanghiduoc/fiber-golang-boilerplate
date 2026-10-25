@@ -295,6 +295,7 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 		PayloadCodec: rt.payloadCodec,
 		Email:        jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(rt.payloadCodec)),
 		Storage:      store,
+		Events:       rt.events,
 		Flags:        flagEvaluator,
 	}
 	return nil
@@ -411,7 +412,6 @@ func (rt *runtime) composeApplication() {
 		Events:         rt.events,
 		Jobs:           rt.worker,
 		Schedules:      rt.schedules,
-		Webhooks:       rt.modules.Webhooks,
 		APIKeyVerifier: rt.modules.APIKeyVerifier,
 	})
 	// Module providers register routes, event subscriptions, job handlers

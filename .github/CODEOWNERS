@@ -19,7 +19,6 @@
 /internal/modules/notifications/    @chuanghiduoc
 /internal/contracts/notifications/  @chuanghiduoc
 /internal/modules/webhooks/         @chuanghiduoc
-/internal/contracts/webhooks/       @chuanghiduoc
 /internal/modules/features/         @chuanghiduoc
 /internal/modules/apikeys/          @chuanghiduoc
 /internal/modules/admin/            @chuanghiduoc

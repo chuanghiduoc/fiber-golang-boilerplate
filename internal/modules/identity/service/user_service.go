@@ -5,11 +5,11 @@ import (
 	"errors"
 	"log/slog"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -59,7 +59,7 @@ type userService struct {
 	audit                    audit.TxRecorder
 	sessions                 session.Store
 	verificationProvisioner  VerificationProvisioner
-	webhooks                 webhookcontracts.Dispatcher
+	events                   *events.Bus
 }
 
 func NewUserService(

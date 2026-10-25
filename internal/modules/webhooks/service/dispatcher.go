@@ -2,202 +2,123 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
-const (
-	// DispatchJobKind is the durable job that fans one event out to the
-	// tenant's matching endpoints. DispatchTx enqueues it inside the
-	// producer's transaction.
-	DispatchJobKind = "webhook.dispatch"
-	// dispatchJobMaxAttempts matches the delivery job budget: a fan-out only
-	// fails on database errors, which are usually transient.
-	dispatchJobMaxAttempts = 20
-)
+// ErrInvalidEvent is returned (wrapped) for an event that can never be
+// dispatched; the durable subscription dead-letters it.
+var ErrInvalidEvent = errors.New("webhooks: invalid event")
 
-// TxQueue is implemented by platform/jobs.Queue.
-type TxQueue interface {
-	EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (int64, bool, error)
-}
+// maxDataVersion is the largest dataVersion webhook_events.data_version holds.
+const maxDataVersion = math.MaxInt32
 
-// Dispatcher fans domain events out to the owning tenant's matching active
-// endpoints. Delivery rows and their first durable job commit atomically, and
-// (tenant, endpoint, event ID) is unique, so retrying Dispatch is safe.
+// Dispatcher fans committed domain events out to the owning tenant's matching
+// active endpoints. It runs as a durable event subscriber (HandleEvent):
+// producers publish with events.Bus.PublishTx and never know about webhooks.
+// Delivery rows and their first durable job commit atomically, and
+// (tenant, endpoint, event ID) is unique, so a retried subscriber job only
+// creates the deliveries still missing.
 type Dispatcher struct {
 	store repository.DispatchStore
-	queue TxQueue
 	now   func() time.Time
 }
 
-var _ webhookcontracts.Dispatcher = (*Dispatcher)(nil)
-
-// NewDispatcher returns a dispatcher backed by store. queue is required only
-// for DispatchTx.
-func NewDispatcher(store repository.DispatchStore, queue TxQueue) *Dispatcher {
+// NewDispatcher returns a dispatcher backed by store.
+func NewDispatcher(store repository.DispatchStore) *Dispatcher {
 	return &Dispatcher{
 		store: store,
-		queue: queue,
 		now:   func() time.Time { return time.Now().UTC() },
 	}
 }
 
-// dispatchJobPayload is a fully prepared event: its ID is fixed at enqueue
-// time, so every retry of the fan-out job deduplicates on the same deliveries.
-type dispatchJobPayload struct {
-	ID         string          `json:"id"`
-	Type       string          `json:"type"`
-	TenantID   int64           `json:"tenantId"`
-	OccurredAt time.Time       `json:"occurredAt"`
-	Data       json.RawMessage `json:"data"`
-}
-
-// DispatchTx records events in the producer's transaction as one
-// webhook.dispatch job each, so a webhook exists if and only if the business
-// change commits. The job later runs Dispatch with the event's stable ID.
-// tx must be the producer's open pgx transaction.
-func (d *Dispatcher) DispatchTx(ctx context.Context, tx pgx.Tx, events ...webhookcontracts.Event) error {
-	if d == nil || d.queue == nil {
-		return errors.New("webhooks: dispatcher job queue is nil")
+// HandleEvent is the durable events.Handler subscribed to every webhook event
+// type (catalog.SubscribedEvents). An invalid event can never be dispatched,
+// so it dead-letters without spending the retry budget; store errors retry.
+func (d *Dispatcher) HandleEvent(ctx context.Context, event events.Event) error {
+	_, err := d.Dispatch(ctx, event)
+	if errors.Is(err, ErrInvalidEvent) {
+		return jobs.Permanent(err)
 	}
-	if tx == nil {
-		return jobs.ErrNoTx
-	}
-	for i := range events {
-		event, err := d.prepare(ctx, events[i])
-		if err != nil {
-			return err
-		}
-		payload, err := json.Marshal(dispatchJobPayload{
-			ID:         event.ID,
-			Type:       event.Type,
-			TenantID:   event.TenantID,
-			OccurredAt: event.OccurredAt,
-			Data:       event.Data,
-		})
-		if err != nil {
-			return fmt.Errorf("webhooks: encode dispatch job: %w", err)
-		}
-		if _, _, err := d.queue.EnqueueOnceTx(ctx, tx, jobs.Job{
-			TenantID:       event.TenantID,
-			Kind:           DispatchJobKind,
-			Payload:        payload,
-			MaxAttempts:    dispatchJobMaxAttempts,
-			IdempotencyKey: DispatchJobKind + ":" + event.ID,
-		}); err != nil {
-			return fmt.Errorf("webhooks: enqueue dispatch job: %w", err)
-		}
-	}
-	return nil
-}
-
-// HandleDispatchJob is registered on the platform jobs worker under
-// DispatchJobKind. It is idempotent: deliveries are unique per endpoint and
-// event ID, so a retried job only creates the deliveries still missing.
-func (d *Dispatcher) HandleDispatchJob(ctx context.Context, payload json.RawMessage) error {
-	// A payload that does not decode or lacks its event id/tenant can never
-	// dispatch, so it dead-letters without spending the retry budget.
-	var job dispatchJobPayload
-	if err := json.Unmarshal(payload, &job); err != nil {
-		return jobs.Permanent(fmt.Errorf("webhooks: invalid dispatch job payload: %w", err))
-	}
-	if job.ID == "" || job.TenantID <= 0 {
-		return jobs.Permanent(fmt.Errorf("%w: dispatch job requires an event id and tenant", webhookcontracts.ErrInvalidEvent))
-	}
-	_, err := d.Dispatch(ctx, webhookcontracts.Event{
-		ID:         job.ID,
-		Type:       job.Type,
-		TenantID:   job.TenantID,
-		OccurredAt: job.OccurredAt,
-		Data:       job.Data,
-	})
 	return err
 }
 
-// Dispatch implements contracts.Dispatcher.
-func (d *Dispatcher) Dispatch(ctx context.Context, events ...webhookcontracts.Event) (int, error) {
+// Dispatch creates one delivery per matching active endpoint and returns how
+// many were newly created. The envelope is stored once in webhook_events.
+func (d *Dispatcher) Dispatch(ctx context.Context, event events.Event) (int, error) {
 	if d == nil || d.store == nil {
-		return 0, fmt.Errorf("webhooks: dispatcher store is nil")
+		return 0, errors.New("webhooks: dispatcher store is nil")
 	}
-	if len(events) == 0 {
-		return 0, nil
+	if err := validateDispatchEvent(event); err != nil {
+		return 0, err
+	}
+	endpoints, err := d.store.ActiveEndpoints(ctx, event.TenantID)
+	if err != nil {
+		return 0, fmt.Errorf("webhooks: load active endpoints: %w", err)
 	}
 
-	endpointCache := make(map[int64][]repository.ActiveEndpoint)
 	created := 0
-	for i := range events {
-		event, err := d.prepare(ctx, events[i])
+	for _, endpoint := range endpoints {
+		if !Matches(endpoint.EventTypes, event.Type) {
+			continue
+		}
+		_, inserted, err := d.store.CreateDeliveryWithJob(ctx, repository.DeliveryDraft{
+			TenantID:         event.TenantID,
+			EndpointID:       endpoint.ID,
+			EventID:          event.ID,
+			EventType:        event.Type,
+			DataVersion:      int32(event.DataVersion), // #nosec G115 -- validated 1..math.MaxInt32
+			ActorType:        event.Actor.Type,
+			ActorID:          event.Actor.ID,
+			EventCreatedAt:   event.OccurredAt,
+			URL:              endpoint.URL,
+			Payload:          event.Data,
+			SecretCiphertext: endpoint.SecretCiphertext,
+			MaxAttempts:      endpoint.MaxAttempts,
+			TimeoutMS:        endpoint.TimeoutMS,
+			RunAt:            d.now(),
+		})
 		if err != nil {
-			return created, err
+			return created, fmt.Errorf("webhooks: create delivery for endpoint %d: %w", endpoint.ID, err)
 		}
-
-		endpoints, ok := endpointCache[event.TenantID]
-		if !ok {
-			var err error
-			endpoints, err = d.store.ActiveEndpoints(ctx, event.TenantID)
-			if err != nil {
-				return created, fmt.Errorf("webhooks: load active endpoints: %w", err)
-			}
-			endpointCache[event.TenantID] = endpoints
-		}
-
-		for _, endpoint := range endpoints {
-			if !webhookcontracts.Matches(endpoint.EventTypes, event.Type) {
-				continue
-			}
-			_, inserted, err := d.store.CreateDeliveryWithJob(ctx, repository.DeliveryDraft{
-				TenantID:         event.TenantID,
-				EndpointID:       endpoint.ID,
-				EventID:          event.ID,
-				EventType:        event.Type,
-				EventCreatedAt:   event.OccurredAt,
-				URL:              endpoint.URL,
-				Payload:          event.Data,
-				SecretCiphertext: endpoint.SecretCiphertext,
-				MaxAttempts:      endpoint.MaxAttempts,
-				TimeoutMS:        endpoint.TimeoutMS,
-				RunAt:            d.now(),
-			})
-			if err != nil {
-				return created, fmt.Errorf("webhooks: create delivery for endpoint %d: %w", endpoint.ID, err)
-			}
-			if inserted {
-				created++
-			}
+		if inserted {
+			created++
 		}
 	}
-
 	if created > 0 {
-		slog.Debug("webhooks: dispatched events", slog.Int("deliveries", created))
+		slog.Debug("webhooks: dispatched event",
+			slog.String("event", event.Type),
+			slog.Int("deliveries", created),
+		)
 	}
 	return created, nil
 }
 
-// prepare resolves the tenant, applies defaults, assigns an ID when the
-// producer left it empty, and validates the event.
-func (d *Dispatcher) prepare(ctx context.Context, event webhookcontracts.Event) (webhookcontracts.Event, error) {
-	if event.TenantID == 0 {
-		event.TenantID = tenant.EffectiveID(ctx)
-	}
-	if event.TenantID <= 0 {
-		return event, fmt.Errorf("%w: tenant id is required", webhookcontracts.ErrInvalidEvent)
-	}
-	event = event.Normalized(d.now())
-	if event.ID == "" {
-		event.ID = "evt_" + randomHex(12)
-	}
+// validateDispatchEvent checks what the bus cannot: a webhook event must
+// belong to a tenant and carry a stable id, a type endpoints can subscribe
+// to, and an actor (the bus fills one in on publish).
+func validateDispatchEvent(event events.Event) error {
 	if err := event.Validate(); err != nil {
-		return event, err
+		return fmt.Errorf("%w: %w", ErrInvalidEvent, err)
 	}
-	return event, nil
+	switch {
+	case event.TenantID <= 0:
+		return fmt.Errorf("%w: tenant id is required", ErrInvalidEvent)
+	case event.ID == "":
+		return fmt.Errorf("%w: id is required", ErrInvalidEvent)
+	case event.Actor.Type == "":
+		return fmt.Errorf("%w: actor is required", ErrInvalidEvent)
+	case event.DataVersion > maxDataVersion:
+		return fmt.Errorf("%w: dataVersion is out of range", ErrInvalidEvent)
+	case !ValidType(event.Type):
+		return fmt.Errorf("%w: type %q is not subscribable", ErrInvalidEvent, event.Type)
+	}
+	return nil
 }

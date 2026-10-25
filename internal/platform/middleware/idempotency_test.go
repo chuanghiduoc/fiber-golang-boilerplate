@@ -221,10 +221,10 @@ func TestIdempotency_BodyBindingRejectsDifferentPayload(t *testing.T) {
 	}
 
 	conflict, body := doIdempotencyRequest(t, app, http.MethodPost, "/test", "body-key", `{"name":"bob"}`)
-	if conflict.StatusCode != fiber.StatusConflict {
-		t.Fatalf("different body status = %d, want 409; body = %s", conflict.StatusCode, body)
+	if conflict.StatusCode != fiber.StatusUnprocessableEntity {
+		t.Fatalf("different body status = %d, want 422; body = %s", conflict.StatusCode, body)
 	}
-	if !strings.Contains(body, "different request body") {
+	if !strings.Contains(body, "different request body") || !strings.Contains(body, `"code":"idempotency.key_mismatch"`) {
 		t.Errorf("different body response = %s, want a body-mismatch conflict", body)
 	}
 	if got := calls.Load(); got != 1 {

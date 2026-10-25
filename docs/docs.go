@@ -4365,7 +4365,7 @@ const docTemplate = `{
         },
         "/webhooks/inbound/{id}": {
             "post": {
-                "description": "Public HMAC-authenticated receiver. Deduplicates on X-Webhook-Id per source.",
+                "description": "Public Standard Webhooks receiver (HMAC-SHA256 over \"id.timestamp.body\"). Deduplicates on webhook-id per source; the event type is the body's top-level \"type\" member (\"inbound\" when absent).",
                 "consumes": [
                     "application/json"
                 ],
@@ -4386,28 +4386,22 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "External event ID",
-                        "name": "X-Webhook-Id",
+                        "description": "Message ID (deduplication key)",
+                        "name": "webhook-id",
                         "in": "header",
                         "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Event type",
-                        "name": "X-Webhook-Event",
-                        "in": "header"
                     },
                     {
                         "type": "string",
                         "description": "Unix seconds used in the signature",
-                        "name": "X-Webhook-Timestamp",
+                        "name": "webhook-timestamp",
                         "in": "header",
                         "required": true
                     },
                     {
                         "type": "string",
-                        "description": "v1=\u003chex HMAC-SHA256\u003e",
-                        "name": "X-Webhook-Signature",
+                        "description": "Space-separated v1,\u003cbase64 HMAC-SHA256\u003e signatures",
+                        "name": "webhook-signature",
                         "in": "header",
                         "required": true
                     }

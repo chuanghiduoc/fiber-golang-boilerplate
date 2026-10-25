@@ -31,6 +31,10 @@ const (
 
 	CodeAPIVersionUnsupported Code = "api.version_unsupported"
 
+	// CodeIdempotencyKeyMismatch is an Idempotency-Key reused with a different
+	// request body (ADR 0008). A duplicate still in progress is a plain 409.
+	CodeIdempotencyKeyMismatch Code = "idempotency.key_mismatch"
+
 	CodeSystemInternal         Code = "system.internal"
 	CodeSystemTimeout          Code = "system.timeout"
 	CodeSystemUnavailable      Code = "system.unavailable"
@@ -102,6 +106,13 @@ var platformSpecs = map[Code]Spec{
 		Status:  http.StatusNotAcceptable,
 		Title:   "Unsupported API version",
 		DocPath: "/errors/api-version-unsupported",
+	},
+	// 422 follows draft-ietf-httpapi-idempotency-key-header: the request is
+	// well-formed but cannot be processed under a key bound to another body.
+	CodeIdempotencyKeyMismatch: {
+		Status:  http.StatusUnprocessableEntity,
+		Title:   "Idempotency key reused with a different request",
+		DocPath: "/errors/idempotency-key-mismatch",
 	},
 
 	CodeSystemInternal: {

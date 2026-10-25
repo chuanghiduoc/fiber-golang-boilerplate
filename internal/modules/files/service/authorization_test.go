@@ -50,7 +50,7 @@ func TestUploadService_ABACOwnerAndTenantPolicies(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store, nil)
+	svc := NewUploadService(repo, newFakeTx(repo), store)
 
 	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleUser))
 
@@ -95,7 +95,7 @@ func TestUploadService_ABACPermissionPreCheck(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store, nil)
+	svc := NewUploadService(repo, newFakeTx(repo), store)
 
 	// A JWT-equivalent subject whose role grants files:read.
 	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleUser))
@@ -131,7 +131,7 @@ func TestAdminFileService_ABACTenantPolicy(t *testing.T) {
 	store.data["uploads/file.txt"] = []byte("tenant-one")
 	store.data["2/20/two.pdf"] = []byte("tenant-two")
 
-	svc := NewAdminFileService(repo, newFakeTx(repo), store, nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), store)
 	ctx := abacCtx(1, authz.NewSubject(1, 1, authz.RoleAdmin))
 
 	files, _, err := svc.ListFiles(ctx, 10, "")
@@ -185,7 +185,7 @@ func TestFileServices_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store, nil)
+	svc := NewUploadService(repo, newFakeTx(repo), store)
 	ctx := tenant.WithID(context.Background(), 1)
 
 	_, err := svc.Upload(ctx, 10, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
@@ -206,7 +206,7 @@ func TestFileServices_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 
 	adminRepo := newFakeAdminFileRepo()
 	seedAdminFiles(adminRepo, 1)
-	admin := NewAdminFileService(adminRepo, newFakeTx(adminRepo), newFakeAdminStorage(), nil)
+	admin := NewAdminFileService(adminRepo, newFakeTx(adminRepo), newFakeAdminStorage())
 	_, _, err = admin.ListFiles(ctx, 10, "")
 	requireStatus(t, err, 403)
 	requireStatus(t, admin.DeleteFile(ctx, 1), 403)

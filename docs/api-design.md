@@ -158,10 +158,10 @@ flowchart TD
 | 403 | Authenticated but not permitted, or tenant mismatch |
 | 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-admin, idempotency in progress or body mismatch |
+| 409 | Conflict, duplicate, last-admin, idempotency key still in progress |
 | 413 | Body or upload too large |
 | 415 | Unsupported media type |
-| 422 | Validation failed |
+| 422 | Validation failed, or `Idempotency-Key` reused with a different body (`idempotency.key_mismatch`) |
 | 429 | Rate limited |
 | 499 | Client closed the request (logged; usually never delivered) |
 | 500 | Internal error |
@@ -283,7 +283,7 @@ flowchart TD
 | First request with a key | Runs normally; a 2xx is cached for 24h |
 | Same key, same body, after success | Replayed response with `Idempotent-Replayed: true` (not re-audited) |
 | Same key while the first is in progress | `409` |
-| Same key, different body (non-multipart, up to 1 MiB, SHA-256 bound) | `409` |
+| Same key, different body (non-multipart, up to 1 MiB, SHA-256 bound) | `422` `idempotency.key_mismatch` (ADR 0008; was `409` before) |
 | Lock claim reply lost | The lock key is re-read: own token runs, another token gets `409`, missing key or read error fails open |
 | Cache unavailable | Fails open (request runs without idempotency) |
 
@@ -329,10 +329,11 @@ flowchart TD
 | `/api/v1/webhooks/endpoints`, `/deliveries`, `/inbound-sources` | `webhooks:read` / `webhooks:write` (`admin` role). Endpoint/source create return a plaintext `secret` once; `rotate-secret` returns the new one once; reads never include it. |
 | Mutations | Create/update/delete, `rotate-secret`, and delivery replay are Tier 2: a required `audithttp.Guard` intent is written first (`503 system.audit_unavailable` changes nothing). The domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`, `webhook.delivery.replayed`) is recorded as its child. Update/delete/replay accept `Idempotency-Key`. |
 | Delivery list | Filters `endpointId`, `status=pending|succeeded|dead`, cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the payload snapshot; lists omit it. |
-| Replay | `POST /deliveries/:id/replay` creates a new delivery with the endpoint's current URL and active secret; `201`. |
-| Outbound requests | At-least-once. Headers `X-Webhook-Id`, `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`, `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, `X-Webhook-Attempt`. HMAC-SHA256 over `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`. |
+| Replay | `POST /deliveries/:id/replay` creates a new event (new `id`) with the original type, `dataVersion`, actor, and data, delivered with the endpoint's current URL and active secret; `201`. |
+| Outbound requests | At-least-once [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Headers `webhook-id` (event id, dedupe key), `webhook-timestamp`, `webhook-signature: v1,<base64>` (space-separated during rotation). HMAC-SHA256 over `<webhook-id>.<webhook-timestamp>.<raw-body>` with the decoded `whsec_` key. Body: the versioned envelope `{id, type, dataVersion, occurredAt, tenantId, actor, data}`. |
+| Event payloads | Contract structs in `internal/contracts/<producer>`, never REST DTOs. Additive changes keep `dataVersion`; breaking ones get a new `dataVersion` or type. |
 | Retries | `408`, `425`, `429`, `5xx` retry; other `3xx`/`4xx` are `dead`. `Retry-After` (seconds or HTTP date) is honored, capped by config. Targets are SSRF-checked at dial time (private/loopback/link-local need `WEBHOOK_SSRF_ALLOWLIST`); redirects are never followed. |
-| Inbound | `POST /api/v1/webhooks/inbound/{id}` is public: no JWT, tenant header, or idempotency middleware. Requires `X-Webhook-Id`, `X-Webhook-Timestamp`, `X-Webhook-Signature`. Unknown/disabled source `404`, bad/stale signature `401`, malformed JSON/IDs `400`, new event `202`, repeat `(source, X-Webhook-Id)` `200` with `duplicate: true`. |
+| Inbound | `POST /api/v1/webhooks/inbound/{id}` is public: no JWT, tenant header, or idempotency middleware. Requires `webhook-id`, `webhook-timestamp`, `webhook-signature` (Standard Webhooks, signed with the source's `whsec_` secret); the event type is the body's `type`. Unknown/disabled source `404`, bad/stale signature `401`, malformed JSON/IDs/type `400`, new event `202`, repeat `(source, webhook-id)` `200` with `duplicate: true`. |
 
 Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
 
@@ -386,10 +387,10 @@ successful no-op; admin send returns `notification: null`,
   queued in PostgreSQL; delivery is at-least-once, so clients must tolerate
   duplicate emails.
 - Outbound webhooks use the same queue. Identity registration, file
-  upload/delete (user and admin), and file restore emit `user.registered`,
-  `file.uploaded`, `file.deleted`, and `file.restored` inside the mutation's
-  transaction (`DispatchTx`), so an outbox failure fails the mutation; only the
-  unwired fallback dispatches after commit and logs failures.
+  upload/delete (user and admin), and file restore publish `user.registered`,
+  `file.uploaded`, `file.deleted`, and `file.restored` domain events with
+  `events.PublishTx` inside the mutation's transaction, so a publish failure
+  fails the mutation. Webhooks subscribes durably and fans out after commit.
 - Terminal jobs clear payloads; succeeded/dead rows are retained 30 days.
 - Email payloads are encrypted at rest; notification emails use the same
   `email.send`/`email.send.encrypted` kinds as identity emails.

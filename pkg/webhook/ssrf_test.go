@@ -159,7 +159,7 @@ func TestSign_DeterministicForUnixSeconds(t *testing.T) {
 	secret := []byte("s")
 	ts := time.Unix(1_792_843_200, 900_000_000)
 	other := time.Unix(1_792_843_200, 100_000_000)
-	if Sign(secret, "evt", "a.b", ts, []byte("x")) != Sign(secret, "evt", "a.b", other, []byte("x")) {
+	if Sign(secret, "evt", ts, []byte("x")) != Sign(secret, "evt", other, []byte("x")) {
 		t.Error("Sign must derive only from Unix seconds")
 	}
 }

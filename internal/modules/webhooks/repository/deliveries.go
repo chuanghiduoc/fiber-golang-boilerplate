@@ -24,11 +24,14 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraf
 	}
 	err = r.withTx(ctx, func(tx pgx.Tx, q *webhooksqlc.Queries) error {
 		if err := q.CreateWebhookEvent(ctx, webhooksqlc.CreateWebhookEventParams{
-			TenantID:   draft.TenantID,
-			EventID:    draft.EventID,
-			EventType:  draft.EventType,
-			OccurredAt: timestamp(draft.EventCreatedAt),
-			Payload:    draft.Payload,
+			TenantID:    draft.TenantID,
+			EventID:     draft.EventID,
+			EventType:   draft.EventType,
+			DataVersion: draft.DataVersion,
+			ActorType:   draft.ActorType,
+			ActorID:     text(draft.ActorID),
+			OccurredAt:  timestamp(draft.EventCreatedAt),
+			Payload:     draft.Payload,
 		}); err != nil {
 			return err
 		}
@@ -77,6 +80,9 @@ func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*Delivery, error)
 	return &Delivery{
 		WebhookDelivery: row.WebhookDelivery,
 		EventType:       row.EventType,
+		DataVersion:     row.DataVersion,
+		ActorType:       row.ActorType,
+		ActorID:         row.ActorID.String,
 		OccurredAt:      row.OccurredAt,
 		Payload:         row.Payload,
 	}, nil
@@ -142,9 +148,12 @@ func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Durat
 			CreatedAt:        row.CreatedAt,
 			UpdatedAt:        row.UpdatedAt,
 		},
-		EventType:  row.EventType,
-		OccurredAt: row.OccurredAt,
-		Payload:    row.Payload,
+		EventType:   row.EventType,
+		DataVersion: row.DataVersion,
+		ActorType:   row.ActorType,
+		ActorID:     row.ActorID.String,
+		OccurredAt:  row.OccurredAt,
+		Payload:     row.Payload,
 	}, nil
 }
 

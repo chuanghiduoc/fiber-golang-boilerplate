@@ -8,10 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
@@ -56,6 +54,18 @@ func activeEndpoint(id, tenantID int64, patterns ...string) repository.ActiveEnd
 	}
 }
 
+func testEvent(id, eventType string, tenantID int64, occurredAt time.Time) events.Event {
+	return events.Event{
+		ID:          id,
+		Type:        eventType,
+		DataVersion: 2,
+		OccurredAt:  occurredAt,
+		TenantID:    tenantID,
+		Actor:       events.UserActor(5),
+		Data:        json.RawMessage(`{"fileId":7}`),
+	}
+}
+
 func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 	store := &fakeDispatchStore{
 		endpoints: map[int64][]repository.ActiveEndpoint{
@@ -66,18 +76,12 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 			},
 		},
 	}
-	dispatcher := NewDispatcher(store, nil)
-	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	dispatcher := NewDispatcher(store)
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	dispatcher.now = func() time.Time { return now }
 
-	event := webhookcontracts.Event{
-		ID:         "evt_1",
-		Type:       "file.uploaded",
-		OccurredAt: now,
-		Data:       json.RawMessage(`{"fileId":7}`),
-	}
-	created, err := dispatcher.Dispatch(ctx, event)
+	event := testEvent("evt_1", "file.uploaded", tenant.DefaultID, now)
+	created, err := dispatcher.Dispatch(context.Background(), event)
 	if err != nil {
 		t.Fatalf("Dispatch(): %v", err)
 	}
@@ -92,6 +96,10 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 		if string(draft.Payload) != `{"fileId":7}` {
 			t.Errorf("payload = %s", draft.Payload)
 		}
+		// The whole envelope is stored, so the worker can rebuild it.
+		if draft.EventType != "file.uploaded" || draft.DataVersion != 2 || draft.ActorType != "user" || draft.ActorID != "5" {
+			t.Errorf("envelope = %s v%d %s/%s", draft.EventType, draft.DataVersion, draft.ActorType, draft.ActorID)
+		}
 		if !draft.EventCreatedAt.Equal(now) {
 			t.Errorf("event time = %v", draft.EventCreatedAt)
 		}
@@ -103,131 +111,60 @@ func TestDispatcher_FanoutAndDedupe(t *testing.T) {
 		t.Fatal("non-matching endpoint received a delivery")
 	}
 
-	// Retrying the same event must be idempotent.
-	created, err = dispatcher.Dispatch(ctx, event)
-	if err != nil {
-		t.Fatalf("second Dispatch(): %v", err)
+	// The durable subscription is at-least-once: re-handling the same event
+	// must be idempotent.
+	if err := dispatcher.HandleEvent(context.Background(), event); err != nil {
+		t.Fatalf("HandleEvent(): %v", err)
 	}
-	if created != 0 {
-		t.Fatalf("second Dispatch created = %d, want 0", created)
+	if len(store.deliveries) != 2 {
+		t.Fatalf("deliveries after redelivery = %d, want 2", len(store.deliveries))
 	}
 }
 
-func TestDispatcher_AssignsIDAndResolvesTenant(t *testing.T) {
+// The tenant comes from the envelope, never from the job context.
+func TestDispatcher_UsesEnvelopeTenant(t *testing.T) {
 	store := &fakeDispatchStore{
 		endpoints: map[int64][]repository.ActiveEndpoint{
 			42: {activeEndpoint(9, 42, "*")},
+			1:  {activeEndpoint(10, 1, "*")},
 		},
 	}
-	dispatcher := NewDispatcher(store, nil)
-	dispatcher.now = func() time.Time { return time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC) }
-	ctx := tenant.WithID(context.Background(), 42)
+	dispatcher := NewDispatcher(store)
+	ctx := tenant.WithID(context.Background(), 1)
 
-	created, err := dispatcher.Dispatch(ctx, webhookcontracts.Event{Type: "user.registered"})
-	if err != nil {
-		t.Fatalf("Dispatch(): %v", err)
+	created, err := dispatcher.Dispatch(ctx, testEvent("evt_t", "user.registered", 42, time.Now()))
+	if err != nil || created != 1 {
+		t.Fatalf("Dispatch() = (%d, %v), want (1, nil)", created, err)
 	}
-	if created != 1 {
-		t.Fatalf("created = %d, want 1", created)
-	}
-	var draft repository.DeliveryDraft
-	for _, d := range store.deliveries {
-		draft = d
-	}
-	if draft.TenantID != 42 {
-		t.Errorf("tenant = %d, want 42", draft.TenantID)
-	}
-	if draft.EventID == "" || draft.EventID[:4] != "evt_" {
-		t.Errorf("event ID = %q, want generated evt_ prefix", draft.EventID)
-	}
-	if string(draft.Payload) != "{}" {
-		t.Errorf("payload = %s, want {}", draft.Payload)
+	if _, ok := store.deliveries["42/9/evt_t"]; !ok {
+		t.Fatalf("deliveries = %v, want endpoint 9 of tenant 42", store.deliveries)
 	}
 }
 
-func TestDispatcher_NoEndpointsAndValidation(t *testing.T) {
-	dispatcher := NewDispatcher(&fakeDispatchStore{}, nil)
-	if created, err := dispatcher.Dispatch(context.Background()); err != nil || created != 0 {
-		t.Fatalf("empty Dispatch = (%d, %v)", created, err)
-	}
+func TestDispatcher_InvalidEventsArePermanent(t *testing.T) {
+	dispatcher := NewDispatcher(&fakeDispatchStore{})
+	valid := testEvent("evt_v", "file.uploaded", 1, time.Now())
 
-	if _, err := dispatcher.Dispatch(context.Background(), webhookcontracts.Event{Type: "file.*"}); !errors.Is(err, webhookcontracts.ErrInvalidEvent) {
-		t.Fatalf("pattern event error = %v, want ErrInvalidEvent", err)
+	cases := map[string]func(*events.Event){
+		"no tenant":    func(e *events.Event) { e.TenantID = 0 },
+		"no id":        func(e *events.Event) { e.ID = "" },
+		"no actor":     func(e *events.Event) { e.Actor = events.Actor{} },
+		"pattern type": func(e *events.Event) { e.Type = "file.*" },
+		"no version":   func(e *events.Event) { e.DataVersion = 0 },
 	}
-
-	store := &fakeDispatchStore{callErr: errors.New("boom")}
-	dispatcher = NewDispatcher(store, nil)
-	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	if _, err := dispatcher.Dispatch(ctx, webhookcontracts.Event{Type: "file.uploaded"}); err == nil {
-		t.Fatal("Dispatch() should surface endpoint load failures")
-	}
-}
-
-type fakeTxQueue struct {
-	jobs []jobs.Job
-}
-
-func (f *fakeTxQueue) EnqueueOnceTx(_ context.Context, _ pgx.Tx, job jobs.Job) (id int64, created bool, err error) {
-	f.jobs = append(f.jobs, job)
-	return int64(len(f.jobs)), true, nil
-}
-
-// fakeTx is a non-nil pgx.Tx; the fake queue never calls it.
-type fakeTx struct{ pgx.Tx }
-
-// TestDispatcher_DispatchTxEnqueuesStableFanoutJob proves the transactional
-// path enqueues one idempotent job carrying a fixed event ID, and that running
-// the job (twice, as at-least-once delivery may) creates each delivery once.
-func TestDispatcher_DispatchTxEnqueuesStableFanoutJob(t *testing.T) {
-	store := &fakeDispatchStore{
-		endpoints: map[int64][]repository.ActiveEndpoint{
-			7: {activeEndpoint(1, 7, "file.*"), activeEndpoint(2, 7, "user.*")},
-		},
-	}
-	queue := &fakeTxQueue{}
-	dispatcher := NewDispatcher(store, queue)
-	ctx := tenant.WithID(context.Background(), 7)
-
-	if err := dispatcher.DispatchTx(ctx, nil, webhookcontracts.Event{Type: "file.uploaded"}); !errors.Is(err, jobs.ErrNoTx) {
-		t.Fatalf("nil tx error = %v, want jobs.ErrNoTx", err)
-	}
-	if err := dispatcher.DispatchTx(ctx, fakeTx{}, webhookcontracts.Event{
-		Type: "file.uploaded",
-		Data: json.RawMessage(`{"fileId":3}`),
-	}); err != nil {
-		t.Fatalf("DispatchTx: %v", err)
-	}
-	if len(queue.jobs) != 1 {
-		t.Fatalf("enqueued jobs = %d, want 1", len(queue.jobs))
-	}
-	job := queue.jobs[0]
-	if job.Kind != DispatchJobKind || job.TenantID != 7 {
-		t.Fatalf("job = %+v", job)
-	}
-	var payload dispatchJobPayload
-	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		t.Fatalf("payload: %v", err)
-	}
-	if payload.ID == "" || job.IdempotencyKey != DispatchJobKind+":"+payload.ID {
-		t.Fatalf("event id %q / key %q must be stable and linked", payload.ID, job.IdempotencyKey)
-	}
-	if len(store.deliveries) != 0 {
-		t.Fatal("DispatchTx must not create deliveries before the producer commits")
-	}
-
-	for range 2 {
-		if err := dispatcher.HandleDispatchJob(context.Background(), job.Payload); err != nil {
-			t.Fatalf("HandleDispatchJob: %v", err)
+	for name, mutate := range cases {
+		event := valid
+		mutate(&event)
+		err := dispatcher.HandleEvent(context.Background(), event)
+		if !errors.Is(err, ErrInvalidEvent) || !jobs.IsPermanent(err) {
+			t.Errorf("%s: error = %v, want a permanent ErrInvalidEvent", name, err)
 		}
 	}
-	if len(store.deliveries) != 1 {
-		t.Fatalf("deliveries = %d, want 1 (only the file.* endpoint, once)", len(store.deliveries))
-	}
-	if _, ok := store.deliveries[fmt.Sprintf("7/1/%s", payload.ID)]; !ok {
-		t.Fatalf("delivery must use the enqueued event id; got %v", store.deliveries)
-	}
 
-	if err := dispatcher.HandleDispatchJob(context.Background(), json.RawMessage(`{"type":"file.uploaded"}`)); err == nil {
-		t.Fatal("a dispatch job without id/tenant must fail")
+	// Store failures are transient and retried.
+	failing := NewDispatcher(&fakeDispatchStore{callErr: errors.New("boom")})
+	err := failing.HandleEvent(context.Background(), valid)
+	if err == nil || jobs.IsPermanent(err) {
+		t.Fatalf("store failure error = %v, want a retryable error", err)
 	}
 }

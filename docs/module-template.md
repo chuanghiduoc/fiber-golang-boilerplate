@@ -805,7 +805,8 @@ Rules:
 - Register before `Listen`. Duplicate paths are a programming error; a catalog
   conflict fails `app.RegisterCatalogs` (and panics in `Register`).
 - Durable work: implement `RegisterJobs(jobs.Registrar)` as webhooks does for
-  `webhook.delivery` and `webhook.dispatch`. The registrar runs every handler
+  `webhook.delivery` (and `RegisterEvents(*events.Bus)` for durable event
+  subscriptions, as webhooks does for `events.*.webhooks`). The registrar runs every handler
   (and every durable event handler) under `authz.SystemContext`, so service
   calls without a subject pass `authz.Authorize`; outside a job, a subject-less
   service call is `403`. Wrap an undecodable or invalid payload error with

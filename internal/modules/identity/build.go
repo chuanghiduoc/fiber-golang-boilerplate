@@ -9,7 +9,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -75,6 +74,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	refreshTokenRepo := identityrepository.NewRefreshTokenRepository(infra.Pool)
 	userSvc := identityservice.NewUserService(userRepo, refreshTokenRepo, cfg.App.RequireEmailVerification,
 		infra.Cache, infra.Tx, infra.Audit, sessionStore)
+	identityservice.AttachEventBus(userSvc, infra.Events)
 	refreshSvc := identityservice.NewRefreshTokenService(refreshTokenRepo, cfg.JWT.RefreshExpireDays)
 
 	passwordResetRepo := identityrepository.NewPasswordResetRepository(infra.Pool)
@@ -132,15 +132,6 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 			return true, nil
 		},
 	}, nil
-}
-
-// AttachWebhooks wires the outbound webhook dispatcher into registration.
-// The webhooks module is built after identity, so the composition root
-// attaches it once both exist.
-func (m *Module) AttachWebhooks(dispatcher webhookcontracts.Dispatcher) {
-	if m.userSvc != nil {
-		identityservice.AttachWebhookDispatcher(m.userSvc, dispatcher)
-	}
 }
 
 // RegisterJobs implements app.JobProvider: the worker performs queued

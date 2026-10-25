@@ -10,12 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
@@ -26,9 +27,9 @@ func emailTaken() error {
 }
 
 // Register creates a local account. The user, the optional verification
-// email job, the auth.registered audit row, and the optional registration
-// webhook job commit in one transaction: any failure rolls the account back,
-// so a registration never exists without its audit record or outbox rows.
+// email job, the auth.registered audit row, and the user.registered event
+// commit in one transaction: any failure rolls the account back, so a
+// registration never exists without its audit record or outbox rows.
 func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
 	email := NormalizeEmail(req.Email)
 	name := strings.TrimSpace(req.Name)
@@ -43,10 +44,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 
-	var (
-		user          *identitysqlc.User
-		webhookQueued bool
-	)
+	var user *identitysqlc.User
 	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
 		created, createErr := s.createUser(ctx, r.users, email, name, hash)
 		if createErr != nil {
@@ -58,11 +56,10 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		if auditErr := checkAudit(audit.RecordInTx(ctx, s.audit, tx, s.registeredEvent(ctx, created))); auditErr != nil {
 			return auditErr
 		}
-		queued, hookErr := s.dispatchRegisteredTx(ctx, tx, created)
-		if hookErr != nil {
-			return hookErr
+		if pubErr := s.publishRegisteredTx(ctx, tx, created); pubErr != nil {
+			return pubErr
 		}
-		user, webhookQueued = created, queued
+		user = created
 		return nil
 	})
 	if err != nil {
@@ -71,12 +68,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 
 	// A previous failed-login lockout must not survive registration.
 	clearLoginAttempts(ctx, s.cache, email)
-
-	response := ToUserResponse(user)
-	if !webhookQueued {
-		s.dispatchWebhook(ctx, webhookcontracts.EventUserRegistered, user.TenantID, response)
-	}
-	return response, nil
+	return ToUserResponse(user), nil
 }
 
 // ensureEmailUnregistered rejects an address that belongs to an active or a
@@ -157,21 +149,42 @@ func (s *userService) registeredEvent(ctx context.Context, user *identitysqlc.Us
 	return event
 }
 
-// dispatchRegisteredTx enqueues the user.registered webhook in the
-// registration transaction when the dispatcher is transactional, so the
-// account never exists without its event (or vice versa). It reports whether
-// the event was queued; if not, Register dispatches it after commit.
-func (s *userService) dispatchRegisteredTx(ctx context.Context, tx pgx.Tx, user *identitysqlc.User) (bool, error) {
-	txDispatcher, ok := s.webhooks.(WebhookTxDispatcher)
-	if tx == nil || !ok {
-		return false, nil
+// publishRegisteredTx publishes user.registered in the registration
+// transaction, so the account never exists without its event (or vice versa)
+// and every durable subscriber (webhooks) sees it. Without a bus or a
+// transaction (unit tests) nothing is published.
+func (s *userService) publishRegisteredTx(ctx context.Context, tx pgx.Tx, user *identitysqlc.User) error {
+	if s.events == nil || tx == nil {
+		return nil
 	}
-	if err := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventUserRegistered, user.TenantID, ToUserResponse(user)); err != nil {
-		slog.Error("failed to enqueue registration webhook",
+	event, err := userRegisteredEvent(user)
+	if err == nil {
+		err = s.events.PublishTx(ctx, tx, event)
+	}
+	if err != nil {
+		slog.Error("failed to publish user.registered",
 			slog.Int64("user_id", user.ID),
 			slog.Any("error", err),
 		)
-		return false, apperror.NewInternal("failed to create user")
+		return apperror.NewInternal("failed to create user")
 	}
-	return true, nil
+	return nil
+}
+
+// userRegisteredEvent builds the user.registered envelope. The new user is the
+// actor, matching the auth.registered audit row.
+func userRegisteredEvent(user *identitysqlc.User) (events.Event, error) {
+	event, err := events.NewEvent(identitycontracts.EventUserRegistered, identitycontracts.UserRegisteredVersion, identitycontracts.UserRegistered{
+		UserID:        user.ID,
+		Email:         user.Email,
+		Name:          user.Name,
+		EmailVerified: user.EmailVerifiedAt.Valid,
+		CreatedAt:     user.CreatedAt.Time.UTC(),
+	})
+	if err != nil {
+		return events.Event{}, err
+	}
+	event.TenantID = user.TenantID
+	event.Actor = events.UserActor(user.ID)
+	return event, nil
 }

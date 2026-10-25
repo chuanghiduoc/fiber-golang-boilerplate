@@ -26,6 +26,8 @@
   "errors.system.audit_unavailable.title": "Không thể ghi nhật ký kiểm toán",
   "errors.api.version_unsupported.title": "Phiên bản API không được hỗ trợ",
   "errors.api.version_unsupported.detail": "Phiên bản API {version} không được hỗ trợ.",
+  "errors.idempotency.key_mismatch.title": "Idempotency-Key đã được dùng cho một yêu cầu khác",
+  "errors.idempotency.key_mismatch.detail": "Idempotency-Key này đã được dùng với nội dung yêu cầu khác. Hãy dùng khóa mới cho yêu cầu mới.",
   "validation.required": "Trường {path} là bắt buộc.",
   "validation.invalid_email": "Trường {path} phải là địa chỉ email hợp lệ.",
   "validation.too_short": "Trường {path} phải có ít nhất {min} ký tự.",

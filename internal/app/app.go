@@ -18,7 +18,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey/apikeyhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -198,10 +197,6 @@ type Deps struct {
 	// Schedules receives module periodic schedules when the scheduler is
 	// enabled. Nil disables ScheduleProvider registration.
 	Schedules *scheduler.Registry
-	// Webhooks publishes domain events to tenant-configured webhook endpoints.
-	// Modules depend on the stdlib-only contracts interface; a nil value is
-	// replaced with a no-op dispatcher.
-	Webhooks webhookcontracts.Dispatcher
 	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
 	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
 	APIKeyVerifier *apikey.Verifier
@@ -260,9 +255,6 @@ func New(cfg *config.Config, deps Deps) *App {
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
 	deps.authGuard = buildAuthGuard(cfg, deps.Cache)
 	deps.Idempotency = middleware.Idempotency(deps.Cache)
-	if deps.Webhooks == nil {
-		deps.Webhooks = webhookcontracts.Noop{}
-	}
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",

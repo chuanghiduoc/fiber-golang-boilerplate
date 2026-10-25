@@ -116,9 +116,9 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	require.NoError(t, err)
 
 	filesTx := filesrepo.NewTransactor(database.NewTxManager(pool), audit.NewPostgresRecorder(pool), nil)
-	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store, nil)
+	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
-	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store, nil))
+	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
@@ -347,7 +347,7 @@ func TestTenantFiles_Isolation(t *testing.T) {
 	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(
 		h.fileRepo,
 		filesrepo.NewTransactor(database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), nil),
-		h.store, nil,
+		h.store,
 	)).ListFiles(ctxA, 10, "")
 	require.NoError(t, err)
 	require.Len(t, adminPage.Items, 1)
