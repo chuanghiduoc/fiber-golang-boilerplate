@@ -340,8 +340,8 @@ handler/service/DTO/repository package.
   - Module retention jobs are hourly `ScheduleProvider` schedules, so they run
     only with `SCHEDULER_ENABLED=true`: `identity.tokens.purge_expired`;
     `files.trash.purge` (files soft-deleted more than
-    `FILES_TRASH_RETENTION_DAYS`, default 30, ago: blob first, then row, in
-    100-row `FOR UPDATE SKIP LOCKED` batches so a restore cannot race it; a
+    `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
+    `purge_started_at` claim that blocks restore, then blob, then row; a
     missing blob counts as deleted; no event/webhook); and
     `notifications.retention.purge` (notifications read more than
     `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept). See
