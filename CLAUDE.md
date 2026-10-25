@@ -339,13 +339,16 @@ handler/service/DTO/repository package.
   Tier 1; no Idempotency-Key on secret-returning endpoints). With a confirmed
   factor, password login and Google sign-in return `mfaRequired` plus a
   five-minute, single-use, tenant-bound challenge sealed with the same codec
-  (no tokens); `POST /auth/mfa/verify` (challenge + TOTP/recovery code)
-  issues the normal pair. Failed verifications count toward the login
-  lockout, and confirming/disabling revokes the user's other sessions
+  (no tokens) that also pins the token version, so a password change or
+  logout-all voids it; `POST /auth/mfa/verify` (challenge + TOTP/recovery
+  code) issues the normal pair. Second-factor guesses (verify, disable,
+  regenerate) use a per-user budget of 5 per 15 minutes that only a successful
+  verification clears (a correct password does not), and confirming/disabling
+  revokes the user's other sessions
   (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
   `rc`; refresh repeats the session's `amr`, tokens without it still verify,
   and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
-  `otp`/`rc` (403 `auth.mfa_required`). Which roles require MFA is not decided
+  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Which roles require MFA is not decided
   here.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles}`; admins get

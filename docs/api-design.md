@@ -255,8 +255,10 @@ With a confirmed factor, `POST /auth/login` and the Google callback do not
 issue tokens. Login returns `200` with the user, `mfaRequired: true`, and
 `mfaChallengeToken`; the Google callback redirects with `mfa_required=true`
 and `mfa_challenge` in the URL fragment. Complete either with
-`POST /auth/mfa/verify`; a wrong code counts toward the existing login lockout
-(per email/address and global per email). When MFA is off, the login response
+`POST /auth/mfa/verify`. Wrong codes spend a per-user second-factor budget
+(5 per 15 minutes, `429` after it) that only a successful verification clears;
+a correct password does not reset it. A password change or logout-all voids
+pending challenges. When MFA is off, the login response
 keeps its original shape (`mfaRequired`/`mfaChallengeToken` are omitted).
 
 Access tokens carry `amr` (`pwd`, `google`, `otp`, `rc`); refresh preserves the
