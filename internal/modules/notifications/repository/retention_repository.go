@@ -5,6 +5,7 @@ import (
 
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // RetentionRepository implements service.RetentionRepository. It is the only
@@ -21,6 +22,7 @@ func NewRetentionRepository(db notificationsqlc.DBTX) *RetentionRepository {
 }
 
 func (r *RetentionRepository) PurgeRead(ctx context.Context, retentionDays, limit int32) (int64, error) {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return r.q.PurgeReadNotifications(ctx, notificationsqlc.PurgeReadNotificationsParams{
 		RetentionDays: retentionDays,
 		BatchSize:     limit,

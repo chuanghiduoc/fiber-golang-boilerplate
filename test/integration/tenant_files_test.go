@@ -37,7 +37,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -102,11 +101,11 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	tokenB, err := token.GenerateWithVersionAndTenant(userB, tenantB, "files-b@test.com", "admin", 0, tenantFilesSecret, 24)
 	require.NoError(t, err)
 
-	fileRepo := filesrepo.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(testutil.Scoped(pool))
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 
-	filesTx := filesrepo.NewTransactor(database.NewTxManager(pool), audit.NewPostgresRecorder(pool), nil)
+	filesTx := filesrepo.NewTransactor(testutil.NewTxManager(pool), audit.NewPostgresRecorder(testutil.Scoped(pool)), nil)
 	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
 	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store))
@@ -114,7 +113,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
-		identityadapter.NewTenantResolver(identityrepo.NewStores(pool).Tenants),
+		identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants),
 		tenant.DefaultSlug,
 	))
 
@@ -337,7 +336,7 @@ func TestTenantFiles_Isolation(t *testing.T) {
 	// The admin adapter must carry the tenant id into contract types.
 	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(
 		h.fileRepo,
-		filesrepo.NewTransactor(database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), nil),
+		filesrepo.NewTransactor(testutil.NewTxManager(h.pool), audit.NewPostgresRecorder(testutil.Scoped(h.pool)), nil),
 		h.store,
 	)).ListFiles(ctxA, 10, "")
 	require.NoError(t, err)

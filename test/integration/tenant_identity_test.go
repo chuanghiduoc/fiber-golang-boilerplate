@@ -56,7 +56,7 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(pool), integrationTenantSecret, nil)
+	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(testutil.Scoped(pool)), integrationTenantSecret, nil)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(identityadapter.NewTenantResolver(kit.stores.Tenants), "default"))

@@ -16,6 +16,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -223,6 +224,9 @@ func (s *InvitationService) Revoke(ctx context.Context, id int64) error {
 // reactivated; an active or banned one is refused.
 func (s *InvitationService) Accept(ctx context.Context, userID int64, token string) (*Member, error) {
 	var member *Member
+	// The token is possession-based and may belong to a tenant the caller is
+	// not signed in to yet; the transaction then writes under its owning tenant.
+	ctx = database.WithRLSBypass(ctx)
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		inv, tctx, err := s.pendingInvitation(ctx, tx.Stores, token)
 		if err != nil {
@@ -262,6 +266,9 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 	var member *Member
+	// The token is possession-based; the request tenant must still match the
+	// invitation's tenant below.
+	ctx = database.WithRLSBypass(ctx)
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		inv, tctx, err := s.pendingInvitation(ctx, tx.Stores, in.Token)
 		if err != nil {

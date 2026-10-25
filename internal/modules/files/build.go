@@ -37,7 +37,7 @@ type Settings struct {
 // inside the mutation's transaction; subscribers such as webhooks never
 // appear here.
 func Build(infra app.Infra, settings Settings) (*Module, Provides) {
-	fileRepo := filesrepo.NewFileRepository(infra.Pool)
+	fileRepo := filesrepo.NewFileRepository(infra.DB)
 	tx := filesrepo.NewTransactor(infra.Tx, infra.Audit, infra.Events)
 
 	uploadSvc := filesvc.NewUploadService(fileRepo, tx, infra.Storage)
@@ -45,7 +45,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides) {
 	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, tx, infra.Storage)
 
 	m := New(uploadHandler)
-	privacyRepo := filesrepo.NewPrivacyRepository(infra.Pool)
+	privacyRepo := filesrepo.NewPrivacyRepository(infra.DB)
 	m.privacyExporter = filesvc.NewPrivacyExporter(privacyRepo, infra.Storage)
 	m.privacyEraser = filesvc.NewPrivacyEraser(privacyRepo, infra.Storage)
 	if settings.TrashRetentionDays > 0 {

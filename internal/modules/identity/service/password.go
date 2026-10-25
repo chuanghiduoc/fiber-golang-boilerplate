@@ -7,6 +7,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // ChangePasswordInput sets a new password after verifying the current one.
@@ -67,6 +68,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 		return apperror.NewInternal("failed to hash password")
 	}
 
+	ctx = database.WithRLSBypass(ctx) // A password change ends the user's sessions in every tenant.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if changeErr := replacePassword(ctx, tx.Stores, userID, string(hash)); changeErr != nil {
 			return changeErr

@@ -277,8 +277,14 @@ normally and its requests return 404.
 
 Repositories derive the tenant from `tenant.EffectiveID(ctx)`; the tenant-1
 fallback is only for jobs, internal callers, and tests. Cross-tenant ids or
-tokens behave as not found. Row-level security and per-tenant limits remain
-future work.
+tokens behave as not found. As a second line, every tenant-owned table has
+forced row-level security: `database.TxManager` and `database.Scoped` set the
+transaction-local `app.tenant_id`/`app.rls_bypass` settings, so a query that
+forgot its predicate still cannot read or write another tenant's rows. The
+deliberate cross-tenant paths (global job work, retention, feature snapshots,
+webhook inbound lookup, global-user operations) set `database.WithRLSBypass`;
+see [ADR 0007](adr/0007-row-level-security-after-schema.md). Per-tenant limits
+remain future work.
 
 ## Authorization
 

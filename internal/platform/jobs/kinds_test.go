@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
 func TestKindFilterOptionsReachTheStore(t *testing.T) {
@@ -38,26 +40,26 @@ func TestClaimIntegrationKindFilters(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	queue := NewQueue(pool)
+	queue := NewQueue(pgtest.Scoped(pool))
 	for _, kind := range []string{"kinds.fast", "kinds.slow", "kinds.other"} {
 		_, err := queue.Enqueue(ctx, Job{Kind: kind})
 		require.NoError(t, err)
 	}
 
-	dedicated := &pgStore{pool: pool, includeKinds: []string{"kinds.slow"}}
+	dedicated := &pgStore{db: pgtest.Scoped(pool), includeKinds: []string{"kinds.slow"}}
 	claimed, err := dedicated.Claim(ctx, "slow-worker", 10, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	assert.Equal(t, "kinds.slow", claimed[0].Kind)
 	assert.GreaterOrEqual(t, claimed[0].QueueLag, time.Duration(0))
 
-	general := &pgStore{pool: pool, excludeKinds: []string{"kinds.slow", "kinds.other"}}
+	general := &pgStore{db: pgtest.Scoped(pool), excludeKinds: []string{"kinds.slow", "kinds.other"}}
 	claimed, err = general.Claim(ctx, "general-worker", 10, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)
 	assert.Equal(t, "kinds.fast", claimed[0].Kind)
 
-	unfiltered := newPGStore(pool)
+	unfiltered := newPGStore(pgtest.Scoped(pool))
 	claimed, err = unfiltered.Claim(ctx, "any-worker", 10, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, claimed, 1)

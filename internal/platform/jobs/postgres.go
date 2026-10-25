@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // claimJobsSQL atomically requeues jobs whose worker lease expired and claims
@@ -171,7 +171,7 @@ const purgeBatchSize = 1000
 
 // pgStore is the PostgreSQL implementation of store.
 type pgStore struct {
-	pool *pgxpool.Pool
+	db database.DBTX
 	// includeKinds and excludeKinds narrow claims; nil means no filter.
 	includeKinds []string
 	excludeKinds []string
@@ -179,14 +179,14 @@ type pgStore struct {
 
 var _ store = (*pgStore)(nil)
 
-func newPGStore(pool *pgxpool.Pool) *pgStore {
-	return &pgStore{pool: pool}
+func newPGStore(db database.DBTX) *pgStore {
+	return &pgStore{db: db}
 }
 
 // Claim takes up to limit due jobs for workerID and stamps each with a lease
 // deadline of now() + lease. Expired leases of any worker are recovered first.
 func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease time.Duration) ([]claimedJob, error) {
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return nil, ErrNoPool
 	}
 	if limit <= 0 {
@@ -195,8 +195,9 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease t
 	if lease <= 0 {
 		lease = defaultLeaseDuration
 	}
+	ctx = database.WithRLSBypass(ctx) // Claim and lease recovery span every tenant.
 
-	rows, err := s.pool.Query(ctx, claimJobsSQL, limit, workerID, lease.Seconds(), s.includeKinds, s.excludeKinds)
+	rows, err := s.db.Query(ctx, claimJobsSQL, limit, workerID, lease.Seconds(), s.includeKinds, s.excludeKinds)
 	if err != nil {
 		return nil, fmt.Errorf("jobs: claim: %w", err)
 	}
@@ -227,10 +228,11 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease t
 }
 
 func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string, attempts int) error {
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, succeedJobSQL, id, workerID, attempts)
+	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
+	tag, err := s.db.Exec(ctx, succeedJobSQL, id, workerID, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: mark %d succeeded: %w", id, err)
 	}
@@ -241,10 +243,11 @@ func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string, attemp
 }
 
 func (s *pgStore) Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error {
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, failJobSQL, id, workerID, reason, retryAt, attempts)
+	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
+	tag, err := s.db.Exec(ctx, failJobSQL, id, workerID, reason, retryAt, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: mark %d failed: %w", id, err)
 	}
@@ -255,10 +258,11 @@ func (s *pgStore) Fail(ctx context.Context, id int64, workerID string, attempts 
 }
 
 func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error {
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
-	tag, err := s.pool.Exec(ctx, releaseJobSQL, id, workerID, reason, attempts)
+	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
+	tag, err := s.db.Exec(ctx, releaseJobSQL, id, workerID, reason, attempts)
 	if err != nil {
 		return fmt.Errorf("jobs: release %d: %w", id, err)
 	}
@@ -273,13 +277,14 @@ func (s *pgStore) Release(ctx context.Context, id int64, workerID string, attemp
 // reported as ErrLeaseLost; the caller logs it but leaves the handler running.
 // The new deadline is now() + lease, the owning worker's own lease duration.
 func (s *pgStore) Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error {
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return ErrNoPool
 	}
 	if lease <= 0 {
 		lease = defaultLeaseDuration
 	}
-	tag, err := s.pool.Exec(ctx, heartbeatJobSQL, id, workerID, attempts, lease.Seconds())
+	ctx = database.WithRLSBypass(ctx) // The claimed job may belong to any tenant.
+	tag, err := s.db.Exec(ctx, heartbeatJobSQL, id, workerID, attempts, lease.Seconds())
 	if err != nil {
 		return fmt.Errorf("jobs: heartbeat %d: %w", id, err)
 	}
@@ -298,16 +303,17 @@ func (s *pgStore) PurgeTerminal(ctx context.Context, olderThan time.Duration) (i
 	if olderThan <= 0 {
 		return 0, ErrInvalidRetention
 	}
-	if s == nil || s.pool == nil {
+	if s == nil || s.db == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention deletes terminal jobs of every tenant.
 
 	var total int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, fmt.Errorf("jobs: purge terminal jobs: %w", err)
 		}
-		tag, err := s.pool.Exec(ctx, purgeTerminalJobsSQL, olderThan.Seconds(), purgeBatchSize)
+		tag, err := s.db.Exec(ctx, purgeTerminalJobsSQL, olderThan.Seconds(), purgeBatchSize)
 		if err != nil {
 			return total, fmt.Errorf("jobs: purge terminal jobs: %w", err)
 		}

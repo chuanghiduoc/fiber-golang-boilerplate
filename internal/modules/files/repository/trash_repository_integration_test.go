@@ -23,7 +23,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -96,7 +95,7 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	recentID, recentPath := insertFile(t, pool, store, tenant.DefaultID, userA, "recent", recent, true)
 	liveID, livePath := insertFile(t, pool, store, tenantB, userB, "live", 0, true)
 
-	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(database.NewTxManager(pool)), store, trashRetentionDays)
+	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(testutil.NewTxManager(pool)), store, trashRetentionDays)
 	ctx := context.Background()
 	require.NoError(t, purger.HandleJob(ctx, nil))
 
@@ -130,8 +129,8 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 
 	ctx := context.Background()
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	files := filesrepo.NewFileRepository(pool)
-	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
+	files := filesrepo.NewFileRepository(testutil.Scoped(pool))
+	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
 	failure := errors.New("hard delete never ran")
 	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
 		require.Len(t, batch, 1)
@@ -171,7 +170,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	_, err = tx.Exec(ctx, `UPDATE files SET deleted_at = NULL WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
+	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
 	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, error) {
 		t.Fatal("a row locked by a restore must be skipped")
 		return nil, nil

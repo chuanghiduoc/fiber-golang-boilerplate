@@ -18,11 +18,12 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
 func TestSchedulerIntegrationLeaderLease(t *testing.T) {
 	pool := setupSchedulerIntegrationDB(t)
-	store := newPGStore(pool)
+	store := newPGStore(pool, pgtest.NewTxManager(pool))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -64,8 +65,8 @@ func TestSchedulerIntegrationRunLedgerAndEnqueue(t *testing.T) {
 	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
-	store := newPGStore(pool)
-	queue := jobs.NewQueue(pool)
+	store := newPGStore(pool, pgtest.NewTxManager(pool))
+	queue := jobs.NewQueue(pgtest.Scoped(pool))
 	slot := time.Date(2026, 10, 24, 12, 5, 0, 0, time.UTC)
 	run := runRecord{Schedule: "cleanup", ScheduledFor: slot, Status: runStatusEnqueued}
 	job := jobs.Job{
@@ -157,7 +158,7 @@ func TestSchedulerIntegrationPurgeKeepsLatestSlot(t *testing.T) {
 		TenantID: tenant.DefaultID,
 	}))
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
-	sched := New(pool, registry, jobs.NewQueue(pool), "integration-node-purge",
+	sched := New(pool, pgtest.NewTxManager(pool), registry, jobs.NewQueue(pgtest.Scoped(pool)), "integration-node-purge",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
@@ -206,15 +207,15 @@ func TestSchedulerIntegrationSingleLeaderEnqueuesOnce(t *testing.T) {
 		Kind:     "integration.scheduler.tick",
 		TenantID: tenant.DefaultID,
 	}))
-	queue := jobs.NewQueue(pool)
+	queue := jobs.NewQueue(pgtest.Scoped(pool))
 
-	first := New(pool, registry, queue, "integration-node-a",
+	first := New(pool, pgtest.NewTxManager(pool), registry, queue, "integration-node-a",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
 		WithCatchup(CatchupLatest),
 	)
-	second := New(pool, registry, queue, "integration-node-b",
+	second := New(pool, pgtest.NewTxManager(pool), registry, queue, "integration-node-b",
 		WithPollInterval(10*time.Millisecond),
 		WithHeartbeatInterval(50*time.Millisecond),
 		WithLeaseTTL(time.Second),
@@ -302,13 +303,9 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	poolCfg, err := pgxpool.ParseConfig(dsn)
-	require.NoError(t, err)
-	poolCfg.ConnConfig.RuntimeParams["search_path"] = schema
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	pool, err := pgtest.OpenAppPool(ctx, dsn, schema)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
 
 	return pool
 }

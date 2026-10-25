@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -55,7 +55,7 @@ WHERE id = $1
 
 // PostgresRecorder writes audit events to the audit_events table.
 type PostgresRecorder struct {
-	pool *pgxpool.Pool
+	db database.DBTX
 }
 
 var (
@@ -65,9 +65,10 @@ var (
 	_ CompletionRecorder = (*PostgresRecorder)(nil)
 )
 
-// NewPostgresRecorder returns a recorder backed by pool.
-func NewPostgresRecorder(pool *pgxpool.Pool) *PostgresRecorder {
-	return &PostgresRecorder{pool: pool}
+// NewPostgresRecorder returns a recorder backed by db. Production passes a
+// database.Scoped handle so each row is written under its context's tenant.
+func NewPostgresRecorder(db database.DBTX) *PostgresRecorder {
+	return &PostgresRecorder{db: db}
 }
 
 type eventValues struct {
@@ -144,7 +145,7 @@ func (r *PostgresRecorder) Record(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	_, err = r.pool.Exec(ctx, insertEventSQL, insertArgs(event, values)...)
+	_, err = r.db.Exec(ctx, insertEventSQL, insertArgs(event, values)...)
 	if err != nil {
 		return fmt.Errorf("audit: insert event: %w", err)
 	}
@@ -183,7 +184,7 @@ func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (int64, er
 		return 0, err
 	}
 	var id int64
-	if err := r.pool.QueryRow(ctx, insertEventSQL+`
+	if err := r.db.QueryRow(ctx, insertEventSQL+`
  RETURNING id`, insertArgs(event, values)...).Scan(&id); err != nil {
 		return 0, fmt.Errorf("audit: insert intent event: %w", err)
 	}
@@ -207,7 +208,7 @@ func (r *PostgresRecorder) Complete(ctx context.Context, id int64, completion Co
 	if completedAt.IsZero() {
 		completedAt = time.Now().UTC()
 	}
-	tag, err := r.pool.Exec(ctx, completeEventSQL,
+	tag, err := r.db.Exec(ctx, completeEventSQL,
 		id,
 		completion.Outcome,
 		nullableStatusCode(completion.StatusCode),

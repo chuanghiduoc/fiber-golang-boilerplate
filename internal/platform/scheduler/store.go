@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 var (
@@ -116,14 +117,18 @@ DELETE FROM scheduler_runs AS r
 USING batch
 WHERE r.id = batch.id`
 
+// pgStore reads the scheduler's own coordination tables from pool. Those have
+// no tenant column, so no RLS scope applies; run transactions go through tx so
+// the job enqueued inside them carries the right scope.
 type pgStore struct {
 	pool *pgxpool.Pool
+	tx   *database.TxManager
 }
 
 var _ store = (*pgStore)(nil)
 
-func newPGStore(pool *pgxpool.Pool) *pgStore {
-	return &pgStore{pool: pool}
+func newPGStore(pool *pgxpool.Pool, tx *database.TxManager) *pgStore {
+	return &pgStore{pool: pool, tx: tx}
 }
 
 func (s *pgStore) AcquireLease(ctx context.Context, holder string, ttl time.Duration) (bool, error) {
@@ -184,56 +189,55 @@ func (s *pgStore) EnqueueRun(ctx context.Context, queue Queue, run runRecord, jo
 		return false, ErrNoQueue
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("scheduler: begin run transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	ctx = database.WithRLSBypass(ctx) // Schedules enqueue global platform jobs, not a tenant's.
+	enqueued := false
+	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		var runID int64
+		err := tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("scheduler: record run for %q: %w", run.Schedule, err)
+		}
 
-	var runID int64
-	err = tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
+		jobID, _, err := queue.EnqueueOnceTx(ctx, tx, job)
+		if err != nil {
+			return fmt.Errorf("scheduler: enqueue %q for %q: %w", job.Kind, run.Schedule, err)
+		}
+		if _, err := tx.Exec(ctx, setRunJobSQL, jobID, runID); err != nil {
+			return fmt.Errorf("scheduler: attach job to run for %q: %w", run.Schedule, err)
+		}
+		enqueued = true
+		return nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("scheduler: record run for %q: %w", run.Schedule, err)
+		return false, err
 	}
-
-	jobID, _, err := queue.EnqueueOnceTx(ctx, tx, job)
-	if err != nil {
-		return false, fmt.Errorf("scheduler: enqueue %q for %q: %w", job.Kind, run.Schedule, err)
-	}
-	if _, err := tx.Exec(ctx, setRunJobSQL, jobID, runID); err != nil {
-		return false, fmt.Errorf("scheduler: attach job to run for %q: %w", run.Schedule, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("scheduler: commit run for %q: %w", run.Schedule, err)
-	}
-	return true, nil
+	return enqueued, nil
 }
 
 func (s *pgStore) SkipRun(ctx context.Context, run runRecord) (bool, error) {
 	if s == nil || s.pool == nil {
 		return false, ErrNoPool
 	}
-	tx, err := s.pool.Begin(ctx)
+	skipped := false
+	err := s.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		var runID int64
+		err := tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("scheduler: record skipped run for %q: %w", run.Schedule, err)
+		}
+		skipped = true
+		return nil
+	})
 	if err != nil {
-		return false, fmt.Errorf("scheduler: begin skip transaction: %w", err)
+		return false, err
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
-
-	var runID int64
-	err = tx.QueryRow(ctx, insertRunSQL, run.Schedule, run.ScheduledFor, run.Status, run.Error).Scan(&runID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("scheduler: record skipped run for %q: %w", run.Schedule, err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("scheduler: commit skipped run for %q: %w", run.Schedule, err)
-	}
-	return true, nil
+	return skipped, nil
 }
 
 func (s *pgStore) PurgeRuns(ctx context.Context, olderThan time.Duration) (int64, error) {

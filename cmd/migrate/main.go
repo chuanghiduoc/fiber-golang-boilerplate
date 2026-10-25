@@ -201,6 +201,35 @@ var requiredTriggers = map[string][]string{
 	},
 }
 
+// requiredRLS lists every table with a tenant_id column. Row-level security
+// must be enabled and forced on each, with the tenant_isolation policy, or a
+// query that forgot its tenant predicate could read another tenant's rows.
+var requiredRLS = []string{
+	"tenant_settings",
+	"memberships",
+	"membership_roles",
+	"roles",
+	"invitations",
+	"sessions",
+	"refresh_tokens",
+	"data_exports",
+	"api_keys",
+	"files",
+	"feature_flag_targets",
+	"notifications",
+	"notification_preferences",
+	"jobs",
+	"audit_events",
+	"webhook_endpoints",
+	"webhook_endpoint_subscriptions",
+	"webhook_endpoint_secrets",
+	"webhook_events",
+	"webhook_deliveries",
+	"webhook_delivery_attempts",
+	"webhook_inbound_sources",
+	"webhook_inbound_events",
+}
+
 // requiredTenantLeadingIndexes are the query indexes that must start with
 // tenant_id. Checking the first key column (not just the index name) catches a
 // legacy global index that kept its name after the tenant rewrite.
@@ -382,6 +411,7 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 		func() ([]string, error) { return checkColumns(ctx, pool, schema, foundTables) },
 		func() ([]string, error) { return checkUniqueIndexes(ctx, pool, schema) },
 		func() ([]string, error) { return checkTenantLeadingIndexes(ctx, pool, schema) },
+		func() ([]string, error) { return checkRLS(ctx, pool, schema) },
 		func() ([]string, error) { return checkTriggers(ctx, pool, schema) },
 		func() ([]string, error) { return checkDefaultTenant(ctx, pool, foundTables) },
 	}
@@ -543,6 +573,55 @@ func checkTenantLeadingIndexes(ctx context.Context, pool *pgxpool.Pool, schema s
 				missing = append(missing, "tenant-leading index "+table+"."+index+
 					" starts with "+firstColumn+", want tenant_id")
 			}
+		}
+	}
+	return missing, nil
+}
+
+// checkRLS reports tenant-owned tables where row-level security is not enabled
+// and forced, or where the tenant_isolation policy is missing. A missing table
+// is already reported by checkTables.
+func checkRLS(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	type state struct {
+		enabled bool
+		forced  bool
+		policy  bool
+	}
+	found := make(map[string]state, len(requiredRLS))
+	err := scanRows(ctx, pool, "verify row-level security", "verify schema: scan row-level security",
+		func(rows pgx.Rows) error {
+			var table string
+			var s state
+			if err := rows.Scan(&table, &s.enabled, &s.forced, &s.policy); err != nil {
+				return err
+			}
+			found[table] = s
+			return nil
+		},
+		`SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+		        EXISTS (SELECT 1 FROM pg_policy p
+		                WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation')
+		 FROM pg_class c
+		 JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+		schema, requiredRLS,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, table := range requiredRLS {
+		s, ok := found[table]
+		switch {
+		case !ok:
+			continue
+		case !s.enabled:
+			missing = append(missing, "row-level security on "+table)
+		case !s.forced:
+			missing = append(missing, "forced row-level security on "+table)
+		case !s.policy:
+			missing = append(missing, "tenant_isolation policy on "+table)
 		}
 	}
 	return missing, nil

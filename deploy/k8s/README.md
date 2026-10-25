@@ -200,6 +200,16 @@ Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
 | `*_PREVIOUS_*` keys | commented out; set only during a [rotation](#secret-rotation) |
 | `<NAME>_FILE` | any secret setting may instead point at a mounted file (for example `JWT_SECRET_FILE=/run/secrets/jwt`); setting both forms fails startup |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` (+ optional `ADMIN_NAME`) | commented out, so no admin is bootstrapped. Uncomment both to create one on API startup; password ≥ 12 characters. Setting only one fails production config validation |
+| `DB_PASSWORD` | Password of the runtime `app` role (`DB_USERNAME`). It must not be a superuser or have `BYPASSRLS`; production startup refuses one |
+| `DB_MIGRATE_PASSWORD` | Password of the schema owner (`DB_MIGRATE_USERNAME`), read only by the migration Job |
+
+Create the runtime role once as the owner before the first migration
+(ADR 0007); the same script is in the repository:
+
+```bash
+psql -v app_user=app -v app_password='<DB_PASSWORD>' -v owner=postgres -v schema=public \
+  -f deploy/postgres/database-roles.sql
+```
 
 If the GHCR package is private, create a pull Secret and uncomment
 `imagePullSecrets` in `base/deployment.yaml` (and add it to

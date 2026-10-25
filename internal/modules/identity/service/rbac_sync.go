@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // SyncPermissions writes the code-owned permission catalog and the system
@@ -33,6 +34,7 @@ func SyncPermissions(ctx context.Context, tx Transactor, roles RoleRepository) e
 	}
 	platformPermissions := permissionKeys(authz.AllPlatformPermissions())
 
+	ctx = database.WithRLSBypass(ctx) // System roles (tenant_id NULL) are shared by every tenant.
 	err := tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		return tx.Roles.SyncCatalog(ctx, permissions, []CatalogRole{
 			{Key: authz.RoleOwner, Name: "Owner", Scope: "tenant", Permissions: tenantPermissions},

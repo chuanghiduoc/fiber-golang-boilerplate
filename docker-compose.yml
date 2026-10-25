@@ -44,8 +44,9 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
-      DB_USERNAME: ${DB_USERNAME:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-password}
+      # Runtime role: non-superuser, subject to FORCE row-level security.
+      DB_USERNAME: ${DB_USERNAME:-app}
+      DB_PASSWORD: ${DB_PASSWORD:-app-password}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
@@ -102,8 +103,9 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
-      DB_USERNAME: ${DB_USERNAME:-postgres}
-      DB_PASSWORD: ${DB_PASSWORD:-password}
+      # The schema owner applies DDL; the API never uses this role.
+      DB_USERNAME: ${DB_MIGRATE_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_MIGRATE_PASSWORD:-password}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
     depends_on:
@@ -122,18 +124,25 @@ services:
           cpus: "1.0"
     environment:
       POSTGRES_DB: ${DB_DATABASE:-boilerplate}
-      POSTGRES_USER: ${DB_USERNAME:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-password}
+      # The container superuser owns the schema and runs migrations.
+      POSTGRES_USER: ${DB_MIGRATE_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_MIGRATE_PASSWORD:-password}
+      # The init hook below creates this non-superuser role for the app.
+      APP_DB_USERNAME: ${DB_USERNAME:-app}
+      APP_DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      DB_SCHEMA: ${DB_SCHEMA:-public}
     ports:
       - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
+      - ./deploy/postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+      - ./deploy/postgres/database-roles.sql:/opt/app/database-roles.sql:ro
       # PostgreSQL 18+ images keep PGDATA in /var/lib/postgresql/<major>/docker
       # and declare the volume at /var/lib/postgresql. The volume is renamed so
       # a PostgreSQL 17 data directory is never opened by 18; a major upgrade
       # needs pg_dump/pg_restore (see docs/operations.md).
       - postgres18_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres} -d ${DB_DATABASE:-boilerplate}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_MIGRATE_USERNAME:-postgres} -d ${DB_DATABASE:-boilerplate}"]
       interval: 5s
       timeout: 5s
       retries: 5

@@ -21,6 +21,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -276,6 +277,7 @@ func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) 
 // commits one erase job per membership plus the global finalizer and a Tier 1
 // audit row.
 func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, action string) error {
+	ctx = database.WithRLSBypass(ctx) // Erasure reads and writes every tenant the user belongs to.
 	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if tx.Privacy == nil || tx.Jobs == nil {
 			return apperror.NewInternal("privacy services are not configured")
@@ -593,6 +595,7 @@ func (s *PrivacyService) HandleFinalizeJob(ctx context.Context, payload json.Raw
 }
 
 func (s *PrivacyService) finalizeUser(ctx context.Context, userID int64) (bool, error) {
+	ctx = database.WithRLSBypass(ctx) // The finalizer checks and cleans every tenant.
 	memberships, err := s.stores.Memberships.ListForUser(ctx, userID)
 	if err != nil {
 		return false, fmt.Errorf("load memberships: %w", err)

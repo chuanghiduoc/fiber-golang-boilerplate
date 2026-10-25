@@ -14,6 +14,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
 // startStressWorker runs a worker until the returned stop function is called
@@ -60,7 +62,7 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 		handlerDelay      = 5 * time.Millisecond
 	)
 
-	queue := NewQueue(pool)
+	queue := NewQueue(pgtest.Scoped(pool))
 	dbIDs := make(map[int]int64, total)
 	for i := 0; i < total; i++ {
 		id, err := queue.Enqueue(ctx, Job{
@@ -109,7 +111,7 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 			// claim or attempt fences.
 			workerID = "stress-shared"
 		}
-		worker := NewWorker(pool, workerID,
+		worker := NewWorker(pgtest.Scoped(pool), workerID,
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(10*time.Millisecond),
 			WithRetention(0),
@@ -192,7 +194,7 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 	poison := func(seq int) bool { return seq%10 < 3 }
 	expectedPoison := total / 10 * 3
 
-	queue := NewQueue(pool)
+	queue := NewQueue(pgtest.Scoped(pool))
 	for i := 0; i < total; i++ {
 		_, err := queue.Enqueue(ctx, Job{
 			Kind:        kind,
@@ -232,7 +234,7 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 
 	stops := make([]func(), 0, workerCount)
 	for i := 0; i < workerCount; i++ {
-		worker := NewWorker(pool, fmt.Sprintf("stress-retry-%d", i),
+		worker := NewWorker(pgtest.Scoped(pool), fmt.Sprintf("stress-retry-%d", i),
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(5*time.Millisecond),
 			WithRetention(0),
@@ -327,7 +329,7 @@ func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 		handlerDelay      = 10 * time.Millisecond
 	)
 
-	queue := NewQueue(pool)
+	queue := NewQueue(pgtest.Scoped(pool))
 
 	insertTerminal := func(jobKind, status string) int64 {
 		t.Helper()
@@ -404,7 +406,7 @@ func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 
 	stops := make([]func(), 0, workerCount)
 	for i := 0; i < workerCount; i++ {
-		worker := NewWorker(pool, fmt.Sprintf("stress-retention-%d", i),
+		worker := NewWorker(pgtest.Scoped(pool), fmt.Sprintf("stress-retention-%d", i),
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(5*time.Millisecond),
 			WithRetention(0),

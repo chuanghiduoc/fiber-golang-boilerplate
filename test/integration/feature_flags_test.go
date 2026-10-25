@@ -94,7 +94,7 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	stores := identityrepo.NewStores(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
 	tokenA := testutil.SessionToken(t, ctx, pool,
 		testutil.Member{UserID: userA, TenantID: tenant.DefaultID, Email: "flags-a@test.com"}, featureSecret)

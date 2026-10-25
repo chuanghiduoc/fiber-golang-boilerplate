@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
 )
 
@@ -202,6 +203,7 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate recovery codes")
 	}
+	ctx = database.WithRLSBypass(ctx) // Confirming MFA ends the user's other sessions in every tenant.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		confirmed, err := tx.MFA.ConfirmTOTP(ctx, factor.ID, userID, step)
 		if err != nil {
@@ -238,6 +240,7 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 	if err != nil {
 		return err
 	}
+	ctx = database.WithRLSBypass(ctx) // Disabling MFA ends the user's other sessions in every tenant.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := s.consumeCode(ctx, tx.Stores, userID, matched); err != nil {
 			return err

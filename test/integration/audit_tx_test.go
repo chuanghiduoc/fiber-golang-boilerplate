@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,11 +38,48 @@ import (
 
 type auditTxHarness struct {
 	pool     *pgxpool.Pool
-	recorder *audit.PostgresRecorder
+	recorder *toggleRecorder
 	tx       *database.TxManager
 	identity identityservice.Stores
 	files    *filesrepo.FileRepository
 	store    storage.Storage
+}
+
+// toggleRecorder fails every audit write on demand, so a test can prove a
+// mutation rolls back with its Tier 1 row without table-owner DDL.
+type toggleRecorder struct {
+	inner *audit.PostgresRecorder
+	fail  bool
+}
+
+var errAuditDown = errors.New("forced audit insert failure")
+
+func (r *toggleRecorder) Record(ctx context.Context, event audit.Event) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.Record(ctx, event)
+}
+
+func (r *toggleRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event audit.Event) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.RecordTx(ctx, tx, event)
+}
+
+func (r *toggleRecorder) RecordID(ctx context.Context, event audit.Event) (int64, error) {
+	if r.fail {
+		return 0, errAuditDown
+	}
+	return r.inner.RecordID(ctx, event)
+}
+
+func (r *toggleRecorder) Complete(ctx context.Context, id int64, completion audit.Completion) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.Complete(ctx, id, completion)
 }
 
 func setupAuditTxHarness(t *testing.T) *auditTxHarness {
@@ -56,10 +94,10 @@ func setupAuditTxHarness(t *testing.T) *auditTxHarness {
 
 	return &auditTxHarness{
 		pool:     pool,
-		recorder: audit.NewPostgresRecorder(pool),
-		tx:       database.NewTxManager(pool),
-		identity: identityrepo.NewStores(pool),
-		files:    filesrepo.NewFileRepository(pool),
+		recorder: &toggleRecorder{inner: audit.NewPostgresRecorder(testutil.Scoped(pool))},
+		tx:       testutil.NewTxManager(pool),
+		identity: identityrepo.NewStores(testutil.Scoped(pool)),
+		files:    filesrepo.NewFileRepository(testutil.Scoped(pool)),
 		store:    store,
 	}
 }
@@ -99,24 +137,7 @@ func (h *auditTxHarness) insertUser(t *testing.T, tenantID int64, email, role st
 
 func (h *auditTxHarness) installInsertFailure(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
-	_, err := h.pool.Exec(ctx, `
-		CREATE OR REPLACE FUNCTION test_audit_insert_failure() RETURNS trigger AS $$
-		BEGIN
-			RAISE EXCEPTION 'forced audit insert failure';
-		END;
-		$$ LANGUAGE plpgsql;
-		CREATE TRIGGER test_audit_insert_failure
-			BEFORE INSERT ON audit_events
-			FOR EACH ROW EXECUTE FUNCTION test_audit_insert_failure();`)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = h.pool.Exec(cleanupCtx,
-			`DROP TRIGGER IF EXISTS test_audit_insert_failure ON audit_events`)
-		_, _ = h.pool.Exec(cleanupCtx, `DROP FUNCTION IF EXISTS test_audit_insert_failure()`)
-	})
+	h.recorder.fail = true
 }
 
 func requireAuditUnavailable(t *testing.T, err error) {
@@ -242,8 +263,8 @@ func TestFilesEvents_AdminAndRestorePublishInTx(t *testing.T) {
 		tenant.DefaultID, ownerID,
 	).Scan(&fileID))
 
-	queue := jobs.NewQueue(h.pool)
-	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue))
+	queue := jobs.NewQueue(testutil.Scoped(h.pool))
+	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(testutil.Scoped(h.pool), testutil.NewTxManager(h.pool), queue))
 	bus := events.New(queue)
 	for _, eventType := range []string{filescontracts.EventFileDeleted, filescontracts.EventFileRestored} {
 		require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", dispatcher.HandleEvent))

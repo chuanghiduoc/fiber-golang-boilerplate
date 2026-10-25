@@ -66,4 +66,6 @@ DROP TABLE IF EXISTS tenant_settings;
 DROP TABLE IF EXISTS tenants;
 
 -- owner: platform
+-- Each tenant-owned table above drops its own tenant_isolation policy with it.
+DROP FUNCTION IF EXISTS app_tenant_visible(BIGINT);
 DROP FUNCTION IF EXISTS update_updated_at();

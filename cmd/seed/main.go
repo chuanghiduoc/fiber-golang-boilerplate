@@ -10,6 +10,7 @@ import (
 	_ "github.com/joho/godotenv/autoload"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -45,9 +46,12 @@ func run() error {
 	defer pool.Close()
 
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
-	stores := repository.NewStores(pool)
+	// Seeding reads and writes tenant-owned rows, so it uses the scoped handle
+	// like the API.
+	stores := repository.NewStores(database.NewScoped(pool, database.WithResolver(app.RLSResolver)))
 	// The seed writes no audit rows, so the transactor has no recorder.
-	transactor := repository.NewTransactor(database.NewTxManager(pool), nil, nil, nil)
+	transactor := repository.NewTransactor(
+		database.NewTxManager(pool, database.WithResolver(app.RLSResolver)), nil, nil, nil)
 	// Seeding checks existence, not request eligibility: an operator may need
 	// to seed an admin before reactivating a suspended default tenant.
 	_, defaultTenant, err := service.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)

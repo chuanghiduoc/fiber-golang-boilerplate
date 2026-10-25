@@ -91,7 +91,7 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
 	sender := &recordingEmailSender{}
-	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(pool), "links-integration-secret", sender)
+	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(testutil.Scoped(pool)), "links-integration-secret", sender)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	// require-header mode: password-reset and verification links must be able

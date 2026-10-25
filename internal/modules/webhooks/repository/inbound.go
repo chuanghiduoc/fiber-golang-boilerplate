@@ -79,6 +79,7 @@ func (r *Postgres) GetInboundSourceByID(ctx context.Context, id int64) (*webhook
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // The public receiver resolves a source by id before it knows the tenant.
 	row, err := r.q.GetWebhookInboundSourceByID(ctx, id)
 	if err != nil {
 		return nil, mapNotFound(err)
@@ -221,6 +222,7 @@ func (r *Postgres) PurgeInboundEvents(ctx context.Context, retentionDays int32) 
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeWebhookInboundEvents(ctx, webhooksqlc.PurgeWebhookInboundEventsParams{
 			RetentionDays: retentionDays,
