@@ -231,7 +231,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 | --- | --- |
 | identity | `Build(infra, Settings) (*Module, Provides, error)` (generated modules use this form) |
 | webhooks | `Build(infra, Settings, tenantActive) (*Module, Provides, error)`: contracts follow `settings` |
-| files | `Build(infra, Settings) (*Module, Provides)` |
+| files | `Build(infra, Settings, webhooks) (*Module, Provides)`: the webhooks contract follows `settings` |
 | apikeys | `Build(infra, principals) (*Module, Provides)` |
 | notifications, features | `Build(infra, ...) *Module` |
 | admin | `Build(identity, files) *Module` (contracts only) |
