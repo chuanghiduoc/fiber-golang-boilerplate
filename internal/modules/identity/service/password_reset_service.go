@@ -2,28 +2,21 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -37,6 +30,9 @@ const resetRequestMaxAttempts = 5
 // resetTokenTTL is how long an emailed reset link stays valid.
 const resetTokenTTL = time.Hour
 
+// PasswordResetService resets the (global) password. Reset tokens are per
+// user: the API looks a token up by its hash alone, and the emailed link's
+// tenant parameter only tells the frontend where to sign in afterwards.
 type PasswordResetService interface {
 	ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error
 	ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error
@@ -59,19 +55,27 @@ type resetRequestPayload struct {
 	TenantSlug string `json:"tenantSlug,omitempty"`
 }
 
+// ResetDeps are the password reset service's collaborators.
+type ResetDeps struct {
+	Stores       Stores
+	Tx           Transactor
+	Sender       email.Sender
+	Cache        cache.Cache
+	FrontendURL  string
+	SessionCache session.Store
+}
+
 type passwordResetService struct {
-	userRepo    repository.UserRepository
-	resetRepo   repository.PasswordResetRepository
-	refreshRepo repository.RefreshTokenRepository
-	txManager   *database.TxManager
-	emailSender email.Sender
-	cache       cache.Cache
-	frontendURL string
-	sessions    session.Store
+	ResetDeps
 	// requestQueue makes ForgotPassword constant-shape; requestCodec seals
 	// the address in the job payload at rest (nil stores plaintext JSON).
 	requestQueue ResetRequestQueue
 	requestCodec *jobs.PayloadCodec
+}
+
+// NewPasswordResetService wires the reset service.
+func NewPasswordResetService(deps ResetDeps) PasswordResetService {
+	return &passwordResetService{ResetDeps: deps}
 }
 
 // AttachResetRequestQueue moves forgot-password work into a durable job.
@@ -87,41 +91,14 @@ func AttachResetRequestQueue(svc PasswordResetService, queue ResetRequestQueue, 
 	}
 }
 
-func NewPasswordResetService(
-	userRepo repository.UserRepository,
-	resetRepo repository.PasswordResetRepository,
-	refreshRepo repository.RefreshTokenRepository,
-	emailSender email.Sender,
-	appCache cache.Cache,
-	frontendURL string,
-	txManager *database.TxManager,
-	sessions ...session.Store,
-) PasswordResetService {
-	var sessionStore session.Store
-	if len(sessions) > 0 {
-		sessionStore = sessions[0]
-	}
-	return &passwordResetService{
-		userRepo:    userRepo,
-		resetRepo:   resetRepo,
-		refreshRepo: refreshRepo,
-		txManager:   txManager,
-		emailSender: emailSender,
-		cache:       appCache,
-		frontendURL: frontendURL,
-		sessions:    sessionStore,
-	}
-}
-
 func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error {
 	emailAddr := NormalizeEmail(req.Email)
 
 	// Rate limit before the lookup, for every address. Increment is atomic and
 	// sets the TTL on the first request. Returning the same generic success
 	// response for known/unknown/limited addresses avoids an enumeration oracle.
-	cacheKey := scopedKey(ctx, "password_reset:", emailAddr)
-	if s.cache != nil {
-		if n, err := s.cache.Increment(ctx, cacheKey, 1*time.Minute); err == nil && n > 1 {
+	if s.Cache != nil {
+		if n, err := s.Cache.Increment(ctx, emailKey("password_reset:", emailAddr), time.Minute); err == nil && n > 1 {
 			return nil
 		}
 	}
@@ -182,45 +159,45 @@ func (s *passwordResetService) HandleResetRequestJob(ctx context.Context, payloa
 // reset token and enqueues the email in one transaction.
 func (s *passwordResetService) processResetRequest(ctx context.Context, emailAddr string) error {
 	// Unknown addresses succeed silently so callers cannot enumerate accounts.
-	user, err := s.userRepo.GetByEmail(ctx, emailAddr)
+	user, err := s.Stores.Users.GetByEmail(ctx, emailAddr)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil // Silent fail
+			return nil
 		}
 		return apperror.NewInternal("failed to process request")
 	}
+	if user.Status != UserStatusActive {
+		return nil
+	}
 
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
+	token, tokenHash, err := newOpaqueToken()
+	if err != nil {
 		return apperror.NewInternal("failed to generate reset token")
 	}
-	token := hex.EncodeToString(b)
-
-	resetURL := tokenLink(ctx, s.frontendURL, "reset-password", token)
+	resetURL := tokenLink(ctx, s.FrontendURL, "reset-password", token)
 	msg := email.Message{
 		To:      []string{user.Email},
 		Subject: "Password Reset Request",
 		HTML:    fmt.Sprintf("<p>Click <a href=%q>here</a> to reset your password. This link expires in 1 hour.</p>", resetURL),
 	}
-	txSender, transactional := s.emailSender.(transactionalEmailSender)
 
 	// issued is false when the account changed its address (or was deleted)
 	// after the lookup: no token exists for the old address, so nothing is
 	// sent. queuedInTx records that the email was enqueued on the token
 	// transaction, so the fallback send below must not run as well.
 	var issued, queuedInTx bool
-	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
-		created, createErr := replaceResetToken(ctx, r.resets, user, token)
+	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		created, createErr := replaceResetToken(ctx, tx.Resets, user, tokenHash)
 		if createErr != nil || !created {
 			return createErr
 		}
 		issued = true
-		if tx == nil || !transactional {
+		if tx.Mail == nil {
 			return nil
 		}
 		// Enqueue on the same transaction: a crash between the token insert
 		// and the enqueue cannot leave a usable reset link without an email.
-		if sendErr := txSender.SendTx(ctx, tx, msg); sendErr != nil {
+		if sendErr := tx.Mail.Send(ctx, msg); sendErr != nil {
 			slog.Error("failed to enqueue password reset email",
 				slog.Int64("user_id", user.ID),
 				slog.Any("error", sendErr),
@@ -234,37 +211,22 @@ func (s *passwordResetService) processResetRequest(ctx context.Context, emailAdd
 		return err
 	}
 	if issued && !queuedInTx {
-		s.sendResetEmailAsync(ctx, user, msg)
+		s.sendResetEmailAsync(ctx, user.ID, msg)
 	}
 	return nil
 }
 
-// replaceResetToken replaces the user's reset token with token. It reports
-// false, without error, when the account no longer has the address the
-// request was made for: CreatePasswordResetToken re-checks the address under
-// a row lock, so an email change between the lookup and this insert can never
-// mail a valid link to the previous address.
-func replaceResetToken(ctx context.Context, resets repository.PasswordResetRepository, user *identitysqlc.User, token string) (bool, error) {
-	// Delete old tokens and create the new one in a single transaction so two
-	// concurrent requests cannot leave two live reset links behind.
-	if err := resets.DeleteByUserID(ctx, user.ID); err != nil {
-		return false, apperror.NewInternal("failed to clear old reset tokens")
-	}
-	_, err := resets.Create(ctx, identitysqlc.CreatePasswordResetTokenParams{
-		TenantID:  tenant.EffectiveID(ctx),
-		UserID:    user.ID,
-		Token:     hashToken(token),
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(resetTokenTTL), Valid: true},
-		Email:     user.Email,
-	})
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, apperror.ErrNotFound):
-		return false, nil
-	default:
+// replaceResetToken replaces the user's reset token. It reports false,
+// without error, when the account no longer has the address the request was
+// made for: the insert re-checks the address under a row lock, so an email
+// change between the lookup and this insert can never mail a valid link to
+// the previous address.
+func replaceResetToken(ctx context.Context, resets PasswordResetRepository, user *User, tokenHash string) (bool, error) {
+	created, err := resets.Create(ctx, user.ID, user.Email, tokenHash, time.Now().Add(resetTokenTTL))
+	if err != nil {
 		return false, apperror.NewInternal("failed to create reset token")
 	}
+	return created, nil
 }
 
 // sendResetEmailAsync sends the reset email after commit when the sender
@@ -272,25 +234,17 @@ func replaceResetToken(ctx context.Context, resets repository.PasswordResetRepos
 // oracle and must not block the request; failures are logged, never
 // returned. The request tenant is carried explicitly: a bare background
 // context would enqueue the job under the default tenant.
-func (s *passwordResetService) sendResetEmailAsync(ctx context.Context, user *identitysqlc.User, msg email.Message) {
-	tenantID := user.TenantID
-	if tenantID <= 0 {
-		tenantID = tenant.EffectiveID(ctx)
-	}
-	tenantSlug := tenant.SlugFromContext(ctx)
+func (s *passwordResetService) sendResetEmailAsync(ctx context.Context, userID int64, msg email.Message) {
+	tenantID, tenantSlug := tenant.EffectiveID(ctx), tenant.SlugFromContext(ctx)
 	async.Go(func() {
 		sendCtx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
-		if err := s.emailSender.Send(sendCtx, msg); err != nil {
+		if err := s.Sender.Send(sendCtx, msg); err != nil {
 			slog.Warn("failed to send password reset email",
-				slog.Int64("user_id", user.ID),
+				slog.Int64("user_id", userID),
 				slog.Any("error", err),
 			)
 		}
 	})
-}
-
-func (s *passwordResetService) fallbackRepos() repos {
-	return repos{users: s.userRepo, refresh: s.refreshRepo, resets: s.resetRepo}
 }
 
 func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error {
@@ -308,16 +262,16 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 		return apperror.NewInternal("failed to hash password")
 	}
 
-	var userID int64
-	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(_ pgx.Tx, r repos) error {
-		owner, consumeErr := consumeResetToken(ctx, r, tokenHash)
+	var owner *User
+	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		user, consumeErr := consumeResetToken(ctx, tx.Stores, tokenHash)
 		if consumeErr != nil {
 			return consumeErr
 		}
-		if resetErr := applyPasswordReset(ctx, r, owner, hash); resetErr != nil {
+		if resetErr := replacePassword(ctx, tx.Stores, user.ID, string(hash)); resetErr != nil {
 			return resetErr
 		}
-		userID = owner
+		owner = user
 		return nil
 	})
 	if err != nil {
@@ -326,12 +280,8 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 
 	// A successful reset must also clear any brute-force lockout so the user
 	// can actually sign in with the new password.
-	if s.cache != nil {
-		if user, err := s.userRepo.GetByID(ctx, userID); err == nil {
-			clearLoginAttempts(ctx, s.cache, NormalizeEmail(user.Email))
-		}
-	}
-	invalidateSessions(ctx, s.sessions, userID)
+	clearLoginAttempts(ctx, s.Cache, owner.Email)
+	invalidateSessions(ctx, s.SessionCache, owner.ID)
 	return nil
 }
 
@@ -339,23 +289,20 @@ func invalidResetToken() error {
 	return apperror.NewBadRequest("invalid or expired reset token")
 }
 
-// precheckResetToken rejects an unknown, cross-tenant, or expired token
-// before any password hashing.
+// precheckResetToken rejects an unknown or expired token before any password
+// hashing.
 func (s *passwordResetService) precheckResetToken(ctx context.Context, tokenHash string) error {
-	pending, err := s.resetRepo.GetByToken(ctx, tokenHash)
+	pending, err := s.Stores.Resets.GetByHash(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return invalidResetToken()
 		}
 		return apperror.NewInternal("failed to verify reset token")
 	}
-	if pending.TenantID != tenant.EffectiveID(ctx) {
-		return invalidResetToken()
-	}
-	if pending.ExpiresAt.Time.Before(time.Now()) {
+	if !pending.ExpiresAt.After(time.Now()) {
 		// Delete outside any transaction so the cleanup persists now rather
 		// than waiting for the scheduled expired-token purge.
-		if err := s.resetRepo.Delete(ctx, tokenHash); err != nil {
+		if err := s.Stores.Resets.Delete(ctx, tokenHash); err != nil {
 			slog.Error("failed to delete expired reset token", slog.Any("error", err))
 		}
 		return apperror.NewBadRequest("reset token has expired")
@@ -363,57 +310,34 @@ func (s *passwordResetService) precheckResetToken(ctx context.Context, tokenHash
 	return nil
 }
 
-// consumeResetToken atomically consumes the token and returns its user. This
-// avoids the token->user lock-order deadlock that FOR UPDATE could create
-// when two resets run concurrently, and a concurrent reset that consumed the
-// token first makes this one fail.
-func consumeResetToken(ctx context.Context, r repos, tokenHash string) (int64, error) {
-	rt, err := r.resets.Consume(ctx, tokenHash)
+// consumeResetToken atomically consumes the token and returns its user. A
+// concurrent reset that consumed the token first makes this one fail.
+func consumeResetToken(ctx context.Context, st Stores, tokenHash string) (*User, error) {
+	rt, err := st.Resets.Consume(ctx, tokenHash)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return 0, invalidResetToken()
+			return nil, invalidResetToken()
 		}
-		return 0, apperror.NewInternal("failed to verify reset token")
-	}
-	if rt.TenantID != tenant.EffectiveID(ctx) {
-		return 0, invalidResetToken()
+		return nil, apperror.NewInternal("failed to verify reset token")
 	}
 	// Re-check: the token may have expired since the pre-check. The rollback
 	// keeps it; the next attempt's pre-check deletes it.
-	if rt.ExpiresAt.Time.Before(time.Now()) {
-		return 0, apperror.NewBadRequest("reset token has expired")
+	if !rt.ExpiresAt.After(time.Now()) {
+		return nil, apperror.NewBadRequest("reset token has expired")
 	}
-
-	currentUser, err := r.users.GetByID(ctx, rt.UserID)
+	user, err := st.Users.GetByID(ctx, rt.UserID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return 0, invalidResetToken()
+			return nil, invalidResetToken()
 		}
-		return 0, apperror.NewInternal("failed to load user")
+		return nil, apperror.NewInternal("failed to load user")
+	}
+	if user.Status != UserStatusActive {
+		return nil, invalidResetToken()
 	}
 	// A password/email change after the link was issued invalidates it.
-	if currentUser.PasswordChangedAt.Valid && rt.CreatedAt.Time.Before(currentUser.PasswordChangedAt.Time) {
-		return 0, apperror.NewBadRequest("reset token has been invalidated by a later account change")
+	if user.CredentialsChangedAt != nil && rt.CreatedAt.Before(*user.CredentialsChangedAt) {
+		return nil, apperror.NewBadRequest("reset token has been invalidated by a later account change")
 	}
-	return rt.UserID, nil
-}
-
-// applyPasswordReset stores the new hash and revokes every reset and refresh
-// token for the user. Deleting all reset tokens, not just the one used, keeps
-// a sibling token from a concurrent request from resetting the password a
-// second time.
-func applyPasswordReset(ctx context.Context, r repos, userID int64, hash []byte) error {
-	if _, err := r.users.UpdatePassword(ctx, identitysqlc.UpdateUserPasswordParams{
-		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-		ID:           userID,
-	}); err != nil {
-		return apperror.NewInternal("failed to update password")
-	}
-	if err := r.resets.DeleteByUserID(ctx, userID); err != nil {
-		return apperror.NewInternal("failed to delete reset tokens")
-	}
-	if err := r.refresh.DeleteByUserID(ctx, userID); err != nil {
-		return apperror.NewInternal("failed to revoke refresh tokens")
-	}
-	return nil
+	return user, nil
 }

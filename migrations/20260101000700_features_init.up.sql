@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS feature_flag_targets (
     CONSTRAINT feature_flag_targets_flag_key_fk
         FOREIGN KEY (flag_key) REFERENCES feature_flags (flag_key) ON DELETE RESTRICT,
     CONSTRAINT feature_flag_targets_user_tenant_fk
-        FOREIGN KEY (tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE RESTRICT
+        FOREIGN KEY (tenant_id, user_id) REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );
 
 -- One tenant-wide target (user_id IS NULL) and one target per user per flag:

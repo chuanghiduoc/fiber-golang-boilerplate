@@ -22,7 +22,13 @@ import (
 // added explicitly.
 var tableOwners = map[string]string{
 	"tenants":                        "identity",
+	"tenant_settings":                "identity",
 	"users":                          "identity",
+	"user_passwords":                 "identity",
+	"user_identities":                "identity",
+	"memberships":                    "identity",
+	"invitations":                    "identity",
+	"sessions":                       "identity",
 	"refresh_tokens":                 "identity",
 	"password_reset_tokens":          "identity",
 	"email_verification_tokens":      "identity",

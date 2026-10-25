@@ -15,6 +15,12 @@ const (
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
+
+	// CodeInvitationInvalid: unknown, expired, or already accepted
+	// invitation token, or one addressed to another email.
+	CodeInvitationInvalid apperror.Code = "invitation.invalid"
+	// CodeMembershipExists: the invitee is already a member (or banned).
+	CodeMembershipExists apperror.Code = "membership.exists"
 )
 
 // ErrorCodes returns identity's error catalog for app.ErrorProvider.
@@ -44,6 +50,16 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusNotFound,
 			Title:   "User not found",
 			DocPath: "/errors/user-not-found",
+		},
+		CodeInvitationInvalid: {
+			Status:  http.StatusBadRequest,
+			Title:   "Invalid invitation",
+			DocPath: "/errors/invitation-invalid",
+		},
+		CodeMembershipExists: {
+			Status:  http.StatusConflict,
+			Title:   "Already a member",
+			DocPath: "/errors/membership-exists",
 		},
 	}
 }

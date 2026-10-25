@@ -9,19 +9,26 @@ import (
 	"time"
 )
 
-// User is the identity module's cross-module view of an account. It
-// deliberately omits credentials, token versions, and other internal fields.
+// User is the identity module's cross-module view of a global user as a
+// member of the context tenant (ADR 0004). Role, MembershipStatus, JoinedAt,
+// BannedAt, and DeletedAt (membership removal or account deletion) describe
+// the membership; the rest is the global identity. It deliberately omits
+// credentials, token versions, and other internal fields.
 type User struct {
-	ID            int64
-	Email         string
-	Name          string
-	Role          string
-	EmailVerified bool
-	HasPassword   bool
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	DeletedAt     *time.Time
-	BannedAt      *time.Time
+	ID    int64
+	Email string
+	Name  string
+	Role  string
+	// MembershipStatus is "active", "suspended" (banned), or "removed".
+	MembershipStatus string
+	EmailVerified    bool
+	HasPassword      bool
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	// JoinedAt orders member lists (their cursor is (JoinedAt, ID)).
+	JoinedAt  time.Time
+	DeletedAt *time.Time
+	BannedAt  *time.Time
 }
 
 // UserPage is one cursor page of users plus the next-page indicator.
@@ -37,22 +44,23 @@ type UserStats struct {
 }
 
 // Principal is the identity-owned view needed to authenticate a request on
-// behalf of an API key's owner. It intentionally excludes credentials and
-// session fields.
+// behalf of an API key's owner: an active membership (ID is the user, Role
+// the membership role). It intentionally excludes credentials and session
+// fields.
 type Principal struct {
 	ID       int64
 	TenantID int64
 	Email    string
 	Name     string
 	Role     string
-	// TenantStatus is the owning tenant's current status ("active" or
-	// "suspended"). API-key authentication rejects anything but
-	// TenantStatusActive.
+	// TenantStatus is TenantStatusActive for every tenant state that serves
+	// requests (trialing or active) and the raw lifecycle state otherwise.
+	// API-key authentication rejects anything but TenantStatusActive.
 	TenantStatus string
-	// CredentialsRevokedAt is set when the account was banned and survives an
-	// unban. API keys created at or before it must be rejected, so a restored
-	// account never revives credentials issued before the ban. Nil means no
-	// revocation.
+	// CredentialsRevokedAt is set when the membership was banned or removed
+	// and survives an unban/re-join. API keys created at or before it must be
+	// rejected, so a restored member never revives credentials issued before
+	// the ban. Nil means no revocation.
 	CredentialsRevokedAt *time.Time
 }
 

@@ -144,12 +144,12 @@ func (h *UserHandler) UpdateMe(c fiber.Ctx) error {
 
 // Update godoc
 // @Summary Update user by ID
-// @Description Update a user's profile (admin or self)
+// @Description Update the caller's own global profile. Users are global identities shared across tenants, so another user's profile (name or email) can never be changed, not even by a tenant admin; admins manage memberships (role, ban, removal).
 // @Tags Users
 // @Accept json
 // @Produce json
 // @Security BearerAuth
-// @Param id path int true "User ID"
+// @Param id path int true "User ID (must be the caller)"
 // @Param request body dto.UpdateUserRequest true "Update request"
 // @Success 200 {object} dto.UserResponse
 // @Failure 400 {object} apperror.ProblemDetails
@@ -164,20 +164,15 @@ func (h *UserHandler) Update(c fiber.Ctx) error {
 		return err
 	}
 
-	if id != httpx.AuthUserID(c) && !httpx.Can(c, authz.PermissionAdminUsersWrite) {
-		return apperror.NewForbidden("you can only update your own profile")
+	if id != httpx.AuthUserID(c) {
+		return apperror.NewCode(apperror.CodePermissionDenied, "a user's profile can only be changed from their own session")
 	}
 
 	var req dto.UpdateUserRequest
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-
-	if id == httpx.AuthUserID(c) {
-		if err := h.requirePasswordForEmailChange(c, id, req); err != nil {
-			return err
-		}
-	} else if err := h.refuseDelegatedEmailChange(c, id, req); err != nil {
+	if err := h.requirePasswordForEmailChange(c, id, req); err != nil {
 		return err
 	}
 
@@ -216,35 +211,6 @@ func (h *UserHandler) requirePasswordForEmailChange(c fiber.Ctx, userID int64, r
 		return apperror.NewBadRequest("currentPassword is required to change email")
 	}
 	return h.service.VerifyPassword(withClientIP(c), userID, *req.CurrentPassword)
-}
-
-// refuseDelegatedEmailChange limits changing ANOTHER user's email, which skips
-// the target's re-authentication. Moving an account's address and then using
-// forgot-password takes the account over, so:
-//   - an API key may never do it: a key with admin:users:write would otherwise
-//     escalate to a full session of any user, beyond its own scopes;
-//   - nobody may do it to an admin: an admin's address changes only from the
-//     admin's own session, with their current password.
-//
-// Name-only updates and a PUT that echoes the current email are unaffected.
-func (h *UserHandler) refuseDelegatedEmailChange(c fiber.Ctx, targetID int64, req dto.UpdateUserRequest) error {
-	if req.Email == nil {
-		return nil
-	}
-	target, err := h.service.GetByID(c.Context(), targetID)
-	if err != nil {
-		return err
-	}
-	if service.NormalizeEmail(*req.Email) == service.NormalizeEmail(target.Email) {
-		return nil
-	}
-	if authenticatedWithAPIKey(c) {
-		return apperror.NewCode(apperror.CodePermissionDenied, "API keys cannot change another user's email")
-	}
-	if target.Role == dto.RoleAdmin {
-		return apperror.NewCode(apperror.CodePermissionDenied, "an admin's email can only be changed from their own session")
-	}
-	return nil
 }
 
 // authenticatedWithAPIKey reports whether apikeyhttp.Authenticate authenticated
@@ -300,8 +266,8 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 }
 
 // Delete godoc
-// @Summary Delete user
-// @Description Delete a user by ID
+// @Summary Delete account or remove member
+// @Description With the caller's own id: delete the caller's global account (every tenant; JWT only, API keys are refused; refused while the caller is the last active admin of any tenant). With another id: remove that user's membership from the request tenant (requires admin:users:delete); the global account and other tenants are untouched.
 // @Tags Users
 // @Security BearerAuth
 // @Param id path int true "User ID"
@@ -310,6 +276,7 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
+// @Failure 409 {object} apperror.ProblemDetails "user.last_admin"
 // @Router /users/{id} [delete]
 func (h *UserHandler) Delete(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
@@ -317,13 +284,23 @@ func (h *UserHandler) Delete(c fiber.Ctx) error {
 		return err
 	}
 
-	if id != httpx.AuthUserID(c) && !httpx.Can(c, authz.PermissionAdminUsersDelete) {
+	if id == httpx.AuthUserID(c) {
+		// Deleting the global account ends the user's access to every tenant,
+		// which an API key scoped to one tenant must not be able to do.
+		if authenticatedWithAPIKey(c) {
+			return apperror.NewCode(apperror.CodePermissionDenied, "API keys cannot delete an account")
+		}
+		if err := h.service.DeleteAccount(c.Context(), id); err != nil {
+			return err
+		}
+		return response.NoContent(c)
+	}
+
+	if !httpx.Can(c, authz.PermissionAdminUsersDelete) {
 		return apperror.NewForbidden("you can only delete your own profile")
 	}
-
-	if err := h.service.Delete(c.Context(), id); err != nil {
+	if err := h.service.RemoveMember(c.Context(), id); err != nil {
 		return err
 	}
-
 	return response.NoContent(c)
 }

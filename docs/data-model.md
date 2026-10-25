@@ -6,7 +6,7 @@ The fresh-install schema is a per-owner baseline (ADR 0005) applied only by
 | Version | File | Creates |
 |---|---|---|
 | `20260101000000` | `platform_functions` | `update_updated_at()` trigger function |
-| `20260101000100` | `identity_init` | `tenants` (seeds id 1 `default`), `users`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `20260101000100` | `identity_init` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
 | `20260101000200` | `platform_jobs` | `jobs` |
 | `20260101000300` | `platform_scheduler` | `scheduler_leases`, `scheduler_runs` |
 | `20260101000400` | `platform_audit` | `audit_events` and its append-only triggers |
@@ -27,7 +27,7 @@ migration policy.
 
 | Owner | Tables |
 |---|---|
-| `identity` | `tenants`, `users`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
 | `files` | `files` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -38,74 +38,141 @@ migration policy.
 Conventions that apply to every diagram below:
 
 - Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES
-  tenants(id)`; the diagrams draw that edge only once (first diagram) to keep
-  them readable. Tenant `1` (`default`) is seeded by the baseline. The one
-  exception is `api_key_scopes`, a child fully owned by its key, which has no
-  `tenant_id` of its own (the key id is global; the parent row holds the
-  tenant).
-- Child rows reference their parent through a **composite** `(tenant_id, id)`
-  foreign key (for example `(tenant_id, user_id) → users(tenant_id, id)`), so a
-  row can never point at a parent in another tenant.
+  tenants(id)` (identity's `memberships` and `invitations` declare it without
+  the default, `ON DELETE RESTRICT`); the diagrams draw that edge only where
+  it matters to keep them readable. Tenant `1` (`default`) is seeded by the
+  baseline. Exceptions: `api_key_scopes`, a child fully owned by its key, has
+  no `tenant_id` of its own (the key id is global; the parent row holds the
+  tenant); `users` and the per-user rows `user_passwords`, `user_identities`,
+  `password_reset_tokens`, and `email_verification_tokens` are global (ADR
+  0004) and have no `tenant_id`.
+- Child rows reference their parent through a **composite** foreign key, so a
+  row can never point at a parent in another tenant. Every per-member row in
+  another module references `(tenant_id, user_id) → memberships(tenant_id,
+  user_id)` `ON DELETE RESTRICT`; identity's own children use
+  `(tenant_id, session_id) → sessions(tenant_id, id)` and
+  `(tenant_id, invited_by | accepted_by) → memberships(tenant_id, user_id)`.
 - Primary keys are `BIGINT GENERATED ALWAYS AS IDENTITY`, except
   `feature_flags.flag_key`, `scheduler_leases.name`, and the natural keys of
   `api_key_scopes (api_key_id, permission_key)`,
   `webhook_endpoint_subscriptions (endpoint_id, pattern)`, and
   `webhook_events (tenant_id, event_id)`. Timestamps are `TIMESTAMPTZ`.
-- Delete actions: `CASCADE` only for rows fully owned by their parent (auth
-  tokens, API-key scopes, endpoint subscriptions and secrets, delivery
+- Delete actions: `CASCADE` only for rows fully owned by their parent
+  (`tenant_settings`, a user's password, identities, and reset/verification
+  tokens, a membership's sessions, a session's refresh tokens, API-key scopes, endpoint subscriptions and secrets, delivery
   attempts); `RESTRICT` for business and history rows; `SET NULL` for
   `webhook_deliveries.replayed_from_id`.
 
 ## Tenants, identity, and credentials
 
+Users are global identities that join tenants through memberships (ADR 0004).
+The membership, not the user, is the tenant-scoped principal: every
+cross-module reference to "a user in a tenant" is a `(tenant_id, user_id)`
+foreign key to `memberships`.
+
 ```mermaid
 erDiagram
-    tenants ||--o{ users : "tenant_id"
-    users ||--o{ refresh_tokens : "CASCADE"
+    tenants ||--|| tenant_settings : "CASCADE"
+    tenants ||--o{ memberships : "RESTRICT"
+    users ||--o{ memberships : "RESTRICT"
+    users ||--o| user_passwords : "CASCADE"
+    users ||--o{ user_identities : "one per provider, CASCADE"
     users ||--o| password_reset_tokens : "one per user, CASCADE"
     users ||--o| email_verification_tokens : "one per user, CASCADE"
-    users ||--o{ api_keys : "RESTRICT"
+    tenants ||--o{ invitations : "RESTRICT"
+    memberships ||--o{ invitations : "invited_by, accepted_by, RESTRICT"
+    memberships ||--o{ sessions : "(tenant_id, user_id), CASCADE"
+    sessions ||--o{ refresh_tokens : "(tenant_id, session_id), CASCADE"
+    memberships ||--o{ api_keys : "(tenant_id, user_id), RESTRICT"
     api_keys ||--o{ api_key_scopes : "CASCADE"
 
     tenants {
         bigint id PK
         varchar slug UK "[a-z0-9-]{1,63}"
         varchar name
-        varchar status "active | suspended"
+        varchar status "trialing | active | suspended | pending_deletion | deleted"
+        timestamptz status_changed_at
+        timestamptz trial_ends_at "required while trialing"
+        timestamptz deletion_scheduled_at "set iff pending_deletion or deleted"
+    }
+    tenant_settings {
+        bigint tenant_id PK, FK
+        varchar locale "BCP 47"
+        varchar timezone "IANA, validated by the service"
     }
     users {
         bigint id PK
+        varchar email "normalized, unique among live rows"
+        varchar name
+        timestamptz email_verified_at
+        varchar status "active | suspended | deleted"
+        int token_version "bumped by global credential events"
+        timestamptz credentials_changed_at
+        timestamptz deleted_at "set iff status = deleted"
+    }
+    user_passwords {
+        bigint user_id PK, FK
+        varchar password_hash "bcrypt"
+        timestamptz changed_at
+    }
+    user_identities {
+        bigint id PK
+        bigint user_id FK "unique with provider"
+        varchar provider "google"
+        varchar subject "unique with provider"
+        varchar email "address reported at link time"
+    }
+    memberships {
+        bigint id PK
+        bigint tenant_id FK "unique with user_id"
+        bigint user_id FK
+        varchar role "user | admin, transitional until P2b-2"
+        varchar status "active | suspended | removed"
+        timestamptz banned_at "set iff suspended"
+        timestamptz removed_at "set iff removed"
+        timestamptz credentials_revoked_at "never cleared"
+    }
+    invitations {
+        bigint id PK
         bigint tenant_id FK
-        varchar email "unique per tenant (lower, active rows)"
-        varchar google_id "unique per tenant (active rows)"
+        varchar email_normalized "one pending row per tenant"
         varchar role "user | admin"
-        varchar auth_provider "local | google"
-        int token_version "bumped to revoke access tokens"
-        timestamptz banned_at
-        timestamptz credentials_revoked_at
-        timestamptz deleted_at "soft delete"
+        varchar token_hash UK "SHA-256 only"
+        bigint invited_by FK
+        timestamptz expires_at
+        timestamptz accepted_at "set together with accepted_by"
+        bigint accepted_by FK
+    }
+    sessions {
+        bigint id PK
+        bigint tenant_id FK
+        bigint user_id FK
+        int token_version "user version at sign-in"
+        varchar user_agent
+        inet ip
+        timestamptz last_used_at
+        timestamptz revoked_at "set together with revoked_reason"
+        varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | ..."
     }
     refresh_tokens {
         bigint id PK
         bigint tenant_id FK
-        bigint user_id FK
-        varchar token UK
-        int token_version
+        bigint session_id FK
+        varchar token_hash UK "SHA-256 only"
         timestamptz expires_at
+        timestamptz used_at "rotation marker"
     }
     password_reset_tokens {
         bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
-        varchar token UK
+        bigint user_id FK, UK
+        varchar token_hash UK
         timestamptz expires_at
     }
     email_verification_tokens {
         bigint id PK
-        bigint tenant_id FK
-        bigint user_id FK
-        varchar email
-        varchar token UK
+        bigint user_id FK, UK
+        varchar email "target address"
+        varchar token_hash UK
         timestamptz expires_at
     }
     api_keys {
@@ -126,9 +193,52 @@ erDiagram
     }
 ```
 
-- A trigger refuses to remove or demote the last admin **of a tenant**.
+- **Tenant lifecycle** (enforced by `identity/service/tenants.go`; the
+  timestamps each state needs are pinned by `CHECK`s): `trialing → active |
+  suspended | pending_deletion`, `active → suspended | pending_deletion`,
+  `suspended → active | pending_deletion`, `pending_deletion → active
+  (cancelled) | deleted`; `deleted` is terminal. Only `trialing` and `active`
+  tenants serve requests. Tenant 1 can never enter `pending_deletion` or
+  `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
+  `RESTRICT`/`NO ACTION`.
+- **Users** are global. `email` is stored normalized (`CHECK (email =
+  lower(btrim(email)))`) and the partial unique index `idx_users_email_live`
+  allows one live account per address; deleting an account (`status =
+  'deleted'` + `deleted_at`) frees the address. There is no `tenant_id`,
+  `role`, or password column: credentials live in `user_passwords` and
+  `user_identities`, roles and bans on `memberships`. `token_version` is bumped
+  by every global credential event (password change or reset, email change,
+  logout-all, account deletion) and invalidates every token and session of
+  the user in every tenant.
+- **Memberships** are the user ↔ tenant N:N join and the parent key
+  (`uq_memberships_tenant_user`) of every cross-module per-member row, which
+  is why both parents are `RESTRICT` and rows are never hard-deleted. A ban is
+  `status = 'suspended'` + `banned_at`; leaving or being removed is
+  `status = 'removed'` + `removed_at`. There is no `invited` state: a pending
+  invite is an `invitations` row (it can target an address with no account).
+  `credentials_revoked_at` is set by a ban or removal and never cleared, so
+  API keys created at or before it stay invalid after an unban or re-join.
+  `role` is transitional; P2b-2 replaces it with `membership_roles`.
+- The last-admin trigger (`protect_last_admin`) lives on `memberships`: a
+  tenant keeps at least one active admin membership. Counting and locking are
+  scoped to the tenant; services also take a per-tenant advisory lock, and the
+  repository maps the trigger exception (`P0001`) or a deadlock (`40P01`) to
+  `409`.
+- **Invitations**: one pending row per `(tenant_id, email_normalized)`
+  (partial unique `WHERE accepted_at IS NULL`); re-inviting refreshes the
+  token, role, and expiry. Revoking deletes the pending row (the trail is in
+  `audit_events`); accepting stamps `accepted_at`/`accepted_by` in the
+  transaction that creates or reactivates the membership.
+- **Sessions** are the RFC 9700 refresh-token family, so there is no separate
+  family id: every rotated refresh token references its session, and
+  presenting an already-used token revokes the session (`revoked_reason =
+  'refresh_reuse'`). `refresh_tokens` is append-only apart from `used_at`;
+  used tokens are kept until they expire so a replay is recognized as reuse.
+- Password-reset and email-verification tokens are **per user**
+  (`user_id UNIQUE`), not per tenant: the password is a global credential.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request
-  tenant cannot be trusted until the key is verified.
+  tenant cannot be trusted until the key is verified. A key's owner is a
+  membership (`(tenant_id, user_id) → memberships`).
 - `api_key_scopes` holds one row per granted permission. Every API-key query
   returns the scopes as one array sorted in byte order, so the API still
   returns a `scopes` array exactly as before. Create and update change the key
@@ -138,15 +248,23 @@ erDiagram
 - `CHECK ((rotation_grace_until IS NULL) = (rotated_at IS NULL))`: rotation is
   the only writer of either column and always sets both.
 
+| Table | Key constraint / index | Why |
+|---|---|---|
+| `users` | partial unique `(email) WHERE status <> 'deleted'` | One live account per address, globally. |
+| `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows and for active admins | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check; last-admin count. |
+| `invitations` | `token_hash` unique; partial unique `(tenant_id, email_normalized) WHERE accepted_at IS NULL`; `(tenant_id, created_at DESC, id DESC)`; partial `(expires_at)` on pending rows | Token lookup; one pending invite per address; list cursor; expiry purge. |
+| `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; "my sessions"; revoking a user's live sessions across tenants; stale-session purge. |
+| `refresh_tokens` | `token_hash` unique; `(tenant_id, session_id)`; `(expires_at)` | Rotation lookup; FK cascade and the purge's live-token check; expiry purge. |
+
 ## Files, notifications, and feature flags
 
 ```mermaid
 erDiagram
-    users ||--o{ files : "RESTRICT"
-    users ||--o{ notifications : "RESTRICT"
-    users ||--o{ notification_preferences : "RESTRICT"
+    memberships ||--o{ files : "(tenant_id, user_id), RESTRICT"
+    memberships ||--o{ notifications : "(tenant_id, user_id), RESTRICT"
+    memberships ||--o{ notification_preferences : "(tenant_id, user_id), RESTRICT"
     feature_flags ||--o{ feature_flag_targets : "flag_key, RESTRICT"
-    users |o--o{ feature_flag_targets : "user target (nullable), RESTRICT"
+    memberships |o--o{ feature_flag_targets : "user target (nullable), RESTRICT"
 
     files {
         bigint id PK

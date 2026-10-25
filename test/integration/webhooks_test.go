@@ -41,7 +41,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
@@ -114,43 +113,26 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('webhooks-acme', 'Webhooks Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "webhooks-acme")
 
-	insertAdmin := func(tenantID int64, email string) int64 {
+	// The session store validates every token against a live session row.
+	sessionToken := func(tenantID int64, email, role string) string {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, strings.Split(email, "@")[0],
-		).Scan(&id))
-		return id
+		member := testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: role})
+		return testutil.SessionToken(t, ctx, pool, member, webhookIntegrationSecret)
 	}
-	userA := insertAdmin(tenant.DefaultID, "webhooks-a@test.com")
-	userB := insertAdmin(tenantB, "webhooks-b@test.com")
-	var regularUser int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, $3, 'user') RETURNING id`,
-		tenant.DefaultID, "webhooks-user@test.com", "webhooks-user",
-	).Scan(&regularUser))
-
-	tokenA, err := token.GenerateWithVersionAndTenant(userA, tenant.DefaultID, "webhooks-a@test.com", "admin", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
-	tokenB, err := token.GenerateWithVersionAndTenant(userB, tenantB, "webhooks-b@test.com", "admin", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
-	tokenUser, err := token.GenerateWithVersionAndTenant(regularUser, tenant.DefaultID, "webhooks-user@test.com", "user", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
+	tokenA := sessionToken(tenant.DefaultID, "webhooks-a@test.com", "admin")
+	tokenB := sessionToken(tenantB, "webhooks-b@test.com", "admin")
+	tokenUser := sessionToken(tenant.DefaultID, "webhooks-user@test.com", "user")
 
 	appCache, err := cache.NewCache(config.CacheConfig{Driver: "memory"})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = appCache.Close() })
 
-	userRepo := identityrepo.NewUserRepository(pool)
-	tenantRepo := identityrepo.NewTenantRepository(pool)
+	stores := identityrepo.NewStores(pool)
+	tenantRepo := stores.Tenants
 	resolver := identityadapter.NewTenantResolver(tenantRepo)
-	sessionStore := session.NewStore(userRepo, appCache)
+	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
 	jobQueue := jobs.NewQueue(pool)
 	repo := webhookrepo.New(pool, jobQueue)
 	codec, err := webhookservice.NewSecretCodec("webhook-integration-encryption-key")
@@ -161,7 +143,7 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 		DefaultTimeoutMS:   2000,
 		TimestampTolerance: 5 * time.Minute,
 		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id int64) (bool, error) {
-			if _, err := tenantRepo.GetByID(ctx, id); err != nil {
+			if _, err := tenantRepo.GetOperationalByID(ctx, id); err != nil {
 				if errors.Is(err, apperror.ErrNotFound) {
 					return false, nil
 				}

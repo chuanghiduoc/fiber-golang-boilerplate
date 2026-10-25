@@ -126,16 +126,18 @@ func (s *service) GetStats(ctx context.Context) (*admindto.AdminStatsResponse, e
 
 func toUserResponse(user identitycontracts.User) admindto.UserResponse {
 	return admindto.UserResponse{
-		ID:            user.ID,
-		Email:         user.Email,
-		Name:          user.Name,
-		Role:          user.Role,
-		EmailVerified: user.EmailVerified,
-		HasPassword:   user.HasPassword,
-		CreatedAt:     user.CreatedAt,
-		UpdatedAt:     user.UpdatedAt,
-		DeletedAt:     user.DeletedAt,
-		BannedAt:      user.BannedAt,
+		ID:               user.ID,
+		Email:            user.Email,
+		Name:             user.Name,
+		Role:             user.Role,
+		MembershipStatus: user.MembershipStatus,
+		EmailVerified:    user.EmailVerified,
+		HasPassword:      user.HasPassword,
+		CreatedAt:        user.CreatedAt,
+		UpdatedAt:        user.UpdatedAt,
+		JoinedAt:         user.JoinedAt,
+		DeletedAt:        user.DeletedAt,
+		BannedAt:         user.BannedAt,
 	}
 }
 

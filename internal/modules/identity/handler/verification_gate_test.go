@@ -11,27 +11,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
 
-// countingRefreshService records Consume calls so tests can prove a refusal
-// did not burn the refresh token.
-type countingRefreshService struct {
-	mockRefreshTokenService
-	consumed int
-}
-
-func (s *countingRefreshService) Consume(ctx context.Context, tokenStr string) (userID, tenantID int64, tokenVersion int32, err error) {
-	s.consumed++
-	return s.mockRefreshTokenService.Consume(ctx, tokenStr)
-}
-
 func TestRefresh_UnverifiedEmailDoesNotConsumeToken(t *testing.T) {
-	refreshSvc := &countingRefreshService{}
-	h := NewAuthHandler(newMockService(), refreshSvc, &mockPasswordResetService{},
+	// mockSessions counts rotations that passed the handler's admission rule.
+	refreshSvc := &mockSessions{}
+	h := newTestAuthHandler(newMockService(), refreshSvc, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, true, nil)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Post("/auth/refresh", h.Refresh)
@@ -64,10 +53,10 @@ func (s *stubGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) str
 
 func TestGoogleCallback_RequiresVerifiedEmailWhenConfigured(t *testing.T) {
 	provider := &stubGoogleOAuth{info: &oauth.GoogleUserInfo{ID: "g-1", Email: "g@example.com", Name: "G", VerifiedEmail: true}}
-	tenants := &fakeTenantRepository{tenant: identitysqlc.Tenant{ID: 1, Slug: "default", Status: "active"}}
+	tenants := &fakeTenantRepository{tenant: service.Tenant{ID: 1, Slug: "default", Status: "active"}}
 	// mockUserService returns an account whose email is not verified, as for
 	// a Google-linked account whose address was later changed.
-	h := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	h := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, true, provider, tenants)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", h.GoogleCallback)
@@ -88,9 +77,9 @@ func TestGoogleCallback_RequiresVerifiedEmailWhenConfigured(t *testing.T) {
 func TestGoogleCallback_UserRegistrationGatesSignUp(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		provider := &stubGoogleOAuth{info: &oauth.GoogleUserInfo{ID: "g-1", Email: "g@example.com", Name: "G", VerifiedEmail: true}}
-		tenants := &fakeTenantRepository{tenant: identitysqlc.Tenant{ID: 1, Slug: "default", Status: "active"}}
+		tenants := &fakeTenantRepository{tenant: service.Tenant{ID: 1, Slug: "default", Status: "active"}}
 		svc := newMockService()
-		h := NewAuthHandler(svc, &mockRefreshTokenService{}, &mockPasswordResetService{},
+		h := newTestAuthHandler(svc, &mockSessions{}, &mockPasswordResetService{},
 			&mockEmailVerificationService{}, "test-secret", 24, false, provider, tenants)
 		h.SetFeatureFlags(features.NewEvaluator(features.Options{
 			Env: map[features.Key]bool{identitycatalog.KeyUserRegistration: enabled},

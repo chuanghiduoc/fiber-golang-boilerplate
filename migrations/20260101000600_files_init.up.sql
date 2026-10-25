@@ -13,13 +13,13 @@ CREATE TABLE IF NOT EXISTS files (
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     deleted_at TIMESTAMP WITH TIME ZONE,
     CONSTRAINT fk_files_tenant_user FOREIGN KEY (tenant_id, user_id)
-        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
+        REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );
 
 -- Deliberately NOT partial: it serves ListFilesByUserCursor for both
 -- include_deleted values under a generic plan, ListFilesByUserID and
 -- CountFilesByUserID (deleted_at is a cheap heap filter), and the
--- fk_files_tenant_user check when a users row is deleted or re-keyed.
+-- fk_files_tenant_user check when a membership row is deleted or re-keyed.
 CREATE INDEX IF NOT EXISTS idx_files_tenant_user_created
     ON files (tenant_id, user_id, created_at DESC, id DESC);
 -- AdminListFilesCursor / AdminListFiles / AdminFileStats.

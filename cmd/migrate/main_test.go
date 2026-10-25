@@ -19,10 +19,20 @@ var (
 // implicitUniqueIndexes are created by a UNIQUE or PRIMARY KEY constraint, so
 // their names never appear as CREATE INDEX statements in the baseline.
 var implicitUniqueIndexes = map[string]bool{
-	"tenants_slug_key":                    true,
-	"api_key_scopes_pkey":                 true,
-	"webhook_endpoint_subscriptions_pkey": true,
-	"webhook_events_pkey":                 true,
+	"tenants_slug_key":                         true,
+	"uq_user_identities_provider_subject":      true,
+	"uq_user_identities_user_provider":         true,
+	"uq_memberships_tenant_user":               true,
+	"uq_sessions_tenant_id":                    true,
+	"invitations_token_hash_key":               true,
+	"refresh_tokens_token_hash_key":            true,
+	"password_reset_tokens_user_id_key":        true,
+	"password_reset_tokens_token_hash_key":     true,
+	"email_verification_tokens_user_id_key":    true,
+	"email_verification_tokens_token_hash_key": true,
+	"api_key_scopes_pkey":                      true,
+	"webhook_endpoint_subscriptions_pkey":      true,
+	"webhook_events_pkey":                      true,
 }
 
 // readBaseline concatenates every up migration in version order: together
@@ -134,8 +144,8 @@ func TestMigrationGuardCoversTenantFoundation(t *testing.T) {
 	// Every tenant-owned table must have at least one index whose first key is
 	// tenant_id, otherwise a scoped query falls back to a full-table scan.
 	for _, table := range []string{
-		"users", "refresh_tokens", "password_reset_tokens",
-		"email_verification_tokens", "files", "jobs", "audit_events",
+		"memberships", "invitations", "sessions", "refresh_tokens",
+		"files", "jobs", "audit_events",
 	} {
 		indexes := requiredTenantLeadingIndexes[table]
 		if len(indexes) == 0 {

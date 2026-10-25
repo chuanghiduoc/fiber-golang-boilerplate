@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_notifications_tenant_user FOREIGN KEY (tenant_id, user_id)
-        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
+        REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );
 
 -- The non-partial index also serves the fk_notifications_tenant_user check.
@@ -44,7 +44,7 @@ CREATE TABLE IF NOT EXISTS notification_preferences (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_notification_preferences_tenant_user FOREIGN KEY (tenant_id, user_id)
-        REFERENCES users (tenant_id, id) ON DELETE RESTRICT
+        REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );
 
 -- Also serves the fk_notification_preferences_tenant_user check.

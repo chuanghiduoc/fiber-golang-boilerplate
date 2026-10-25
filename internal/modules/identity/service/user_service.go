@@ -3,123 +3,102 @@ package service
 import (
 	"context"
 	"errors"
-	"log/slog"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // bcryptCost is the production password-hashing cost. It is a variable only
 // so this package's tests can lower it in TestMain (main_test.go).
 var bcryptCost = 12
 
-// UserService owns the account lifecycle. Its methods are split by
+// UserService owns the account lifecycle as seen from the request tenant.
+// Users are global identities (ADR 0004); every read here goes through the
+// caller's membership in the request tenant. Its methods are split by
 // responsibility across this package: registration.go, authentication.go and
 // lockout.go, oauth_google.go, profile.go (update/delete/sessions), and
 // password.go.
 type UserService interface {
 	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
+	// Authenticate checks the global password and requires an active
+	// membership in the request tenant.
 	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
 	// SignInWithGoogle signs in an existing or linkable account, or creates
-	// one when req.AllowSignUp is set (see GoogleSignIn). The caller's
-	// Complete hook admits the account and issues the session in the same
-	// transaction as the auth.google_login audit row.
-	SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*dto.UserResponse, error)
+	// one when req.AllowSignUp is set (see GoogleSignIn), and issues the
+	// session in the same transaction as the auth.google_login audit row.
+	SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*GoogleSignInResult, error)
+	// GetByID returns an active member of the request tenant.
 	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
 	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
+	// Update changes the caller's own global profile.
 	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
 	VerifyPassword(ctx context.Context, userID int64, password string) error
-	Delete(ctx context.Context, id int64) error
+	// DeleteAccount deletes the caller's global account (self-service only).
+	DeleteAccount(ctx context.Context, id int64) error
+	// RemoveMember removes another user's membership from the request tenant.
+	RemoveMember(ctx context.Context, id int64) error
 	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
+	// RevokeSessions ends every session of the user in every tenant
+	// (logout-all) and invalidates every access token.
 	RevokeSessions(ctx context.Context, userID int64) error
-	// SetVerificationProvisioner wires registration email provisioning into the
-	// user-creation transaction. When unset, or when the provisioner cannot
-	// enqueue transactionally, registration falls back to the handler's
-	// post-commit verification email.
-	SetVerificationProvisioner(p VerificationProvisioner)
 	// RegistrationEmailsTransactional reports whether Register commits the
 	// verification email with the user. Callers must not send a second email
 	// when it returns true.
 	RegistrationEmailsTransactional() bool
 }
 
+// UserDeps are the user service's collaborators.
+type UserDeps struct {
+	Stores Stores
+	Tx     Transactor
+	Cache  cache.Cache
+	// SessionCache is the access-token validator; nil disables invalidation.
+	SessionCache session.Store
+	// Sessions issues sessions for Google sign-in.
+	Sessions *SessionService
+	// Verification provisions the registration email. When it can enqueue
+	// on the registration transaction (MailTransactional), the user, token,
+	// and email job commit together; otherwise the handler sends after
+	// commit.
+	Verification             EmailVerificationService
+	MailTransactional        bool
+	RequireEmailVerification bool
+}
+
 type userService struct {
-	repo                     repository.UserRepository
-	refreshTokenRepo         repository.RefreshTokenRepository
-	requireEmailVerification bool
-	cache                    cache.Cache
-	txManager                *database.TxManager
-	audit                    audit.TxRecorder
-	sessions                 session.Store
-	verificationProvisioner  VerificationProvisioner
-	events                   *events.Bus
+	UserDeps
 }
 
-func NewUserService(
-	repo repository.UserRepository,
-	refreshTokenRepo repository.RefreshTokenRepository,
-	requireEmailVerification bool,
-	appCache cache.Cache,
-	txManager *database.TxManager,
-	auditRecorder audit.TxRecorder,
-	sessions ...session.Store,
-) UserService {
-	var sessionStore session.Store
-	if len(sessions) > 0 {
-		sessionStore = sessions[0]
-	}
-	return &userService{
-		repo:                     repo,
-		refreshTokenRepo:         refreshTokenRepo,
-		requireEmailVerification: requireEmailVerification,
-		cache:                    appCache,
-		txManager:                txManager,
-		audit:                    auditRecorder,
-		sessions:                 sessionStore,
-	}
-}
-
-// fallbackRepos are the pool-backed repositories inTx uses without a
-// transaction manager.
-func (s *userService) fallbackRepos() repos {
-	return repos{users: s.repo, refresh: s.refreshTokenRepo}
-}
-
-func (s *userService) SetVerificationProvisioner(p VerificationProvisioner) {
-	s.verificationProvisioner = p
+// NewUserService wires the user service.
+func NewUserService(deps UserDeps) UserService {
+	return &userService{UserDeps: deps}
 }
 
 func (s *userService) RegistrationEmailsTransactional() bool {
-	return s.verificationProvisioner != nil &&
-		s.txManager != nil &&
-		s.verificationProvisioner.SupportsTransactionalEnqueue()
+	_, ok := s.Verification.(txProvisioner)
+	return ok && s.MailTransactional
 }
 
-// getUser loads an active account in the request tenant as a public error.
-func (s *userService) getUser(ctx context.Context, id int64) (*identitysqlc.User, error) {
-	user, err := s.repo.GetByID(ctx, id)
+// getMember loads an active member of the request tenant as a public error.
+func getMember(ctx context.Context, memberships MembershipRepository, id int64) (*Member, error) {
+	member, err := memberships.GetActive(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("user not found")
 		}
 		return nil, apperror.NewInternal("failed to get user")
 	}
-	return user, nil
+	return member, nil
 }
 
 func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
-	user, err := s.getUser(ctx, id)
+	member, err := getMember(ctx, s.Stores.Memberships, id)
 	if err != nil {
 		return nil, err
 	}
-	return ToUserResponse(user), nil
+	return ToUserResponse(member), nil
 }
 
 func (s *userService) List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
@@ -127,26 +106,27 @@ func (s *userService) List(ctx context.Context, limit int, startingAfter string)
 	if err != nil {
 		return nil, false, err
 	}
-
-	users, err := s.repo.ListCursor(ctx, cur)
+	members, err := s.Stores.Memberships.ListActiveCursor(ctx, cur)
 	if err != nil {
 		return nil, false, apperror.NewInternal("failed to list users")
 	}
+	return memberPage(members, pageSize)
+}
 
-	hasMore := len(users) > pageSize
+// memberPage trims the extra probe row and maps members to responses.
+func memberPage(members []Member, pageSize int) ([]dto.UserResponse, bool, error) {
+	hasMore := len(members) > pageSize
 	if hasMore {
-		users = users[:pageSize]
+		members = members[:pageSize]
 	}
-
-	responses := make([]dto.UserResponse, len(users))
-	for i := range users {
-		responses[i] = *ToUserResponse(&users[i])
+	responses := make([]dto.UserResponse, len(members))
+	for i := range members {
+		responses[i] = *ToUserResponse(&members[i])
 	}
-
 	return responses, hasMore, nil
 }
 
-// userWriteError maps a failed user-row write: a missing row becomes 404 with
+// userWriteError maps a failed write: a missing row becomes 404 with
 // notFoundDetail, a repository AppError (last admin, concurrent change) is
 // kept, and anything else becomes a 500 with internalDetail.
 func userWriteError(err error, notFoundDetail, internalDetail string) error {
@@ -160,42 +140,34 @@ func userWriteError(err error, notFoundDetail, internalDetail string) error {
 	return apperror.NewInternal(internalDetail)
 }
 
-// invalidateSessions drops the cached session state after a committed change
-// that bumped the user's token version. The database is already
-// authoritative, so a cache failure only delays the effect until the cached
-// entry expires; it is logged, not returned.
-func invalidateSessions(ctx context.Context, sessions session.Store, userID int64) {
-	if sessions == nil {
-		return
-	}
-	if err := sessions.Invalidate(ctx, userID); err != nil {
-		slog.Warn("failed to invalidate cached session state",
-			slog.Int64("user_id", userID),
-			slog.Any("error", err),
-		)
-	}
-}
-
-func ToUserResponse(user *identitysqlc.User) *dto.UserResponse {
+// ToUserResponse maps a member of the request tenant to the API shape. Role,
+// ban, and join time come from the membership; identity fields from the
+// global user. DeletedAt is the membership removal or the account deletion.
+func ToUserResponse(member *Member) *dto.UserResponse {
+	user, membership := member.User, member.Membership
 	resp := &dto.UserResponse{
-		ID:            user.ID,
-		Email:         user.Email,
-		Name:          user.Name,
-		Role:          user.Role,
-		EmailVerified: user.EmailVerifiedAt.Valid,
-		HasPassword:   user.PasswordHash.Valid,
-		CreatedAt:     user.CreatedAt.Time,
-		UpdatedAt:     user.UpdatedAt.Time,
-		TokenVersion:  user.TokenVersion,
-		TenantID:      user.TenantID,
+		ID:               user.ID,
+		Email:            user.Email,
+		Name:             user.Name,
+		Role:             membership.Role,
+		MembershipStatus: string(membership.Status),
+		EmailVerified:    user.EmailVerified(),
+		HasPassword:      user.HasPassword,
+		CreatedAt:        user.CreatedAt,
+		UpdatedAt:        user.UpdatedAt,
+		JoinedAt:         membership.CreatedAt,
+		BannedAt:         membership.BannedAt,
+		TokenVersion:     user.TokenVersion,
+		TenantID:         membership.TenantID,
 	}
-	if user.DeletedAt.Valid {
-		deletedAt := user.DeletedAt.Time
-		resp.DeletedAt = &deletedAt
+	if membership.UpdatedAt.After(resp.UpdatedAt) {
+		resp.UpdatedAt = membership.UpdatedAt
 	}
-	if user.BannedAt.Valid {
-		bannedAt := user.BannedAt.Time
-		resp.BannedAt = &bannedAt
+	switch {
+	case membership.RemovedAt != nil:
+		resp.DeletedAt = membership.RemovedAt
+	case user.DeletedAt != nil:
+		resp.DeletedAt = user.DeletedAt
 	}
 	return resp
 }

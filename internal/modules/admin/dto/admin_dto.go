@@ -21,17 +21,21 @@ type AdminStatsResponse struct {
 	TotalFileSize int64 `json:"totalFileSize"`
 }
 
+// UserResponse is a member of the request tenant: identity fields from the
+// global user, role/status/joinedAt/bannedAt from the membership.
 type UserResponse struct {
-	ID            int64      `json:"id"`
-	Email         string     `json:"email"`
-	Name          string     `json:"name"`
-	Role          string     `json:"role"`
-	EmailVerified bool       `json:"emailVerified"`
-	HasPassword   bool       `json:"hasPassword"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	UpdatedAt     time.Time  `json:"updatedAt"`
-	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
-	BannedAt      *time.Time `json:"bannedAt,omitempty"`
+	ID               int64      `json:"id"`
+	Email            string     `json:"email"`
+	Name             string     `json:"name"`
+	Role             string     `json:"role"`
+	MembershipStatus string     `json:"membershipStatus" enums:"active,suspended,removed"`
+	EmailVerified    bool       `json:"emailVerified"`
+	HasPassword      bool       `json:"hasPassword"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
+	JoinedAt         time.Time  `json:"joinedAt"`
+	DeletedAt        *time.Time `json:"deletedAt,omitempty"`
+	BannedAt         *time.Time `json:"bannedAt,omitempty"`
 }
 
 type FileResponse struct {

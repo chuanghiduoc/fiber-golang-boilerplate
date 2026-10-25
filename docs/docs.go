@@ -1159,7 +1159,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get statistics for the caller's tenant only (admin only)",
+                "description": "Get statistics for the caller's tenant only (admin only): activeUsers counts active memberships of active users, deletedUsers every other membership",
                 "produces": [
                     "application/json"
                 ],
@@ -1196,7 +1196,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Get a paginated list of users in the caller's tenant, including soft-deleted",
+                "description": "Get a paginated list of the members of the caller's tenant in every membership state (active, suspended, removed), ordered by join time",
                 "produces": [
                     "application/json"
                 ],
@@ -1263,7 +1263,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Soft delete a user (admin only)",
+                "description": "Ban a member of the caller's tenant (membership suspended; sessions and API keys in this tenant end; the global account and other tenants are untouched)",
                 "produces": [
                     "application/json"
                 ],
@@ -1324,7 +1324,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Update a user's role (admin only)",
+                "description": "Change a member's role in the caller's tenant (admin only); the member's sessions in this tenant end",
                 "consumes": [
                     "application/json"
                 ],
@@ -1400,7 +1400,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Restore a soft-deleted user (admin only)",
+                "description": "Lift a member's ban in the caller's tenant (API keys issued before the ban stay revoked)",
                 "produces": [
                     "application/json"
                 ],
@@ -1606,6 +1606,127 @@ const docTemplate = `{
                 }
             }
         },
+        "/auth/invitations/accept": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Join the invitation's tenant as the signed-in user. The token is checked by possession (the caller is signed in to another tenant); the invitation must be addressed to the caller's current email. Afterwards sign in with X-Tenant-Slug of the new tenant.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Invitations"
+                ],
+                "summary": "Accept an invitation",
+                "parameters": [
+                    {
+                        "description": "Invitation token",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.AcceptInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "the membership in the invitation's tenant",
+                        "schema": {
+                            "$ref": "#/definitions/dto.UserResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invitation.invalid",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "membership.exists",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/invitations/signup": {
+            "post": {
+                "description": "Create an account for the invited address and join the invitation's tenant (send X-Tenant-Slug from the link's tenant parameter). The email is verified by the token. An address that already has an account gets 409 user.email_taken: sign in and accept instead. Not gated by user_registration.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Sign up from an invitation",
+                "parameters": [
+                    {
+                        "description": "Invitation sign-up",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.InvitationSignUpRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.UserResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invitation.invalid",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "user.email_taken",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/auth/login": {
             "post": {
                 "description": "Authenticate user and return access + refresh tokens",
@@ -1666,7 +1787,7 @@ const docTemplate = `{
         },
         "/auth/logout": {
             "post": {
-                "description": "Revoke one refresh token by possession. The tenant header is not required because possession of the opaque token authorizes revocation.",
+                "description": "Revoke the session of a refresh token by possession. The tenant header is not required because possession of the opaque token authorizes revocation.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1679,7 +1800,7 @@ const docTemplate = `{
                 "summary": "Logout",
                 "parameters": [
                     {
-                        "description": "Refresh token to revoke",
+                        "description": "Refresh token whose session is revoked",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -1714,11 +1835,11 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Revoke every refresh token for the authenticated user",
+                "description": "Revoke every session of the authenticated user in every tenant and invalidate every access token (token version bump)",
                 "tags": [
                     "Auth"
                 ],
-                "summary": "Revoke all refresh tokens",
+                "summary": "Log out everywhere",
                 "responses": {
                     "204": {
                         "description": "No Content"
@@ -1969,6 +2090,119 @@ const docTemplate = `{
                     },
                     "429": {
                         "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/sessions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Live sign-in sessions of the authenticated user in the request tenant, newest first. current marks the session of the calling access token.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "List my sessions",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max items to return",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Cursor from the last item of the previous page",
+                        "name": "startingAfter",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.ListResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/dto.SessionResponse"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/sessions/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends one live session of the authenticated user in the request tenant (its refresh tokens stop working and its access tokens are rejected). Another user's session behaves as not found.",
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Revoke one of my sessions",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Session ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -2379,6 +2613,204 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Conflict",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/invitations": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Pending invitations of the request tenant, newest first.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Invitations"
+                ],
+                "summary": "List pending invitations",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max items to return",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Cursor from the last item of the previous page",
+                        "name": "startingAfter",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.ListResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/dto.InvitationResponse"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Invite an email address into the request tenant (role defaults to user). Re-inviting a pending address replaces its token, role, and expiry. The link is emailed; the token is never returned.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Invitations"
+                ],
+                "summary": "Invite a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Idempotency key",
+                        "name": "Idempotency-Key",
+                        "in": "header"
+                    },
+                    {
+                        "description": "Invitation",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.InviteRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.InvitationResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "membership.exists",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/invitations/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Delete a pending invitation of the request tenant; its link stops working.",
+                "tags": [
+                    "Invitations"
+                ],
+                "summary": "Revoke an invitation",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Invitation ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -3113,7 +3545,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Update a user's profile (admin or self)",
+                "description": "Update the caller's own global profile. Users are global identities shared across tenants, so another user's profile (name or email) can never be changed, not even by a tenant admin; admins manage memberships (role, ban, removal).",
                 "consumes": [
                     "application/json"
                 ],
@@ -3127,7 +3559,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "integer",
-                        "description": "User ID",
+                        "description": "User ID (must be the caller)",
                         "name": "id",
                         "in": "path",
                         "required": true
@@ -3187,11 +3619,11 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Delete a user by ID",
+                "description": "With the caller's own id: delete the caller's global account (every tenant; JWT only, API keys are refused; refused while the caller is the last active admin of any tenant). With another id: remove that user's membership from the request tenant (requires admin:users:delete); the global account and other tenants are untouched.",
                 "tags": [
                     "Users"
                 ],
-                "summary": "Delete user",
+                "summary": "Delete account or remove member",
                 "parameters": [
                     {
                         "type": "integer",
@@ -3225,6 +3657,12 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "user.last_admin",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -4527,6 +4965,17 @@ const docTemplate = `{
                 "id": {
                     "type": "integer"
                 },
+                "joinedAt": {
+                    "type": "string"
+                },
+                "membershipStatus": {
+                    "type": "string",
+                    "enum": [
+                        "active",
+                        "suspended",
+                        "removed"
+                    ]
+                },
                 "name": {
                     "type": "string"
                 },
@@ -4777,6 +5226,18 @@ const docTemplate = `{
                 },
                 "type": {
                     "type": "string"
+                }
+            }
+        },
+        "dto.AcceptInvitationRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "maxLength": 256
                 }
             }
         },
@@ -5176,6 +5637,76 @@ const docTemplate = `{
                 }
             }
         },
+        "dto.InvitationResponse": {
+            "type": "object",
+            "properties": {
+                "acceptedAt": {
+                    "type": "string"
+                },
+                "createdAt": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "expiresAt": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "invitedBy": {
+                    "type": "integer"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "tenantId": {
+                    "type": "integer"
+                }
+            }
+        },
+        "dto.InvitationSignUpRequest": {
+            "type": "object",
+            "required": [
+                "name",
+                "password",
+                "token"
+            ],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "maxLength": 255,
+                    "minLength": 2
+                },
+                "password": {
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string",
+                    "maxLength": 256
+                }
+            }
+        },
+        "dto.InviteRequest": {
+            "type": "object",
+            "required": [
+                "email"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string",
+                    "maxLength": 255
+                },
+                "role": {
+                    "type": "string",
+                    "enum": [
+                        "user",
+                        "admin"
+                    ]
+                }
+            }
+        },
         "dto.LoginRequest": {
             "type": "object",
             "required": [
@@ -5377,6 +5908,30 @@ const docTemplate = `{
                 }
             }
         },
+        "dto.SessionResponse": {
+            "type": "object",
+            "properties": {
+                "createdAt": {
+                    "type": "string"
+                },
+                "current": {
+                    "description": "Current marks the session of the access token making the request.",
+                    "type": "boolean"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "ip": {
+                    "type": "string"
+                },
+                "lastUsedAt": {
+                    "type": "string"
+                },
+                "userAgent": {
+                    "type": "string"
+                }
+            }
+        },
         "dto.UnreadCountResponse": {
             "type": "object",
             "properties": {
@@ -5518,14 +6073,27 @@ const docTemplate = `{
                 "id": {
                     "type": "integer"
                 },
+                "joinedAt": {
+                    "type": "string"
+                },
+                "membershipStatus": {
+                    "description": "MembershipStatus is active, suspended (banned), or removed.",
+                    "type": "string",
+                    "enum": [
+                        "active",
+                        "suspended",
+                        "removed"
+                    ]
+                },
                 "name": {
                     "type": "string"
                 },
                 "role": {
+                    "description": "Role is the membership role in TenantID (transitional; P2b-2 replaces\nit with membership roles).",
                     "type": "string"
                 },
                 "tenantId": {
-                    "description": "TenantID identifies the owning tenant. It is additive and read-only.",
+                    "description": "TenantID is the tenant this view (membership) belongs to.",
                     "type": "integer"
                 },
                 "updatedAt": {

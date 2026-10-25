@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     -- The composite FK below makes the database reject a key whose owner
-    -- belongs to a different tenant (parent key: idx_users_tenant_id_id).
+    -- is not a member of the key's tenant (parent key: uq_memberships_tenant_user).
     user_id BIGINT NOT NULL,
     name VARCHAR(255) NOT NULL,
     prefix VARCHAR(16) NOT NULL,
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_api_keys_tenant_user FOREIGN KEY (tenant_id, user_id)
-        REFERENCES users (tenant_id, id) ON DELETE RESTRICT,
+        REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT,
     -- MarkAPIKeyRotated is the only writer of either column and always sets
     -- both, so a grace window exists exactly when the key was rotated.
     CONSTRAINT api_keys_rotation_grace_matches_rotated

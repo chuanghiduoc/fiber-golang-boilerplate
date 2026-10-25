@@ -12,6 +12,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
@@ -44,18 +45,20 @@ func run() error {
 	defer pool.Close()
 
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
-	userRepo := repository.NewUserRepository(pool)
-	tenantRepo := repository.NewTenantRepository(pool)
+	stores := repository.NewStores(pool)
+	// The seed writes no audit rows, so the transactor has no recorder.
+	transactor := repository.NewTransactor(database.NewTxManager(pool), nil, nil, nil)
 	// Seeding checks existence, not request eligibility: an operator may need
 	// to seed an admin before reactivating a suspended default tenant.
-	_, defaultTenant, err := repository.StartupTenants(ctx, tenantRepo, cfg.Tenant.DefaultSlug)
+	_, defaultTenant, err := service.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)
 	if err != nil {
 		return err
 	}
-	if defaultTenant.Status != "active" {
-		slog.Warn("configured default tenant is suspended; seeding anyway",
+	if !defaultTenant.Status.Operational() {
+		slog.Warn("configured default tenant is not operational; seeding anyway",
 			slog.String("tenant", defaultTenant.Slug),
 			slog.Int64("tenant_id", defaultTenant.ID),
+			slog.String("status", string(defaultTenant.Status)),
 		)
 	}
 
@@ -63,7 +66,7 @@ func run() error {
 		return fmt.Errorf("ADMIN_EMAIL and ADMIN_PASSWORD must be set for seeding")
 	}
 
-	if err := seed.Admin(ctx, cfg.Admin, userRepo, defaultTenant.ID); err != nil {
+	if err := seed.Admin(ctx, cfg.Admin, stores, transactor, defaultTenant.ID); err != nil {
 		return fmt.Errorf("seed admin: %w", err)
 	}
 

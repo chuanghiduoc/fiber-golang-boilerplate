@@ -35,9 +35,9 @@ func setupAuthAuditApp(recorder audit.Recorder) *fiber.App {
 		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
-	authHandler := NewAuthHandler(
+	authHandler := newTestAuthHandler(
 		newMockService(),
-		&mockRefreshTokenService{},
+		&mockSessions{},
 		&mockPasswordResetService{},
 		&mockEmailVerificationService{},
 		"test-secret",
@@ -122,9 +122,9 @@ func TestAuthAudit_FailedLoginIsNotAttributed(t *testing.T) {
 	recorder := &recordingAuditRecorder{}
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 
-	authHandler := NewAuthHandler(
+	authHandler := newTestAuthHandler(
 		newMockService(),
-		&mockRefreshTokenService{},
+		&mockSessions{},
 		&mockPasswordResetService{},
 		&mockEmailVerificationService{},
 		"test-secret",

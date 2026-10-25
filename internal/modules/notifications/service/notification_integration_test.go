@@ -27,21 +27,12 @@ import (
 
 func integrationTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
 	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug,
-	).Scan(&id))
-	return id
+	return testutil.CreateTenant(t, context.Background(), pool, slug)
 }
 
 func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address string) int64 {
 	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`,
-		tenantID, address,
-	).Scan(&id))
-	return id
+	return testutil.CreateMember(t, context.Background(), pool, tenantID, address, testutil.MemberOptions{}).UserID
 }
 
 func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) NotificationService {

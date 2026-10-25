@@ -76,7 +76,7 @@ flowchart LR
 | `cmd/seed` | Standalone admin seeder (schema must exist) |
 | `internal/bootstrap` | The single ordered module list and contract cross-wiring |
 | `internal/app` | Composition root: Fiber app, global middleware, module registry, provider hooks |
-| `internal/modules/identity` | Auth, users, sessions, tokens, admin seed |
+| `internal/modules/identity` | Auth, global users, memberships, invitations, sessions, tokens, tenant lifecycle, admin seed |
 | `internal/modules/files` | Upload, download, soft delete, restore |
 | `internal/modules/admin` | Back-office facade over identity/files contracts (no SQL) |
 | `internal/modules/features` | Feature-flag admin API |
@@ -178,8 +178,12 @@ on startup.
 
 ## Multi-tenancy
 
-The schema, request pipeline, and every module are tenant-scoped. One user
-belongs to exactly one tenant, and no identity read or write crosses tenants.
+The schema, request pipeline, and every module are tenant-scoped. Users are
+global identities (one email, one password, an optional linked Google
+identity) that join tenants through **memberships** (ADR 0004); each
+membership has its own role and status, and every tenant-scoped row of other
+modules references the membership, not the user. A user joins another tenant
+only by accepting an invitation.
 
 ```mermaid
 flowchart TD
@@ -208,15 +212,15 @@ flowchart TD
 | Default tenant | The baseline seeds `default` with id `1`. Header-less requests resolve to `TENANT_DEFAULT_SLUG` in local/test compatibility mode. `TENANT_REQUIRE_HEADER=true` rejects them; **production requires it** (staging should set it too) so a write never silently falls back to tenant 1. |
 | Resolution | `X-Tenant-Slug` selects the tenant on `/api/v1` and `/api/v2`. Invalid, unknown, or suspended slugs return `404 tenant not found`. |
 | Startup | Startup checks tenant *existence* separately: a suspended configured/default tenant does not crash `cmd/api` or `cmd/seed`; its requests return `404` until reactivated. |
-| Public auth | Register, login, forgot/reset password, resend/verify email, and refresh use the resolved tenant; clients of a non-default tenant must send the header consistently. `GET /auth/google` and the reset/verify endpoints also accept a validated `?tenant=<slug>`; an explicit header always wins. Reset/verification links include `?tenant=<slug>` automatically. |
-| Google OAuth | The tenant is bound into the OAuth `state` (and state cookie). The callback ignores `X-Tenant-Slug`, uses the state tenant, and refuses an unknown or suspended tenant even when the header is required. |
-| Access tokens | Carry `tenant_id`. A conflicting explicit `X-Tenant-Slug` returns `403 permission.denied` (`tenant mismatch`); a zero, negative, or missing claim returns `401`. Pre-multi-tenancy tokens are rejected fail-closed, so users must log in again after upgrading. |
-| Sessions | The session validator compares the JWT tenant with the stored user tenant and rejects suspended tenants within the 5-second session-cache TTL, so a token minted while a tenant was active can survive that short window. |
-| Identity | All SQL is scoped by `tenant_id`: users by id, email, Google ID, admin lists/stats, and refresh/reset/verification tokens. Cross-tenant ids or tokens behave as not found (user/admin APIs `404`, refresh `401`, reset/verify link tokens `400`). Emails and Google IDs are unique per tenant; the last-admin trigger and application check protect each tenant independently. |
-| Logout | `POST /auth/logout` revokes by possession of the opaque refresh token, even without `X-Tenant-Slug`, and returns `204` when the token is already absent. |
+| Public auth | Register, login, and refresh use the resolved tenant; clients of a non-default tenant must send the header consistently. Login needs the global password **and** an active membership in that tenant. Registration creates the account and its membership there; an email that already has an account (in any tenant) gets `409 user.email_taken`. Password reset and email verification are per user. `GET /auth/google` and the reset/verify endpoints also accept a validated `?tenant=<slug>`; an explicit header always wins. Reset, verification, and invitation links include `?tenant=<slug>` so the frontend knows where to sign in. |
+| Google OAuth | The tenant is bound into the OAuth `state` (and state cookie). The callback ignores `X-Tenant-Slug`, uses the state tenant, and refuses an unknown or suspended tenant even when the header is required. Linking to an existing account needs a verified local email and Google's `verified_email`; an existing user must already be a member of the state tenant (Google sign-in never joins a tenant implicitly). |
+| Access tokens | Carry `tenant_id` and `sid` (the session). A conflicting explicit `X-Tenant-Slug` returns `403 permission.denied` (`tenant mismatch`); a zero, negative, or missing `tenant_id` or `sid` returns `401`, so tokens minted before sessions existed are rejected fail-closed and users must log in again after upgrading. |
+| Sessions | Each sign-in is a session (the refresh-token family). The session validator checks the session is not revoked, the membership and user are active, the tenant is operational, and role/token version match, within the 5-second session-cache TTL. `GET /auth/sessions` lists and `DELETE /auth/sessions/:id` revokes the caller's sessions in the tenant; a reused refresh token revokes its whole session. |
+| Identity | Membership, session, refresh-token, invitation, member-list, and stats SQL is scoped by `tenant_id`. Non-member user ids return `404`, another tenant's refresh token `401`. Emails and Google subjects are unique among live accounts globally; the last-admin trigger (on `memberships`) and application check protect each tenant independently. Ban, unban, role change, and removal are membership changes in one tenant. |
+| Logout | `POST /auth/logout` revokes the session of the opaque refresh token by possession, even without `X-Tenant-Slug`, and returns `204` when the token is already absent. `POST /auth/logout-all` revokes every session in every tenant. |
 | Files | Every metadata read/write, admin list/stats, download, delete, and restore filters the request tenant; cross-tenant ids return `404`. Blobs use `<tenantID>/<userID>/<uuid>.<ext>`. |
 | Jobs and audit | Enqueue records the request tenant, the worker restores tenant context for handlers, and audit rows are tenant-scoped. |
-| Feature flags | Targets carry `tenant_id` and a nullable `user_id`; a composite foreign key rejects a target pointing at another tenant's user. Defaults and kill switches are process-wide. See [docs/feature-flags.md](docs/feature-flags.md). |
+| Feature flags | Targets carry `tenant_id` and a nullable `user_id`; a composite foreign key to `memberships` rejects a target pointing at a user who is not a member of that tenant. Defaults and kill switches are process-wide. See [docs/feature-flags.md](docs/feature-flags.md). |
 | Webhooks | Endpoints, versioned secrets, deliveries, attempts, inbound sources, and inbound events are tenant-scoped in SQL and indexes. The public receiver resolves the tenant from the source id and writes/audits under it regardless of `X-Tenant-Slug`. |
 | Notifications | Feed and preference queries filter both `tenant_id` and `user_id`; cross-tenant or other-user ids return `404`. Email jobs inherit the notification tenant. |
 | Idempotency | Keys are scoped by method, path, tenant ID/slug, and caller (user, or IP for public routes), so a key/body/IP in two tenants cannot replay one tenant's `201` into another. |
@@ -317,6 +321,19 @@ flowchart LR
 source files are missing. Later migrations are ordinary timestamped files
 (`make migrate-create`), always above the legacy versions.
 
+> **Identity model change (ADR 0004).** The baseline identity schema stores
+> global `users` plus `memberships`, `user_passwords`, `user_identities`,
+> `sessions`, and per-user reset/verification tokens, while legacy databases
+> have per-tenant `users` rows with `tenant_id`, `role`, and the password on
+> the row. Converting them is a **data migration**, not DDL alone: merge
+> accounts that share a normalized email across tenants into one user, move
+> each old row's tenant/role/ban into a membership, move passwords and Google
+> IDs into their own tables, repoint every cross-module `(tenant_id, user_id)`
+> FK at `memberships`, and drop refresh/reset/verification tokens (users sign
+> in again). The repository ships no script for it; write and rehearse one
+> against a restored backup. The table below still describes the non-identity
+> objects.
+
 The manual upgrade DDL (step 2) must cover:
 
 | Object group | Required DDL |
@@ -325,7 +342,7 @@ The manual upgrade DDL (step 2) must cover:
 | Tenant columns | `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` on `users`, `files`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `jobs`, and `audit_events`. |
 | Indexes | Rebuild user indexes with `tenant_id` leading, then add the tenant-leading indexes used by scoped queries. |
 | Last-admin trigger | Replace `protect_last_admin()` with the per-tenant version. |
-| Feature flags | `feature_flags`, `feature_flag_targets`, the `UNIQUE NULLS NOT DISTINCT (tenant_id, flag_key, user_id)` target index, and a unique `users(tenant_id, id)` for tenant-safe user targets. Without them the evaluator still uses env/compiled defaults, but the admin API fails. |
+| Feature flags | `feature_flags`, `feature_flag_targets`, the `UNIQUE NULLS NOT DISTINCT (tenant_id, flag_key, user_id)` target index, and the `(tenant_id, user_id) → memberships` FK for tenant-safe user targets (see the identity note above). Without them the evaluator still uses env/compiled defaults, but the admin API fails. |
 | Notifications | `notifications` and `notification_preferences` plus indexes; `cmd/migrate` verifies both tables, tenant columns, and the unique preference index. |
 | `ON CONFLICT` targets | Every unique index an upsert uses: `idx_jobs_tenant_idempotency_key`, `idx_scheduler_runs_schedule_slot`, the feature-flag target index, the `api_key_scopes`/`webhook_events` primary keys, and the webhook secret/delivery/attempt indexes. |
 | Triggers | `trigger_protect_last_admin`, `trigger_audit_events_completion`, `trigger_audit_events_no_delete`, `trigger_audit_events_no_truncate`. `cmd/migrate` reports missing or disabled ones. `audit_events` rejects `DELETE`/`TRUNCATE`; a reviewed retention or erasure job must disable those triggers explicitly as the table owner. |
@@ -354,8 +371,12 @@ Protected routes accept a JWT or `Authorization: ApiKey` unless noted.
 | POST | `/api/v1/auth/register` | Register new user |
 | POST | `/api/v1/auth/login` | Login, returns JWT + refresh token |
 | POST | `/api/v1/auth/refresh` | Refresh access token |
-| POST | `/api/v1/auth/logout` | Revoke one refresh token |
-| POST | `/api/v1/auth/logout-all` | Revoke every refresh token for the current user (JWT only) |
+| POST | `/api/v1/auth/logout` | Revoke the session of one refresh token |
+| POST | `/api/v1/auth/logout-all` | Revoke every session of the current user in every tenant (JWT only) |
+| GET | `/api/v1/auth/sessions` | List my live sessions in this tenant (JWT only) |
+| DELETE | `/api/v1/auth/sessions/:id` | Revoke one of my sessions (JWT only) |
+| POST | `/api/v1/auth/invitations/accept` | Join the invitation's tenant as the signed-in user (JWT only) |
+| POST | `/api/v1/auth/invitations/signup` | Create an account from an invitation token (public) |
 | POST | `/api/v1/auth/forgot-password` | Request password reset email |
 | POST | `/api/v1/auth/reset-password` | Reset password with token (`?tenant=` link fallback) |
 | POST | `/api/v1/auth/verify-email` | Verify email with token (`?tenant=` link fallback) |
@@ -369,10 +390,17 @@ Protected routes accept a JWT or `Authorization: ApiKey` unless noted.
 | GET | `/api/v1/users/me` | Get current user |
 | PUT | `/api/v1/users/me` | Update own profile |
 | PUT | `/api/v1/users/me/password` | Change password |
-| GET | `/api/v1/users/:id` | Get user by ID (self or admin) |
-| GET | `/api/v1/users/` | List users (admin only) |
-| PUT | `/api/v1/users/:id` | Update user (admin or self) |
-| DELETE | `/api/v1/users/:id` | Delete user (admin or self) |
+| GET | `/api/v1/users/:id` | Get a member of this tenant by user ID (self or admin) |
+| GET | `/api/v1/users/` | List members of this tenant (admin only) |
+| PUT | `/api/v1/users/:id` | Update own global profile (another id: `403`) |
+| DELETE | `/api/v1/users/:id` | Own id: delete the global account (JWT only); another id: remove that membership from this tenant (admin) |
+
+### Invitations (admin)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/v1/invitations/` | Invite an email into this tenant (link emailed) |
+| GET | `/api/v1/invitations/` | List pending invitations |
+| DELETE | `/api/v1/invitations/:id` | Revoke a pending invitation |
 
 ### Files (protected)
 Scoped to the request tenant; another tenant's file id returns `404`, including
@@ -777,11 +805,11 @@ migration entrypoint, and tenant foundation exist.
 
 | Area | Guarantee |
 |------|-----------|
-| Refresh tokens | Hashed, atomic single-use, bound to the user's token version, rotated on every refresh. |
-| Access tokens | Carry `token_version`; password change/reset, ban, unban, and role change invalidate them immediately. Validated against the user record through a generation-keyed session cache (use Redis in production so invalidation is shared). |
+| Refresh tokens | Hashed, atomic single-use, bound to their session and the user's token version, rotated on every refresh. Reusing a rotated token revokes the whole session (RFC 9700). |
+| Access tokens | Carry `sid`, `token_version`, and the membership role; password change/reset, email change, logout-all, session revocation, ban, removal, and role change invalidate them immediately. Validated against the session, membership, user, and tenant through a generation-keyed session cache (use Redis in production so invalidation is shared). |
 | Tenant claim | A conflicting explicit `X-Tenant-Slug` returns `403`; a missing/zero/negative claim `401`. Unknown or suspended tenants are rejected with `404` before authentication; a cached suspended snapshot returns `401` until the 5-second TTL expires. |
-| Emails | Normalized and unique case-insensitively among active accounts within a tenant. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. Banned emails cannot re-register or use Google login; self-deleted accounts can re-register. |
-| Logout | `POST /auth/logout` revokes one refresh token by possession; `/auth/logout-all` bumps the token version and invalidates access tokens. |
+| Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
+| Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
 | Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
 | Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
 | Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |

@@ -406,16 +406,50 @@ do not linger in a dump. It also means **a dead job cannot be replayed from its
 row**: re-trigger the business flow (for example ask the user to request
 another reset email) instead of updating dead rows back to `queued`.
 
-### Expired identity tokens
+### Expired identity tokens and stale sessions
 
 | Rule | Value |
 | --- | --- |
 | Job | `identity.tokens.purge_expired`, scheduled hourly by the identity `ScheduleProvider`. |
 | Prerequisite | `SCHEDULER_ENABLED=true`. Without the scheduler, expired tokens are still rejected on use but never deleted. |
-| Tables | `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, in that order. |
+| Tables | In order: expired `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`; expired **pending** `invitations` (accepted rows are kept as the membership's provenance); then stale `sessions`, so sessions whose last refresh token expired in the same run are already eligible. |
+| Session retention | A session is purged when it was revoked more than 30 days ago (kept that long so `revoked_reason`, for example `refresh_reuse`, is visible for incident review), or when it has been idle (`last_used_at`) for more than 24 hours **and** has no refresh-token rows left. The 24-hour grace keeps a rotation in flight from losing its session row. Used refresh tokens stay until they expire so a replay is still recognized as reuse. |
 | Bounds | `DELETE` batches of 1,000 rows chosen with `FOR UPDATE SKIP LOCKED`; at most 1 minute per table per run, the remainder goes to the next run. |
-| Index | `idx_refresh_tokens_expires_at`; the one-row-per-user reset and verification tables are small enough without one. |
-| Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate). |
+| Index | `idx_refresh_tokens_expires_at`, `idx_invitations_expires_at_pending`, `idx_sessions_last_used_at` (plus `idx_refresh_tokens_tenant_session_id` for the live-token check); the one-row-per-user reset and verification tables are small enough without one. |
+| Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate besides the global per-user rows). Reset and verification tokens are per user and have no tenant. |
+
+### Sessions and legacy tokens
+
+- Every sign-in creates a `sessions` row; the access token's `sid` claim names
+  it. Tokens without a positive `sid` (or `tenant_id`) claim are rejected with
+  `401` fail-closed, so after deploying this release every user signs in again;
+  no migration of old tokens is possible or needed.
+- Revocation reasons in `sessions.revoked_reason`: `logout`, `logout_all`,
+  `revoked` (`DELETE /auth/sessions/:id`), `refresh_reuse`,
+  `credentials_changed`, `membership_changed` (ban, removal, role change),
+  `account_deleted`. A burst of `refresh_reuse` (also logged as
+  `refresh token reuse detected; session revoked`) points at stolen refresh
+  tokens or a client that retries refresh with an old token.
+- To force everyone to sign in again without rotating `JWT_SECRET`, revoke
+  live sessions (`UPDATE sessions SET revoked_at = now(), revoked_reason =
+  'revoked' WHERE revoked_at IS NULL`) and wait out the 5-second session cache,
+  or bump users' `token_version`.
+
+### Tenant lifecycle
+
+Tenant status is `trialing | active | suspended | pending_deletion |
+deleted`; only `trialing` and `active` serve requests. Transitions go through
+the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
+which enforces the state machine (`trialing → active | suspended |
+pending_deletion`, `active ↔ suspended`, `active | suspended →
+pending_deletion`, `pending_deletion → active | deleted`) and writes a Tier 1
+audit row per change. Entering `pending_deletion` schedules deletion after a
+30-day grace; cancelling it clears the schedule. Tenant 1 can never be
+deleted (also a `CHECK`). There are no platform-admin HTTP endpoints for this
+yet (they arrive with platform roles in P2b-2); use operator tooling that calls
+the service rather than raw `UPDATE`s, which skip the audit row. A
+non-operational tenant returns `404` on tenant resolution after the resolver
+cache TTL (30s) and `401` for existing sessions and API keys.
 
 ### Data retention overview
 
@@ -514,7 +548,8 @@ JWT notes:
 
 - Refresh tokens are opaque database rows, not JWTs: rotation does not revoke
   them, and a valid refresh token mints an access token with the new key. To
-  force a full re-login, revoke refresh tokens or bump users' token version.
+  force a full re-login, revoke sessions or bump users' token version (see
+  [Sessions and legacy tokens](#sessions-and-legacy-tokens)).
 - Google OAuth `state` is HMAC-signed with a key derived from the **active**
   `JWT_SECRET` only, so sign-ins started before the swap fail once and must be
   restarted.
@@ -1047,6 +1082,15 @@ those objects from the baseline. The upgrade DDL must:
    and a unique index on `users(tenant_id, id)` for tenant-safe user targets;
 6. create `notifications` and `notification_preferences` with tenant/user
    columns, the feed/unread indexes, and the unique preference index.
+
+The steps above describe the earlier per-tenant `users` foundation. The
+current baseline goes further (ADR 0004): `users` are global, tenant access is
+a `memberships` row, and every cross-module `(tenant_id, user_id)` FK
+references `memberships`. Moving a per-tenant `users` database onto it is a
+data migration (merge accounts sharing an email, create memberships, move
+passwords/Google IDs to `user_passwords`/`user_identities`, drop old
+tokens); see the identity note in the README's
+[Upgrading an existing database](../README.md#upgrading-an-existing-database).
 
 Keep tenant id 1 as the compatibility anchor unless you also change the column
 defaults and backfill every row. Existing rows default to tenant 1, and their

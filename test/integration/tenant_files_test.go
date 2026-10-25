@@ -88,20 +88,11 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('files-acme', 'Files Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "files-acme")
 
 	insertUser := func(tenantID int64, email string) int64 {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role)
-			 VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, strings.Split(email, "@")[0],
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "files-a@test.com")
 	userB := insertUser(tenantB, "files-b@test.com")
@@ -123,7 +114,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
-		identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
+		identityadapter.NewTenantResolver(identityrepo.NewStores(pool).Tenants),
 		tenant.DefaultSlug,
 	))
 

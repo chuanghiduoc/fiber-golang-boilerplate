@@ -59,32 +59,24 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('apikey-acme', 'API Key Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "apikey-acme")
 
 	insertUser := func(tenantID int64, email string) int64 {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role)
-			 VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, email,
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "apikey-a@test.com")
 	userB := insertUser(tenantB, "apikey-b@test.com")
 
+	stores := identityrepo.NewStores(pool)
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
-	principalReader := identityadapter.NewPrincipalReader(identityrepo.NewUserRepository(pool))
+	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
 	svc := apikeyservice.NewService(apiKeyRepo, principalReader, nil, audit.Noop{})
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
-		identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
+		identityadapter.NewTenantResolver(stores.Tenants),
 		tenant.DefaultSlug,
 	))
 	protected := api.Group("/protected", apikeyhttp.Authenticate(

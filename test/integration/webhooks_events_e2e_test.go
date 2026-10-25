@@ -99,11 +99,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// The producer: a user uploads a file through the files service.
-	var userID int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, 'e2e@test.com', 'E2E', 'user') RETURNING id`,
-		tenant.DefaultID,
-	).Scan(&userID))
+	userID := testutil.CreateMember(t, ctx, pool, tenant.DefaultID, "e2e@test.com", testutil.MemberOptions{}).UserID
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(pool),

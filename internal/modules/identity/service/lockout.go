@@ -11,11 +11,11 @@ import (
 )
 
 const (
-	// maxLoginAttempts is the per-(tenant, email, client IP) budget. Keying by
-	// source means a stranger cannot lock a victim out from one address.
+	// maxLoginAttempts is the per-(email, client IP) budget. Keying by source
+	// means a stranger cannot lock a victim out from one address.
 	maxLoginAttempts = 5
-	// accountLockoutMultiplier sets the global per-(tenant, email) budget,
-	// which still stops guessing distributed across many addresses. One source
+	// accountLockoutMultiplier sets the global per-email budget, which still
+	// stops guessing distributed across many addresses. One source
 	// contributes at most maxLoginAttempts per window to it.
 	accountLockoutMultiplier = 5
 	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
@@ -23,11 +23,12 @@ const (
 	loginAttemptPrefix       = "login_attempts:"
 )
 
-// loginAttemptKeys returns the per-source key (tenant, email, client IP) and
-// the global per-account key (tenant, email) for one password attempt. The
-// email is hashed by scopedKey, so neither key contains the address.
+// loginAttemptKeys returns the per-source key (email, client IP) and the
+// global per-account key (email) for one password attempt. The email is
+// hashed by emailKey, so neither key contains the address. The password is
+// a global credential (ADR 0004), so neither key is tenant-scoped.
 func loginAttemptKeys(ctx context.Context, email string) (source, account string) {
-	account = scopedKey(ctx, loginAttemptPrefix, email)
+	account = emailKey(loginAttemptPrefix, email)
 	return account + ":ip=" + clientIPFromContext(ctx), account
 }
 

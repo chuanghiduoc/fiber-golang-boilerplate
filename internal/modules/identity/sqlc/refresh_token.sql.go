@@ -11,141 +11,69 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const consumeRefreshToken = `-- name: ConsumeRefreshToken :one
-DELETE FROM refresh_tokens
-WHERE token = $1 AND tenant_id = $2
-RETURNING id, tenant_id, user_id, token, token_version, expires_at, created_at
-`
-
-type ConsumeRefreshTokenParams struct {
-	Token    string `json:"token"`
-	TenantID int64  `json:"tenant_id"`
-}
-
-func (q *Queries) ConsumeRefreshToken(ctx context.Context, arg ConsumeRefreshTokenParams) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, consumeRefreshToken, arg.Token, arg.TenantID)
-	var i RefreshToken
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.UserID,
-		&i.Token,
-		&i.TokenVersion,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-	)
-	return i, err
-}
-
-const createRefreshToken = `-- name: CreateRefreshToken :one
-INSERT INTO refresh_tokens (tenant_id, user_id, token, expires_at, token_version)
-SELECT u.tenant_id, $1, $2, $3, u.token_version
-FROM users u
-WHERE u.id = $1
-  AND u.tenant_id = $5
-  AND u.deleted_at IS NULL
-  -- Compare with the version the caller authenticated/consumed. This closes
-  -- the bcrypt-length window where a password change could commit after the
-  -- password check but before this INSERT.
-  AND u.token_version = $4
-RETURNING id, tenant_id, user_id, token, token_version, expires_at, created_at
+const createRefreshToken = `-- name: CreateRefreshToken :exec
+INSERT INTO refresh_tokens (tenant_id, session_id, token_hash, expires_at)
+VALUES ($1, $2, $3, $4)
 `
 
 type CreateRefreshTokenParams struct {
-	UserID       int64              `json:"user_id"`
-	Token        string             `json:"token"`
-	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
-	TokenVersion int32              `json:"token_version"`
-	TenantID     int64              `json:"tenant_id"`
+	TenantID  int64              `json:"tenant_id"`
+	SessionID int64              `json:"session_id"`
+	TokenHash string             `json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
-func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, createRefreshToken,
-		arg.UserID,
-		arg.Token,
-		arg.ExpiresAt,
-		arg.TokenVersion,
+func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) error {
+	_, err := q.db.Exec(ctx, createRefreshToken,
 		arg.TenantID,
+		arg.SessionID,
+		arg.TokenHash,
+		arg.ExpiresAt,
 	)
+	return err
+}
+
+const getRefreshTokenByHash = `-- name: GetRefreshTokenByHash :one
+SELECT id, tenant_id, session_id, token_hash, expires_at, used_at, created_at FROM refresh_tokens
+WHERE token_hash = $1
+`
+
+// Possession-based lookup (the hash is unique across tenants); the service
+// compares the row's tenant with the request tenant before using it.
+func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error) {
+	row := q.db.QueryRow(ctx, getRefreshTokenByHash, tokenHash)
 	var i RefreshToken
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
-		&i.UserID,
-		&i.Token,
-		&i.TokenVersion,
+		&i.SessionID,
+		&i.TokenHash,
 		&i.ExpiresAt,
+		&i.UsedAt,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
-const deleteRefreshToken = `-- name: DeleteRefreshToken :exec
-DELETE FROM refresh_tokens
-WHERE token = $1 AND tenant_id = $2
+const markRefreshTokenUsed = `-- name: MarkRefreshTokenUsed :execrows
+UPDATE refresh_tokens
+SET used_at = NOW()
+WHERE tenant_id = $1 AND id = $2 AND used_at IS NULL
 `
 
-type DeleteRefreshTokenParams struct {
-	Token    string `json:"token"`
-	TenantID int64  `json:"tenant_id"`
-}
-
-func (q *Queries) DeleteRefreshToken(ctx context.Context, arg DeleteRefreshTokenParams) error {
-	_, err := q.db.Exec(ctx, deleteRefreshToken, arg.Token, arg.TenantID)
-	return err
-}
-
-const deleteRefreshTokenByPossession = `-- name: DeleteRefreshTokenByPossession :exec
-DELETE FROM refresh_tokens
-WHERE token = $1
-`
-
-// Logout is possession-based: presenting the opaque token is sufficient to
-// revoke it, even if the caller omits X-Tenant-Slug. Possession cannot be used
-// to read or mint anything, so this does not weaken tenant isolation.
-func (q *Queries) DeleteRefreshTokenByPossession(ctx context.Context, token string) error {
-	_, err := q.db.Exec(ctx, deleteRefreshTokenByPossession, token)
-	return err
-}
-
-const deleteRefreshTokensByUserID = `-- name: DeleteRefreshTokensByUserID :exec
-DELETE FROM refresh_tokens
-WHERE user_id = $1 AND tenant_id = $2
-`
-
-type DeleteRefreshTokensByUserIDParams struct {
-	UserID   int64 `json:"user_id"`
+type MarkRefreshTokenUsedParams struct {
 	TenantID int64 `json:"tenant_id"`
+	ID       int64 `json:"id"`
 }
 
-func (q *Queries) DeleteRefreshTokensByUserID(ctx context.Context, arg DeleteRefreshTokensByUserIDParams) error {
-	_, err := q.db.Exec(ctx, deleteRefreshTokensByUserID, arg.UserID, arg.TenantID)
-	return err
-}
-
-const getRefreshTokenByToken = `-- name: GetRefreshTokenByToken :one
-SELECT id, tenant_id, user_id, token, token_version, expires_at, created_at FROM refresh_tokens
-WHERE token = $1 AND tenant_id = $2
-`
-
-type GetRefreshTokenByTokenParams struct {
-	Token    string `json:"token"`
-	TenantID int64  `json:"tenant_id"`
-}
-
-func (q *Queries) GetRefreshTokenByToken(ctx context.Context, arg GetRefreshTokenByTokenParams) (RefreshToken, error) {
-	row := q.db.QueryRow(ctx, getRefreshTokenByToken, arg.Token, arg.TenantID)
-	var i RefreshToken
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.UserID,
-		&i.Token,
-		&i.TokenVersion,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-	)
-	return i, err
+// Exactly one concurrent rotation can win; the loser sees zero rows and is
+// treated as reuse.
+func (q *Queries) MarkRefreshTokenUsed(ctx context.Context, arg MarkRefreshTokenUsedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markRefreshTokenUsed, arg.TenantID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const purgeExpiredRefreshTokens = `-- name: PurgeExpiredRefreshTokens :execrows
@@ -160,8 +88,10 @@ USING batch
 WHERE t.id = batch.id
 `
 
-// Maintenance purge across every tenant; see PurgeExpiredPasswordResetTokens.
-// Served by idx_refresh_tokens_expires_at.
+// Maintenance purge across every tenant (an expired token is dead in any
+// tenant). One bounded batch per call; SKIP LOCKED avoids waiting on rows a
+// concurrent purge or rotation already holds. Served by
+// idx_refresh_tokens_expires_at.
 func (q *Queries) PurgeExpiredRefreshTokens(ctx context.Context, batchSize int32) (int64, error) {
 	result, err := q.db.Exec(ctx, purgeExpiredRefreshTokens, batchSize)
 	if err != nil {

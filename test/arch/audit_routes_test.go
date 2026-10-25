@@ -28,7 +28,12 @@ var tier1Mutations = map[string]tier1Audit{
 	"POST /api/v1/auth/register": {"identity", "auth.registered"},
 	// Signed-state tenant: UserService records auth.google_login in the
 	// sign-in transaction with the state tenant and the signed-in user.
-	"GET /api/v1/auth/google/callback":     {"identity", "auth.google_login"},
+	"GET /api/v1/auth/google/callback": {"identity", "auth.google_login"},
+	// Invitations: InvitationService records in the mutation transaction.
+	"POST /api/v1/invitations/":            {"identity", "invitation.created"},
+	"DELETE /api/v1/invitations/:id":       {"identity", "invitation.revoked"},
+	"POST /api/v1/auth/invitations/accept": {"identity", "invitation.accepted"},
+	"POST /api/v1/auth/invitations/signup": {"identity", "invitation.accepted"},
 	"PUT /api/v1/users/me":                 {"identity", "user.profile_updated"},
 	"PUT /api/v1/users/me/password":        {"identity", "user.password_changed"},
 	"PUT /api/v1/users/:id":                {"identity", "user.profile_updated"},

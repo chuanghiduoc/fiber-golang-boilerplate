@@ -76,7 +76,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 
 | Module | Owns |
 |---|---|
-| `identity` | Auth, users, sessions, tokens, tenants, admin seed (dto/repository/service/handler + adapter + queries/sqlc) |
+| `identity` | Auth, global users, memberships, invitations, sessions, tokens, tenant lifecycle, admin seed (dto/repository/service/handler + adapter + queries/sqlc) |
 | `files` | Upload, metadata, download, soft delete, restore (+ adapter + queries/sqlc) |
 | `features` | Admin feature-flag catalogue surface (+ queries/sqlc) |
 | `notifications` | In-app feed, channel preferences, durable email channel (+ queries/sqlc) |
@@ -244,7 +244,9 @@ it yet.
 
 ## Multi-tenant model
 
-One user belongs to exactly one tenant. Tenant `1` (`default`) is seeded by
+Users are global identities that join tenants through memberships (ADR 0004):
+one account (one email, one password, linked Google identity) can be a member
+of several tenants, each membership with its own role and status. Tenant `1` (`default`) is seeded by
 the baseline and keeps header-less local/test requests and pre-tenancy rows
 working; production sets `TENANT_REQUIRE_HEADER=true`. Startup checks tenant
 **existence** regardless of status, so a suspended default tenant starts
@@ -252,8 +254,8 @@ normally and its requests return 404.
 
 | Area | Isolation rule |
 |---|---|
-| Schema | Every tenant-owned table has `tenant_id … DEFAULT 1 REFERENCES tenants(id)` and composite `(tenant_id, id)` child FKs. See [Data Model](data-model.md). |
-| Identity | Every user/admin/stat and refresh/reset/verification query filters `tenant_id`. Emails and Google IDs are unique per tenant; the last-admin trigger counts only the affected tenant. Public auth flows use the request tenant; reset/verification links carry `?tenant=<slug>` (header wins). |
+| Schema | Every tenant-owned table has `tenant_id … REFERENCES tenants(id)` and composite child FKs; per-member rows of other modules reference `(tenant_id, user_id) → memberships`. `users` and per-user credential rows are global. See [Data Model](data-model.md). |
+| Identity | Membership, session, refresh-token, invitation, member-list, and stats queries filter `tenant_id`; global user rows are reached through the caller's membership. Emails and Google subjects are globally unique among live accounts; the last-admin trigger (on `memberships`) counts only the affected tenant. Login requires an active membership in the request tenant. Reset/verification tokens are per user; their links carry `?tenant=<slug>` only for the frontend (header wins). |
 | Files | Every metadata read/write, list, admin list/stats, download, delete, and restore filters the request tenant. Services re-check the returned tenant/owner. New blobs use `<tenantID>/<userID>/<uuid>.<ext>`; old rows keep `<userID>/<uuid>`. |
 | Notifications | Every query filters `(tenant_id, user_id)`; another user's or tenant's id is not found. |
 | Webhooks | Endpoints, secrets, deliveries, attempts, sources, and inbound events all lead with `tenant_id`. The only unscoped lookup is the public receiver's source-by-ID, which then authenticates with HMAC and installs the source tenant. |
@@ -262,9 +264,9 @@ normally and its requests return 404.
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
 | OAuth | The tenant is bound into `state` and the state cookie; the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. |
-| Sessions | Tokens without a positive `tenant_id` claim are rejected. The session validator compares the claim with the stored user tenant and tenant status, so a suspension takes effect within the 5-second session-cache TTL. |
+| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, and the tenant status, so a revocation, ban, role change, or suspension takes effect within the 5-second session-cache TTL. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
-| Logout | Revokes refresh tokens by possession, so a valid token is deleted even without the header. |
+| Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
 
 Repositories derive the tenant from `tenant.EffectiveID(ctx)`; the tenant-1
 fallback is only for jobs, internal callers, and tests. Cross-tenant ids or
@@ -351,8 +353,10 @@ keeps the repository's tenant scoping.
   (`make migrate-create module=<owner> name=<purpose>`); never edit a shipped
   migration. Legacy databases keep their recorded history (see README).
 - `feature_flags` is global configuration; `scheduler_leases` and
-  `scheduler_runs` are tenant-independent with no foreign keys. Everything
-  else is tenant-owned with tenant-leading indexes.
+  `scheduler_runs` are tenant-independent with no foreign keys; identity's
+  `users`, `user_passwords`, `user_identities`, and reset/verification tokens
+  are global per-user rows (ADR 0004). Everything else is tenant-owned with
+  tenant-leading indexes.
 - `api_keys.key_hash` is globally unique; it is the only lookup made before a
   request tenant can be trusted.
 - `files.storage_path` is the authoritative blob key; moving a blob without
@@ -365,7 +369,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Concern | Convention |
 |---|---|
 | Authorization | Module permissions live in `catalog/permissions.go` and register through `app.PermissionProvider`; only shared back-office permissions stay in `internal/platform/authz`. Notification routes use `notifications:read`/`notifications:write`; sending to another user needs admin-only `notifications:send`. Legacy exceptions: [Module Template](module-template.md#legacy-exceptions-do-not-copy). |
-| Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
+| Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, invitations create/revoke/accept/sign-up, tenant lifecycle, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |
 | API versions | `/api/v1` always; opt-in `/api/v2` via `app.V2Module`. `Accept-Version` must match the path (406 `api.version_unsupported`). Responses carry `API-Version`, `Vary: Accept-Version`, and configured deprecation metadata. Swagger stays on v1. |

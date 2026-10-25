@@ -159,39 +159,35 @@ most allowlisted violations).
 
 | Path | Role |
 | --- | --- |
-| `service/ports.go` | service types (`File`, `NewFile`, `FileStats`, `ErrStoragePathTaken`) and the ports: `FileRepository`, `Transactor`, and the transaction-bound `TxRepos{Files, Audit, Outbox}` |
+| `service/ports.go` | service types (`File`, `NewFile`, `FileStats`, `ErrStoragePathTaken`) and the ports: `FileRepository`, `Transactor`, and the transaction-bound `TxRepos{Files, Audit, Events}` |
 | `service/*_service.go` | use cases; imports only ports, `internal/contracts`, platform cores (`authz`, `audit`, `tenant`), `pkg/storage`, `pkg/apperror`, `pkg/pagination` |
-| `service/webhooks.go` | webhook payload types and the in-transaction / post-commit dispatch helpers |
+| `service/events.go` | maps `File` to the `internal/contracts/files` event payloads and publishes them through `TxRepos.Events` |
 | `repository/file_repository.go` | implements `service.FileRepository` over sqlc; `toFile` maps rows to `service.File`, and Postgres errors become `apperror.ErrNotFound` / `service.ErrStoragePathTaken` |
-| `repository/tx.go` | `Transactor.InTx` opens a `database.TxManager` transaction and hands the service a `TxRepos` whose repository, audit writer, and outbox are all bound to that `pgx.Tx` |
+| `repository/tx.go` | `Transactor.InTx` opens a `database.TxManager` transaction and hands the service a `TxRepos` whose repository, audit writer, and event publisher are all bound to that `pgx.Tx` |
 | `handler/mapping.go` | `service.File` → `dto.FileResponse` (download URL, `deletedAt`) |
 | `adapter/admin.go` | `service.File` → `internal/contracts/files` types for the admin module |
-| `build.go` | the only place that wires concrete types: repository, `NewTransactor(infra.Tx, infra.Audit, outbox)`, services, handler, adapter |
+| `build.go` | the only place that wires concrete types: repository, `NewTransactor(infra.Tx, infra.Audit, infra.Events)`, services, handler, adapter |
 
 Transactional side effects never expose `pgx.Tx` to the service. The use case
 writes through the collaborators it is given:
 
 ```go
 err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-	file, err := tx.Files.Delete(ctx, id)
+	file, err := m.apply(ctx, tx.Files)
 	if err != nil {
 		return err
 	}
 	if err := tx.Audit.RecordTx(ctx, event); err != nil { // Tier 1 audit row
 		return filesAuditWriteError(err)
 	}
-	if tx.Outbox != nil { // webhook outbox job in the same transaction
-		return enqueueWebhook(ctx, tx.Outbox, eventType, file.TenantID, data)
-	}
-	return nil
+	// Domain event in the same transaction (events.PublishTx); webhooks
+	// subscribes durably, so files never imports it.
+	return publishEvent(ctx, tx.Events, m.eventType, m.dataVersion, file.TenantID, m.eventData(file))
 })
 ```
 
-`TxRepos.Outbox` is nil when the dispatcher passed to `Build` cannot join a
-transaction; the service then dispatches after commit. Dependencies are
-constructor arguments (`files.Build(infra, settings, webhooks)`), so the
-composition root builds webhooks before files rather than attaching it after
-construction. Unit tests use an in-memory `FileRepository` and a fake
+`files.Build(infra, settings)` takes no other module: events go through
+`infra.Events`. Unit tests use an in-memory `FileRepository` and a fake
 `Transactor` (`service/upload_service_mocks_test.go`); rollback is covered
 against PostgreSQL in `test/integration`.
 
@@ -354,8 +350,8 @@ permission and keep the module's routes together.
 | --- | --- | --- |
 | Public routes | The `publicRoutes` allowlist in `test/arch/routes_test.go` (anonymous/token-possession auth flows and the HMAC-authenticated webhook receiver) is the complete list of `/api/v1` routes without `authzhttp.Require`. Every other route, including all `files` routes and `POST /auth/logout-all` (`sessions:revoke`), requires a permission. | Adding to the list is a reviewed product decision. |
 | Fallback-audited mutations | Only the public webhook receiver and the caller's own notification state (`read-all`, `:id/read`, preferences) are neither Tier 1 nor `audithttp.Guard`ed; the best-effort global middleware records them (`fallbackAudited` in `test/arch/audit_routes_test.go`). Webhook administration and `POST /notifications/send` are guarded. | Never extend the list with privileged mutations. |
-| `identity` user reads/updates | `GET/PUT/DELETE /users/:id` require `profile:read`/`profile:write`, then allow another user's id only if the caller also holds the matching `admin:users:*` permission (`httpx.Can` in the handler). | Keep the route permission; move row-level ownership into the service. |
-| `users` references from other modules | `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` keep `(tenant_id, user_id) REFERENCES users (tenant_id, id) ON DELETE RESTRICT`. Users are soft-deleted, so the key only guarantees same-tenant ownership and never cascades across the module boundary. | No new cross-module foreign keys; core identity references need explicit owner approval. |
+| `identity` user reads/updates | `GET/DELETE /users/:id` require `profile:read`/`profile:write`, then allow another user's id only if the caller also holds the matching `admin:users:*` permission (`httpx.Can` in the handler; `DELETE` on another id removes the membership). `PUT /users/:id` accepts only the caller's own id (the global profile has one owner). | Keep the route permission; move row-level ownership into the service. |
+| Membership references from other modules | `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` keep `(tenant_id, user_id) REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT` (ADR 0004: users are global; the membership is the tenant-scoped principal). Memberships are never hard-deleted (removal is a status), so the key only guarantees the user is or was a member of that tenant and never cascades across the module boundary. | No new cross-module foreign keys; core identity references need explicit owner approval. |
 
 ## 4. Permissions and catalog
 
@@ -498,7 +494,7 @@ One module owns each table:
 
 | Owner | Tables |
 | --- | --- |
-| `identity` | `tenants`, `users`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants`, `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
 | `files` | `files` |
 | `features` | `feature_flags`, `feature_flag_targets` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -537,7 +533,7 @@ even in a JOIN; use a contract/read model or a job.
 | Timestamps | `created_at`/`updated_at` `TIMESTAMP WITH TIME ZONE NOT NULL`; shared `update_updated_at()` trigger for mutable tables |
 | Soft delete | `deleted_at` plus partial unique indexes for active rows |
 | Pagination | `(created_at DESC, id DESC)` index |
-| Foreign keys | fine inside the module; avoid cross-module ones. An unavoidable core reference (`user_id`) needs owner agreement, documentation, `(tenant_id, user_id)` → `users (tenant_id, id)`, and `ON DELETE RESTRICT`, never `CASCADE` |
+| Foreign keys | fine inside the module; avoid cross-module ones. An unavoidable core reference (`user_id`) needs owner agreement, documentation, `(tenant_id, user_id)` → `memberships (tenant_id, user_id)`, and `ON DELETE RESTRICT`, never `CASCADE` |
 | Indexes | every ownership and lookup path used by list/detail endpoints, in the same migration as the table |
 
 ### Migration rules

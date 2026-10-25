@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 type fakeTokenPurgeRepo struct {
@@ -32,11 +33,24 @@ func (f *fakeTokenPurgeRepo) PurgeExpiredEmailVerificationTokens(_ context.Conte
 	return f.take("verification", batch)
 }
 
+func (f *fakeTokenPurgeRepo) PurgeExpiredInvitations(_ context.Context, batch int32) (int64, error) {
+	return f.take("invitations", batch)
+}
+
+func (f *fakeTokenPurgeRepo) PurgeStaleSessions(_ context.Context, revokedBefore, idleBefore time.Time, batch int32) (int64, error) {
+	if !revokedBefore.Before(idleBefore) {
+		return 0, errors.New("revoked sessions must be kept longer than idle ones")
+	}
+	return f.take("sessions", batch)
+}
+
 func TestTokenPurgerDrainsEveryTableInBatches(t *testing.T) {
 	repo := &fakeTokenPurgeRepo{backlog: map[string]int64{
 		"refresh":      2*tokenPurgeBatchSize + 7,
 		"reset":        tokenPurgeBatchSize,
 		"verification": 3,
+		"invitations":  tokenPurgeBatchSize + 1,
+		"sessions":     5,
 	}}
 	if err := NewTokenPurger(repo).HandleJob(context.Background(), nil); err != nil {
 		t.Fatalf("purge: %v", err)

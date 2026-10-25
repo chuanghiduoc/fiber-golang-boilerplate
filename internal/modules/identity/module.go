@@ -22,10 +22,13 @@ import (
 type Module struct {
 	auth  *identityhandler.AuthHandler
 	users *identityhandler.UserHandler
+	// sessions and invitations are set by Build (or WithSessions /
+	// WithInvitations); their routes are mounted only when present.
+	sessions    *identityhandler.SessionHandler
+	invitations *identityhandler.InvitationHandler
 
-	// userSvc and startup are set by Build; a module built with New (tests)
-	// has neither.
-	userSvc     identityservice.UserService
+	// The job, schedule, and startup collaborators are set by Build; a module
+	// built with New (tests) has none.
 	resetSvc    identityservice.PasswordResetService
 	tokenPurger *identityservice.TokenPurger
 	startup     func(ctx context.Context) error
@@ -90,6 +93,17 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// state tenant and the signed-in user in the sign-in transaction.
 	auth.Get("/google/callback", rl.Normal, m.auth.GoogleCallback)
 
+	// Sessions belong to JWT sign-ins; an API key has none, so these routes
+	// are JWT-only like logout-all.
+	jwtOnly := middleware.JWTAuthKeys(cfg.JWT.Keyring(), deps.Sessions)
+	if m.sessions != nil {
+		auth.Get("/sessions", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.sessions.List)
+		auth.Delete("/sessions/:id", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.session_revoked", "session"), m.sessions.Revoke)
+	}
+	if m.invitations != nil {
+		m.registerInvitationRoutes(v1, auth, jwtOnly, deps)
+	}
+
 	users := v1.Group("/users", deps.Authenticate())
 	users.Get("/me", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
 	users.Put("/me", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
@@ -98,4 +112,22 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
 	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
 	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+}
+
+// registerInvitationRoutes mounts the invitation flow. Create, revoke,
+// accept, and sign-up are Tier 1: InvitationService writes invitation.* in
+// the mutation transaction, so no route-level Guard is added.
+func (m *Module) registerInvitationRoutes(v1, auth fiber.Router, jwtOnly fiber.Handler, deps app.Deps) {
+	rl := deps.Limiters
+	invitations := v1.Group("/invitations", deps.Authenticate())
+	invitations.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), deps.Idempotency, m.invitations.Create)
+	invitations.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionInvitationsRead), m.invitations.List)
+	invitations.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), m.invitations.Revoke)
+
+	// Accepting joins another tenant with the global identity, which a
+	// tenant-scoped API key must not do: JWT only. Mounted under /auth (no
+	// group middleware) so /invitations' API-key chain does not apply.
+	auth.Post("/invitations/accept", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.invitations.Accept)
+	// Public: the emailed token authorizes creating the invited account.
+	auth.Post("/invitations/signup", rl.Strict, deps.Idempotency, m.invitations.SignUp)
 }

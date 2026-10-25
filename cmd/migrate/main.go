@@ -42,7 +42,13 @@ const (
 // golang-migrate alone would treat as current.
 var requiredTables = []string{
 	"tenants",
+	"tenant_settings",
 	"users",
+	"user_passwords",
+	"user_identities",
+	"memberships",
+	"invitations",
+	"sessions",
 	"refresh_tokens",
 	"password_reset_tokens",
 	"email_verification_tokens",
@@ -70,11 +76,22 @@ var requiredTables = []string{
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the baseline.
 var requiredColumns = map[string][]string{
-	"tenants":                   {"slug", "status"},
-	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at", "credentials_revoked_at"},
-	"refresh_tokens":            {"tenant_id", "token_version"},
-	"password_reset_tokens":     {"tenant_id"},
-	"email_verification_tokens": {"tenant_id", "email"},
+	"tenants":         {"slug", "status", "status_changed_at", "trial_ends_at", "deletion_scheduled_at"},
+	"tenant_settings": {"tenant_id", "locale", "timezone"},
+	// Global users (ADR 0004): no tenant_id, role, or credential columns.
+	"users":           {"email", "status", "token_version", "credentials_changed_at", "deleted_at"},
+	"user_passwords":  {"user_id", "password_hash", "changed_at"},
+	"user_identities": {"user_id", "provider", "subject", "email"},
+	"memberships": {
+		"tenant_id", "user_id", "role", "status", "banned_at", "removed_at", "credentials_revoked_at",
+	},
+	"invitations": {
+		"tenant_id", "email_normalized", "role", "token_hash", "invited_by", "expires_at", "accepted_at", "accepted_by",
+	},
+	"sessions":                  {"tenant_id", "user_id", "token_version", "ip", "last_used_at", "revoked_at", "revoked_reason"},
+	"refresh_tokens":            {"tenant_id", "session_id", "token_hash", "used_at"},
+	"password_reset_tokens":     {"user_id", "token_hash"},
+	"email_verification_tokens": {"user_id", "email", "token_hash"},
 	"files":                     {"tenant_id", "updated_at"},
 	"api_keys": {
 		"tenant_id", "user_id", "key_hash", "expires_at",
@@ -106,17 +123,26 @@ var requiredColumns = map[string][]string{
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens, duplicate active emails per tenant, duplicate
-// tenant slugs, and duplicate API-key hashes, plus every unique index an
-// ON CONFLICT target relies on (without it the upsert fails at runtime with
-// "no unique or exclusion constraint matching the ON CONFLICT specification").
+// and verification tokens, duplicate live emails, duplicate memberships and
+// external identities, duplicate pending invitations, duplicate tenant slugs,
+// and duplicate API-key hashes, plus every unique index an ON CONFLICT target
+// or composite FK parent relies on (without it the upsert fails at runtime
+// with "no unique or exclusion constraint matching the ON CONFLICT
+// specification").
 var requiredUniqueIndexes = []string{
 	"tenants_slug_key",
-	"idx_users_tenant_email_lower_active",
-	"idx_users_tenant_google_id_active",
-	"idx_users_tenant_id_id",
-	"idx_password_reset_tokens_tenant_user_id",
-	"idx_email_verification_tokens_tenant_user_id",
+	"idx_users_email_live",
+	"uq_user_identities_provider_subject",
+	"uq_user_identities_user_provider",
+	"uq_memberships_tenant_user",
+	"uq_sessions_tenant_id",
+	"idx_invitations_tenant_email_pending",
+	"invitations_token_hash_key",
+	"refresh_tokens_token_hash_key",
+	"password_reset_tokens_user_id_key",
+	"password_reset_tokens_token_hash_key",
+	"email_verification_tokens_user_id_key",
+	"email_verification_tokens_token_hash_key",
 	"idx_webhook_inbound_sources_tenant_slug_active",
 	"idx_webhook_inbound_events_source_event",
 	"idx_api_keys_key_hash",
@@ -138,7 +164,7 @@ var requiredUniqueIndexes = []string{
 // requiredTriggers are the database-level invariants the application relies
 // on: the per-tenant last-admin guard and the audit append-only guards.
 var requiredTriggers = map[string][]string{
-	"users": {"trigger_protect_last_admin"},
+	"memberships": {"trigger_protect_last_admin"},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",
@@ -150,21 +176,24 @@ var requiredTriggers = map[string][]string{
 // tenant_id. Checking the first key column (not just the index name) catches a
 // legacy global index that kept its name after the tenant rewrite.
 var requiredTenantLeadingIndexes = map[string][]string{
-	"users": {
-		"idx_users_tenant_email_lower_active",
-		"idx_users_tenant_google_id_active",
-		"idx_users_tenant_role_active",
-		"idx_users_tenant_created_at_id",
-		"idx_users_tenant_email_lower_banned",
+	// users, user_passwords, user_identities, and the reset/verification
+	// tokens are global (ADR 0004) and have no tenant_id.
+	// uq_memberships_tenant_user (tenant_id, user_id) is verified as a
+	// required unique index above.
+	"memberships": {
+		"idx_memberships_tenant_created_at_user",
+		"idx_memberships_tenant_active_admins",
+		"idx_memberships_tenant_suspended",
+	},
+	"invitations": {
+		"idx_invitations_tenant_email_pending",
+		"idx_invitations_tenant_created_at_id",
+	},
+	"sessions": {
+		"idx_sessions_tenant_user_created_at",
 	},
 	"refresh_tokens": {
-		"idx_refresh_tokens_tenant_user_id",
-	},
-	"password_reset_tokens": {
-		"idx_password_reset_tokens_tenant_user_id",
-	},
-	"email_verification_tokens": {
-		"idx_email_verification_tokens_tenant_user_id",
+		"idx_refresh_tokens_tenant_session_id",
 	},
 	"files": {
 		"idx_files_tenant_user_created",

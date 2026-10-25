@@ -21,23 +21,12 @@ import (
 
 func createUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
 	t.Helper()
-	var id int64
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`,
-		tenantID, email,
-	).Scan(&id)
-	require.NoError(t, err)
-	return id
+	return testutil.CreateMember(t, context.Background(), pool, tenantID, email, testutil.MemberOptions{}).UserID
 }
 
 func createTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
 	t.Helper()
-	var id int64
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug,
-	).Scan(&id)
-	require.NoError(t, err)
-	return id
+	return testutil.CreateTenant(t, context.Background(), pool, slug)
 }
 
 func TestRepositoryUserAndTenantIsolation(t *testing.T) {

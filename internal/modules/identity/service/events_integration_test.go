@@ -1,0 +1,91 @@
+//go:build integration
+
+package service_test
+
+import (
+	"context"
+	"encoding/json"
+	"strconv"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+)
+
+const probeHandler = "probe"
+
+func subscribeProbe(t *testing.T, bus *events.Bus) {
+	t.Helper()
+	require.NoError(t, bus.SubscribeDurable(identitycontracts.EventUserRegistered, probeHandler,
+		func(context.Context, events.Event) error { return nil }))
+}
+
+// Registration publishes user.registered through the identity transactor:
+// the durable subscriber job commits with the account, carries the envelope,
+// and is scoped to the tenant of the new membership.
+func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
+
+	bus := events.New(jobs.NewQueue(e.pool))
+	subscribeProbe(t, bus)
+	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
+	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
+
+	user, err := users.Register(tenant.WithID(ctx, acmeID), dto.RegisterRequest{Email: "event@example.com", Password: "Password1!", Name: "Event"})
+	require.NoError(t, err)
+
+	var (
+		jobTenant int64
+		payload   []byte
+	)
+	require.NoError(t, e.pool.QueryRow(ctx,
+		`SELECT tenant_id, payload FROM jobs WHERE kind = $1`, "events.user.registered."+probeHandler,
+	).Scan(&jobTenant, &payload))
+	assert.Equal(t, acmeID, jobTenant)
+
+	var envelope events.Event
+	require.NoError(t, json.Unmarshal(payload, &envelope))
+	assert.Equal(t, identitycontracts.EventUserRegistered, envelope.Type)
+	assert.Equal(t, identitycontracts.UserRegisteredVersion, envelope.DataVersion)
+	assert.Equal(t, acmeID, envelope.TenantID)
+	assert.Equal(t, events.UserActor(user.ID), envelope.Actor)
+	data, err := events.Decode[identitycontracts.UserRegistered](envelope)
+	require.NoError(t, err)
+	assert.Equal(t, user.ID, data.UserID)
+	assert.Equal(t, "event@example.com", data.Email)
+	assert.Equal(t, strconv.FormatInt(user.ID, 10), envelope.Actor.ID)
+}
+
+// A publish failure (here a durable subscriber with no queue) fails the
+// registration closed: user, password, membership, and audit row roll back.
+func TestRegister_RollsBackWhenPublishFails(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+
+	bus := events.New(nil) // durable publish fails with events.ErrNoQueue
+	subscribeProbe(t, bus)
+	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
+	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
+
+	_, err := users.Register(ctx, dto.RegisterRequest{Email: "rollback@example.com", Password: "Password1!", Name: "Rollback"})
+	require.Error(t, err)
+	assert.Equal(t, 500, appStatus(err))
+	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM users`))
+	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM memberships`))
+	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM user_passwords`))
+	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM audit_events WHERE action = 'auth.registered'`))
+}

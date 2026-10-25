@@ -39,22 +39,6 @@ func setupTrashDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-func insertTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
-	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug).Scan(&id))
-	return id
-}
-
-func insertUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
-	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`, tenantID, email).Scan(&id))
-	return id
-}
-
 // insertFile creates a metadata row (soft-deleted deletedAgo ago when
 // deletedAgo > 0) and, when withBlob, its blob.
 func insertFile(t *testing.T, pool *pgxpool.Pool, store storage.Storage, tenantID, userID int64, name string, deletedAgo time.Duration, withBlob bool) (id int64, path string) {
@@ -101,9 +85,9 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
 
-	tenantB := insertTenant(t, pool, "trash-b")
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-a@example.com")
-	userB := insertUser(t, pool, tenantB, "trash-b@example.com")
+	tenantB := testutil.CreateTenant(t, context.Background(), pool, "trash-b")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-a@example.com", testutil.MemberOptions{}).UserID
+	userB := testutil.CreateMember(t, context.Background(), pool, tenantB, "trash-b@example.com", testutil.MemberOptions{}).UserID
 
 	const old, recent = 40 * 24 * time.Hour, 5 * 24 * time.Hour
 	_, oldA := insertFile(t, pool, store, tenant.DefaultID, userA, "old-a", old, true)
@@ -141,7 +125,7 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-claim@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-claim@example.com", testutil.MemberOptions{}).UserID
 	id, path := insertFile(t, pool, store, tenant.DefaultID, userA, "claimed", 40*24*time.Hour, true)
 
 	ctx := context.Background()
@@ -177,7 +161,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	pool := setupTrashDB(t)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-skip@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-skip@example.com", testutil.MemberOptions{}).UserID
 	id, _ := insertFile(t, pool, store, tenant.DefaultID, userA, "restoring", 40*24*time.Hour, true)
 
 	ctx := context.Background()
@@ -202,7 +186,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
 	pool := setupTrashDB(t)
 	ctx := context.Background()
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-plan@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-plan@example.com", testutil.MemberOptions{}).UserID
 	_, err := pool.Exec(ctx, `
 		INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size, deleted_at)
 		SELECT 1, $1, 'f', 'seed/' || g, 'image/png', 1,

@@ -12,9 +12,11 @@
 --   * every tenant-owned row carries tenant_id and tenant-leading indexes;
 --   * surrogate keys are BIGINT GENERATED ALWAYS AS IDENTITY, so an explicit
 --     id needs OVERRIDING SYSTEM VALUE (only the default tenant seed uses it);
---   * a cross-module child of users references (tenant_id, user_id) with
---     ON DELETE RESTRICT: users are soft-deleted and another module's rows
---     must never vanish through a cascade it does not own.
+--   * a cross-module per-user row references memberships (tenant_id, user_id)
+--     with ON DELETE RESTRICT: a module row for a user in a tenant requires
+--     that membership, memberships are never hard-deleted while referenced,
+--     and another module's rows must never vanish through a cascade it does
+--     not own (users are global identities, ADR 0004).
 
 CREATE OR REPLACE FUNCTION update_updated_at()
 RETURNS TRIGGER AS $$

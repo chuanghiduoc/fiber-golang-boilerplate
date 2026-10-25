@@ -5,25 +5,26 @@ import (
 	"errors"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// NotificationRecipient adapts the tenant-scoped user repository to the
-// notifications module's recipient lookup. Identity remains the owner of user
-// email addresses; notifications never query the users table.
+// NotificationRecipient adapts identity memberships to the notifications
+// module's recipient lookup. Identity remains the owner of user email
+// addresses; notifications never query the users table. Only an active member
+// of the context tenant is a recipient.
 type NotificationRecipient struct {
-	users repository.UserRepository
+	memberships identityservice.MembershipRepository
 }
 
 var _ identitycontracts.NotificationRecipientLookup = (*NotificationRecipient)(nil)
 
-func NewNotificationRecipient(users repository.UserRepository) *NotificationRecipient {
-	return &NotificationRecipient{users: users}
+func NewNotificationRecipient(memberships identityservice.MembershipRepository) *NotificationRecipient {
+	return &NotificationRecipient{memberships: memberships}
 }
 
 func (a *NotificationRecipient) NotificationRecipient(ctx context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
-	user, err := a.users.GetByID(ctx, userID)
+	member, err := a.memberships.GetActive(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return identitycontracts.NotificationRecipient{}, apperror.ErrNotFound
@@ -31,8 +32,8 @@ func (a *NotificationRecipient) NotificationRecipient(ctx context.Context, userI
 		return identitycontracts.NotificationRecipient{}, err
 	}
 	return identitycontracts.NotificationRecipient{
-		UserID: user.ID,
-		Email:  user.Email,
-		Name:   user.Name,
+		UserID: member.User.ID,
+		Email:  member.User.Email,
+		Name:   member.User.Name,
 	}, nil
 }

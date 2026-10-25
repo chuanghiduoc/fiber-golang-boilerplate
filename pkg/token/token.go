@@ -12,8 +12,10 @@ import (
 
 // Claims represents the JWT claims used across the application.
 type Claims struct {
-	UserID       int64  `json:"user_id"`
-	TenantID     int64  `json:"tenant_id,omitempty"`
+	UserID   int64 `json:"user_id"`
+	TenantID int64 `json:"tenant_id,omitempty"`
+	// SessionID is the sign-in session (sessions.id) the token belongs to.
+	SessionID    int64  `json:"sid,omitempty"`
 	Email        string `json:"email"`
 	Role         string `json:"role"`
 	TokenVersion int32  `json:"token_version"`
@@ -48,15 +50,44 @@ func GenerateWithVersion(userID int64, email, role string, tokenVersion int32, s
 // user's current token version and tenant ID. A negative tenant ID is rejected;
 // zero remains reserved for legacy tokens that predate multi-tenancy.
 func GenerateWithVersionAndTenant(userID, tenantID int64, email, role string, tokenVersion int32, secret string, expireHour int) (string, error) {
-	if tenantID < 0 {
-		return "", errors.New("tenant ID must not be negative")
-	}
-	claims := Claims{
+	return GenerateForSession(SessionClaims{
 		UserID:       userID,
 		TenantID:     tenantID,
 		Email:        email,
 		Role:         role,
 		TokenVersion: tokenVersion,
+	}, secret, expireHour)
+}
+
+// SessionClaims are the application claims of an access token issued for a
+// sign-in session.
+type SessionClaims struct {
+	UserID       int64
+	TenantID     int64
+	SessionID    int64
+	Email        string
+	Role         string
+	TokenVersion int32
+}
+
+// GenerateForSession creates a signed JWT bound to a user, tenant, and
+// session. The session validator rejects a token whose session was revoked;
+// a zero SessionID produces a token without the sid claim, which the
+// validator rejects fail-closed.
+func GenerateForSession(c SessionClaims, secret string, expireHour int) (string, error) {
+	if c.TenantID < 0 {
+		return "", errors.New("tenant ID must not be negative")
+	}
+	if c.SessionID < 0 {
+		return "", errors.New("session ID must not be negative")
+	}
+	claims := Claims{
+		UserID:       c.UserID,
+		TenantID:     c.TenantID,
+		SessionID:    c.SessionID,
+		Email:        c.Email,
+		Role:         c.Role,
+		TokenVersion: c.TokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expireHour) * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

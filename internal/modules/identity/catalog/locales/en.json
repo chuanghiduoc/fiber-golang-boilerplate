@@ -3,5 +3,7 @@
   "errors.auth.email_not_verified.title": "Email not verified",
   "errors.auth.refresh_invalid.title": "Invalid refresh token",
   "errors.user.email_taken.title": "Email already in use",
-  "errors.user.not_found.title": "User not found"
+  "errors.user.not_found.title": "User not found",
+  "errors.invitation.invalid.title": "Invalid invitation",
+  "errors.membership.exists.title": "Already a member"
 }

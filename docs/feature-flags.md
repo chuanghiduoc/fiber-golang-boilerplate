@@ -36,7 +36,7 @@ Each flag is enforced by its owning module with the request subject
 
 | Key | Enforced at | Subject | When off |
 | --- | --- | --- | --- |
-| `user_registration` | `POST /auth/register` (handler) and new-account creation in `GET /auth/google/callback` | request tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
+| `user_registration` | `POST /auth/register` (handler) and new-account creation in `GET /auth/google/callback`; `POST /auth/invitations/signup` is deliberately not gated (the admin invited the address) | request tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
 | `google_oauth` | `GET /auth/google` and `GET /auth/google/callback` (handler) | redirect: resolved tenant; callback: tenant in the signed `state` | `404 feature.disabled` |
 | `file_uploads` | `POST /files/upload` (route middleware after auth, before idempotency/audit) | request tenant + JWT user | `404 feature.disabled` |
 | `email_verification` | `POST /auth/login`, `POST /auth/refresh` | user's tenant + user | when **on**, unverified users get `403 auth.email_not_verified` |
@@ -145,8 +145,8 @@ Both tables are created by the fresh-install baseline file `migrations/202601010
   `description`, timestamps.
 - `feature_flag_targets` is tenant-owned: `flag_key`, `tenant_id`, nullable
   `user_id`, `enabled`, timestamps. A `(tenant_id, user_id)` composite foreign
-  key references `users(tenant_id, id)`, so a target cannot point at a user in
-  another tenant. `feature_flag_targets_flag_key_fk` references
+  key references `memberships(tenant_id, user_id)` (`ON DELETE RESTRICT`), so a
+  target cannot point at a user who is not a member of that tenant. `feature_flag_targets_flag_key_fk` references
   `feature_flags(flag_key)` with `ON DELETE RESTRICT`: deleting a flag can never
   wipe another tenant's targets.
 - A target upsert creates the parent flag row in the same statement when it is
@@ -161,7 +161,8 @@ also the tenant-leading index of the admin list query; `(flag_key)` is indexed
 separately for the `RESTRICT` check on flag delete.
 
 `cmd/migrate` verifies both tables, their tenant/key columns, and this unique
-index (plus `users(tenant_id, id)`, which backs the composite foreign key).
+index (plus `uq_memberships_tenant_user`, which backs the composite foreign
+key).
 
 ## Cache and invalidation
 

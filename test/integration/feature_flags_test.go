@@ -76,20 +76,12 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('flags-acme', 'Flags Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "flags-acme")
 
+	// User feature-flag targets reference the (tenant, user) membership.
 	insertUser := func(tenantID int64, email string) int64 {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role)
-			 VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, email,
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "flags-a@test.com")
 	userB := insertUser(tenantB, "flags-b@test.com")
@@ -118,7 +110,7 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	application := app.New(cfg, app.Deps{
 		Cache:          cache.NewMemoryCache(),
 		Audit:          recorder,
-		TenantResolver: identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
+		TenantResolver: identityadapter.NewTenantResolver(identityrepo.NewStores(pool).Tenants),
 		Flags:          flags,
 	})
 	application.Register(featuresmodule.New(handler))

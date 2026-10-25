@@ -5,16 +5,10 @@ import (
 	"errors"
 	"strconv"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Google sign-in outcomes recorded in the auth.google_login audit metadata.
@@ -24,174 +18,203 @@ const (
 	googleAccountCreated  = "created"
 )
 
-// GoogleSignIn is one verified Google identity from the OAuth callback.
+// GoogleSignIn is one verified Google identity from the OAuth callback, for
+// the request tenant (the tenant bound into the signed OAuth state).
 type GoogleSignIn struct {
 	GoogleID string
 	Email    string
 	Name     string
+	// EmailVerified is Google's verified_email. An unverified Google address
+	// can neither create an account nor link to one.
+	EmailVerified bool
 	// AllowSignUp permits creating a new account (the user_registration
 	// flag). An existing or linkable account may always sign in; otherwise a
 	// sign-up attempt fails with feature.disabled.
 	AllowSignUp bool
-	// Complete runs inside the sign-in transaction after the account is
-	// resolved and before auth.google_login is recorded. The caller applies
-	// its admission rules (tenant, email verification) and issues the session
-	// through tx. An error rolls back any account link/creation and writes no
-	// audit row, so a refused sign-in is never audited as a success. tx is nil
-	// when the service runs without a transaction manager. A nil Complete
-	// admits every resolved account.
-	Complete func(ctx context.Context, tx pgx.Tx, user *dto.UserResponse) error
+	// Complete runs inside the sign-in transaction after the account and its
+	// membership are resolved and before the session is issued. The caller
+	// applies its admission rules (email verification flag). An error rolls
+	// back any account link/creation and writes no audit row, so a refused
+	// sign-in is never audited as a success. A nil Complete admits every
+	// resolved member.
+	Complete func(ctx context.Context, user *dto.UserResponse) error
 }
 
-// googleAccountResolver finds, links, or creates the account for a Google
-// identity and names the outcome (googleAccount*).
-type googleAccountResolver func(ctx context.Context, repo repository.UserRepository, req GoogleSignIn) (*identitysqlc.User, string, error)
+// GoogleSignInResult is the signed-in member and the issued session.
+type GoogleSignInResult struct {
+	User   *dto.UserResponse
+	Tokens TokenPair
+}
 
-func (s *userService) SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*dto.UserResponse, error) {
+// SignInWithGoogle resolves the Google identity to a global user (existing
+// link, a verified local account with the same address, or a new account),
+// requires an active membership in the request tenant (a new account gets
+// one; an existing user joins other tenants through invitations), and issues
+// the session and the Tier 1 auth.google_login audit row in one transaction.
+func (s *userService) SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*GoogleSignInResult, error) {
 	req.Email = NormalizeEmail(req.Email)
-	user, err := s.completeGoogleSignIn(ctx, req, s.linkOrCreateGoogleUser)
-	if err != nil {
-		user, err = s.retryAfterConcurrentSignUp(ctx, req, err)
+	result, err := s.completeGoogleSignIn(ctx, req)
+	if errors.Is(err, errConcurrentSignUp) {
+		// Another request created the account or the link first; this
+		// request signs in to it with its own admission check and audit row.
+		result, err = s.completeGoogleSignIn(ctx, req)
 	}
-	if err != nil {
-		return nil, err
+	if errors.Is(err, errConcurrentSignUp) {
+		return nil, apperror.NewConflict("the account was modified concurrently, please retry")
 	}
-	return ToUserResponse(user), nil
+	return result, err
 }
 
-// completeGoogleSignIn resolves the account, lets the caller admit it and
-// issue the session, and records the Tier 1 audit row in one transaction:
-// the account change, the session, and the audit row commit together.
-func (s *userService) completeGoogleSignIn(ctx context.Context, req GoogleSignIn, resolve googleAccountResolver) (*identitysqlc.User, error) {
-	var user *identitysqlc.User
-	err := inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
-		resolved, account, err := resolve(ctx, r.users, req)
+// errConcurrentSignUp aborts a sign-in transaction that lost a create/link
+// race; SignInWithGoogle retries once.
+var errConcurrentSignUp = errors.New("identity: concurrent google sign-up")
+
+func (s *userService) completeGoogleSignIn(ctx context.Context, req GoogleSignIn) (*GoogleSignInResult, error) {
+	var result *GoogleSignInResult
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		member, account, err := s.resolveGoogleMember(ctx, tx.Stores, req)
 		if err != nil {
 			return err
 		}
+		user := ToUserResponse(member)
 		if req.Complete != nil {
-			if err := req.Complete(ctx, tx, ToUserResponse(resolved)); err != nil {
+			if err := req.Complete(ctx, user); err != nil {
 				return err
 			}
 		}
-		if err := s.recordGoogleLogin(ctx, tx, resolved, account); err != nil {
+		tokens, err := s.Sessions.issueTx(ctx, tx.Stores, member.User.ID, member.User.TokenVersion)
+		if err != nil {
 			return err
 		}
-		user = resolved
+		if err := s.recordGoogleLogin(ctx, tx, member, account); err != nil {
+			return err
+		}
+		result = &GoogleSignInResult{User: user, Tokens: tokens}
 		return nil
 	})
-	return user, err
+	return result, err
 }
 
-// linkOrCreateGoogleUser signs in the account bound to the Google ID, links
-// a verified local account with the same address, or creates a new account.
-func (s *userService) linkOrCreateGoogleUser(ctx context.Context, repo repository.UserRepository, req GoogleSignIn) (*identitysqlc.User, string, error) {
-	user, err := repo.GetByGoogleID(ctx, req.GoogleID)
-	if err == nil {
-		return user, googleAccountExisting, nil
-	}
-	if !errors.Is(err, apperror.ErrNotFound) {
+// resolveGoogleMember finds, links, or creates the user and returns its
+// active membership in the request tenant plus the outcome (googleAccount*).
+func (s *userService) resolveGoogleMember(ctx context.Context, st Stores, req GoogleSignIn) (*Member, string, error) {
+	user, err := st.Users.GetByIdentity(ctx, ProviderGoogle, req.GoogleID)
+	switch {
+	case err == nil:
+		member, memberErr := googleMembership(ctx, st, user)
+		return member, googleAccountExisting, memberErr
+	case !errors.Is(err, apperror.ErrNotFound):
 		return nil, "", apperror.NewInternal("failed to find user by google id")
 	}
-
-	existing, err := repo.GetByEmail(ctx, req.Email)
-	if err == nil {
-		linked, linkErr := linkGoogleAccount(ctx, repo, existing, req.GoogleID)
-		return linked, googleAccountLinked, linkErr
+	if !req.EmailVerified {
+		return nil, "", apperror.NewBadRequest("the Google account email is not verified")
 	}
-	if !errors.Is(err, apperror.ErrNotFound) {
+
+	existing, err := st.Users.GetByEmail(ctx, req.Email)
+	switch {
+	case err == nil:
+		if linkErr := linkGoogleAccount(ctx, st, existing, req); linkErr != nil {
+			return nil, "", linkErr
+		}
+		member, memberErr := googleMembership(ctx, st, existing)
+		return member, googleAccountLinked, memberErr
+	case !errors.Is(err, apperror.ErrNotFound):
 		return nil, "", apperror.NewInternal("failed to find user by email")
 	}
 
-	created, err := createGoogleUser(ctx, repo, req)
+	created, err := createGoogleAccount(ctx, st, req)
 	return created, googleAccountCreated, err
 }
 
-// linkGoogleAccount binds googleID to an existing local account.
-func linkGoogleAccount(ctx context.Context, repo repository.UserRepository, existing *identitysqlc.User, googleID string) (*identitysqlc.User, error) {
+// googleMembership requires an active membership of user in the request
+// tenant. Signing in with Google never joins a tenant implicitly.
+func googleMembership(ctx context.Context, st Stores, user *User) (*Member, error) {
+	if user.Status != UserStatusActive {
+		return nil, accountNotActive()
+	}
+	member, err := st.Memberships.GetActive(ctx, user.ID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, accountNotActive()
+		}
+		return nil, apperror.NewInternal("failed to load membership")
+	}
+	return member, nil
+}
+
+// linkGoogleAccount binds the Google identity to an existing local account.
+func linkGoogleAccount(ctx context.Context, st Stores, existing *User, req GoogleSignIn) error {
 	// Never silently attach a Google identity to an unverified local account.
 	// An attacker could otherwise pre-register a victim's address and take
 	// over the account when the victim uses Google.
-	if !existing.EmailVerifiedAt.Valid {
-		return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
+	if !existing.EmailVerified() {
+		return apperror.NewConflict("an account with this email already exists; verify it before linking Google")
 	}
-	linked, err := repo.LinkGoogleAccount(ctx, identitysqlc.LinkGoogleAccountParams{
-		GoogleID: pgtype.Text{String: googleID, Valid: true},
-		ID:       existing.ID,
+	err := st.Users.LinkIdentity(ctx, ExternalIdentity{
+		UserID: existing.ID, Provider: ProviderGoogle, Subject: req.GoogleID, Email: req.Email,
 	})
 	switch {
 	case err == nil:
-		return linked, nil
-	case database.IsUniqueViolation(err):
-		return nil, apperror.NewConflict("this Google account is already linked to another user")
-	case errors.Is(err, apperror.ErrNotFound):
-		// The guarded UPDATE matched no row: the account is already bound to
-		// a different Google identity, which is never replaced.
-		return nil, apperror.NewConflict("this account is already linked to a different Google account")
+		return nil
+	case errors.Is(err, ErrIdentityTaken):
+		// A concurrent sign-in linked this Google identity first.
+		return errConcurrentSignUp
+	case errors.Is(err, ErrIdentityConflict):
+		// The account is already bound to a different Google identity, which
+		// is never replaced.
+		return apperror.NewConflict("this account is already linked to a different Google account")
 	default:
-		return nil, apperror.NewInternal("failed to link google account")
+		return apperror.NewInternal("failed to link google account")
 	}
 }
 
-// createGoogleUser registers a new Google account. A unique violation is
-// returned unwrapped so SignInWithGoogle can detect a concurrent sign-up.
-func createGoogleUser(ctx context.Context, repo repository.UserRepository, req GoogleSignIn) (*identitysqlc.User, error) {
+// createGoogleAccount registers a new verified account linked to the Google
+// identity, with a membership in the request tenant.
+func createGoogleAccount(ctx context.Context, st Stores, req GoogleSignIn) (*Member, error) {
 	if !req.AllowSignUp {
 		return nil, apperror.NewCode(apperror.CodeFeatureDisabled, "feature user_registration is disabled")
 	}
-	if err := ensureEmailNotBanned(ctx, repo, req.Email); err != nil {
+	if err := ensureEmailNotBanned(ctx, st.Memberships, req.Email); err != nil {
 		return nil, err
 	}
-	return repo.CreateOAuthUser(ctx, identitysqlc.CreateOAuthUserParams{
-		TenantID:     tenant.EffectiveID(ctx),
-		Email:        req.Email,
-		Name:         req.Name,
-		GoogleID:     pgtype.Text{String: req.GoogleID, Valid: true},
-		AuthProvider: "google",
-	})
-}
-
-// retryAfterConcurrentSignUp handles the concurrent-create race. When another
-// request created the account first (unique violation), this request signs
-// in to that account with its own admission check and audit row. Any other
-// AppError is returned as is; anything else becomes a generic 500.
-func (s *userService) retryAfterConcurrentSignUp(ctx context.Context, req GoogleSignIn, cause error) (*identitysqlc.User, error) {
-	if !database.IsUniqueViolation(cause) {
-		var appErr *apperror.AppError
-		if errors.As(cause, &appErr) {
-			return nil, cause
-		}
-		return nil, apperror.NewInternal("failed to create oauth user")
-	}
-	winner, err := s.repo.GetByGoogleID(ctx, req.GoogleID)
+	member, err := createAccount(ctx, st, NewUser{Email: req.Email, Name: req.Name, EmailVerified: true}, "", RoleUser)
 	if err != nil {
-		if _, emailErr := s.repo.GetByEmail(ctx, req.Email); emailErr == nil {
-			return nil, apperror.NewConflict("an account with this email already exists; verify it before linking Google")
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) && appErr.Code == string(identitycatalog.CodeUserEmailTaken) {
+			return nil, errConcurrentSignUp
 		}
+		return nil, err
+	}
+	linkErr := st.Users.LinkIdentity(ctx, ExternalIdentity{
+		UserID: member.User.ID, Provider: ProviderGoogle, Subject: req.GoogleID, Email: req.Email,
+	})
+	switch {
+	case linkErr == nil:
+		return member, nil
+	case errors.Is(linkErr, ErrIdentityTaken):
+		return nil, errConcurrentSignUp
+	default:
 		return nil, apperror.NewInternal("failed to create oauth user")
 	}
-	return s.completeGoogleSignIn(ctx, req, func(context.Context, repository.UserRepository, GoogleSignIn) (*identitysqlc.User, string, error) {
-		return winner, googleAccountExisting, nil
-	})
 }
 
 // recordGoogleLogin writes the Tier 1 auth.google_login event. The OAuth
 // callback skips tenant middleware (its tenant comes from the signed state),
-// so the event takes its tenant and actor from the signed-in account rather
+// so the event takes its tenant and actor from the signed-in member rather
 // than from request-level audit state.
-func (s *userService) recordGoogleLogin(ctx context.Context, tx pgx.Tx, user *identitysqlc.User, account string) error {
+func (s *userService) recordGoogleLogin(ctx context.Context, tx TxRepos, member *Member, account string) error {
 	event := audit.NewServiceEvent(ctx, "auth.google_login", "auth")
-	event.TenantID = user.TenantID
-	event.ResourceID = strconv.FormatInt(user.ID, 10)
-	event.ActorID = user.ID
-	event.ActorRole = user.Role
-	event.ActorType = audit.ActorTypeForRole(user.Role)
+	event.TenantID = member.Membership.TenantID
+	event.ResourceID = strconv.FormatInt(member.User.ID, 10)
+	event.ActorID = member.User.ID
+	event.ActorRole = member.Membership.Role
+	event.ActorType = audit.ActorTypeForRole(member.Membership.Role)
 	if event.ActorType == audit.ActorTypeUnknown {
 		event.ActorType = audit.ActorTypeUser
 	}
 	event.Metadata = map[string]any{
 		"account":        account,
-		"email_verified": user.EmailVerifiedAt.Valid,
+		"email_verified": member.User.EmailVerified(),
 	}
-	return checkAudit(audit.RecordInTx(ctx, s.audit, tx, event))
+	return checkAudit(tx.Audit.RecordTx(ctx, event))
 }

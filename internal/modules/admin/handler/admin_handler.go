@@ -25,7 +25,7 @@ func NewHandler(svc adminsvc.Service) *Handler {
 
 // GetStats godoc
 // @Summary Get tenant statistics
-// @Description Get statistics for the caller's tenant only (admin only)
+// @Description Get statistics for the caller's tenant only (admin only): activeUsers counts active memberships of active users, deletedUsers every other membership
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -44,7 +44,7 @@ func (h *Handler) GetStats(c fiber.Ctx) error {
 
 // ListUsers godoc
 // @Summary List tenant users (admin)
-// @Description Get a paginated list of users in the caller's tenant, including soft-deleted
+// @Description Get a paginated list of the members of the caller's tenant in every membership state (active, suspended, removed), ordered by join time
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -65,12 +65,12 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u admindto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
+	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
 }
 
 // UpdateRole godoc
 // @Summary Update user role
-// @Description Update a user's role (admin only)
+// @Description Change a member's role in the caller's tenant (admin only); the member's sessions in this tenant end
 // @Tags Admin
 // @Accept json
 // @Produce json
@@ -108,7 +108,7 @@ func (h *Handler) UpdateRole(c fiber.Ctx) error {
 
 // BanUser godoc
 // @Summary Ban a user
-// @Description Soft delete a user (admin only)
+// @Description Ban a member of the caller's tenant (membership suspended; sessions and API keys in this tenant end; the global account and other tenants are untouched)
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -138,7 +138,7 @@ func (h *Handler) BanUser(c fiber.Ctx) error {
 
 // UnbanUser godoc
 // @Summary Unban a user
-// @Description Restore a soft-deleted user (admin only)
+// @Description Lift a member's ban in the caller's tenant (API keys issued before the ban stay revoked)
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth

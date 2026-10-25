@@ -7,14 +7,116 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const getTenantByID = `-- name: GetTenantByID :one
-SELECT id, slug, name, status, created_at, updated_at FROM tenants
-WHERE id = $1
-  AND status = 'active'
+const createTenant = `-- name: CreateTenant :one
+INSERT INTO tenants (slug, name, status, trial_ends_at)
+VALUES ($1, $2, $3, $4)
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at
 `
 
+type CreateTenantParams struct {
+	Slug        string             `json:"slug"`
+	Name        string             `json:"name"`
+	Status      string             `json:"status"`
+	TrialEndsAt pgtype.Timestamptz `json:"trial_ends_at"`
+}
+
+func (q *Queries) CreateTenant(ctx context.Context, arg CreateTenantParams) (Tenant, error) {
+	row := q.db.QueryRow(ctx, createTenant,
+		arg.Slug,
+		arg.Name,
+		arg.Status,
+		arg.TrialEndsAt,
+	)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const createTenantSettings = `-- name: CreateTenantSettings :exec
+INSERT INTO tenant_settings (tenant_id, locale, timezone)
+VALUES ($1, $2, $3)
+`
+
+type CreateTenantSettingsParams struct {
+	TenantID int64  `json:"tenant_id"`
+	Locale   string `json:"locale"`
+	Timezone string `json:"timezone"`
+}
+
+func (q *Queries) CreateTenantSettings(ctx context.Context, arg CreateTenantSettingsParams) error {
+	_, err := q.db.Exec(ctx, createTenantSettings, arg.TenantID, arg.Locale, arg.Timezone)
+	return err
+}
+
+const getOperationalTenantByID = `-- name: GetOperationalTenantByID :one
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+WHERE id = $1
+  AND status IN ('trialing', 'active')
+`
+
+func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenant, error) {
+	row := q.db.QueryRow(ctx, getOperationalTenantByID, id)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getOperationalTenantBySlug = `-- name: GetOperationalTenantBySlug :one
+
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+WHERE slug = $1
+  AND status IN ('trialing', 'active')
+`
+
+// Only trialing and active tenants serve requests ("operational").
+func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (Tenant, error) {
+	row := q.db.QueryRow(ctx, getOperationalTenantBySlug, slug)
+	var i Tenant
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getTenantByID = `-- name: GetTenantByID :one
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+WHERE id = $1
+`
+
+// Startup checks need existence independent of request eligibility so a
+// suspended configured/default tenant does not crash the process.
 func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getTenantByID, id)
 	var i Tenant
@@ -23,27 +125,32 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 		&i.Slug,
 		&i.Name,
 		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
 }
 
-const getTenantByIDIncludingSuspended = `-- name: GetTenantByIDIncludingSuspended :one
-SELECT id, slug, name, status, created_at, updated_at FROM tenants
+const getTenantByIDForUpdate = `-- name: GetTenantByIDForUpdate :one
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
 WHERE id = $1
+FOR UPDATE
 `
 
-// Startup checks need existence independent of request eligibility so a
-// suspended configured/default tenant does not crash the process.
-func (q *Queries) GetTenantByIDIncludingSuspended(ctx context.Context, id int64) (Tenant, error) {
-	row := q.db.QueryRow(ctx, getTenantByIDIncludingSuspended, id)
+func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant, error) {
+	row := q.db.QueryRow(ctx, getTenantByIDForUpdate, id)
 	var i Tenant
 	err := row.Scan(
 		&i.ID,
 		&i.Slug,
 		&i.Name,
 		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -51,9 +158,8 @@ func (q *Queries) GetTenantByIDIncludingSuspended(ctx context.Context, id int64)
 }
 
 const getTenantBySlug = `-- name: GetTenantBySlug :one
-SELECT id, slug, name, status, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
 WHERE slug = $1
-  AND status = 'active'
 `
 
 func (q *Queries) GetTenantBySlug(ctx context.Context, slug string) (Tenant, error) {
@@ -64,27 +170,59 @@ func (q *Queries) GetTenantBySlug(ctx context.Context, slug string) (Tenant, err
 		&i.Slug,
 		&i.Name,
 		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
 }
 
-const getTenantBySlugIncludingSuspended = `-- name: GetTenantBySlugIncludingSuspended :one
-SELECT id, slug, name, status, created_at, updated_at FROM tenants
-WHERE slug = $1
+const getTenantSettings = `-- name: GetTenantSettings :one
+SELECT tenant_id, locale, timezone, created_at, updated_at FROM tenant_settings
+WHERE tenant_id = $1
 `
 
-// Startup checks need existence independent of request eligibility so a
-// suspended configured/default tenant does not crash the process.
-func (q *Queries) GetTenantBySlugIncludingSuspended(ctx context.Context, slug string) (Tenant, error) {
-	row := q.db.QueryRow(ctx, getTenantBySlugIncludingSuspended, slug)
+func (q *Queries) GetTenantSettings(ctx context.Context, tenantID int64) (TenantSetting, error) {
+	row := q.db.QueryRow(ctx, getTenantSettings, tenantID)
+	var i TenantSetting
+	err := row.Scan(
+		&i.TenantID,
+		&i.Locale,
+		&i.Timezone,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateTenantStatus = `-- name: UpdateTenantStatus :one
+UPDATE tenants
+SET status = $1,
+    status_changed_at = NOW(),
+    deletion_scheduled_at = $2
+WHERE id = $3
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at
+`
+
+type UpdateTenantStatusParams struct {
+	Status              string             `json:"status"`
+	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
+	ID                  int64              `json:"id"`
+}
+
+func (q *Queries) UpdateTenantStatus(ctx context.Context, arg UpdateTenantStatusParams) (Tenant, error) {
+	row := q.db.QueryRow(ctx, updateTenantStatus, arg.Status, arg.DeletionScheduledAt, arg.ID)
 	var i Tenant
 	err := row.Scan(
 		&i.ID,
 		&i.Slug,
 		&i.Name,
 		&i.Status,
+		&i.StatusChangedAt,
+		&i.TrialEndsAt,
+		&i.DeletionScheduledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

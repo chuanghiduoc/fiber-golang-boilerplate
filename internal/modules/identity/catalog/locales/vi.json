@@ -3,5 +3,7 @@
   "errors.auth.email_not_verified.title": "Email chưa được xác thực",
   "errors.auth.refresh_invalid.title": "Mã làm mới không hợp lệ",
   "errors.user.email_taken.title": "Email đã được sử dụng",
-  "errors.user.not_found.title": "Không tìm thấy người dùng"
+  "errors.user.not_found.title": "Không tìm thấy người dùng",
+  "errors.invitation.invalid.title": "Lời mời không hợp lệ",
+  "errors.membership.exists.title": "Đã là thành viên"
 }

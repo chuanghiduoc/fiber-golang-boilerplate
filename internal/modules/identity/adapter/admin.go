@@ -67,15 +67,17 @@ func (a *AdminIdentity) GetUserStats(ctx context.Context) (identitycontracts.Use
 
 func toUser(user dto.UserResponse) identitycontracts.User {
 	return identitycontracts.User{
-		ID:            user.ID,
-		Email:         user.Email,
-		Name:          user.Name,
-		Role:          user.Role,
-		EmailVerified: user.EmailVerified,
-		HasPassword:   user.HasPassword,
-		CreatedAt:     user.CreatedAt,
-		UpdatedAt:     user.UpdatedAt,
-		DeletedAt:     user.DeletedAt,
-		BannedAt:      user.BannedAt,
+		ID:               user.ID,
+		Email:            user.Email,
+		Name:             user.Name,
+		Role:             user.Role,
+		MembershipStatus: user.MembershipStatus,
+		EmailVerified:    user.EmailVerified,
+		HasPassword:      user.HasPassword,
+		CreatedAt:        user.CreatedAt,
+		UpdatedAt:        user.UpdatedAt,
+		JoinedAt:         user.JoinedAt,
+		DeletedAt:        user.DeletedAt,
+		BannedAt:         user.BannedAt,
 	}
 }

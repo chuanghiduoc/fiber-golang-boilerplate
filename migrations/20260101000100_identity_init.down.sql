@@ -1,6 +1,12 @@
 DROP TABLE IF EXISTS email_verification_tokens;
 DROP TABLE IF EXISTS password_reset_tokens;
 DROP TABLE IF EXISTS refresh_tokens;
-DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS invitations;
+DROP TABLE IF EXISTS memberships;
 DROP FUNCTION IF EXISTS protect_last_admin();
+DROP TABLE IF EXISTS user_identities;
+DROP TABLE IF EXISTS user_passwords;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS tenant_settings;
 DROP TABLE IF EXISTS tenants;

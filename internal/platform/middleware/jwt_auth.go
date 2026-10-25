@@ -16,9 +16,13 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
+// LocalSessionID is the Fiber local holding the authenticated token's
+// session id (0 for API keys).
+const LocalSessionID = "session_id"
+
 // JWTAuth validates the bearer token and, when a session store is supplied,
-// confirms that the account still exists and that its role/token version match
-// the claims. The optional variadic form keeps tests and simple deployments
+// confirms that its session is live, the membership and user are active, and
+// that the role/token version match the claims. The optional variadic form keeps tests and simple deployments
 // working without a session store.
 //
 // The global tenant middleware runs first and resolves X-Tenant-Slug (or the
@@ -81,12 +85,19 @@ func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
 		c.SetContext(tenant.WithID(c.Context(), claims.TenantID))
 
 		if store != nil {
-			if err := store.Validate(c.Context(), claims.UserID, claims.TenantID, claims.Role, claims.TokenVersion); err != nil {
+			if err := store.Validate(c.Context(), session.Claims{
+				UserID:       claims.UserID,
+				TenantID:     claims.TenantID,
+				SessionID:    claims.SessionID,
+				Role:         claims.Role,
+				TokenVersion: claims.TokenVersion,
+			}); err != nil {
 				return err
 			}
 		}
 
 		fiber.Locals[int64](c, "user_id", claims.UserID)
+		fiber.Locals[int64](c, LocalSessionID, claims.SessionID)
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
 		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)

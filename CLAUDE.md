@@ -153,14 +153,21 @@ migrations) to its owners; keep it current when adding a module.
 - `cmd/migrate` refuses a database recorded at a legacy sequential version
   (1–999999) with upgrade guidance; never rewrite `schema_migrations` to skip
   DDL or edit a shipped migration.
-- Tenant-owned tables (`users`, `files`, `notifications`,
-  `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
-  `email_verification_tokens`, `api_keys`, `jobs`, `audit_events`,
-  `feature_flag_targets`, `webhook_*`) have
-  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones must
-  too, and lead tenant-scoped query indexes with `tenant_id`. `feature_flags`
-  is process-wide (deliberate exception); `api_key_scopes` is a pure child of
-  `api_keys` (CASCADE) and inherits its tenant through the parent key. Job
+- Tenant-owned tables (`memberships`, `invitations`, `sessions`,
+  `refresh_tokens`, `files`, `notifications`, `notification_preferences`,
+  `api_keys`, `jobs`, `audit_events`, `feature_flag_targets`, `webhook_*`)
+  have `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones
+  must too, and lead tenant-scoped
+  query indexes with `tenant_id`. `feature_flags` is process-wide (deliberate
+  exception); `api_key_scopes` is a pure child of `api_keys` (CASCADE) and
+  inherits its tenant through the parent key.
+- Users are global (ADR 0004): `users`, `user_passwords`, `user_identities`,
+  `password_reset_tokens`, and `email_verification_tokens` have no
+  `tenant_id`; `tenants`/`tenant_settings` are the tenant rows themselves. A
+  user joins a tenant through `memberships` (`UNIQUE (tenant_id, user_id)`,
+  transitional `role user|admin`, `status active|suspended|removed`); every
+  per-member row in another module references
+  `(tenant_id, user_id) → memberships ON DELETE RESTRICT`, never `users`. Job
   claim/lease recovery/purge are
   global, so `jobs` has only the tenant-leading idempotency index.
 - `cmd/migrate` verifies required tables, columns, unique indexes (every
@@ -174,13 +181,19 @@ migrations) to its owners; keep it current when adding a module.
   `(schedule, scheduled_for)` ledger) are platform coordination tables with no
   tenant column and no cross-module/jobs foreign keys; do not add them.
 - The baseline seeds tenant id 1 (`default`); keep it as the compatibility
-  tenant. The last-admin trigger is per tenant.
+  tenant (it can never be `pending_deletion`/`deleted`). The last-admin
+  trigger lives on `memberships` and is per tenant. Tenant status is
+  `trialing|active|suspended|pending_deletion|deleted`; only
+  `trialing`/`active` serve requests; transitions go through the audited
+  identity `TenantService` (no HTTP endpoints until P2b-2).
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
   every new query keeps a `tenant_id` predicate. Cross-tenant ids behave as
-  not found (`404`), never forbidden. Deliberate exceptions are the
-  cross-tenant retention queries: identity `PurgeExpired*Tokens`
+  not found (`404`), never forbidden. Identity scopes memberships, sessions,
+  refresh tokens, and invitations by tenant; global user/credential rows are
+  reached through the caller's membership. Deliberate exceptions are the
+  cross-tenant retention queries: identity `PurgeExpired*`/`PurgeStaleSessions`
   (`identity.tokens.purge_expired`), files `ClaimTrashedFiles`/
   `HardDeleteTrashedFiles` (`files.trash.purge`), and notifications
   `PurgeReadNotifications` (`notifications.retention.purge`); their indexes
@@ -192,10 +205,12 @@ migrations) to its owners; keep it current when adding a module.
 - `tenanthttp.Middleware` resolves `X-Tenant-Slug` (empty → `TENANT_DEFAULT_SLUG`;
   production requires the header). A validated `?tenant=` fallback is accepted
   only on `/auth/google`, `/auth/reset-password`, `/auth/verify-email` (the
-  header wins; reset/verify links carry it). The OAuth callback is exempt and
-  uses the tenant in signed `state`.
-- Tokens without a positive `tenant_id` claim are rejected fail-closed; rotate
-  legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
+  header wins; reset/verify/invitation links carry it so the frontend knows
+  where to sign in; reset and verification tokens are per user and ignore it
+  for the lookup). The OAuth callback is exempt and uses the tenant in signed
+  `state`.
+- Tokens without a positive `tenant_id` or `sid` claim are rejected
+  fail-closed; rotate legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
   is for jobs/internal/tests only, never HTTP handling.
 - RLS and per-tenant limits remain future work; do not claim
   whole-application isolation.
@@ -256,42 +271,68 @@ handler/service/DTO/repository package.
   match the path, else 406 `api.version_unsupported`; unknown `/api/vN` → 406.
   Responses carry `API-Version`, `Vary: Accept-Version`, optional
   `Deprecation`/`Sunset`/`Link`. Keep Swagger's base path at `/api/v1`.
-- **Auth/session:** JWT carries `token_version` and `tenant_id`;
-  `session.Store` validates version, tenant, and tenant status with
-  generation-keyed invalidation. `JWTAuth` rejects a non-positive tenant and an
+- **Auth/session:** login is the global password plus an *active membership*
+  in the request tenant (otherwise the same 401 as a wrong password). JWT
+  carries user id, `tenant_id`, `sid` (session id), `token_version`, and the
+  transitional membership `role`; `session.Store` loads the session and
+  requires it unrevoked, the membership and user active, the tenant
+  operational, and role/version to match (5s snapshot per session,
+  generation-keyed per-user invalidation). `JWTAuth` rejects a non-positive tenant and an
   explicit header that conflicts with the claim, and clears `tenant_slug` when
   the claim overrides an unresolved default. `pkg/token` pins HS256 and
   requires `exp`; tokens carry a `kid` header derived from the signing secret,
   and a `token.Keyring` (active `JWT_SECRET` + verify-only
   `JWT_PREVIOUS_SECRETS`) picks the key by `kid` (unknown `kid` rejected;
-  tokens without one verify against the active secret only). Refresh tokens are atomic single-use, tenant-scoped, and
-  version-bound; logout deletes by possession; refresh with an inactive owner
-  returns 401. Login lockout counts failures per (tenant, email, IP) and locks
-  the account globally only after 5x that threshold. Lockout/rate-limit cache
-  keys hash the normalized email (SHA-256, 128-bit hex:
-  `<prefix><hash>:tenant=N[:ip=…]`), never store it raw. Banning sets
-  `users.credentials_revoked_at` (`clock_timestamp()`); API keys created at or
-  before it are rejected, so unban never revives them. API-key creation locks
-  the owner row through `PrincipalLocker.LockPrincipalTx` (the only
-  transactional apikeys→identity channel); rotate returns 409 when the owner
-  is inactive or the key predates `credentials_revoked_at`.
-  `(*AppError).Is(apperror.ErrNotFound)` matches any 404 `AppError`. Changing
-  another user's email is refused for API-key callers and for admin targets.
-  Google sign-in (`SignInWithGoogle` with a `Complete` hook) runs the
-  tenant/email checks and session creation in the sign-in transaction before
-  the Tier 1 `auth.google_login` row, so refused logins are never audited as
-  success. The password-reset token insert re-checks the current email (an
-  email change in between skips the send). The admin seed only creates a
-  missing admin; an existing demoted/banned/deleted account is skipped, never
-  re-promoted.
+  tokens without one verify against the active secret only). A session is the
+  RFC 9700 refresh-token family: refresh tokens are atomic single-use,
+  tenant-scoped, and version-bound; presenting a used token revokes the whole
+  session (`refresh_reuse`) and returns 401; logout revokes the session by
+  possession; logout-all revokes every session in every tenant and bumps
+  `token_version`; refresh with an inactive member returns 401. Login lockout
+  counts failures per (email, IP) and locks the account globally only after
+  5x that threshold; neither key is tenant-scoped (the password is global).
+  Lockout/rate-limit cache keys hash the normalized email (SHA-256, 128-bit
+  hex: `<prefix><hash>[:ip=…]`), never store it raw. Admin ban/unban/role
+  change/removal are membership changes in the request tenant; ban, removal,
+  and an actual role change revoke the member's sessions there. A ban or
+  removal sets
+  `memberships.credentials_revoked_at` (`clock_timestamp()`, never cleared);
+  API keys created at or before it are rejected, so unban never revives them.
+  A ban also survives the banned user deleting and re-creating the account
+  (`EmailBannedInTenant`). The API-key principal is an active membership;
+  API-key creation locks the membership row through
+  `PrincipalLocker.LockPrincipalTx` (the only transactional apikeys→identity
+  channel); rotate returns 409 when the owner is inactive or the key predates
+  `credentials_revoked_at`. `(*AppError).Is(apperror.ErrNotFound)` matches any
+  404 `AppError`. The global profile is editable only by its owner
+  (`PUT /users/:id` for another id → 403). `DELETE /users/:id` on yourself
+  deletes the global account (JWT only; refused while you are the last active
+  admin of any tenant); on another id it removes that membership from the
+  request tenant. Registration creates user + password + membership in the
+  request tenant; an email that already has an account gets 409
+  `user.email_taken`, and an existing user joins another tenant only through
+  an invitation (`/invitations`, `/auth/invitations/accept|signup`). Google
+  sign-in links/creates through `user_identities` (linking needs a verified
+  local email and Google `verified_email`); a new Google account gets a
+  membership in the state tenant, an existing user never joins a tenant
+  implicitly. `SignInWithGoogle` with a `Complete` hook runs these checks and
+  session creation in the sign-in transaction before the Tier 1
+  `auth.google_login` row, so refused logins are never audited as success.
+  Password reset and email verification are per user. The password-reset
+  token insert re-checks the current email (an email change in between skips
+  the send). The admin seed only creates a missing admin; an existing
+  demoted/banned/deleted or non-member account is skipped, never re-promoted
+  or added.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles}`; admins get
   everything). Only permissions shared by several modules (`admin:users:*`,
   `admin:files:*`, `admin:stats:read`) stay in `platform/authz`. Duplicate or
   conflicting registrations fail startup. Protect routes with
   `authzhttp.Require(<m>catalog.PermissionX)` behind `deps.Authenticate()`
-  (API key or JWT; API-key scopes are the subject's permissions). Only
-  `POST /auth/logout-all` is JWT-only (`sessions:revoke`).
+  (API key or JWT; API-key scopes are the subject's permissions). JWT-only:
+  `POST /auth/logout-all` and `DELETE /auth/sessions/:id` (`sessions:revoke`),
+  `GET /auth/sessions` (`profile:read`), `POST /auth/invitations/accept`
+  (`profile:write`). `invitations:read|write` are admin-only.
   Service-level checks use `authz.Authorize`, the single fail-closed path: a
   subject in ctx ⇒ permission + policies; no subject but
   `authz.SystemContext(ctx)` ⇒ allowed; neither ⇒ `403`. A subject always wins
@@ -310,7 +351,7 @@ handler/service/DTO/repository package.
     enqueues an encrypted `password_reset.request` job (same response and work
     whether or not the account exists); the handler does the lookup and the
     token + email transaction. With transactional email wired (as in
-    `identity.Build`), registration commits user, token, and `email.send` job
+    `identity.Build`), registration commits user, membership, token, and `email.send` job
     together (fail-closed); otherwise the handler falls back to a post-commit
     email. Resend and email-change use a separate post-commit transaction.
   - Retries with backoff, dead-letter after `max_attempts`; unknown kinds retry
@@ -468,7 +509,8 @@ handler/service/DTO/repository package.
   preferences, and the email channel. Queries filter `tenant_id` and
   `user_id`; missing preferences mean both channels on. `notifications.Notifier`
   is the cross-module create API; identity implements
-  `NotificationRecipientLookup`, so notifications never reads `users`. With
+  `NotificationRecipientLookup` (only an active member of the context tenant
+  is a recipient), so notifications never reads `users`. With
   email on, the row and `email.send` job commit together (queue failure rolls
   back); both channels off is a successful no-op. Writes use
   `Idempotency-Key`; admin sends need `notifications:send`.

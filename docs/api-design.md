@@ -87,7 +87,7 @@ comparison as an index condition).
 
 | Style | Routes |
 |---|---|
-| **Partial update** (pointer DTO fields; omitted fields unchanged) | `PUT /users/me`, `PUT /users/:id` (`name`, `email`), `PUT /admin/api-keys/:id` (`name`, `scopes`) |
+| **Partial update** (pointer DTO fields; omitted fields unchanged) | `PUT /users/me`, `PUT /users/:id` (`name`, `email`; own id only), `PUT /admin/api-keys/:id` (`name`, `scopes`) |
 | **Full replace** (omitted optional fields reset to defaults) | `PUT /webhooks/endpoints/:id` (`url`/`status`), `PUT /webhooks/inbound-sources/:id` (`name`/`slug`/`status`), `PUT /admin/features/flags/{key}` (database default/kill switch/description) |
 | **Upsert** | Notification preference and feature-flag target `PUT`s |
 | **RPC-style, kept for compatibility** | `POST /files/upload` (multipart create), `POST /admin/api-keys/:id/revoke` (alias of `DELETE /admin/api-keys/:id`) |
@@ -173,8 +173,11 @@ flowchart TD
 Every authenticated module route accepts both credential types through one
 chain (`app.Deps.Authenticate()`), after a per-IP `auth` limiter. The route's
 `authzhttp.Require` then decides access, so an API key reaches a route only when
-its scopes include the permission. `POST /auth/logout-all` is the exception:
-JWT-only.
+its scopes include the permission. Routes that act on the caller's sign-in
+sessions or global identity are JWT-only: `POST /auth/logout-all`,
+`GET /auth/sessions`, `DELETE /auth/sessions/:id`, and
+`POST /auth/invitations/accept`; `DELETE /users/:id` on the caller's own id
+refuses API keys.
 
 ```mermaid
 flowchart TD
@@ -190,15 +193,15 @@ flowchart TD
     khdr -->|no| r403["403 tenant mismatch"]
     khdr -->|yes| kstate{"not revoked, not expired,<br/>rotation grace open?"}
     kstate -->|no| r401a
-    kstate -->|yes| owner{"owner active, tenant active,<br/>key newer than ban?"}
+    kstate -->|yes| owner{"owner membership active, tenant active,<br/>key newer than ban?"}
     owner -->|no| r401a
     owner -->|yes| ksub["subject = key scopes intersected<br/>with owner's current role<br/>auth_method=api_key"]
     jwt -->|no| r401b["401"]
-    jwt -->|yes| claim{"tenant_id claim > 0?"}
+    jwt -->|yes| claim{"tenant_id and sid claims > 0?"}
     claim -->|no| r401b
     claim -->|yes| jhdr{"explicit X-Tenant-Slug<br/>matches claim?"}
     jhdr -->|no| r403
-    jhdr -->|yes| sess{"session store: role, token_version,<br/>tenant, tenant status current?"}
+    jhdr -->|yes| sess{"session store: session live, membership<br/>and user active, tenant operational,<br/>role and token_version current?"}
     sess -->|no| r401b
     sess -->|yes| jsub["subject from role catalog<br/>auth_method=jwt"]
     ksub --> authz{"authzhttp.Require(permission)"}
@@ -209,17 +212,21 @@ flowchart TD
 
 | Aspect | JWT (`Authorization: Bearer <jwt>`) | API key (`Authorization: ApiKey <prefix>_<secret>`) |
 |---|---|---|
-| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries `token_version` and `tenant_id`; the `kid` header selects the verification key (`JWT_SECRET` or a `JWT_PREVIOUS_SECRETS` entry), an unknown `kid` is `401`, and a token without `kid` verifies against the active secret only | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
-| Tenant | `tenant_id` claim is authoritative; missing/zero/negative claim is `401` (tokens minted before multi-tenancy must log in again) | Key's bound tenant is authoritative |
-| Revocation | Session store compares role, token version, tenant, and tenant status (5s cache, generation-keyed invalidation); `POST /auth/logout-all` bumps the version | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban revokes keys issued before it |
+| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries the user id, `tenant_id`, `sid` (session id), `token_version`, and the transitional membership `role`; the `kid` header selects the verification key (`JWT_SECRET` or a `JWT_PREVIOUS_SECRETS` entry), an unknown `kid` is `401`, and a token without `kid` verifies against the active secret only | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
+| Tenant | `tenant_id` claim is authoritative; a missing/zero/negative `tenant_id` or `sid` claim is `401` (tokens minted before sessions existed must log in again) | Key's bound tenant is authoritative |
+| Revocation | Session store loads the token's session and requires it unrevoked, the membership and user active, the tenant operational, and the role and token version to match (5s snapshot per session, generation-keyed per-user invalidation); revoking a session, a membership change, or `POST /auth/logout-all` (version bump) apply on the next request | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban or removal revokes keys issued before it |
 | Permissions | Derived from the role catalog | Explicit scopes intersected with the owner's **current** role, so a key never exceeds its scopes or survives a demotion |
 | Locals set | `user_id`, `tenant_id`, `auth_method=jwt` | `user_id`, `tenant_id`, `api_key_id`, `auth_method=api_key` |
 
-- Refresh tokens rotate atomically, are single-use, version-bound, and scoped
-  to the issuing tenant. Access tokens are short-lived.
+- Each sign-in opens a session (the RFC 9700 refresh-token family). Refresh
+  tokens rotate atomically, are single-use, version-bound, and scoped to the
+  issuing tenant. Presenting an already-used refresh token is reuse: the whole
+  session is revoked (`refresh_reuse`) and the call returns `401
+  auth.refresh_invalid`, so both the legitimate client and an attacker must
+  sign in again. Access tokens are short-lived.
 - `POST /auth/logout-all` requires `sessions:revoke` (every built-in role holds
-  it), revokes all refresh tokens, and bumps the token version, invalidating
-  access tokens immediately.
+  it), revokes every session of the user in every tenant, and bumps the token
+  version, invalidating access tokens immediately.
 - Permissions are declared in module catalogs (`catalog/permissions.go`) and
   shared back-office permissions in `internal/platform/authz/permissions.go`;
   routes use `authzhttp.Require`. Never check role strings ad hoc in handlers.
@@ -236,15 +243,48 @@ flowchart TD
 |---|---|
 | Selection | `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) on `/api/v1` routes. Without it, local/test mode resolves `TENANT_DEFAULT_SLUG` (`default`); `TENANT_REQUIRE_HEADER=true` rejects header-less requests and is **required in production**. |
 | Unknown tenant | Invalid, unknown, or suspended slugs (including the default) return `404 tenant not found`. Startup checks only existence, so a suspended default tenant does not crash the API or seed. |
-| Browser fallback | Validated `?tenant=<slug>` is accepted on `GET /auth/google` and the reset/verify endpoints; an explicit header wins. Reset/verification links include `?tenant=<slug>`. |
-| Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. Key owner and tenant status are re-read on every authentication, so bans, deletions, role changes, and suspensions apply immediately (`401`). |
+| Browser fallback | Validated `?tenant=<slug>` is accepted on `GET /auth/google` and the reset/verify endpoints; an explicit header wins. Reset, verification, and invitation links include `?tenant=<slug>` so the frontend knows where to sign in. |
+| Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership and tenant status are re-read on every authentication, so bans, removals, deletions, role changes, and suspensions apply immediately (`401`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
-| Scoping | Emails and Google IDs are unique per tenant. Login, registration, refresh, reset, and verification use the request tenant. Cross-tenant user/file/notification ids return `404`, refresh tokens `401`, reset/verification tokens `400` (without consuming the token). |
+| Scoping | Users are global (ADR 0004): an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
 | OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
-| Logout | `POST /auth/logout` revokes the presented refresh token by possession, with or without the header; `204` even if already gone. |
+| Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
-| Responses | `UserResponse`/`FileResponse` include additive `tenantId`. |
+| Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `membershipStatus`, `joinedAt`, `bannedAt`). |
 | Remaining | Row-level security and per-tenant limits/quotas. |
+
+## Users, memberships, sessions, and invitations
+
+Users are global identities; a user joins tenants through memberships
+(ADR 0004). Everything below runs in the request tenant unless stated.
+
+| Flow | Behavior |
+|---|---|
+| Register `POST /auth/register` | Creates user + password + active `user` membership in the request tenant (gated by the `user_registration` flag). An address that already has an account in **any** tenant gets `409 user.email_taken`; an existing user joins another tenant only through an invitation. An address banned in this tenant is refused even after the banned account was deleted. |
+| Login `POST /auth/login` | Global password plus an active membership in the request tenant; a correct password without one (never joined, banned, removed) gets the same `401 auth.invalid_credentials` as a wrong password. Opens a session; the JWT carries `sid`. |
+| Google OAuth | Resolves the identity through `user_identities`: an existing link, a verified local account with the same address (linking requires both a verified local email and Google `verified_email`), or a new account with a membership in the state tenant (`user_registration` flag). An existing user must already be an active member of the state tenant; Google sign-in never joins a tenant implicitly. |
+| Password reset / email verification | Per user. The emailed link keeps `?tenant=<slug>` only so the frontend knows where to sign in afterwards. |
+| `GET /auth/sessions` | JWT only, `profile:read`. Cursor list of the caller's live sessions in the request tenant, newest first (`id`, `userAgent`, `ip`, `createdAt`, `lastUsedAt`, `current`). |
+| `DELETE /auth/sessions/:id` | JWT only, `sessions:revoke`, Tier 2 audited (`auth.session_revoked`). Revokes one of the caller's sessions in the request tenant (`204`); its refresh tokens stop working and its access tokens are rejected. Another user's session is `404`. |
+| `POST /auth/logout-all` | Revokes every session in every tenant and bumps `token_version`. |
+| `PUT /users/:id` | Own id only (the global profile is editable only by its owner); another id is `403 permission.denied`, even for a tenant admin. |
+| `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active admin of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
+| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. |
+| Member lists | `GET /users`, `GET /admin/users` paginate members by `(joinedAt, id)`; `UserResponse` adds `membershipStatus` and `joinedAt`. |
+
+Invitations (pending invites are `invitations` rows; there is no "invited"
+membership state):
+
+| Route | Auth | Behavior |
+|---|---|---|
+| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `user`) and emails a link; the token is never returned. Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
+| `GET /invitations` | `invitations:read` (admin only) | Cursor list of the tenant's pending invitations, newest first. |
+| `DELETE /invitations/:id` | `invitations:write` | Deletes a pending invitation (`204`); its link stops working. Tier 1 (`invitation.revoked`). |
+| `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
+| `POST /auth/invitations/signup` | Public (token possession), strict limiter, `Idempotency-Key` | Creates the account for the invited address and joins the tenant (send `X-Tenant-Slug` from the link). The email is verified by the token; not gated by `user_registration`. An address that already has an account is `409 user.email_taken` (sign in and accept instead). `201 UserResponse`; no tokens are issued. Tier 1 (`invitation.accepted`). |
+
+Unknown, expired, already accepted, or misaddressed invitation tokens are
+`400 invitation.invalid`.
 
 ## Headers
 
@@ -272,7 +312,8 @@ flowchart TD
   (`RATE_LIMIT_AUTH_MAX`/`RATE_LIMIT_AUTH_WINDOW_SECS`) before credential
   verification, so bogus credentials cannot drive unthrottled lookups.
 - Login attempts, password-reset requests, and verification resends have
-  dedicated lockouts. Login failures count per (tenant, email, client IP); the
+  dedicated lockouts. Login failures count per (email, client IP), across
+  tenants because the password is global; the
   account locks for every IP only after 5x the per-IP threshold, so one client
   cannot lock someone else out.
 

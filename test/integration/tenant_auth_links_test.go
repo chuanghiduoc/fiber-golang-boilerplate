@@ -20,18 +20,15 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/bcrypt"
 
+	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
-	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -67,22 +64,9 @@ func (s *recordingEmailSender) Messages() []email.Message {
 	return append([]email.Message(nil), s.messages...)
 }
 
-type tenantResolver struct {
-	repo identityrepo.TenantRepository
-}
-
-func (r tenantResolver) Resolve(ctx context.Context, slug string) (tenant.Tenant, error) {
-	found, err := r.repo.ResolveBySlug(ctx, slug)
-	if err != nil {
-		return tenant.Tenant{}, err
-	}
-	return tenant.Tenant{ID: found.ID, Slug: found.Slug, Name: found.Name}, nil
-}
-
 type tenantAuthLinksHarness struct {
 	app       *fiber.App
 	pool      *pgxpool.Pool
-	userRepo  identityrepo.UserRepository
 	verifSvc  identityservice.EmailVerificationService
 	sender    *recordingEmailSender
 	tenantTwo int64
@@ -98,61 +82,29 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantTwo int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('links-acme', 'Links Acme') RETURNING id`,
-	).Scan(&tenantTwo))
+	tenantTwo := testutil.CreateTenant(t, ctx, pool, "links-acme")
+	userID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links@example.com",
+		testutil.MemberOptions{Password: "Password1!", Unverified: true}).UserID
+	user2ID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links2@example.com",
+		testutil.MemberOptions{Password: "Password1!"}).UserID
 
-	hash, err := bcrypt.GenerateFromPassword([]byte("Password1!"), bcrypt.MinCost)
-	require.NoError(t, err)
-	var userID, user2ID int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, password_hash, name)
-		 VALUES ($1, 'links@example.com', $2, 'Links User') RETURNING id`,
-		tenantTwo, string(hash),
-	).Scan(&userID))
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, password_hash, name)
-		 VALUES ($1, 'links2@example.com', $2, 'Links User Two') RETURNING id`,
-		tenantTwo, string(hash),
-	).Scan(&user2ID))
-
-	userRepo := identityrepo.NewUserRepository(pool)
-	tenantRepo := identityrepo.NewTenantRepository(pool)
-	refreshRepo := identityrepo.NewRefreshTokenRepository(pool)
-	resetRepo := identityrepo.NewPasswordResetRepository(pool)
-	verifRepo := identityrepo.NewEmailVerificationRepository(pool)
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	txManager := database.NewTxManager(pool)
 	sender := &recordingEmailSender{}
-
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, audit.NewPostgresRecorder(pool), session.NewStore(userRepo, appCache))
-	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
-	resetSvc := identityservice.NewPasswordResetService(
-		userRepo, resetRepo, refreshRepo, sender, appCache, "https://frontend.example.test", txManager,
-	)
-	verifSvc := identityservice.NewEmailVerificationService(
-		userRepo, verifRepo, sender, appCache, "https://frontend.example.test", txManager,
-	)
-	authHandler := identityhandler.NewAuthHandler(
-		userSvc, refreshSvc, resetSvc, verifSvc,
-		"links-integration-secret", 24, false, nil, tenantRepo,
-	)
+	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(pool), "links-integration-secret", sender)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	// require-header mode: password-reset and verification links must be able
 	// to complete through the validated ?tenant= fallback.
-	api := app.Group("/api/v1", tenanthttp.Middleware(tenantResolver{repo: tenantRepo}, ""))
-	api.Post("/auth/forgot-password", authHandler.ForgotPassword)
-	api.Post("/auth/reset-password", authHandler.ResetPassword)
-	api.Post("/auth/verify-email", authHandler.VerifyEmail)
+	api := app.Group("/api/v1", tenanthttp.Middleware(identityadapter.NewTenantResolver(kit.stores.Tenants), ""))
+	api.Post("/auth/forgot-password", kit.auth.ForgotPassword)
+	api.Post("/auth/reset-password", kit.auth.ResetPassword)
+	api.Post("/auth/verify-email", kit.auth.VerifyEmail)
 
 	return &tenantAuthLinksHarness{
 		app:       app,
 		pool:      pool,
-		userRepo:  userRepo,
-		verifSvc:  verifSvc,
+		verifSvc:  kit.verification,
 		sender:    sender,
 		tenantTwo: tenantTwo,
 		userID:    userID,
@@ -229,28 +181,33 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 		identitydto.VerifyEmailRequest{Token: verifyLink.Query().Get("token")})
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 
-	// Cross-tenant completion is rejected even with the correct opaque token.
-	// Use a second account so the per-email reset rate limit does not suppress
-	// this email.
+	var verified bool
+	require.NoError(t, h.pool.QueryRow(context.Background(),
+		`SELECT email_verified_at IS NOT NULL FROM users WHERE id = $1`, h.userID,
+	).Scan(&verified))
+	assert.True(t, verified, "verification should have happened")
+
+	// Passwords are global (ADR 0004): a reset token belongs to the user, not
+	// to a tenant, so it completes from any tenant's link. Use a second
+	// account so the per-email reset rate limit does not suppress this email.
 	status, _ = h.postJSONWithTenant(t, "/api/v1/auth/forgot-password",
 		identitydto.ForgotPasswordRequest{Email: "links2@example.com"}, "links-acme")
 	require.Equal(t, fiber.StatusOK, status)
 	require.True(t, h.sender.WaitFor(3, 2*time.Second))
 	secondReset := extractEmailLink(t, h.sender.Messages()[2])
+	assert.Equal(t, "links-acme", secondReset.Query().Get("tenant"))
 
-	status, _ = h.postJSON(t, "/api/v1/auth/reset-password?tenant=default",
+	status, body = h.postJSON(t, "/api/v1/auth/reset-password?tenant=default",
 		identitydto.ResetPasswordRequest{
 			Token:    secondReset.Query().Get("token"),
 			Password: "AnotherPassword1!",
 		})
-	assert.Equal(t, fiber.StatusBadRequest, status, "cross-tenant reset must fail")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 
-	user, err := h.userRepo.GetByID(tenant.WithID(context.Background(), h.tenantTwo), h.userID)
-	require.NoError(t, err)
-	assert.True(t, user.EmailVerifiedAt.Valid, "verification should have happened")
-	var tenantID int64
+	var hash string
 	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT tenant_id FROM password_reset_tokens WHERE user_id = $1`, h.user2ID,
-	).Scan(&tenantID))
-	assert.Equal(t, h.tenantTwo, tenantID, "reset tokens stay bound to the owning tenant")
+		`SELECT password_hash FROM user_passwords WHERE user_id = $1`, h.user2ID,
+	).Scan(&hash))
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(hash), []byte("AnotherPassword1!")),
+		"the global password must be the reset one")
 }
