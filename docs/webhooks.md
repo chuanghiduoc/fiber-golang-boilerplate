@@ -71,7 +71,9 @@ could lose (or, on a retry, duplicate) the event. Producers that own a
 transaction call the dispatcher's `DispatchTx(ctx, tx pgx.Tx, events...)`
 instead. It is not on the stdlib-only contract (it takes a `pgx.Tx`):
 producers declare a narrow `WebhookTxDispatcher` interface and type-assert the
-injected dispatcher, mirroring `jobs.EnqueueTx`/`events.PublishTx`.
+injected dispatcher, mirroring `jobs.EnqueueTx`/`events.PublishTx`. Files
+keeps that interface in its `repository/` package and asserts it once in
+`build.go`; its services only see the `service.Outbox` port.
 
 `DispatchTx` fixes the event ID and enqueues one `webhook.dispatch` job per
 event in the caller's transaction, deduplicated by the idempotency key

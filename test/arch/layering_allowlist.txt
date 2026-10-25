@@ -6,13 +6,6 @@ apikeys/service/service.go -> github.com/jackc/pgx/v5
 features/service/features_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto
 features/service/features_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc
 features/service/features_service.go -> github.com/jackc/pgx/v5/pgtype
-files/service/admin_file_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto
-files/service/admin_file_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc
-files/service/admin_file_service.go -> github.com/jackc/pgx/v5
-files/service/authorization.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc
-files/service/upload_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto
-files/service/upload_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc
-files/service/upload_service.go -> github.com/jackc/pgx/v5
 identity/handler/auth_handler.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository
 identity/handler/auth_handler.go -> github.com/jackc/pgx/v5
 identity/service/admin_user_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto

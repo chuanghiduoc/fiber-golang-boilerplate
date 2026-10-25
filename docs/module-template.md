@@ -135,6 +135,50 @@ platform packages and fails on Fiber or fasthttp. Fiber code goes in
 `handler/` or a platform `<pkg>http` adapter (`authzhttp`, `audithttp`,
 `tenanthttp`, `featureshttp`, `apikeyhttp`, `apperrorhttp`).
 
+### Reference module: `files`
+
+`internal/modules/files` is the reference implementation of ADR 0002 and has
+no allowlist entries. Copy its shape, not identity's (identity still has the
+most allowlisted violations).
+
+| Path | Role |
+| --- | --- |
+| `service/ports.go` | service types (`File`, `NewFile`, `FileStats`, `ErrStoragePathTaken`) and the ports: `FileRepository`, `Transactor`, and the transaction-bound `TxRepos{Files, Audit, Outbox}` |
+| `service/*_service.go` | use cases; imports only ports, `internal/contracts`, platform cores (`authz`, `audit`, `tenant`), `pkg/storage`, `pkg/apperror`, `pkg/pagination` |
+| `service/webhooks.go` | webhook payload types and the in-transaction / post-commit dispatch helpers |
+| `repository/file_repository.go` | implements `service.FileRepository` over sqlc; `toFile` maps rows to `service.File`, and Postgres errors become `apperror.ErrNotFound` / `service.ErrStoragePathTaken` |
+| `repository/tx.go` | `Transactor.InTx` opens a `database.TxManager` transaction and hands the service a `TxRepos` whose repository, audit writer, and outbox are all bound to that `pgx.Tx` |
+| `handler/mapping.go` | `service.File` → `dto.FileResponse` (download URL, `deletedAt`) |
+| `adapter/admin.go` | `service.File` → `internal/contracts/files` types for the admin module |
+| `build.go` | the only place that wires concrete types: repository, `NewTransactor(infra.Tx, infra.Audit, outbox)`, services, handler, adapter |
+
+Transactional side effects never expose `pgx.Tx` to the service. The use case
+writes through the collaborators it is given:
+
+```go
+err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+	file, err := tx.Files.Delete(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := tx.Audit.RecordTx(ctx, event); err != nil { // Tier 1 audit row
+		return filesAuditWriteError(err)
+	}
+	if tx.Outbox != nil { // webhook outbox job in the same transaction
+		return enqueueWebhook(ctx, tx.Outbox, eventType, file.TenantID, data)
+	}
+	return nil
+})
+```
+
+`TxRepos.Outbox` is nil when the dispatcher passed to `Build` cannot join a
+transaction; the service then dispatches after commit. Dependencies are
+constructor arguments (`files.Build(infra, settings, webhooks)`), so the
+composition root builds webhooks before files rather than attaching it after
+construction. Unit tests use an in-memory `FileRepository` and a fake
+`Transactor` (`service/upload_service_mocks_test.go`); rollback is covered
+against PostgreSQL in `test/integration`.
+
 Why a `catalog` subpackage: the module root imports its handler and service, so
 a handler referencing a root constant would be an import cycle. The leaf can be
 imported by every layer and by tests.

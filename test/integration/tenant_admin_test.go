@@ -108,7 +108,7 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 		identityservice.NewAdminUserService(userRepo, identityrepo.NewRefreshTokenRepository(pool), txManager, auditRecorder, sessionStore),
 	)
 	filesRepo := filesrepo.NewFileRepository(pool)
-	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, txManager, auditRecorder, store))
+	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store, nil))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
 	cfg := &config.Config{

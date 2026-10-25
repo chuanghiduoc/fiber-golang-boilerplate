@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
+	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
@@ -22,22 +22,22 @@ import (
 
 // mockUploadService is a manual mock for testing the upload handler.
 type mockUploadService struct {
-	files map[int64]*dto.FileResponse
+	files map[int64]*filesvc.File
 }
 
 func newMockUploadService() *mockUploadService {
 	return &mockUploadService{
-		files: map[int64]*dto.FileResponse{
-			1: {ID: 1, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024, URL: "http://localhost/files/1"},
+		files: map[int64]*filesvc.File{
+			1: {ID: 1, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
 		},
 	}
 }
 
-func (m *mockUploadService) Upload(_ context.Context, _ int64, filename string, _ io.Reader, size int64, contentType string) (*dto.FileResponse, error) {
-	return &dto.FileResponse{ID: 2, OriginalName: filename, MimeType: contentType, Size: size, URL: "http://localhost/files/2"}, nil
+func (m *mockUploadService) Upload(_ context.Context, _ int64, filename string, _ io.Reader, size int64, contentType string) (*filesvc.File, error) {
+	return &filesvc.File{ID: 2, OriginalName: filename, MimeType: contentType, Size: size}, nil
 }
 
-func (m *mockUploadService) GetFileInfo(_ context.Context, id, _ int64) (*dto.FileResponse, error) {
+func (m *mockUploadService) GetFileInfo(_ context.Context, id, _ int64) (*filesvc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.NewNotFound("file not found")
@@ -45,16 +45,16 @@ func (m *mockUploadService) GetFileInfo(_ context.Context, id, _ int64) (*dto.Fi
 	return f, nil
 }
 
-func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*dto.FileResponse, io.ReadCloser, error) {
+func (m *mockUploadService) Download(_ context.Context, id, _ int64) (*filesvc.File, io.ReadCloser, error) {
 	if _, ok := m.files[id]; !ok {
 		return nil, nil, apperror.NewNotFound("file not found")
 	}
-	return &dto.FileResponse{ID: id, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
+	return &filesvc.File{ID: id, OriginalName: "test.pdf", MimeType: "application/pdf", Size: 1024},
 		io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), 1024))), nil
 }
 
-func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string, _ bool) ([]dto.FileResponse, bool, error) {
-	files := make([]dto.FileResponse, 0, len(m.files))
+func (m *mockUploadService) List(_ context.Context, _ int64, _ int, _ string, _ bool) ([]filesvc.File, bool, error) {
+	files := make([]filesvc.File, 0, len(m.files))
 	for _, f := range m.files {
 		files = append(files, *f)
 	}
@@ -69,7 +69,7 @@ func (m *mockUploadService) Delete(_ context.Context, id, _ int64) error {
 	return nil
 }
 
-func (m *mockUploadService) Restore(_ context.Context, id, _ int64) (*dto.FileResponse, error) {
+func (m *mockUploadService) Restore(_ context.Context, id, _ int64) (*filesvc.File, error) {
 	f, ok := m.files[id]
 	if !ok {
 		return nil, apperror.NewNotFound("file not found")

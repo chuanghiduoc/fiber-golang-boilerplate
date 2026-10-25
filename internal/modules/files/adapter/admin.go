@@ -1,5 +1,5 @@
 // Package adapter exposes the files module's implementation of the
-// cross-module admin contracts. It translates the module's DTOs into
+// cross-module admin contracts. It translates the service types into
 // transport-neutral contract types so no caller imports files internals.
 package adapter
 
@@ -7,7 +7,6 @@ import (
 	"context"
 
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 )
 
@@ -29,7 +28,7 @@ func (a *AdminFiles) ListFiles(ctx context.Context, limit int, startingAfter str
 	}
 	items := make([]filescontracts.File, len(files))
 	for i := range files {
-		items[i] = toFile(files[i])
+		items[i] = toFile(&files[i])
 	}
 	return filescontracts.FilePage{Items: items, HasMore: hasMore}, nil
 }
@@ -39,7 +38,7 @@ func (a *AdminFiles) OpenFile(ctx context.Context, id int64) (filescontracts.Fil
 	if err != nil {
 		return filescontracts.FileDownload{}, err
 	}
-	return filescontracts.FileDownload{File: toFile(*file), Reader: reader}, nil
+	return filescontracts.FileDownload{File: toFile(file), Reader: reader}, nil
 }
 
 func (a *AdminFiles) DeleteFile(ctx context.Context, id int64) error {
@@ -51,7 +50,7 @@ func (a *AdminFiles) RestoreFile(ctx context.Context, id int64) (filescontracts.
 	if err != nil {
 		return filescontracts.File{}, err
 	}
-	return toFile(*file), nil
+	return toFile(file), nil
 }
 
 func (a *AdminFiles) GetFileStats(ctx context.Context) (filescontracts.FileStats, error) {
@@ -65,7 +64,7 @@ func (a *AdminFiles) GetFileStats(ctx context.Context) (filescontracts.FileStats
 	}, nil
 }
 
-func toFile(file dto.FileResponse) filescontracts.File {
+func toFile(file *service.File) filescontracts.File {
 	return filescontracts.File{
 		ID:           file.ID,
 		TenantID:     file.TenantID,

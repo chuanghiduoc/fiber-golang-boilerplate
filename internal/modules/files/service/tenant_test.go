@@ -7,9 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
-	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -89,15 +86,15 @@ func TestUploadService_TenantIsolation(t *testing.T) {
 	store := newMockStorage()
 	svc := newTestUploadService(repo, store)
 
-	repo.files[1] = &filesqlc.File{
+	repo.files[1] = &File{
 		ID: 1, TenantID: 1, UserID: 10, OriginalName: "tenant-one.pdf",
 		StoragePath: "1/10/a.pdf", MimeType: "application/pdf", Size: 10,
 	}
-	repo.files[2] = &filesqlc.File{
+	repo.files[2] = &File{
 		ID: 2, TenantID: 2, UserID: 20, OriginalName: "tenant-two.pdf",
 		StoragePath: "2/20/b.pdf", MimeType: "application/pdf", Size: 20,
 	}
-	repo.files[3] = &filesqlc.File{
+	repo.files[3] = &File{
 		ID: 3, TenantID: 2, UserID: 10, OriginalName: "same-user-other-tenant.pdf",
 		StoragePath: "2/10/c.pdf", MimeType: "application/pdf", Size: 30,
 	}
@@ -115,14 +112,14 @@ func TestUploadService_TenantIsolation(t *testing.T) {
 	_, _, err = svc.Download(ctxA, 2, 20)
 	requireNotFound(t, err)
 	requireNotFound(t, svc.Delete(ctxA, 2, 20))
-	if repo.files[2].DeletedAt.Valid {
+	if repo.files[2].DeletedAt != nil {
 		t.Fatal("cross-tenant delete must not touch tenant two's file")
 	}
 
-	repo.files[2].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	repo.files[2].DeletedAt = timePtr(time.Now())
 	_, err = svc.Restore(ctxA, 2, 20)
 	requireNotFound(t, err)
-	if !repo.files[2].DeletedAt.Valid {
+	if repo.files[2].DeletedAt == nil {
 		t.Fatal("cross-tenant restore must not revive tenant two's file")
 	}
 
@@ -159,15 +156,15 @@ type tenantBlindRepo struct {
 	*mockFileRepo
 }
 
-func (r *tenantBlindRepo) GetByID(_ context.Context, id int64) (*filesqlc.File, error) {
+func (r *tenantBlindRepo) GetByID(_ context.Context, id int64) (*File, error) {
 	f, ok := r.files[id]
-	if !ok || f.DeletedAt.Valid {
+	if !ok || f.DeletedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	return f, nil
 }
 
-func (r *tenantBlindRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*filesqlc.File, error) {
+func (r *tenantBlindRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (*File, error) {
 	f, ok := r.files[id]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -175,21 +172,21 @@ func (r *tenantBlindRepo) GetByIDIncludingDeleted(_ context.Context, id int64) (
 	return f, nil
 }
 
-func (r *tenantBlindRepo) Delete(_ context.Context, id int64) (*filesqlc.File, error) {
+func (r *tenantBlindRepo) Delete(_ context.Context, id int64) (*File, error) {
 	f, ok := r.files[id]
-	if !ok || f.DeletedAt.Valid {
+	if !ok || f.DeletedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
-	f.DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	f.DeletedAt = timePtr(time.Now())
 	return f, nil
 }
 
-func (r *tenantBlindRepo) Restore(_ context.Context, id int64) (*filesqlc.File, error) {
+func (r *tenantBlindRepo) Restore(_ context.Context, id int64) (*File, error) {
 	f, ok := r.files[id]
-	if !ok || !f.DeletedAt.Valid {
+	if !ok || f.DeletedAt == nil {
 		return nil, apperror.ErrNotFound
 	}
-	f.DeletedAt = pgtype.Timestamptz{}
+	f.DeletedAt = nil
 	return f, nil
 }
 
@@ -197,9 +194,9 @@ func TestUploadService_RejectsLeakedCrossTenantRows(t *testing.T) {
 	base := newMockFileRepo()
 	repo := &tenantBlindRepo{mockFileRepo: base}
 	store := newMockStorage()
-	svc := NewUploadService(repo, store)
+	svc := NewUploadService(repo, newFakeTx(repo), store, nil)
 
-	base.files[1] = &filesqlc.File{
+	base.files[1] = &File{
 		ID: 1, TenantID: 2, UserID: 20, OriginalName: "tenant-two.pdf",
 		StoragePath: "2/20/b.pdf", MimeType: "application/pdf", Size: 20,
 	}
@@ -211,14 +208,14 @@ func TestUploadService_RejectsLeakedCrossTenantRows(t *testing.T) {
 	_, _, err = svc.Download(ctxA, 1, 20)
 	requireNotFound(t, err)
 	requireNotFound(t, svc.Delete(ctxA, 1, 20))
-	if base.files[1].DeletedAt.Valid {
+	if base.files[1].DeletedAt != nil {
 		t.Fatal("leaked cross-tenant delete must not mutate the row")
 	}
 
-	base.files[1].DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	base.files[1].DeletedAt = timePtr(time.Now())
 	_, err = svc.Restore(ctxA, 1, 20)
 	requireNotFound(t, err)
-	if !base.files[1].DeletedAt.Valid {
+	if base.files[1].DeletedAt == nil {
 		t.Fatal("leaked cross-tenant restore must not revive the row")
 	}
 }

@@ -48,7 +48,7 @@ const tenantFilesSecret = "tenant-files-integration-secret"
 type tenantFilesHarness struct {
 	app      *fiber.App
 	pool     *pgxpool.Pool
-	fileRepo filesrepo.FileRepository
+	fileRepo *filesrepo.FileRepository
 	store    storage.Storage
 	tenantA  int64
 	tenantB  int64
@@ -115,11 +115,10 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 
-	uploadSvc := filesvc.NewUploadService(fileRepo, store)
+	filesTx := filesrepo.NewTransactor(database.NewTxManager(pool), audit.NewPostgresRecorder(pool), nil)
+	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store, nil)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
-	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(
-		fileRepo, database.NewTxManager(pool), audit.NewPostgresRecorder(pool), store,
-	))
+	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store, nil))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
@@ -339,9 +338,6 @@ func TestTenantFiles_Isolation(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, adminRepoFilesA, 1)
 	assert.Equal(t, fileA.ID, adminRepoFilesA[0].ID)
-	countA, err := h.fileRepo.AdminCount(ctxA)
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), countA)
 	repoStatsA, err := h.fileRepo.AdminFileStats(ctxA)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), repoStatsA.TotalFiles)
@@ -349,7 +345,9 @@ func TestTenantFiles_Isolation(t *testing.T) {
 
 	// The admin adapter must carry the tenant id into contract types.
 	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(
-		h.fileRepo, database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), h.store,
+		h.fileRepo,
+		filesrepo.NewTransactor(database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), nil),
+		h.store, nil,
 	)).ListFiles(ctxA, 10, "")
 	require.NoError(t, err)
 	require.Len(t, adminPage.Items, 1)
