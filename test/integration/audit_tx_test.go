@@ -40,7 +40,7 @@ type auditTxHarness struct {
 	tx       *database.TxManager
 	users    identityrepo.UserRepository
 	refresh  identityrepo.RefreshTokenRepository
-	files    filesrepo.FileRepository
+	files    *filesrepo.FileRepository
 	store    storage.Storage
 }
 
@@ -186,7 +186,7 @@ func TestAuditTx_FileDeleteAndRestoreRollBackWhenAuditFails(t *testing.T) {
 		tenant.DefaultID, adminID,
 	).Scan(&fileID))
 
-	svc := filesvc.NewAdminFileService(h.files, h.tx, h.recorder, h.store)
+	svc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, nil), h.store, nil)
 	ctx := h.actorCtx(tenant.DefaultID, adminID, "admin")
 
 	h.installInsertFailure(t)
@@ -227,11 +227,9 @@ func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
 
 	queue := jobs.NewQueue(h.pool)
 	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), queue)
-	adminSvc := filesvc.NewAdminFileService(h.files, h.tx, h.recorder, h.store)
-	filesvc.AttachAdminWebhookDispatcher(adminSvc, dispatcher)
-	uploadSvc := filesvc.NewUploadService(h.files, h.store)
-	filesvc.AttachTxManager(uploadSvc, h.tx)
-	filesvc.AttachWebhookDispatcher(uploadSvc, dispatcher)
+	tx := filesrepo.NewTransactor(h.tx, h.recorder, dispatcher)
+	adminSvc := filesvc.NewAdminFileService(h.files, tx, h.store, dispatcher)
+	uploadSvc := filesvc.NewUploadService(h.files, tx, h.store, dispatcher)
 
 	adminCtx := h.actorCtx(tenant.DefaultID, adminID, "admin")
 	ownerCtx := h.actorCtx(tenant.DefaultID, ownerID, "user")
@@ -263,8 +261,7 @@ func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
 
 	// A dispatcher whose outbox cannot enqueue fails the admin delete closed.
 	broken := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), nil)
-	brokenSvc := filesvc.NewAdminFileService(h.files, h.tx, h.recorder, h.store)
-	filesvc.AttachAdminWebhookDispatcher(brokenSvc, broken)
+	brokenSvc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, broken), h.store, broken)
 	require.Error(t, brokenSvc.DeleteFile(adminCtx, fileID))
 	var deletedAt *time.Time
 	require.NoError(t, h.pool.QueryRow(bg, `SELECT deleted_at FROM files WHERE id = $1`, fileID).Scan(&deletedAt))

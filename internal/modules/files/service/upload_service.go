@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,16 +12,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
-	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -38,26 +32,29 @@ var mimeExtensions = map[string]string{
 }
 
 type UploadService interface {
-	Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*dto.FileResponse, error)
-	GetFileInfo(ctx context.Context, id, userID int64) (*dto.FileResponse, error)
-	Download(ctx context.Context, id, userID int64) (*dto.FileResponse, io.ReadCloser, error)
-	List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]dto.FileResponse, bool, error)
+	Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error)
+	GetFileInfo(ctx context.Context, id, userID int64) (*File, error)
+	Download(ctx context.Context, id, userID int64) (*File, io.ReadCloser, error)
+	List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error)
 	Delete(ctx context.Context, id, userID int64) error
-	Restore(ctx context.Context, id, userID int64) (*dto.FileResponse, error)
+	Restore(ctx context.Context, id, userID int64) (*File, error)
 }
 
 type uploadService struct {
-	repo      filesrepo.FileRepository
-	storage   storage.Storage
-	webhooks  webhookcontracts.Dispatcher
-	txManager *database.TxManager
+	repo     FileRepository
+	tx       Transactor
+	storage  storage.Storage
+	webhooks webhookcontracts.Dispatcher
 }
 
-func NewUploadService(repo filesrepo.FileRepository, store storage.Storage) UploadService {
-	return &uploadService{repo: repo, storage: store}
+// NewUploadService builds the user file service. Mutations run through tx, so
+// a metadata change and its webhook outbox job commit atomically. webhooks is
+// the post-commit fallback used when tx offers no outbox; nil disables it.
+func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage, webhooks webhookcontracts.Dispatcher) UploadService {
+	return &uploadService{repo: repo, tx: tx, storage: store, webhooks: webhooks}
 }
 
-func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*dto.FileResponse, error) {
+func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error) {
 	tenantID := tenant.EffectiveID(ctx)
 	if tenantID <= 0 {
 		return nil, apperror.NewInternal("tenant context is required")
@@ -80,8 +77,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		return nil, apperror.NewInternal("failed to store file")
 	}
 
-	params := filesqlc.CreateFileParams{
-		TenantID:     tenantID,
+	input := NewFile{
 		UserID:       userID,
 		OriginalName: originalName,
 		StoragePath:  storagePath,
@@ -89,29 +85,26 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		Size:         size,
 	}
 	var (
-		file          *filesqlc.File
-		webhookQueued bool
-		err           error
+		file   *File
+		queued bool
 	)
-	if txDispatcher, ok := s.webhooks.(WebhookTxDispatcher); ok && s.txManager != nil {
-		// The metadata row and the webhook outbox job commit together; an
-		// enqueue failure rolls the row back and cleans up the blob below.
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			created, createErr := filesrepo.NewFileRepository(tx).Create(ctx, params)
-			if createErr != nil {
-				return createErr
-			}
-			if hookErr := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventFileUploaded, tenantID, s.toFileResponse(created)); hookErr != nil {
+	// The metadata row and the webhook outbox job commit together; an enqueue
+	// failure rolls the row back and cleans up the blob below.
+	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		created, createErr := tx.Files.Create(ctx, input)
+		if createErr != nil {
+			return createErr
+		}
+		if tx.Outbox != nil {
+			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileUploaded, tenantID, uploadedEventData(created)); hookErr != nil {
 				slog.Error("failed to enqueue file upload webhook", slog.Any("error", hookErr))
 				return hookErr
 			}
-			file = created
-			return nil
-		})
-		webhookQueued = err == nil
-	} else {
-		file, err = s.repo.Create(ctx, params)
-	}
+			queued = true
+		}
+		file = created
+		return nil
+	})
 	if err != nil {
 		// Cleanup storage on DB failure. The request context may already be
 		// canceled; storage cleanup must still run.
@@ -121,96 +114,16 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 				slog.Any("error", delErr),
 			)
 		}
-		if database.IsUniqueViolation(err) {
+		if errors.Is(err, ErrStoragePathTaken) {
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
 		return nil, apperror.NewInternal("failed to save file metadata")
 	}
 
-	response := s.toFileResponse(file)
-	if !webhookQueued {
-		s.dispatchWebhook(ctx, webhookcontracts.EventFileUploaded, tenantID, response)
+	if !queued {
+		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileUploaded, tenantID, uploadedEventData(file))
 	}
-	return response, nil
-}
-
-// WebhookTxDispatcher is the optional transactional side of the webhooks
-// dispatcher. It cannot live in the stdlib-only contracts package because it
-// takes the producer's pgx.Tx.
-type WebhookTxDispatcher interface {
-	DispatchTx(ctx context.Context, tx pgx.Tx, events ...webhookcontracts.Event) error
-}
-
-// AttachTxManager enables transactional webhook dispatch: when the wired
-// dispatcher implements WebhookTxDispatcher, file mutations and their webhook
-// outbox jobs commit atomically.
-func AttachTxManager(svc UploadService, txManager *database.TxManager) {
-	if s, ok := svc.(*uploadService); ok {
-		s.txManager = txManager
-	}
-}
-
-// dispatchWebhookTx enqueues one domain event inside tx.
-func dispatchWebhookTx(ctx context.Context, dispatcher WebhookTxDispatcher, tx pgx.Tx, eventType string, tenantID int64, data any) error {
-	payload, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("marshal webhook payload: %w", err)
-	}
-	return dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
-		Type:     eventType,
-		TenantID: tenantID,
-		Data:     payload,
-	})
-}
-
-// SetWebhookDispatcher wires outbound domain events.
-func (s *uploadService) SetWebhookDispatcher(dispatcher webhookcontracts.Dispatcher) {
-	s.webhooks = dispatcher
-}
-
-// AttachWebhookDispatcher wires the production dispatcher without widening the
-// UploadService interface, so handler fakes remain small.
-func AttachWebhookDispatcher(svc UploadService, dispatcher webhookcontracts.Dispatcher) {
-	if s, ok := svc.(*uploadService); ok {
-		s.webhooks = dispatcher
-	}
-}
-
-// dispatchWebhook emits one best-effort domain event. Delivery failures are
-// logged; they must not turn a committed file mutation into an API error.
-func (s *uploadService) dispatchWebhook(ctx context.Context, eventType string, tenantID int64, data any) {
-	dispatchWebhookAfterCommit(ctx, s.webhooks, eventType, tenantID, data)
-}
-
-// fileEventData is the payload of file.deleted and file.restored events.
-func fileEventData(file *filesqlc.File) map[string]any {
-	return map[string]any{
-		"id":           file.ID,
-		"tenantId":     file.TenantID,
-		"userId":       file.UserID,
-		"originalName": file.OriginalName,
-	}
-}
-
-// dispatchWebhookAfterCommit is the post-commit fallback used when no
-// transactional dispatcher is wired. Failures are logged only, because the
-// mutation has already committed.
-func dispatchWebhookAfterCommit(ctx context.Context, dispatcher webhookcontracts.Dispatcher, eventType string, tenantID int64, data any) {
-	if dispatcher == nil {
-		return
-	}
-	payload, err := json.Marshal(data)
-	if err != nil {
-		slog.Warn("failed to marshal webhook payload", slog.String("event", eventType), slog.Any("error", err))
-		return
-	}
-	if _, err := dispatcher.Dispatch(context.WithoutCancel(ctx), webhookcontracts.Event{
-		Type:     eventType,
-		TenantID: tenantID,
-		Data:     payload,
-	}); err != nil {
-		slog.Warn("failed to dispatch webhook event", slog.String("event", eventType), slog.Any("error", err))
-	}
+	return file, nil
 }
 
 // cleanOriginalName makes the client filename safe to store and display: valid
@@ -245,7 +158,7 @@ func extensionForMIME(contentType string) string {
 	return ".bin"
 }
 
-func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto.FileResponse, error) {
+func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*File, error) {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -262,10 +175,10 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*dto
 		return nil, apperror.NewNotFound("file not found")
 	}
 
-	return s.toFileResponse(file), nil
+	return file, nil
 }
 
-func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.FileResponse, io.ReadCloser, error) {
+func (s *uploadService) Download(ctx context.Context, id, userID int64) (*File, io.ReadCloser, error) {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -290,13 +203,13 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*dto.Fi
 		return nil, nil, storageReadError(file, err)
 	}
 
-	return s.toFileResponse(file), reader, nil
+	return file, reader, nil
 }
 
 // storageReadError maps a blob read failure. A missing blob behind live
 // metadata is a 404 for the client, but it is data loss for operators, so it
 // is logged as an error.
-func storageReadError(file *filesqlc.File, err error) *apperror.AppError {
+func storageReadError(file *File, err error) *apperror.AppError {
 	if errors.Is(err, storage.ErrNotFound) {
 		slog.Error("file metadata exists but its blob is missing",
 			slog.Int64("file_id", file.ID),
@@ -312,7 +225,7 @@ func storageReadError(file *filesqlc.File, err error) *apperror.AppError {
 	return apperror.NewInternal("failed to read file from storage")
 }
 
-func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]dto.FileResponse, bool, error) {
+func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -330,13 +243,7 @@ func (s *uploadService) List(ctx context.Context, userID int64, limit int, start
 	if hasMore {
 		files = files[:pageSize]
 	}
-
-	responses := make([]dto.FileResponse, len(files))
-	for i := range files {
-		responses[i] = *s.toFileResponse(&files[i])
-	}
-
-	return responses, hasMore, nil
+	return files, hasMore, nil
 }
 
 func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
@@ -357,23 +264,21 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 
 	eventData := fileEventData(file)
 	// Soft delete — do NOT remove from storage so the file can be restored.
-	webhookQueued := false
-	if txDispatcher, ok := s.webhooks.(WebhookTxDispatcher); ok && s.txManager != nil {
-		// The soft delete and its webhook outbox job commit together.
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			if _, delErr := filesrepo.NewFileRepository(tx).Delete(ctx, id); delErr != nil {
-				return delErr
-			}
-			if hookErr := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventFileDeleted, file.TenantID, eventData); hookErr != nil {
+	// The soft delete and its webhook outbox job commit together.
+	queued := false
+	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if _, delErr := tx.Files.Delete(ctx, id); delErr != nil {
+			return delErr
+		}
+		if tx.Outbox != nil {
+			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileDeleted, file.TenantID, eventData); hookErr != nil {
 				slog.Error("failed to enqueue file delete webhook", slog.Int64("file_id", id), slog.Any("error", hookErr))
 				return hookErr
 			}
-			return nil
-		})
-		webhookQueued = err == nil
-	} else {
-		_, err = s.repo.Delete(ctx, id)
-	}
+			queued = true
+		}
+		return nil
+	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("file not found")
@@ -385,14 +290,14 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		slog.Int64("file_id", id),
 		slog.String("path", file.StoragePath),
 	)
-	if !webhookQueued {
-		s.dispatchWebhook(ctx, webhookcontracts.EventFileDeleted, file.TenantID, eventData)
+	if !queued {
+		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileDeleted, file.TenantID, eventData)
 	}
 
 	return nil
 }
 
-func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.FileResponse, error) {
+func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*File, error) {
 	file, err := s.repo.GetByIDIncludingDeleted(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -406,59 +311,38 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*dto.Fil
 	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
 		return nil, apperror.NewNotFound("file not found")
 	}
-	if !file.DeletedAt.Valid {
+	if file.DeletedAt == nil {
 		return nil, apperror.NewCode(filescatalog.CodeFileNotDeleted, "file is not deleted")
 	}
 
-	var restored *filesqlc.File
-	webhookQueued := false
-	if txDispatcher, ok := s.webhooks.(WebhookTxDispatcher); ok && s.txManager != nil {
-		// The restore and its webhook outbox job commit together.
-		err = s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-			row, restoreErr := filesrepo.NewFileRepository(tx).Restore(ctx, id)
-			if restoreErr != nil {
-				return restoreErr
-			}
-			if hookErr := dispatchWebhookTx(ctx, txDispatcher, tx, webhookcontracts.EventFileRestored, row.TenantID, fileEventData(row)); hookErr != nil {
+	var restored *File
+	queued := false
+	// The restore and its webhook outbox job commit together.
+	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		row, restoreErr := tx.Files.Restore(ctx, id)
+		if restoreErr != nil {
+			return restoreErr
+		}
+		if tx.Outbox != nil {
+			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileRestored, row.TenantID, fileEventData(row)); hookErr != nil {
 				slog.Error("failed to enqueue file restore webhook", slog.Int64("file_id", id), slog.Any("error", hookErr))
 				return hookErr
 			}
-			restored = row
-			return nil
-		})
-		webhookQueued = err == nil
-	} else {
-		restored, err = s.repo.Restore(ctx, id)
-	}
+			queued = true
+		}
+		restored = row
+		return nil
+	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("file not found")
 		}
 		return nil, apperror.NewInternal("failed to restore file")
 	}
-	if !webhookQueued {
-		s.dispatchWebhook(ctx, webhookcontracts.EventFileRestored, restored.TenantID, fileEventData(restored))
+	if !queued {
+		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileRestored, restored.TenantID, fileEventData(restored))
 	}
-	return s.toFileResponse(restored), nil
-}
-
-func (s *uploadService) toFileResponse(file *filesqlc.File) *dto.FileResponse {
-	resp := &dto.FileResponse{
-		ID:           file.ID,
-		TenantID:     file.TenantID,
-		UserID:       file.UserID,
-		OriginalName: file.OriginalName,
-		MimeType:     file.MimeType,
-		Size:         file.Size,
-		CreatedAt:    file.CreatedAt.Time,
-	}
-	if file.DeletedAt.Valid {
-		deletedAt := file.DeletedAt.Time
-		resp.DeletedAt = &deletedAt
-	} else {
-		resp.URL = fmt.Sprintf("/api/v1/files/%d/download", file.ID)
-	}
-	return resp
+	return restored, nil
 }
 
 // buildCursor normalizes the page size and decodes an optional cursor.

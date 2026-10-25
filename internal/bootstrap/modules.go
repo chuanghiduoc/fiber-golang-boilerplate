@@ -60,10 +60,6 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	if err != nil {
 		return nil, err
 	}
-	filesModule, filesProvides := files.Build(infra, files.Settings{
-		MaxFileSize:  cfg.Storage.MaxFileSize,
-		AllowedTypes: cfg.Storage.AllowedTypes(),
-	})
 	webhooksModule, webhooksProvides, err := webhooks.Build(infra, webhooks.Settings{
 		Webhook: cfg.Webhook,
 		// JWT_SECRET is the local/test-only fallback; production requires
@@ -74,10 +70,14 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	if err != nil {
 		return nil, err
 	}
-	// File upload/delete and user registration enqueue webhook events inside
-	// their own transactions; the dispatcher exists only after webhooks.
+	// User registration enqueues webhook events inside its own transaction;
+	// identity is built before webhooks (which needs TenantActive), so the
+	// dispatcher is attached afterwards. Files takes it at construction.
 	identityModule.AttachWebhooks(webhooksProvides.Dispatcher)
-	filesModule.AttachWebhooks(webhooksProvides.Dispatcher)
+	filesModule, filesProvides := files.Build(infra, files.Settings{
+		MaxFileSize:  cfg.Storage.MaxFileSize,
+		AllowedTypes: cfg.Storage.AllowedTypes(),
+	}, webhooksProvides.Dispatcher)
 
 	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
 

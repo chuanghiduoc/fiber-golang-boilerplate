@@ -8,7 +8,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
-	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
@@ -20,10 +19,6 @@ import (
 // Module owns file upload, metadata, download, soft delete, and restore.
 type Module struct {
 	upload *fileshandler.UploadHandler
-	// uploadSvc and adminSvc are set by Build so AttachWebhooks can wire the
-	// dispatcher.
-	uploadSvc filesvc.UploadService
-	adminSvc  filesvc.AdminFileService
 }
 
 // New builds the module from its handler. Production uses Build.

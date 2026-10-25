@@ -90,7 +90,7 @@ func (h *UploadHandler) Upload(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Created(c, result)
+	return response.Created(c, toFileResponse(result))
 }
 
 // GetInfo godoc
@@ -116,7 +116,7 @@ func (h *UploadHandler) GetInfo(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, file)
+	return response.Success(c, toFileResponse(file))
 }
 
 // Download godoc
@@ -173,11 +173,12 @@ func (h *UploadHandler) List(c fiber.Ctx) error {
 	}
 
 	includeDeleted, _ := strconv.ParseBool(c.Query("includeDeleted"))
-	files, hasMore, err := h.service.List(c.Context(), authUserID(c), limit, startingAfter, includeDeleted)
+	result, hasMore, err := h.service.List(c.Context(), authUserID(c), limit, startingAfter, includeDeleted)
 	if err != nil {
 		return err
 	}
 
+	files := toFileResponses(result)
 	return response.List(c, files, hasMore, pagination.NextCursor(files, func(f dto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
@@ -229,5 +230,5 @@ func (h *UploadHandler) Restore(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, file)
+	return response.Success(c, toFileResponse(file))
 }

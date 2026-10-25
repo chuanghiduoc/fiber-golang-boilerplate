@@ -24,30 +24,18 @@ type Settings struct {
 }
 
 // Build constructs the files repository, services, and handler from infra.
-// It performs no I/O.
-func Build(infra app.Infra, settings Settings) (*Module, Provides) {
+// It performs no I/O. webhooks publishes file.uploaded/deleted/restored; when
+// it can also enqueue inside a transaction (the webhooks module's
+// dispatcher does), each file mutation and its outbox job commit atomically,
+// otherwise events are dispatched after commit. A nil webhooks disables them.
+func Build(infra app.Infra, settings Settings, webhooks webhookcontracts.Dispatcher) (*Module, Provides) {
 	fileRepo := filesrepo.NewFileRepository(infra.Pool)
-	uploadSvc := filesvc.NewUploadService(fileRepo, infra.Storage)
-	// With a transaction manager, file mutations and their webhook outbox
-	// jobs commit atomically (see AttachWebhooks).
-	filesvc.AttachTxManager(uploadSvc, infra.Tx)
+	outbox, _ := webhooks.(filesrepo.WebhookTxDispatcher)
+	tx := filesrepo.NewTransactor(infra.Tx, infra.Audit, outbox)
+
+	uploadSvc := filesvc.NewUploadService(fileRepo, tx, infra.Storage, webhooks)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, settings.MaxFileSize, settings.AllowedTypes)
-	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, infra.Tx, infra.Audit, infra.Storage)
+	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, tx, infra.Storage, webhooks)
 
-	m := New(uploadHandler)
-	m.uploadSvc = uploadSvc
-	m.adminSvc = filesAdminSvc
-	return m, Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}
-}
-
-// AttachWebhooks wires the outbound webhook dispatcher into user and admin
-// upload/delete/restore. The webhooks module is built after files, so the
-// composition root attaches it once both exist.
-func (m *Module) AttachWebhooks(dispatcher webhookcontracts.Dispatcher) {
-	if m.uploadSvc != nil {
-		filesvc.AttachWebhookDispatcher(m.uploadSvc, dispatcher)
-	}
-	if m.adminSvc != nil {
-		filesvc.AttachAdminWebhookDispatcher(m.adminSvc, dispatcher)
-	}
+	return New(uploadHandler), Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}
 }

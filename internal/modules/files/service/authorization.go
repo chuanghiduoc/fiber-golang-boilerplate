@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 
-	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 )
 
@@ -16,7 +15,7 @@ import (
 // authorizeFile applies ABAC to an existing file: the tenant policy plus the
 // owner policy, so a cross-tenant file or another user's file is concealed as
 // 404.
-func authorizeFile(ctx context.Context, permission authz.Permission, file *filesqlc.File) error {
+func authorizeFile(ctx context.Context, permission authz.Permission, file *File) error {
 	return authz.Authorize(
 		ctx,
 		permission,

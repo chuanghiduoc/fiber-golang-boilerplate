@@ -7,13 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 func newTestUploadService(repo *mockFileRepo, store *mockStorage) UploadService {
-	return NewUploadService(repo, store)
+	return NewUploadService(repo, newFakeTx(repo), store, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -39,8 +38,8 @@ func TestUpload(t *testing.T) {
 		if resp.Size != 10 {
 			t.Errorf("expected size 10, got %d", resp.Size)
 		}
-		if resp.URL == "" {
-			t.Error("expected non-empty URL")
+		if !strings.HasPrefix(resp.StoragePath, "1/1/") || !strings.HasSuffix(resp.StoragePath, ".jpg") {
+			t.Errorf("storage path = %q, want 1/1/<uuid>.jpg", resp.StoragePath)
 		}
 		// Verify file was stored
 		if len(store.files) != 1 {
@@ -70,31 +69,41 @@ func TestUpload(t *testing.T) {
 	t.Run("DB failure cleans up storage", func(t *testing.T) {
 		store := newMockStorage()
 		// Use a special repo that always fails on Create
-		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), failCreate: true}
-		svc := NewUploadService(failRepo, store)
+		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: fmt.Errorf("db error")}
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, nil)
 
 		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
-		if err == nil {
-			t.Fatal("expected error for DB failure")
-		}
+		requireStatus(t, err, 500)
 		// Storage should be cleaned up
 		if len(store.files) != 0 {
 			t.Error("storage should be cleaned up after DB failure")
 		}
 	})
+
+	t.Run("duplicate storage path is a conflict", func(t *testing.T) {
+		store := newMockStorage()
+		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: ErrStoragePathTaken}
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, nil)
+
+		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		requireStatus(t, err, 409)
+		if len(store.files) != 0 {
+			t.Error("storage should be cleaned up after a conflict")
+		}
+	})
 }
 
-// failingFileRepo wraps mockFileRepo but can fail on specific operations
+// failingFileRepo wraps mockFileRepo and fails Create with createErr.
 type failingFileRepo struct {
 	*mockFileRepo
-	failCreate bool
+	createErr error
 }
 
-func (r *failingFileRepo) Create(_ context.Context, _ filesqlc.CreateFileParams) (*filesqlc.File, error) {
-	if r.failCreate {
-		return nil, fmt.Errorf("db error")
+func (r *failingFileRepo) Create(ctx context.Context, input NewFile) (*File, error) {
+	if r.createErr != nil {
+		return nil, r.createErr
 	}
-	return r.mockFileRepo.Create(context.Background(), filesqlc.CreateFileParams{})
+	return r.mockFileRepo.Create(ctx, input)
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +116,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -144,7 +153,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -173,7 +182,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -184,7 +193,7 @@ func TestUploadDelete(t *testing.T) {
 		}
 		// Soft delete: file stays in repo but has DeletedAt set
 		f := repo.files[1]
-		if !f.DeletedAt.Valid {
+		if f.DeletedAt == nil {
 			t.Error("expected DeletedAt to be set (soft delete)")
 		}
 	})
@@ -208,7 +217,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -237,7 +246,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -279,7 +288,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -303,7 +312,7 @@ func TestUploadDownload(t *testing.T) {
 		store.getErr = fmt.Errorf("storage unavailable")
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -321,7 +330,7 @@ func TestUploadDownload(t *testing.T) {
 		store.getErr = fmt.Errorf("%w: 10/abc.pdf", storage.ErrNotFound)
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{
+		repo.files[1] = &File{
 			ID: 1, TenantID: 1, UserID: 10, OriginalName: "doc.pdf",
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
@@ -344,9 +353,9 @@ func TestUploadList(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		repo.files[1] = &filesqlc.File{ID: 1, TenantID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
-		repo.files[2] = &filesqlc.File{ID: 2, TenantID: 1, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
-		repo.files[3] = &filesqlc.File{ID: 3, TenantID: 1, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
+		repo.files[1] = &File{ID: 1, TenantID: 1, UserID: 10, OriginalName: "a.txt", StoragePath: "10/a.txt", MimeType: "text/plain", Size: 5}
+		repo.files[2] = &File{ID: 2, TenantID: 1, UserID: 10, OriginalName: "b.txt", StoragePath: "10/b.txt", MimeType: "text/plain", Size: 8}
+		repo.files[3] = &File{ID: 3, TenantID: 1, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
 		files, hasMore, err := svc.List(systemCtx(), 10, 10, "", false)

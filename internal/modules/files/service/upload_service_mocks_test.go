@@ -6,14 +6,14 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
-	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
-	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
+
+func timePtr(t time.Time) *time.Time { return &t }
 
 // cursorLess reports whether (ts1,id1) sorts before (ts2,id2) in the
 // (created_at DESC, id DESC) order used by cursor pagination.
@@ -25,52 +25,93 @@ func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
 }
 
 // ---------------------------------------------------------------------------
+// fakeTx
+// ---------------------------------------------------------------------------
+
+// fakeTx runs fn directly against files. It has no rollback; tests that need
+// atomicity run against PostgreSQL (test/integration).
+type fakeTx struct {
+	files  FileRepository
+	audit  AuditWriter
+	outbox Outbox
+}
+
+var _ Transactor = (*fakeTx)(nil)
+
+// newFakeTx builds a transactor with a no-op audit writer and no outbox, so
+// webhooks fall back to post-commit dispatch.
+func newFakeTx(files FileRepository) *fakeTx {
+	return &fakeTx{files: files, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil })}
+}
+
+func (f *fakeTx) InTx(ctx context.Context, fn func(ctx context.Context, tx TxRepos) error) error {
+	return fn(ctx, TxRepos{Files: f.files, Audit: f.audit, Outbox: f.outbox})
+}
+
+type auditWriterFunc func(ctx context.Context, event audit.Event) error
+
+func (f auditWriterFunc) RecordTx(ctx context.Context, event audit.Event) error { return f(ctx, event) }
+
+// recordingOutbox records transactional webhook enqueues.
+type recordingOutbox struct {
+	events []webhookcontracts.Event
+	err    error
+}
+
+func (o *recordingOutbox) Enqueue(_ context.Context, events ...webhookcontracts.Event) error {
+	if o.err != nil {
+		return o.err
+	}
+	o.events = append(o.events, events...)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // mockFileRepo
 // ---------------------------------------------------------------------------
 
 type mockFileRepo struct {
-	files  map[int64]*filesqlc.File
+	files  map[int64]*File
 	nextID int64
 }
 
 // scoped mirrors the repository's tenant predicate so service tests cannot
 // accidentally read another tenant's rows.
-func (m *mockFileRepo) scoped(ctx context.Context, f *filesqlc.File) bool {
+func (m *mockFileRepo) scoped(ctx context.Context, f *File) bool {
 	return f.TenantID == tenant.EffectiveID(ctx)
 }
 
-var _ filesrepo.FileRepository = (*mockFileRepo)(nil)
+var _ FileRepository = (*mockFileRepo)(nil)
 
 func newMockFileRepo() *mockFileRepo {
-	return &mockFileRepo{files: make(map[int64]*filesqlc.File), nextID: 1}
+	return &mockFileRepo{files: make(map[int64]*File), nextID: 1}
 }
 
-func (m *mockFileRepo) Create(ctx context.Context, params filesqlc.CreateFileParams) (*filesqlc.File, error) {
-	params.TenantID = tenant.EffectiveID(ctx)
-	f := &filesqlc.File{
+func (m *mockFileRepo) Create(ctx context.Context, input NewFile) (*File, error) {
+	f := &File{
 		ID:           m.nextID,
-		TenantID:     params.TenantID,
-		UserID:       params.UserID,
-		OriginalName: params.OriginalName,
-		StoragePath:  params.StoragePath,
-		MimeType:     params.MimeType,
-		Size:         params.Size,
-		CreatedAt:    pgtype.Timestamptz{Time: time.Now(), Valid: true},
+		TenantID:     tenant.EffectiveID(ctx),
+		UserID:       input.UserID,
+		OriginalName: input.OriginalName,
+		StoragePath:  input.StoragePath,
+		MimeType:     input.MimeType,
+		Size:         input.Size,
+		CreatedAt:    time.Now(),
 	}
 	m.files[m.nextID] = f
 	m.nextID++
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByID(ctx context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) GetByID(ctx context.Context, id int64) (*File, error) {
 	f, ok := m.files[id]
-	if !ok || f.DeletedAt.Valid || !m.scoped(ctx, f) {
+	if !ok || f.DeletedAt != nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*File, error) {
 	f, ok := m.files[id]
 	if !ok || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
@@ -78,34 +119,16 @@ func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*
 	return f, nil
 }
 
-func (m *mockFileRepo) ListByUserID(ctx context.Context, userID int64, limit, offset int32) ([]filesqlc.File, error) {
-	var result []filesqlc.File
-	for _, f := range m.files {
-		if f.UserID == userID && !f.DeletedAt.Valid && m.scoped(ctx, f) {
-			result = append(result, *f)
-		}
-	}
-	start := int(offset)
-	if start > len(result) {
-		return nil, nil
-	}
-	end := start + int(limit)
-	if end > len(result) {
-		end = len(result)
-	}
-	return result[start:end], nil
-}
-
-func (m *mockFileRepo) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesqlc.File, error) {
+func (m *mockFileRepo) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]File, error) {
 	return m.listCursor(ctx, &userID, cur, includeDeleted), nil
 }
 
-func (m *mockFileRepo) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]filesqlc.File, error) {
+func (m *mockFileRepo) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]File, error) {
 	return m.listCursor(ctx, nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagination.DBCursor, includeDeleted bool) []filesqlc.File {
-	all := make([]filesqlc.File, 0, len(m.files))
+func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagination.DBCursor, includeDeleted bool) []File {
+	all := make([]File, 0, len(m.files))
 	for _, f := range m.files {
 		if !m.scoped(ctx, f) {
 			continue
@@ -113,17 +136,17 @@ func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagina
 		if userID != nil && f.UserID != *userID {
 			continue
 		}
-		if !includeDeleted && f.DeletedAt.Valid {
+		if !includeDeleted && f.DeletedAt != nil {
 			continue
 		}
 		all = append(all, *f)
 	}
 	sort.Slice(all, func(i, j int) bool {
-		return cursorLess(all[j].CreatedAt.Time, all[j].ID, all[i].CreatedAt.Time, all[i].ID)
+		return cursorLess(all[j].CreatedAt, all[j].ID, all[i].CreatedAt, all[i].ID)
 	})
-	out := make([]filesqlc.File, 0, len(all))
+	out := make([]File, 0, len(all))
 	for _, f := range all {
-		if cur.HasCursor && !cursorLess(f.CreatedAt.Time, f.ID, cur.CreatedAt, cur.ID) {
+		if cur.HasCursor && !cursorLess(f.CreatedAt, f.ID, cur.CreatedAt, cur.ID) {
 			continue
 		}
 		out = append(out, f)
@@ -134,66 +157,28 @@ func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagina
 	return out
 }
 
-func (m *mockFileRepo) CountByUserID(ctx context.Context, userID int64) (int64, error) {
-	var count int64
-	for _, f := range m.files {
-		if f.UserID == userID && !f.DeletedAt.Valid && m.scoped(ctx, f) {
-			count++
-		}
-	}
-	return count, nil
-}
-
-func (m *mockFileRepo) Delete(ctx context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) Delete(ctx context.Context, id int64) (*File, error) {
 	f, ok := m.files[id]
-	if !ok || f.DeletedAt.Valid || !m.scoped(ctx, f) {
+	if !ok || f.DeletedAt != nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
-	f.DeletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	f.DeletedAt = timePtr(time.Now())
 	return f, nil
 }
 
-func (m *mockFileRepo) Restore(ctx context.Context, id int64) (*filesqlc.File, error) {
+func (m *mockFileRepo) Restore(ctx context.Context, id int64) (*File, error) {
 	f, ok := m.files[id]
-	if !ok || !f.DeletedAt.Valid || !m.scoped(ctx, f) {
+	if !ok || f.DeletedAt == nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
 	}
-	f.DeletedAt = pgtype.Timestamptz{}
+	f.DeletedAt = nil
 	return f, nil
 }
 
-func (m *mockFileRepo) AdminList(ctx context.Context, limit, offset int32) ([]filesqlc.File, error) {
-	all := make([]filesqlc.File, 0, len(m.files))
+func (m *mockFileRepo) AdminFileStats(ctx context.Context) (FileStats, error) {
+	var stats FileStats
 	for _, f := range m.files {
-		if m.scoped(ctx, f) {
-			all = append(all, *f)
-		}
-	}
-	start := int(offset)
-	if start > len(all) {
-		return nil, nil
-	}
-	end := start + int(limit)
-	if end > len(all) {
-		end = len(all)
-	}
-	return all[start:end], nil
-}
-
-func (m *mockFileRepo) AdminCount(ctx context.Context) (int64, error) {
-	var count int64
-	for _, f := range m.files {
-		if m.scoped(ctx, f) {
-			count++
-		}
-	}
-	return count, nil
-}
-
-func (m *mockFileRepo) AdminFileStats(ctx context.Context) (filesqlc.AdminFileStatsRow, error) {
-	var stats filesqlc.AdminFileStatsRow
-	for _, f := range m.files {
-		if f.DeletedAt.Valid || !m.scoped(ctx, f) {
+		if f.DeletedAt != nil || !m.scoped(ctx, f) {
 			continue
 		}
 		stats.TotalFiles++
