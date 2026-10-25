@@ -230,9 +230,12 @@ erDiagram
     }
     webhook_events {
         bigint tenant_id PK, FK
-        varchar event_id PK "envelope id, X-Webhook-Id"
+        varchar event_id PK "envelope id (UUIDv7), webhook-id"
         varchar event_type
-        timestamptz occurred_at "envelope createdAt"
+        int data_version "envelope dataVersion"
+        varchar actor_type "user | service | system"
+        varchar actor_id "NULL iff system"
+        timestamptz occurred_at "envelope occurredAt"
         jsonb payload "envelope data"
         timestamptz created_at "retention clock"
     }
@@ -269,7 +272,7 @@ erDiagram
         bigint id PK
         bigint tenant_id FK
         bigint source_id FK
-        varchar external_event_id "X-Webhook-Id"
+        varchar external_event_id "webhook-id"
         jsonb payload
     }
 ```
@@ -277,12 +280,14 @@ erDiagram
 - An endpoint's event-type patterns are `webhook_endpoint_subscriptions` rows;
   reads return them as one `eventTypes` array sorted in byte order (create and
   update sort them too). Matching is unchanged: the dispatcher loads the
-  patterns and applies `webhookcontracts.Match` (exact type, `prefix.*`, `*`).
+  patterns and applies `service.Match` (exact type, `prefix.*`, `*`).
 - `webhook_events` stores each event once. The first delivery of an event
   writes it in the same transaction as the delivery row and its job; later
-  endpoints of the event reuse it. Every delivery of the event signs the same
-  `{id, type, createdAt, data}` envelope built from this row. A replay is a
-  new event (new id and `createdAt`) carrying a copy of the original payload.
+  endpoints of the event reuse it. Its columns are the versioned event
+  envelope (ADR 0011), and every delivery of the event signs the same
+  `{id, type, dataVersion, occurredAt, tenantId, actor, data}` body built from
+  this row. A replay is a new event (new id and `occurredAt`) carrying the
+  original type, `dataVersion`, actor, and payload.
 - `(tenant_id, endpoint_id, event_id)` is unique, so re-dispatching the same
   domain event never creates a second delivery.
 - `(tenant_id, source_id, external_event_id)` is unique: the inbound dedupe key.

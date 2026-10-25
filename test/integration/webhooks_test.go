@@ -5,6 +5,7 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
@@ -32,6 +33,7 @@ import (
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -169,7 +171,7 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 		}),
 	})
 	handler := webhookshandler.New(svc)
-	dispatcher := webhookservice.NewDispatcher(repo, jobQueue)
+	dispatcher := webhookservice.NewDispatcher(repo)
 	guard, err := webhook.NewGuard([]string{"127.0.0.1"})
 	require.NoError(t, err)
 	client := webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second})
@@ -190,7 +192,6 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 		Sessions:       sessionStore,
 		Audit:          recorder,
 		TenantResolver: resolver,
-		Webhooks:       dispatcher,
 	})
 	application.Register(webhooks.New(handler))
 
@@ -354,13 +355,8 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("dispatcher fanout, dedupe, and delivery isolation", func(t *testing.T) {
 		endpoint2 := h.createEndpoint(t, h.tokenA, "https://receiver.example/users", "user.registered")
-		event := webhookcontracts.Event{
-			ID:         "evt_file_integration_1",
-			Type:       "file.uploaded",
-			TenantID:   h.tenantA,
-			OccurredAt: time.Now().UTC(),
-			Data:       json.RawMessage(`{"fileId":77}`),
-		}
+		event := testEnvelope("evt_file_integration_1", "file.uploaded", h.tenantA)
+		event.Data = json.RawMessage(`{"fileId":77}`)
 		created, err := h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), event)
 		require.NoError(t, err)
 		assert.Equal(t, 1, created)
@@ -369,9 +365,8 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.NoError(t, err)
 		assert.Zero(t, created, "re-dispatching the same event must not create deliveries")
 
-		created, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), webhookcontracts.Event{
-			ID: "evt_user_integration_1", Type: "user.registered", TenantID: h.tenantA,
-		})
+		created, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA),
+			testEnvelope("evt_user_integration_1", "user.registered", h.tenantA))
 		require.NoError(t, err)
 		assert.Equal(t, 1, created)
 		assert.NotZero(t, endpoint2.ID)
@@ -431,19 +426,19 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			body, _ := io.ReadAll(r.Body)
 			switch r.URL.Path {
 			case "/success":
-				secret := h.endpointSecret
-				if err := webhook.VerifyRequest([]byte(secret), r.Header, body, 5*time.Minute, time.Now()); err == nil {
+				if err := verifyStandardWebhook(h.endpointSecret, r.Header, body, time.Now()); err == nil {
 					mu.Lock()
 					signatureValid = true
 					mu.Unlock()
 				}
-				deliveryID := r.Header.Get(webhook.HeaderDelivery)
+				// Standard Webhooks receivers deduplicate on webhook-id.
+				messageID := r.Header.Get(webhook.HeaderID)
 				mu.Lock()
-				seen[deliveryID]++
-				count := seen[deliveryID]
+				seen[messageID]++
+				count := seen[messageID]
 				mu.Unlock()
 				if count > 1 {
-					t.Logf("duplicate delivery %s deduplicated by test receiver", deliveryID)
+					t.Logf("duplicate message %s deduplicated by test receiver", messageID)
 					w.WriteHeader(http.StatusOK)
 					return
 				}
@@ -464,7 +459,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		// its own secret for signature verification.
 		h.endpointSecret = successEndpoint.Secret
 
-		successEvent := webhookcontracts.Event{ID: "evt_worker_success", Type: "worker.success", TenantID: h.tenantA}
+		successEvent := testEnvelope("evt_worker_success", "worker.success", h.tenantA)
 		created, err := h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), successEvent)
 		require.NoError(t, err)
 		require.Equal(t, 1, created)
@@ -506,7 +501,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		badEndpoint := h.createEndpoint(t, h.tokenA, server.URL+"/bad", "worker.permanent")
 		_ = badEndpoint
-		badEvent := webhookcontracts.Event{ID: "evt_worker_bad", Type: "worker.permanent", TenantID: h.tenantA}
+		badEvent := testEnvelope("evt_worker_bad", "worker.permanent", h.tenantA)
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), badEvent)
 		require.NoError(t, err)
 		badID := h.deliveryID(t, badEvent.ID)
@@ -520,7 +515,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		retryEndpoint := h.createEndpoint(t, h.tokenA, server.URL+"/retry", "worker.retry")
 		_ = retryEndpoint
-		retryEvent := webhookcontracts.Event{ID: "evt_worker_retry", Type: "worker.retry", TenantID: h.tenantA}
+		retryEvent := testEnvelope("evt_worker_retry", "worker.retry", h.tenantA)
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), retryEvent)
 		require.NoError(t, err)
 		retryID := h.deliveryID(t, retryEvent.ID)
@@ -561,19 +556,25 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d", sourceA.ID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
 
-		payload := []byte(`{"invoice":"in_1","amount":100}`)
-		headers := func(secret, eventID string) map[string]string {
+		// Standard Webhooks senders put the event type in the signed body.
+		require.True(t, strings.HasPrefix(sourceA.Secret, webhook.SecretPrefix), "inbound secret %q", sourceA.Secret)
+		payload := []byte(`{"type":"invoice.paid","data":{"invoice":"in_1","amount":100}}`)
+		signFor := func(secret, eventID string, body []byte) map[string]string {
+			key, err := webhook.DecodeSecret(secret)
+			require.NoError(t, err)
 			ts := time.Now().UTC()
 			return map[string]string{
 				webhook.HeaderID:        eventID,
-				webhook.HeaderEvent:     "invoice.paid",
 				webhook.HeaderTimestamp: strconv.FormatInt(ts.Unix(), 10),
-				webhook.HeaderSignature: webhook.SignatureHeader(webhook.Sign([]byte(secret), eventID, "invoice.paid", ts, payload)),
+				webhook.HeaderSignature: webhook.Sign(key, eventID, ts, body),
 			}
+		}
+		headers := func(secret, eventID string) map[string]string {
+			return signFor(secret, eventID, payload)
 		}
 
 		bad := headers(sourceA.Secret, "evt_in_bad")
-		bad[webhook.HeaderSignature] = "v1=" + strings.Repeat("0", 64)
+		bad[webhook.HeaderSignature] = "v1," + base64.StdEncoding.EncodeToString(make([]byte, 32))
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, bad)
 		assert.Equal(t, fiber.StatusUnauthorized, status)
 
@@ -606,6 +607,12 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &page))
 		require.Len(t, page.Data, 1)
 		assert.Equal(t, "evt_in_1", page.Data[0].EventID)
+		var storedType string
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT event_type FROM webhook_inbound_events WHERE tenant_id = $1 AND source_id = $2`,
+			h.tenantA, sourceA.ID,
+		).Scan(&storedType))
+		assert.Equal(t, "invoice.paid", storedType, "the type comes from the signed body")
 
 		// Rotation invalidates the old secret immediately.
 		key := "rotate-source-" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -645,10 +652,16 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		replayed[webhook.HeaderID] = "evt_in_forged"
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, replayed)
 		assert.Equal(t, fiber.StatusUnauthorized, status)
+		// Relabeling the event means editing the signed body, which also fails.
 		relabeled := headers(rotated.Secret, "evt_in_relabel")
-		relabeled[webhook.HeaderEvent] = "invoice.refunded"
-		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, relabeled)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL,
+			[]byte(strings.Replace(string(payload), "invoice.paid", "invoice.refunded", 1)), relabeled)
 		assert.Equal(t, fiber.StatusUnauthorized, status)
+		// A signed body whose type is not a concrete event name is rejected.
+		patternBody := []byte(`{"type":"invoice.*"}`)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, patternBody,
+			signFor(rotated.Secret, "evt_in_pattern", patternBody))
+		assert.Equal(t, fiber.StatusBadRequest, status)
 
 		// A suspended source tenant behaves like a missing source.
 		_, err := h.pool.Exec(ctx, `UPDATE tenants SET status = 'suspended' WHERE id = $1`, h.tenantB)
@@ -659,44 +672,48 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.NoError(t, err)
 	})
 
-	t.Run("transactional dispatch commits with the producer", func(t *testing.T) {
+	t.Run("transactional publish commits with the producer", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/tx", "tx.*")
+		bus := events.New(jobs.NewQueue(h.pool))
+		for _, eventType := range []string{"tx.rolled_back", "tx.committed"} {
+			require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", h.dispatcher.HandleEvent))
+		}
+		handlers := jobHandlers{}
+		require.NoError(t, bus.RegisterJobs(handlers))
 
 		countJobs := func() int {
 			var n int
 			require.NoError(t, h.pool.QueryRow(ctx,
-				`SELECT count(*)::int FROM jobs WHERE tenant_id = $1 AND kind = $2`,
-				h.tenantA, webhookservice.DispatchJobKind,
+				`SELECT count(*)::int FROM jobs WHERE tenant_id = $1 AND kind LIKE 'events.tx.%'`,
+				h.tenantA,
 			).Scan(&n))
 			return n
 		}
 		before := countJobs()
 
-		// A rolled-back producer transaction leaves no webhook behind.
+		// A rolled-back producer transaction leaves no subscriber job behind.
 		tx, err := h.pool.Begin(ctx)
 		require.NoError(t, err)
-		require.NoError(t, h.dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
-			Type: "tx.rolled_back", TenantID: h.tenantA, Data: json.RawMessage(`{}`),
-		}))
+		require.NoError(t, bus.PublishTx(ctx, tx, testEnvelope("", "tx.rolled_back", h.tenantA)))
 		require.NoError(t, tx.Rollback(ctx))
 		assert.Equal(t, before, countJobs())
 
 		tx, err = h.pool.Begin(ctx)
 		require.NoError(t, err)
-		require.NoError(t, h.dispatcher.DispatchTx(ctx, tx, webhookcontracts.Event{
-			ID: "evt_tx_1", Type: "tx.committed", TenantID: h.tenantA, Data: json.RawMessage(`{"n":1}`),
-		}))
+		committed := testEnvelope("evt_tx_1", "tx.committed", h.tenantA)
+		committed.Data = json.RawMessage(`{"n":1}`)
+		require.NoError(t, bus.PublishTx(ctx, tx, committed))
 		require.NoError(t, tx.Commit(ctx))
 		require.Equal(t, before+1, countJobs())
 
 		var payload []byte
 		require.NoError(t, h.pool.QueryRow(ctx,
-			`SELECT payload FROM jobs WHERE tenant_id = $1 AND kind = $2 AND idempotency_key = $3`,
-			h.tenantA, webhookservice.DispatchJobKind, webhookservice.DispatchJobKind+":evt_tx_1",
+			`SELECT payload FROM jobs WHERE tenant_id = $1 AND kind = 'events.tx.committed.webhooks'`,
+			h.tenantA,
 		).Scan(&payload))
-		// At-least-once: running the fan-out twice creates one delivery.
+		// At-least-once: running the subscriber job twice creates one delivery.
 		for range 2 {
-			require.NoError(t, h.dispatcher.HandleDispatchJob(tenant.WithID(ctx, h.tenantA), payload))
+			require.NoError(t, handlers["events.tx.committed.webhooks"](ctx, payload))
 		}
 		var deliveries int
 		var timeoutMS int32
@@ -711,16 +728,15 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 	t.Run("unclaimable pending deliveries are dead-lettered", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/stuck", "stuck.*")
 		tenantCtx := tenant.WithID(ctx, h.tenantA)
-		_, err := h.dispatcher.Dispatch(tenantCtx,
-			webhookcontracts.Event{ID: "evt_stuck_exhausted", Type: "stuck.one", TenantID: h.tenantA},
-			webhookcontracts.Event{ID: "evt_stuck_disabled", Type: "stuck.two", TenantID: h.tenantA},
-		)
-		require.NoError(t, err)
+		for id, eventType := range map[string]string{"evt_stuck_exhausted": "stuck.one", "evt_stuck_disabled": "stuck.two"} {
+			_, err := h.dispatcher.Dispatch(tenantCtx, testEnvelope(id, eventType, h.tenantA))
+			require.NoError(t, err)
+		}
 		exhausted := h.deliveryID(t, "evt_stuck_exhausted")
 		disabled := h.deliveryID(t, "evt_stuck_disabled")
 
 		// Simulate a final attempt whose bookkeeping write was lost.
-		_, err = h.pool.Exec(ctx,
+		_, err := h.pool.Exec(ctx,
 			`UPDATE webhook_deliveries SET attempts = max_attempts, next_attempt_at = now() - interval '1 second' WHERE id = $1`,
 			exhausted)
 		require.NoError(t, err)
@@ -808,8 +824,8 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		for _, endpoint := range active {
 			if endpoint.ID == created.ID {
 				assert.Equal(t, []string{"user.*"}, endpoint.EventTypes)
-				assert.True(t, webhookcontracts.Matches(endpoint.EventTypes, "user.registered"))
-				assert.False(t, webhookcontracts.Matches(endpoint.EventTypes, "file.uploaded"))
+				assert.True(t, webhookservice.Matches(endpoint.EventTypes, "user.registered"))
+				assert.False(t, webhookservice.Matches(endpoint.EventTypes, "file.uploaded"))
 			}
 		}
 	})
@@ -817,13 +833,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 	t.Run("retention purges terminal rows and then unreferenced events in batches", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/purge", "purge.*")
 		_, err := h.pool.Exec(ctx, `
-			INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload, created_at)
-			SELECT $1::bigint, 'evt_purge_' || g, 'purge.old', now(), '{}'::jsonb, now() - interval '40 days'
+			INSERT INTO webhook_events (tenant_id, event_id, event_type, data_version, actor_type, occurred_at, payload, created_at)
+			SELECT $1::bigint, 'evt_purge_' || g, 'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
 			FROM generate_series(1, 1500) AS g
 			UNION ALL
-			SELECT $1::bigint, 'evt_purge_pending', 'purge.old', now(), '{}'::jsonb, now() - interval '40 days'
+			SELECT $1::bigint, 'evt_purge_pending', 'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
 			UNION ALL
-			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', now(), '{}'::jsonb, now()`,
+			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', 1, 'system', now(), '{}'::jsonb, now()`,
 			h.tenantA)
 		require.NoError(t, err)
 		_, err = h.pool.Exec(ctx, `
@@ -858,9 +874,9 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		).Scan(&pending))
 		assert.Equal(t, 1, pending, "pending deliveries are never purged")
 
-		events, err := h.repo.PurgeOrphanEvents(ctx, 30)
+		purgedEvents, err := h.repo.PurgeOrphanEvents(ctx, 30)
 		require.NoError(t, err)
-		assert.Equal(t, int64(1500), events, "every unreferenced old event is purged across batches")
+		assert.Equal(t, int64(1500), purgedEvents, "every unreferenced old event is purged across batches")
 		var left []string
 		rows, err := h.pool.Query(ctx,
 			`SELECT event_id FROM webhook_events WHERE event_id LIKE 'evt_purge_%' ORDER BY event_id`)
@@ -911,7 +927,7 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), h.tenantA)
 	h.createEndpoint(t, h.tokenA, "http://127.0.0.1:9/hook", "fence.test")
 
-	event := webhookcontracts.Event{ID: "evt_fence", Type: "fence.test", TenantID: h.tenantA}
+	event := testEnvelope("evt_fence", "fence.test", h.tenantA)
 	created, err := h.dispatcher.Dispatch(ctx, event)
 	require.NoError(t, err)
 	require.Equal(t, 1, created)
@@ -955,3 +971,22 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "succeeded", got.Status)
 }
+
+// testEnvelope is a minimal valid event envelope for dispatcher tests. An
+// empty id is filled in by the bus on publish.
+func testEnvelope(id, eventType string, tenantID int64) events.Event {
+	return events.Event{
+		ID:          id,
+		Type:        eventType,
+		DataVersion: 1,
+		OccurredAt:  time.Now().UTC(),
+		TenantID:    tenantID,
+		Actor:       events.Actor{Type: events.ActorSystem},
+		Data:        json.RawMessage(`{}`),
+	}
+}
+
+// jobHandlers is a jobs.Registrar that keeps handlers for direct invocation.
+type jobHandlers map[string]jobs.Handler
+
+func (r jobHandlers) Register(kind string, handler jobs.Handler) { r[kind] = handler }

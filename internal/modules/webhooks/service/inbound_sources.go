@@ -19,7 +19,7 @@ func (s *service) CreateInboundSource(ctx context.Context, actorID int64, req dt
 	if err := validateSlug(req.Slug); err != nil {
 		return nil, err
 	}
-	secret, ciphertext, err := s.newSealedSecret(secretPrefixInbound, inboundSecretLabel)
+	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
 	if err != nil {
 		return nil, err
 	}

@@ -116,10 +116,16 @@ ORDER BY e.id;
 
 -- name: CreateWebhookEvent :exec
 -- The first delivery of an event writes it; every later endpoint (and every
--- retry of the dispatch job) finds it already present. An event id is
+-- retry of the subscriber job) finds it already present. An event id is
 -- immutable once written, so the existing row is kept as is.
-INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload)
-VALUES (@tenant_id, @event_id, @event_type, @occurred_at, @payload::jsonb)
+INSERT INTO webhook_events (
+    tenant_id, event_id, event_type, data_version, actor_type, actor_id,
+    occurred_at, payload
+)
+VALUES (
+    @tenant_id, @event_id, @event_type, @data_version, @actor_type,
+    sqlc.narg(actor_id), @occurred_at, @payload::jsonb
+)
 ON CONFLICT (tenant_id, event_id) DO NOTHING;
 
 -- name: CreateWebhookDelivery :one
@@ -137,7 +143,8 @@ ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
 RETURNING id;
 
 -- name: GetWebhookDelivery :one
-SELECT sqlc.embed(d), ev.event_type, ev.occurred_at, ev.payload
+SELECT sqlc.embed(d), ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
+       ev.occurred_at, ev.payload
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
 WHERE d.id = @id AND d.tenant_id = @tenant_id;
@@ -176,7 +183,8 @@ WHERE webhook_deliveries.id = @id
         AND e.status = 'active'
         AND e.deleted_at IS NULL
   )
-RETURNING webhook_deliveries.*, ev.event_type, ev.occurred_at, ev.payload;
+RETURNING webhook_deliveries.*, ev.event_type, ev.data_version, ev.actor_type,
+          ev.actor_id, ev.occurred_at, ev.payload;
 
 -- name: ExpireUnclaimableWebhookDelivery :execrows
 -- Dead-letters a pending delivery that can never be claimed again: its

@@ -31,8 +31,6 @@ const (
 	defaultMaxAttempts     = 8
 	defaultTimeoutMS       = 10_000
 	maxEventIDLen          = 255
-	secretPrefixEndpoint   = "whsec_"
-	secretPrefixInbound    = "whin_"
 	auditTimeout           = 2 * time.Second
 )
 

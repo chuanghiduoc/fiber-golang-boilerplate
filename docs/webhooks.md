@@ -1,13 +1,17 @@
 # Webhooks
 
-Tenant-scoped outbound webhooks with durable delivery, plus a public
-HMAC-authenticated inbound receiver.
+Tenant-scoped outbound webhooks with durable delivery, plus a public inbound
+receiver. Both follow the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)
+specification (ADR 0009), and outbound payloads are the versioned domain event
+envelope (ADR 0011).
 
 | Concern | Lives in |
 |---|---|
+| Event envelope, bus, durable subscriptions | `internal/platform/events` |
+| Event payload structs and versions | `internal/contracts/<producer>` (`identity`, `files`) |
 | Endpoints, deliveries, inbound sources, worker | `internal/modules/webhooks` |
-| Stdlib-only event/dispatcher contract | `internal/contracts/webhooks` |
-| Signing, verification, SSRF-safe HTTP client | `pkg/webhook` |
+| Subscribed event types | `internal/modules/webhooks/catalog` (`SubscribedEvents`) |
+| Signing, verification, secrets, SSRF-safe HTTP client | `pkg/webhook` |
 
 ```mermaid
 flowchart LR
@@ -15,79 +19,90 @@ flowchart LR
         ID[identity]
         FI[files]
     end
-    ID & FI -->|"contracts/webhooks.Dispatcher"| WH[webhooks module]
-    WH -->|"webhook_deliveries + jobs"| PG[(PostgreSQL)]
+    ID & FI -->|"events.Bus.PublishTx<br/>(in the business tx)"| BUS[(jobs: events.&lt;type&gt;.webhooks)]
+    BUS -->|"durable subscription"| WH[webhooks dispatcher]
+    WH -->|"webhook_events + webhook_deliveries + jobs"| PG[(PostgreSQL)]
     PG -->|"webhook.delivery job"| DW[delivery worker]
-    DW -->|"signed POST via pkg/webhook.Client"| RX[Receiver]
+    DW -->|"Standard Webhooks POST via pkg/webhook.Client"| RX[Receiver]
     EXT[External sender] -->|"POST /webhooks/inbound/:id"| WH
 ```
 
+Producers never import or call the webhooks module: they publish domain
+events, and webhooks is one durable subscriber (notifications or a future
+broker relay can subscribe to the same events).
+
 ## Outbound
 
-### Event contract
+### Event envelope
 
-Business modules emit `webhooks.Event` through `webhooks.Dispatcher` without
-importing the webhooks module:
+Every event, and therefore every outbound webhook body, is one envelope
+(`events.Event`):
 
-```go
-type Event struct {
-    ID         string
-    Type       string
-    TenantID   int64
-    OccurredAt time.Time
-    Data       json.RawMessage
-}
-
-type Dispatcher interface {
-    Dispatch(ctx context.Context, events ...Event) (int, error)
+```json
+{
+  "id": "01920f6e-5b7c-7a3e-9c1d-2f4b8e6a1c3d",
+  "type": "file.uploaded",
+  "dataVersion": 1,
+  "occurredAt": "2026-10-25T08:00:00.123456Z",
+  "tenantId": 1,
+  "actor": {"type": "user", "id": "42"},
+  "data": {"fileId": 7, "ownerId": 42, "originalName": "report.pdf",
+           "mimeType": "application/pdf", "size": 1024,
+           "createdAt": "2026-10-25T08:00:00.12Z"}
 }
 ```
 
-| Field | Rule |
-|---|---|
-| `Type` | Concrete lowercase dotted name (`file.uploaded`, `user.registered`). Patterns (`file.*`, `*`) are endpoint filters, not event types. |
-| `ID` | Supply a stable ID when the producer may retry. Empty gets an `evt_...` ID, but a retry with a new ID is a new logical event and cannot be deduplicated. |
-| `TenantID` | Zero resolves from the context (`tenant.EffectiveID`). |
-| `Data` | Defaults to `{}`; must be valid JSON. |
+| Field | Rule | CloudEvents 1.0 |
+|---|---|---|
+| `id` | UUIDv7 (`uuid.NewV7`), assigned by the bus; also the `webhook-id` header and the receiver's deduplication key. | `id` |
+| `type` | Concrete lowercase dotted name (`[a-z0-9._-]`). Patterns (`file.*`, `*`) are endpoint filters, not types. | `type` |
+| `dataVersion` | Integer >= 1, the version of `data`'s schema for this type. | extension `dataversion` |
+| `occurredAt` | UTC time the event happened. | `time` |
+| `tenantId` | Owning tenant. | `source` = `/tenants/<tenantId>` + extension `tenantid` |
+| `actor` | `{type, id}`: `user` (id = user id), `service` (id names it), or `system` (no id). Defaults to the request user, else `system`. | extensions `actortype`, `actorid` |
+| `data` | The type's payload struct, JSON. | `data` (`datacontenttype: application/json`) |
 
-Application bootstrap attaches the webhooks dispatcher to identity and files
-and installs it in `app.Deps.Webhooks`. A nil dispatcher is a no-op, so tests
-and minimal deployments do not need the module. Modules can also inject the
-contract directly.
+`specversion` is always `1.0`, so a relay can emit CloudEvents without touching
+producers. The bus also carries an internal `requestId` for log/trace
+correlation; it is never stored in `webhook_events` or sent to receivers.
 
-| Event | Producer |
-|---|---|
-| `user.registered` | Identity registration. |
-| `file.uploaded` | File upload. |
-| `file.deleted` | User soft delete and admin takedown (`DELETE /admin/files/:id`). |
-| `file.restored` | User restore and admin restore. |
+**Evolution rule.** Adding an optional field to `data` keeps `dataVersion`.
+Removing, renaming, or retyping a field, or changing its meaning, is breaking:
+publish a new `dataVersion` (or a new type) and keep the old one until
+receivers have moved. Payload structs live in `internal/contracts/<producer>`
+and are deliberately not REST DTOs, so an API response change can never
+silently change a webhook contract.
 
-`file.deleted`/`file.restored` carry `{id, tenantId, userId, originalName}`.
+### Event catalog
 
-### Transactional dispatch (outbox)
+| Type | `dataVersion` | Producer | `data` (struct) |
+|---|---|---|---|
+| `user.registered` | 1 | Identity registration (actor: the new user) | `{userId, email, name, emailVerified, createdAt}` (`identity.UserRegistered`) |
+| `file.uploaded` | 1 | File upload | `{fileId, ownerId, originalName, mimeType, size, createdAt}` (`files.FileUploaded`) |
+| `file.deleted` | 1 | User soft delete and admin takedown (`DELETE /admin/files/:id`) | `{fileId, ownerId, originalName, deletedAt}` (`files.FileDeleted`) |
+| `file.restored` | 1 | User restore and admin restore | `{fileId, ownerId, originalName}` (`files.FileRestored`) |
 
-Plain `Dispatch` runs after the producer's commit, so a crash between the two
-could lose (or, on a retry, duplicate) the event. Producers that own a
-transaction call the dispatcher's `DispatchTx(ctx, tx pgx.Tx, events...)`
-instead. It is not on the stdlib-only contract (it takes a `pgx.Tx`):
-producers declare a narrow `WebhookTxDispatcher` interface and type-assert the
-injected dispatcher, mirroring `jobs.EnqueueTx`/`events.PublishTx`. Files
-keeps that interface in its `repository/` package and asserts it once in
-`build.go`; its services only see the `service.Outbox` port.
+To make a new type deliverable, add its payload struct and version constant to
+the producer's contracts package, publish it with `PublishTx`, and add the type
+to `webhooks/catalog.SubscribedEvents`.
 
-`DispatchTx` fixes the event ID and enqueues one `webhook.dispatch` job per
-event in the caller's transaction, deduplicated by the idempotency key
-`webhook.dispatch:<eventId>`. The event and the business change commit or roll
-back together; an enqueue failure fails the producer's mutation (fail-closed,
-like the email outbox). Endpoints are matched when the job runs, not at commit
-time.
+### Publishing in the producer transaction
 
-| Producer path | Dispatch mode |
-|---|---|
-| Identity registration (with `TxManager`) | `DispatchTx` |
-| User file upload/delete/restore (with the files tx manager, as wired by default) | `DispatchTx` |
-| Admin file delete/restore | `DispatchTx` inside the audit transaction |
-| Any of the above without a transaction manager | Best-effort post-commit `Dispatch` |
+Producers call `events.Bus.PublishTx(ctx, tx, event)` inside the transaction
+that makes the change. For every durable subscriber the bus enqueues one job
+(`events.<type>.<handler>`, idempotency key
+`event:<type>:<id>:<handler>:<tenantId>`) through the same `pgx.Tx`, so the
+event exists if and only if the change commits; a publish failure rolls the
+change back (fail-closed). Files publishes through the tx-bound
+`service.EventPublisher` port (`repository.Transactor`), so its services never
+see `pgx.Tx`; identity registration publishes in its registration
+transaction. A nil bus (unit tests) publishes nothing.
+
+The webhooks module implements `app.EventProvider`: `RegisterEvents`
+subscribes `Dispatcher.HandleEvent` durably to each `SubscribedEvents` type
+(handler `webhooks`, 20 job attempts). The subscription is at-least-once, so
+fan-out is idempotent; an invalid envelope dead-letters at once
+(`jobs.Permanent`).
 
 ### Dispatch and delivery flow
 
@@ -95,26 +110,28 @@ time.
 sequenceDiagram
     autonumber
     participant P as Producer service
+    participant B as events.Bus
     participant DB as PostgreSQL
     participant JW as Jobs worker
-    participant D as Dispatcher (fan-out)
+    participant D as Dispatcher (durable subscriber)
     participant W as Delivery worker
     participant R as Receiver
 
     P->>DB: BEGIN, business write
-    P->>DB: DispatchTx: enqueue webhook.dispatch<br/>(key webhook.dispatch:eventId)
+    P->>B: PublishTx(tx, envelope)
+    B->>DB: enqueue events.<type>.webhooks job (same tx,<br/>key event:<type>:<id>:webhooks:<tenant>)
     P->>DB: COMMIT (event exists iff the change commits)
-    JW->>D: claim webhook.dispatch
+    JW->>D: claim events.<type>.webhooks, HandleEvent(envelope)
     D->>DB: load tenant's active endpoints + active sealed secret
     D->>D: filter by eventTypes
     loop each matching endpoint
-        D->>DB: one tx: INSERT webhook_events (first time)<br/>+ webhook_deliveries (snapshot) + webhook.delivery job
-        Note over D,DB: unique (tenant, endpoint, event):<br/>a retried fan-out only adds missing rows
+        D->>DB: one tx: INSERT webhook_events (envelope, first time)<br/>+ webhook_deliveries (snapshot) + webhook.delivery job
+        Note over D,DB: unique (tenant, endpoint, event):<br/>a redelivered event only adds missing rows
     end
     JW->>W: claim webhook.delivery
     W->>DB: claim attempt (attempts+1, lease)
-    W->>W: open snapshot secret, sign body
-    W->>R: POST (SSRF-checked, pinned IP, no redirects)
+    W->>W: open snapshot secret, rebuild envelope body,<br/>sign id.timestamp.body
+    W->>R: POST webhook-id / webhook-timestamp / webhook-signature<br/>(SSRF-checked, pinned IP, no redirects)
     R-->>W: status / error
     W->>DB: record attempt row (detached, bounded ctx)
     alt 2xx
@@ -128,16 +145,16 @@ sequenceDiagram
 
 Step by step, the fan-out:
 
-1. Resolves/validates the tenant, event ID, type, timestamp, and JSON body.
-2. Loads the tenant's active endpoints with their active sealed secret and
-   filters by `eventTypes`.
+1. Validates the envelope (tenant, id, type, `dataVersion`, actor, JSON data).
+2. Loads the envelope tenant's active endpoints with their active sealed
+   secret and filters by `eventTypes`.
 3. Inserts the `webhook_events` row (first endpoint only), a
    `webhook_deliveries` row, and a `webhook.delivery` job in **one
-   transaction**. The event row holds the payload, type, and event timestamp
-   once; the delivery snapshots the endpoint URL, secret ciphertext, max
-   attempts, and timeout.
-4. Returns the number of newly created deliveries; re-dispatching the same
-   event is a no-op.
+   transaction**. The event row stores the envelope once (id, type,
+   `data_version`, actor, `occurred_at`, data); the delivery snapshots the
+   endpoint URL, secret ciphertext, max attempts, and timeout.
+4. Returns the number of newly created deliveries; handling the same event
+   again is a no-op.
 
 The worker sends **one attempt per job**. Retries are new jobs scheduled at the
 delivery's next attempt time; the platform job's own backoff is not used for
@@ -174,56 +191,100 @@ stateDiagram-v2
 | Interrupted attempt | If the job context ends (worker shutdown **or** platform job timeout) before a response arrives, the delivery attempt is given back (`attempts - 1`, lease cleared) instead of recorded as a failure, so a drain on the last attempt cannot dead-letter a delivery that may never have been sent. The request may still have reached the receiver, which is within the at-least-once contract. |
 | Platform job after interruption | On worker **shutdown** the jobs worker releases the job without consuming a platform attempt. A platform **job timeout** is a real failure: it consumes a platform job attempt and retries with job backoff (the delivery attempt itself was still given back). |
 | Per-endpoint timeout | A normal retryable failure that consumes the delivery attempt. |
-| Residual fencing gap (ABA) | The fence is the attempt number, and a release decrements it. If worker A stalls for more than ~55s beyond its request inside the 3-minute claim lease (120s max request + bookkeeping), worker B reclaims attempt N+1, and B is then released back to N, A's late write matches again. The worst case is one redundant `webhook.delivery` job, which receivers already absorb by deduplicating on `X-Webhook-Delivery`. |
+| Residual fencing gap (ABA) | The fence is the attempt number, and a release decrements it. If worker A stalls for more than ~55s beyond its request inside the 3-minute claim lease (120s max request + bookkeeping), worker B reclaims attempt N+1, and B is then released back to N, A's late write matches again. The worst case is one redundant `webhook.delivery` job, which receivers already absorb by deduplicating on `webhook-id`. |
 | Lease sizing | Keep the delivery claim lease (`WorkerOptions.Lease`, default 3m) and the jobs worker lease well above the maximum request timeout (`WEBHOOK_REQUEST_TIMEOUT_SECS`, max 120s) plus bookkeeping (5s), so a live attempt is never reclaimed. |
 
-### Signed request
+
+### Signed request (Standard Webhooks)
 
 | Header | Value |
 |---|---|
-| `X-Webhook-Id` | Event ID (stable across delivery retries). |
-| `X-Webhook-Delivery` | Delivery ID. **Deduplicate on this value**; delivery is at-least-once. |
-| `X-Webhook-Event` | Event type. |
-| `X-Webhook-Timestamp` | Unix seconds used in the signature. |
-| `X-Webhook-Signature` | `v1=<lowercase hex HMAC-SHA256>`; two comma-separated values during a rotation grace period. |
-| `X-Webhook-Attempt` | 1-based attempt number. |
-| `User-Agent` | `fiber-golang-boilerplate-webhooks/1.0`. |
+| `webhook-id` | The event id (UUIDv7), stable across delivery retries. **Deduplicate on this value**; delivery is at-least-once. |
+| `webhook-timestamp` | Unix seconds used in the signature. |
+| `webhook-signature` | `v1,<base64 HMAC-SHA256>`; two space-separated signatures during a rotation grace period. |
+| `Content-Type` | `application/json`. |
+| `User-Agent` | `fiber-golang-boilerplate-webhooks/2.0`. |
 
-Body:
-
-```json
-{
-  "id": "evt_...",
-  "type": "file.uploaded",
-  "createdAt": "2026-10-24T12:00:00Z",
-  "data": {"fileId": 42}
-}
-```
-
+The body is the [event envelope](#event-envelope). The event type and
+`dataVersion` are in the signed body, not in a header or the signed string.
 The signature input is these exact bytes:
 
 ```text
-<X-Webhook-Id>.<X-Webhook-Timestamp>.<X-Webhook-Event>.<raw-request-body>
+<webhook-id>.<webhook-timestamp>.<raw-request-body>
 ```
 
-> **Breaking change for receivers.** Earlier builds signed only
-> `<timestamp>.<raw-body>`. The prefix stays `v1=` (still HMAC-SHA256), but a
-> receiver verifying the old input rejects every request. Update receivers
-> before deploying this build, or accept both inputs during the rollout.
-> Binding the event ID and type closes a replay gap: a captured request can no
-> longer be resent within the timestamp window under a fresh `X-Webhook-Id`
-> (bypassing ID deduplication) or a different `X-Webhook-Event`.
+The HMAC key is the base64-decoded part of the endpoint secret after
+`whsec_` (not the secret string itself).
 
 Receiver checklist:
 
-- Use the raw header values exactly as received (an absent `X-Webhook-Event`
-  signs as the empty string).
-- Verify with `webhook.Sign`/`webhook.VerifyRequest`, compare in constant time,
-  and use a small timestamp tolerance (default 5 minutes).
-- Accept the request when **any** comma-separated `v1=` value matches; the
-  sender co-signs during endpoint secret rotation.
-- `X-Webhook-Timestamp` must be positive Unix **seconds** (milliseconds are
-  rejected) and within the tolerance in both directions.
+- Verify with an official Standard Webhooks library (below) or
+  `webhook.DecodeSecret` + `webhook.VerifyRequest`; compare in constant time
+  and keep a small timestamp tolerance (default 5 minutes, both directions).
+- Accept the request when **any** space-separated `v1,` signature matches; the
+  sender co-signs during endpoint secret rotation. Ignore unknown versions.
+- Deduplicate on `webhook-id`, then switch on `type` and `dataVersion` in the
+  body; ignore unknown types and unknown fields.
+- `webhook-timestamp` must be positive Unix **seconds** (milliseconds are
+  rejected).
+
+### Verifying a delivery
+
+The Go library accepts the secret exactly as returned on create/rotate
+(`whsec_...`); the Python and TypeScript examples pass the base64 key after the
+prefix, as their READMEs document. Always verify the raw body bytes, before
+parsing them.
+
+Go, with the official library
+([`libraries/go`](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/go)):
+
+```go
+import standardwebhooks "github.com/standard-webhooks/standard-webhooks/libraries/go"
+
+wh, err := standardwebhooks.NewWebhook(secret) // "whsec_..."
+if err != nil {
+    return err
+}
+body, _ := io.ReadAll(r.Body)
+if err := wh.Verify(body, r.Header); err != nil {
+    http.Error(w, "invalid signature", http.StatusUnauthorized)
+    return
+}
+```
+
+Go, with this repository's helper (`pkg/webhook`, same algorithm):
+
+```go
+key, err := webhook.DecodeSecret(secret)
+if err != nil {
+    return err
+}
+err = webhook.VerifyRequest(key, r.Header, body, webhook.DefaultTolerance, time.Now())
+```
+
+Python ([`standardwebhooks`](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/python)):
+
+```python
+from standardwebhooks.webhooks import Webhook
+
+wh = Webhook(secret.removeprefix("whsec_"))  # base64 key
+event = wh.verify(raw_body, headers)  # raises on a bad signature or timestamp
+```
+
+TypeScript ([`standardwebhooks`](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/javascript)):
+
+```ts
+import { Webhook } from "standardwebhooks";
+
+const wh = new Webhook(secret.replace(/^whsec_/, "")); // base64 key
+const event = wh.verify(rawBody, headers); // throws on failure
+```
+
+Other languages: see the [library list](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries).
+The repository's integration suite checks every delivery against an
+independent verifier written from the specification
+(`test/integration/webhooks_wire_test.go`), and `pkg/webhook` is pinned to the
+specification's published test vector.
 
 ### Signing during secret rotation
 
@@ -232,10 +293,10 @@ flowchart TD
     A[Attempt ready to sign] --> B{Load current active secret}
     B -->|lookup fails| S[Sign with snapshot only<br/>+ log error]
     B -->|same ciphertext as snapshot| S2[Sign with snapshot]
-    B -->|rotated since snapshot| C{Current secret decrypts?}
+    B -->|rotated since snapshot| C{Current secret decrypts<br/>and decodes?}
     C -->|no| S
     C -->|yes| D{Within 24h of rotation?}
-    D -->|yes| E["v1=&lt;snapshot&gt;,v1=&lt;current&gt;"]
+    D -->|yes| E["v1,&lt;snapshot&gt; v1,&lt;current&gt;"]
     D -->|no| F[Sign with current only]
 ```
 
@@ -253,7 +314,8 @@ the window, a receiver still on the intermediate secret rejects the request.
 | `5xx` | Retry while attempts remain. |
 | Transport/DNS/timeout | Retry while attempts remain. |
 | Blocked/invalid target | Dead immediately. |
-| Undecodable `webhook.delivery`/`webhook.dispatch` job payload (or missing delivery id / event id / tenant) | The job is dead-lettered at once via `jobs.Permanent` (`last_error` starts with `permanent failure (not retried): `). |
+| Snapshot secret that predates Standard Webhooks (not `whsec_<base64>`) | Dead immediately, `endpoint secret predates Standard Webhooks; rotate it`. |
+| Undecodable `webhook.delivery` job or invalid `events.*.webhooks` envelope (missing id/tenant/actor, bad type or version) | The job is dead-lettered at once via `jobs.Permanent` (`last_error` starts with `permanent failure (not retried): `). |
 
 - Backoff is `base * 2^(attempt-1)` capped at `WEBHOOK_RETRY_MAX_SECS`.
 - A valid `Retry-After` (seconds or HTTP date) can only **lengthen** the
@@ -261,9 +323,11 @@ the window, a receiver still on the intermediate secret rejects the request.
   immediate retry), and is capped at the same maximum.
 - Every attempt is recorded in `webhook_delivery_attempts` with status code,
   duration, and a truncated error (never the response body).
-- Replay (`POST /webhooks/deliveries/:id/replay`) creates a **new** delivery
-  from the retained payload with the endpoint's current URL and active secret.
-  The original row is untouched.
+- Replay (`POST /webhooks/deliveries/:id/replay`) creates a **new** event (new
+  UUIDv7 `id`, so receivers do not drop it as a duplicate, and a new
+  `occurredAt`) with the original type, `dataVersion`, actor, and data,
+  delivered to the endpoint's current URL with its active secret. The original
+  rows are untouched.
 
 ### Endpoint model
 
@@ -301,19 +365,22 @@ receiver is intentionally internal. Never use `0.0.0.0/0` or `::/0`.
 
 `POST /api/v1/webhooks/inbound/{sourceID}` is public: no JWT and no
 `X-Tenant-Slug`. The source ID selects the owning tenant; the source secret
-authenticates the request.
+authenticates the request. Senders sign with any Standard Webhooks library
+using the source secret.
 
 | Header | Rule |
 |---|---|
-| `X-Webhook-Id` | Required external event ID, 1-255 printable characters; used for deduplication. |
-| `X-Webhook-Timestamp` | Required Unix seconds. |
-| `X-Webhook-Signature` | Required `v1=<hex>`. |
-| `X-Webhook-Event` | Optional event type (default `inbound`). |
+| `webhook-id` | Required message ID, 1-255 printable characters; used for deduplication. |
+| `webhook-timestamp` | Required Unix seconds. |
+| `webhook-signature` | Required, space-separated `v1,<base64>` signatures (one must match). |
 
-The signature covers `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`
-(the same breaking change as outbound) and must be within
-`WEBHOOK_TIMESTAMP_TOLERANCE_SECS`. Because the ID is signed, a captured
-request cannot be replayed under a new ID to bypass deduplication.
+The signature covers `<webhook-id>.<webhook-timestamp>.<raw-body>` and the
+timestamp must be within `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`. Because the id is
+signed, a captured request cannot be replayed under a new id to bypass
+deduplication, and because the body is signed, its `type` cannot be relabeled.
+The stored event type is the body's top-level `"type"` string (`inbound` when
+the body is not an object or has no `type`); a `type` that is present but not
+a concrete event name is rejected with `400`.
 
 Checks run in this order (the first failure wins):
 
@@ -331,12 +398,12 @@ sequenceDiagram
     SV->>DB: load source (not soft-deleted)
     Note over SV: missing / disabled source -> 404
     SV->>SV: source tenant active? (suspended -> 404)
-    SV->>SV: X-Webhook-Id present and well-formed (else 400)
-    SV->>SV: open sealed source secret
+    SV->>SV: webhook-id present and well-formed (else 400)
+    SV->>SV: open sealed source secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
     SV->>SV: headers present, timestamp parses,<br/>inside tolerance window (else 401)
-    SV->>SV: constant-time HMAC over id.ts.event.body (else 401)
-    SV->>SV: X-Webhook-Event valid (else 400)
-    SV->>DB: INSERT inbound event, unique (source, X-Webhook-Id)
+    SV->>SV: constant-time HMAC over id.timestamp.body (else 401)
+    SV->>SV: body "type" valid if present (else 400)
+    SV->>DB: INSERT inbound event, unique (source, webhook-id)
     alt new event
         SV-->>H: receipt, duplicate=false
         H-->>S: 202 Accepted
@@ -351,10 +418,10 @@ sequenceDiagram
 | Outcome | Response |
 |---|---|
 | New event | `202 Accepted` with `{id, tenantId, sourceId, eventId, eventType, receivedAt, duplicate: false}`. |
-| Repeated `(source, X-Webhook-Id)` | `200 OK`, `duplicate: true`, and the original row. The body is stored once. |
+| Repeated `(source, webhook-id)` | `200 OK`, `duplicate: true`, and the original row. The body is stored once. |
 | Unknown, disabled, soft-deleted source, or suspended tenant | `404`. |
-| Missing/invalid signature or stale timestamp | `401`. |
-| Malformed body, ID, or event type | `400`. |
+| Missing/invalid signature, stale timestamp, or a source secret that predates Standard Webhooks | `401`. |
+| Malformed body, id, or body `type` | `400`. |
 
 The stored row keeps the signature and payload but does not echo them back.
 
@@ -362,8 +429,20 @@ The stored row keeps the signature and payload but does not echo them back.
 
 | Secret | Format | Storage |
 |---|---|---|
-| Endpoint signing secret | 32 random bytes, `whsec_...` | `webhook_endpoint_secrets` (versioned, one active) |
-| Inbound source secret | `whin_...` | `webhook_inbound_sources` |
+| Endpoint signing secret | `whsec_` + standard base64 of 32 random bytes | `webhook_endpoint_secrets` (versioned, one active) |
+| Inbound source secret | `whsec_` + standard base64 of 32 random bytes | `webhook_inbound_sources` |
+
+Both use the Standard Webhooks secret format, so official libraries accept
+them unchanged; the HMAC key is the decoded 32 bytes (`webhook.DecodeSecret`
+requires the prefix and at least 24 decoded bytes).
+
+**Compatibility.** Secrets created before this format (`whsec_`/`whin_` +
+URL-safe base64, used as raw HMAC keys) cannot be decoded. They are not
+converted silently: a delivery whose snapshot secret predates the format is
+dead-lettered with `endpoint secret predates Standard Webhooks; rotate it`,
+and an inbound source with such a secret rejects every request with `401`
+(logged as an error). Rotate every endpoint and inbound source secret
+(`POST .../rotate-secret`) when upgrading, then replay dead deliveries.
 
 Both are sealed with AES-256-GCM using HKDF-SHA256 domain separation from
 `WEBHOOK_SECRET_ENCRYPTION_KEY`. Outside production an empty dedicated key
@@ -374,7 +453,7 @@ once on create or rotate. The stored envelope (v2) records the sealing key's
 
 | Rotation | Behavior |
 |---|---|
-| Endpoint | Locks the endpoint row, deactivates the old secret, inserts the next version (concurrent rotations serialize). Queued deliveries keep their ciphertext snapshot and are co-signed for 24 hours (see [Signing during secret rotation](#signing-during-secret-rotation)). If the current secret cannot be loaded or decrypted, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
+| Endpoint | Locks the endpoint row, deactivates the old secret, inserts the next version (concurrent rotations serialize). Queued deliveries keep their ciphertext snapshot and are co-signed for 24 hours (see [Signing during secret rotation](#signing-during-secret-rotation)). If the current secret cannot be loaded, decrypted, or decoded, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
 | Inbound source | Replaces the verification secret immediately; old signatures fail on the next request. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
@@ -438,7 +517,7 @@ Idempotency:
 |---|---|
 | Endpoint/source create, both `rotate-secret` routes | Deliberately not cached, so a plaintext secret never sits in the shared response cache. A retried rotation rotates again and returns the newest (only active) secret. |
 | Update, delete, replay | Accepted. |
-| Public receiver | Not used; relies on `(source, X-Webhook-Id)` deduplication. |
+| Public receiver | Not used; relies on `(source, webhook-id)` deduplication. |
 
 ## Tables and retention
 
@@ -446,7 +525,7 @@ Idempotency:
 |---|---|
 | `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active). |
 | `webhook_endpoint_subscriptions` | One row per `eventTypes` pattern of an endpoint. |
-| `webhook_events` | Each dispatched event once: id, type, occurrence time, payload (the signed envelope). |
+| `webhook_events` | Each dispatched event envelope once: id, type, `data_version`, `actor_type`/`actor_id`, `occurred_at`, and `payload` (the envelope data). The worker rebuilds the signed body from it. |
 | `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret ciphertext, timeout, max attempts) + state. |
 | `webhook_delivery_attempts` | One row per attempt. |
 | `webhook_inbound_sources` | Inbound receivers and sealed secrets. |
@@ -482,11 +561,12 @@ GROUP BY tenant_id, status
 ORDER BY count(*) DESC;
 
 -- Dead deliveries and last failures
-SELECT id, tenant_id, endpoint_id, event_type, attempts, max_attempts,
-       last_status_code, last_error, updated_at
-FROM webhook_deliveries
-WHERE status = 'dead'
-ORDER BY updated_at DESC
+SELECT d.id, d.tenant_id, d.endpoint_id, ev.event_type, ev.data_version, d.attempts,
+       d.max_attempts, d.last_status_code, d.last_error, d.updated_at
+FROM webhook_deliveries d
+JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
+WHERE d.status = 'dead'
+ORDER BY d.updated_at DESC
 LIMIT 50;
 
 -- Recent attempts for one delivery
@@ -498,7 +578,7 @@ ORDER BY attempt;
 -- Outstanding fan-out and delivery jobs
 SELECT id, tenant_id, kind, status, attempts, run_at, last_error
 FROM jobs
-WHERE kind IN ('webhook.dispatch', 'webhook.delivery') AND status IN ('queued', 'running')
+WHERE (kind = 'webhook.delivery' OR kind LIKE 'events.%.webhooks') AND status IN ('queued', 'running')
 ORDER BY run_at
 LIMIT 50;
 ```

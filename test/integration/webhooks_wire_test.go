@@ -4,7 +4,12 @@ package integration_test
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,11 +19,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -33,28 +40,66 @@ type capturedRequest struct {
 	body   []byte
 }
 
-// wireGoldenBody and wireGoldenHeaders are the exact request the delivery
-// worker sent for the fixed event below, captured from the schema that
-// stored payload/event_type/event_created_at on webhook_deliveries (before
-// webhook_events existed). The normalized schema must reproduce them byte for
-// byte; X-Webhook-Delivery is the delivery id and X-Webhook-Timestamp /
-// X-Webhook-Signature depend on the wall clock, so the test checks those
-// against a signature recomputed over the golden body instead.
-const wireGoldenBody = `{"id":"evt_wire_golden_1","type":"file.uploaded","createdAt":"2026-10-24T11:59:30.123456Z","data":{"big":12345678901234567890,"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo \u003c\u0026\u003e"}}`
+// wireSecret is the Standard Webhooks example secret ("whsec_" + base64 key).
+const wireSecret = webhook.SecretPrefix + "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw" // public spec example key
 
-var wireGoldenHeaders = []string{
-	"Accept-Encoding: gzip",
-	"Content-Length: 206",
-	"Content-Type: application/json",
-	"User-Agent: fiber-golang-boilerplate-webhooks/1.0",
-	"X-Webhook-Attempt: 1",
-	"X-Webhook-Event: file.uploaded",
-	"X-Webhook-Id: evt_wire_golden_1",
+// verifyStandardWebhook is an independent Standard Webhooks verifier written
+// from the specification (https://www.standardwebhooks.com), deliberately not
+// pkg/webhook: the HMAC key is the base64-decoded secret after "whsec_", the
+// signed content is "<webhook-id>.<webhook-timestamp>.<raw body>", the
+// timestamp must be within five minutes of now, and webhook-signature holds
+// space-separated "v1,<base64 HMAC-SHA256>" entries, any of which may match.
+func verifyStandardWebhook(secret string, header http.Header, body []byte, now time.Time) error {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
+	if err != nil {
+		return fmt.Errorf("decode secret: %w", err)
+	}
+	id, rawTimestamp := header.Get("webhook-id"), header.Get("webhook-timestamp")
+	if id == "" || rawTimestamp == "" {
+		return errors.New("missing webhook-id or webhook-timestamp")
+	}
+	seconds, err := strconv.ParseInt(rawTimestamp, 10, 64)
+	if err != nil {
+		return fmt.Errorf("webhook-timestamp: %w", err)
+	}
+	if skew := now.Sub(time.Unix(seconds, 0)); skew > 5*time.Minute || skew < -5*time.Minute {
+		return fmt.Errorf("webhook-timestamp is %s away from now", skew)
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(id + "." + rawTimestamp + "."))
+	mac.Write(body)
+	expected := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	for _, entry := range strings.Split(header.Get("webhook-signature"), " ") {
+		version, signature, _ := strings.Cut(entry, ",")
+		if version == "v1" && hmac.Equal([]byte(signature), []byte(expected)) {
+			return nil
+		}
+	}
+	return errors.New("no matching v1 signature")
 }
 
-// TestWebhookDeliveryWireFormatIsStable dispatches a fixed event through the
-// real job payload, repository, and worker, captures the HTTP request, and
-// compares it with the golden capture.
+// wireGoldenBody is the exact Standard Webhooks request body the worker must
+// send for the fixed event below: the versioned envelope (ADR 0011) with the
+// data stored as JSONB (keys normalized by PostgreSQL, numbers kept verbatim,
+// "<", "&", ">" HTML-escaped by encoding/json).
+const wireGoldenBody = `{"id":"evt_wire_golden_1","type":"file.uploaded","dataVersion":1,` +
+	`"occurredAt":"2026-10-24T11:59:30.123456Z","tenantId":1,"actor":{"type":"user","id":"42"},` +
+	`"data":{"big":12345678901234567890,"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo \u003c\u0026\u003e"}}`
+
+// wireGoldenHeaders are the headers besides webhook-timestamp and
+// webhook-signature, which depend on the clock and are verified separately.
+var wireGoldenHeaders = []string{
+	"Accept-Encoding: gzip",
+	"Content-Length: " + strconv.Itoa(len(wireGoldenBody)),
+	"Content-Type: application/json",
+	"User-Agent: fiber-golang-boilerplate-webhooks/2.0",
+	"Webhook-Id: evt_wire_golden_1",
+}
+
+// TestWebhookDeliveryWireFormatIsStable feeds a fixed event (exactly as the
+// event bus stores it in the durable subscription job) through the real
+// dispatcher, repository, and worker, captures the HTTP request, and compares
+// it with the golden Standard Webhooks request.
 func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	ctx := context.Background()
 	pool, cleanup, err := testutil.SetupTestDB(ctx)
@@ -73,8 +118,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	repo := webhookrepo.New(pool, queue)
 	codec, err := webhookservice.NewSecretCodec("webhook-wire-encryption-key")
 	require.NoError(t, err)
-	const secret = "whsec_wire_golden_secret"
-	ciphertext, err := codec.Seal([]byte(secret))
+	ciphertext, err := codec.Seal([]byte(wireSecret))
 	require.NoError(t, err)
 
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
@@ -88,11 +132,14 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	dispatcher := webhookservice.NewDispatcher(repo, queue)
-	jobPayload := `{"id":"evt_wire_golden_1","type":"file.uploaded","tenantId":1,` +
-		`"occurredAt":"2026-10-24T11:59:30.123456789Z",` +
-		`"data":{"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo <&>","big":12345678901234567890}}`
-	require.NoError(t, dispatcher.HandleDispatchJob(tenantCtx, json.RawMessage(jobPayload)))
+	dispatcher := webhookservice.NewDispatcher(repo)
+	jobPayload := `{"id":"evt_wire_golden_1","type":"file.uploaded","dataVersion":1,` +
+		`"occurredAt":"2026-10-24T11:59:30.123456789Z","tenantId":1,"actor":{"type":"user","id":"42"},` +
+		`"data":{"zeta":1,"alpha":{"nested":[1,2.50,"x"]},"unicode":"héllo <&>","big":12345678901234567890},` +
+		`"requestId":"req-internal"}`
+	var event events.Event
+	require.NoError(t, json.Unmarshal([]byte(jobPayload), &event))
+	require.NoError(t, dispatcher.HandleEvent(tenantCtx, event))
 
 	var deliveryID int64
 	require.NoError(t, pool.QueryRow(ctx,
@@ -118,29 +165,23 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 
 	assert.Equal(t, http.MethodPost, got.method)
 	assert.Equal(t, "/hook", got.path)
-	assert.Equal(t, wireGoldenBody, string(got.body), "body must be byte-identical to the golden capture")
-	assert.Equal(t, strconv.FormatInt(deliveryID, 10), got.header.Get(webhook.HeaderDelivery))
+	assert.Equal(t, wireGoldenBody, string(got.body), "body must be byte-identical to the golden request")
+	assert.NotContains(t, string(got.body), "req-internal", "the request id never leaves the process")
 
 	headers := make([]string, 0, len(got.header))
 	for name, values := range got.header {
 		switch name {
-		case webhook.HeaderDelivery, webhook.HeaderTimestamp, webhook.HeaderSignature:
+		case "Webhook-Timestamp", "Webhook-Signature":
 			continue
 		}
 		headers = append(headers, name+": "+strings.Join(values, ","))
 	}
 	sort.Strings(headers)
 	assert.Equal(t, wireGoldenHeaders, headers)
+	require.NoError(t, verifyStandardWebhook(wireSecret, got.header, got.body, time.Now()))
 
-	timestamp, err := strconv.ParseInt(got.header.Get(webhook.HeaderTimestamp), 10, 64)
-	require.NoError(t, err)
-	want := webhook.SignatureHeader(webhook.Sign([]byte(secret), "evt_wire_golden_1", "file.uploaded",
-		time.Unix(timestamp, 0), []byte(wireGoldenBody)))
-	assert.Equal(t, want, got.header.Get(webhook.HeaderSignature))
-	require.NoError(t, webhook.VerifyRequest([]byte(secret), got.header, got.body, time.Minute, time.Unix(timestamp, 0)))
-
-	// A replay is a new event (fresh id and createdAt) that must carry the
-	// original type and byte-identical data.
+	// A replay is a new event (fresh UUIDv7 id and occurredAt) that carries
+	// the original type, dataVersion, actor, and byte-identical data.
 	svc := webhookservice.New(repo, repo, repo, codec, nil, webhookservice.Options{})
 	replayed, err := svc.ReplayDelivery(tenantCtx, 0, deliveryID)
 	require.NoError(t, err)
@@ -154,16 +195,18 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 		t.Fatal("receiver got no replay request")
 	}
 	var envelope struct {
-		ID        string `json:"id"`
-		CreatedAt string `json:"createdAt"`
+		ID         string `json:"id"`
+		OccurredAt string `json:"occurredAt"`
 	}
 	require.NoError(t, json.Unmarshal(replay.body, &envelope))
-	assert.True(t, strings.HasPrefix(envelope.ID, "replay."), "replay id %q", envelope.ID)
-	_, goldenData, found := strings.Cut(wireGoldenBody, `,"data":`)
-	require.True(t, found, "golden body has a data member")
-	goldenData = `,"data":` + goldenData
-	wantReplay := `{"id":"` + envelope.ID + `","type":"file.uploaded","createdAt":"` + envelope.CreatedAt + `"` + goldenData
-	assert.Equal(t, wantReplay, string(replay.body), "replay must resend the original type and data bytes")
+	replayID, err := uuid.Parse(envelope.ID)
+	require.NoError(t, err, "replay id %q", envelope.ID)
+	assert.Equal(t, uuid.Version(7), replayID.Version())
+	_, goldenTail, found := strings.Cut(wireGoldenBody, `,"tenantId":`)
+	require.True(t, found, "golden body has a tenantId member")
+	wantReplay := `{"id":"` + envelope.ID + `","type":"file.uploaded","dataVersion":1,"occurredAt":"` +
+		envelope.OccurredAt + `","tenantId":` + goldenTail
+	assert.Equal(t, wantReplay, string(replay.body), "replay must resend the original envelope and data bytes")
 	assert.Equal(t, envelope.ID, replay.header.Get(webhook.HeaderID))
-	assert.Equal(t, "file.uploaded", replay.header.Get(webhook.HeaderEvent))
+	require.NoError(t, verifyStandardWebhook(wireSecret, replay.header, replay.body, time.Now()))
 }

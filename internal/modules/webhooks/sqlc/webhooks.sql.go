@@ -30,7 +30,8 @@ WHERE webhook_deliveries.id = $2
         AND e.status = 'active'
         AND e.deleted_at IS NULL
   )
-RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.occurred_at, ev.payload
+RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.data_version, ev.actor_type,
+          ev.actor_id, ev.occurred_at, ev.payload
 `
 
 type ClaimWebhookDeliveryParams struct {
@@ -58,6 +59,9 @@ type ClaimWebhookDeliveryRow struct {
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	EventType        string             `json:"event_type"`
+	DataVersion      int32              `json:"data_version"`
+	ActorType        string             `json:"actor_type"`
+	ActorID          pgtype.Text        `json:"actor_id"`
 	OccurredAt       pgtype.Timestamptz `json:"occurred_at"`
 	Payload          []byte             `json:"payload"`
 }
@@ -87,6 +91,9 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.EventType,
+		&i.DataVersion,
+		&i.ActorType,
+		&i.ActorID,
 		&i.OccurredAt,
 		&i.Payload,
 	)
@@ -276,28 +283,40 @@ func (q *Queries) CreateWebhookEndpointSubscriptions(ctx context.Context, arg Cr
 
 const createWebhookEvent = `-- name: CreateWebhookEvent :exec
 
-INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload)
-VALUES ($1, $2, $3, $4, $5::jsonb)
+INSERT INTO webhook_events (
+    tenant_id, event_id, event_type, data_version, actor_type, actor_id,
+    occurred_at, payload
+)
+VALUES (
+    $1, $2, $3, $4, $5,
+    $6, $7, $8::jsonb
+)
 ON CONFLICT (tenant_id, event_id) DO NOTHING
 `
 
 type CreateWebhookEventParams struct {
-	TenantID   int64              `json:"tenant_id"`
-	EventID    string             `json:"event_id"`
-	EventType  string             `json:"event_type"`
-	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
-	Payload    []byte             `json:"payload"`
+	TenantID    int64              `json:"tenant_id"`
+	EventID     string             `json:"event_id"`
+	EventType   string             `json:"event_type"`
+	DataVersion int32              `json:"data_version"`
+	ActorType   string             `json:"actor_type"`
+	ActorID     pgtype.Text        `json:"actor_id"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+	Payload     []byte             `json:"payload"`
 }
 
 // Events and deliveries -----------------------------------------------------
 // The first delivery of an event writes it; every later endpoint (and every
-// retry of the dispatch job) finds it already present. An event id is
+// retry of the subscriber job) finds it already present. An event id is
 // immutable once written, so the existing row is kept as is.
 func (q *Queries) CreateWebhookEvent(ctx context.Context, arg CreateWebhookEventParams) error {
 	_, err := q.db.Exec(ctx, createWebhookEvent,
 		arg.TenantID,
 		arg.EventID,
 		arg.EventType,
+		arg.DataVersion,
+		arg.ActorType,
+		arg.ActorID,
 		arg.OccurredAt,
 		arg.Payload,
 	)
@@ -526,7 +545,8 @@ func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetAct
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.occurred_at, ev.payload
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
+       ev.occurred_at, ev.payload
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
 WHERE d.id = $1 AND d.tenant_id = $2
@@ -540,6 +560,9 @@ type GetWebhookDeliveryParams struct {
 type GetWebhookDeliveryRow struct {
 	WebhookDelivery WebhookDelivery    `json:"webhook_delivery"`
 	EventType       string             `json:"event_type"`
+	DataVersion     int32              `json:"data_version"`
+	ActorType       string             `json:"actor_type"`
+	ActorID         pgtype.Text        `json:"actor_id"`
 	OccurredAt      pgtype.Timestamptz `json:"occurred_at"`
 	Payload         []byte             `json:"payload"`
 }
@@ -566,6 +589,9 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDelivery
 		&i.WebhookDelivery.CreatedAt,
 		&i.WebhookDelivery.UpdatedAt,
 		&i.EventType,
+		&i.DataVersion,
+		&i.ActorType,
+		&i.ActorID,
 		&i.OccurredAt,
 		&i.Payload,
 	)

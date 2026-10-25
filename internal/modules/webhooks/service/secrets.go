@@ -6,6 +6,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
 // Labels used in the public error detail when a secret cannot be produced.
@@ -14,11 +15,13 @@ const (
 	inboundSecretLabel  = "inbound secret"
 )
 
-// newSealedSecret generates a prefixed signing secret and seals it for
-// storage. The plaintext is returned to the caller exactly once (create or
-// rotate) and is never persisted; label names the secret in public errors.
-func (s *service) newSealedSecret(prefix, label string) (secret, ciphertext string, err error) {
-	secret, err = GenerateSecret(prefix)
+// newSealedSecret generates a Standard Webhooks "whsec_<base64>" secret (for
+// endpoints and inbound sources alike, so the official libraries accept it
+// unchanged) and seals it for storage. The plaintext is returned to the
+// caller exactly once (create or rotate) and is never persisted; label names
+// the secret in public errors.
+func (s *service) newSealedSecret(label string) (secret, ciphertext string, err error) {
+	secret, err = webhook.NewSecret()
 	if err != nil {
 		return "", "", apperror.NewInternal("failed to generate " + label)
 	}
@@ -32,7 +35,7 @@ func (s *service) newSealedSecret(prefix, label string) (secret, ciphertext stri
 // RotateEndpointSecret makes a fresh secret active for new deliveries. The
 // delivery worker keeps dual-signing pending retries during the rotation grace.
 func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (*dto.EndpointSecretResponse, error) {
-	secret, ciphertext, err := s.newSealedSecret(secretPrefixEndpoint, endpointSecretLabel)
+	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +53,7 @@ func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (
 
 // RotateInboundSourceSecret replaces the secret the sender signs with.
 func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*dto.InboundSourceSecretResponse, error) {
-	secret, ciphertext, err := s.newSealedSecret(secretPrefixInbound, inboundSecretLabel)
+	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
 	if err != nil {
 		return nil, err
 	}

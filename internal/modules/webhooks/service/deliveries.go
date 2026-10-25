@@ -2,12 +2,10 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
@@ -104,12 +102,20 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 		return nil, apperror.NewInternal("failed to get webhook secret")
 	}
 
-	eventID := fmt.Sprintf("replay.%d.%s", original.ID, randomHex(8))
+	// A replay is a new event (new webhook-id, so receivers do not drop it as
+	// a duplicate) carrying the original type, dataVersion, actor, and data.
+	eventID, err := uuid.NewV7()
+	if err != nil {
+		return nil, apperror.NewInternal("failed to replay webhook delivery")
+	}
 	newID, created, err := s.deliveries.CreateDeliveryWithJob(ctx, repository.DeliveryDraft{
 		TenantID:         tenant.EffectiveID(ctx),
 		EndpointID:       endpoint.ID,
-		EventID:          eventID,
+		EventID:          eventID.String(),
 		EventType:        original.EventType,
+		DataVersion:      original.DataVersion,
+		ActorType:        original.ActorType,
+		ActorID:          original.ActorID,
 		EventCreatedAt:   s.now(),
 		URL:              endpoint.Url,
 		Payload:          json.RawMessage(original.Payload),
@@ -136,16 +142,6 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.D
 	})
 	resp := toDeliveryResponse(delivery, true)
 	return &resp, nil
-}
-
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand failure is unrecoverable for delivery identity; fall back
-		// to a time-based suffix rather than panicking inside a request.
-		return fmt.Sprintf("%x", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(buf)
 }
 
 func toDeliveryResponse(delivery *repository.Delivery, includePayload bool) dto.DeliveryResponse {

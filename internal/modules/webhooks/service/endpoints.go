@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -23,7 +22,7 @@ func (s *service) CreateEndpoint(ctx context.Context, actorID int64, req dto.Cre
 	if err != nil {
 		return nil, err
 	}
-	secret, ciphertext, err := s.newSealedSecret(secretPrefixEndpoint, endpointSecretLabel)
+	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +167,7 @@ func normalizeEventTypes(types []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(types))
 	for _, raw := range types {
 		pattern := strings.TrimSpace(raw)
-		if !webhookcontracts.ValidType(pattern) {
+		if !ValidType(pattern) {
 			return nil, apperror.NewBadRequest("invalid event type pattern: " + raw)
 		}
 		if _, ok := seen[pattern]; ok {

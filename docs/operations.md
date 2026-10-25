@@ -605,15 +605,21 @@ ORDER BY count(*) DESC;
 
 ## 5. Webhooks
 
-Outbound deliveries reuse the jobs queue. Producers with a transaction
-(registration, file upload/delete/restore, admin file delete/restore) enqueue a
-`webhook.dispatch` fan-out job in that transaction; the fan-out commits a
-`webhook_deliveries` row and its first `webhook.delivery` job atomically per
-endpoint; the worker sends one signed attempt and schedules the next attempt as
-a new job. Receivers must deduplicate on `X-Webhook-Delivery`. The signature
-covers `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<body>` (a breaking change
-from the earlier `<timestamp>.<body>`). The dispatch sequence and delivery
-state machine are diagrammed in [Webhooks](webhooks.md).
+Outbound deliveries reuse the jobs queue. Producers (registration, file
+upload/delete/restore, admin file delete/restore) publish a domain event with
+`events.PublishTx` in their transaction, which enqueues the webhooks durable
+subscription job (`events.<type>.webhooks`); that job commits a
+`webhook_events` row (first endpoint), a `webhook_deliveries` row, and its
+first `webhook.delivery` job atomically per endpoint; the worker sends one
+Standard Webhooks attempt and schedules the next attempt as a new job.
+Receivers must deduplicate on `webhook-id`. The signature is
+`v1,<base64 HMAC-SHA256>` over `<webhook-id>.<webhook-timestamp>.<body>`. The
+dispatch sequence and delivery state machine are diagrammed in
+[Webhooks](webhooks.md).
+
+Monitor `events.*.webhooks` jobs as well as `webhook.delivery`: a dead
+subscription job means an event was never fanned out (invalid envelope, or the
+database failed for all 20 attempts).
 
 ### Delivery state and retries
 
@@ -688,8 +694,9 @@ instead of bulk-editing state.
 
 ### Secrets and key rotation
 
-Outbound endpoint secrets (`whsec_...`) and inbound source secrets
-(`whin_...`) are sealed with AES-256-GCM using
+Outbound endpoint and inbound source secrets (Standard Webhooks
+`whsec_<base64>`; rotate any secret created before that format) are sealed
+with AES-256-GCM using
 `WEBHOOK_SECRET_ENCRYPTION_KEY`; outside production an empty key falls back to
 `JWT_SECRET`, while production **requires** a dedicated key of at least 32
 characters. Envelopes (v2) record the sealing key's `kid`; v1 envelopes are
@@ -742,8 +749,8 @@ only leaves through this purge. The retention indexes are described in
 | `404` | Source ID unknown, disabled, or soft-deleted, or its tenant is suspended; verify the configured `receiverUrl`. |
 | `401` `webhook signature is required` | Missing timestamp or signature header. |
 | `401` stale/invalid timestamp | Clock skew beyond `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` (default 300). |
-| `401` invalid signature | Confirm the sender signs `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<exact raw body>` (raw header values; empty event if the header is absent) with the active source secret, not a rotated one. Senders still signing the old `<timestamp>.<body>` input fail here. |
-| `200` `duplicate: true` | The event was already stored for `(source, X-Webhook-Id)`; this is success. |
+| `401` invalid signature | Confirm the sender uses Standard Webhooks: `v1,<base64 HMAC-SHA256>` over `<webhook-id>.<webhook-timestamp>.<exact raw body>`, keyed with the base64-decoded active source secret (after `whsec_`), not a rotated one. Senders on the pre-Standard `X-Webhook-*` scheme fail here, and so does every request to a source whose secret predates the `whsec_<base64>` format (logged as `predates Standard Webhooks; rotate it`): rotate it. |
+| `200` `duplicate: true` | The event was already stored for `(source, webhook-id)`; this is success. |
 
 Inbound events are stored under the source tenant and audited as
 `webhook.inbound.received`; `X-Tenant-Slug` is ignored on the public route.
@@ -762,7 +769,7 @@ flowchart TD
     k -- invalid --> bad[400 invalid Idempotency-Key]
     k -- valid --> cached{Cached 2xx response<br/>for this scope?}
     cached -- yes --> body{Stored body hash differs<br/>from this body?}
-    body -- yes --> mismatch[409 different request body]
+    body -- yes --> mismatch[422 idempotency.key_mismatch]
     body -- no --> replay[Replay status, body, headers<br/>Idempotent-Replayed: true]
     cached -- no --> lock{SET NX PX lock<br/>UUID owner token, 2m TTL}
     lock -- stored --> run[Run handler]

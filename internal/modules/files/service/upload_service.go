@@ -13,7 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -41,17 +41,15 @@ type UploadService interface {
 }
 
 type uploadService struct {
-	repo     FileRepository
-	tx       Transactor
-	storage  storage.Storage
-	webhooks webhookcontracts.Dispatcher
+	repo    FileRepository
+	tx      Transactor
+	storage storage.Storage
 }
 
 // NewUploadService builds the user file service. Mutations run through tx, so
-// a metadata change and its webhook outbox job commit atomically. webhooks is
-// the post-commit fallback used when tx offers no outbox; nil disables it.
-func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage, webhooks webhookcontracts.Dispatcher) UploadService {
-	return &uploadService{repo: repo, tx: tx, storage: store, webhooks: webhooks}
+// a metadata change and its domain event commit atomically.
+func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage) UploadService {
+	return &uploadService{repo: repo, tx: tx, storage: store}
 }
 
 func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error) {
@@ -84,23 +82,16 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		MimeType:     contentType,
 		Size:         size,
 	}
-	var (
-		file   *File
-		queued bool
-	)
-	// The metadata row and the webhook outbox job commit together; an enqueue
+	var file *File
+	// The metadata row and the file.uploaded event commit together; a publish
 	// failure rolls the row back and cleans up the blob below.
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		created, createErr := tx.Files.Create(ctx, input)
 		if createErr != nil {
 			return createErr
 		}
-		if tx.Outbox != nil {
-			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileUploaded, tenantID, uploadedEventData(created)); hookErr != nil {
-				slog.Error("failed to enqueue file upload webhook", slog.Any("error", hookErr))
-				return hookErr
-			}
-			queued = true
+		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileUploaded, filescontracts.FileUploadedVersion, tenantID, fileUploaded(created)); pubErr != nil {
+			return pubErr
 		}
 		file = created
 		return nil
@@ -118,10 +109,6 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
 		return nil, apperror.NewInternal("failed to save file metadata")
-	}
-
-	if !queued {
-		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileUploaded, tenantID, uploadedEventData(file))
 	}
 	return file, nil
 }
@@ -262,22 +249,14 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		return apperror.NewNotFound("file not found")
 	}
 
-	eventData := fileEventData(file)
 	// Soft delete — do NOT remove from storage so the file can be restored.
-	// The soft delete and its webhook outbox job commit together.
-	queued := false
+	// The soft delete and its file.deleted event commit together.
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if _, delErr := tx.Files.Delete(ctx, id); delErr != nil {
+		deleted, delErr := tx.Files.Delete(ctx, id)
+		if delErr != nil {
 			return delErr
 		}
-		if tx.Outbox != nil {
-			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileDeleted, file.TenantID, eventData); hookErr != nil {
-				slog.Error("failed to enqueue file delete webhook", slog.Int64("file_id", id), slog.Any("error", hookErr))
-				return hookErr
-			}
-			queued = true
-		}
-		return nil
+		return publishEvent(ctx, tx.Events, filescontracts.EventFileDeleted, filescontracts.FileDeletedVersion, deleted.TenantID, fileDeleted(deleted))
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -290,10 +269,6 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		slog.Int64("file_id", id),
 		slog.String("path", file.StoragePath),
 	)
-	if !queued {
-		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileDeleted, file.TenantID, eventData)
-	}
-
 	return nil
 }
 
@@ -316,19 +291,14 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*File, e
 	}
 
 	var restored *File
-	queued := false
-	// The restore and its webhook outbox job commit together.
+	// The restore and its file.restored event commit together.
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		row, restoreErr := tx.Files.Restore(ctx, id)
 		if restoreErr != nil {
 			return restoreErr
 		}
-		if tx.Outbox != nil {
-			if hookErr := enqueueWebhook(ctx, tx.Outbox, webhookcontracts.EventFileRestored, row.TenantID, fileEventData(row)); hookErr != nil {
-				slog.Error("failed to enqueue file restore webhook", slog.Int64("file_id", id), slog.Any("error", hookErr))
-				return hookErr
-			}
-			queued = true
+		if pubErr := publishEvent(ctx, tx.Events, filescontracts.EventFileRestored, filescontracts.FileRestoredVersion, row.TenantID, fileRestored(row)); pubErr != nil {
+			return pubErr
 		}
 		restored = row
 		return nil
@@ -338,9 +308,6 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*File, e
 			return nil, apperror.NewNotFound("file not found")
 		}
 		return nil, apperror.NewInternal("failed to restore file")
-	}
-	if !queued {
-		dispatchWebhookAfterCommit(ctx, s.webhooks, webhookcontracts.EventFileRestored, restored.TenantID, fileEventData(restored))
 	}
 	return restored, nil
 }

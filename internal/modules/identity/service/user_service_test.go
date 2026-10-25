@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -125,40 +125,30 @@ func TestRegister(t *testing.T) {
 	})
 }
 
-func TestRegisterDispatchesUserRegistered(t *testing.T) {
-	dispatcher := &recordUserWebhookDispatcher{}
-	svc := newTestUserService(newMockUserRepo(), false)
-	AttachWebhookDispatcher(svc, dispatcher)
-
-	if _, err := svc.Register(context.Background(), dto.RegisterRequest{
-		Email:    "webhook@example.com",
-		Password: "Password1!",
-		Name:     "Webhook User",
-	}); err != nil {
-		t.Fatalf("register: %v", err)
+// The user.registered envelope carries the contracts payload (not the REST
+// DTO), the new user as actor, and the user's tenant. Transactional
+// publishing is covered by the integration suite.
+func TestUserRegisteredEvent(t *testing.T) {
+	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	event, err := userRegisteredEvent(&identitysqlc.User{
+		ID: 7, TenantID: 3, Email: "new@example.com", Name: "New User", Role: "user",
+		CreatedAt:    pgtype.Timestamptz{Time: created, Valid: true},
+		PasswordHash: pgtype.Text{String: "hash", Valid: true},
+		TokenVersion: 4,
+	})
+	if err != nil {
+		t.Fatalf("userRegisteredEvent: %v", err)
 	}
-	if len(dispatcher.events) != 1 {
-		t.Fatalf("events = %d, want 1", len(dispatcher.events))
+	if event.Type != identitycontracts.EventUserRegistered || event.DataVersion != identitycontracts.UserRegisteredVersion {
+		t.Errorf("event = %s v%d", event.Type, event.DataVersion)
 	}
-	event := dispatcher.events[0]
-	if event.Type != webhookcontracts.EventUserRegistered {
-		t.Errorf("event type = %q, want %q", event.Type, webhookcontracts.EventUserRegistered)
+	if event.TenantID != 3 || event.Actor.Type != "user" || event.Actor.ID != "7" || event.ID == "" {
+		t.Errorf("envelope = %+v", event)
 	}
-	if event.TenantID != 1 {
-		t.Errorf("tenant = %d, want 1", event.TenantID)
+	const want = `{"userId":7,"email":"new@example.com","name":"New User","emailVerified":false,"createdAt":"2026-01-02T03:04:05Z"}`
+	if string(event.Data) != want {
+		t.Errorf("data =\n%s\nwant\n%s", event.Data, want)
 	}
-	if !strings.Contains(string(event.Data), `"email":"webhook@example.com"`) {
-		t.Errorf("payload = %s, want registered email", event.Data)
-	}
-}
-
-type recordUserWebhookDispatcher struct {
-	events []webhookcontracts.Event
-}
-
-func (r *recordUserWebhookDispatcher) Dispatch(_ context.Context, events ...webhookcontracts.Event) (int, error) {
-	r.events = append(r.events, events...)
-	return len(events), nil
 }
 
 // ---------------------------------------------------------------------------

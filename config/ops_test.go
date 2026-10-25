@@ -176,11 +176,11 @@ func TestAppRole(t *testing.T) {
 
 func TestJobsConfig(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Jobs = JobsConfig{WorkerKinds: "webhook.delivery, webhook.dispatch", WorkerExcludeKinds: "email.send"}
+	cfg.Jobs = JobsConfig{WorkerKinds: "webhook.delivery, events.file.uploaded.webhooks", WorkerExcludeKinds: "email.send"}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("disjoint kind filters rejected: %v", err)
 	}
-	if got := cfg.Jobs.WorkerKindList(); len(got) != 2 || got[1] != "webhook.dispatch" {
+	if got := cfg.Jobs.WorkerKindList(); len(got) != 2 || got[1] != "events.file.uploaded.webhooks" {
 		t.Fatalf("WorkerKindList() = %v", got)
 	}
 

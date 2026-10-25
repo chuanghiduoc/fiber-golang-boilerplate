@@ -116,26 +116,6 @@ func TestSecretCodec_RequiresKey(t *testing.T) {
 	}
 }
 
-func TestGenerateSecret(t *testing.T) {
-	first, err := GenerateSecret(secretPrefixEndpoint)
-	if err != nil {
-		t.Fatalf("GenerateSecret: %v", err)
-	}
-	second, err := GenerateSecret(secretPrefixEndpoint)
-	if err != nil {
-		t.Fatalf("GenerateSecret: %v", err)
-	}
-	if !strings.HasPrefix(first, secretPrefixEndpoint) {
-		t.Errorf("secret %q lacks prefix", first)
-	}
-	if first == second {
-		t.Error("generated secrets must be unique")
-	}
-	if len(first) < 32 {
-		t.Errorf("secret too short: %d", len(first))
-	}
-}
-
 func TestNormalizeEventTypes(t *testing.T) {
 	got, err := normalizeEventTypes(nil)
 	if err != nil || len(got) != 1 || got[0] != "*" {

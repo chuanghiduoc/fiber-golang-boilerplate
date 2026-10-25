@@ -20,8 +20,7 @@ const (
 	legacySecretEnvelopeVer = 1
 	// secretEnvelopeVer is written by Seal: it names the sealing key and
 	// binds the id into the AAD.
-	secretEnvelopeVer  = 2
-	generatedSecretLen = 32
+	secretEnvelopeVer = 2
 )
 
 var (
@@ -156,14 +155,4 @@ func (c *SecretCodec) envelopeKeys(envelope secretEnvelope) ([]cipher.AEAD, erro
 	default:
 		return nil, fmt.Errorf("%w: unsupported version %d", ErrInvalidSecretEnvelope, envelope.Version)
 	}
-}
-
-// GenerateSecret creates a URL-safe random signing secret. The prefix makes
-// the secret recognisable in configuration and receiver logs.
-func GenerateSecret(prefix string) (string, error) {
-	raw := make([]byte, generatedSecretLen)
-	if _, err := io.ReadFull(rand.Reader, raw); err != nil {
-		return "", fmt.Errorf("webhooks: generate secret: %w", err)
-	}
-	return prefix + base64.RawURLEncoding.EncodeToString(raw), nil
 }

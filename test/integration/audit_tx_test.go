@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
@@ -25,6 +25,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -186,7 +187,7 @@ func TestAuditTx_FileDeleteAndRestoreRollBackWhenAuditFails(t *testing.T) {
 		tenant.DefaultID, adminID,
 	).Scan(&fileID))
 
-	svc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, nil), h.store, nil)
+	svc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, nil), h.store)
 	ctx := h.actorCtx(tenant.DefaultID, adminID, "admin")
 
 	h.installInsertFailure(t)
@@ -210,10 +211,11 @@ func TestAuditTx_FileDeleteAndRestoreRollBackWhenAuditFails(t *testing.T) {
 	require.NotNil(t, deletedAt, "file restore must roll back when audit fails")
 }
 
-// TestFilesWebhooks_AdminAndRestoreUseOutbox proves admin delete and both
-// restores enqueue file.deleted/file.restored in the mutation transaction, and
-// that an outbox failure rolls the mutation back (fail-closed).
-func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
+// TestFilesEvents_AdminAndRestorePublishInTx proves admin delete and both
+// restores publish file.deleted/file.restored in the mutation transaction (the
+// webhooks durable subscription job commits with the row change), and that a
+// publish failure rolls the mutation back (fail-closed).
+func TestFilesEvents_AdminAndRestorePublishInTx(t *testing.T) {
 	h := setupAuditTxHarness(t)
 	bg := context.Background()
 	adminID := h.insertUser(t, tenant.DefaultID, "files-webhook-admin@test.com", "admin")
@@ -226,10 +228,14 @@ func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
 	).Scan(&fileID))
 
 	queue := jobs.NewQueue(h.pool)
-	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), queue)
-	tx := filesrepo.NewTransactor(h.tx, h.recorder, dispatcher)
-	adminSvc := filesvc.NewAdminFileService(h.files, tx, h.store, dispatcher)
-	uploadSvc := filesvc.NewUploadService(h.files, tx, h.store, dispatcher)
+	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue))
+	bus := events.New(queue)
+	for _, eventType := range []string{filescontracts.EventFileDeleted, filescontracts.EventFileRestored} {
+		require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", dispatcher.HandleEvent))
+	}
+	tx := filesrepo.NewTransactor(h.tx, h.recorder, bus)
+	adminSvc := filesvc.NewAdminFileService(h.files, tx, h.store)
+	uploadSvc := filesvc.NewUploadService(h.files, tx, h.store)
 
 	adminCtx := h.actorCtx(tenant.DefaultID, adminID, "admin")
 	ownerCtx := h.actorCtx(tenant.DefaultID, ownerID, "user")
@@ -242,8 +248,8 @@ func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
 	require.NoError(t, err)
 
 	rows, err := h.pool.Query(bg,
-		`SELECT payload->>'type' FROM jobs WHERE kind = $1 AND tenant_id = $2 ORDER BY id`,
-		webhookservice.DispatchJobKind, tenant.DefaultID)
+		`SELECT payload->>'type' FROM jobs WHERE kind LIKE 'events.file.%.webhooks' AND tenant_id = $1 ORDER BY id`,
+		tenant.DefaultID)
 	require.NoError(t, err)
 	var types []string
 	for rows.Next() {
@@ -254,18 +260,20 @@ func TestFilesWebhooks_AdminAndRestoreUseOutbox(t *testing.T) {
 	require.NoError(t, rows.Err())
 	rows.Close()
 	assert.Equal(t, []string{
-		webhookcontracts.EventFileDeleted,
-		webhookcontracts.EventFileRestored,
-		webhookcontracts.EventFileRestored,
+		filescontracts.EventFileDeleted,
+		filescontracts.EventFileRestored,
+		filescontracts.EventFileRestored,
 	}, types)
 
-	// A dispatcher whose outbox cannot enqueue fails the admin delete closed.
-	broken := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue), nil)
-	brokenSvc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, broken), h.store, broken)
+	// A bus that cannot enqueue its durable subscription fails the admin
+	// delete closed.
+	broken := events.New(nil)
+	require.NoError(t, broken.SubscribeDurable(filescontracts.EventFileDeleted, "webhooks", dispatcher.HandleEvent))
+	brokenSvc := filesvc.NewAdminFileService(h.files, filesrepo.NewTransactor(h.tx, h.recorder, broken), h.store)
 	require.Error(t, brokenSvc.DeleteFile(adminCtx, fileID))
 	var deletedAt *time.Time
 	require.NoError(t, h.pool.QueryRow(bg, `SELECT deleted_at FROM files WHERE id = $1`, fileID).Scan(&deletedAt))
-	assert.Nil(t, deletedAt, "the delete must roll back when the webhook outbox fails")
+	assert.Nil(t, deletedAt, "the delete must roll back when the event cannot be published")
 }
 
 func TestAuditTx_RecordsTenantAndActor(t *testing.T) {

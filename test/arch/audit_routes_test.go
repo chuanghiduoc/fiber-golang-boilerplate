@@ -122,7 +122,7 @@ func containsAny(s string, needles []string) bool {
 // Tier 1 or guarded; only non-privileged writes belong here.
 var fallbackAudited = map[string]bool{
 	// Public receiver: authenticated by the source HMAC, deduplicated per
-	// (source, X-Webhook-Id); every accepted event is stored.
+	// (source, webhook-id); every accepted event is stored.
 	"POST /api/v1/webhooks/inbound/:id": true,
 	// The caller's own notification state, not privileged configuration.
 	"POST /api/v1/notifications/read-all":   true,

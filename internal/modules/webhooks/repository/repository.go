@@ -61,13 +61,18 @@ type Endpoint struct {
 	EventTypes []string
 }
 
-// Delivery is a delivery row plus the event it delivers (webhook_events).
-// Payload is nil on list reads, which never return it.
+// Delivery is a delivery row plus the event envelope it delivers
+// (webhook_events). Payload is the envelope's data. DataVersion, the actor,
+// and Payload are only set by GetDelivery and ClaimDelivery; list reads never
+// return them.
 type Delivery struct {
 	webhooksqlc.WebhookDelivery
-	EventType  string
-	OccurredAt pgtype.Timestamptz
-	Payload    []byte
+	EventType   string
+	DataVersion int32
+	ActorType   string
+	ActorID     string
+	OccurredAt  pgtype.Timestamptz
+	Payload     []byte
 }
 
 // ActiveEndpoint is the snapshot needed to fan an event out to one endpoint.
@@ -104,13 +109,17 @@ type UpdateEndpointDraft struct {
 }
 
 // DeliveryDraft creates one delivery row and its first durable job atomically.
-// EventType, EventCreatedAt, and Payload describe the event: they are written
-// to webhook_events by the first delivery of EventID and ignored afterwards.
+// EventType, DataVersion, ActorType/ActorID, EventCreatedAt, and Payload (the
+// envelope data) describe the event: they are written to webhook_events by
+// the first delivery of EventID and ignored afterwards.
 type DeliveryDraft struct {
 	TenantID         int64
 	EndpointID       int64
 	EventID          string
 	EventType        string
+	DataVersion      int32
+	ActorType        string
+	ActorID          string
 	EventCreatedAt   time.Time
 	URL              string
 	Payload          json.RawMessage

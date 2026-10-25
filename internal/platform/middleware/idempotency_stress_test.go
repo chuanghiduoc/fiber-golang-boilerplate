@@ -280,8 +280,8 @@ func TestIdempotencyStressBodyBinding(t *testing.T) {
 	mismatchWait()
 
 	for _, response := range mismatchResponses {
-		if response.status != fiber.StatusConflict {
-			t.Errorf("different body status = %d, want 409: %s", response.status, response.body)
+		if response.status != fiber.StatusUnprocessableEntity {
+			t.Errorf("different body status = %d, want 422: %s", response.status, response.body)
 		}
 		if !strings.Contains(response.body, "different request body") {
 			t.Errorf("different body response = %q, want a body-mismatch conflict", response.body)

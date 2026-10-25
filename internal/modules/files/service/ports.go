@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	webhookcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -65,18 +65,19 @@ type AuditWriter interface {
 	RecordTx(ctx context.Context, event audit.Event) error
 }
 
-// Outbox enqueues webhook events in the current transaction.
-type Outbox interface {
-	Enqueue(ctx context.Context, events ...webhookcontracts.Event) error
+// EventPublisher publishes a domain event in the current transaction
+// (events.Bus.PublishTx): the event's durable subscriber jobs commit or roll
+// back with the mutation.
+type EventPublisher interface {
+	Publish(ctx context.Context, event events.Event) error
 }
 
-// TxRepos are the collaborators bound to one transaction.
+// TxRepos are the collaborators bound to one transaction. Every field is
+// non-nil.
 type TxRepos struct {
-	Files FileRepository
-	Audit AuditWriter
-	// Outbox is nil when the wired webhook dispatcher cannot join the
-	// transaction; callers then dispatch after commit.
-	Outbox Outbox
+	Files  FileRepository
+	Audit  AuditWriter
+	Events EventPublisher
 }
 
 // Transactor runs fn in one transaction: when fn returns an error every write

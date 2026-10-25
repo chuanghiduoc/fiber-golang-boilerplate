@@ -487,15 +487,14 @@ func (h *Handler) ListInboundEvents(c fiber.Ctx) error {
 
 // ReceiveInbound godoc
 // @Summary Receive an inbound webhook
-// @Description Public HMAC-authenticated receiver. Deduplicates on X-Webhook-Id per source.
+// @Description Public Standard Webhooks receiver (HMAC-SHA256 over "id.timestamp.body"). Deduplicates on webhook-id per source; the event type is the body's top-level "type" member ("inbound" when absent).
 // @Tags Webhooks
 // @Accept application/json
 // @Produce json
 // @Param id path int true "Inbound source ID"
-// @Param X-Webhook-Id header string true "External event ID"
-// @Param X-Webhook-Event header string false "Event type"
-// @Param X-Webhook-Timestamp header string true "Unix seconds used in the signature"
-// @Param X-Webhook-Signature header string true "v1=<hex HMAC-SHA256>"
+// @Param webhook-id header string true "Message ID (deduplication key)"
+// @Param webhook-timestamp header string true "Unix seconds used in the signature"
+// @Param webhook-signature header string true "Space-separated v1,<base64 HMAC-SHA256> signatures"
 // @Success 202 {object} dto.InboundReceipt
 // @Success 200 {object} dto.InboundReceipt
 // @Failure 400 {object} apperror.ProblemDetails

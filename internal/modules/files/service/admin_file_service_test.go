@@ -129,7 +129,7 @@ func seedAdminFiles(repo *fakeAdminFileRepo, n int) {
 func TestAdminListFiles(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		repo := newFakeAdminFileRepo()
-		svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage(), nil)
+		svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage())
 		seedAdminFiles(repo, 2)
 		repo.files[2].DeletedAt = timePtr(time.Now())
 
@@ -152,7 +152,7 @@ func TestAdminListFiles(t *testing.T) {
 
 	t.Run("empty list", func(t *testing.T) {
 		repo := newFakeAdminFileRepo()
-		svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage(), nil)
+		svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage())
 
 		files, hasMore, err := svc.ListFiles(systemCtx(), 10, "")
 		if err != nil {
@@ -170,7 +170,7 @@ func TestAdminListFiles(t *testing.T) {
 func TestAdminDownloadFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, newFakeTx(repo), store, nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), store)
 	seedAdminFiles(repo, 1)
 	store.data["uploads/file.txt"] = []byte("payload")
 
@@ -195,7 +195,7 @@ func TestAdminDownloadFile_MissingBlobIsNotFound(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
 	store.getErr = fmt.Errorf("%w: uploads/file.txt", storage.ErrNotFound)
-	svc := NewAdminFileService(repo, newFakeTx(repo), store, nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), store)
 	seedAdminFiles(repo, 1)
 
 	_, _, err := svc.Download(systemCtx(), 1)
@@ -213,7 +213,7 @@ func TestAdminDownloadFile_MissingBlobIsNotFound(t *testing.T) {
 
 func TestAdminDeleteFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage(), nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	if err := svc.DeleteFile(systemCtx(), 1); err != nil {
@@ -234,7 +234,7 @@ func TestAdminDeleteFile(t *testing.T) {
 
 func TestAdminRestoreFile(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage(), nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage())
 	seedAdminFiles(repo, 1)
 
 	_, err := svc.RestoreFile(systemCtx(), 1)
@@ -255,7 +255,7 @@ func TestAdminRestoreFile(t *testing.T) {
 
 func TestAdminGetFileStats(t *testing.T) {
 	repo := newFakeAdminFileRepo()
-	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage(), nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), newFakeAdminStorage())
 	seedAdminFiles(repo, 3)
 	repo.files[2].DeletedAt = timePtr(time.Now())
 
@@ -274,7 +274,7 @@ func TestAdminGetFileStats(t *testing.T) {
 func TestAdminFileService_TenantIsolation(t *testing.T) {
 	repo := newFakeAdminFileRepo()
 	store := newFakeAdminStorage()
-	svc := NewAdminFileService(repo, newFakeTx(repo), store, nil)
+	svc := NewAdminFileService(repo, newFakeTx(repo), store)
 	seedAdminFiles(repo, 1) // tenant 1, file 1
 	repo.files[2] = &File{
 		ID:           2,

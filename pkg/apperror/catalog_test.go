@@ -14,6 +14,7 @@ var requiredCodes = []Code{
 	CodeFeatureDisabled,
 	CodeRateLimitExceeded,
 	CodeAPIVersionUnsupported,
+	CodeIdempotencyKeyMismatch,
 	CodeSystemInternal,
 	CodeSystemTimeout,
 	CodeSystemUnavailable,

@@ -5,6 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -42,6 +43,10 @@ type Infra struct {
 	Email   *jobs.QueuedSender
 	Storage storage.Storage
 	Flags   features.Evaluator
+	// Events is the domain event bus. Producers publish with PublishTx inside
+	// their transaction; subscribers (webhooks) register through
+	// app.EventProvider. Nil (tests) disables publishing.
+	Events *events.Bus
 }
 
 // PlatformConfig is the configuration shared by every module: application

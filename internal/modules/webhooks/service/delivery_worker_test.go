@@ -2,11 +2,16 @@ package service
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,10 +170,45 @@ func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *reposit
 			CreatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
 			UpdatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
 		},
-		EventType:  "file.uploaded",
-		OccurredAt: pgtype.Timestamptz{Time: created, Valid: true},
-		Payload:    []byte(`{"fileId":9}`),
+		EventType:   "file.uploaded",
+		DataVersion: 1,
+		ActorType:   "user",
+		ActorID:     "3",
+		OccurredAt:  pgtype.Timestamptz{Time: created, Valid: true},
+		Payload:     []byte(`{"fileId":9}`),
 	}
+}
+
+// Standard Webhooks secrets ("whsec_" + base64 key) used by the worker tests.
+var (
+	testSecret    = webhook.SecretPrefix + "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw" // public Standard Webhooks spec example key
+	rotatedSecret = "whsec_" + base64.StdEncoding.EncodeToString([]byte("second-rotated-key-32-bytes-long!"))
+)
+
+// specVerify is an independent Standard Webhooks verifier written from the
+// specification (not pkg/webhook): the key is the base64-decoded secret after
+// "whsec_", the signed content is "<webhook-id>.<webhook-timestamp>.<body>",
+// and webhook-signature holds space-separated "v1,<base64 HMAC-SHA256>"
+// entries, any of which may match.
+func specVerify(secret string, header http.Header, body []byte) error {
+	key, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(secret, "whsec_"))
+	if err != nil {
+		return fmt.Errorf("decode secret: %w", err)
+	}
+	id, timestamp := header.Get("webhook-id"), header.Get("webhook-timestamp")
+	if id == "" || timestamp == "" {
+		return errors.New("missing webhook-id or webhook-timestamp")
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(id + "." + timestamp + "."))
+	mac.Write(body)
+	expected := "v1," + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	for _, signature := range strings.Split(header.Get("webhook-signature"), " ") {
+		if hmac.Equal([]byte(signature), []byte(expected)) {
+			return nil
+		}
+	}
+	return errors.New("no matching v1 signature")
 }
 
 func testCodec(t *testing.T) (codec *SecretCodec, ciphertext string) {
@@ -177,8 +217,7 @@ func testCodec(t *testing.T) (codec *SecretCodec, ciphertext string) {
 	if err != nil {
 		t.Fatalf("NewSecretCodec: %v", err)
 	}
-	secret := "whsec_test_secret"
-	ciphertext, err = codec.Seal([]byte(secret))
+	ciphertext, err = codec.Seal([]byte(testSecret))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -206,29 +245,28 @@ func testWorker(store WorkerStore, client *webhook.Client) (*DeliveryWorker, tim
 
 func TestDeliveryWorker_SuccessSignsAndRecordsAttempt(t *testing.T) {
 	codec, ciphertext := testCodec(t)
-	secret := "whsec_test_secret"
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 
 	var verified bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		if err := webhook.VerifyRequest([]byte(secret), r.Header, body, time.Minute, now); err != nil {
-			t.Errorf("receiver signature verification failed: %v", err)
+		if err := specVerify(testSecret, r.Header, body); err != nil {
+			t.Errorf("independent Standard Webhooks verification failed: %v", err)
 		} else {
 			verified = true
 		}
-		if r.Header.Get(webhook.HeaderDelivery) != "7" {
-			t.Errorf("delivery header = %q, want 7", r.Header.Get(webhook.HeaderDelivery))
+		if r.Header.Get("webhook-id") != "evt_1" || r.Header.Get("webhook-timestamp") != strconv.FormatInt(now.Unix(), 10) {
+			t.Errorf("headers = %v", r.Header)
 		}
-		if r.Header.Get(webhook.HeaderID) != "evt_1" {
-			t.Errorf("event header = %q", r.Header.Get(webhook.HeaderID))
+		for _, legacy := range []string{"X-Webhook-Id", "X-Webhook-Event", "X-Webhook-Signature", "X-Webhook-Delivery"} {
+			if r.Header.Get(legacy) != "" {
+				t.Errorf("legacy header %s must not be sent", legacy)
+			}
 		}
-		var envelope DeliveryEnvelope
-		if err := json.Unmarshal(body, &envelope); err != nil {
-			t.Errorf("envelope: %v", err)
-		}
-		if envelope.ID != "evt_1" || envelope.Type != "file.uploaded" || string(envelope.Data) != `{"fileId":9}` {
-			t.Errorf("envelope = %+v", envelope)
+		const want = `{"id":"evt_1","type":"file.uploaded","dataVersion":1,"occurredAt":"2026-10-24T11:59:00Z",` +
+			`"tenantId":1,"actor":{"type":"user","id":"3"},"data":{"fileId":9}}`
+		if string(body) != want {
+			t.Errorf("body =\n%s\nwant\n%s", body, want)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -531,9 +569,7 @@ func TestDeliveryWorker_StaleOutcomeIsDiscarded(t *testing.T) {
 // period and with the current secret alone after it.
 func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 	codec, oldCiphertext := testCodec(t)
-	oldSecret := []byte("whsec_test_secret")
-	newSecret := []byte("whsec_rotated_secret")
-	newCiphertext, err := codec.Seal(newSecret)
+	newCiphertext, err := codec.Seal([]byte(rotatedSecret))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -552,8 +588,11 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 			var newErr, oldErr error
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
-				newErr = webhook.VerifyRequest(newSecret, r.Header, body, time.Minute, now)
-				oldErr = webhook.VerifyRequest(oldSecret, r.Header, body, time.Minute, now)
+				if strings.Count(r.Header.Get("webhook-signature"), "v1,") > 1 && !strings.Contains(r.Header.Get("webhook-signature"), " ") {
+					t.Errorf("co-signatures must be space-separated: %q", r.Header.Get("webhook-signature"))
+				}
+				newErr = verifyWith(rotatedSecret, r.Header, body, now)
+				oldErr = verifyWith(testSecret, r.Header, body, now)
 				w.WriteHeader(http.StatusNoContent)
 			}))
 			defer server.Close()
@@ -578,5 +617,34 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 				t.Fatalf("snapshot secret must stop signing after the grace, got %v", oldErr)
 			}
 		})
+	}
+}
+
+// verifyWith checks a request with the production verifier (pkg/webhook).
+func verifyWith(secret string, header http.Header, body []byte, now time.Time) error {
+	key, err := webhook.DecodeSecret(secret)
+	if err != nil {
+		return err
+	}
+	return webhook.VerifyRequest(key, header, body, time.Minute, now)
+}
+
+// A secret created before Standard Webhooks cannot be decoded into a key: the
+// delivery dead-letters with an actionable reason instead of retrying.
+func TestDeliveryWorker_LegacySecretIsDead(t *testing.T) {
+	codec, _ := testCodec(t)
+	legacy, err := codec.Seal([]byte("whsec_Zm9v-legacy_url_safe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeWorkerStore{delivery: fixedDelivery("https://example.com/hook", legacy, 0, 3)}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if !store.dead || !strings.Contains(store.deadReason, "rotate") {
+		t.Fatalf("dead=%v reason=%q, want a dead delivery asking for rotation", store.dead, store.deadReason)
 	}
 }

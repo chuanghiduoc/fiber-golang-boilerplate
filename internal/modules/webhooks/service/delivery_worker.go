@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
@@ -38,14 +39,6 @@ type WorkerOptions struct {
 	RetryBase time.Duration
 	RetryMax  time.Duration
 	Lease     time.Duration
-}
-
-// DeliveryEnvelope is the stable JSON body signed and delivered to receivers.
-type DeliveryEnvelope struct {
-	ID        string          `json:"id"`
-	Type      string          `json:"type"`
-	CreatedAt time.Time       `json:"createdAt"`
-	Data      json.RawMessage `json:"data"`
 }
 
 // WorkerStore is the narrow persistence surface for delivery attempts.
@@ -123,12 +116,12 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		return fmt.Errorf("webhooks: claim delivery %d: %w", job.DeliveryID, err)
 	}
 
-	secret, body, unsendable := w.prepare(delivery)
+	key, body, unsendable := w.prepare(delivery)
 	if unsendable != "" {
 		return w.deadLetterUnsendable(ctx, delivery, unsendable)
 	}
 
-	headers := w.requestHeaders(ctx, delivery, secret, body)
+	headers := w.requestHeaders(ctx, delivery, key, body)
 	sent := w.send(ctx, delivery, headers, body)
 	// The job context itself ended (worker shutdown or job timeout), as
 	// opposed to the per-endpoint request timeout, before any response
@@ -162,28 +155,51 @@ func (w *DeliveryWorker) checkConfigured() error {
 	return nil
 }
 
-// prepare opens the snapshotted secret and builds the signed envelope. A
-// non-empty unsendable reason means retrying cannot help: the delivery is
-// dead-lettered without sending anything.
-func (w *DeliveryWorker) prepare(delivery *repository.Delivery) (secret, body []byte, unsendable string) {
-	secret, err := w.codec.Open(delivery.SecretCiphertext)
+// prepare opens the snapshotted secret, derives its Standard Webhooks HMAC
+// key, and builds the signed body. A non-empty unsendable reason means
+// retrying cannot help: the delivery is dead-lettered without sending
+// anything.
+func (w *DeliveryWorker) prepare(delivery *repository.Delivery) (key, body []byte, unsendable string) {
+	key, err := w.signingKey(delivery.SecretCiphertext)
 	if err != nil {
-		slog.Error("webhooks: delivery secret decryption failed",
+		slog.Error("webhooks: delivery secret is unusable",
 			slog.Int64("delivery_id", delivery.ID),
 			slog.Any("error", err),
 		)
+		if errors.Is(err, webhook.ErrInvalidSecret) {
+			return nil, nil, "endpoint secret predates Standard Webhooks; rotate it"
+		}
 		return nil, nil, "secret snapshot could not be decrypted"
 	}
-	body, err = json.Marshal(DeliveryEnvelope{
-		ID:        delivery.EventID,
-		Type:      delivery.EventType,
-		CreatedAt: delivery.OccurredAt.Time.UTC(),
-		Data:      json.RawMessage(delivery.Payload),
-	})
+	body, err = deliveryBody(delivery)
 	if err != nil {
 		return nil, nil, "delivery payload is not valid JSON"
 	}
-	return secret, body, ""
+	return key, body, ""
+}
+
+// signingKey opens a sealed "whsec_" secret and decodes its HMAC key.
+func (w *DeliveryWorker) signingKey(ciphertext string) ([]byte, error) {
+	secret, err := w.codec.Open(ciphertext)
+	if err != nil {
+		return nil, err
+	}
+	return webhook.DecodeSecret(string(secret))
+}
+
+// deliveryBody rebuilds the event envelope (ADR 0011) stored in
+// webhook_events. The event type and dataVersion travel in this signed body.
+// RequestID is process-internal and stays empty, so it is never sent.
+func deliveryBody(delivery *repository.Delivery) ([]byte, error) {
+	return json.Marshal(events.Event{
+		ID:          delivery.EventID,
+		Type:        delivery.EventType,
+		DataVersion: int(delivery.DataVersion),
+		OccurredAt:  delivery.OccurredAt.Time.UTC(),
+		TenantID:    delivery.TenantID,
+		Actor:       events.Actor{Type: delivery.ActorType, ID: delivery.ActorID},
+		Data:        json.RawMessage(delivery.Payload),
+	})
 }
 
 // deadLetterUnsendable records the failed attempt and dead-letters a
@@ -196,17 +212,15 @@ func (w *DeliveryWorker) deadLetterUnsendable(ctx context.Context, delivery *rep
 		w.store.MarkDeliveryDead(ctx, delivery.ID, delivery.Attempts, 0, reason))
 }
 
-// requestHeaders builds the delivery headers, including the timestamped
-// signature over the exact body that will be sent.
-func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *repository.Delivery, secret, body []byte) http.Header {
+// requestHeaders builds the Standard Webhooks headers: webhook-id is the event
+// id (stable across retries, the receiver's deduplication key) and the
+// signature covers "<id>.<timestamp>.<exact body sent>".
+func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *repository.Delivery, key, body []byte) http.Header {
 	timestamp := w.now()
 	headers := http.Header{}
 	headers.Set(webhook.HeaderID, delivery.EventID)
-	headers.Set(webhook.HeaderDelivery, strconv.FormatInt(delivery.ID, 10))
-	headers.Set(webhook.HeaderEvent, delivery.EventType)
 	headers.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
-	headers.Set(webhook.HeaderSignature, w.signatureHeader(ctx, delivery, secret, timestamp, body))
-	headers.Set(webhook.HeaderAttempt, strconv.FormatInt(int64(delivery.Attempts), 10))
+	headers.Set(webhook.HeaderSignature, w.signatureHeader(ctx, delivery, key, timestamp, body))
 	headers.Set("Content-Type", "application/json")
 	return headers
 }
@@ -348,14 +362,15 @@ func (w *DeliveryWorker) fenced(delivery *repository.Delivery, action string, er
 	return nil
 }
 
-// signatureHeader signs with the delivery's snapshot secret. When the endpoint
-// secret was rotated after the snapshot, it also signs with the current secret
-// during secretRotationGrace (receivers accept either "v1=" value), and with
-// the current secret alone after it. A failed lookup falls back to the
-// snapshot signature, which is what the delivery was created with.
+// signatureHeader signs with the delivery's snapshot key. When the endpoint
+// secret was rotated after the snapshot, it also signs with the current key
+// during secretRotationGrace (two space-separated "v1," signatures; receivers
+// accept either), and with the current key alone after it. A failed lookup
+// falls back to the snapshot signature, which is what the delivery was
+// created with.
 func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *repository.Delivery, snapshot []byte, timestamp time.Time, body []byte) string {
-	sign := func(secret []byte) string {
-		return webhook.SignatureHeader(webhook.Sign(secret, delivery.EventID, delivery.EventType, timestamp, body))
+	sign := func(key []byte) string {
+		return webhook.Sign(key, delivery.EventID, timestamp, body)
 	}
 	current, err := w.store.ActiveSigningSecret(ctx, delivery.EndpointID)
 	if err != nil {
@@ -371,9 +386,9 @@ func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *reposito
 	if current.Ciphertext == delivery.SecretCiphertext {
 		return sign(snapshot)
 	}
-	currentSecret, err := w.codec.Open(current.Ciphertext)
+	currentKey, err := w.signingKey(current.Ciphertext)
 	if err != nil {
-		slog.Error("webhooks: current endpoint secret could not be decrypted; signing with the snapshot only",
+		slog.Error("webhooks: current endpoint secret is unusable; signing with the snapshot only",
 			slog.Int64("delivery_id", delivery.ID),
 			slog.Int64("endpoint_id", delivery.EndpointID),
 			slog.Any("error", err),
@@ -381,9 +396,9 @@ func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *reposito
 		return sign(snapshot)
 	}
 	if w.now().Before(current.CreatedAt.Add(secretRotationGrace)) {
-		return sign(snapshot) + "," + sign(currentSecret)
+		return webhook.SignatureHeader(sign(snapshot), sign(currentKey))
 	}
-	return sign(currentSecret)
+	return sign(currentKey)
 }
 
 // handleNotClaimable distinguishes an already-terminal delivery (nothing to

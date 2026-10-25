@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
@@ -105,8 +104,8 @@ func (b *Bus) Subscribe(eventName string, handler Handler) error {
 	if b == nil {
 		return errors.New("events: bus is nil")
 	}
-	if !namePattern.MatchString(eventName) {
-		return fmt.Errorf("%w: name %q must match %s", ErrInvalidEvent, eventName, namePattern)
+	if err := validType(eventName); err != nil {
+		return err
 	}
 	if handler == nil {
 		return fmt.Errorf("%w: local handler for %q is nil", ErrInvalidEvent, eventName)
@@ -128,8 +127,8 @@ func (b *Bus) SubscribeDurable(eventName, handlerName string, handler Handler, o
 	if b == nil {
 		return errors.New("events: bus is nil")
 	}
-	if !namePattern.MatchString(eventName) {
-		return fmt.Errorf("%w: name %q must match %s", ErrInvalidEvent, eventName, namePattern)
+	if err := validType(eventName); err != nil {
+		return err
 	}
 	if !namePattern.MatchString(handlerName) {
 		return fmt.Errorf("%w: handler %q must match %s", ErrInvalidEvent, handlerName, namePattern)
@@ -197,7 +196,7 @@ func (b *Bus) PublishLocal(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	metrics.EventsPublishedTotal.WithLabelValues(event.Name, "local").Inc()
+	metrics.EventsPublishedTotal.WithLabelValues(event.Type, "local").Inc()
 	return b.publishLocal(ctx, event)
 }
 
@@ -210,7 +209,7 @@ func (b *Bus) Publish(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	metrics.EventsPublishedTotal.WithLabelValues(event.Name, "durable").Inc()
+	metrics.EventsPublishedTotal.WithLabelValues(event.Type, "durable").Inc()
 
 	localErr := b.publishLocal(ctx, event)
 	durableErr := b.enqueueDurable(ctx, nil, event)
@@ -229,7 +228,7 @@ func (b *Bus) PublishTx(ctx context.Context, tx pgx.Tx, event Event) error {
 	if err != nil {
 		return err
 	}
-	metrics.EventsPublishedTotal.WithLabelValues(event.Name, "durable").Inc()
+	metrics.EventsPublishedTotal.WithLabelValues(event.Type, "durable").Inc()
 
 	localErr := b.publishLocal(ctx, event)
 	durableErr := b.enqueueDurable(ctx, tx, event)
@@ -241,7 +240,11 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 		return Event{}, errors.New("events: bus is nil")
 	}
 	if event.ID == "" {
-		event.ID = uuid.NewString()
+		id, err := newID()
+		if err != nil {
+			return Event{}, err
+		}
+		event.ID = id
 	}
 	if event.OccurredAt.IsZero() {
 		event.OccurredAt = time.Now().UTC()
@@ -254,8 +257,8 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 	if event.RequestID == "" {
 		event.RequestID = requestctx.RequestID(ctx)
 	}
-	if event.ActorID == 0 {
-		event.ActorID = requestctx.ActorID(ctx)
+	if event.Actor.Type == "" {
+		event.Actor = actorFromContext(ctx)
 	}
 	if len(event.Data) == 0 {
 		event.Data = json.RawMessage(`{}`)
@@ -266,15 +269,32 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 	return event, nil
 }
 
+// actorFromContext attributes an event to the request's authenticated user,
+// or to the system when there is none (jobs, schedules, maintenance).
+func actorFromContext(ctx context.Context) Actor {
+	if id := requestctx.ActorID(ctx); id > 0 {
+		return UserActor(id)
+	}
+	return Actor{Type: ActorSystem}
+}
+
+// validType checks an event type at subscription time.
+func validType(eventType string) error {
+	if !typePattern.MatchString(eventType) {
+		return fmt.Errorf("%w: type %q must match %s", ErrInvalidEvent, eventType, typePattern)
+	}
+	return nil
+}
+
 func (b *Bus) publishLocal(ctx context.Context, event Event) error {
 	b.mu.RLock()
-	subscriptions := append([]localSubscription(nil), b.local[event.Name]...)
+	subscriptions := append([]localSubscription(nil), b.local[event.Type]...)
 	b.mu.RUnlock()
 
 	var errs []error
 	for _, sub := range subscriptions {
 		if err := invoke(ctx, sub.handler, event, "local"); err != nil {
-			errs = append(errs, fmt.Errorf("events: local handler for %q: %w", event.Name, err))
+			errs = append(errs, fmt.Errorf("events: local handler for %q: %w", event.Type, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -282,7 +302,7 @@ func (b *Bus) publishLocal(ctx context.Context, event Event) error {
 
 func (b *Bus) enqueueDurable(ctx context.Context, tx pgx.Tx, event Event) error {
 	b.mu.RLock()
-	subscriptions := append([]durableSubscription(nil), b.durable[event.Name]...)
+	subscriptions := append([]durableSubscription(nil), b.durable[event.Type]...)
 	b.mu.RUnlock()
 	if len(subscriptions) == 0 {
 		return nil
@@ -293,7 +313,7 @@ func (b *Bus) enqueueDurable(ctx context.Context, tx pgx.Tx, event Event) error 
 
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("events: marshal %q for durable delivery: %w", event.Name, err)
+		return fmt.Errorf("events: marshal %q for durable delivery: %w", event.Type, err)
 	}
 
 	var errs []error
@@ -311,35 +331,39 @@ func (b *Bus) enqueueDurable(ctx context.Context, tx pgx.Tx, event Event) error 
 			_, _, err = b.queue.EnqueueOnce(ctx, job)
 		}
 		if err != nil {
-			metrics.EventsEnqueueErrorsTotal.WithLabelValues(event.Name).Inc()
-			errs = append(errs, fmt.Errorf("events: enqueue %q for %q: %w", sub.Kind, event.Name, err))
+			metrics.EventsEnqueueErrorsTotal.WithLabelValues(event.Type).Inc()
+			errs = append(errs, fmt.Errorf("events: enqueue %q for %q: %w", sub.Kind, event.Type, err))
 		}
 	}
 	return errors.Join(errs...)
 }
 
 func durableIdempotencyKey(event Event, sub durableSubscription) string {
-	return fmt.Sprintf("event:%s:%s:%s:%d", event.Name, event.ID, sub.Handler, event.TenantID)
+	return fmt.Sprintf("event:%s:%s:%s:%d", event.Type, event.ID, sub.Handler, event.TenantID)
 }
 
 func (b *Bus) jobHandler(sub durableSubscription) jobs.Handler {
 	return func(ctx context.Context, payload json.RawMessage) error {
+		// A payload that does not decode, validate, or match the subscription
+		// can never succeed, so it dead-letters without spending retries.
 		var event Event
 		if err := json.Unmarshal(payload, &event); err != nil {
-			return fmt.Errorf("events: decode durable %q payload: %w", sub.Kind, err)
+			return jobs.Permanent(fmt.Errorf("events: decode durable %q payload: %w", sub.Kind, err))
 		}
 		if err := event.Validate(); err != nil {
-			return err
+			return jobs.Permanent(err)
 		}
-		if event.Name != sub.Event {
-			return fmt.Errorf("events: durable %q payload has event %q, want %q", sub.Kind, event.Name, sub.Event)
+		if event.Type != sub.Event {
+			return jobs.Permanent(fmt.Errorf("events: durable %q payload has event %q, want %q", sub.Kind, event.Type, sub.Event))
 		}
 
 		if event.TenantID > 0 {
 			ctx = tenant.WithID(ctx, event.TenantID)
 		}
 		ctx = requestctx.WithRequestID(ctx, event.RequestID)
-		ctx = requestctx.WithActorID(ctx, event.ActorID)
+		if actorID := event.Actor.userID(); actorID > 0 {
+			ctx = requestctx.WithActorID(ctx, actorID)
+		}
 		if err := invoke(ctx, sub.Fn, event, sub.Handler); err != nil {
 			return fmt.Errorf("events: durable handler %q for %q: %w", sub.Handler, sub.Event, err)
 		}
@@ -354,7 +378,7 @@ func invoke(ctx context.Context, handler Handler, event Event, name string) (err
 			outcome = "panic"
 			err = fmt.Errorf("events: handler %q panic: %v\n%s", name, recovered, debug.Stack())
 		}
-		metrics.EventsHandledTotal.WithLabelValues(event.Name, outcome).Inc()
+		metrics.EventsHandledTotal.WithLabelValues(event.Type, outcome).Inc()
 	}()
 
 	err = handler(ctx, event)
