@@ -7,9 +7,14 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
+
+// LoginInput is one password sign-in attempt in the request tenant.
+type LoginInput struct {
+	Email    string
+	Password string
+}
 
 // dummyPasswordHash equalizes the bcrypt work for unknown-email logins so the
 // response time does not reveal whether an account exists.
@@ -27,7 +32,7 @@ func invalidCredentials() error {
 // not an active member of this tenant (never joined, banned, or removed) gets
 // the same 401 as a wrong password, so the response does not tell an
 // attacker holding a leaked password which tenants the account belongs to.
-func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
+func (s *userService) Authenticate(ctx context.Context, req LoginInput) (*Member, error) {
 	email := NormalizeEmail(req.Email)
 
 	// Reserve an attempt before any lookup or password check. The counters
@@ -71,7 +76,7 @@ func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*
 	if s.RequireEmailVerification && !member.User.EmailVerified() {
 		return nil, apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
-	return ToUserResponse(member), nil
+	return member, nil
 }
 
 // loadCredential returns the account and its password hash; the hash is ""

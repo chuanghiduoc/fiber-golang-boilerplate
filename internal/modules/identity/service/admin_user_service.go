@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -14,10 +13,10 @@ import (
 // bans, unbans, and the identity half of the dashboard statistics. Every
 // operation changes a membership, never the global user.
 type AdminUserService interface {
-	ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
-	UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error)
+	ListUsers(ctx context.Context, limit int, startingAfter string) ([]Member, bool, error)
+	UpdateRole(ctx context.Context, id int64, role string) (*Member, error)
 	BanUser(ctx context.Context, id int64) error
-	UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error)
+	UnbanUser(ctx context.Context, id int64) (*Member, error)
 	GetUserStats(ctx context.Context) (UserStats, error)
 }
 
@@ -38,7 +37,7 @@ func NewAdminUserService(stores Stores, tx Transactor, sessionCache session.Stor
 	return &adminUserService{stores: stores, tx: tx, sessionCache: sessionCache}
 }
 
-func (s *adminUserService) ListUsers(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+func (s *adminUserService) ListUsers(ctx context.Context, limit int, startingAfter string) ([]Member, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -50,7 +49,7 @@ func (s *adminUserService) ListUsers(ctx context.Context, limit int, startingAft
 	return memberPage(members, pageSize)
 }
 
-func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error) {
+func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string) (*Member, error) {
 	role = NormalizeRole(role)
 	if !ValidRole(role) {
 		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
@@ -78,7 +77,7 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 	}
 
 	invalidateSessions(ctx, s.sessionCache, id)
-	return ToUserResponse(member), nil
+	return member, nil
 }
 
 // changeRole replaces the member's roles with role, ends their sessions in
@@ -146,7 +145,7 @@ func banMember(ctx context.Context, st Stores, id int64) error {
 	return nil
 }
 
-func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*dto.UserResponse, error) {
+func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*Member, error) {
 	var member *Member
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if _, err := tx.Memberships.Unban(ctx, id); err != nil {
@@ -163,7 +162,7 @@ func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*dto.UserRe
 		return nil, err
 	}
 	invalidateSessions(ctx, s.sessionCache, id)
-	return ToUserResponse(member), nil
+	return member, nil
 }
 
 // getActiveMemberForAdmin loads an active member through memberships

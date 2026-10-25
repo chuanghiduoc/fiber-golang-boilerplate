@@ -5,9 +5,9 @@ package adapter
 
 import (
 	"context"
+	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 )
 
@@ -29,7 +29,7 @@ func (a *AdminIdentity) ListUsers(ctx context.Context, limit int, startingAfter 
 	}
 	items := make([]identitycontracts.User, len(users))
 	for i := range users {
-		items[i] = toUser(users[i])
+		items[i] = toUser(&users[i])
 	}
 	return identitycontracts.UserPage{Items: items, HasMore: hasMore}, nil
 }
@@ -39,7 +39,7 @@ func (a *AdminIdentity) UpdateRole(ctx context.Context, id int64, role string) (
 	if err != nil {
 		return identitycontracts.User{}, err
 	}
-	return toUser(*user), nil
+	return toUser(user), nil
 }
 
 func (a *AdminIdentity) BanUser(ctx context.Context, id int64) error {
@@ -51,7 +51,7 @@ func (a *AdminIdentity) UnbanUser(ctx context.Context, id int64) (identitycontra
 	if err != nil {
 		return identitycontracts.User{}, err
 	}
-	return toUser(*user), nil
+	return toUser(user), nil
 }
 
 func (a *AdminIdentity) GetUserStats(ctx context.Context) (identitycontracts.UserStats, error) {
@@ -65,20 +65,32 @@ func (a *AdminIdentity) GetUserStats(ctx context.Context) (identitycontracts.Use
 	}, nil
 }
 
-func toUser(user dto.UserResponse) identitycontracts.User {
+func toUser(member *service.Member) identitycontracts.User {
+	user, membership := member.User, member.Membership
+	updatedAt := user.UpdatedAt
+	if membership.UpdatedAt.After(updatedAt) {
+		updatedAt = membership.UpdatedAt
+	}
+	var deletedAt *time.Time
+	switch {
+	case membership.RemovedAt != nil:
+		deletedAt = membership.RemovedAt
+	case user.DeletedAt != nil:
+		deletedAt = user.DeletedAt
+	}
 	return identitycontracts.User{
 		ID:               user.ID,
 		Email:            user.Email,
 		Name:             user.Name,
-		Role:             user.Role,
-		Roles:            user.Roles,
-		MembershipStatus: user.MembershipStatus,
-		EmailVerified:    user.EmailVerified,
+		Role:             membership.Role,
+		Roles:            membership.Roles,
+		MembershipStatus: string(membership.Status),
+		EmailVerified:    user.EmailVerified(),
 		HasPassword:      user.HasPassword,
 		CreatedAt:        user.CreatedAt,
-		UpdatedAt:        user.UpdatedAt,
-		JoinedAt:         user.JoinedAt,
-		DeletedAt:        user.DeletedAt,
-		BannedAt:         user.BannedAt,
+		UpdatedAt:        updatedAt,
+		JoinedAt:         membership.CreatedAt,
+		DeletedAt:        deletedAt,
+		BannedAt:         membership.BannedAt,
 	}
 }

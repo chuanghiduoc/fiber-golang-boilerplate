@@ -6,9 +6,14 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
+
+// ChangePasswordInput sets a new password after verifying the current one.
+type ChangePasswordInput struct {
+	CurrentPassword string
+	NewPassword     string
+}
 
 func currentPasswordIncorrect() error {
 	return apperror.NewBadRequest("current password is incorrect")
@@ -42,7 +47,7 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 	return nil
 }
 
-func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error {
+func (s *userService) ChangePassword(ctx context.Context, userID int64, req ChangePasswordInput) error {
 	member, err := getMember(ctx, s.Stores.Memberships, userID)
 	if err != nil {
 		return err

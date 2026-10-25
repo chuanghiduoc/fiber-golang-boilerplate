@@ -6,10 +6,16 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
+
+// UpdateProfileInput changes the caller's global profile. Email is only
+// applied when set.
+type UpdateProfileInput struct {
+	Name  *string
+	Email *string
+}
 
 // profileChange is a validated profile update: the values to store and what
 // actually changes.
@@ -31,7 +37,7 @@ func (c profileChange) auditMetadata() map[string]any {
 // Update changes the global profile of an active member of the request
 // tenant. The handler only allows a user to change their own profile: a
 // tenant admin manages memberships, never another person's global identity.
-func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
+func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInput) (*Member, error) {
 	existing, err := getMember(ctx, s.Stores.Memberships, id)
 	if err != nil {
 		return nil, err
@@ -57,12 +63,12 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 		invalidateSessions(ctx, s.SessionCache, id)
 	}
 	existing.User = *updated
-	return ToUserResponse(existing), nil
+	return existing, nil
 }
 
 // planProfileChange resolves the requested name/email against the stored
 // account and checks that a new address is available.
-func (s *userService) planProfileChange(ctx context.Context, existing *User, req dto.UpdateUserRequest) (profileChange, error) {
+func (s *userService) planProfileChange(ctx context.Context, existing *User, req UpdateProfileInput) (profileChange, error) {
 	change := profileChange{
 		name:        existing.Name,
 		email:       existing.Email,

@@ -77,8 +77,8 @@ func TestUpdateOtherUser_IsAlwaysDenied(t *testing.T) {
 
 			status, _ = putUser(t, app, "/users/1", dto.UpdateUserRequest{Name: ptr("Renamed")})
 			assert.Equal(t, fiber.StatusForbidden, status)
-			assert.Equal(t, "test@example.com", svc.users[1].Email)
-			assert.Equal(t, "Test User", svc.users[1].Name)
+			assert.Equal(t, "test@example.com", svc.users[1].User.Email)
+			assert.Equal(t, "Test User", svc.users[1].User.Name)
 		})
 	}
 }
@@ -86,12 +86,12 @@ func TestUpdateOtherUser_IsAlwaysDenied(t *testing.T) {
 // PUT /users/{caller id} behaves like PUT /users/me.
 func TestUpdateSelfByID_IsAllowed(t *testing.T) {
 	svc := newMockService()
-	svc.users[9] = &dto.UserResponse{ID: 9, TenantID: 1, Email: "self@example.com", Name: "Self", Role: dto.RoleAdmin, HasPassword: true}
+	svc.users[9] = testMember(9, "self@example.com", "Self", dto.RoleAdmin)
 	app := emailChangeApp(svc, false)
 
 	status, body := putUser(t, app, "/users/9", dto.UpdateUserRequest{Name: ptr("Renamed")})
 	assert.Equal(t, fiber.StatusOK, status, body)
-	assert.Equal(t, "Renamed", svc.users[9].Name)
+	assert.Equal(t, "Renamed", svc.users[9].User.Name)
 }
 
 // strings.EqualFold treats U+017F (long s) as "s" but the service's
@@ -101,7 +101,7 @@ func TestUpdateMeEmail_UnicodeFoldStillRequiresPassword(t *testing.T) {
 	svc := newMockService()
 	app := emailChangeApp(svc, false)
 	// The stub authenticates as user 9, so /users/me targets this account.
-	svc.users[9] = &dto.UserResponse{ID: 9, TenantID: 1, Email: "test@example.com", Name: "Self", Role: dto.RoleAdmin, HasPassword: true}
+	svc.users[9] = testMember(9, "test@example.com", "Self", dto.RoleAdmin)
 
 	status, body := putUser(t, app, "/users/me", dto.UpdateUserRequest{Email: ptr("teſt@example.com")})
 	assert.Equal(t, fiber.StatusBadRequest, status, body)

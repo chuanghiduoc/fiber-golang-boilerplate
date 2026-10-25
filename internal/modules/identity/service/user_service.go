@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -21,25 +20,25 @@ var bcryptCost = 12
 // lockout.go, oauth_google.go, profile.go (update/delete/sessions), and
 // password.go.
 type UserService interface {
-	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
+	Register(ctx context.Context, req RegisterInput) (*Member, error)
 	// Authenticate checks the global password and requires an active
 	// membership in the request tenant.
-	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
+	Authenticate(ctx context.Context, req LoginInput) (*Member, error)
 	// SignInWithGoogle signs in an existing or linkable account, or creates
 	// one when req.AllowSignUp is set (see GoogleSignIn), and issues the
 	// session in the same transaction as the auth.google_login audit row.
 	SignInWithGoogle(ctx context.Context, req GoogleSignIn) (*GoogleSignInResult, error)
 	// GetByID returns an active member of the request tenant.
-	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
-	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
+	GetByID(ctx context.Context, id int64) (*Member, error)
+	List(ctx context.Context, limit int, startingAfter string) ([]Member, bool, error)
 	// Update changes the caller's own global profile.
-	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
+	Update(ctx context.Context, id int64, req UpdateProfileInput) (*Member, error)
 	VerifyPassword(ctx context.Context, userID int64, password string) error
 	// DeleteAccount deletes the caller's global account (self-service only).
 	DeleteAccount(ctx context.Context, id int64) error
 	// RemoveMember removes another user's membership from the request tenant.
 	RemoveMember(ctx context.Context, id int64) error
-	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
+	ChangePassword(ctx context.Context, userID int64, req ChangePasswordInput) error
 	// RevokeSessions ends every session of the user in every tenant
 	// (logout-all) and invalidates every access token.
 	RevokeSessions(ctx context.Context, userID int64) error
@@ -93,15 +92,11 @@ func getMember(ctx context.Context, memberships MembershipRepository, id int64) 
 	return member, nil
 }
 
-func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
-	member, err := getMember(ctx, s.Stores.Memberships, id)
-	if err != nil {
-		return nil, err
-	}
-	return ToUserResponse(member), nil
+func (s *userService) GetByID(ctx context.Context, id int64) (*Member, error) {
+	return getMember(ctx, s.Stores.Memberships, id)
 }
 
-func (s *userService) List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+func (s *userService) List(ctx context.Context, limit int, startingAfter string) ([]Member, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -113,17 +108,13 @@ func (s *userService) List(ctx context.Context, limit int, startingAfter string)
 	return memberPage(members, pageSize)
 }
 
-// memberPage trims the extra probe row and maps members to responses.
-func memberPage(members []Member, pageSize int) ([]dto.UserResponse, bool, error) {
+// memberPage trims the extra probe row.
+func memberPage(members []Member, pageSize int) ([]Member, bool, error) {
 	hasMore := len(members) > pageSize
 	if hasMore {
 		members = members[:pageSize]
 	}
-	responses := make([]dto.UserResponse, len(members))
-	for i := range members {
-		responses[i] = *ToUserResponse(&members[i])
-	}
-	return responses, hasMore, nil
+	return members, hasMore, nil
 }
 
 // userWriteError maps a failed write: a missing row becomes 404 with
@@ -138,37 +129,4 @@ func userWriteError(err error, notFoundDetail, internalDetail string) error {
 		return err
 	}
 	return apperror.NewInternal(internalDetail)
-}
-
-// ToUserResponse maps a member of the request tenant to the API shape. Role,
-// ban, and join time come from the membership; identity fields from the
-// global user. DeletedAt is the membership removal or the account deletion.
-func ToUserResponse(member *Member) *dto.UserResponse {
-	user, membership := member.User, member.Membership
-	resp := &dto.UserResponse{
-		ID:               user.ID,
-		Email:            user.Email,
-		Name:             user.Name,
-		Role:             membership.Role,
-		Roles:            membership.Roles,
-		MembershipStatus: string(membership.Status),
-		EmailVerified:    user.EmailVerified(),
-		HasPassword:      user.HasPassword,
-		CreatedAt:        user.CreatedAt,
-		UpdatedAt:        user.UpdatedAt,
-		JoinedAt:         membership.CreatedAt,
-		BannedAt:         membership.BannedAt,
-		TokenVersion:     user.TokenVersion,
-		TenantID:         membership.TenantID,
-	}
-	if membership.UpdatedAt.After(resp.UpdatedAt) {
-		resp.UpdatedAt = membership.UpdatedAt
-	}
-	switch {
-	case membership.RemovedAt != nil:
-		resp.DeletedAt = membership.RemovedAt
-	case user.DeletedAt != nil:
-		resp.DeletedAt = user.DeletedAt
-	}
-	return resp
 }

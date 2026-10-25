@@ -9,10 +9,16 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
+
+// RegisterInput creates an account in the request tenant.
+type RegisterInput struct {
+	Email    string
+	Password string
+	Name     string
+}
 
 func emailTaken() error {
 	return apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
@@ -30,7 +36,7 @@ func emailUnavailable() error {
 // email job, auth.registered audit row, and user.registered event commit in
 // one transaction: any failure rolls the account back, so a registration
 // never exists without its audit record or outbox rows.
-func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
+func (s *userService) Register(ctx context.Context, req RegisterInput) (*Member, error) {
 	email := NormalizeEmail(req.Email)
 	name := strings.TrimSpace(req.Name)
 
@@ -68,7 +74,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 
 	// A previous failed-login lockout must not survive registration.
 	clearLoginAttempts(ctx, s.Cache, email)
-	return ToUserResponse(member), nil
+	return member, nil
 }
 
 // ensureEmailUnregistered rejects an address that belongs to a live account

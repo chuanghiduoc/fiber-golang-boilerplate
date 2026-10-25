@@ -166,7 +166,7 @@ func (h *AuthHandler) SetFeatureFlags(flags features.Evaluator) {
 // emailVerificationRequired combines REQUIRE_EMAIL_VERIFICATION with the
 // email_verification flag for the user's tenant/user targets. The flag can
 // only add the requirement; it never lifts the configured one.
-func (h *AuthHandler) emailVerificationRequired(ctx context.Context, user *dto.UserResponse) bool {
+func (h *AuthHandler) emailVerificationRequired(ctx context.Context, member *service.Member) bool {
 	if h.requireEmailVerification {
 		return true
 	}
@@ -175,7 +175,7 @@ func (h *AuthHandler) emailVerificationRequired(ctx context.Context, user *dto.U
 		flags = features.NewEvaluator(features.Options{})
 	}
 	return flags.Enabled(ctx, identitycatalog.KeyEmailVerification,
-		features.Subject{TenantID: user.TenantID, UserID: user.ID})
+		features.Subject{TenantID: member.Membership.TenantID, UserID: member.User.ID})
 }
 
 // NewAuthHandler wires the auth handlers.
@@ -222,7 +222,11 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.userSvc.Register(withClientIP(c), req)
+	member, err := h.userSvc.Register(withClientIP(c), service.RegisterInput{
+		Email:    req.Email,
+		Password: req.Password,
+		Name:     req.Name,
+	})
 	if err != nil {
 		return err
 	}
@@ -235,21 +239,21 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		// background context would fall back to the default tenant and write
 		// the verification token to the wrong tenant.
 		tenantID := tenant.EffectiveID(c.Context())
-		if user.TenantID != 0 {
-			tenantID = user.TenantID
+		if member.Membership.TenantID != 0 {
+			tenantID = member.Membership.TenantID
 		}
 		tenantSlug := tenant.SlugFromContext(c.Context())
 		async.Go(func() {
 			ctx := tenant.WithIdentity(context.Background(), tenantID, tenantSlug)
-			_ = h.emailVerifSvc.SendVerification(ctx, user.ID, user.Email)
+			_ = h.emailVerifSvc.SendVerification(ctx, member.User.ID, member.User.Email)
 		})
 	}
 
 	// Attribute the audit event to the newly registered user. The key matches
 	// middleware.JWTAuth and is read by audithttp.Middleware after the response.
-	fiber.Locals(c, "user_id", user.ID)
+	fiber.Locals(c, "user_id", member.User.ID)
 
-	return response.Created(c, user)
+	return response.Created(c, toUserResponse(member))
 }
 
 // Login godoc
@@ -272,38 +276,41 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	}
 
 	ctx := withClient(c)
-	user, err := h.userSvc.Authenticate(ctx, req)
+	member, err := h.userSvc.Authenticate(ctx, service.LoginInput{
+		Email:    req.Email,
+		Password: req.Password,
+	})
 	if err != nil {
 		return err
 	}
 	// Authenticate requires a membership in the request tenant, but keep the
 	// invariant explicit: a token must never be minted outside it.
-	if user.TenantID != tenant.EffectiveID(c.Context()) {
+	if member.Membership.TenantID != tenant.EffectiveID(c.Context()) {
 		return apperror.NewCode(identitycatalog.CodeAuthInvalidCredentials, "invalid email or password")
 	}
 	// Authenticate already enforces REQUIRE_EMAIL_VERIFICATION; this adds the
 	// email_verification flag for the user's tenant/user targets.
-	if !user.EmailVerified && h.emailVerificationRequired(c.Context(), user) {
+	if !member.User.EmailVerified() && h.emailVerificationRequired(c.Context(), member) {
 		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 
 	// Attribute the audit event to the authenticated user.
-	fiber.Locals(c, "user_id", user.ID)
+	fiber.Locals(c, "user_id", member.User.ID)
 
 	// A confirmed factor makes the password only the first step: issue a
 	// short-lived challenge instead of a session.
 	if h.mfa != nil {
-		required, err := h.mfa.Required(c.Context(), user.ID)
+		required, err := h.mfa.Required(c.Context(), member.User.ID)
 		if err != nil {
 			return err
 		}
 		if required {
-			challenge, err := h.mfa.BeginChallenge(ctx, user.ID, service.AMRPassword)
+			challenge, err := h.mfa.BeginChallenge(ctx, member.User.ID, service.AMRPassword)
 			if err != nil {
 				return err
 			}
 			return response.Success(c, dto.LoginResponse{
-				User:              *user,
+				User:              toUserResponse(member),
 				MFARequired:       true,
 				MFAChallengeToken: challenge,
 			})
@@ -312,7 +319,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 
 	// Issue re-checks the membership and the token version the password was
 	// verified at, so a credential change committed in between fails closed.
-	pair, err := h.sessions.Issue(ctx, user.ID, user.TokenVersion, []string{service.AMRPassword})
+	pair, err := h.sessions.Issue(ctx, member.User.ID, member.User.TokenVersion, []string{service.AMRPassword})
 	if err != nil {
 		return err
 	}
@@ -320,7 +327,7 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  pair.AccessToken,
 		RefreshToken: pair.RefreshToken,
-		User:         *user,
+		User:         toUserResponse(member),
 	})
 }
 
@@ -348,7 +355,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	// so a recoverable refusal (email not yet verified) does not burn a valid
 	// token. A token that was already used revokes its whole session.
 	result, err := h.sessions.Refresh(withClient(c), req.RefreshToken, func(ctx context.Context, member *service.Member) error {
-		if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, service.ToUserResponse(member)) {
+		if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
 			return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 		}
 		return nil
@@ -356,7 +363,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	user := service.ToUserResponse(result.Member)
+	user := toUserResponse(result.Member)
 
 	// Attribute the audit event to the authenticated user.
 	fiber.Locals(c, "user_id", user.ID)
@@ -364,7 +371,7 @@ func (h *AuthHandler) Refresh(c fiber.Ctx) error {
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  result.Tokens.AccessToken,
 		RefreshToken: result.Tokens.RefreshToken,
-		User:         *user,
+		User:         user,
 	})
 }
 
@@ -425,7 +432,7 @@ func (h *AuthHandler) ForgotPassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.resetSvc.ForgotPassword(c.Context(), req); err != nil {
+	if err := h.resetSvc.ForgotPassword(c.Context(), service.ForgotPasswordInput{Email: req.Email}); err != nil {
 		return err
 	}
 
@@ -451,7 +458,10 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.resetSvc.ResetPassword(withClientIP(c), req); err != nil {
+	if err := h.resetSvc.ResetPassword(withClientIP(c), service.ResetPasswordInput{
+		Token:    req.Token,
+		Password: req.Password,
+	}); err != nil {
 		return err
 	}
 
@@ -635,8 +645,8 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		// Admission runs inside the sign-in transaction, before the session
 		// is issued and auth.google_login is recorded: a refused sign-in
 		// rolls back and is not audited.
-		Complete: func(ctx context.Context, user *dto.UserResponse) error {
-			return h.admitGoogleUser(ctx, c, tenantID, user)
+		Complete: func(ctx context.Context, member *service.Member) error {
+			return h.admitGoogleUser(ctx, c, tenantID, member)
 		},
 		MFARequired: func(ctx context.Context, member *service.Member) (bool, error) {
 			if h.mfa == nil {
@@ -649,7 +659,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		return err
 	}
 	if result.MFARequired {
-		challenge, err := h.mfa.BeginChallenge(ctx, result.User.ID, service.AMRGoogle)
+		challenge, err := h.mfa.BeginChallenge(ctx, result.Member.User.ID, service.AMRGoogle)
 		if err != nil {
 			return err
 		}
@@ -701,13 +711,13 @@ func clearOAuthStateCookie(c fiber.Ctx) {
 // admitGoogleUser applies the Login/Refresh sign-in rules to the account a
 // Google identity resolved to. A Google-linked account whose email was later
 // changed (which clears email_verified_at) must not mint a session.
-func (h *AuthHandler) admitGoogleUser(ctx context.Context, c fiber.Ctx, tenantID int64, user *dto.UserResponse) error {
-	if user.TenantID != tenantID {
+func (h *AuthHandler) admitGoogleUser(ctx context.Context, c fiber.Ctx, tenantID int64, member *service.Member) error {
+	if member.Membership.TenantID != tenantID {
 		return apperror.NewUnauthorized("account is not active")
 	}
 	// Attribute request-level audit/logging to the signed-in user, as Login does.
-	fiber.Locals(c, "user_id", user.ID)
-	if !user.EmailVerified && h.emailVerificationRequired(ctx, user) {
+	fiber.Locals(c, "user_id", member.User.ID)
+	if !member.User.EmailVerified() && h.emailVerificationRequired(ctx, member) {
 		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 	return nil

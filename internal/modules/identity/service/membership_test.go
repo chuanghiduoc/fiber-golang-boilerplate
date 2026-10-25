@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -32,17 +31,17 @@ func TestRegistrationAndLogin_AreScopedToMemberships(t *testing.T) {
 	ctx := context.Background()
 	acme := tenant.WithID(ctx, 2)
 
-	user, err := svc.Register(ctx, dto.RegisterRequest{Email: "Ada@Example.com", Password: "Password1!", Name: "Ada"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "Ada@Example.com", Password: "Password1!", Name: "Ada"})
 	require.NoError(t, err)
-	assert.Equal(t, "ada@example.com", user.Email)
-	assert.Equal(t, int64(1), user.TenantID)
-	assert.Equal(t, RoleMember, user.Role)
-	assert.Equal(t, string(MembershipStatusActive), user.MembershipStatus)
+	assert.Equal(t, "ada@example.com", user.User.Email)
+	assert.Equal(t, int64(1), user.Membership.TenantID)
+	assert.Equal(t, RoleMember, user.Membership.Role)
+	assert.Equal(t, string(MembershipStatusActive), string(user.Membership.Status))
 
-	_, err = svc.Authenticate(acme, dto.LoginRequest{Email: "ada@example.com", Password: "Password1!"})
+	_, err = svc.Authenticate(acme, LoginInput{Email: "ada@example.com", Password: "Password1!"})
 	assert.Equal(t, string(identitycatalog.CodeAuthInvalidCredentials), codeOf(err), "no membership in tenant 2")
 
-	_, err = svc.Register(acme, dto.RegisterRequest{Email: "ada@example.com", Password: "Password1!", Name: "Ada again"})
+	_, err = svc.Register(acme, RegisterInput{Email: "ada@example.com", Password: "Password1!", Name: "Ada again"})
 	assert.Equal(t, string(identitycatalog.CodeUserEmailTaken), codeOf(err))
 	assert.Len(t, db.users, 1, "no second account is created")
 }
@@ -51,17 +50,17 @@ func TestAuthenticate_BannedMemberGetsInvalidCredentials(t *testing.T) {
 	db := newMemDB()
 	svc := newTestUserService(db)
 	ctx := context.Background()
-	user, err := svc.Register(ctx, dto.RegisterRequest{Email: "b@example.com", Password: "Password1!", Name: "B"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: "Password1!", Name: "B"})
 	require.NoError(t, err)
-	_, err = db.stores().Memberships.Ban(ctx, user.ID)
+	_, err = db.stores().Memberships.Ban(ctx, user.User.ID)
 	require.NoError(t, err)
 
-	_, err = svc.Authenticate(ctx, dto.LoginRequest{Email: "b@example.com", Password: "Password1!"})
+	_, err = svc.Authenticate(ctx, LoginInput{Email: "b@example.com", Password: "Password1!"})
 	assert.Equal(t, string(identitycatalog.CodeAuthInvalidCredentials), codeOf(err))
 
 	// The ban survives in the tenant: the address cannot register there again
 	// (here it still has a live account, so it is simply taken).
-	_, err = svc.Register(ctx, dto.RegisterRequest{Email: "b@example.com", Password: "Password1!", Name: "B"})
+	_, err = svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: "Password1!", Name: "B"})
 	assert.Equal(t, http.StatusConflict, statusOf(err))
 }
 
@@ -76,16 +75,16 @@ func newTestSessions(db *memDB, signed *[]AccessClaims) *SessionService {
 func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, dto.RegisterRequest{Email: "s@example.com", Password: "Password1!", Name: "S"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "s@example.com", Password: "Password1!", Name: "S"})
 	require.NoError(t, err)
 
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	first, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	first, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 	require.Positive(t, first.SessionID)
 	require.Len(t, signed, 1)
-	assert.Equal(t, AccessClaims{UserID: user.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com", AMR: []string{AMRPassword}}, signed[0])
+	assert.Equal(t, AccessClaims{UserID: user.User.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com", AMR: []string{AMRPassword}}, signed[0])
 
 	rotated, err := sessions.Refresh(ctx, first.RefreshToken, nil)
 	require.NoError(t, err)
@@ -104,11 +103,11 @@ func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 func TestSessions_CrossTenantRefreshHasNoSideEffects(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, dto.RegisterRequest{Email: "x@example.com", Password: "Password1!", Name: "X"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "x@example.com", Password: "Password1!", Name: "X"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 
 	_, err = sessions.Refresh(tenant.WithID(ctx, 2), pair.RefreshToken, nil)
@@ -122,11 +121,11 @@ func TestSessions_CrossTenantRefreshHasNoSideEffects(t *testing.T) {
 func TestSessions_AdmissionRefusalDoesNotConsume(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, dto.RegisterRequest{Email: "a@example.com", Password: "Password1!", Name: "A"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "a@example.com", Password: "Password1!", Name: "A"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 
 	refuse := func(context.Context, *Member) error { return apperror.NewForbidden("not yet") }
@@ -140,18 +139,18 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
 	svc := newTestUserService(db)
-	user, err := svc.Register(ctx, dto.RegisterRequest{Email: "v@example.com", Password: "Password1!", Name: "V"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "v@example.com", Password: "Password1!", Name: "V"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
-	pair, err := sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 
 	// logout-all bumps the version and revokes every session.
-	require.NoError(t, svc.RevokeSessions(ctx, user.ID))
+	require.NoError(t, svc.RevokeSessions(ctx, user.User.ID))
 	_, err = sessions.Refresh(ctx, pair.RefreshToken, nil)
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err))
-	_, err = sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	_, err = sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err), "a password checked at the old version cannot open a session")
 }
 
@@ -184,8 +183,8 @@ func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {
 
 	restored, err := adminSvc.UnbanUser(ctx, member)
 	require.NoError(t, err)
-	assert.Equal(t, string(MembershipStatusActive), restored.MembershipStatus)
-	assert.Nil(t, restored.BannedAt)
+	assert.Equal(t, MembershipStatusActive, restored.Membership.Status)
+	assert.Nil(t, restored.Membership.BannedAt)
 }
 
 func seedMember(t *testing.T, db *memDB, tenantID int64, email, role string) int64 {
@@ -197,23 +196,4 @@ func seedMember(t *testing.T, db *memDB, tenantID int64, email, role string) int
 	_, err = st.Memberships.Create(ctx, user.ID, role)
 	require.NoError(t, err)
 	return user.ID
-}
-
-func TestToUserResponse_MapsMembership(t *testing.T) {
-	joined := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	removed := joined.Add(time.Hour)
-	resp := ToUserResponse(&Member{
-		User: User{ID: 7, Email: "m@example.com", Name: "M", Status: UserStatusActive, HasPassword: true,
-			CreatedAt: joined.Add(-time.Hour), UpdatedAt: joined},
-		Membership: Membership{TenantID: 3, UserID: 7, Role: RoleAdmin, Status: MembershipStatusRemoved,
-			RemovedAt: &removed, CreatedAt: joined, UpdatedAt: removed},
-	})
-	assert.Equal(t, int64(3), resp.TenantID)
-	assert.Equal(t, RoleAdmin, resp.Role)
-	assert.Equal(t, "removed", resp.MembershipStatus)
-	assert.Equal(t, joined, resp.JoinedAt)
-	assert.Equal(t, removed, resp.UpdatedAt, "the later of the user/membership updates")
-	require.NotNil(t, resp.DeletedAt)
-	assert.Equal(t, removed, *resp.DeletedAt)
-	assert.False(t, resp.EmailVerified)
 }

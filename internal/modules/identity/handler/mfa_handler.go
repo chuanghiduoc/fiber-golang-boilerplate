@@ -162,11 +162,11 @@ func (h *MFAHandler) Verify(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	user := service.ToUserResponse(result.Member)
+	user := toUserResponse(result.Member)
 	fiber.Locals(c, "user_id", user.ID)
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  result.Tokens.AccessToken,
 		RefreshToken: result.Tokens.RefreshToken,
-		User:         *user,
+		User:         user,
 	})
 }

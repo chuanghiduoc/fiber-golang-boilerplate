@@ -42,12 +42,12 @@ func NewUserHandler(svc service.UserService, emailVerif ...service.EmailVerifica
 // @Failure 401 {object} apperror.ProblemDetails
 // @Router /users/me [get]
 func (h *UserHandler) GetMe(c fiber.Ctx) error {
-	user, err := h.service.GetByID(c.Context(), httpx.AuthUserID(c))
+	member, err := h.service.GetByID(c.Context(), httpx.AuthUserID(c))
 	if err != nil {
 		return err
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(member))
 }
 
 // GetByID godoc
@@ -68,7 +68,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.service.GetByID(c.Context(), id)
+	member, err := h.service.GetByID(c.Context(), id)
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func (h *UserHandler) GetByID(c fiber.Ctx) error {
 		return apperror.NewNotFound("user not found")
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(member))
 }
 
 // List godoc
@@ -108,7 +108,8 @@ func (h *UserHandler) List(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u dto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
+	resp := toUserResponses(users)
+	return response.List(c, resp, hasMore, pagination.NextCursor(resp, func(u dto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
 }
 
 // UpdateMe godoc
@@ -133,13 +134,13 @@ func (h *UserHandler) UpdateMe(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.service.Update(c.Context(), httpx.AuthUserID(c), req)
+	member, err := h.service.Update(c.Context(), httpx.AuthUserID(c), service.UpdateProfileInput{Name: req.Name, Email: req.Email})
 	if err != nil {
 		return err
 	}
-	h.sendVerificationAfterEmailChange(c.Context(), user, req)
+	h.sendVerificationAfterEmailChange(c.Context(), member, req)
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(member))
 }
 
 // Update godoc
@@ -176,13 +177,13 @@ func (h *UserHandler) Update(c fiber.Ctx) error {
 		return err
 	}
 
-	user, err := h.service.Update(c.Context(), id, req)
+	member, err := h.service.Update(c.Context(), id, service.UpdateProfileInput{Name: req.Name, Email: req.Email})
 	if err != nil {
 		return err
 	}
-	h.sendVerificationAfterEmailChange(c.Context(), user, req)
+	h.sendVerificationAfterEmailChange(c.Context(), member, req)
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(member))
 }
 
 // requirePasswordForEmailChange forces a re-authentication step before a user
@@ -201,10 +202,10 @@ func (h *UserHandler) requirePasswordForEmailChange(c fiber.Ctx, userID int64, r
 	// identity change and must not demand re-authentication. Compare with the
 	// service's normalization: any looser folding would let a real change
 	// skip the password check.
-	if service.NormalizeEmail(*req.Email) == service.NormalizeEmail(current.Email) {
+	if service.NormalizeEmail(*req.Email) == service.NormalizeEmail(current.User.Email) {
 		return nil
 	}
-	if !current.HasPassword {
+	if !current.User.HasPassword {
 		return apperror.NewBadRequest("email changes are not available for passwordless accounts")
 	}
 	if req.CurrentPassword == nil || *req.CurrentPassword == "" {
@@ -225,17 +226,17 @@ func authenticatedWithAPIKey(c fiber.Ctx) bool {
 
 // sendVerificationAfterEmailChange invalidates tokens sent to the old address
 // and sends a fresh verification link to the new one.
-func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, user *dto.UserResponse, req dto.UpdateUserRequest) {
-	if req.Email == nil || user.EmailVerified || h.emailVerifSvc == nil {
+func (h *UserHandler) sendVerificationAfterEmailChange(ctx context.Context, member *service.Member, req dto.UpdateUserRequest) {
+	if req.Email == nil || member.User.EmailVerified() || h.emailVerifSvc == nil {
 		return
 	}
-	if err := h.emailVerifSvc.Invalidate(ctx, user.ID); err != nil {
+	if err := h.emailVerifSvc.Invalidate(ctx, member.User.ID); err != nil {
 		return
 	}
 	tenantSlug := tenant.SlugFromContext(ctx)
 	async.Go(func() {
-		sendCtx := tenant.WithIdentity(context.Background(), user.TenantID, tenantSlug)
-		_ = h.emailVerifSvc.SendVerification(sendCtx, user.ID, user.Email)
+		sendCtx := tenant.WithIdentity(context.Background(), member.Membership.TenantID, tenantSlug)
+		_ = h.emailVerifSvc.SendVerification(sendCtx, member.User.ID, member.User.Email)
 	})
 }
 
@@ -258,7 +259,10 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.service.ChangePassword(withClientIP(c), httpx.AuthUserID(c), req); err != nil {
+	if err := h.service.ChangePassword(withClientIP(c), httpx.AuthUserID(c), service.ChangePasswordInput{
+		CurrentPassword: req.CurrentPassword,
+		NewPassword:     req.NewPassword,
+	}); err != nil {
 		return err
 	}
 

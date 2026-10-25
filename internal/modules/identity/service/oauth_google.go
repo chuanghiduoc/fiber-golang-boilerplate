@@ -6,7 +6,6 @@ import (
 	"strconv"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -37,7 +36,7 @@ type GoogleSignIn struct {
 	// back any account link/creation and writes no audit row, so a refused
 	// sign-in is never audited as a success. A nil Complete admits every
 	// resolved member.
-	Complete func(ctx context.Context, user *dto.UserResponse) error
+	Complete func(ctx context.Context, member *Member) error
 	// MFARequired runs inside the same transaction after Complete. When it
 	// reports true, the first factor succeeded but no session is issued; the
 	// caller starts a two-step login challenge. A nil hook never requires MFA.
@@ -47,7 +46,7 @@ type GoogleSignIn struct {
 // GoogleSignInResult is the signed-in member and the issued session. When
 // MFARequired is set, Tokens is empty and the caller must start a challenge.
 type GoogleSignInResult struct {
-	User        *dto.UserResponse
+	Member      *Member
 	Tokens      TokenPair
 	MFARequired bool
 }
@@ -82,9 +81,8 @@ func (s *userService) completeGoogleSignIn(ctx context.Context, req GoogleSignIn
 		if err != nil {
 			return err
 		}
-		user := ToUserResponse(member)
 		if req.Complete != nil {
-			if err := req.Complete(ctx, user); err != nil {
+			if err := req.Complete(ctx, member); err != nil {
 				return err
 			}
 		}
@@ -106,7 +104,7 @@ func (s *userService) completeGoogleSignIn(ctx context.Context, req GoogleSignIn
 		if err := s.recordGoogleLogin(ctx, tx, member, account, mfaRequired); err != nil {
 			return err
 		}
-		result = &GoogleSignInResult{User: user, Tokens: tokens, MFARequired: mfaRequired}
+		result = &GoogleSignInResult{Member: member, Tokens: tokens, MFARequired: mfaRequired}
 		return nil
 	})
 	return result, err
