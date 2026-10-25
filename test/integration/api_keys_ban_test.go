@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
+	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 )
@@ -23,24 +23,24 @@ func TestIntegration_APIKeyBanRevokesAndUnbanDoesNotRevive(t *testing.T) {
 
 	ownerID := testutil.CreateMember(t, ctx, h.pool, h.tenant, "apikey-ban@test.com", testutil.MemberOptions{}).UserID
 
-	before, err := h.svc.Create(ctx, ownerID, apikeydto.CreateRequest{Name: "before-ban", Scopes: []string{"files:read"}})
+	before, err := h.svc.Create(ctx, ownerID, apikeyservice.CreateInput{Name: "before-ban", Scopes: []string{"files:read"}})
 	require.NoError(t, err)
-	resp, body := h.request(t, before.Key, "")
+	resp, body := h.request(t, before.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 
 	memberships := identityrepo.NewMembershipRepository(h.pool)
 	_, err = memberships.Ban(ctx, ownerID)
 	require.NoError(t, err)
-	resp, _ = h.request(t, before.Key, "")
+	resp, _ = h.request(t, before.Secret, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode, "banned owner")
 
 	_, err = memberships.Unban(ctx, ownerID)
 	require.NoError(t, err)
-	resp, _ = h.request(t, before.Key, "")
+	resp, _ = h.request(t, before.Secret, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode, "unban must not revive a key issued before the ban")
 
-	after, err := h.svc.Create(ctx, ownerID, apikeydto.CreateRequest{Name: "after-unban", Scopes: []string{"files:read"}})
+	after, err := h.svc.Create(ctx, ownerID, apikeyservice.CreateInput{Name: "after-unban", Scopes: []string{"files:read"}})
 	require.NoError(t, err)
-	resp, body = h.request(t, after.Key, "")
+	resp, body = h.request(t, after.Secret, "")
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "a key issued after the unban works; body: %s", body)
 }

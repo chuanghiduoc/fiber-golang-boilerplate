@@ -9,8 +9,6 @@ import (
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -20,17 +18,17 @@ import (
 )
 
 type fakeRepo struct {
-	keys   map[int64]*repository.APIKey
+	keys   map[int64]*APIKey
 	nextID int64
 }
 
 func newFakeRepo() *fakeRepo {
-	return &fakeRepo{keys: make(map[int64]*repository.APIKey), nextID: 1}
+	return &fakeRepo{keys: make(map[int64]*APIKey), nextID: 1}
 }
 
-func (r *fakeRepo) Create(ctx context.Context, params repository.CreateParams) (*repository.APIKey, error) {
+func (r *fakeRepo) Create(ctx context.Context, params NewKey) (*APIKey, error) {
 	now := time.Now().UTC()
-	key := &repository.APIKey{
+	key := &APIKey{
 		ID:        r.nextID,
 		TenantID:  tenant.EffectiveID(ctx),
 		UserID:    params.UserID,
@@ -48,7 +46,7 @@ func (r *fakeRepo) Create(ctx context.Context, params repository.CreateParams) (
 	return &clone, nil
 }
 
-func (r *fakeRepo) GetByID(ctx context.Context, id int64) (*repository.APIKey, error) {
+func (r *fakeRepo) GetByID(ctx context.Context, id int64) (*APIKey, error) {
 	key, ok := r.keys[id]
 	if !ok || key.TenantID != tenant.EffectiveID(ctx) {
 		return nil, apperror.ErrNotFound
@@ -57,7 +55,7 @@ func (r *fakeRepo) GetByID(ctx context.Context, id int64) (*repository.APIKey, e
 	return &clone, nil
 }
 
-func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*repository.APIKey, error) {
+func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*APIKey, error) {
 	for _, key := range r.keys {
 		if key.Hash == hash {
 			clone := *key
@@ -67,8 +65,8 @@ func (r *fakeRepo) GetByHash(_ context.Context, hash string) (*repository.APIKey
 	return nil, apperror.ErrNotFound
 }
 
-func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]repository.APIKey, error) {
-	keys := make([]repository.APIKey, 0)
+func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error) {
+	keys := make([]APIKey, 0)
 	for _, key := range r.keys {
 		if key.TenantID == tenant.EffectiveID(ctx) {
 			keys = append(keys, *key)
@@ -87,7 +85,7 @@ func (r *fakeRepo) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]r
 	return keys, nil
 }
 
-func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*repository.APIKey, error) {
+func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error) {
 	key, ok := r.keys[id]
 	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
 		return nil, apperror.ErrNotFound
@@ -99,7 +97,7 @@ func (r *fakeRepo) Update(ctx context.Context, id int64, name string, scopes []a
 	return &clone, nil
 }
 
-func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*repository.APIKey, error) {
+func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*APIKey, error) {
 	key, ok := r.keys[id]
 	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil {
 		return nil, apperror.ErrNotFound
@@ -111,7 +109,7 @@ func (r *fakeRepo) Revoke(ctx context.Context, id int64) (*repository.APIKey, er
 	return &clone, nil
 }
 
-func (r *fakeRepo) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*repository.APIKey, error) {
+func (r *fakeRepo) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error) {
 	key, ok := r.keys[id]
 	if !ok || key.TenantID != tenant.EffectiveID(ctx) || key.RevokedAt != nil || key.RotatedAt != nil {
 		return nil, apperror.ErrNotFound
@@ -144,6 +142,28 @@ func (p fakePrincipals) GetPrincipal(_ context.Context, tenantID, userID int64) 
 	return user, nil
 }
 
+func (p fakePrincipals) LockPrincipal(ctx context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
+	return p.GetPrincipal(ctx, tenantID, userID)
+}
+
+type auditWriterFunc func(ctx context.Context, event audit.Event) error
+
+func (f auditWriterFunc) RecordTx(ctx context.Context, event audit.Event) error { return f(ctx, event) }
+
+// fakeTx runs fn directly against the fake repository. It has no rollback;
+// atomicity is covered against PostgreSQL in test/integration.
+type fakeTx struct {
+	keys       APIKeyRepository
+	audit      AuditWriter
+	principals PrincipalLocker
+}
+
+var _ Transactor = fakeTx{}
+
+func (f fakeTx) InTx(ctx context.Context, fn func(ctx context.Context, tx TxRepos) error) error {
+	return fn(ctx, TxRepos{Keys: f.keys, Audit: f.audit, Principals: f.principals})
+}
+
 // testContext is a trusted system-caller context for tenantID. Tests that
 // model an HTTP caller wrap it with authz.WithSubject; the subject wins.
 func testContext(tenantID int64) context.Context {
@@ -157,7 +177,7 @@ func TestService_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	}}
 	svc := newTestService(repo, principals)
 
-	_, err := svc.Create(tenant.WithID(context.Background(), 1), 10, apikeydto.CreateRequest{
+	_, err := svc.Create(tenant.WithID(context.Background(), 1), 10, CreateInput{
 		Name: "x", Scopes: []string{"files:read"},
 	})
 	var appErr *apperror.AppError
@@ -169,8 +189,12 @@ func TestService_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	}
 }
 
-func newTestService(repo *fakeRepo, principals identitycontracts.PrincipalReader) Service {
-	return NewService(repo, principals, nil, audit.Noop{})
+func newTestService(repo *fakeRepo, principals fakePrincipals) Service {
+	return newAuditedTestService(repo, principals, auditWriterFunc(func(context.Context, audit.Event) error { return nil }))
+}
+
+func newAuditedTestService(repo *fakeRepo, principals fakePrincipals, recorder AuditWriter) Service {
+	return NewService(repo, principals, fakeTx{keys: repo, audit: recorder, principals: principals})
 }
 
 func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
@@ -180,7 +204,7 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	}}
 	svc := newTestService(repo, principals)
 
-	created, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{
+	created, err := svc.Create(testContext(1), 10, CreateInput{
 		Name:   "  deploy  ",
 		Scopes: []string{"files:read", "files:read"},
 	})
@@ -193,20 +217,20 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	if len(created.Scopes) != 1 || created.Scopes[0] != "files:read" {
 		t.Fatalf("scopes = %v, want deduplicated files:read", created.Scopes)
 	}
-	if !apikey.Valid(created.Key) {
-		t.Fatalf("returned key %q is malformed", created.Key)
+	if !apikey.Valid(created.Secret) {
+		t.Fatalf("returned key %q is malformed", created.Secret)
 	}
-	if !strings.HasPrefix(created.Key, apikey.DefaultPrefix+"_") {
-		t.Fatalf("returned key %q has wrong prefix", created.Key)
+	if !strings.HasPrefix(created.Secret, apikey.DefaultPrefix+"_") {
+		t.Fatalf("returned key %q has wrong prefix", created.Secret)
 	}
 	stored := repo.keys[created.ID]
 	if stored == nil {
 		t.Fatal("key not persisted")
 	}
-	if stored.Hash != apikey.Hash(created.Key) {
+	if stored.Hash != apikey.Hash(created.Secret) {
 		t.Fatal("stored hash does not match the returned key")
 	}
-	if strings.Contains(stored.Hash, created.Key) {
+	if strings.Contains(stored.Hash, created.Secret) {
 		t.Fatal("plaintext key must never be stored")
 	}
 	if stored.TenantID != 1 || stored.UserID != 10 {
@@ -237,13 +261,13 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 
 	tests := []struct {
 		name string
-		req  apikeydto.CreateRequest
+		req  CreateInput
 	}{
-		{name: "blank name", req: apikeydto.CreateRequest{Name: "  ", Scopes: []string{"files:read"}}},
-		{name: "no scopes", req: apikeydto.CreateRequest{Name: "x"}},
-		{name: "unknown scope", req: apikeydto.CreateRequest{Name: "x", Scopes: []string{"root:everything"}}},
-		{name: "privilege escalation", req: apikeydto.CreateRequest{Name: "x", Scopes: []string{"admin:users:read"}}},
-		{name: "past expiry", req: apikeydto.CreateRequest{
+		{name: "blank name", req: CreateInput{Name: "  ", Scopes: []string{"files:read"}}},
+		{name: "no scopes", req: CreateInput{Name: "x"}},
+		{name: "unknown scope", req: CreateInput{Name: "x", Scopes: []string{"root:everything"}}},
+		{name: "privilege escalation", req: CreateInput{Name: "x", Scopes: []string{"admin:users:read"}}},
+		{name: "past expiry", req: CreateInput{
 			Name:      "x",
 			Scopes:    []string{"files:read"},
 			ExpiresAt: ptrTime(time.Now().Add(-time.Minute)),
@@ -259,7 +283,7 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 		})
 	}
 
-	_, err := svc.Create(ctx, 99, apikeydto.CreateRequest{Name: "x", Scopes: []string{"files:read"}})
+	_, err := svc.Create(ctx, 99, CreateInput{Name: "x", Scopes: []string{"files:read"}})
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 404 {
 		t.Fatalf("missing owner error = %v, want 404", err)
@@ -269,14 +293,14 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	scopedCaller := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
 		10, 1, authz.RoleAdmin, testScopeFilesRead,
 	))
-	_, err = svc.Create(scopedCaller, 10, apikeydto.CreateRequest{Name: "x", Scopes: []string{"files:write"}})
+	_, err = svc.Create(scopedCaller, 10, CreateInput{Name: "x", Scopes: []string{"files:write"}})
 	if !errors.As(err, &appErr) || appErr.Status != 400 {
 		t.Fatalf("caller escalation error = %v, want 400", err)
 	}
 
 	// Rotation mints a secret with the existing scopes, so a narrower caller
 	// cannot rotate a broader key either.
-	broad, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{Name: "broad", Scopes: []string{"files:write"}})
+	broad, err := svc.Create(testContext(1), 10, CreateInput{Name: "broad", Scopes: []string{"files:write"}})
 	if err != nil {
 		t.Fatalf("create broad key: %v", err)
 	}
@@ -294,11 +318,11 @@ func TestService_TenantIsolation(t *testing.T) {
 	}}
 	svc := newTestService(repo, principals)
 
-	keyA, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{Name: "a", Scopes: []string{"files:read"}})
+	keyA, err := svc.Create(testContext(1), 10, CreateInput{Name: "a", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create tenant 1: %v", err)
 	}
-	keyB, err := svc.Create(testContext(2), 20, apikeydto.CreateRequest{Name: "b", Scopes: []string{"files:read"}})
+	keyB, err := svc.Create(testContext(2), 20, CreateInput{Name: "b", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create tenant 2: %v", err)
 	}
@@ -306,7 +330,7 @@ func TestService_TenantIsolation(t *testing.T) {
 	if _, err := svc.Get(testContext(1), keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant get error = %v, want 404", err)
 	}
-	if _, err := svc.Update(testContext(1), keyB.ID, apikeydto.UpdateRequest{Name: ptrString("hijack")}); !isNotFound(err) {
+	if _, err := svc.Update(testContext(1), keyB.ID, UpdateInput{Name: ptrString("hijack")}); !isNotFound(err) {
 		t.Fatalf("cross-tenant update error = %v, want 404", err)
 	}
 	if err := svc.Revoke(testContext(1), keyB.ID); !isNotFound(err) {
@@ -340,7 +364,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
 
-	created, err := svc.Create(ctx, 10, apikeydto.CreateRequest{
+	created, err := svc.Create(ctx, 10, CreateInput{
 		Name:   "deploy",
 		Scopes: []string{"files:read"},
 	})
@@ -348,7 +372,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	updated, err := svc.Update(ctx, created.ID, apikeydto.UpdateRequest{
+	updated, err := svc.Update(ctx, created.ID, UpdateInput{
 		Name:   ptrString("release"),
 		Scopes: []string{"files:read", "files:write"},
 	})
@@ -358,7 +382,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	if updated.Name != "release" || len(updated.Scopes) != 2 {
 		t.Fatalf("updated = %+v, want release with two scopes", updated)
 	}
-	if _, err := svc.Update(ctx, created.ID, apikeydto.UpdateRequest{Scopes: []string{"admin:users:read"}}); !isBadRequest(err) {
+	if _, err := svc.Update(ctx, created.ID, UpdateInput{Scopes: []string{"admin:users:read"}}); !isBadRequest(err) {
 		t.Fatalf("scope escalation update error = %v, want 400", err)
 	}
 
@@ -369,7 +393,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	if rotated.PreviousKeyID != created.ID {
 		t.Fatalf("previous key id = %d, want %d", rotated.PreviousKeyID, created.ID)
 	}
-	if rotated.Key == created.Key {
+	if rotated.Secret == created.Secret {
 		t.Fatal("rotation must return a new secret")
 	}
 	if rotated.ID == created.ID {
@@ -395,7 +419,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	if err := svc.Revoke(ctx, rotated.ID); err != nil {
 		t.Fatalf("idempotent revoke: %v", err)
 	}
-	if _, err := svc.Update(ctx, rotated.ID, apikeydto.UpdateRequest{Name: ptrString("x")}); !isConflict(err) {
+	if _, err := svc.Update(ctx, rotated.ID, UpdateInput{Name: ptrString("x")}); !isConflict(err) {
 		t.Fatalf("update revoked error = %v, want 409", err)
 	}
 	if _, err := svc.Rotate(ctx, rotated.ID); !isConflict(err) {
@@ -411,7 +435,7 @@ func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
 
-	created, err := svc.Create(ctx, 10, apikeydto.CreateRequest{Name: "deploy", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, 10, CreateInput{Name: "deploy", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -421,13 +445,13 @@ func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	}
 
 	verifier := apikey.NewVerifier(verifierStore{repo: repo}, principals)
-	if _, err := verifier.Verify(ctx, created.Key, 1); err != nil {
+	if _, err := verifier.Verify(ctx, created.Secret, 1); err != nil {
 		t.Fatalf("old key must remain valid during grace: %v", err)
 	}
-	if _, err := verifier.Verify(ctx, rotated.Key, 1); err != nil {
+	if _, err := verifier.Verify(ctx, rotated.Secret, 1); err != nil {
 		t.Fatalf("new key must verify: %v", err)
 	}
-	if _, err := verifier.Verify(ctx, created.Key, 2); !isForbidden(err) {
+	if _, err := verifier.Verify(ctx, created.Secret, 2); !isForbidden(err) {
 		t.Fatalf("tenant mismatch error = %v, want 403", err)
 	}
 }

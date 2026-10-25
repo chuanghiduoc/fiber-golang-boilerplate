@@ -12,17 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -36,55 +31,38 @@ const (
 
 // Service is the API-key administration surface consumed by the HTTP handler.
 type Service interface {
-	Create(ctx context.Context, callerUserID int64, req apikeydto.CreateRequest) (*apikeydto.KeyWithSecretResponse, error)
-	List(ctx context.Context, limit int, startingAfter string) ([]apikeydto.APIKeyResponse, bool, error)
-	Get(ctx context.Context, id int64) (*apikeydto.APIKeyResponse, error)
-	Update(ctx context.Context, id int64, req apikeydto.UpdateRequest) (*apikeydto.APIKeyResponse, error)
+	Create(ctx context.Context, callerUserID int64, in CreateInput) (*CreatedKey, error)
+	List(ctx context.Context, limit int, startingAfter string) ([]APIKey, bool, error)
+	Get(ctx context.Context, id int64) (*APIKey, error)
+	Update(ctx context.Context, id int64, in UpdateInput) (*APIKey, error)
 	Revoke(ctx context.Context, id int64) error
-	Rotate(ctx context.Context, id int64) (*apikeydto.RotateResponse, error)
+	Rotate(ctx context.Context, id int64) (*RotatedKey, error)
 }
 
 type service struct {
-	repo       repository.APIKeyRepository
+	keys       APIKeyRepository
 	principals identitycontracts.PrincipalReader
-	txManager  *database.TxManager
-	audit      audit.TxRecorder
+	tx         Transactor
 	now        func() time.Time
 }
 
 // NewService builds the API-key service. Every lifecycle mutation is Tier 1
 // audited: the audit row is written in the mutation's transaction, so a
-// failed audit write rolls the change back (503 system.audit_unavailable). A
-// nil auditRecorder disables auditing for tests and minimal deployments.
-func NewService(
-	repo repository.APIKeyRepository,
-	principals identitycontracts.PrincipalReader,
-	txManager *database.TxManager,
-	auditRecorder audit.TxRecorder,
-) Service {
+// failed audit write rolls the change back (503 system.audit_unavailable).
+func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, tx Transactor) Service {
 	return &service{
-		repo:       repo,
+		keys:       keys,
 		principals: principals,
-		txManager:  txManager,
-		audit:      auditRecorder,
+		tx:         tx,
 		now:        time.Now,
 	}
 }
 
-// mutate runs fn on a transaction-backed repository (or the pool repository
-// when no transaction manager is wired, in which case tx is nil) and records
-// the audit event fn returns in the same transaction. A nil event means
-// nothing changed.
-func (s *service) mutate(ctx context.Context, fn func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error)) error {
-	if s.txManager == nil {
-		event, err := fn(nil, s.repo)
-		if err != nil {
-			return err
-		}
-		return s.recordAudit(ctx, nil, event)
-	}
-	return s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-		event, err := fn(tx, repository.NewAPIKeyRepository(tx))
+// mutate runs fn on a transaction and records the audit event it returns in
+// the same transaction. A nil event means nothing changed.
+func (s *service) mutate(ctx context.Context, fn func(ctx context.Context, tx TxRepos) (*audit.Event, error)) error {
+	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		event, err := fn(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -92,11 +70,11 @@ func (s *service) mutate(ctx context.Context, fn func(tx pgx.Tx, repo repository
 	})
 }
 
-func (s *service) recordAudit(ctx context.Context, tx pgx.Tx, event *audit.Event) error {
+func (s *service) recordAudit(ctx context.Context, tx TxRepos, event *audit.Event) error {
 	if event == nil {
 		return nil
 	}
-	if err := audit.RecordInTx(ctx, s.audit, tx, *event); err != nil {
+	if err := tx.Audit.RecordTx(ctx, *event); err != nil {
 		slog.Error("failed to write transactional audit event",
 			slog.String("action", event.Action),
 			slog.Any("error", err),
@@ -108,7 +86,7 @@ func (s *service) recordAudit(ctx context.Context, tx pgx.Tx, event *audit.Event
 
 // keyEvent builds a service audit event for key. Metadata never contains the
 // secret or its hash.
-func keyEvent(ctx context.Context, action string, key *repository.APIKey, extra map[string]any) *audit.Event {
+func keyEvent(ctx context.Context, action string, key *APIKey, extra map[string]any) *audit.Event {
 	event := audit.NewServiceEvent(ctx, action, "api_key")
 	event.ResourceID = strconv.FormatInt(key.ID, 10)
 	scopes := make([]string, len(key.Scopes))
@@ -129,13 +107,13 @@ func keyEvent(ctx context.Context, action string, key *repository.APIKey, extra 
 	return &event
 }
 
-func (s *service) Create(ctx context.Context, callerUserID int64, req apikeydto.CreateRequest) (*apikeydto.KeyWithSecretResponse, error) {
-	name, err := normalizeName(req.Name)
+func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput) (*CreatedKey, error) {
+	name, err := normalizeName(in.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	ownerID := req.UserID
+	ownerID := in.UserID
 	if ownerID == 0 {
 		ownerID = callerUserID
 	}
@@ -143,7 +121,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, req apikeydto.
 		return nil, apperror.NewBadRequest("userId is required")
 	}
 
-	expiresAt, err := validateExpiry(req.ExpiresAt, s.now())
+	expiresAt, err := validateExpiry(in.ExpiresAt, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -152,22 +130,22 @@ func (s *service) Create(ctx context.Context, callerUserID int64, req apikeydto.
 		return nil, apperror.NewInternal("failed to generate API key")
 	}
 
-	var created *repository.APIKey
-	err = s.mutate(ctx, func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
+	var created *APIKey
+	err = s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
 		// The owner stays locked until the key commits, so a concurrent ban
 		// either finishes first (no row: 404) or waits and then revokes it.
 		principal, ownerErr := s.lockActiveOwner(ctx, tx, ownerID)
 		if ownerErr != nil {
 			return nil, ownerErr
 		}
-		scopes, scopeErr := normalizeScopes(req.Scopes, principal.Role)
+		scopes, scopeErr := normalizeScopes(in.Scopes, principal.Role)
 		if scopeErr != nil {
 			return nil, scopeErr
 		}
 		if grantErr := ensureCallerCanGrant(ctx, scopes); grantErr != nil {
 			return nil, grantErr
 		}
-		key, createErr := repo.Create(ctx, repository.CreateParams{
+		key, createErr := tx.Keys.Create(ctx, NewKey{
 			UserID:    ownerID,
 			Name:      name,
 			Prefix:    credentials.Prefix,
@@ -188,18 +166,15 @@ func (s *service) Create(ctx context.Context, callerUserID int64, req apikeydto.
 		return nil, err
 	}
 
-	return &apikeydto.KeyWithSecretResponse{
-		APIKeyResponse: toResponse(created),
-		Key:            credentials.Key,
-	}, nil
+	return &CreatedKey{APIKey: *created, Secret: credentials.Key}, nil
 }
 
-func (s *service) List(ctx context.Context, limit int, startingAfter string) ([]apikeydto.APIKeyResponse, bool, error) {
+func (s *service) List(ctx context.Context, limit int, startingAfter string) ([]APIKey, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
 	}
-	keys, err := s.repo.ListCursor(ctx, cur)
+	keys, err := s.keys.ListCursor(ctx, cur)
 	if err != nil {
 		return nil, false, apperror.NewInternal("failed to list API keys")
 	}
@@ -207,24 +182,15 @@ func (s *service) List(ctx context.Context, limit int, startingAfter string) ([]
 	if hasMore {
 		keys = keys[:pageSize]
 	}
-	responses := make([]apikeydto.APIKeyResponse, len(keys))
-	for i := range keys {
-		responses[i] = toResponse(&keys[i])
-	}
-	return responses, hasMore, nil
+	return keys, hasMore, nil
 }
 
-func (s *service) Get(ctx context.Context, id int64) (*apikeydto.APIKeyResponse, error) {
-	key, err := s.get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	resp := toResponse(key)
-	return &resp, nil
+func (s *service) Get(ctx context.Context, id int64) (*APIKey, error) {
+	return s.get(ctx, id)
 }
 
-func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequest) (*apikeydto.APIKeyResponse, error) {
-	if req.Name == nil && len(req.Scopes) == 0 {
+func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey, error) {
+	if in.Name == nil && len(in.Scopes) == 0 {
 		return nil, apperror.NewBadRequest("at least one of name or scopes is required")
 	}
 	existing, err := s.get(ctx, id)
@@ -236,19 +202,19 @@ func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequ
 	}
 
 	name := existing.Name
-	if req.Name != nil {
-		name, err = normalizeName(*req.Name)
+	if in.Name != nil {
+		name, err = normalizeName(*in.Name)
 		if err != nil {
 			return nil, err
 		}
 	}
 	scopes := existing.Scopes
-	if len(req.Scopes) > 0 {
+	if len(in.Scopes) > 0 {
 		principal, err := s.loadPrincipal(ctx, existing.UserID)
 		if err != nil {
 			return nil, err
 		}
-		scopes, err = normalizeScopes(req.Scopes, principal.Role)
+		scopes, err = normalizeScopes(in.Scopes, principal.Role)
 		if err != nil {
 			return nil, err
 		}
@@ -257,9 +223,9 @@ func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequ
 		}
 	}
 
-	var updated *repository.APIKey
-	err = s.mutate(ctx, func(_ pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
-		key, updateErr := repo.Update(ctx, id, name, scopes)
+	var updated *APIKey
+	err = s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
+		key, updateErr := tx.Keys.Update(ctx, id, name, scopes)
 		if updateErr != nil {
 			if errors.Is(updateErr, apperror.ErrNotFound) {
 				return nil, apperror.NewNotFound("API key not found")
@@ -272,13 +238,12 @@ func (s *service) Update(ctx context.Context, id int64, req apikeydto.UpdateRequ
 	if err != nil {
 		return nil, err
 	}
-	resp := toResponse(updated)
-	return &resp, nil
+	return updated, nil
 }
 
 func (s *service) Revoke(ctx context.Context, id int64) error {
-	return s.mutate(ctx, func(_ pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
-		revoked, err := repo.Revoke(ctx, id)
+	return s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
+		revoked, err := tx.Keys.Revoke(ctx, id)
 		if err == nil {
 			return keyEvent(ctx, "api_key.revoked", revoked, nil), nil
 		}
@@ -289,7 +254,7 @@ func (s *service) Revoke(ctx context.Context, id int64) error {
 		// Revocation is idempotent: revoking an already-revoked key succeeds
 		// without a second audit row, while a missing or cross-tenant id is
 		// concealed as not found.
-		existing, getErr := repo.GetByID(ctx, id)
+		existing, getErr := tx.Keys.GetByID(ctx, id)
 		if getErr != nil {
 			if errors.Is(getErr, apperror.ErrNotFound) {
 				return nil, apperror.NewNotFound("API key not found")
@@ -303,12 +268,12 @@ func (s *service) Revoke(ctx context.Context, id int64) error {
 	})
 }
 
-func (s *service) Rotate(ctx context.Context, id int64) (*apikeydto.RotateResponse, error) {
+func (s *service) Rotate(ctx context.Context, id int64) (*RotatedKey, error) {
 	graceSeconds := int32(RotationGrace / time.Second)
 
-	var result *apikeydto.RotateResponse
-	err := s.mutate(ctx, func(tx pgx.Tx, repo repository.APIKeyRepository) (*audit.Event, error) {
-		rotated, rotateErr := s.rotate(ctx, tx, repo, id, graceSeconds)
+	var result *RotatedKey
+	err := s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
+		rotated, rotateErr := s.rotate(ctx, tx, id, graceSeconds)
 		if rotateErr != nil {
 			return nil, rotateErr
 		}
@@ -328,14 +293,8 @@ func (s *service) Rotate(ctx context.Context, id int64) (*apikeydto.RotateRespon
 	return result, nil
 }
 
-func (s *service) rotate(
-	ctx context.Context,
-	tx pgx.Tx,
-	repo repository.APIKeyRepository,
-	id int64,
-	graceSeconds int32,
-) (*apikeydto.RotateResponse, error) {
-	existing, err := repo.GetByID(ctx, id)
+func (s *service) rotate(ctx context.Context, tx TxRepos, id int64, graceSeconds int32) (*RotatedKey, error) {
+	existing, err := tx.Keys.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("API key not found")
@@ -358,7 +317,7 @@ func (s *service) rotate(
 		return nil, err
 	}
 
-	rotated, err := repo.MarkRotated(ctx, id, graceSeconds)
+	rotated, err := tx.Keys.MarkRotated(ctx, id, graceSeconds)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			// Another request rotated or revoked the key between the read and
@@ -372,7 +331,7 @@ func (s *service) rotate(
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate API key")
 	}
-	created, err := repo.Create(ctx, repository.CreateParams{
+	created, err := tx.Keys.Create(ctx, NewKey{
 		UserID:    rotated.UserID,
 		Name:      rotated.Name,
 		Prefix:    credentials.Prefix,
@@ -388,18 +347,15 @@ func (s *service) rotate(
 	if rotated.RotationGraceUntil != nil {
 		validUntil = *rotated.RotationGraceUntil
 	}
-	return &apikeydto.RotateResponse{
-		KeyWithSecretResponse: apikeydto.KeyWithSecretResponse{
-			APIKeyResponse: toResponse(created),
-			Key:            credentials.Key,
-		},
+	return &RotatedKey{
+		CreatedKey:            CreatedKey{APIKey: *created, Secret: credentials.Key},
 		PreviousKeyID:         rotated.ID,
 		PreviousKeyValidUntil: validUntil,
 	}, nil
 }
 
-func (s *service) get(ctx context.Context, id int64) (*repository.APIKey, error) {
-	key, err := s.repo.GetByID(ctx, id)
+func (s *service) get(ctx context.Context, id int64) (*APIKey, error) {
+	key, err := s.keys.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("API key not found")
@@ -414,7 +370,7 @@ func (s *service) get(ctx context.Context, id int64) (*repository.APIKey, error)
 // created: the verifier already rejects such a key, and rotating it would
 // otherwise turn a dead credential into a live one (for example after an
 // unban, which keeps credentials_revoked_at).
-func (s *service) ensureOwnerCanRotate(ctx context.Context, tx pgx.Tx, key *repository.APIKey) error {
+func (s *service) ensureOwnerCanRotate(ctx context.Context, tx TxRepos, key *APIKey) error {
 	owner, err := s.lockActiveOwner(ctx, tx, key.UserID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -428,30 +384,21 @@ func (s *service) ensureOwnerCanRotate(ctx context.Context, tx pgx.Tx, key *repo
 	return nil
 }
 
-// PrincipalLocker is the transactional side of the identity principal reader
-// (identity's adapter implements it). It lives here rather than in the
-// stdlib-only contracts package because it takes the caller's pgx.Tx.
-type PrincipalLocker interface {
-	LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (identitycontracts.Principal, error)
-}
-
-// lockActiveOwner loads the key owner and, inside a transaction, holds the
-// owner's user row FOR SHARE until the key write commits. The API-key FK only
-// takes KEY SHARE, which a ban's UPDATE does not wait for; without this lock
-// a key inserted while its owner is being banned would survive the ban and
-// come back to life on unban. Without a transaction (unit tests) it falls
-// back to an unlocked read. A wired reader that cannot lock fails closed.
-func (s *service) lockActiveOwner(ctx context.Context, tx pgx.Tx, userID int64) (identitycontracts.Principal, error) {
-	if tx == nil || s.principals == nil {
+// lockActiveOwner loads the key owner and holds the owner's membership row
+// FOR SHARE until the key write commits. The API-key FK only takes KEY SHARE,
+// which a ban's UPDATE does not wait for; without this lock a key inserted
+// while its owner is being banned would survive the ban and come back to life
+// on unban. A wired reader that cannot lock fails closed.
+func (s *service) lockActiveOwner(ctx context.Context, tx TxRepos, userID int64) (identitycontracts.Principal, error) {
+	if s.principals == nil {
 		return s.loadPrincipal(ctx, userID)
 	}
-	locker, ok := s.principals.(PrincipalLocker)
-	if !ok {
+	if tx.Principals == nil {
 		slog.Error("API key owner reader cannot lock the owner row; refusing the key write")
 		return identitycontracts.Principal{}, apperror.NewInternal("failed to load API key owner")
 	}
 	return s.checkPrincipal(ctx, userID, func(tenantID int64) (identitycontracts.Principal, error) {
-		return locker.LockPrincipalTx(ctx, tx, tenantID, userID)
+		return tx.Principals.LockPrincipal(ctx, tenantID, userID)
 	})
 }
 
@@ -556,27 +503,6 @@ func validateExpiry(expiresAt *time.Time, now time.Time) (*time.Time, error) {
 		return nil, apperror.NewBadRequest("expiresAt must be in the future")
 	}
 	return &value, nil
-}
-
-func toResponse(key *repository.APIKey) apikeydto.APIKeyResponse {
-	scopes := make([]string, len(key.Scopes))
-	for i, scope := range key.Scopes {
-		scopes[i] = string(scope)
-	}
-	return apikeydto.APIKeyResponse{
-		ID:                 key.ID,
-		UserID:             key.UserID,
-		Name:               key.Name,
-		Prefix:             key.Prefix,
-		Scopes:             scopes,
-		ExpiresAt:          key.ExpiresAt,
-		RevokedAt:          key.RevokedAt,
-		RotatedAt:          key.RotatedAt,
-		RotationGraceUntil: key.RotationGraceUntil,
-		LastUsedAt:         key.LastUsedAt,
-		CreatedAt:          key.CreatedAt,
-		UpdatedAt:          key.UpdatedAt,
-	}
 }
 
 func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {

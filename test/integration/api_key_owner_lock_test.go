@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	apikeyrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
@@ -56,7 +55,7 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	keyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	return &ownerLockHarness{
 		pool:     pool,
-		keys:     apikeyservice.NewService(keyRepo, principals, txManager, audit.Noop{}),
+		keys:     apikeyservice.NewService(keyRepo, principals, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals)),
 		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil), nil),
 		verifier: apikey.NewVerifier(apikeyadapter.NewVerifierStore(keyRepo), principals),
 		owner:    owner,
@@ -67,8 +66,8 @@ func ownerLockCtx() context.Context {
 	return authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 }
 
-func (h *ownerLockHarness) createKey(ctx context.Context) (*apikeydto.KeyWithSecretResponse, error) {
-	return h.keys.Create(ctx, h.owner, apikeydto.CreateRequest{Name: "lock", Scopes: []string{"files:read"}})
+func (h *ownerLockHarness) createKey(ctx context.Context) (*apikeyservice.CreatedKey, error) {
+	return h.keys.Create(ctx, h.owner, apikeyservice.CreateInput{Name: "lock", Scopes: []string{"files:read"}})
 }
 
 // A key created while its owner's ban is in flight must not be minted: the
@@ -130,7 +129,7 @@ func TestAPIKeyCreatedDuringBanStaysRevokedAfterUnban(t *testing.T) {
 	require.NoError(t, err)
 	credentials, err := apikey.Generate()
 	require.NoError(t, err)
-	_, err = apikeyrepo.NewAPIKeyRepository(keyTx).Create(ctx, apikeyrepo.CreateParams{
+	_, err = apikeyrepo.NewAPIKeyRepository(keyTx).Create(ctx, apikeyservice.NewKey{
 		UserID: h.owner, Name: "racing", Prefix: credentials.Prefix, Hash: credentials.Hash,
 	})
 	require.NoError(t, err)

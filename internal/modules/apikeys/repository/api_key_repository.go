@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	apikeyssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -20,66 +21,28 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// APIKey is the module's persistence-neutral representation. Hash never leaves
-// the module/platform boundary and is never serialized to HTTP clients.
-type APIKey struct {
-	ID                 int64
-	TenantID           int64
-	UserID             int64
-	Name               string
-	Prefix             string
-	Hash               string
-	Scopes             []authz.Permission
-	ExpiresAt          *time.Time
-	RevokedAt          *time.Time
-	RotatedAt          *time.Time
-	RotationGraceUntil *time.Time
-	LastUsedAt         *time.Time
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
-}
-
-// CreateParams creates a key for a tenant/user. TenantID is overridden by the
-// repository with the request tenant.
-type CreateParams struct {
-	TenantID  int64
-	UserID    int64
-	Name      string
-	Prefix    string
-	Hash      string
-	Scopes    []authz.Permission
-	ExpiresAt *time.Time
-}
-
-// APIKeyRepository is the module's data-access contract.
-type APIKeyRepository interface {
-	Create(ctx context.Context, params CreateParams) (*APIKey, error)
-	GetByID(ctx context.Context, id int64) (*APIKey, error)
-	GetByHash(ctx context.Context, hash string) (*APIKey, error)
-	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error)
-	Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error)
-	Revoke(ctx context.Context, id int64) (*APIKey, error)
-	MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error)
-	TouchLastUsed(ctx context.Context, id int64, at time.Time) error
-}
-
-type apiKeyRepository struct {
+// APIKeyRepository implements service.APIKeyRepository over sqlc.
+type APIKeyRepository struct {
 	q *apikeyssqlc.Queries
 }
 
-func NewAPIKeyRepository(db apikeyssqlc.DBTX) APIKeyRepository {
-	return &apiKeyRepository{q: apikeyssqlc.New(db)}
+var _ apikeysvc.APIKeyRepository = (*APIKeyRepository)(nil)
+
+// NewAPIKeyRepository binds the repository to db: a pool for standalone reads
+// and writes, or a pgx.Tx inside Transactor.InTx.
+func NewAPIKeyRepository(db apikeyssqlc.DBTX) *APIKeyRepository {
+	return &APIKeyRepository{q: apikeyssqlc.New(db)}
 }
 
-func (r *apiKeyRepository) Create(ctx context.Context, params CreateParams) (*APIKey, error) {
+func (r *APIKeyRepository) Create(ctx context.Context, key apikeysvc.NewKey) (*apikeysvc.APIKey, error) {
 	row, err := r.q.CreateAPIKey(ctx, apikeyssqlc.CreateAPIKeyParams{
-		Scopes:    scopeStrings(params.Scopes),
+		Scopes:    scopeStrings(key.Scopes),
 		TenantID:  tenant.EffectiveID(ctx),
-		UserID:    params.UserID,
-		Name:      params.Name,
-		Prefix:    params.Prefix,
-		KeyHash:   params.Hash,
-		ExpiresAt: timestamptz(params.ExpiresAt),
+		UserID:    key.UserID,
+		Name:      key.Name,
+		Prefix:    key.Prefix,
+		KeyHash:   key.Hash,
+		ExpiresAt: timestamptz(key.ExpiresAt),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -87,7 +50,7 @@ func (r *apiKeyRepository) Create(ctx context.Context, params CreateParams) (*AP
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) GetByID(ctx context.Context, id int64) (*APIKey, error) {
+func (r *APIKeyRepository) GetByID(ctx context.Context, id int64) (*apikeysvc.APIKey, error) {
 	row, err := r.q.GetAPIKeyByID(ctx, apikeyssqlc.GetAPIKeyByIDParams{
 		ID:       id,
 		TenantID: tenant.EffectiveID(ctx),
@@ -98,7 +61,7 @@ func (r *apiKeyRepository) GetByID(ctx context.Context, id int64) (*APIKey, erro
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) GetByHash(ctx context.Context, hash string) (*APIKey, error) {
+func (r *APIKeyRepository) GetByHash(ctx context.Context, hash string) (*apikeysvc.APIKey, error) {
 	row, err := r.q.GetAPIKeyByHash(ctx, hash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -106,7 +69,7 @@ func (r *apiKeyRepository) GetByHash(ctx context.Context, hash string) (*APIKey,
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error) {
+func (r *APIKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]apikeysvc.APIKey, error) {
 	rows, err := r.q.ListAPIKeysCursor(ctx, apikeyssqlc.ListAPIKeysCursorParams{
 		TenantID:        tenant.EffectiveID(ctx),
 		CursorCreatedAt: cur.CreatedAtParam(),
@@ -116,14 +79,14 @@ func (r *apiKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCurs
 	if err != nil {
 		return nil, err
 	}
-	keys := make([]APIKey, len(rows))
+	keys := make([]apikeysvc.APIKey, len(rows))
 	for i := range rows {
 		keys[i] = *toAPIKey(keyRow(rows[i]))
 	}
 	return keys, nil
 }
 
-func (r *apiKeyRepository) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error) {
+func (r *APIKeyRepository) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*apikeysvc.APIKey, error) {
 	row, err := r.q.UpdateAPIKey(ctx, apikeyssqlc.UpdateAPIKeyParams{
 		Scopes:   scopeStrings(scopes),
 		Name:     name,
@@ -136,7 +99,7 @@ func (r *apiKeyRepository) Update(ctx context.Context, id int64, name string, sc
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) Revoke(ctx context.Context, id int64) (*APIKey, error) {
+func (r *APIKeyRepository) Revoke(ctx context.Context, id int64) (*apikeysvc.APIKey, error) {
 	row, err := r.q.RevokeAPIKey(ctx, apikeyssqlc.RevokeAPIKeyParams{
 		ID:       id,
 		TenantID: tenant.EffectiveID(ctx),
@@ -147,7 +110,7 @@ func (r *apiKeyRepository) Revoke(ctx context.Context, id int64) (*APIKey, error
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error) {
+func (r *APIKeyRepository) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*apikeysvc.APIKey, error) {
 	row, err := r.q.MarkAPIKeyRotated(ctx, apikeyssqlc.MarkAPIKeyRotatedParams{
 		GraceSeconds: graceSeconds,
 		ID:           id,
@@ -159,7 +122,7 @@ func (r *apiKeyRepository) MarkRotated(ctx context.Context, id int64, graceSecon
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *apiKeyRepository) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+func (r *APIKeyRepository) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
 	return r.q.TouchAPIKeyLastUsed(ctx, apikeyssqlc.TouchAPIKeyLastUsedParams{
 		ID:         id,
 		LastUsedAt: timestamptz(&at),
@@ -192,12 +155,12 @@ func keyRow[T apiKeyRowTypes](row T) apiKeyRow {
 	return apiKeyRow(row)
 }
 
-func toAPIKey(row apiKeyRow) *APIKey {
+func toAPIKey(row apiKeyRow) *apikeysvc.APIKey {
 	scopes := make([]authz.Permission, len(row.Scopes))
 	for i, scope := range row.Scopes {
 		scopes[i] = authz.Permission(scope)
 	}
-	return &APIKey{
+	return &apikeysvc.APIKey{
 		ID:                 row.ID,
 		TenantID:           row.TenantID,
 		UserID:             row.UserID,

@@ -6,10 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
-
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -20,16 +17,12 @@ type recordingAudit struct {
 	err    error
 }
 
-func (r *recordingAudit) Record(_ context.Context, event audit.Event) error {
+func (r *recordingAudit) RecordTx(_ context.Context, event audit.Event) error {
 	if r.err != nil {
 		return r.err
 	}
 	r.events = append(r.events, event)
 	return nil
-}
-
-func (r *recordingAudit) RecordTx(ctx context.Context, _ pgx.Tx, event audit.Event) error {
-	return r.Record(ctx, event)
 }
 
 func auditTestPrincipals() fakePrincipals {
@@ -40,15 +33,15 @@ func auditTestPrincipals() fakePrincipals {
 
 func TestService_LifecycleMutationsAreAudited(t *testing.T) {
 	recorder := &recordingAudit{}
-	svc := NewService(newFakeRepo(), auditTestPrincipals(), nil, recorder)
+	svc := newAuditedTestService(newFakeRepo(), auditTestPrincipals(), recorder)
 	ctx := testContext(1)
 
-	created, err := svc.Create(ctx, 10, apikeydto.CreateRequest{Name: "deploy", Scopes: []string{"files:read"}})
+	created, err := svc.Create(ctx, 10, CreateInput{Name: "deploy", Scopes: []string{"files:read"}})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	name := "renamed"
-	if _, err := svc.Update(ctx, created.ID, apikeydto.UpdateRequest{Name: &name}); err != nil {
+	if _, err := svc.Update(ctx, created.ID, UpdateInput{Name: &name}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
 	rotated, err := svc.Rotate(ctx, created.ID)
@@ -73,7 +66,7 @@ func TestService_LifecycleMutationsAreAudited(t *testing.T) {
 			t.Fatalf("event %d = %+v, want %s on api_key", i, event, action)
 		}
 		for key, value := range event.Metadata {
-			if s, ok := value.(string); ok && (s == created.Key || s == rotated.Key) {
+			if s, ok := value.(string); ok && (s == created.Secret || s == rotated.Secret) {
 				t.Fatalf("event %d metadata %q leaks the secret", i, key)
 			}
 		}
@@ -82,9 +75,9 @@ func TestService_LifecycleMutationsAreAudited(t *testing.T) {
 
 func TestService_AuditFailureFailsClosed(t *testing.T) {
 	recorder := &recordingAudit{err: errors.New("audit store down")}
-	svc := NewService(newFakeRepo(), auditTestPrincipals(), nil, recorder)
+	svc := newAuditedTestService(newFakeRepo(), auditTestPrincipals(), recorder)
 
-	created, err := svc.Create(testContext(1), 10, apikeydto.CreateRequest{Name: "deploy", Scopes: []string{"files:read"}})
+	created, err := svc.Create(testContext(1), 10, CreateInput{Name: "deploy", Scopes: []string{"files:read"}})
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != http.StatusServiceUnavailable || appErr.Code != string(apperror.CodeSystemAuditUnavailable) {
 		t.Fatalf("err = %v, want 503 system.audit_unavailable", err)

@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	apikeyrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
@@ -30,6 +29,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 const apiKeyIntegrationSecret = "api-key-integration-secret"
@@ -37,7 +37,6 @@ const apiKeyIntegrationSecret = "api-key-integration-secret"
 type apiKeyHarness struct {
 	app    *fiber.App
 	pool   *pgxpool.Pool
-	repo   apikeyrepo.APIKeyRepository
 	svc    apikeyservice.Service
 	tenant int64
 	other  int64
@@ -72,7 +71,7 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, nil, audit.Noop{})
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(database.NewTxManager(pool), audit.Noop{}, principalReader))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
@@ -95,7 +94,6 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	return &apiKeyHarness{
 		app:    app,
 		pool:   pool,
-		repo:   apiKeyRepo,
 		svc:    svc,
 		tenant: tenant.DefaultID,
 		other:  tenantB,
@@ -123,13 +121,13 @@ func (h *apiKeyHarness) request(t *testing.T, key, slug string) (res *http.Respo
 func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	h := setupAPIKeyHarness(t)
 
-	created, err := h.svc.Create(systemTenantCtx(h.tenant), h.user, apikeydto.CreateRequest{
+	created, err := h.svc.Create(systemTenantCtx(h.tenant), h.user, apikeyservice.CreateInput{
 		Name:   "integration",
 		Scopes: []string{"files:read"},
 	})
 	require.NoError(t, err)
 
-	resp, body := h.request(t, created.Key, "")
+	resp, body := h.request(t, created.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 	var payload struct {
 		UserID     int64  `json:"userID"`
@@ -156,34 +154,34 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT slug FROM tenants WHERE id = $1`, h.other,
 	).Scan(&otherSlug))
-	resp, _ = h.request(t, created.Key, otherSlug)
+	resp, _ = h.request(t, created.Secret, otherSlug)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode, "tenant mismatch")
 
 	// Rotation keeps the old key valid during grace and issues a working new key.
 	rotated, err := h.svc.Rotate(systemTenantCtx(h.tenant), created.ID)
 	require.NoError(t, err)
-	resp, _ = h.request(t, created.Key, "")
+	resp, _ = h.request(t, created.Secret, "")
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "old key within rotation grace")
-	resp, _ = h.request(t, rotated.Key, "")
+	resp, _ = h.request(t, rotated.Secret, "")
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "new key after rotation")
 
 	// Revocation is immediate.
 	require.NoError(t, h.svc.Revoke(systemTenantCtx(h.tenant), rotated.ID))
-	resp, _ = h.request(t, rotated.Key, "")
+	resp, _ = h.request(t, rotated.Secret, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode, "revoked key")
 }
 
 func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	h := setupAPIKeyHarness(t)
 
-	keyB, err := h.svc.Create(systemTenantCtx(h.other), h.userB, apikeydto.CreateRequest{
+	keyB, err := h.svc.Create(systemTenantCtx(h.other), h.userB, apikeyservice.CreateInput{
 		Name:   "tenant-b",
 		Scopes: []string{"files:read"},
 	})
 	require.NoError(t, err)
 
 	// No header: the key's tenant is authoritative, so a non-default key works.
-	resp, body := h.request(t, keyB.Key, "")
+	resp, body := h.request(t, keyB.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 	var payload struct {
 		TenantID int64 `json:"tenantID"`
@@ -192,6 +190,6 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	assert.Equal(t, h.other, payload.TenantID)
 
 	// An explicit default-tenant header conflicts with the key binding.
-	resp, _ = h.request(t, keyB.Key, tenant.DefaultSlug)
+	resp, _ = h.request(t, keyB.Secret, tenant.DefaultSlug)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
 }

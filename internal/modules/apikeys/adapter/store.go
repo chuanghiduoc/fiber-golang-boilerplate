@@ -6,18 +6,18 @@ import (
 	"context"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
+	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 )
 
-// VerifierStore adapts APIKeyRepository to apikey.Store.
+// VerifierStore adapts the key repository to apikey.Store.
 type VerifierStore struct {
-	repo repository.APIKeyRepository
+	repo apikeysvc.APIKeyRepository
 }
 
 var _ apikey.Store = (*VerifierStore)(nil)
 
-func NewVerifierStore(repo repository.APIKeyRepository) *VerifierStore {
+func NewVerifierStore(repo apikeysvc.APIKeyRepository) *VerifierStore {
 	return &VerifierStore{repo: repo}
 }
 

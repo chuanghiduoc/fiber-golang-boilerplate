@@ -24,7 +24,7 @@ type Provides struct {
 func Build(infra app.Infra, principals identitycontracts.PrincipalReader) (*Module, Provides) {
 	repo := apikeyrepo.NewAPIKeyRepository(infra.Pool)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(repo), principals)
-	svc := apikeyservice.NewService(repo, principals, infra.Tx, infra.Audit)
+	svc := apikeyservice.NewService(repo, principals, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals))
 	return New(apikeyhandler.NewHandler(svc)), Provides{Verifier: verifier}
 }
 
