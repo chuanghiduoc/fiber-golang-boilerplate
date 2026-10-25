@@ -81,6 +81,10 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 
 	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
 
+	// cmd/gen (make gen module=<name>) inserts generated modules above the
+	// two gen: markers below; keep both lines.
+	// gen:module-build
+
 	return &Modules{
 		List: []app.Module{
 			identityModule,
@@ -90,6 +94,7 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 			webhooksModule,
 			apikeysModule,
 			notifications.Build(infra, identityProvides.Recipients),
+			// gen:module-list
 		},
 		Sessions:       identityProvides.Sessions,
 		TenantResolver: identityProvides.TenantResolver,

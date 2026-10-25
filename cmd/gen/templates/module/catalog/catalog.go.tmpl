@@ -1,0 +1,43 @@
+// Package catalog declares the {{.M.Name}} module's permissions
+// (permissions.go), error codes (errors.go), and i18n strings (locales/). It
+// is a leaf package so the module root, handlers, and services can use the
+// constants without an import cycle; the module root registers them through
+// the app provider hooks. Values are public API: never change them once
+// released.
+package catalog
+
+import (
+	"embed"
+	"io/fs"
+
+	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// Owner is the module name (Module.Name()) that owns these entries.
+const Owner = "{{.M.Name}}"
+
+// Register adds this catalog to the process-wide catalogs. At startup
+// app.RegisterCatalogs does the same through the module provider hooks;
+// handler/service unit tests that do not build the app call it directly.
+// Repeating it is a no-op.
+func Register() error {
+	if err := authz.Register(Owner, Permissions()...); err != nil {
+		return err
+	}
+	return apperror.Register(Owner, ErrorCodes())
+}
+
+//go:embed locales/*.json
+var localesFS embed.FS
+
+// Locales returns en.json/vi.json for app.LocaleProvider. Keys start with
+// "{{.M.Name}}." or "errors.", and both files must have the same keys.
+func Locales() fs.FS {
+	sub, err := fs.Sub(localesFS, "locales")
+	if err != nil {
+		// fs.Sub only fails for an invalid path literal: a build bug.
+		panic(err)
+	}
+	return sub
+}

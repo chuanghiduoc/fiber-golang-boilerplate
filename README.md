@@ -529,7 +529,8 @@ make docker-run                   # Start with Docker Compose (includes migrate 
 make docker-down                  # Stop Docker Compose
 make migrate-down CONFIRM=yes     # golang-migrate CLI: roll back everything (DROPS THE WHOLE SCHEMA)
 make migrate-create module=files name=add_x  # New UTC-timestamp migration (<ts>_<owner>_<purpose>)
-make sqlc-generate                # Regenerate sqlc code
+make sqlc-generate                # Regenerate sqlc code (every internal/modules/*/sqlc.yaml)
+make gen module=billing           # Generate a module (also resource= / command= / query= with module=)
 make swagger                      # Regenerate Swagger docs
 make seed                         # Apply schema, then seed the admin user
 make watch                        # Live reload with Air
@@ -646,18 +647,24 @@ flowchart LR
 
 ## Adding a New Module
 
-Run `scripts/new-module.sh <name>`, then follow
+Generate it with `cmd/gen`, then follow
 [docs/module-template.md](docs/module-template.md) for route wiring,
-permissions, audit, idempotency, tables, contracts, and tests.
+permissions, audit, idempotency, tables, contracts, and tests:
+
+```bash
+make gen module=billing                            # skeleton + bootstrap entry + init migration
+make gen resource=invoice module=billing           # tenant-scoped CRUD slice
+make gen command=IssueInvoice module=billing       # CQRS command (+ POST route)
+make gen query=ListOverdueInvoices module=billing  # CQRS query (+ GET route)
+```
 
 ```mermaid
 flowchart LR
-    A["scripts/new-module.sh"] --> B["Register in<br/>internal/bootstrap"]
-    B --> C["Catalog: permissions,<br/>errors, flags, en/vi"]
-    C --> D["queries/*.sql +<br/>make sqlc-generate"]
-    D --> E["Migration or<br/>init schema update"]
-    E --> F["Unit + integration tests"]
-    F --> G["make swagger<br/>make check"]
+    A["make gen module=..."] --> B["make gen resource= /<br/>command= / query="]
+    B --> C["auto: sqlc, build, vet,<br/>module tests, test/arch<br/>(rollback on failure)"]
+    C --> D["Review migration, grants,<br/>vi strings"]
+    D --> E["make migrate-run<br/>make swagger"]
+    E --> F["make check"]
 ```
 
 1. Implement `app.Module` (`Name`, `RegisterRoutes`) in
@@ -669,13 +676,14 @@ flowchart LR
    `catalog/` (self-registered through provider hooks) and protect every route
    with `authzhttp.Require(...)`. Do not copy the
    [legacy exceptions](docs/module-template.md#legacy-exceptions-do-not-copy).
-4. Write queries in `internal/modules/<name>/queries/<name>.sql` (the scaffold
-   appends the `sqlc.yaml` block) and run `make sqlc-generate`.
-5. For a deployed database run `make migrate-create module=<name>
-   name=<purpose>`; for this boilerplate's fresh installs update
-   `000001_init_schema`.
-6. Register the module once in `internal/bootstrap/modules.go`; module-owned
-   settings go in the module's `Settings` struct, filled there from `config`.
+4. Write queries in `internal/modules/<name>/queries/*.sql`; the module owns
+   its `internal/modules/<name>/sqlc.yaml` (there is no root config). Run
+   `make sqlc-generate` (every module) or `go generate ./internal/modules/<name>/`.
+5. Generated migrations are `<UTC ts>_<name>_<purpose>`; add other schema
+   changes with `make migrate-create module=<name> name=<purpose>`.
+6. `make gen module=<name>` registers the module once in
+   `internal/bootstrap/modules.go`; module-owned settings go in the module's
+   `Settings` struct, filled there from `config`.
 7. Add unit and integration tests; `test/arch` rejects cross-module imports
    and new layering violations.
 8. Run `make swagger` and `make check` before opening a PR.

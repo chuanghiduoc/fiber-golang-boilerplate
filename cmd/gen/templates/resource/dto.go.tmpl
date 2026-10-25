@@ -1,0 +1,16 @@
+package {{.M.Ident}}dto
+
+import "time"
+
+// {{.R.Pascal}}Request creates or fully replaces a {{.R.Human}}.
+type {{.R.Pascal}}Request struct {
+	Name string `json:"name" validate:"required,max=255"`
+}
+
+// {{.R.Pascal}}Response is one {{.R.Human}} on the wire.
+type {{.R.Pascal}}Response struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}

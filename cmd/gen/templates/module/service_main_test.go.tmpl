@@ -1,0 +1,45 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"testing"
+
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/internal/platform/tenant"
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// TestMain registers the module catalog: these tests do not build the app,
+// and unregistered permissions or error codes would fail closed.
+func TestMain(m *testing.M) {
+	if err := {{.M.Ident}}catalog.Register(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
+// adminContext is a request context for an administrator of tenantID.
+func adminContext(tenantID int64) context.Context {
+	ctx := tenant.WithID(context.Background(), tenantID)
+	return authz.WithSubject(ctx, authz.NewSubject(1, tenantID, authz.RoleAdmin))
+}
+
+// userContext is a request context for a plain user of tenantID.
+func userContext(tenantID int64) context.Context {
+	ctx := tenant.WithID(context.Background(), tenantID)
+	return authz.WithSubject(ctx, authz.NewSubject(2, tenantID, authz.RoleUser))
+}
+
+// requireCode fails unless err is an *apperror.AppError with code want.
+func requireCode(t *testing.T, err error, want apperror.Code) {
+	t.Helper()
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Code != string(want) {
+		t.Fatalf("error = %v, want code %s", err, want)
+	}
+}

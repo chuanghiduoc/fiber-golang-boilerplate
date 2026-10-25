@@ -101,11 +101,38 @@ migrate-create:
 	@test -n "$(module)" -a -n "$(name)" || { echo "usage: make migrate-create module=<module|platform> name=<purpose>"; exit 1; }
 	@migrate create -ext sql -dir migrations -format 20060102150405 -tz UTC $(module)_$(name)
 
-# sqlc needs cgo, so it stays an external binary instead of `go run`.
+# sqlc needs cgo, so it stays an external binary instead of `go run`. Each
+# module owns internal/modules/<name>/sqlc.yaml (paths relative to it); this
+# runs every one and stops at the first failure.
 sqlc-generate:
 	@command -v sqlc >/dev/null 2>&1 || { echo "sqlc not found; install $(SQLC_VERSION) (the CI version): go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)"; exit 1; }
 	@sqlc version | grep -qx "$(SQLC_VERSION)" || echo "warning: sqlc $$(sqlc version) differs from $(SQLC_VERSION) used in CI; generated code may drift"
-	@sqlc generate
+	@for config in internal/modules/*/sqlc.yaml; do \
+		echo "sqlc generate -f $$config"; \
+		sqlc generate -f "$$config" || exit 1; \
+	done
+
+# Code generator (cmd/gen, ADR 0002 layout). It writes the files, then runs
+# sqlc, go build/vet, the module tests, and test/arch, and rolls every write
+# back if a step fails. Usage:
+#   make gen module=billing
+#   make gen resource=invoice module=billing [plural=invoices]
+#   make gen command=IssueInvoice module=billing [no_http=1]
+#   make gen query=ListOverdueInvoices module=billing [no_http=1]
+# Add dry_run=1 to print a unified diff and write nothing.
+GEN_FLAGS = $(if $(dry_run),--dry-run) $(if $(no_http),--no-http)
+gen:
+	@if [ -n "$(resource)" ]; then \
+		go run ./cmd/gen resource --module "$(module)" $(GEN_FLAGS) $(if $(plural),--plural "$(plural)") "$(resource)"; \
+	elif [ -n "$(command)" ]; then \
+		go run ./cmd/gen command --module "$(module)" $(GEN_FLAGS) "$(command)"; \
+	elif [ -n "$(query)" ]; then \
+		go run ./cmd/gen query --module "$(module)" $(GEN_FLAGS) "$(query)"; \
+	elif [ -n "$(module)" ]; then \
+		go run ./cmd/gen module $(GEN_FLAGS) "$(module)"; \
+	else \
+		go run ./cmd/gen -h; \
+	fi
 
 lint:
 	@golangci-lint run ./...
@@ -122,4 +149,4 @@ swagger:
 rename-module:
 	@bash scripts/rename-module.sh $(mod)
 
-.PHONY: all build run migrate-run docker-run docker-down check vet arch test test-race test-integration clean watch migrate-down migrate-create sqlc-generate lint seed swagger rename-module
+.PHONY: all build run migrate-run docker-run docker-down check vet arch test test-race test-integration clean watch migrate-down migrate-create sqlc-generate gen lint seed swagger rename-module

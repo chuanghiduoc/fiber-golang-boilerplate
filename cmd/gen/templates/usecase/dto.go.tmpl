@@ -1,0 +1,7 @@
+package {{.M.Ident}}dto
+{{if .U.IsCommand}}
+// {{.U.Name}}Request is the body of the {{.U.Name}} command.
+type {{.U.Name}}Request struct{}
+{{end}}
+// {{.U.Name}}Response is the result of the {{.U.Name}} {{.U.Kind}}.
+type {{.U.Name}}Response struct{}

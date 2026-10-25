@@ -1,0 +1,19 @@
+package repository
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// noRows maps pgx.ErrNoRows to apperror.ErrNotFound, so the service layer
+// never sees a driver error, and wraps anything else with op.
+func noRows(err error, op string) error {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return apperror.ErrNotFound
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}

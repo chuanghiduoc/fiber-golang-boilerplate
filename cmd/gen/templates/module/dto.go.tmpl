@@ -1,0 +1,10 @@
+// Package {{.M.Ident}}dto contains the {{.M.Name}} HTTP request and response
+// types. Handlers map service types to these; services never import this
+// package. The package name is unique so Swagger type names do not collide.
+package {{.M.Ident}}dto
+
+// HealthResponse reports that the module reached its database.
+type HealthResponse struct {
+	Module string `json:"module"`
+	Status string `json:"status"`
+}

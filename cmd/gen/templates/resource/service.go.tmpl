@@ -1,0 +1,194 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/tenant"
+	"{{.M.ModulePath}}/pkg/apperror"
+	"{{.M.ModulePath}}/pkg/pagination"
+)
+
+// max{{.R.Pascal}}NameLength mirrors name VARCHAR(255) in the migration.
+const max{{.R.Pascal}}NameLength = 255
+
+// {{.R.Pascal}} is the service view of one {{.R.Table}} row. repository/
+// maps sqlc rows to it, so no persistence type crosses this package.
+type {{.R.Pascal}} struct {
+	ID        int64
+	TenantID  int64
+	Name      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// {{.R.Pascal}}Input holds the writable {{.R.Human}} fields (create and full update).
+type {{.R.Pascal}}Input struct {
+	Name string
+}
+
+// {{.R.Pascal}}Page is one page of {{.R.HumanPlural}}, newest first.
+type {{.R.Pascal}}Page struct {
+	Items      []{{.R.Pascal}}
+	HasMore    bool
+	NextCursor string
+}
+
+// {{.R.Pascal}}Service implements the {{.R.Human}} use cases over the
+// {{.R.Pascal}}Repository port. Every method authorizes first (fail closed) and
+// treats a row from another tenant as not found.
+type {{.R.Pascal}}Service struct {
+	repo {{.R.Pascal}}Repository
+}
+
+// New{{.R.Pascal}}Service returns a {{.R.Pascal}}Service over repo.
+func New{{.R.Pascal}}Service(repo {{.R.Pascal}}Repository) *{{.R.Pascal}}Service {
+	return &{{.R.Pascal}}Service{repo: repo}
+}
+
+// Create stores a new {{.R.Human}} in the request tenant.
+func (s *{{.R.Pascal}}Service) Create(ctx context.Context, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
+		return {{.R.Pascal}}{}, err
+	}
+	in, err := normalize{{.R.Pascal}}Input(in)
+	if err != nil {
+		return {{.R.Pascal}}{}, err
+	}
+	created, err := s.repo.Create{{.R.Pascal}}(ctx, in)
+	if err != nil {
+		return {{.R.Pascal}}{}, fmt.Errorf("{{.M.Name}}: create {{.R.Human}}: %w", err)
+	}
+	return ensure{{.R.Pascal}}Tenant(ctx, created)
+}
+
+// Get returns one {{.R.Human}} of the request tenant.
+func (s *{{.R.Pascal}}Service) Get(ctx context.Context, id int64) ({{.R.Pascal}}, error) {
+	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
+		return {{.R.Pascal}}{}, err
+	}
+	if id <= 0 {
+		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
+	}
+	found, err := s.repo.Get{{.R.Pascal}}(ctx, id)
+	if err != nil {
+		return {{.R.Pascal}}{}, {{.R.Camel}}Error("get", err)
+	}
+	return ensure{{.R.Pascal}}Tenant(ctx, found)
+}
+
+// List returns a cursor page of the request tenant's {{.R.HumanPlural}}. limit is
+// clamped to [1, pagination.MaxLimit]; startingAfter is the previous page's
+// NextCursor.
+func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfter string) ({{.R.Pascal}}Page, error) {
+	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
+		return {{.R.Pascal}}Page{}, err
+	}
+	pageSize := pagination.NormalizeLimit(limit)
+	// One extra row tells whether another page exists.
+	cursor := pagination.DBCursor{Limit: pagination.RowLimit(pageSize + 1)}
+	if startingAfter != "" {
+		createdAt, id, err := pagination.DecodeCursor(startingAfter)
+		if err != nil {
+			return {{.R.Pascal}}Page{}, apperror.NewBadRequest("invalid startingAfter cursor")
+		}
+		cursor.HasCursor, cursor.CreatedAt, cursor.ID = true, createdAt, id
+	}
+	items, err := s.repo.List{{.R.PluralPascal}}(ctx, cursor)
+	if err != nil {
+		return {{.R.Pascal}}Page{}, fmt.Errorf("{{.M.Name}}: list {{.R.HumanPlural}}: %w", err)
+	}
+	for i := range items {
+		if _, err := ensure{{.R.Pascal}}Tenant(ctx, items[i]); err != nil {
+			return {{.R.Pascal}}Page{}, fmt.Errorf("{{.M.Name}}: list {{.R.HumanPlural}}: row %d escaped the tenant filter", items[i].ID)
+		}
+	}
+	page := {{.R.Pascal}}Page{Items: items}
+	if len(items) > pageSize {
+		page.Items = items[:pageSize]
+		page.HasMore = true
+		page.NextCursor = pagination.NextCursor(page.Items, func(item {{.R.Pascal}}) (time.Time, int64) {
+			return item.CreatedAt, item.ID
+		})
+	}
+	return page, nil
+}
+
+// Update replaces the writable fields of one {{.R.Human}} of the request tenant.
+func (s *{{.R.Pascal}}Service) Update(ctx context.Context, id int64, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
+		return {{.R.Pascal}}{}, err
+	}
+	if id <= 0 {
+		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
+	}
+	in, err := normalize{{.R.Pascal}}Input(in)
+	if err != nil {
+		return {{.R.Pascal}}{}, err
+	}
+	updated, err := s.repo.Update{{.R.Pascal}}(ctx, id, in)
+	if err != nil {
+		return {{.R.Pascal}}{}, {{.R.Camel}}Error("update", err)
+	}
+	return ensure{{.R.Pascal}}Tenant(ctx, updated)
+}
+
+// Delete removes one {{.R.Human}} of the request tenant.
+func (s *{{.R.Pascal}}Service) Delete(ctx context.Context, id int64) error {
+	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete); err != nil {
+		return err
+	}
+	if id <= 0 {
+		return {{.R.Camel}}NotFound()
+	}
+	if err := s.repo.Delete{{.R.Pascal}}(ctx, id); err != nil {
+		return {{.R.Camel}}Error("delete", err)
+	}
+	return nil
+}
+
+// normalize{{.R.Pascal}}Input trims and validates in. The HTTP DTO validates
+// too; this keeps every transport on the same rules.
+func normalize{{.R.Pascal}}Input(in {{.R.Pascal}}Input) ({{.R.Pascal}}Input, error) {
+	in.Name = strings.TrimSpace(in.Name)
+	if in.Name == "" {
+		return in, apperror.NewValidation("invalid {{.R.Human}}", []apperror.FieldError{
+			{Path: "name", Code: "required", Message: "name is required"},
+		})
+	}
+	if utf8.RuneCountInString(in.Name) > max{{.R.Pascal}}NameLength {
+		return in, apperror.NewValidation("invalid {{.R.Human}}", []apperror.FieldError{
+			{Path: "name", Code: "max", Message: fmt.Sprintf("name must be at most %d characters", max{{.R.Pascal}}NameLength)},
+		})
+	}
+	return in, nil
+}
+
+// ensure{{.R.Pascal}}Tenant is defense in depth behind the repository's
+// tenant_id predicate: a row from another tenant is reported as not found,
+// never as forbidden, so ids in other tenants are not disclosed.
+func ensure{{.R.Pascal}}Tenant(ctx context.Context, item {{.R.Pascal}}) ({{.R.Pascal}}, error) {
+	if item.TenantID != tenant.EffectiveID(ctx) {
+		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
+	}
+	return item, nil
+}
+
+func {{.R.Camel}}NotFound() error {
+	return apperror.NewCode({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound, "{{.R.Human}} not found")
+}
+
+// {{.R.Camel}}Error maps a repository error: apperror.ErrNotFound becomes the
+// module's 404 code, anything else is wrapped and rendered as 500 (and
+// logged) by the HTTP error handler.
+func {{.R.Camel}}Error(op string, err error) error {
+	if errors.Is(err, apperror.ErrNotFound) {
+		return {{.R.Camel}}NotFound()
+	}
+	return fmt.Errorf("{{.M.Name}}: %s {{.R.Human}}: %w", op, err)
+}

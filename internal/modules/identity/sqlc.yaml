@@ -1,0 +1,15 @@
+# sqlc configuration owned by this module. Paths are relative to this file;
+# regenerate with `make sqlc-generate` (every module) or `go generate` here.
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "queries/"
+    schema: "../../../migrations/"
+    gen:
+      go:
+        package: "sqlc"
+        out: "sqlc"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_empty_slices: true
+        omit_unused_structs: true

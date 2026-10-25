@@ -1,0 +1,29 @@
+package service
+
+import (
+	"context"
+	"testing"
+
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/pkg/apperror"
+)
+
+// Test{{.U.Name}} pins the generated behavior: authorized callers get 501
+// until the {{.U.Kind}} is implemented. Replace it with real cases.
+func Test{{.U.Name}}(t *testing.T) {
+	h := New{{.U.Name}}Handler()
+	cases := map[string]struct {
+		ctx  context.Context
+		want apperror.Code
+	}{
+		"authorized":         {adminContext(1), {{.M.Ident}}catalog.CodeNotImplemented},
+		"no subject":         {context.Background(), apperror.CodePermissionDenied},
+		"missing permission": {userContext(1), apperror.CodePermissionDenied},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := h.Handle(tc.ctx, {{.U.Name}}Input{})
+			requireCode(t, err, tc.want)
+		})
+	}
+}

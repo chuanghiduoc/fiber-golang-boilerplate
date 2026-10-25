@@ -1,0 +1,31 @@
+package handler
+
+import (
+	"context"
+	"net/http"
+	"testing"
+
+	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
+)
+
+type fake{{.U.Name}} struct{ calls int }
+
+func (f *fake{{.U.Name}}) Handle(context.Context, {{.M.Ident}}service.{{.U.Name}}Input) ({{.M.Ident}}service.{{.U.Name}}Result, error) {
+	f.calls++
+	return {{.M.Ident}}service.{{.U.Name}}Result{}, nil
+}
+
+func Test{{.U.Name}}HTTP(t *testing.T) {
+	fake := &fake{{.U.Name}}{}
+	app := newTestApp()
+{{- if .U.IsCommand}}
+	app.Post("/{{.U.Route}}", New{{.U.Name}}HTTP(fake).Handle)
+	status, body := do(t, app, http.MethodPost, "/{{.U.Route}}", `{}`)
+{{- else}}
+	app.Get("/{{.U.Route}}", New{{.U.Name}}HTTP(fake).Handle)
+	status, body := do(t, app, http.MethodGet, "/{{.U.Route}}", "")
+{{- end}}
+	if status != http.StatusOK || fake.calls != 1 {
+		t.Fatalf("{{.U.Route}} = %d %s (calls=%d), want 200 and one call", status, body, fake.calls)
+	}
+}

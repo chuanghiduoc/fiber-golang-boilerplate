@@ -1,0 +1,107 @@
+package repository
+
+import (
+	"context"
+	"fmt"
+
+	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
+	{{.M.Ident}}sqlc "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/sqlc"
+	"{{.M.ModulePath}}/internal/platform/tenant"
+	"{{.M.ModulePath}}/pkg/apperror"
+	"{{.M.ModulePath}}/pkg/pagination"
+)
+
+// {{.R.Pascal}}Repository implements {{.M.Ident}}service.{{.R.Pascal}}Repository over
+// {{.R.Table}}. Every query binds tenant.EffectiveID(ctx).
+type {{.R.Pascal}}Repository struct {
+	q *{{.M.Ident}}sqlc.Queries
+}
+
+var _ {{.M.Ident}}service.{{.R.Pascal}}Repository = (*{{.R.Pascal}}Repository)(nil)
+
+// New{{.R.Pascal}}Repository returns a {{.R.Pascal}}Repository over db (a pool or
+// a transaction).
+func New{{.R.Pascal}}Repository(db {{.M.Ident}}sqlc.DBTX) *{{.R.Pascal}}Repository {
+	return &{{.R.Pascal}}Repository{q: {{.M.Ident}}sqlc.New(db)}
+}
+
+// Create{{.R.Pascal}} inserts a {{.R.Human}} in the request tenant.
+func (r *{{.R.Pascal}}Repository) Create{{.R.Pascal}}(ctx context.Context, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	row, err := r.q.Create{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Create{{.R.Pascal}}Params{
+		TenantID: tenant.EffectiveID(ctx),
+		Name:     in.Name,
+	})
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, fmt.Errorf("insert {{.R.Table}}: %w", err)
+	}
+	return to{{.R.Pascal}}(row), nil
+}
+
+// Get{{.R.Pascal}} loads one {{.R.Human}} of the request tenant.
+func (r *{{.R.Pascal}}Repository) Get{{.R.Pascal}}(ctx context.Context, id int64) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	row, err := r.q.Get{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Get{{.R.Pascal}}Params{
+		TenantID: tenant.EffectiveID(ctx),
+		ID:       id,
+	})
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, noRows(err, "select {{.R.Table}}")
+	}
+	return to{{.R.Pascal}}(row), nil
+}
+
+// List{{.R.PluralPascal}} returns up to cursor.Limit {{.R.HumanPlural}} older than the
+// cursor, newest first.
+func (r *{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Context, cursor pagination.DBCursor) ([]{{.M.Ident}}service.{{.R.Pascal}}, error) {
+	rows, err := r.q.List{{.R.PluralPascal}}(ctx, {{.M.Ident}}sqlc.List{{.R.PluralPascal}}Params{
+		TenantID:        tenant.EffectiveID(ctx),
+		CursorCreatedAt: cursor.CreatedAtParam(),
+		CursorID:        cursor.IDParam(),
+		RowLimit:        cursor.Limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list {{.R.Table}}: %w", err)
+	}
+	out := make([]{{.M.Ident}}service.{{.R.Pascal}}, len(rows))
+	for i, row := range rows {
+		out[i] = to{{.R.Pascal}}(row)
+	}
+	return out, nil
+}
+
+// Update{{.R.Pascal}} replaces the writable fields of one {{.R.Human}}.
+func (r *{{.R.Pascal}}Repository) Update{{.R.Pascal}}(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	row, err := r.q.Update{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Update{{.R.Pascal}}Params{
+		Name:     in.Name,
+		TenantID: tenant.EffectiveID(ctx),
+		ID:       id,
+	})
+	if err != nil {
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, noRows(err, "update {{.R.Table}}")
+	}
+	return to{{.R.Pascal}}(row), nil
+}
+
+// Delete{{.R.Pascal}} removes one {{.R.Human}}; deleting nothing is not found.
+func (r *{{.R.Pascal}}Repository) Delete{{.R.Pascal}}(ctx context.Context, id int64) error {
+	affected, err := r.q.Delete{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Delete{{.R.Pascal}}Params{
+		TenantID: tenant.EffectiveID(ctx),
+		ID:       id,
+	})
+	if err != nil {
+		return fmt.Errorf("delete {{.R.Table}}: %w", err)
+	}
+	if affected == 0 {
+		return apperror.ErrNotFound
+	}
+	return nil
+}
+
+func to{{.R.Pascal}}(row {{.M.Ident}}sqlc.{{.R.Model}}) {{.M.Ident}}service.{{.R.Pascal}} {
+	return {{.M.Ident}}service.{{.R.Pascal}}{
+		ID:        row.ID,
+		TenantID:  row.TenantID,
+		Name:      row.Name,
+		CreatedAt: row.CreatedAt.Time,
+		UpdatedAt: row.UpdatedAt.Time,
+	}
+}

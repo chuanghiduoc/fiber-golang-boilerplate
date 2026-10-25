@@ -18,8 +18,9 @@ make check                 # vet + lint + arch tests + unit tests
 make lint                  # golangci-lint v2
 make docker-run            # Compose: migrate job -> API
 make docker-down
-make sqlc-generate
+make sqlc-generate         # every internal/modules/*/sqlc.yaml (no root sqlc.yaml)
 make swagger
+make gen module=<name>     # cmd/gen: module | resource=<r> | command=<Name> | query=<Name> (+ module=<m>)
 ```
 
 Production build: `CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o server ./cmd/api`.
@@ -471,29 +472,46 @@ handler/service/DTO/repository package.
 
 ## Adding a Module
 
-Run `scripts/new-module.sh <name>` and follow `docs/module-template.md`. The
-scaffold generates `module.go` (`Build(app.Infra)` + catalog providers + one
-protected sample route), `module_test.go`, `catalog/` (`permissions.go`,
-`errors.go`, `locales/en.json`, `locales/vi.json`),
-handler/service/repository/dto, `queries/<name>.sql`, a `sqlc.yaml` block, and
-`README.md`, then builds, vets, and tests the module.
+Use the Go generator `cmd/gen` (stdlib `text/template` + `embed`) and follow
+`docs/module-template.md`; its output follows ADR 0002, so `test/arch`
+(layering ratchet included) passes with no allowlist entries.
 
-1. Register it in `internal/bootstrap/modules.go` (`<name>.Build(infra)` in
-   `List`, passing only contracts from earlier modules). Module-owned
-   configuration goes in a module `Settings` struct that `bootstrap.Build(cfg,
-   infra)` fills from its own `config` section (as identity, files, and
-   webhooks do); `app.Infra.Platform` carries only App, JWT, and Tenant. This is the only
-   central edit: catalogs self-register through the catalog providers, and
-   jobs/events/schedules through `JobProvider`/`EventProvider`/
-   `ScheduleProvider`. Add `RegisterV2Routes` only for a breaking v2 surface.
+- `make gen module=<name>`: `module.go` (`Handlers`, catalog providers,
+  routes), `build.go` (`Build(infra app.Infra, settings Settings) (*Module,
+  Provides, error)`), `generate.go` + `sqlc.yaml`, `catalog/` (permissions,
+  errors, en/vi), `service/ports.go` + a health use case, `repository/`,
+  `handler/`, `dto/`, `queries/`, tests, README, a
+  `<UTC ts>_<name>_init.{up,down}.sql` pair, and the
+  `internal/bootstrap/modules.go` entry (inserted once at the `gen:` markers).
+- `make gen resource=<r> module=<m>`: tenant-scoped CRUD (`<m>_<plural>`
+  table, sqlc queries, repository mapping rows to service types, service over
+  ports, handler/dto, routes `rate limit → authzhttp.Require → idempotency →
+  audithttp.Guard → handler`, permissions, error code, en/vi keys, fake-based
+  unit tests, a PostgreSQL integration test).
+- `make gen command=<Name> module=<m>` / `query=<Name>`:
+  `service/{command,query}_<name>.go` with Input/Result (501 until written)
+  plus an HTTP stub (`no_http=1` skips it).
+- Every run writes, then runs sqlc, `go build ./...`, `go vet` (with and
+  without `-tags=integration`), the module tests, and `test/arch`; any failure
+  restores every written file. `dry_run=1` prints a diff. Only modules created
+  by cmd/gen (with `gen:` markers) can be extended. `scripts/new-module.sh` is
+  a wrapper for `go run ./cmd/gen module`.
+
+1. Module-owned configuration goes in the module's `Settings`, filled by
+   `bootstrap.Build(cfg, infra)` from its own `config` section (as identity,
+   files, and webhooks do); `app.Infra.Platform` carries only App, JWT, and
+   Tenant. Contracts from earlier modules follow `settings` in `Build`. The
+   bootstrap entry is the only central edit: catalogs self-register through
+   the catalog providers, and jobs/events/schedules through
+   `JobProvider`/`EventProvider`/`ScheduleProvider`. Add `RegisterV2Routes`
+   only for a breaking v2 surface.
 2. Keep handler/service/repository/DTO/catalog inside the module; protect
    every route with `authzhttp.Require`; keep `service/` free of sqlc, pgx,
    Fiber, and `dto/` (layering ratchet).
 3. Name tables `<name>`/`<name>_*` (or add them to the `test/arch` table
-   ownership list); queries must not touch other modules' tables. Run
-   `make sqlc-generate`.
-4. Deployed DB: `make migrate-create module=<name> name=<purpose>`; otherwise
-   update the single init schema.
+   ownership list); queries must not touch other modules' tables. Each module
+   owns `internal/modules/<name>/sqlc.yaml`; run `make sqlc-generate`.
+4. Other schema changes: `make migrate-create module=<name> name=<purpose>`.
 5. Expose data to other modules only through `internal/contracts/<name>/`
    (stdlib-only).
 6. Add unit + integration tests; `test/arch` must stay green.

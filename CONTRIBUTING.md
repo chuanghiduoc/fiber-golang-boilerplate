@@ -137,22 +137,29 @@ If you copy blobs, update `files.storage_path` atomically.
 
 ## Adding a New Module
 
-Run `scripts/new-module.sh <name>` and follow
+Run `make gen module=<name>` (the Go generator `cmd/gen`; `scripts/new-module.sh
+<name>` is a wrapper for it) and follow
 [`docs/module-template.md`](docs/module-template.md); runtime behavior is
 covered by [`docs/operations.md`](docs/operations.md).
 
-1. The scaffold creates `module.go` (`Build(app.Infra)` + catalog providers),
-   `catalog/` (permissions, error codes, en/vi strings), the layers, queries,
-   the `sqlc.yaml` block, and a module test. Keep everything in that directory.
-2. Adjust `catalog/permissions.go` and protect every route with
-   `authzhttp.Require(...)` (`test/arch` enforces it). Do not copy the
+1. The generator creates `module.go`, `build.go` (`Build(infra, Settings)
+   (*Module, Provides, error)`), `catalog/` (permissions, error codes, en/vi
+   strings), the ADR 0002 layers with `service/ports.go`, `queries/`, the
+   module's own `sqlc.yaml`, tests, a `<UTC ts>_<name>_init` migration pair,
+   and the `internal/bootstrap/modules.go` entry, then builds, vets, and tests
+   (rolling everything back on failure). Keep everything in that directory.
+2. Add slices with `make gen resource=<r> module=<name>` (tenant-scoped CRUD
+   with migration, queries, routes, permissions, and unit + integration tests)
+   and `make gen command=<Name> module=<name>` / `query=<Name>`. Add
+   `dry_run=1` to preview a diff.
+3. Adjust `catalog/permissions.go` (generated permissions are admin-only) and
+   protect every route with `authzhttp.Require(...)` (`test/arch` enforces
+   it). Do not copy the
    [legacy exceptions](docs/module-template.md#legacy-exceptions-do-not-copy).
-3. Replace `internal/modules/<name>/queries/<name>.sql` and run
-   `make sqlc-generate`.
-4. For a deployed DB, `make migrate-create module=<name> name=<purpose>`; for
-   this boilerplate's fresh installs, update the single init schema.
-5. Register the module once in `internal/bootstrap/modules.go`; pass
-   module-owned configuration as a `Settings` struct filled there.
+4. Other schema changes: `make migrate-create module=<name> name=<purpose>`,
+   then `make sqlc-generate` (runs every `internal/modules/*/sqlc.yaml`).
+5. Pass module-owned configuration as the module's `Settings`, filled in
+   `internal/bootstrap/modules.go`.
 6. Add unit tests plus an integration test; `test/arch` rejects cross-module
    imports, Fiber in `service`/`repository` packages, and new
    [ADR 0002](docs/adr/0002-module-layering.md) layering violations (never add

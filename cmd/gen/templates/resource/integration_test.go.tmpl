@@ -1,0 +1,110 @@
+//go:build integration
+
+package {{.M.Name}}
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"testing"
+
+	"{{.M.ModulePath}}/internal/app"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	"{{.M.ModulePath}}/internal/platform/audit"
+	"{{.M.ModulePath}}/internal/platform/authz"
+	"{{.M.ModulePath}}/internal/testutil"
+)
+
+// Test{{.R.Pascal}}CRUDAndTenantIsolation runs the generated routes through the
+// full middleware stack against PostgreSQL (Testcontainers, or
+// TEST_DATABASE_URL): CRUD in one tenant, and every cross-tenant id is 404.
+func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
+	ctx := context.Background()
+	pool, cleanup, err := testutil.SetupTestDB(ctx)
+	if err != nil {
+		t.Fatalf("SetupTestDB: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	var tenantB int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('{{.M.Route}}-{{.R.Route}}-b', 'Tenant B') RETURNING id`,
+	).Scan(&tenantB); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+	fiberApp := testApp(t, app.Infra{Pool: pool}, app.Deps{Audit: audit.NewPostgresRecorder(pool)})
+	adminA := bearer(t, 1, 1, authz.RoleAdmin)
+	adminB := bearer(t, 2, tenantB, authz.RoleAdmin)
+	base := "/api/v1/{{.M.Route}}/{{.R.PluralRoute}}"
+
+	status, body := do(t, fiberApp, http.MethodPost, base, adminA, `{"name":"first"}`)
+	if status != http.StatusCreated {
+		t.Fatalf("create = %d %s", status, body)
+	}
+	var created struct {
+		ID   int64  `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil || created.ID == 0 {
+		t.Fatalf("create body %s: %v", body, err)
+	}
+	item := base + "/" + strconv.FormatInt(created.ID, 10)
+
+	if status, body := do(t, fiberApp, http.MethodGet, item, adminA, ""); status != http.StatusOK {
+		t.Fatalf("get = %d %s", status, body)
+	}
+	if status, body := do(t, fiberApp, http.MethodPut, item, adminA, `{"name":"renamed"}`); status != http.StatusOK {
+		t.Fatalf("update = %d %s", status, body)
+	}
+	var page struct {
+		Data []struct {
+			ID   int64  `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	status, body = do(t, fiberApp, http.MethodGet, base, adminA, "")
+	if err := json.Unmarshal([]byte(body), &page); status != http.StatusOK || err != nil ||
+		len(page.Data) != 1 || page.Data[0].Name != "renamed" {
+		t.Fatalf("list in tenant A = %d %s (%v)", status, body, err)
+	}
+
+	// Tenant B sees nothing and cannot read, change, or delete tenant A's row.
+	notFound := string({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	for _, req := range []struct{ method, body string }{
+		{http.MethodGet, ""},
+		{http.MethodPut, `{"name":"stolen"}`},
+		{http.MethodDelete, ""},
+	} {
+		status, body := do(t, fiberApp, req.method, item, adminB, req.body)
+		var problem struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal([]byte(body), &problem)
+		if status != http.StatusNotFound || problem.Code != notFound {
+			t.Errorf("tenant B %s %s = %d %s, want 404 %s", req.method, item, status, body, notFound)
+		}
+	}
+	status, body = do(t, fiberApp, http.MethodGet, base, adminB, "")
+	if err := json.Unmarshal([]byte(body), &page); status != http.StatusOK || err != nil || len(page.Data) != 0 {
+		t.Fatalf("list in tenant B = %d %s, want empty", status, body)
+	}
+
+	if status, body := do(t, fiberApp, http.MethodDelete, item, adminA, ""); status != http.StatusNoContent {
+		t.Fatalf("delete = %d %s", status, body)
+	}
+	if status, body := do(t, fiberApp, http.MethodGet, item, adminA, ""); status != http.StatusNotFound {
+		t.Fatalf("get after delete = %d %s, want 404", status, body)
+	}
+
+	// Every mutation wrote a completed Tier 2 intent row in its own tenant.
+	var audited int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE resource = '{{.R.Table}}' AND tenant_id = 1 AND outcome = 'succeeded'`,
+	).Scan(&audited); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if audited != 3 {
+		t.Fatalf("succeeded audit rows = %d, want 3 (create, update, delete)", audited)
+	}
+}

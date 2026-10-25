@@ -18,4 +18,4 @@ Deployment and tooling:
 | Link | Covers |
 |---|---|
 | [Kubernetes](../deploy/k8s/README.md) | Manifests, staging/production overlays, GitHub Actions CD, migration Job, release workflow, external DB/Redis, storage choices |
-| [New module scaffold](../scripts/new-module.sh) | `scripts/new-module.sh <name>` creates the module layout from the template and verifies it with `go build` |
+| [Code generator](../cmd/gen/main.go) | `make gen module=<name>` / `resource=` / `command=` / `query=` generates ADR 0002 code, then runs sqlc, build, vet, module tests, and `test/arch`, rolling back on failure (`scripts/new-module.sh` wraps the module command) |

@@ -1,0 +1,6 @@
+-- {{.M.Name}} module baseline. It intentionally creates nothing: it records
+-- the module's ownership of the {{.M.Name}} / {{.M.Name}}_* table namespace in the
+-- migration history. Tables arrive in later migrations, one per change
+-- (`make gen resource=<name> module={{.M.Name}}` or
+-- `make migrate-create module={{.M.Name}} name=<purpose>`).
+SELECT 1;

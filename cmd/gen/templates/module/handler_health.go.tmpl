@@ -1,0 +1,46 @@
+// Package handler is the {{.M.Name}} HTTP adapter (ADR 0002): it binds and
+// validates requests, calls a service use case, and maps service types to
+// dto/ responses. It must not import repository/, sqlc, or pgx.
+package handler
+
+import (
+	"context"
+
+	"github.com/gofiber/fiber/v3"
+
+	{{.M.Ident}}dto "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/dto"
+	"{{.M.ModulePath}}/pkg/response"
+)
+
+// HealthUseCase is the service surface HealthHandler needs.
+type HealthUseCase interface {
+	Check(ctx context.Context) error
+}
+
+// HealthHandler serves the module health route.
+type HealthHandler struct {
+	service HealthUseCase
+}
+
+// NewHealthHandler returns a HealthHandler over service.
+func NewHealthHandler(service HealthUseCase) *HealthHandler {
+	return &HealthHandler{service: service}
+}
+
+// Health godoc
+// @Summary {{.M.Name}} module health
+// @Description Checks that the {{.M.Name}} module can reach its database.
+// @Tags {{.M.Pascal}}
+// @Produce json
+// @Security BearerAuth
+// @Security ApiKeyAuth
+// @Success 200 {object} {{.M.Ident}}dto.HealthResponse
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Router /{{.M.Route}}/health [get]
+func (h *HealthHandler) Health(c fiber.Ctx) error {
+	if err := h.service.Check(c.Context()); err != nil {
+		return err
+	}
+	return response.Success(c, {{.M.Ident}}dto.HealthResponse{Module: "{{.M.Name}}", Status: "ok"})
+}
