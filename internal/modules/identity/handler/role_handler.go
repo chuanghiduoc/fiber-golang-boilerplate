@@ -172,7 +172,7 @@ func (h *RoleHandler) ReplaceMemberRoles(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, service.ToUserResponse(member))
+	return response.Success(c, toUserResponse(member))
 }
 
 func toRoleResponse(role *service.Role) dto.RoleResponse {

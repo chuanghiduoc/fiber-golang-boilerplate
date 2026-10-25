@@ -495,24 +495,24 @@ func TestPrivacy_AdminErasureRejectsAnAPIKey(t *testing.T) {
 	assert.Zero(t, queued)
 }
 
-func TestPrivacy_LastAdminErasureIsRefused(t *testing.T) {
+func TestPrivacy_LastOwnerErasureIsRefused(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()
-	tenantC := testutil.CreateTenant(t, ctx, h.pool, "privacy-admin-c")
-	admin := testutil.CreateMember(t, ctx, h.pool, tenantC, "privacy-admin@example.com", testutil.MemberOptions{Role: "admin"})
-	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
+	tenantC := testutil.CreateTenant(t, ctx, h.pool, "privacy-owner-c")
+	owner := testutil.CreateMember(t, ctx, h.pool, tenantC, "privacy-owner@example.com", testutil.MemberOptions{Role: "owner"})
+	token := testutil.SessionToken(t, ctx, h.pool, owner, privacyIntegrationSecret)
 
 	status, body := h.request(t, http.MethodPost,
-		"/api/v1/admin/users/"+strconv.FormatInt(admin.UserID, 10)+"/erasure", token, "privacy-admin-c", "")
+		"/api/v1/admin/users/"+strconv.FormatInt(owner.UserID, 10)+"/erasure", token, "privacy-owner-c", "")
 	assert.Equal(t, fiber.StatusConflict, status, "body: %s", body)
 	var jobsForUser int
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`SELECT count(*) FROM jobs WHERE kind LIKE 'privacy.%' AND payload->>'userId' = $1`,
-		strconv.FormatInt(admin.UserID, 10)).Scan(&jobsForUser))
-	assert.Zero(t, jobsForUser, "nothing may be queued before the last-admin refusal")
+		strconv.FormatInt(owner.UserID, 10)).Scan(&jobsForUser))
+	assert.Zero(t, jobsForUser, "nothing may be queued before the last-owner refusal")
 
 	var membershipStatus string
 	require.NoError(t, h.pool.QueryRow(ctx,
-		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenantC, admin.UserID).Scan(&membershipStatus))
+		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenantC, owner.UserID).Scan(&membershipStatus))
 	assert.Equal(t, "active", membershipStatus)
 }

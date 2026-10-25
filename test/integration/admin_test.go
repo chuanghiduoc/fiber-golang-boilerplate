@@ -25,6 +25,7 @@ import (
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
@@ -70,11 +71,21 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
 		if err := httpx.BindAndValidate(c, &req); err != nil {
 			return err
 		}
-		user, err := kit.users.Register(c.Context(), req)
+		user, err := kit.users.Register(c.Context(), identityservice.RegisterInput{
+			Email:    req.Email,
+			Password: req.Password,
+			Name:     req.Name,
+		})
 		if err != nil {
 			return err
 		}
-		return response.Created(c, user)
+		return response.Created(c, identitydto.UserResponse{
+			ID:       user.User.ID,
+			TenantID: user.Membership.TenantID,
+			Email:    user.User.Email,
+			Name:     user.User.Name,
+			Role:     user.Membership.Role,
+		})
 	})
 
 	users := app.Group("/users", middleware.JWTAuth(adminIntegrationSecret, kit.sessions))

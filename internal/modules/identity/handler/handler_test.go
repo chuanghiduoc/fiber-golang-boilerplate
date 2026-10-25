@@ -26,33 +26,42 @@ import (
 
 // mockUserService is a manual mock for testing handlers.
 type mockUserService struct {
-	users                           map[int64]*dto.UserResponse
+	users                           map[int64]*service.Member
 	hasMore                         bool
 	registrationEmailsTransactional bool
 	// googleAllowSignUp records the allowSignUp argument of each Google call.
 	googleAllowSignUp []bool
 }
 
-func newMockService() *mockUserService {
-	return &mockUserService{
-		users: map[int64]*dto.UserResponse{
-			1: {ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user", HasPassword: true},
+func testMember(id int64, email, name, role string) *service.Member {
+	return &service.Member{
+		User: service.User{ID: id, Email: email, Name: name, Status: service.UserStatusActive, HasPassword: true},
+		Membership: service.Membership{
+			TenantID: 1, UserID: id, Role: role, Status: service.MembershipStatusActive,
 		},
 	}
 }
 
-func (m *mockUserService) Register(_ context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	return &dto.UserResponse{ID: 2, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}, nil
+func newMockService() *mockUserService {
+	return &mockUserService{
+		users: map[int64]*service.Member{
+			1: testMember(1, "test@example.com", "Test User", "user"),
+		},
+	}
 }
 
-func (m *mockUserService) Authenticate(_ context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
+func (m *mockUserService) Register(_ context.Context, req service.RegisterInput) (*service.Member, error) {
+	return testMember(2, req.Email, req.Name, "user"), nil
+}
+
+func (m *mockUserService) Authenticate(_ context.Context, req service.LoginInput) (*service.Member, error) {
 	if req.Email == "test@example.com" && req.Password == "Password1!" {
-		return &dto.UserResponse{ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
+		return testMember(1, "test@example.com", "Test User", "user"), nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
 }
 
-func (m *mockUserService) GetByID(_ context.Context, id int64) (*dto.UserResponse, error) {
+func (m *mockUserService) GetByID(_ context.Context, id int64) (*service.Member, error) {
 	user, ok := m.users[id]
 	if !ok {
 		return nil, apperror.NewNotFound("user not found")
@@ -60,21 +69,21 @@ func (m *mockUserService) GetByID(_ context.Context, id int64) (*dto.UserRespons
 	return user, nil
 }
 
-func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]dto.UserResponse, bool, error) {
-	users := make([]dto.UserResponse, 0, len(m.users))
+func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]service.Member, bool, error) {
+	users := make([]service.Member, 0, len(m.users))
 	for _, u := range m.users {
 		users = append(users, *u)
 	}
 	return users, m.hasMore, nil
 }
 
-func (m *mockUserService) Update(_ context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
+func (m *mockUserService) Update(_ context.Context, id int64, req service.UpdateProfileInput) (*service.Member, error) {
 	user, ok := m.users[id]
 	if !ok {
 		return nil, apperror.NewNotFound("user not found")
 	}
 	if req.Name != nil {
-		user.Name = *req.Name
+		user.User.Name = *req.Name
 	}
 	return user, nil
 }
@@ -93,19 +102,19 @@ func (m *mockUserService) RemoveMember(ctx context.Context, id int64) error {
 
 func (m *mockUserService) SignInWithGoogle(ctx context.Context, req service.GoogleSignIn) (*service.GoogleSignInResult, error) {
 	m.googleAllowSignUp = append(m.googleAllowSignUp, req.AllowSignUp)
-	user := &dto.UserResponse{ID: 1, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}
+	member := testMember(1, req.Email, req.Name, "user")
 	if req.Complete != nil {
-		if err := req.Complete(ctx, user); err != nil {
+		if err := req.Complete(ctx, member); err != nil {
 			return nil, err
 		}
 	}
 	return &service.GoogleSignInResult{
-		User:   user,
+		Member: member,
 		Tokens: service.TokenPair{AccessToken: "mock-access-token", RefreshToken: "mock-refresh-token", SessionID: 1},
 	}, nil
 }
 
-func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.ChangePasswordRequest) error {
+func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ service.ChangePasswordInput) error {
 	return nil
 }
 
@@ -127,11 +136,11 @@ func (m *mockUserService) RegistrationEmailsTransactional() bool {
 // mockPasswordResetService is a manual mock for testing handlers.
 type mockPasswordResetService struct{}
 
-func (m *mockPasswordResetService) ForgotPassword(_ context.Context, _ dto.ForgotPasswordRequest) error {
+func (m *mockPasswordResetService) ForgotPassword(_ context.Context, _ service.ForgotPasswordInput) error {
 	return nil
 }
 
-func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ dto.ResetPasswordRequest) error {
+func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ service.ResetPasswordInput) error {
 	return nil
 }
 
@@ -768,5 +777,5 @@ func TestCrossUserAccess_ScopedAPIKeyCannotUseOwnerRole(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, tc.want, resp.StatusCode, tc.method)
 	}
-	assert.Equal(t, "Test User", svc.users[1].Name)
+	assert.Equal(t, "Test User", svc.users[1].User.Name)
 }

@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -45,7 +44,7 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
-	user, err := users.Register(tenant.WithID(ctx, acmeID), dto.RegisterRequest{Email: "event@example.com", Password: "Password1!", Name: "Event"})
+	user, err := users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "event@example.com", Password: "Password1!", Name: "Event"})
 	require.NoError(t, err)
 
 	var (
@@ -62,12 +61,12 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	assert.Equal(t, identitycontracts.EventUserRegistered, envelope.Type)
 	assert.Equal(t, identitycontracts.UserRegisteredVersion, envelope.DataVersion)
 	assert.Equal(t, acmeID, envelope.TenantID)
-	assert.Equal(t, events.UserActor(user.ID), envelope.Actor)
+	assert.Equal(t, events.UserActor(user.User.ID), envelope.Actor)
 	data, err := events.Decode[identitycontracts.UserRegistered](envelope)
 	require.NoError(t, err)
-	assert.Equal(t, user.ID, data.UserID)
+	assert.Equal(t, user.User.ID, data.UserID)
 	assert.Equal(t, "event@example.com", data.Email)
-	assert.Equal(t, strconv.FormatInt(user.ID, 10), envelope.Actor.ID)
+	assert.Equal(t, strconv.FormatInt(user.User.ID, 10), envelope.Actor.ID)
 }
 
 // A publish failure (here a durable subscriber with no queue) fails the
@@ -81,7 +80,7 @@ func TestRegister_RollsBackWhenPublishFails(t *testing.T) {
 	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
-	_, err := users.Register(ctx, dto.RegisterRequest{Email: "rollback@example.com", Password: "Password1!", Name: "Rollback"})
+	_, err := users.Register(ctx, service.RegisterInput{Email: "rollback@example.com", Password: "Password1!", Name: "Rollback"})
 	require.Error(t, err)
 	assert.Equal(t, 500, appStatus(err))
 	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM users`))

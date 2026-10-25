@@ -1,10 +1,2 @@
 # Ratchet for TestModuleLayering (ADR 0002). Existing violations only:
 # delete a line when its violation is fixed; never add new lines.
-identity/service/admin_user_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/authentication.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/oauth_google.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/password.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/password_reset_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/profile.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/registration.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
-identity/service/user_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto

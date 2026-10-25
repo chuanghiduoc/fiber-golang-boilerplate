@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -149,7 +148,7 @@ func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	broken := identityrepo.NewTransactor(database.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: broken, Cache: cache.NewMemoryCache()})
 
-	_, err := users.Register(ctx, dto.RegisterRequest{Email: "atomic@example.com", Password: "Password1!", Name: "Atomic"})
+	_, err := users.Register(ctx, service.RegisterInput{Email: "atomic@example.com", Password: "Password1!", Name: "Atomic"})
 	require.Error(t, err)
 	assert.Equal(t, string(apperror.CodeSystemAuditUnavailable), appCode(err))
 	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM users`))
@@ -192,26 +191,26 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
 	testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
-	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "banned@example.com", Password: "Password1!", Name: "Banned"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!", Name: "Banned"})
 	require.NoError(t, err)
-	require.NoError(t, e.admin.BanUser(ctx, user.ID))
+	require.NoError(t, e.admin.BanUser(ctx, user.User.ID))
 	assert.NotNil(t, scalar[*time.Time](t, e.pool,
-		`SELECT credentials_revoked_at FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.ID),
+		`SELECT credentials_revoked_at FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.User.ID),
 		"a ban revokes the member's API keys")
 
 	// The banned user can still delete their global account (from another
 	// tenant, where they are a member).
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "banned@example.com", testutil.MemberOptions{})
-	require.NoError(t, e.users.DeleteAccount(tenant.WithID(ctx, acmeID), user.ID))
+	require.NoError(t, e.users.DeleteAccount(tenant.WithID(ctx, acmeID), user.User.ID))
 	assert.Equal(t, "suspended", scalar[string](t, e.pool,
-		`SELECT status FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.ID), "the ban stays recorded")
+		`SELECT status FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.User.ID), "the ban stays recorded")
 
-	_, err = e.users.Register(ctx, dto.RegisterRequest{Email: "banned@example.com", Password: "Password1!", Name: "Again"})
+	_, err = e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!", Name: "Again"})
 	assert.Equal(t, http.StatusConflict, appStatus(err))
-	again, err := e.users.Register(tenant.WithID(ctx, acmeID), dto.RegisterRequest{Email: "banned@example.com", Password: "Password1!", Name: "Again"})
+	again, err := e.users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "banned@example.com", Password: "Password1!", Name: "Again"})
 	require.NoError(t, err, "the address is free elsewhere once the account is deleted")
-	assert.NotEqual(t, user.ID, again.ID)
+	assert.NotEqual(t, user.User.ID, again.User.ID)
 }
 
 // Two concurrent rotations of one refresh token: exactly one succeeds and the
@@ -219,9 +218,9 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 func TestRefresh_ConcurrentRotationRevokesFamily(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "race@example.com", Password: "Password1!", Name: "Race"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "race@example.com", Password: "Password1!", Name: "Race"})
 	require.NoError(t, err)
-	pair, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	pair, err := e.sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -257,39 +256,39 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
-	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "reset@example.com", Password: "Password1!", Name: "Reset"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "reset@example.com", Password: "Password1!", Name: "Reset"})
 	require.NoError(t, err)
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "reset@example.com", testutil.MemberOptions{})
-	inDefault, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
+	inDefault, err := e.sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
-	inAcme, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.ID, user.TokenVersion, nil)
+	inAcme, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
 
-	require.NoError(t, e.resets.ForgotPassword(tenant.WithIdentity(ctx, acmeID, "acme"), dto.ForgotPasswordRequest{Email: "Reset@Example.com"}))
+	require.NoError(t, e.resets.ForgotPassword(tenant.WithIdentity(ctx, acmeID, "acme"), service.ForgotPasswordInput{Email: "Reset@Example.com"}))
 	resetToken := e.mail.tokenFor(t, "reset@example.com")
 
 	// Reset from a request in the default tenant: the link is not tenant-bound.
-	require.NoError(t, e.resets.ResetPassword(ctx, dto.ResetPasswordRequest{Token: resetToken, Password: "NewPassword2@"}))
+	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: resetToken, Password: "NewPassword2@"}))
 	for _, sid := range []int64{inDefault.SessionID, inAcme.SessionID} {
 		assert.Equal(t, "credentials_changed", scalar[string](t, e.pool, `SELECT revoked_reason FROM sessions WHERE id = $1`, sid))
 	}
-	_, err = e.users.Authenticate(tenant.WithID(ctx, acmeID), dto.LoginRequest{Email: "reset@example.com", Password: "NewPassword2@"})
+	_, err = e.users.Authenticate(tenant.WithID(ctx, acmeID), service.LoginInput{Email: "reset@example.com", Password: "NewPassword2@"})
 	assert.NoError(t, err, "the new password works in every tenant")
-	assert.Equal(t, http.StatusBadRequest, appStatus(e.resets.ResetPassword(ctx, dto.ResetPasswordRequest{Token: resetToken, Password: "Another3#"})),
+	assert.Equal(t, http.StatusBadRequest, appStatus(e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: resetToken, Password: "Another3#"})),
 		"single use")
 }
 
 func TestEmailVerification_IsPerUser(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "verify@example.com", Password: "Password1!", Name: "V"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "verify@example.com", Password: "Password1!", Name: "V"})
 	require.NoError(t, err)
-	require.NoError(t, e.verify.SendVerification(tenant.WithIdentity(ctx, tenant.DefaultID, "default"), user.ID, user.Email))
+	require.NoError(t, e.verify.SendVerification(tenant.WithIdentity(ctx, tenant.DefaultID, "default"), user.User.ID, user.User.Email))
 	tok := e.mail.tokenFor(t, "verify@example.com")
 
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 	require.NoError(t, e.verify.Verify(tenant.WithID(ctx, acmeID), tok), "verification is not tenant-bound")
-	assert.NotNil(t, scalar[*time.Time](t, e.pool, `SELECT email_verified_at FROM users WHERE id = $1`, user.ID))
+	assert.NotNil(t, scalar[*time.Time](t, e.pool, `SELECT email_verified_at FROM users WHERE id = $1`, user.User.ID))
 	assert.Equal(t, http.StatusBadRequest, appStatus(e.verify.Verify(ctx, tok)), "single use")
 }
 

@@ -387,7 +387,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	}
 
 	// Enroll and confirm a TOTP factor for the Google account.
-	enrollment, err := mfa.EnrollTOTP(ctx, first.User.ID)
+	enrollment, err := mfa.EnrollTOTP(ctx, first.Member.User.ID)
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := mfa.ConfirmTOTP(ctx, first.User.ID, 0, code); err != nil {
+	if _, err := mfa.ConfirmTOTP(ctx, first.Member.User.ID, 0, code); err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
 
@@ -413,7 +413,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	}
 
 	clock.at = clock.at.Add(totp.Period)
-	challenge, err := mfa.BeginChallenge(ctx, second.User.ID, AMRGoogle)
+	challenge, err := mfa.BeginChallenge(ctx, second.Member.User.ID, AMRGoogle)
 	if err != nil {
 		t.Fatalf("BeginChallenge: %v", err)
 	}

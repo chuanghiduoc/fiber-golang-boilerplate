@@ -157,7 +157,7 @@ func (h *InvitationHandler) Accept(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, service.ToUserResponse(member))
+	return response.Success(c, toUserResponse(member))
 }
 
 // SignUp godoc
@@ -188,5 +188,5 @@ func (h *InvitationHandler) SignUp(c fiber.Ctx) error {
 	}
 	// Attribute the audit/log line to the new account, as Register does.
 	fiber.Locals(c, "user_id", member.User.ID)
-	return response.Created(c, service.ToUserResponse(member))
+	return response.Created(c, toUserResponse(member))
 }

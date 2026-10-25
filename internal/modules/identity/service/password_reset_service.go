@@ -10,7 +10,6 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -34,12 +33,23 @@ const resetTokenTTL = time.Hour
 // user: the API looks a token up by its hash alone, and the emailed link's
 // tenant parameter only tells the frontend where to sign in afterwards.
 type PasswordResetService interface {
-	ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error
-	ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error
+	ForgotPassword(ctx context.Context, req ForgotPasswordInput) error
+	ResetPassword(ctx context.Context, req ResetPasswordInput) error
 	// HandleResetRequestJob processes one ResetRequestJobKind job. Delivery is
 	// at-least-once: a duplicate run replaces the user's single reset token
 	// (the newest emailed link wins), so it is safe to repeat.
 	HandleResetRequestJob(ctx context.Context, payload json.RawMessage) error
+}
+
+// ForgotPasswordInput requests a reset link for an address.
+type ForgotPasswordInput struct {
+	Email string
+}
+
+// ResetPasswordInput consumes a reset token and sets a new password.
+type ResetPasswordInput struct {
+	Token    string
+	Password string
 }
 
 // ResetRequestQueue is the durable queue ForgotPassword writes to.
@@ -91,7 +101,7 @@ func AttachResetRequestQueue(svc PasswordResetService, queue ResetRequestQueue, 
 	}
 }
 
-func (s *passwordResetService) ForgotPassword(ctx context.Context, req dto.ForgotPasswordRequest) error {
+func (s *passwordResetService) ForgotPassword(ctx context.Context, req ForgotPasswordInput) error {
 	emailAddr := NormalizeEmail(req.Email)
 
 	// Rate limit before the lookup, for every address. Increment is atomic and
@@ -247,7 +257,7 @@ func (s *passwordResetService) sendResetEmailAsync(ctx context.Context, userID i
 	})
 }
 
-func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetPasswordRequest) error {
+func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPasswordInput) error {
 	tokenHash := hashToken(req.Token)
 
 	// Validate the token with a cheap read before spending bcrypt CPU, and

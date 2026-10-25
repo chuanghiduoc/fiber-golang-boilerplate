@@ -8,7 +8,6 @@ import (
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
@@ -46,7 +45,7 @@ func TestUserRegisteredEvent(t *testing.T) {
 func TestRegister_PublishesUserRegisteredInRequestTenant(t *testing.T) {
 	db := newMemDB()
 	ctx := tenant.WithID(context.Background(), 2)
-	user, err := newTestUserService(db).Register(ctx, dto.RegisterRequest{Email: "e@example.com", Password: "Password1!", Name: "E"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "e@example.com", Password: "Password1!", Name: "E"})
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -54,7 +53,7 @@ func TestRegister_PublishesUserRegisteredInRequestTenant(t *testing.T) {
 		t.Fatalf("published = %d events, want 1", len(db.published))
 	}
 	event := db.published[0]
-	if event.Type != identitycontracts.EventUserRegistered || event.TenantID != 2 || event.Actor.ID != strconv.FormatInt(user.ID, 10) {
+	if event.Type != identitycontracts.EventUserRegistered || event.TenantID != 2 || event.Actor.ID != strconv.FormatInt(user.User.ID, 10) {
 		t.Errorf("event = %+v", event)
 	}
 }
