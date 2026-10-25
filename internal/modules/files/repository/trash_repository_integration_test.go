@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -133,39 +132,69 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	assert.Equal(t, []int64{recentID, liveID}, fileIDs(t, pool))
 }
 
-// TestTrashPurgeLocksRowsAgainstRestore proves a restore cannot race the
-// purge: while the batch's blobs are being deleted the row is locked, and
-// once the purge commits the restore finds nothing.
-func TestTrashPurgeLocksRowsAgainstRestore(t *testing.T) {
+// TestTrashPurgeClaimBlocksRestore proves a restore can never revive a row
+// whose blob the purge already deleted: the claim commits before purge runs,
+// so restore fails while the blob is being deleted and still fails after the
+// purge errors out (blob gone, row kept). The next run finishes the row.
+func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	pool := setupTrashDB(t)
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-lock@example.com")
-	id, _ := insertFile(t, pool, store, tenant.DefaultID, userA, "locked", 40*24*time.Hour, true)
+	userA := insertUser(t, pool, tenant.DefaultID, "trash-claim@example.com")
+	id, path := insertFile(t, pool, store, tenant.DefaultID, userA, "claimed", 40*24*time.Hour, true)
 
 	ctx := context.Background()
+	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
+	files := filesrepo.NewFileRepository(pool)
 	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
-	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
+	failure := errors.New("hard delete never ran")
+	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
 		require.Len(t, batch, 1)
+		_, restoreErr := files.Restore(tenantCtx, id)
+		assert.ErrorIs(t, restoreErr, apperror.ErrNotFound, "a claimed row is not restorable")
+		require.NoError(t, store.Delete(ctx, path))
+		return nil, failure
+	})
+	require.ErrorIs(t, err, failure)
 
-		tx, err := pool.Begin(ctx)
-		require.NoError(t, err)
-		defer func() { _ = tx.Rollback(ctx) }()
-		_, err = tx.Exec(ctx, `SET LOCAL lock_timeout = '200ms'`)
-		require.NoError(t, err)
-		_, err = tx.Exec(ctx, `UPDATE files SET deleted_at = NULL WHERE id = $1`, id)
-		var pgErr *pgconn.PgError
-		require.ErrorAs(t, err, &pgErr)
-		assert.Equal(t, "55P03", pgErr.Code, "a concurrent restore must wait for the purge lock")
+	assert.Equal(t, []int64{id}, fileIDs(t, pool), "the failed batch keeps its row")
+	assert.False(t, blobExists(t, root, path))
+	_, err = files.Restore(tenantCtx, id)
+	assert.ErrorIs(t, err, apperror.ErrNotFound, "the claim survives the failed purge")
 
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(_ context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
 		return []int64{batch[0].ID}, nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, int64(1), deleted)
+	assert.Equal(t, int64(1), deleted, "the next run reclaims and finishes the row")
+	assert.Empty(t, fileIDs(t, pool))
+}
 
-	_, err = filesrepo.NewFileRepository(pool).Restore(tenant.WithID(ctx, tenant.DefaultID), id)
-	assert.ErrorIs(t, err, apperror.ErrNotFound)
+// TestTrashPurgeSkipsRowsLockedByRestore proves the claim does not wait on a
+// row a restore is still updating: it skips it, and the restore wins.
+func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
+	pool := setupTrashDB(t)
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	userA := insertUser(t, pool, tenant.DefaultID, "trash-skip@example.com")
+	id, _ := insertFile(t, pool, store, tenant.DefaultID, userA, "restoring", 40*24*time.Hour, true)
+
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	_, err = tx.Exec(ctx, `UPDATE files SET deleted_at = NULL WHERE id = $1`, id)
+	require.NoError(t, err)
+
+	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, error) {
+		t.Fatal("a row locked by a restore must be skipped")
+		return nil, nil
+	})
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+	require.NoError(t, tx.Commit(ctx))
 }
 
 // TestTrashPurgeQueryUsesPartialIndex checks the purge plan on a realistic
@@ -183,7 +212,7 @@ func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
 	_, err = pool.Exec(ctx, `ANALYZE files`)
 	require.NoError(t, err)
 
-	// The LockTrashedFiles query (queries/trash.sql). EXPLAIN ANALYZE takes
+	// The ClaimTrashedFiles subquery (queries/trash.sql). EXPLAIN ANALYZE takes
 	// the row locks, so it runs in a transaction that rolls back.
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)

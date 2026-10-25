@@ -29,6 +29,7 @@ RETURNING *;
 -- name: RestoreFile :one
 UPDATE files SET deleted_at = NULL
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL
+  AND purge_started_at IS NULL
 RETURNING *;
 
 -- name: AdminListFiles :many

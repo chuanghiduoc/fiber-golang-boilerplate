@@ -24,28 +24,30 @@ func NewTrashRepository(txManager *database.TxManager) *TrashRepository {
 }
 
 func (r *TrashRepository) PurgeBatch(ctx context.Context, retentionDays, limit int32, purge filesvc.TrashPurgeFunc) (int64, error) {
-	var deleted int64
+	var rows []filesqlc.ClaimTrashedFilesRow
 	err := r.txManager.WithTx(ctx, func(tx pgx.Tx) error {
-		q := filesqlc.New(tx)
-		rows, err := q.LockTrashedFiles(ctx, filesqlc.LockTrashedFilesParams{
+		var err error
+		rows, err = filesqlc.New(tx).ClaimTrashedFiles(ctx, filesqlc.ClaimTrashedFilesParams{
 			RetentionDays: retentionDays,
 			BatchSize:     limit,
 		})
-		if err != nil {
-			return err
-		}
-		if len(rows) == 0 {
-			return nil
-		}
-		batch := make([]filesvc.TrashedFile, len(rows))
-		for i, row := range rows {
-			batch[i] = filesvc.TrashedFile{ID: row.ID, TenantID: row.TenantID, StoragePath: row.StoragePath}
-		}
-		ids, err := purge(ctx, batch)
-		if err != nil || len(ids) == 0 {
-			return err
-		}
-		deleted, err = q.HardDeleteTrashedFiles(ctx, ids)
+		return err
+	})
+	if err != nil || len(rows) == 0 {
+		return 0, err
+	}
+	batch := make([]filesvc.TrashedFile, len(rows))
+	for i, row := range rows {
+		batch[i] = filesvc.TrashedFile{ID: row.ID, TenantID: row.TenantID, StoragePath: row.StoragePath}
+	}
+	ids, err := purge(ctx, batch)
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	var deleted int64
+	err = r.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		deleted, err = filesqlc.New(tx).HardDeleteTrashedFiles(ctx, ids)
 		return err
 	})
 	if err != nil {

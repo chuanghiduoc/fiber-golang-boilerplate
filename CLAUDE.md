@@ -181,7 +181,7 @@ migrations) to its owners; keep it current when adding a module.
   every new query keeps a `tenant_id` predicate. Cross-tenant ids behave as
   not found (`404`), never forbidden. Deliberate exceptions are the
   cross-tenant retention queries: identity `PurgeExpired*Tokens`
-  (`identity.tokens.purge_expired`), files `LockTrashedFiles`/
+  (`identity.tokens.purge_expired`), files `ClaimTrashedFiles`/
   `HardDeleteTrashedFiles` (`files.trash.purge`), and notifications
   `PurgeReadNotifications` (`notifications.retention.purge`); their indexes
   lead with the age column (`idx_files_deleted_at`,

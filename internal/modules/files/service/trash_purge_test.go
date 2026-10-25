@@ -114,5 +114,13 @@ func TestTrashPurgeCanceledJobFailsWithoutDeletingRows(t *testing.T) {
 
 	err := NewTrashPurger(repo, &fakeBlobStore{}, 30).HandleJob(ctx, nil)
 	require.ErrorIs(t, err, context.Canceled)
-	assert.Len(t, repo.trash, 2, "a canceled batch rolls back")
+	assert.Len(t, repo.trash, 2, "a canceled batch hard-deletes nothing")
+}
+
+func TestTrashPurgeDriverTimeoutIsNotBudgetExhaustion(t *testing.T) {
+	// A driver timeout (e.g. pgx connect) also wraps DeadlineExceeded, but the
+	// run budget is untouched, so the job must fail and retry.
+	repo := &fakeTrashRepo{batchErr: fmt.Errorf("connect: %w", context.DeadlineExceeded)}
+	err := NewTrashPurger(repo, &fakeBlobStore{}, 30).HandleJob(context.Background(), nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }

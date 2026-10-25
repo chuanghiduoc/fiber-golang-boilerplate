@@ -20,9 +20,7 @@ const (
 	// already invisible to users, so the cadence only bounds storage growth.
 	TrashPurgeInterval = time.Hour
 
-	// trashPurgeBatchSize bounds one purge transaction. The rows stay locked
-	// while their blobs are deleted (one storage call each), so the batch is
-	// small enough to keep that transaction short.
+	// trashPurgeBatchSize bounds one claimed batch.
 	trashPurgeBatchSize = 100
 	// trashPurgeBudget bounds one run; whatever is left goes to the next run.
 	trashPurgeBudget = time.Minute
@@ -35,21 +33,18 @@ type TrashedFile struct {
 	StoragePath string
 }
 
-// TrashPurgeFunc removes the blobs of a locked batch and returns the IDs whose
+// TrashPurgeFunc removes the blobs of a claimed batch and returns the IDs whose
 // rows may now be hard-deleted. A row whose blob could not be removed is left
-// out, so it stays in the trash for the next run.
+// out, so it stays claimed for the next run.
 type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs []int64, err error)
 
 // TrashRepository is the purge persistence port. Unlike FileRepository it is
 // not tenant-scoped: retention is a cross-tenant maintenance pass, and every
 // candidate carries its own tenant and storage path.
 type TrashRepository interface {
-	// PurgeBatch opens one transaction, locks up to limit rows soft-deleted
-	// more than retentionDays ago (rows locked by a concurrent purge are
-	// skipped), calls purge with them, hard-deletes the returned IDs, and
-	// commits. It returns the number of rows deleted. When purge fails the
-	// transaction rolls back and no row is deleted. A restore of a locked row
-	// waits for the commit and then finds no row.
+	// PurgeBatch commits a claim on up to limit expired rows (making them
+	// unrestorable), calls purge, then hard-deletes the returned IDs. On
+	// failure the rows stay claimed and the next run finishes them.
 	PurgeBatch(ctx context.Context, retentionDays, limit int32, purge TrashPurgeFunc) (int64, error)
 }
 
@@ -66,9 +61,8 @@ func NewTrashPurger(repo TrashRepository, store storage.Storage, retentionDays i
 	return &TrashPurger{repo: repo, storage: store, retentionDays: retentionDays}
 }
 
-// HandleJob purges expired trash in bounded batches: blob first, then the row,
-// so a crash between the two leaves a row whose blob is gone, which the next
-// run finishes (a missing blob counts as deleted). It is idempotent under
+// HandleJob purges expired trash in bounded batches: claim, blob, then row
+// (a missing blob counts as deleted). It is idempotent under
 // at-least-once delivery and publishes no domain event, so no webhook fires:
 // the user-visible deletion already emitted file.deleted. The scheduler
 // payload is not needed and is ignored.
@@ -101,7 +95,7 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 			return nil
 		case err == nil:
 			continue
-		case ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		case ctx.Err() == nil && budgetCtx.Err() != nil && errors.Is(err, context.DeadlineExceeded):
 			slog.Warn("trash purge budget exhausted; the next run continues")
 			return nil
 		default:
@@ -112,8 +106,8 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 
 // deleteBlobs removes each candidate's blob. A blob that is already gone is a
 // success (a previous attempt deleted it before its row). Other failures are
-// logged and the row is kept. Cancellation aborts the batch so its
-// transaction rolls back.
+// logged and the row stays claimed. Cancellation aborts the batch before its
+// hard delete.
 func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids []int64, failed int, err error) {
 	ids = make([]int64, 0, len(batch))
 	for _, file := range batch {

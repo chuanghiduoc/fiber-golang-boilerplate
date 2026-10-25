@@ -9,38 +9,26 @@ import (
 	"context"
 )
 
-const hardDeleteTrashedFiles = `-- name: HardDeleteTrashedFiles :execrows
-DELETE FROM files
-WHERE id = ANY($1::bigint[])
-  AND deleted_at IS NOT NULL
+const claimTrashedFiles = `-- name: ClaimTrashedFiles :many
+
+UPDATE files SET purge_started_at = COALESCE(purge_started_at, now())
+WHERE id IN (
+    SELECT id FROM files
+    WHERE deleted_at IS NOT NULL
+      AND deleted_at < now() - make_interval(days => $1::int)
+    ORDER BY deleted_at
+    LIMIT $2::int
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, tenant_id, storage_path
 `
 
-// Rows are still locked by LockTrashedFiles in the same transaction, so a
-// restore cannot slip in between; the deleted_at guard is defense in depth.
-func (q *Queries) HardDeleteTrashedFiles(ctx context.Context, ids []int64) (int64, error) {
-	result, err := q.db.Exec(ctx, hardDeleteTrashedFiles, ids)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
-const lockTrashedFiles = `-- name: LockTrashedFiles :many
-
-SELECT id, tenant_id, storage_path FROM files
-WHERE deleted_at IS NOT NULL
-  AND deleted_at < now() - make_interval(days => $1::int)
-ORDER BY deleted_at
-LIMIT $2::int
-FOR UPDATE SKIP LOCKED
-`
-
-type LockTrashedFilesParams struct {
+type ClaimTrashedFilesParams struct {
 	RetentionDays int32 `json:"retention_days"`
 	BatchSize     int32 `json:"batch_size"`
 }
 
-type LockTrashedFilesRow struct {
+type ClaimTrashedFilesRow struct {
 	ID          int64  `json:"id"`
 	TenantID    int64  `json:"tenant_id"`
 	StoragePath string `json:"storage_path"`
@@ -49,18 +37,17 @@ type LockTrashedFilesRow struct {
 // Trash retention (files.trash.purge). These are the only files queries
 // without a tenant_id predicate: the purge is a deliberate cross-tenant
 // maintenance pass, and each row carries its own tenant and storage path.
-// One bounded batch of rows soft-deleted more than @retention_days ago, oldest
-// first, locked for the purge transaction. SKIP LOCKED lets a concurrent purge
-// take the next rows instead of waiting. Served by idx_files_deleted_at.
-func (q *Queries) LockTrashedFiles(ctx context.Context, arg LockTrashedFilesParams) ([]LockTrashedFilesRow, error) {
-	rows, err := q.db.Query(ctx, lockTrashedFiles, arg.RetentionDays, arg.BatchSize)
+// Committed before any blob delete; RestoreFile skips claimed rows.
+// Served by idx_files_deleted_at.
+func (q *Queries) ClaimTrashedFiles(ctx context.Context, arg ClaimTrashedFilesParams) ([]ClaimTrashedFilesRow, error) {
+	rows, err := q.db.Query(ctx, claimTrashedFiles, arg.RetentionDays, arg.BatchSize)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []LockTrashedFilesRow{}
+	items := []ClaimTrashedFilesRow{}
 	for rows.Next() {
-		var i LockTrashedFilesRow
+		var i ClaimTrashedFilesRow
 		if err := rows.Scan(&i.ID, &i.TenantID, &i.StoragePath); err != nil {
 			return nil, err
 		}
@@ -70,4 +57,19 @@ func (q *Queries) LockTrashedFiles(ctx context.Context, arg LockTrashedFilesPara
 		return nil, err
 	}
 	return items, nil
+}
+
+const hardDeleteTrashedFiles = `-- name: HardDeleteTrashedFiles :execrows
+DELETE FROM files
+WHERE id = ANY($1::bigint[])
+  AND deleted_at IS NOT NULL
+  AND purge_started_at IS NOT NULL
+`
+
+func (q *Queries) HardDeleteTrashedFiles(ctx context.Context, ids []int64) (int64, error) {
+	result, err := q.db.Exec(ctx, hardDeleteTrashedFiles, ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
