@@ -32,7 +32,7 @@ func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
 	).Scan(&suspendedID))
 	require.NotZero(t, suspendedID)
 
-	resolver := identityadapter.NewTenantResolver(identityrepo.NewStores(pool).Tenants)
+	resolver := identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "suspended-default"))
 	api.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })

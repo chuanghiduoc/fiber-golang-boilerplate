@@ -327,6 +327,25 @@ jobs:
             exit 1
           fi
 
+      - name: Create the non-superuser app role and verify RLS
+        run: |
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
+            -v app_user=app -v app_password=app -v owner="$DB_USERNAME" -v schema=public \
+            -f deploy/postgres/database-roles.sql
+          unsafe=$(psql -h "$DB_HOST" -U app -d "$DB_DATABASE" -tAc \
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user")
+          if [ "$unsafe" != "f" ]; then
+            echo "::error::the app role must be a non-superuser without BYPASSRLS"
+            exit 1
+          fi
+          guarded=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relrowsecurity AND c.relforcerowsecurity")
+          if [ "$guarded" -ne 21 ]; then
+            echo "::error::expected 21 tables with forced RLS, found $guarded"
+            exit 1
+          fi
+
       - name: Reject a legacy version-1 schema with an actionable error
         run: |
           psql -h "$DB_HOST" -U "$DB_USERNAME" -d postgres -v ON_ERROR_STOP=1 \

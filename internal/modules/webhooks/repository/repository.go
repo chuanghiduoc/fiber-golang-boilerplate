@@ -12,7 +12,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
@@ -49,7 +48,8 @@ type JobQueue interface {
 
 // Postgres implements every webhooks persistence interface.
 type Postgres struct {
-	pool  *pgxpool.Pool
+	db    database.DBTX
+	tx    *database.TxManager
 	q     *webhooksqlc.Queries
 	queue JobQueue
 }
@@ -61,39 +61,20 @@ var (
 	_ webhooksvc.DispatchStore = (*Postgres)(nil)
 )
 
-// New returns a repository backed by pool. queue may be nil only for reads and
-// non-job writes; delivery creation and retry scheduling fail with ErrNoQueue.
-func New(pool *pgxpool.Pool, queue JobQueue) *Postgres {
-	return &Postgres{pool: pool, q: webhooksqlc.New(pool), queue: queue}
+// New returns a repository backed by db for single statements and tx for
+// multi-statement work. queue may be nil only for reads and non-job writes;
+// delivery creation and retry scheduling fail with ErrNoQueue.
+func New(db database.DBTX, tx *database.TxManager, queue JobQueue) *Postgres {
+	return &Postgres{db: db, tx: tx, q: webhooksqlc.New(db), queue: queue}
 }
 
-func (r *Postgres) withTx(ctx context.Context, fn func(tx pgx.Tx, q *webhooksqlc.Queries) error) (err error) {
-	if r == nil || r.pool == nil {
+func (r *Postgres) withTx(ctx context.Context, fn func(tx pgx.Tx, q *webhooksqlc.Queries) error) error {
+	if r == nil || r.tx == nil {
 		return ErrNoPool
 	}
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("webhooks: begin transaction: %w", err)
-	}
-	defer func() {
-		rbErr := tx.Rollback(context.WithoutCancel(ctx))
-		if rbErr == nil || errors.Is(rbErr, pgx.ErrTxClosed) {
-			return
-		}
-		if err != nil {
-			err = errors.Join(err, fmt.Errorf("webhooks: rollback: %w", rbErr))
-			return
-		}
-		err = fmt.Errorf("webhooks: rollback: %w", rbErr)
-	}()
-
-	if err := fn(tx, r.q.WithTx(tx)); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("webhooks: commit: %w", err)
-	}
-	return nil
+	return r.tx.WithTx(ctx, func(tx pgx.Tx) error {
+		return fn(tx, r.q.WithTx(tx))
+	})
 }
 
 // tenantID returns the tenant every scoped query must use.

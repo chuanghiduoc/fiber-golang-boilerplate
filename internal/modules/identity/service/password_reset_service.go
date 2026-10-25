@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -263,6 +264,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req dto.ResetP
 	}
 
 	var owner *User
+	ctx = database.WithRLSBypass(ctx) // A password reset ends the user's sessions in every tenant.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, consumeErr := consumeResetToken(ctx, tx.Stores, tokenHash)
 		if consumeErr != nil {

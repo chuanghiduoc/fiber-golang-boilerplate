@@ -47,6 +47,10 @@ Conventions that apply to every diagram below:
   tenant); `users` and the per-user rows `user_passwords`, `user_identities`,
   `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, and
   `mfa_recovery_codes` are global (ADR 0004) and have no `tenant_id`.
+- Every table with a `tenant_id` has `ENABLE`/`FORCE ROW LEVEL SECURITY` and a
+  `tenant_isolation` policy on `app_tenant_visible(tenant_id)` (ADR 0007).
+  `api_key_scopes` has no tenant column and stays unprotected because it is
+  reachable only through its key; `feature_flags` is process-wide.
 - Child rows reference their parent through a **composite** foreign key, so a
   row can never point at a parent in another tenant. Every per-member row in
   another module references `(tenant_id, user_id) → memberships(tenant_id,

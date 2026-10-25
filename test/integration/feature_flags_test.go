@@ -110,7 +110,7 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	application := app.New(cfg, app.Deps{
 		Cache:          cache.NewMemoryCache(),
 		Audit:          recorder,
-		TenantResolver: identityadapter.NewTenantResolver(identityrepo.NewStores(pool).Tenants),
+		TenantResolver: identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants),
 		Flags:          flags,
 	})
 	application.Register(featuresmodule.New(handler))

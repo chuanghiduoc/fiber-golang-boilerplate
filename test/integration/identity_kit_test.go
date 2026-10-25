@@ -13,8 +13,8 @@ import (
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -40,8 +40,8 @@ type identityKit struct {
 // newIdentityKit signs access tokens with secret. sender may be nil, which
 // leaves email verification and password reset unwired.
 func newIdentityKit(pool *pgxpool.Pool, appCache cache.Cache, recorder audit.TxRecorder, secret string, sender email.Sender) *identityKit {
-	stores := identityrepo.NewStores(pool)
-	tx := identityrepo.NewTransactor(database.NewTxManager(pool), recorder, nil, nil)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), recorder, nil, nil)
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
 	sign := func(c identityservice.AccessClaims) (string, error) {
 		return token.GenerateForSession(token.SessionClaims{

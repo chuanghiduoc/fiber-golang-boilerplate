@@ -12,6 +12,7 @@ import (
 
 	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 func toDelivery(row webhooksqlc.WebhookDelivery) webhooksvc.Delivery {
@@ -51,7 +52,7 @@ func toDeliveryAttempt(row webhooksqlc.WebhookDeliveryAttempt) webhooksvc.Delive
 // CreateDeliveryWithJob writes the event (first delivery of EventID only),
 // the delivery row, and its first durable job in one transaction.
 func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft webhooksvc.DeliveryDraft) (deliveryID int64, created bool, err error) {
-	if r == nil || r.pool == nil {
+	if r == nil || r.db == nil {
 		return 0, false, ErrNoPool
 	}
 	if r.queue == nil {
@@ -249,7 +250,7 @@ func fencedResult(affected int64, err error) error {
 }
 
 func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft webhooksvc.RetryDraft) error {
-	if r == nil || r.pool == nil {
+	if r == nil || r.db == nil {
 		return ErrNoPool
 	}
 	if r.queue == nil {
@@ -318,6 +319,7 @@ func (r *Postgres) PurgeDeliveries(ctx context.Context, retentionDays int32) (in
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeWebhookDeliveries(ctx, webhooksqlc.PurgeWebhookDeliveriesParams{
 			RetentionDays: retentionDays,
@@ -332,6 +334,7 @@ func (r *Postgres) PurgeOrphanEvents(ctx context.Context, retentionDays int32) (
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeOrphanWebhookEvents(ctx, webhooksqlc.PurgeOrphanWebhookEventsParams{
 			RetentionDays: retentionDays,

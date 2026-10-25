@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -137,11 +138,12 @@ type Scheduler struct {
 }
 
 // New returns a PostgreSQL-backed scheduler. holder identifies the process in
-// the lease; an empty value becomes "scheduler".
-func New(pool *pgxpool.Pool, registry *Registry, queue Queue, holder string, opts ...Option) *Scheduler {
+// the lease; an empty value becomes "scheduler". tx scopes the transaction
+// that records a run and enqueues its job.
+func New(pool *pgxpool.Pool, tx *database.TxManager, registry *Registry, queue Queue, holder string, opts ...Option) *Scheduler {
 	var st store
 	if pool != nil {
-		st = newPGStore(pool)
+		st = newPGStore(pool, tx)
 	}
 	return newScheduler(st, registry, queue, holder, opts...)
 }

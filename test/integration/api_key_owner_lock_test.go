@@ -23,7 +23,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 type ownerLockHarness struct {
@@ -49,8 +48,8 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	owner := insertAdmin("lock-owner@test.com")
 	insertAdmin("lock-other-admin@test.com") // the owner is not the last admin
 
-	txManager := database.NewTxManager(pool)
-	stores := identityrepo.NewStores(pool)
+	txManager := testutil.NewTxManager(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
 	principals := identityadapter.NewPrincipalReader(stores.Memberships)
 	keyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	return &ownerLockHarness{

@@ -18,7 +18,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -70,8 +69,8 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	stores := identityrepo.NewStores(pool)
-	transactor := identityrepo.NewTransactor(database.NewTxManager(pool), audit.NewPostgresRecorder(pool), nil, nil)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	transactor := identityrepo.NewTransactor(testutil.NewTxManager(pool), audit.NewPostgresRecorder(testutil.Scoped(pool)), nil, nil)
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
 	sign := func(c identityservice.AccessClaims) (string, error) {
 		return token.GenerateForSession(token.SessionClaims{

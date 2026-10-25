@@ -126,6 +126,36 @@ func TestRequiredObjectsMatchBaseline(t *testing.T) {
 	}
 }
 
+// TestRLSGuardMatchesBaseline derives tenant-owned tables from requiredColumns
+// (every one carries tenant_id) and checks that the guard and the baseline
+// enable and force row-level security with the tenant_isolation policy.
+func TestRLSGuardMatchesBaseline(t *testing.T) {
+	baseline := readBaseline(t)
+	for table, columns := range requiredColumns {
+		if !slices.Contains(columns, "tenant_id") {
+			continue
+		}
+		if !slices.Contains(requiredRLS, table) {
+			t.Errorf("%s has tenant_id but is missing from the RLS guard", table)
+			continue
+		}
+		for _, statement := range []string{
+			"ALTER TABLE " + table + " ENABLE ROW LEVEL SECURITY;",
+			"ALTER TABLE " + table + " FORCE ROW LEVEL SECURITY;",
+			"CREATE POLICY tenant_isolation ON " + table,
+		} {
+			if !strings.Contains(baseline, statement) {
+				t.Errorf("baseline is missing %q", statement)
+			}
+		}
+	}
+	for _, table := range requiredRLS {
+		if !slices.Contains(requiredColumns[table], "tenant_id") {
+			t.Errorf("RLS guard lists %s, which has no tenant_id column", table)
+		}
+	}
+}
+
 func TestRunIsDefined(t *testing.T) {
 	// Compile-level guard: main must keep a testable run() entry point.
 	_ = run

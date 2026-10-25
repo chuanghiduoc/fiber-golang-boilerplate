@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
@@ -8,6 +10,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
@@ -27,9 +30,12 @@ import (
 type Infra struct {
 	// Platform is the process-wide configuration every module may read.
 	Platform PlatformConfig
-	Pool     *pgxpool.Pool
-	Tx       *database.TxManager
-	Cache    cache.Cache
+	// Pool is for pool-level infrastructure only (health checks, shutdown).
+	// Repositories take DB so every statement carries the RLS scope.
+	Pool  *pgxpool.Pool
+	DB    database.DBTX
+	Tx    *database.TxManager
+	Cache cache.Cache
 	// Audit is the process-wide recorder; it implements both audit.Recorder
 	// (Tier 2 guards, best-effort events) and audit.TxRecorder (Tier 1).
 	Audit *audit.PostgresRecorder
@@ -56,6 +62,14 @@ type PlatformConfig struct {
 	App    config.AppConfig
 	JWT    config.JWTConfig
 	Tenant config.TenantConfig
+}
+
+// RLSResolver scopes a statement or transaction to the context tenant, or
+// bypasses isolation when the context is marked with
+// database.WithRLSBypass. cmd/api and cmd/seed inject it into every
+// database.TxManager and database.Scoped they build.
+func RLSResolver(ctx context.Context) database.Scope {
+	return database.Scope{TenantID: tenant.EffectiveID(ctx), Bypass: database.RLSBypass(ctx)}
 }
 
 // NewPlatformConfig extracts the shared sections from cfg.

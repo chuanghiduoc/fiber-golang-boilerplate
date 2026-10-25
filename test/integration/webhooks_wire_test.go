@@ -114,8 +114,8 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	queue := jobs.NewQueue(pool)
-	repo := webhookrepo.New(pool, queue)
+	queue := jobs.NewQueue(testutil.Scoped(pool))
+	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue)
 	codec, err := webhookservice.NewSecretCodec("webhook-wire-encryption-key")
 	require.NoError(t, err)
 	ciphertext, err := codec.Seal([]byte(wireSecret))

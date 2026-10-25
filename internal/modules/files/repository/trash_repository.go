@@ -24,6 +24,7 @@ func NewTrashRepository(txManager *database.TxManager) *TrashRepository {
 }
 
 func (r *TrashRepository) PurgeBatch(ctx context.Context, retentionDays, limit int32, purge filesvc.TrashPurgeFunc) (int64, error) {
+	ctx = database.WithRLSBypass(ctx) // Trash retention spans every tenant.
 	var rows []filesqlc.ClaimTrashedFilesRow
 	err := r.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 		var err error

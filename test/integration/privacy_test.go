@@ -32,7 +32,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -79,9 +78,9 @@ func setupPrivacyHarness(t *testing.T) *privacyHarness {
 	t.Cleanup(func() { _ = appCache.Close() })
 	codec, err := jobs.NewPayloadCodec("privacy-integration-encryption-key")
 	require.NoError(t, err)
-	queue := jobs.NewQueue(pool)
+	queue := jobs.NewQueue(testutil.Scoped(pool))
 	bus := events.New(queue)
-	recorder := audit.NewPostgresRecorder(pool)
+	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
 	flags := featureflags.NewEvaluator(featureflags.Options{})
 
 	cfg := &config.Config{
@@ -98,7 +97,8 @@ func setupPrivacyHarness(t *testing.T) *privacyHarness {
 	infra := app.Infra{
 		Platform:     app.NewPlatformConfig(cfg),
 		Pool:         pool,
-		Tx:           database.NewTxManager(pool),
+		DB:           testutil.Scoped(pool),
+		Tx:           testutil.NewTxManager(pool),
 		Cache:        appCache,
 		Audit:        recorder,
 		Queue:        queue,

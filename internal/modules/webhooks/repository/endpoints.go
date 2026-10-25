@@ -30,7 +30,7 @@ func toEndpoint(row webhooksqlc.WebhookEndpoint, eventTypes []string) webhooksvc
 // CreateEndpoint inserts the endpoint, its subscriptions, and its first
 // secret in one transaction.
 func (r *Postgres) CreateEndpoint(ctx context.Context, draft webhooksvc.CreateEndpointDraft) (*webhooksvc.Endpoint, error) {
-	if r == nil || r.pool == nil {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)
@@ -110,7 +110,7 @@ func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) (
 // UpdateEndpoint replaces the endpoint configuration and its subscription set
 // in one transaction.
 func (r *Postgres) UpdateEndpoint(ctx context.Context, draft webhooksvc.UpdateEndpointDraft) (*webhooksvc.Endpoint, error) {
-	if r == nil || r.pool == nil {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)
@@ -171,7 +171,7 @@ func (r *Postgres) DeleteEndpoint(ctx context.Context, id int64) error {
 }
 
 func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*webhooksvc.Endpoint, error) {
-	if r == nil || r.pool == nil {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)

@@ -63,7 +63,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		slog.Info("Google OAuth enabled")
 	}
 
-	stores := identityrepository.NewStores(infra.Pool)
+	stores := identityrepository.NewStores(infra.DB)
 	// cmd/api always supplies the DATA_ENCRYPTION_KEY codec. Builds without one
 	// (unit/arch tests, an app built with New) fall back to the JWT secret the
 	// same way local job payload encryption does.
@@ -148,7 +148,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	m.invitations = identityhandler.NewInvitationHandler(invitationSvc)
 	m.mfa = identityhandler.NewMFAHandler(mfaSvc)
 	m.resetSvc = passwordResetSvc
-	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
+	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.DB))
 	m.privacySvc = identityservice.NewPrivacyService(identityservice.PrivacyDeps{
 		Stores:       stores,
 		Tx:           transactor,

@@ -14,7 +14,6 @@ import (
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 const adminEmail = "admin@example.com"
@@ -24,8 +23,8 @@ func setup(t *testing.T) (pool *pgxpool.Pool, run func(cfg config.AdminConfig, t
 	pool, cleanup, err := testutil.SetupTestDB(context.Background())
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
-	stores := identityrepo.NewStores(pool)
-	tx := identityrepo.NewTransactor(database.NewTxManager(pool), nil, nil, nil)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), nil, nil, nil)
 	return pool, func(cfg config.AdminConfig, tenantID int64) error {
 		return seed.Admin(context.Background(), cfg, stores, tx, tenantID)
 	}

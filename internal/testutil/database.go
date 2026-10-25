@@ -25,7 +25,13 @@ import (
 // returns the pool plus a cleanup function. By default it starts a disposable
 // testcontainer; set TEST_DATABASE_URL to use an existing PostgreSQL server
 // (useful on hosts without Docker). The supplied database must allow CREATE
-// SCHEMA.
+// SCHEMA and CREATE ROLE.
+//
+// The returned pool connects as the non-superuser app role, so RLS is
+// enforced. Its sessions default app.rls_bypass to on for fixtures and
+// assertions that use the raw pool: application code always overrides both
+// settings per statement (database.Scoped) or transaction (TxManager), and
+// TestRLS proves the enforcement.
 func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
 		return setupExternalDB(ctx, dsn)
@@ -52,22 +58,12 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 		return nil, nil, err
 	}
 
-	// Run migrations
-	migrationsDir := migrationsPath()
-	if err := database.RunMigrations(connStr, migrationsDir); err != nil {
+	if err := database.RunMigrations(connStr, migrationsPath()); err != nil {
 		_ = pgContainer.Terminate(ctx)
 		return nil, nil, err
 	}
 
-	// Create pool from connection string directly
-	poolCfg, err := pgxpool.ParseConfig(connStr)
-	if err != nil {
-		_ = pgContainer.Terminate(ctx)
-		return nil, nil, err
-	}
-	poolCfg.MaxConns = 5
-
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	pool, err := OpenAppPool(ctx, connStr, "public")
 	if err != nil {
 		_ = pgContainer.Terminate(ctx)
 		return nil, nil, err
@@ -116,16 +112,10 @@ func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, func(), er
 		return nil, nil, fmt.Errorf("run migrations in test schema: %w", err)
 	}
 
-	poolCfg, err := pgxpool.ParseConfig(schemaDSN)
+	pool, err := OpenAppPool(ctx, schemaDSN, schema)
 	if err != nil {
 		dropSchema()
-		return nil, nil, fmt.Errorf("parse test schema pool config: %w", err)
-	}
-	poolCfg.MaxConns = 5
-	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
-	if err != nil {
-		dropSchema()
-		return nil, nil, fmt.Errorf("connect to test schema: %w", err)
+		return nil, nil, err
 	}
 
 	cleanup := func() {

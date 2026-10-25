@@ -60,7 +60,7 @@ func TestRetentionPurgeDeletesOnlyOldReadNotifications(t *testing.T) {
 	unreadOld := insertNotification(t, pool, tenant.DefaultID, userA, 400*day, 0)
 	readRecently := insertNotification(t, pool, tenantB, userB, 400*day, 10*day)
 
-	purger := notificationservice.NewRetentionPurger(repository.NewRetentionRepository(pool), notificationRetentionDays)
+	purger := notificationservice.NewRetentionPurger(repository.NewRetentionRepository(testutil.Scoped(pool)), notificationRetentionDays)
 	ctx := context.Background()
 	require.NoError(t, purger.HandleJob(ctx, nil))
 

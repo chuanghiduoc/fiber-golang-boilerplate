@@ -281,7 +281,7 @@ Token-minting endpoints never take `Idempotency-Key`.
 | Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
 | Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `membershipStatus`, `joinedAt`, `bannedAt`). |
-| Remaining | Row-level security and per-tenant limits/quotas. |
+| Remaining | Per-tenant limits/quotas. |
 
 ## Users, memberships, sessions, and invitations
 

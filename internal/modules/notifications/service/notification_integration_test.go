@@ -21,7 +21,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -37,13 +36,20 @@ func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address s
 
 func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) notificationservice.NotificationService {
 	t.Helper()
-	sender := jobs.NewQueuedSender(jobs.NewQueue(pool))
+	sender := jobs.NewQueuedSender(jobs.NewQueue(testutil.Scoped(pool)))
 	return notificationservice.NewNotificationService(
-		repository.NewNotificationRepository(pool),
+		repository.NewNotificationRepository(testutil.Scoped(pool)),
 		recipients,
 		sender,
-		repository.NewTransactor(database.NewTxManager(pool), sender),
+		repository.NewTransactor(testutil.NewTxManager(pool), sender),
 	)
+}
+
+// failingSender returns an error while the notification transaction is open.
+type failingSender struct{}
+
+func (failingSender) Send(context.Context, email.Message) error {
+	return errors.New("queue unavailable")
 }
 
 type staticRecipients map[int64]identitycontracts.NotificationRecipient
@@ -215,11 +221,15 @@ func TestCreateIntegrationRollsBackNotificationWhenQueueFails(t *testing.T) {
 
 	userID := integrationUser(t, pool, tenant.DefaultID, "notifications-queue-fail@example.com")
 	recipients := staticRecipients{userID: {UserID: userID, Email: "notifications-queue-fail@example.com"}}
-	svc := newIntegrationService(t, pool, recipients)
+	// The sender stands in for a full job queue: it fails while the row's
+	// transaction is open, like an INSERT into jobs would.
+	svc := notificationservice.NewNotificationService(
+		repository.NewNotificationRepository(testutil.Scoped(pool)),
+		recipients,
+		failingSender{},
+		repository.NewTransactor(testutil.NewTxManager(pool), failingSender{}),
+	)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-
-	_, err = pool.Exec(ctx, `DROP TABLE jobs`)
-	require.NoError(t, err)
 
 	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "system.info", Title: "Atomic", Body: "Body",

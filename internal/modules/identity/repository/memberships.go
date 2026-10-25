@@ -5,6 +5,7 @@ import (
 
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -105,6 +106,7 @@ func (r *MembershipRepository) ListCursor(ctx context.Context, cur pagination.DB
 }
 
 func (r *MembershipRepository) ListForUser(ctx context.Context, userID int64) ([]identityservice.Membership, error) {
+	ctx = database.WithRLSBypass(ctx) // The user's memberships in every tenant (global account operations).
 	rows, err := r.q.ListUserMemberships(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)

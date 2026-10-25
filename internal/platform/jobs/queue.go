@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -35,19 +35,20 @@ RETURNING id`
 const existingIdempotentJobSQL = `
 SELECT id FROM jobs WHERE tenant_id = $1 AND idempotency_key = $2`
 
-// queryRower is implemented by both *pgxpool.Pool and pgx.Tx.
+// queryRower is the subset of database.DBTX used by enqueue.
 type queryRower interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // Queue enqueues jobs for a Worker to process.
 type Queue struct {
-	pool *pgxpool.Pool
+	db database.DBTX
 }
 
-// NewQueue returns a queue backed by pool.
-func NewQueue(pool *pgxpool.Pool) *Queue {
-	return &Queue{pool: pool}
+// NewQueue returns a queue backed by db. The queue inserts tenant-owned rows,
+// so production passes a database.Scoped handle, not the raw pool.
+func NewQueue(db database.DBTX) *Queue {
+	return &Queue{db: db}
 }
 
 // Enqueue inserts job as queued work and returns its id. A zero RunAt means
@@ -59,10 +60,10 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if q == nil || q.pool == nil {
+	if q == nil || q.db == nil {
 		return 0, ErrNoPool
 	}
-	return insertJob(ctx, q.pool, normalized)
+	return insertJob(ctx, q.db, normalized)
 }
 
 // EnqueueTx inserts job using tx, so the job is committed atomically with the
@@ -87,10 +88,10 @@ func (q *Queue) EnqueueOnce(ctx context.Context, job Job) (id int64, created boo
 	if err != nil {
 		return 0, false, err
 	}
-	if q == nil || q.pool == nil {
+	if q == nil || q.db == nil {
 		return 0, false, ErrNoPool
 	}
-	return insertJobOnce(ctx, q.pool, normalized)
+	return insertJobOnce(ctx, q.db, normalized)
 }
 
 // EnqueueOnceTx is EnqueueOnce using tx, so the deduplicated job commits
@@ -186,10 +187,10 @@ func (q *Queue) PurgeTerminal(ctx context.Context, olderThan time.Duration) (int
 	if olderThan <= 0 {
 		return 0, ErrInvalidRetention
 	}
-	if q == nil || q.pool == nil {
+	if q == nil || q.db == nil {
 		return 0, ErrNoPool
 	}
-	purged, err := newPGStore(q.pool).PurgeTerminal(ctx, olderThan)
+	purged, err := newPGStore(q.db).PurgeTerminal(ctx, olderThan)
 	if purged > 0 {
 		metrics.JobsPurgedTotal.Add(float64(purged))
 	}

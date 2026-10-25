@@ -41,6 +41,11 @@ type DBConfig struct {
 	// session-mode pool) while the API keeps using the pooler.
 	MigrateHost string `env:"DB_MIGRATE_HOST"`
 	MigratePort int    `env:"DB_MIGRATE_PORT"`
+	// MigrateUsername and MigratePassword, when set, replace Username/Password
+	// for cmd/migrate only. Migrations need the schema owner (DDL); the API and
+	// worker connect as the non-superuser app role so RLS applies.
+	MigrateUsername string `env:"DB_MIGRATE_USERNAME"`
+	MigratePassword string `env:"DB_MIGRATE_PASSWORD"`
 }
 
 // dbQueryExecModes are the accepted DB_QUERY_EXEC_MODE values; pkg/database
@@ -56,15 +61,21 @@ func (db DBConfig) EffectiveQueryExecMode() string {
 	return db.QueryExecMode
 }
 
-// ForMigration returns the settings cmd/migrate connects with: DB_MIGRATE_HOST
-// and DB_MIGRATE_PORT override the API's host/port when set. Credentials,
-// database, schema, and TLS settings are shared.
+// ForMigration returns the settings cmd/migrate connects with: DB_MIGRATE_*
+// override the API's host, port, and credentials when set. The database,
+// schema, and TLS settings are shared.
 func (db DBConfig) ForMigration() DBConfig {
 	if host := strings.TrimSpace(db.MigrateHost); host != "" {
 		db.Host = host
 	}
 	if db.MigratePort != 0 {
 		db.Port = db.MigratePort
+	}
+	if username := strings.TrimSpace(db.MigrateUsername); username != "" {
+		db.Username = username
+	}
+	if db.MigratePassword != "" {
+		db.Password = db.MigratePassword
 	}
 	return db
 }

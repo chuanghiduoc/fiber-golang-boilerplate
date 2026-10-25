@@ -226,7 +226,7 @@ flowchart TD
 | Idempotency | Keys are scoped by method, path, tenant ID/slug, and caller (user, or IP for public routes), so a key/body/IP in two tenants cannot replay one tenant's `201` into another. |
 | Audit | Fail-closed for privileged mutations: Tier 1 services write the audit row in the mutation transaction; Tier 2 routes write a pre-write intent row through `audithttp.Guard`. A required intent that cannot be stored returns `503 system.audit_unavailable` before the handler runs. |
 | Internal fallback | `tenant.EffectiveID(ctx)` falls back to tenant 1 only for jobs, internal callers, and tests. HTTP writes must resolve a tenant through middleware. |
-| Remaining | Row-level security and per-tenant limits/quotas. |
+| Remaining | Per-tenant limits/quotas. |
 
 ## Internationalization and API Versioning
 
@@ -757,7 +757,7 @@ See [.env.example](.env.example) for every option and default. Key settings:
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (required in production; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
 | `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |
-| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
+| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
 
 ## Pagination
 
@@ -796,7 +796,7 @@ migration entrypoint, and tenant foundation exist.
 
 | Area | Status |
 |------|--------|
-| Tenant isolation | Implemented for identity, files, webhooks, apikeys, and notifications (scoped SQL/indexes, tenant-bound OAuth state, tenant-aware sessions, tenant-prefixed storage keys, source-resolved inbound webhooks). Row-level security and per-tenant limits are future work. |
+| Tenant isolation | Implemented for identity, files, webhooks, apikeys, and notifications (scoped SQL/indexes, tenant-bound OAuth state, tenant-aware sessions, tenant-prefixed storage keys, source-resolved inbound webhooks). Row-level security is enforced on every tenant-owned table (ADR 0007); per-tenant limits are future work. |
 | Notifications | In-app feed, per-type channel preferences, durable email channel committed with the in-app row; at-least-once delivery. |
 | Tracing | HTTP, sanitized pgx queries, and durable jobs; disabled by default (`OTEL_ENABLED=true` plus a collector to enable). |
 | Delivery | Metrics, Kubernetes manifests, GHCR release workflow, and an optional gated CD workflow exist; full promotion/rollout automation does not. |

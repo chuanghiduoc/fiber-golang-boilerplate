@@ -29,7 +29,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 const apiKeyIntegrationSecret = "api-key-integration-secret"
@@ -67,11 +66,11 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	userA := insertUser(tenant.DefaultID, "apikey-a@test.com")
 	userB := insertUser(tenantB, "apikey-b@test.com")
 
-	stores := identityrepo.NewStores(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(database.NewTxManager(pool), audit.Noop{}, principalReader))
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(testutil.NewTxManager(pool), audit.Noop{}, principalReader))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(

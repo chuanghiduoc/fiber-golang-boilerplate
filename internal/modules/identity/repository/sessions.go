@@ -6,6 +6,7 @@ import (
 
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -104,6 +105,7 @@ func (r *SessionRepository) RevokeAllInTenant(ctx context.Context, userID int64,
 }
 
 func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID int64, why identityservice.RevokeReason) error {
+	ctx = database.WithRLSBypass(ctx) // The user's sessions in every tenant (global account operations).
 	if err := r.q.RevokeAllUserSessions(ctx, identitysqlc.RevokeAllUserSessionsParams{
 		UserID: userID,
 		Reason: optionalText(string(why)),
@@ -114,6 +116,7 @@ func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID int64, 
 }
 
 func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID, keepID int64, why identityservice.RevokeReason) error {
+	ctx = database.WithRLSBypass(ctx) // The user's other sessions in every tenant (MFA change).
 	if err := r.q.RevokeOtherUserSessions(ctx, identitysqlc.RevokeOtherUserSessionsParams{
 		UserID: userID,
 		KeepID: keepID,

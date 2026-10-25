@@ -216,11 +216,24 @@ migrations) to its owners; keep it current when adding a module.
 - Tokens without a positive `tenant_id` or `sid` claim are rejected
   fail-closed; rotate legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
   is for jobs/internal/tests only, never HTTP handling.
-- RLS and per-tenant limits remain future work; do not claim
-  whole-application isolation.
+- **Row-level security (ADR 0007):** every table with a `tenant_id` has
+  `ENABLE`+`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy calling
+  `app_tenant_visible(tenant_id)`. `database.TxManager` sets
+  `app.tenant_id`/`app.rls_bypass` with transaction-local `set_config` right
+  after `BEGIN`; `database.Scoped` does the same for one statement in a single
+  pgx Batch (`BEGIN; set_config; statement; COMMIT`). Repositories are wired
+  with `app.Infra.DB` (the Scoped handle), never the raw pool. A query without
+  a tenant setting sees no rows. `database.WithRLSBypass(ctx)` marks a
+  deliberate cross-tenant path (global job claim/lease/purge, retention
+  purges, feature snapshot, webhook inbound source lookup, global-user
+  identity operations, tenant lifecycle) and must never appear on an HTTP
+  path serving one tenant. The API/worker/seed connect as a non-superuser
+  role without `BYPASSRLS` (`cmd/api` refuses production startup otherwise);
+  `cmd/migrate` uses the owner role via `DB_MIGRATE_*`. Per-tenant limits
+  remain future work; do not claim whole-application isolation.
 
 **Scope:** a boilerplate, not a finished multi-tenant SaaS platform.
-Row-level security, per-tenant quotas, and promotion/rollout automation are
+Per-tenant quotas and promotion/rollout automation are
 future work. Tracing (HTTP, sanitized pgx, jobs) is disabled by default
 (`OTEL_ENABLED=false`). Kubernetes manifests and the GHCR release workflow are
 a production foundation, not a complete CD platform. There is no shared
@@ -462,8 +475,11 @@ handler/service/DTO/repository package.
   `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; pgx's
   `exec`/`simple_protocol` are rejected because json/jsonb `[]byte` binding
   (audit metadata) breaks. `cmd/migrate` uses `DB_MIGRATE_HOST`/
-  `DB_MIGRATE_PORT` when set: golang-migrate holds a session advisory lock,
-  so it must bypass a transaction-mode pooler. `search_path` stays a startup
+  `DB_MIGRATE_PORT` (and `DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD` for the
+  schema owner) when set: golang-migrate holds a session advisory lock,
+  so it must bypass a transaction-mode pooler. The API/worker/seed role is a
+  non-superuser without `BYPASSRLS`; create it with
+  `deploy/postgres/database-roles.sql`. `search_path` stays a startup
   parameter: with PgBouncer either `track_extra_parameters = search_path` or
   `ignore_startup_parameters = search_path` plus
   `ALTER ROLE ... SET search_path`.
@@ -571,8 +587,9 @@ handler/service/DTO/repository package.
   Precedence: force-off > kill switch > user > tenant > database default >
   environment > compiled default. The `features` module scopes targets to
   `tenant.EffectiveID(ctx)` and invalidates the local snapshot after writes.
-- **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate;
-  never span modules (use jobs/events).
+- **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate
+  and installs the context's RLS scope right after `BEGIN`; never span modules
+  (use jobs/events).
 - **Drivers:** storage `local|s3|seaweedfs` (`pkg/storage/drivers.New`; S3 via
   aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis`, email
   `console|smtp`, chosen by config factories.

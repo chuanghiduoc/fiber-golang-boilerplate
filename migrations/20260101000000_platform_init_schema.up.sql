@@ -28,6 +28,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- app_tenant_visible is the single RLS predicate for tenant-owned tables. It
+-- reads the transaction-local settings TxManager/Scoped install, so a pooled
+-- connection is never scoped to its previous caller (ADR 0007). Bypass is for
+-- deliberate cross-tenant platform work only. With neither setting, the
+-- comparison against NULL is NULL, so the row is invisible (fail closed).
+CREATE OR REPLACE FUNCTION app_tenant_visible(row_tenant BIGINT) RETURNS BOOLEAN
+LANGUAGE sql STABLE AS $$
+  SELECT current_setting('app.rls_bypass', true) = 'on'
+      OR row_tenant = NULLIF(current_setting('app.tenant_id', true), '')::BIGINT
+$$;
+
 -- owner: identity
 -- Identity baseline (ADR 0004): users are global identities and join tenants
 -- through memberships. Credentials (user_passwords) and external identities
@@ -530,6 +541,39 @@ CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_user_unused
     ON mfa_recovery_codes (user_id)
     WHERE used_at IS NULL;
 
+-- Tenant isolation (ADR 0007). FORCE subjects the table owner too, so the app
+-- role cannot silently bypass a policy it owns.
+ALTER TABLE tenant_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_settings FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON tenant_settings
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON memberships
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE data_exports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE data_exports FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON data_exports
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invitations FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON invitations
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessions FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON sessions
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE refresh_tokens FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON refresh_tokens
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+
 -- owner: platform
 -- ---------------------------------------------------------------------------
 -- platform: durable jobs / outbox
@@ -592,6 +636,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_tenant_idempotency_key
 CREATE INDEX IF NOT EXISTS idx_jobs_terminal_updated_at
     ON jobs (updated_at)
     WHERE status IN ('succeeded', 'dead');
+
+-- Global claim/lease recovery is a deliberate cross-tenant job path, so those
+-- statements run with app.rls_bypass (ADR 0007).
+ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE jobs FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON jobs
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
 
 -- owner: platform
 -- ---------------------------------------------------------------------------
@@ -750,6 +802,12 @@ CREATE TRIGGER trigger_audit_events_no_truncate
     FOR EACH STATEMENT
     EXECUTE FUNCTION audit_events_append_only();
 
+ALTER TABLE audit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON audit_events
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+
 -- owner: apikeys
 -- ---------------------------------------------------------------------------
 -- apikeys: tenant/user-bound API credentials (only SHA-256 hashes at rest)
@@ -811,6 +869,14 @@ CREATE TABLE IF NOT EXISTS api_key_scopes (
     PRIMARY KEY (api_key_id, permission_key)
 );
 
+-- api_key_scopes has no tenant_id: it is a pure child of api_keys, reachable
+-- only through a key RLS already filtered.
+ALTER TABLE api_keys ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_keys FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON api_keys
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+
 -- owner: files
 -- ---------------------------------------------------------------------------
 -- files: metadata (blobs live in local/S3 storage)
@@ -851,6 +917,12 @@ CREATE TRIGGER trigger_files_updated_at
     BEFORE UPDATE ON files
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
+
+ALTER TABLE files ENABLE ROW LEVEL SECURITY;
+ALTER TABLE files FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON files
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
 
 -- owner: features
 -- ---------------------------------------------------------------------------
@@ -916,6 +988,14 @@ CREATE TRIGGER trigger_feature_flag_targets_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
 
+-- feature_flags stays unprotected: it is process-wide configuration. Loads of
+-- the full target snapshot run with app.rls_bypass.
+ALTER TABLE feature_flag_targets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE feature_flag_targets FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON feature_flag_targets
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+
 -- owner: notifications
 -- ---------------------------------------------------------------------------
 -- notifications: per-user in-app feed and channel preferences
@@ -979,6 +1059,17 @@ CREATE TRIGGER trigger_notification_preferences_updated_at
     BEFORE UPDATE ON notification_preferences
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
+
+ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notifications FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON notifications
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE notification_preferences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notification_preferences FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON notification_preferences
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
 
 -- owner: webhooks
 -- ---------------------------------------------------------------------------
@@ -1244,3 +1335,45 @@ CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_tenant_source_received
 -- Cross-tenant retention purge (PurgeWebhookInboundEvents).
 CREATE INDEX IF NOT EXISTS idx_webhook_inbound_events_received_at
     ON webhook_inbound_events (received_at);
+
+-- webhook_delivery_attempts is tenant-owned too, so it gets the same policy.
+ALTER TABLE webhook_endpoints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_endpoints FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_endpoints
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_endpoint_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_endpoint_subscriptions FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_endpoint_subscriptions
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_endpoint_secrets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_endpoint_secrets FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_endpoint_secrets
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_events
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_deliveries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_deliveries FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_deliveries
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_delivery_attempts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_delivery_attempts FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_delivery_attempts
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_inbound_sources ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_inbound_sources FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_inbound_sources
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));
+ALTER TABLE webhook_inbound_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE webhook_inbound_events FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON webhook_inbound_events
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));

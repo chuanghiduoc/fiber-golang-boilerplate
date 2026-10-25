@@ -13,9 +13,9 @@ import (
 // Build constructs the feature-flag admin surface. It shares the process
 // evaluator so a successful write invalidates the local snapshot immediately.
 func Build(infra app.Infra) *Module {
-	repo := featuresrepo.New(infra.Pool)
+	repo := featuresrepo.New(infra.DB)
 	m := New(featureshandler.NewHandler(featuressvc.New(repo, infra.Flags, infra.Audit)))
-	m.privacy = featuresprivacy.New(featuresrepo.NewPrivacyStore(infra.Pool))
+	m.privacy = featuresprivacy.New(featuresrepo.NewPrivacyStore(infra.DB))
 	return m
 }
 

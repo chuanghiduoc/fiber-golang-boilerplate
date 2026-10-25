@@ -9,6 +9,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // profileChange is a validated profile update: the values to store and what
@@ -42,6 +43,9 @@ func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRe
 	}
 
 	var updated *User
+	if change.emailChanged {
+		ctx = database.WithRLSBypass(ctx) // An email change ends the user's sessions in every tenant.
+	}
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, updateErr := applyProfileChange(ctx, tx.Stores, id, change)
 		if updateErr != nil {
@@ -133,6 +137,7 @@ func (s *userService) DeleteAccount(ctx context.Context, id int64) error {
 	if _, err := getMember(ctx, s.Stores.Memberships, id); err != nil {
 		return err
 	}
+	ctx = database.WithRLSBypass(ctx) // Deleting the global account removes memberships and sessions in every tenant.
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := deleteAccount(ctx, tx.Stores, id); err != nil {
 			return err
@@ -227,6 +232,7 @@ func removeMembership(ctx context.Context, st Stores, id int64) error {
 // RevokeSessions invalidates every access token and session of the user in
 // every tenant ("log out all devices").
 func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
+	ctx = database.WithRLSBypass(ctx) // Logout-all ends the user's sessions in every tenant.
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
 			return userWriteError(err, "user not found", "failed to revoke sessions")

@@ -21,7 +21,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 const probeHandler = "probe"
@@ -40,9 +39,9 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	ctx := context.Background()
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 
-	bus := events.New(jobs.NewQueue(e.pool))
+	bus := events.New(jobs.NewQueue(testutil.Scoped(e.pool)))
 	subscribeProbe(t, bus)
-	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
+	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
 	user, err := users.Register(tenant.WithID(ctx, acmeID), dto.RegisterRequest{Email: "event@example.com", Password: "Password1!", Name: "Event"})
@@ -78,7 +77,7 @@ func TestRegister_RollsBackWhenPublishFails(t *testing.T) {
 
 	bus := events.New(nil) // durable publish fails with events.ErrNoQueue
 	subscribeProbe(t, bus)
-	tx := identityrepo.NewTransactor(database.NewTxManager(e.pool), audit.NewPostgresRecorder(e.pool), nil, bus)
+	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
 	_, err := users.Register(ctx, dto.RegisterRequest{Email: "rollback@example.com", Password: "Password1!", Name: "Rollback"})

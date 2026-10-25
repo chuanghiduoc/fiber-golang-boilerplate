@@ -129,15 +129,15 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = appCache.Close() })
 
-	stores := identityrepo.NewStores(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
 	tenantRepo := stores.Tenants
 	resolver := identityadapter.NewTenantResolver(tenantRepo)
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
-	jobQueue := jobs.NewQueue(pool)
-	repo := webhookrepo.New(pool, jobQueue)
+	jobQueue := jobs.NewQueue(testutil.Scoped(pool))
+	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), jobQueue)
 	codec, err := webhookservice.NewSecretCodec("webhook-integration-encryption-key")
 	require.NoError(t, err)
-	recorder := audit.NewPostgresRecorder(pool)
+	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
 	svc := webhookservice.New(repo, repo, repo, codec, recorder, webhookservice.Options{
 		DefaultMaxAttempts: 3,
 		DefaultTimeoutMS:   2000,
@@ -656,7 +656,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("transactional publish commits with the producer", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/tx", "tx.*")
-		bus := events.New(jobs.NewQueue(h.pool))
+		bus := events.New(jobs.NewQueue(testutil.Scoped(h.pool)))
 		for _, eventType := range []string{"tx.rolled_back", "tx.committed"} {
 			require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", h.dispatcher.HandleEvent))
 		}
@@ -824,11 +824,14 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', 1, 'system', now(), '{}'::jsonb, now()`,
 			h.tenantA)
 		require.NoError(t, err)
+		// Insert terminal rows already old: the updated_at trigger only fires on
+		// UPDATE, and the app role must not need table ownership for DDL.
 		_, err = h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
-			    url, secret_ciphertext, status, max_attempts)
+			    url, secret_ciphertext, status, max_attempts, updated_at)
 			SELECT $1, $2, 'evt_purge_' || g, 'https://receiver.example/purge',
-			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3
+			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3,
+			       now() - interval '40 days'
 			FROM generate_series(1, 1500) AS g`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
@@ -838,15 +841,6 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			VALUES ($1, $2, 'evt_purge_pending', 'https://receiver.example/purge', 'sealed', 'pending', 3)`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
-		// The updated_at trigger fires on UPDATE, so disable it to age rows.
-		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries DISABLE TRIGGER trigger_webhook_deliveries_updated_at`)
-		require.NoError(t, err)
-		_, err = h.pool.Exec(ctx,
-			`UPDATE webhook_deliveries SET updated_at = now() - interval '40 days' WHERE event_id LIKE 'evt_purge_%'`)
-		require.NoError(t, err)
-		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries ENABLE TRIGGER trigger_webhook_deliveries_updated_at`)
-		require.NoError(t, err)
-
 		purged, err := h.repo.PurgeDeliveries(ctx, 30)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1500), purged, "every terminal row is purged across batches")

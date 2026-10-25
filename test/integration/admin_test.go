@@ -32,7 +32,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -49,11 +48,11 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	txManager := database.NewTxManager(pool)
-	auditRecorder := audit.NewPostgresRecorder(pool)
+	txManager := testutil.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
 	kit := newIdentityKit(pool, appCache, auditRecorder, adminIntegrationSecret, nil)
 
-	fileRepo := filesrepo.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(testutil.Scoped(pool))
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 

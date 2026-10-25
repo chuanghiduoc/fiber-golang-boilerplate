@@ -1048,6 +1048,43 @@ flowchart TD
     newer --> run
 ```
 
+### Database roles and row-level security
+
+Every tenant-owned table has forced row-level security (ADR 0007). The API,
+worker, and `cmd/seed` must connect as a dedicated non-superuser role without
+`BYPASSRLS`; a superuser or a `BYPASSRLS` role ignores every policy. `cmd/api`
+logs an error when it detects one and refuses to start when
+`APP_ENV=production`. `cmd/migrate` needs the schema owner instead
+(`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
+`DB_USERNAME`/`DB_PASSWORD`).
+
+Create the runtime role once, before the first migration:
+
+```bash
+psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
+  -f deploy/postgres/database-roles.sql
+```
+
+The script grants schema access, table/sequence/function privileges, and
+`ALTER DEFAULT PRIVILEGES` for tables later migrations create. Docker Compose
+runs it automatically on a fresh volume (`deploy/postgres/init-app-role.sh`).
+
+Scoping is per transaction and never session-level:
+`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
+set_config('app.rls_bypass', $2, true)` right after `BEGIN`; a statement
+outside a transaction (`database.Scoped`) runs
+`BEGIN; set_config(...); <statement>; COMMIT` as one pgx Batch. This keeps
+transaction-mode PgBouncer working. A connection with no setting sees no
+tenant-owned rows.
+
+`database.WithRLSBypass(ctx)` marks deliberate cross-tenant work (global job
+claim/lease/purge, retention purges, the feature-flag snapshot, the public
+webhook receiver's source lookup, invitation token acceptance, and identity
+operations on a global user across tenants). Never mark an HTTP path that
+serves one tenant. `cmd/migrate` verifies `relrowsecurity`,
+`relforcerowsecurity`, and the `tenant_isolation` policy on every table with a
+`tenant_id` column.
+
 ### Connection poolers (PgBouncer)
 
 The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
@@ -1055,7 +1092,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 | Setting | Rule |
 | --- | --- |
 | `DB_QUERY_EXEC_MODE` | `cache_statement` (default, pgx named prepared statements per connection) needs PgBouncer 1.21+ with `max_prepared_statements > 0` in transaction mode. `cache_describe` and `describe_exec` use unnamed statements and keep server-side parameter types. `exec` and `simple_protocol` are rejected at startup: without described parameter types, `[]byte` values bound to `json`/`jsonb` columns (audit metadata) are sent as `bytea` and the insert fails. |
-| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT` (credentials, database, schema, and TLS settings are shared). golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` / `DB_MIGRATE_USERNAME` / `DB_MIGRATE_PASSWORD` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT`/`DB_USERNAME`/`DB_PASSWORD`; database, schema, and TLS settings are shared. Use the schema owner here and the non-superuser role for the API. golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
 | `search_path` | Sent as a startup parameter from `DB_SCHEMA`, never as a `SET` after connect (behind a transaction pooler that `SET` would land on one server connection only). Configure PgBouncer to forward it (`track_extra_parameters = search_path`, on versions that support it) or to ignore it (`ignore_startup_parameters = search_path`) and set it on the role with `ALTER ROLE ... SET search_path`. |
 
 ### Fresh installs vs deployed databases
@@ -1128,8 +1165,8 @@ defaults and backfill every row. Existing rows default to tenant 1, and their
 old `<userID>/<uuid>.<ext>` storage keys stay valid because downloads read
 `files.storage_path`. New uploads use `<tenantID>/<userID>/<uuid>.<ext>`; if you
 migrate existing blobs, copy first and update `files.storage_path` in the same
-operation. RLS and per-tenant limits are future work (see the README scope
-note).
+operation. Row-level security (ADR 0007) is enforced on every tenant-owned
+table; per-tenant limits are future work (see the README scope note).
 
 | Setting | Behavior |
 | --- | --- |

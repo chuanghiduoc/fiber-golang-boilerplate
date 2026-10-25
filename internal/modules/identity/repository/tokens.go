@@ -6,6 +6,7 @@ import (
 
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // PasswordResetRepository implements service.PasswordResetRepository. Reset
@@ -122,6 +123,7 @@ func NewTokenPurgeRepository(db identitysqlc.DBTX) *TokenPurgeRepository {
 }
 
 func (r *TokenPurgeRepository) PurgeExpiredRefreshTokens(ctx context.Context, batchSize int32) (int64, error) {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return r.q.PurgeExpiredRefreshTokens(ctx, batchSize)
 }
 
@@ -134,10 +136,12 @@ func (r *TokenPurgeRepository) PurgeExpiredEmailVerificationTokens(ctx context.C
 }
 
 func (r *TokenPurgeRepository) PurgeExpiredInvitations(ctx context.Context, batchSize int32) (int64, error) {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return r.q.PurgeExpiredInvitations(ctx, batchSize)
 }
 
 func (r *TokenPurgeRepository) PurgeStaleSessions(ctx context.Context, revokedBefore, idleBefore time.Time, batchSize int32) (int64, error) {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return r.q.PurgeStaleSessions(ctx, identitysqlc.PurgeStaleSessionsParams{
 		RevokedBefore: timestamptz(revokedBefore),
 		IdleBefore:    timestamptz(idleBefore),

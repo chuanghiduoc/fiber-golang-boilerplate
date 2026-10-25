@@ -28,15 +28,15 @@ type Settings struct {
 // sender writes the email job into the shared outbox in the same transaction
 // as the in-app row.
 func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup, settings Settings) *Module {
-	repo := notificationsrepo.NewNotificationRepository(infra.Pool)
+	repo := notificationsrepo.NewNotificationRepository(infra.DB)
 	svc := notificationsservice.NewNotificationService(
 		repo, recipients, infra.Email, notificationsrepo.NewTransactor(infra.Tx, infra.Email))
 	m := New(notificationshandler.New(svc))
 	m.notifier = svc
-	m.privacy = notificationsprivacy.New(notificationsrepo.NewPrivacyStore(infra.Pool))
+	m.privacy = notificationsprivacy.New(notificationsrepo.NewPrivacyStore(infra.DB))
 	if settings.RetentionDays > 0 {
 		m.retentionPurger = notificationsservice.NewRetentionPurger(
-			notificationsrepo.NewRetentionRepository(infra.Pool), settings.RetentionDays)
+			notificationsrepo.NewRetentionRepository(infra.DB), settings.RetentionDays)
 	}
 	return m
 }

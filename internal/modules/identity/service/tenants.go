@@ -11,6 +11,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // TenantDeletionGrace is how long a tenant stays in pending_deletion (and
@@ -85,6 +86,7 @@ func (s *TenantService) Create(ctx context.Context, in NewTenant) (*Tenant, erro
 	}
 
 	var created *Tenant
+	ctx = database.WithRLSBypass(ctx) // A new tenant's settings and audit row are not the caller's tenant.
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		t, err := tx.Tenants.Create(ctx, in)
 		if err != nil {
@@ -132,6 +134,7 @@ func normalizeNewTenant(in *NewTenant) error {
 // sessions.
 func (s *TenantService) Transition(ctx context.Context, id int64, to TenantStatus) (*Tenant, error) {
 	var updated *Tenant
+	ctx = database.WithRLSBypass(ctx) // Platform tenant lifecycle targets a tenant other than the caller's.
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		current, err := tx.Tenants.GetByIDForUpdate(ctx, id)
 		if err != nil {
@@ -176,6 +179,7 @@ func deletionSchedule(current *Tenant, to TenantStatus) *time.Time {
 
 // Settings returns a tenant's typed settings.
 func (s *TenantService) Settings(ctx context.Context, id int64) (*TenantSettings, error) {
+	ctx = database.WithRLSBypass(ctx) // Platform lookup of another tenant's settings.
 	settings, err := s.stores.Tenants.Settings(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {

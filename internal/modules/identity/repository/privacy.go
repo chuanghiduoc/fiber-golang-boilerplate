@@ -10,6 +10,7 @@ import (
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -149,6 +150,7 @@ func (r *DataExportRepository) DeleteForUser(ctx context.Context, userID int64) 
 }
 
 func (r *DataExportRepository) Purgeable(ctx context.Context, limit int32) ([]identityservice.DataExport, error) {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	rows, err := r.q.ListPurgeableDataExports(ctx, limit)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -161,6 +163,7 @@ func (r *DataExportRepository) Purgeable(ctx context.Context, limit int32) ([]id
 }
 
 func (r *DataExportRepository) Delete(ctx context.Context, id int64) error {
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return wrapErr(r.q.DeleteDataExport(ctx, id))
 }
 
@@ -205,5 +208,6 @@ func (r *DataExportRepository) DeleteSessionsInTenant(ctx context.Context, userI
 }
 
 func (r *DataExportRepository) DeleteSessionsForUser(ctx context.Context, userID int64) error {
+	ctx = database.WithRLSBypass(ctx) // The finalizer removes the user's sessions in every tenant.
 	return wrapErr(r.q.DeleteUserSessions(ctx, userID))
 }

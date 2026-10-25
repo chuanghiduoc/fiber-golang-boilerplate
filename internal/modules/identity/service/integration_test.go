@@ -24,7 +24,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -90,10 +89,10 @@ func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 	t.Cleanup(func() { _ = appCache.Close() })
 
 	if recorder == nil {
-		recorder = audit.NewPostgresRecorder(pool)
+		recorder = audit.NewPostgresRecorder(testutil.Scoped(pool))
 	}
-	stores := identityrepo.NewStores(pool)
-	tx := identityrepo.NewTransactor(database.NewTxManager(pool), recorder, nil, nil)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), recorder, nil, nil)
 	mail := &mailbox{}
 	sign := func(c service.AccessClaims) (string, error) { return "access", nil }
 	sessions := service.NewSessionService(stores, tx, sign, time.Hour, nil)
@@ -146,7 +145,7 @@ func scalar[T any](t *testing.T, pool *pgxpool.Pool, sql string, args ...any) T 
 func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	broken := identityrepo.NewTransactor(database.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
+	broken := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: broken, Cache: cache.NewMemoryCache()})
 
 	_, err := users.Register(ctx, dto.RegisterRequest{Email: "atomic@example.com", Password: "Password1!", Name: "Atomic"})

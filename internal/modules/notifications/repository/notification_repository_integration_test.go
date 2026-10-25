@@ -41,7 +41,7 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-two@example.com")
 
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
@@ -128,7 +128,7 @@ func TestRepositoryUnreadListAndCursor(t *testing.T) {
 
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	userID := createUser(t, pool, tenant.DefaultID, "notifications-cursor@example.com")
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 
 	base := time.Now().UTC().Add(-time.Hour)
 	for i, title := range []string{"one", "two", "three"} {
@@ -175,7 +175,7 @@ func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
 	tenantTwo := createTenant(t, pool, "notifications-prefs-two")
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-prefs-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-prefs-two@example.com")
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
