@@ -95,7 +95,7 @@ When releasing, move `[Unreleased]` entries under a version header such as
 |------|--------|
 | One DDL entrypoint | Only `cmd/migrate` applies DDL. `make migrate-run` runs it, `make run`/`make seed` migrate first, Compose runs `migrate` before `app`. `cmd/api`/`cmd/seed` assume the schema exists, so replicas never race. |
 | Migrate config | `config.LoadDatabase` needs only `DB_*`; `DB_SSLMODE=disable\|allow\|prefer` is rejected in production. It verifies required tables, indexes, and triggers after migrating. |
-| Fresh installs | One baseline: `migrations/000001_init_schema.up.sql` (and `.down.sql`). |
+| Fresh installs | The per-owner baseline (ADR 0005): `migrations/20260101000*_<owner>_*.{up,down}.sql`, applied in version order (see `docs/data-model.md`). |
 | Deployed databases | Never edit a shipped migration. Add one with `make migrate-create module=<owner> name=<purpose>` → `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch` rejects duplicate versions, missing up/down pairs, and non-timestamp versions. |
 | Ownership | One module owns each table; cross-module access goes through a contract or read model, never another module's repository. |
 | Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Emails and Google IDs are unique per tenant. |
@@ -104,31 +104,32 @@ When releasing, move `[Unreleased]` entries under a version header such as
 
 ### Upgrading an existing database
 
-The consolidated `000001` is a fresh-install baseline (old `000001`–`000003`
-plus every later table). Never run it against a database that applied the old
-migrations (normally at version 3), and never reset `schema_migrations` to
-force it. Do **not** restore the old `000002`/`000003` files:
-`test/arch/migrations_test.go` rejects sequential versions other than `1`, and
-a fresh install would run them after the new baseline.
+The per-owner baseline (`20260101000000`–`20260101000900`, ADR 0005) is a
+fresh-install baseline that replaces the old `000001`–`000003` files and the
+former consolidated `000001`. Never run it against a database recorded at one
+of those sequential versions, and never reset `schema_migrations` to force it.
+Do **not** restore the old sequential files: `test/arch/migrations_test.go`
+rejects every non-timestamp version.
 
 The supported upgrade is a one-time, reviewed manual step (full DDL checklist in
 the README's [Upgrading an existing database](README.md#upgrading-an-existing-database)):
 
 1. Take a verified backup/PITR snapshot.
 2. Apply the missing DDL with `psql` in one transaction so the schema matches
-   `000001_init_schema.up.sql` (tenants and default tenant, `tenant_id`
-   columns, tenant-leading indexes, per-tenant last-admin trigger, feature-flag,
-   notification, and webhook tables, every `ON CONFLICT` unique index, audit
-   triggers).
+   the baseline files (tenants and default tenant, `tenant_id` columns,
+   tenant-leading indexes, per-tenant last-admin trigger, API-key scope,
+   feature-flag, notification, and webhook tables, every `ON CONFLICT` unique
+   index, audit triggers).
 3. Only after the schema matches, record the baseline:
-   `migrate -path migrations -database "$DSN" force 1`. This rewrites the
-   version, not the schema; never use it to skip DDL that was not applied.
+   `migrate -path migrations -database "$DSN" force 20260101000900`. This
+   rewrites the version, not the schema; never use it to skip DDL that was not
+   applied.
 4. Run `cmd/migrate`. It applies newer timestamped migrations and verifies the
    schema, listing anything step 2 missed.
 
-A fresh schema created out-of-band that already matches `000001` can be
-baselined the same way (`force 1` after verification) instead of re-running
-the file.
+A fresh schema created out-of-band that already matches the baseline can be
+baselined the same way (`force 20260101000900` after verification) instead of
+re-running the files.
 
 After the upgrade, legacy access tokens without `tenant_id` are rejected (users
 log in again) and old token rows stay on tenant 1. Existing files keep their

@@ -31,7 +31,7 @@ func TestNewServiceEvent_UsesRequestIdentity(t *testing.T) {
 		EventID:            9,
 		TenantID:           3,
 		ActorID:            42,
-		ActorType:          ActorTypeAdmin,
+		ActorType:          ActorTypeUser,
 		ActorRole:          "admin",
 		RequestID:          "req-1",
 		IP:                 "203.0.113.9",
@@ -44,7 +44,7 @@ func TestNewServiceEvent_UsesRequestIdentity(t *testing.T) {
 	assert.Equal(t, int64(3), event.TenantID)
 	assert.Equal(t, int64(9), event.ParentID)
 	assert.Equal(t, int64(42), event.ActorID)
-	assert.Equal(t, ActorTypeAdmin, event.ActorType)
+	assert.Equal(t, ActorTypeUser, event.ActorType)
 	assert.Equal(t, SourceService, event.Source)
 	assert.Equal(t, OutcomeSucceeded, event.Outcome)
 	assert.Equal(t, "req-1", event.RequestID)

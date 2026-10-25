@@ -12,32 +12,63 @@ import (
 )
 
 const createAPIKey = `-- name: CreateAPIKey :one
-INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash, scopes, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+
+WITH key AS (
+    INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash, expires_at)
+    VALUES ($2, $3, $4, $5, $6, $7)
+    RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+), granted AS (
+    INSERT INTO api_key_scopes (api_key_id, permission_key)
+    SELECT key.id, scope
+    FROM key, unnest($1::text[]) AS scope
+)
+SELECT key.id, key.tenant_id, key.user_id, key.name, key.prefix, key.key_hash, key.expires_at, key.revoked_at, key.rotated_at, key.rotation_grace_until, key.last_used_at, key.created_at, key.updated_at, $1::text[] AS scopes
+FROM key
 `
 
 type CreateAPIKeyParams struct {
+	Scopes    []string           `json:"scopes"`
 	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
 	Name      string             `json:"name"`
 	Prefix    string             `json:"prefix"`
 	KeyHash   string             `json:"key_hash"`
-	Scopes    []byte             `json:"scopes"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
-func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (ApiKey, error) {
+type CreateAPIKeyRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+// Scopes live in api_key_scopes. Every query returns them as one sorted
+// text[] column (byte order, matching the service's sort.Slice), so a key and
+// its scopes are always read in one statement. Writes change the key and its
+// scope rows in a single statement as well (data-modifying CTEs), so they are
+// atomic even without an enclosing transaction.
+func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (CreateAPIKeyRow, error) {
 	row := q.db.QueryRow(ctx, createAPIKey,
+		arg.Scopes,
 		arg.TenantID,
 		arg.UserID,
 		arg.Name,
 		arg.Prefix,
 		arg.KeyHash,
-		arg.Scopes,
 		arg.ExpiresAt,
 	)
-	var i ApiKey
+	var i CreateAPIKeyRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -45,7 +76,6 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Api
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -53,21 +83,43 @@ func (q *Queries) CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (Api
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
 
 const getAPIKeyByHash = `-- name: GetAPIKeyByHash :one
-SELECT id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at FROM api_keys
+SELECT api_keys.id, api_keys.tenant_id, api_keys.user_id, api_keys.name, api_keys.prefix, api_keys.key_hash, api_keys.expires_at, api_keys.revoked_at, api_keys.rotated_at, api_keys.rotation_grace_until, api_keys.last_used_at, api_keys.created_at, api_keys.updated_at,
+       ARRAY(SELECT s.permission_key FROM api_key_scopes s
+             WHERE s.api_key_id = api_keys.id
+             ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
+FROM api_keys
 WHERE key_hash = $1
 `
+
+type GetAPIKeyByHashRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
 
 // The hash is globally unique. This lookup intentionally has no tenant
 // predicate because the verifier learns the key's tenant from the row before
 // the request can be scoped.
-func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (ApiKey, error) {
+func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (GetAPIKeyByHashRow, error) {
 	row := q.db.QueryRow(ctx, getAPIKeyByHash, keyHash)
-	var i ApiKey
+	var i GetAPIKeyByHashRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -75,7 +127,6 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (ApiKey, 
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -83,12 +134,17 @@ func (q *Queries) GetAPIKeyByHash(ctx context.Context, keyHash string) (ApiKey, 
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
 
 const getAPIKeyByID = `-- name: GetAPIKeyByID :one
-SELECT id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at FROM api_keys
+SELECT api_keys.id, api_keys.tenant_id, api_keys.user_id, api_keys.name, api_keys.prefix, api_keys.key_hash, api_keys.expires_at, api_keys.revoked_at, api_keys.rotated_at, api_keys.rotation_grace_until, api_keys.last_used_at, api_keys.created_at, api_keys.updated_at,
+       ARRAY(SELECT s.permission_key FROM api_key_scopes s
+             WHERE s.api_key_id = api_keys.id
+             ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
+FROM api_keys
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -97,9 +153,26 @@ type GetAPIKeyByIDParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
-func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (ApiKey, error) {
+type GetAPIKeyByIDRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (GetAPIKeyByIDRow, error) {
 	row := q.db.QueryRow(ctx, getAPIKeyByID, arg.ID, arg.TenantID)
-	var i ApiKey
+	var i GetAPIKeyByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -107,7 +180,6 @@ func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (A
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -115,12 +187,17 @@ func (q *Queries) GetAPIKeyByID(ctx context.Context, arg GetAPIKeyByIDParams) (A
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
 
 const listAPIKeysCursor = `-- name: ListAPIKeysCursor :many
-SELECT id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at FROM api_keys
+SELECT api_keys.id, api_keys.tenant_id, api_keys.user_id, api_keys.name, api_keys.prefix, api_keys.key_hash, api_keys.expires_at, api_keys.revoked_at, api_keys.rotated_at, api_keys.rotation_grace_until, api_keys.last_used_at, api_keys.created_at, api_keys.updated_at,
+       ARRAY(SELECT s.permission_key FROM api_key_scopes s
+             WHERE s.api_key_id = api_keys.id
+             ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
+FROM api_keys
 WHERE tenant_id = $1::bigint
   AND (created_at, id) < ($2::timestamptz, $3::bigint)
 ORDER BY created_at DESC, id DESC
@@ -134,7 +211,24 @@ type ListAPIKeysCursorParams struct {
 	RowLimit        int32              `json:"row_limit"`
 }
 
-func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorParams) ([]ApiKey, error) {
+type ListAPIKeysCursorRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorParams) ([]ListAPIKeysCursorRow, error) {
 	rows, err := q.db.Query(ctx, listAPIKeysCursor,
 		arg.TenantID,
 		arg.CursorCreatedAt,
@@ -145,9 +239,9 @@ func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorPa
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ApiKey{}
+	items := []ListAPIKeysCursorRow{}
 	for rows.Next() {
-		var i ApiKey
+		var i ListAPIKeysCursorRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.TenantID,
@@ -155,7 +249,6 @@ func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorPa
 			&i.Name,
 			&i.Prefix,
 			&i.KeyHash,
-			&i.Scopes,
 			&i.ExpiresAt,
 			&i.RevokedAt,
 			&i.RotatedAt,
@@ -163,6 +256,7 @@ func (q *Queries) ListAPIKeysCursor(ctx context.Context, arg ListAPIKeysCursorPa
 			&i.LastUsedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.Scopes,
 		); err != nil {
 			return nil, err
 		}
@@ -183,7 +277,10 @@ WHERE id = $2::bigint
   AND tenant_id = $3::bigint
   AND revoked_at IS NULL
   AND rotated_at IS NULL
-RETURNING id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at,
+          ARRAY(SELECT s.permission_key FROM api_key_scopes s
+                WHERE s.api_key_id = api_keys.id
+                ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 `
 
 type MarkAPIKeyRotatedParams struct {
@@ -192,9 +289,26 @@ type MarkAPIKeyRotatedParams struct {
 	TenantID     int64 `json:"tenant_id"`
 }
 
-func (q *Queries) MarkAPIKeyRotated(ctx context.Context, arg MarkAPIKeyRotatedParams) (ApiKey, error) {
+type MarkAPIKeyRotatedRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+func (q *Queries) MarkAPIKeyRotated(ctx context.Context, arg MarkAPIKeyRotatedParams) (MarkAPIKeyRotatedRow, error) {
 	row := q.db.QueryRow(ctx, markAPIKeyRotated, arg.GraceSeconds, arg.ID, arg.TenantID)
-	var i ApiKey
+	var i MarkAPIKeyRotatedRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -202,7 +316,6 @@ func (q *Queries) MarkAPIKeyRotated(ctx context.Context, arg MarkAPIKeyRotatedPa
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -210,6 +323,7 @@ func (q *Queries) MarkAPIKeyRotated(ctx context.Context, arg MarkAPIKeyRotatedPa
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
@@ -219,7 +333,10 @@ UPDATE api_keys
 SET revoked_at = NOW(),
     updated_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-RETURNING id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at,
+          ARRAY(SELECT s.permission_key FROM api_key_scopes s
+                WHERE s.api_key_id = api_keys.id
+                ORDER BY s.permission_key COLLATE "C")::text[] AS scopes
 `
 
 type RevokeAPIKeyParams struct {
@@ -227,9 +344,26 @@ type RevokeAPIKeyParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
-func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (ApiKey, error) {
+type RevokeAPIKeyRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (RevokeAPIKeyRow, error) {
 	row := q.db.QueryRow(ctx, revokeAPIKey, arg.ID, arg.TenantID)
-	var i ApiKey
+	var i RevokeAPIKeyRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -237,7 +371,6 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (Api
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -245,6 +378,7 @@ func (q *Queries) RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (Api
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }
@@ -266,29 +400,62 @@ func (q *Queries) TouchAPIKeyLastUsed(ctx context.Context, arg TouchAPIKeyLastUs
 }
 
 const updateAPIKey = `-- name: UpdateAPIKey :one
-UPDATE api_keys
-SET name = $1,
-    scopes = $2,
-    updated_at = NOW()
-WHERE id = $3 AND tenant_id = $4 AND revoked_at IS NULL
-RETURNING id, tenant_id, user_id, name, prefix, key_hash, scopes, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+WITH key AS (
+    UPDATE api_keys
+    SET name = $2,
+        updated_at = NOW()
+    WHERE id = $3 AND tenant_id = $4 AND revoked_at IS NULL
+    RETURNING id, tenant_id, user_id, name, prefix, key_hash, expires_at, revoked_at, rotated_at, rotation_grace_until, last_used_at, created_at, updated_at
+), revoked AS (
+    DELETE FROM api_key_scopes AS s
+    USING key
+    WHERE s.api_key_id = key.id
+      AND NOT (s.permission_key = ANY($1::text[]))
+), granted AS (
+    INSERT INTO api_key_scopes (api_key_id, permission_key)
+    SELECT key.id, scope
+    FROM key, unnest($1::text[]) AS scope
+    ON CONFLICT (api_key_id, permission_key) DO NOTHING
+)
+SELECT key.id, key.tenant_id, key.user_id, key.name, key.prefix, key.key_hash, key.expires_at, key.revoked_at, key.rotated_at, key.rotation_grace_until, key.last_used_at, key.created_at, key.updated_at, $1::text[] AS scopes
+FROM key
 `
 
 type UpdateAPIKeyParams struct {
-	Name     string `json:"name"`
-	Scopes   []byte `json:"scopes"`
-	ID       int64  `json:"id"`
-	TenantID int64  `json:"tenant_id"`
+	Scopes   []string `json:"scopes"`
+	Name     string   `json:"name"`
+	ID       int64    `json:"id"`
+	TenantID int64    `json:"tenant_id"`
 }
 
-func (q *Queries) UpdateAPIKey(ctx context.Context, arg UpdateAPIKeyParams) (ApiKey, error) {
+type UpdateAPIKeyRow struct {
+	ID                 int64              `json:"id"`
+	TenantID           int64              `json:"tenant_id"`
+	UserID             int64              `json:"user_id"`
+	Name               string             `json:"name"`
+	Prefix             string             `json:"prefix"`
+	KeyHash            string             `json:"key_hash"`
+	ExpiresAt          pgtype.Timestamptz `json:"expires_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+	RotatedAt          pgtype.Timestamptz `json:"rotated_at"`
+	RotationGraceUntil pgtype.Timestamptz `json:"rotation_grace_until"`
+	LastUsedAt         pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Scopes             []string           `json:"scopes"`
+}
+
+// Replaces the scope set: rows outside @scopes are deleted and missing ones
+// inserted. The two scope statements never touch the same row, so they can
+// run in one statement despite sharing a snapshot.
+func (q *Queries) UpdateAPIKey(ctx context.Context, arg UpdateAPIKeyParams) (UpdateAPIKeyRow, error) {
 	row := q.db.QueryRow(ctx, updateAPIKey,
-		arg.Name,
 		arg.Scopes,
+		arg.Name,
 		arg.ID,
 		arg.TenantID,
 	)
-	var i ApiKey
+	var i UpdateAPIKeyRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
@@ -296,7 +463,6 @@ func (q *Queries) UpdateAPIKey(ctx context.Context, arg UpdateAPIKeyParams) (Api
 		&i.Name,
 		&i.Prefix,
 		&i.KeyHash,
-		&i.Scopes,
 		&i.ExpiresAt,
 		&i.RevokedAt,
 		&i.RotatedAt,
@@ -304,6 +470,7 @@ func (q *Queries) UpdateAPIKey(ctx context.Context, arg UpdateAPIKeyParams) (Api
 		&i.LastUsedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Scopes,
 	)
 	return i, err
 }

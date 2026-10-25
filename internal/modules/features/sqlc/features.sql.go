@@ -112,7 +112,9 @@ ORDER BY flag_key
 // the request tenant, enforced by the (tenant_id, user_id) foreign key.
 // Target upserts create the parent flag row on demand, in the same statement,
 // with a NULL database default so a tenant target never forces a
-// process-wide default on every other tenant.
+// process-wide default on every other tenant. Both target upserts conflict on
+// idx_feature_flag_targets_tenant_flag_user, which is UNIQUE NULLS NOT
+// DISTINCT, so the tenant-wide target (user_id NULL) is unique too.
 func (q *Queries) ListFeatureFlags(ctx context.Context) ([]FeatureFlag, error) {
 	rows, err := q.db.Query(ctx, listFeatureFlags)
 	if err != nil {
@@ -185,7 +187,7 @@ WITH flag AS (
 )
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES ($1, $2, NULL, $3)
-ON CONFLICT (flag_key, tenant_id) WHERE user_id IS NULL
+ON CONFLICT (tenant_id, flag_key, user_id)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
 `
@@ -219,7 +221,7 @@ WITH flag AS (
 )
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES ($1, $2, $3, $4)
-ON CONFLICT (flag_key, tenant_id, user_id) WHERE user_id IS NOT NULL
+ON CONFLICT (tenant_id, flag_key, user_id)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING id, flag_key, tenant_id, user_id, enabled, created_at, updated_at
 `

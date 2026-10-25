@@ -15,11 +15,14 @@ const claimWebhookDelivery = `-- name: ClaimWebhookDelivery :one
 UPDATE webhook_deliveries
 SET attempts = attempts + 1,
     next_attempt_at = NOW() + make_interval(secs => $1::double precision)
+FROM webhook_events ev
 WHERE webhook_deliveries.id = $2
   AND webhook_deliveries.tenant_id = $3
-  AND status = 'pending'
-  AND attempts < max_attempts
-  AND next_attempt_at <= NOW()
+  AND ev.tenant_id = webhook_deliveries.tenant_id
+  AND ev.event_id = webhook_deliveries.event_id
+  AND webhook_deliveries.status = 'pending'
+  AND webhook_deliveries.attempts < webhook_deliveries.max_attempts
+  AND webhook_deliveries.next_attempt_at <= NOW()
   AND EXISTS (
       SELECT 1 FROM webhook_endpoints e
       WHERE e.id = webhook_deliveries.endpoint_id
@@ -27,7 +30,7 @@ WHERE webhook_deliveries.id = $2
         AND e.status = 'active'
         AND e.deleted_at IS NULL
   )
-RETURNING id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at
+RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.occurred_at, ev.payload
 `
 
 type ClaimWebhookDeliveryParams struct {
@@ -36,20 +39,41 @@ type ClaimWebhookDeliveryParams struct {
 	TenantID     int64   `json:"tenant_id"`
 }
 
+type ClaimWebhookDeliveryRow struct {
+	ID               int64              `json:"id"`
+	TenantID         int64              `json:"tenant_id"`
+	EndpointID       int64              `json:"endpoint_id"`
+	EventID          string             `json:"event_id"`
+	Url              string             `json:"url"`
+	SecretCiphertext string             `json:"secret_ciphertext"`
+	Status           string             `json:"status"`
+	Attempts         int32              `json:"attempts"`
+	MaxAttempts      int32              `json:"max_attempts"`
+	TimeoutMs        int32              `json:"timeout_ms"`
+	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
+	LastStatusCode   pgtype.Int4        `json:"last_status_code"`
+	LastError        pgtype.Text        `json:"last_error"`
+	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
+	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	EventType        string             `json:"event_type"`
+	OccurredAt       pgtype.Timestamptz `json:"occurred_at"`
+	Payload          []byte             `json:"payload"`
+}
+
 // A disabled or deleted endpoint is never claimed, so it stops receiving
 // retries; ExpireUnclaimableWebhookDelivery then dead-letters the delivery.
-func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeliveryParams) (WebhookDelivery, error) {
+// The event is joined in so the worker builds the envelope from one read.
+func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeliveryParams) (ClaimWebhookDeliveryRow, error) {
 	row := q.db.QueryRow(ctx, claimWebhookDelivery, arg.LeaseSeconds, arg.ID, arg.TenantID)
-	var i WebhookDelivery
+	var i ClaimWebhookDeliveryRow
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.EndpointID,
 		&i.EventID,
-		&i.EventType,
-		&i.EventCreatedAt,
 		&i.Url,
-		&i.Payload,
 		&i.SecretCiphertext,
 		&i.Status,
 		&i.Attempts,
@@ -62,50 +86,45 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 		&i.ReplayedFromID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.EventType,
+		&i.OccurredAt,
+		&i.Payload,
 	)
 	return i, err
 }
 
 const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
-
 INSERT INTO webhook_deliveries (
-    tenant_id, endpoint_id, event_id, event_type, event_created_at,
-    url, payload, secret_ciphertext, status, max_attempts, timeout_ms,
+    tenant_id, endpoint_id, event_id,
+    url, secret_ciphertext, status, max_attempts, timeout_ms,
     next_attempt_at, replayed_from_id
 )
 VALUES (
-    $1, $2, $3, $4, $5,
-    $6, $7::jsonb, $8, 'pending', $9, $10,
-    NOW(), $11
+    $1, $2, $3,
+    $4, $5, 'pending', $6, $7,
+    NOW(), $8
 )
 ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
 RETURNING id
 `
 
 type CreateWebhookDeliveryParams struct {
-	TenantID         int64              `json:"tenant_id"`
-	EndpointID       int64              `json:"endpoint_id"`
-	EventID          string             `json:"event_id"`
-	EventType        string             `json:"event_type"`
-	EventCreatedAt   pgtype.Timestamptz `json:"event_created_at"`
-	Url              string             `json:"url"`
-	Payload          []byte             `json:"payload"`
-	SecretCiphertext string             `json:"secret_ciphertext"`
-	MaxAttempts      int32              `json:"max_attempts"`
-	TimeoutMs        int32              `json:"timeout_ms"`
-	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
+	TenantID         int64       `json:"tenant_id"`
+	EndpointID       int64       `json:"endpoint_id"`
+	EventID          string      `json:"event_id"`
+	Url              string      `json:"url"`
+	SecretCiphertext string      `json:"secret_ciphertext"`
+	MaxAttempts      int32       `json:"max_attempts"`
+	TimeoutMs        int32       `json:"timeout_ms"`
+	ReplayedFromID   pgtype.Int8 `json:"replayed_from_id"`
 }
 
-// Deliveries ----------------------------------------------------------------
 func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (int64, error) {
 	row := q.db.QueryRow(ctx, createWebhookDelivery,
 		arg.TenantID,
 		arg.EndpointID,
 		arg.EventID,
-		arg.EventType,
-		arg.EventCreatedAt,
 		arg.Url,
-		arg.Payload,
 		arg.SecretCiphertext,
 		arg.MaxAttempts,
 		arg.TimeoutMs,
@@ -154,31 +173,33 @@ func (q *Queries) CreateWebhookDeliveryAttempt(ctx context.Context, arg CreateWe
 const createWebhookEndpoint = `-- name: CreateWebhookEndpoint :one
 
 INSERT INTO webhook_endpoints (
-    tenant_id, url, description, event_types, status, max_attempts, timeout_ms
+    tenant_id, url, description, status, max_attempts, timeout_ms
 )
 VALUES (
-    $1, $2, $3, $4::text[], $5, $6, $7
+    $1, $2, $3, $4, $5, $6
 )
-RETURNING id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, url, description, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
 `
 
 type CreateWebhookEndpointParams struct {
-	TenantID    int64    `json:"tenant_id"`
-	Url         string   `json:"url"`
-	Description string   `json:"description"`
-	EventTypes  []string `json:"event_types"`
-	Status      string   `json:"status"`
-	MaxAttempts int32    `json:"max_attempts"`
-	TimeoutMs   int32    `json:"timeout_ms"`
+	TenantID    int64  `json:"tenant_id"`
+	Url         string `json:"url"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	MaxAttempts int32  `json:"max_attempts"`
+	TimeoutMs   int32  `json:"timeout_ms"`
 }
 
 // Outbound endpoints -------------------------------------------------------
+//
+// An endpoint's event-type patterns are rows of webhook_endpoint_subscriptions.
+// Reads return them as one event_types text[] column sorted in byte order
+// (COLLATE "C", matching the service's sort.Strings).
 func (q *Queries) CreateWebhookEndpoint(ctx context.Context, arg CreateWebhookEndpointParams) (WebhookEndpoint, error) {
 	row := q.db.QueryRow(ctx, createWebhookEndpoint,
 		arg.TenantID,
 		arg.Url,
 		arg.Description,
-		arg.EventTypes,
 		arg.Status,
 		arg.MaxAttempts,
 		arg.TimeoutMs,
@@ -189,7 +210,6 @@ func (q *Queries) CreateWebhookEndpoint(ctx context.Context, arg CreateWebhookEn
 		&i.TenantID,
 		&i.Url,
 		&i.Description,
-		&i.EventTypes,
 		&i.Status,
 		&i.MaxAttempts,
 		&i.TimeoutMs,
@@ -235,6 +255,53 @@ func (q *Queries) CreateWebhookEndpointSecret(ctx context.Context, arg CreateWeb
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const createWebhookEndpointSubscriptions = `-- name: CreateWebhookEndpointSubscriptions :exec
+INSERT INTO webhook_endpoint_subscriptions (tenant_id, endpoint_id, pattern)
+SELECT $1, $2, pattern
+FROM unnest($3::text[]) AS pattern
+`
+
+type CreateWebhookEndpointSubscriptionsParams struct {
+	TenantID   int64    `json:"tenant_id"`
+	EndpointID int64    `json:"endpoint_id"`
+	Patterns   []string `json:"patterns"`
+}
+
+func (q *Queries) CreateWebhookEndpointSubscriptions(ctx context.Context, arg CreateWebhookEndpointSubscriptionsParams) error {
+	_, err := q.db.Exec(ctx, createWebhookEndpointSubscriptions, arg.TenantID, arg.EndpointID, arg.Patterns)
+	return err
+}
+
+const createWebhookEvent = `-- name: CreateWebhookEvent :exec
+
+INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload)
+VALUES ($1, $2, $3, $4, $5::jsonb)
+ON CONFLICT (tenant_id, event_id) DO NOTHING
+`
+
+type CreateWebhookEventParams struct {
+	TenantID   int64              `json:"tenant_id"`
+	EventID    string             `json:"event_id"`
+	EventType  string             `json:"event_type"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+	Payload    []byte             `json:"payload"`
+}
+
+// Events and deliveries -----------------------------------------------------
+// The first delivery of an event writes it; every later endpoint (and every
+// retry of the dispatch job) finds it already present. An event id is
+// immutable once written, so the existing row is kept as is.
+func (q *Queries) CreateWebhookEvent(ctx context.Context, arg CreateWebhookEventParams) error {
+	_, err := q.db.Exec(ctx, createWebhookEvent,
+		arg.TenantID,
+		arg.EventID,
+		arg.EventType,
+		arg.OccurredAt,
+		arg.Payload,
+	)
+	return err
 }
 
 const createWebhookInboundEvent = `-- name: CreateWebhookInboundEvent :one
@@ -328,11 +395,10 @@ func (q *Queries) DeactivateWebhookEndpointSecrets(ctx context.Context, arg Deac
 	return err
 }
 
-const deleteWebhookEndpoint = `-- name: DeleteWebhookEndpoint :one
+const deleteWebhookEndpoint = `-- name: DeleteWebhookEndpoint :execrows
 UPDATE webhook_endpoints
 SET status = 'disabled', deleted_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
 `
 
 type DeleteWebhookEndpointParams struct {
@@ -340,23 +406,27 @@ type DeleteWebhookEndpointParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
-func (q *Queries) DeleteWebhookEndpoint(ctx context.Context, arg DeleteWebhookEndpointParams) (WebhookEndpoint, error) {
-	row := q.db.QueryRow(ctx, deleteWebhookEndpoint, arg.ID, arg.TenantID)
-	var i WebhookEndpoint
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Url,
-		&i.Description,
-		&i.EventTypes,
-		&i.Status,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
+func (q *Queries) DeleteWebhookEndpoint(ctx context.Context, arg DeleteWebhookEndpointParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteWebhookEndpoint, arg.ID, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteWebhookEndpointSubscriptions = `-- name: DeleteWebhookEndpointSubscriptions :exec
+DELETE FROM webhook_endpoint_subscriptions
+WHERE tenant_id = $1 AND endpoint_id = $2
+`
+
+type DeleteWebhookEndpointSubscriptionsParams struct {
+	TenantID   int64 `json:"tenant_id"`
+	EndpointID int64 `json:"endpoint_id"`
+}
+
+func (q *Queries) DeleteWebhookEndpointSubscriptions(ctx context.Context, arg DeleteWebhookEndpointSubscriptionsParams) error {
+	_, err := q.db.Exec(ctx, deleteWebhookEndpointSubscriptions, arg.TenantID, arg.EndpointID)
+	return err
 }
 
 const deleteWebhookInboundSource = `-- name: DeleteWebhookInboundSource :one
@@ -456,8 +526,10 @@ func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetAct
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
-WHERE id = $1 AND tenant_id = $2
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.occurred_at, ev.payload
+FROM webhook_deliveries d
+JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
+WHERE d.id = $1 AND d.tenant_id = $2
 `
 
 type GetWebhookDeliveryParams struct {
@@ -465,37 +537,48 @@ type GetWebhookDeliveryParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
-func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDeliveryParams) (WebhookDelivery, error) {
+type GetWebhookDeliveryRow struct {
+	WebhookDelivery WebhookDelivery    `json:"webhook_delivery"`
+	EventType       string             `json:"event_type"`
+	OccurredAt      pgtype.Timestamptz `json:"occurred_at"`
+	Payload         []byte             `json:"payload"`
+}
+
+func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDeliveryParams) (GetWebhookDeliveryRow, error) {
 	row := q.db.QueryRow(ctx, getWebhookDelivery, arg.ID, arg.TenantID)
-	var i WebhookDelivery
+	var i GetWebhookDeliveryRow
 	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.EndpointID,
-		&i.EventID,
+		&i.WebhookDelivery.ID,
+		&i.WebhookDelivery.TenantID,
+		&i.WebhookDelivery.EndpointID,
+		&i.WebhookDelivery.EventID,
+		&i.WebhookDelivery.Url,
+		&i.WebhookDelivery.SecretCiphertext,
+		&i.WebhookDelivery.Status,
+		&i.WebhookDelivery.Attempts,
+		&i.WebhookDelivery.MaxAttempts,
+		&i.WebhookDelivery.TimeoutMs,
+		&i.WebhookDelivery.NextAttemptAt,
+		&i.WebhookDelivery.LastStatusCode,
+		&i.WebhookDelivery.LastError,
+		&i.WebhookDelivery.DeliveredAt,
+		&i.WebhookDelivery.ReplayedFromID,
+		&i.WebhookDelivery.CreatedAt,
+		&i.WebhookDelivery.UpdatedAt,
 		&i.EventType,
-		&i.EventCreatedAt,
-		&i.Url,
+		&i.OccurredAt,
 		&i.Payload,
-		&i.SecretCiphertext,
-		&i.Status,
-		&i.Attempts,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.NextAttemptAt,
-		&i.LastStatusCode,
-		&i.LastError,
-		&i.DeliveredAt,
-		&i.ReplayedFromID,
-		&i.CreatedAt,
-		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const getWebhookEndpoint = `-- name: GetWebhookEndpoint :one
-SELECT id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at FROM webhook_endpoints
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+SELECT e.id, e.tenant_id, e.url, e.description, e.status, e.max_attempts, e.timeout_ms, e.created_at, e.updated_at, e.deleted_at,
+       ARRAY(SELECT s.pattern FROM webhook_endpoint_subscriptions s
+             WHERE s.tenant_id = e.tenant_id AND s.endpoint_id = e.id
+             ORDER BY s.pattern COLLATE "C")::text[] AS event_types
+FROM webhook_endpoints e
+WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 `
 
 type GetWebhookEndpointParams struct {
@@ -503,21 +586,26 @@ type GetWebhookEndpointParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
-func (q *Queries) GetWebhookEndpoint(ctx context.Context, arg GetWebhookEndpointParams) (WebhookEndpoint, error) {
+type GetWebhookEndpointRow struct {
+	WebhookEndpoint WebhookEndpoint `json:"webhook_endpoint"`
+	EventTypes      []string        `json:"event_types"`
+}
+
+func (q *Queries) GetWebhookEndpoint(ctx context.Context, arg GetWebhookEndpointParams) (GetWebhookEndpointRow, error) {
 	row := q.db.QueryRow(ctx, getWebhookEndpoint, arg.ID, arg.TenantID)
-	var i WebhookEndpoint
+	var i GetWebhookEndpointRow
 	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Url,
-		&i.Description,
+		&i.WebhookEndpoint.ID,
+		&i.WebhookEndpoint.TenantID,
+		&i.WebhookEndpoint.Url,
+		&i.WebhookEndpoint.Description,
+		&i.WebhookEndpoint.Status,
+		&i.WebhookEndpoint.MaxAttempts,
+		&i.WebhookEndpoint.TimeoutMs,
+		&i.WebhookEndpoint.CreatedAt,
+		&i.WebhookEndpoint.UpdatedAt,
+		&i.WebhookEndpoint.DeletedAt,
 		&i.EventTypes,
-		&i.Status,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
 	)
 	return i, err
 }
@@ -605,16 +693,11 @@ SELECT
     e.id,
     e.tenant_id,
     e.url,
-    e.description,
-    e.event_types,
-    e.status,
     e.max_attempts,
     e.timeout_ms,
-    e.created_at,
-    e.updated_at,
-    e.deleted_at,
-    s.id AS secret_id,
-    s.version AS secret_version,
+    ARRAY(SELECT sub.pattern FROM webhook_endpoint_subscriptions sub
+          WHERE sub.tenant_id = e.tenant_id AND sub.endpoint_id = e.id
+          ORDER BY sub.pattern COLLATE "C")::text[] AS event_types,
     s.secret_ciphertext AS secret_ciphertext
 FROM webhook_endpoints e
 JOIN webhook_endpoint_secrets s
@@ -626,20 +709,13 @@ ORDER BY e.id
 `
 
 type ListActiveWebhookEndpointsWithSecretRow struct {
-	ID               int64              `json:"id"`
-	TenantID         int64              `json:"tenant_id"`
-	Url              string             `json:"url"`
-	Description      string             `json:"description"`
-	EventTypes       []string           `json:"event_types"`
-	Status           string             `json:"status"`
-	MaxAttempts      int32              `json:"max_attempts"`
-	TimeoutMs        int32              `json:"timeout_ms"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
-	SecretID         int64              `json:"secret_id"`
-	SecretVersion    int32              `json:"secret_version"`
-	SecretCiphertext string             `json:"secret_ciphertext"`
+	ID               int64    `json:"id"`
+	TenantID         int64    `json:"tenant_id"`
+	Url              string   `json:"url"`
+	MaxAttempts      int32    `json:"max_attempts"`
+	TimeoutMs        int32    `json:"timeout_ms"`
+	EventTypes       []string `json:"event_types"`
+	SecretCiphertext string   `json:"secret_ciphertext"`
 }
 
 func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tenantID int64) ([]ListActiveWebhookEndpointsWithSecretRow, error) {
@@ -655,16 +731,9 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 			&i.ID,
 			&i.TenantID,
 			&i.Url,
-			&i.Description,
-			&i.EventTypes,
-			&i.Status,
 			&i.MaxAttempts,
 			&i.TimeoutMs,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-			&i.SecretID,
-			&i.SecretVersion,
+			&i.EventTypes,
 			&i.SecretCiphertext,
 		); err != nil {
 			return nil, err
@@ -678,12 +747,14 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 }
 
 const listWebhookDeliveries = `-- name: ListWebhookDeliveries :many
-SELECT id, tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload, secret_ciphertext, status, attempts, max_attempts, timeout_ms, next_attempt_at, last_status_code, last_error, delivered_at, replayed_from_id, created_at, updated_at FROM webhook_deliveries
-WHERE tenant_id = $1
-  AND ($2::bigint = 0 OR endpoint_id = $2)
-  AND ($3::text = '' OR status = $3)
-  AND (created_at, id) < ($4::timestamptz, $5::bigint)
-ORDER BY created_at DESC, id DESC
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.occurred_at
+FROM webhook_deliveries d
+JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
+WHERE d.tenant_id = $1
+  AND ($2::bigint = 0 OR d.endpoint_id = $2)
+  AND ($3::text = '' OR d.status = $3)
+  AND (d.created_at, d.id) < ($4::timestamptz, $5::bigint)
+ORDER BY d.created_at DESC, d.id DESC
 LIMIT $6::int
 `
 
@@ -696,7 +767,14 @@ type ListWebhookDeliveriesParams struct {
 	RowLimit        int32              `json:"row_limit"`
 }
 
-func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeliveriesParams) ([]WebhookDelivery, error) {
+type ListWebhookDeliveriesRow struct {
+	WebhookDelivery WebhookDelivery    `json:"webhook_delivery"`
+	EventType       string             `json:"event_type"`
+	OccurredAt      pgtype.Timestamptz `json:"occurred_at"`
+}
+
+// The list response carries no payload, so it is not read.
+func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeliveriesParams) ([]ListWebhookDeliveriesRow, error) {
 	rows, err := q.db.Query(ctx, listWebhookDeliveries,
 		arg.TenantID,
 		arg.EndpointID,
@@ -709,30 +787,29 @@ func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeli
 		return nil, err
 	}
 	defer rows.Close()
-	items := []WebhookDelivery{}
+	items := []ListWebhookDeliveriesRow{}
 	for rows.Next() {
-		var i WebhookDelivery
+		var i ListWebhookDeliveriesRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.EndpointID,
-			&i.EventID,
+			&i.WebhookDelivery.ID,
+			&i.WebhookDelivery.TenantID,
+			&i.WebhookDelivery.EndpointID,
+			&i.WebhookDelivery.EventID,
+			&i.WebhookDelivery.Url,
+			&i.WebhookDelivery.SecretCiphertext,
+			&i.WebhookDelivery.Status,
+			&i.WebhookDelivery.Attempts,
+			&i.WebhookDelivery.MaxAttempts,
+			&i.WebhookDelivery.TimeoutMs,
+			&i.WebhookDelivery.NextAttemptAt,
+			&i.WebhookDelivery.LastStatusCode,
+			&i.WebhookDelivery.LastError,
+			&i.WebhookDelivery.DeliveredAt,
+			&i.WebhookDelivery.ReplayedFromID,
+			&i.WebhookDelivery.CreatedAt,
+			&i.WebhookDelivery.UpdatedAt,
 			&i.EventType,
-			&i.EventCreatedAt,
-			&i.Url,
-			&i.Payload,
-			&i.SecretCiphertext,
-			&i.Status,
-			&i.Attempts,
-			&i.MaxAttempts,
-			&i.TimeoutMs,
-			&i.NextAttemptAt,
-			&i.LastStatusCode,
-			&i.LastError,
-			&i.DeliveredAt,
-			&i.ReplayedFromID,
-			&i.CreatedAt,
-			&i.UpdatedAt,
+			&i.OccurredAt,
 		); err != nil {
 			return nil, err
 		}
@@ -785,11 +862,15 @@ func (q *Queries) ListWebhookDeliveryAttempts(ctx context.Context, arg ListWebho
 }
 
 const listWebhookEndpoints = `-- name: ListWebhookEndpoints :many
-SELECT id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at FROM webhook_endpoints
-WHERE tenant_id = $1
-  AND deleted_at IS NULL
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
-ORDER BY created_at DESC, id DESC
+SELECT e.id, e.tenant_id, e.url, e.description, e.status, e.max_attempts, e.timeout_ms, e.created_at, e.updated_at, e.deleted_at,
+       ARRAY(SELECT s.pattern FROM webhook_endpoint_subscriptions s
+             WHERE s.tenant_id = e.tenant_id AND s.endpoint_id = e.id
+             ORDER BY s.pattern COLLATE "C")::text[] AS event_types
+FROM webhook_endpoints e
+WHERE e.tenant_id = $1
+  AND e.deleted_at IS NULL
+  AND (e.created_at, e.id) < ($2::timestamptz, $3::bigint)
+ORDER BY e.created_at DESC, e.id DESC
 LIMIT $4::int
 `
 
@@ -800,7 +881,12 @@ type ListWebhookEndpointsParams struct {
 	RowLimit        int32              `json:"row_limit"`
 }
 
-func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpointsParams) ([]WebhookEndpoint, error) {
+type ListWebhookEndpointsRow struct {
+	WebhookEndpoint WebhookEndpoint `json:"webhook_endpoint"`
+	EventTypes      []string        `json:"event_types"`
+}
+
+func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpointsParams) ([]ListWebhookEndpointsRow, error) {
 	rows, err := q.db.Query(ctx, listWebhookEndpoints,
 		arg.TenantID,
 		arg.CursorCreatedAt,
@@ -811,21 +897,21 @@ func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpo
 		return nil, err
 	}
 	defer rows.Close()
-	items := []WebhookEndpoint{}
+	items := []ListWebhookEndpointsRow{}
 	for rows.Next() {
-		var i WebhookEndpoint
+		var i ListWebhookEndpointsRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Url,
-			&i.Description,
+			&i.WebhookEndpoint.ID,
+			&i.WebhookEndpoint.TenantID,
+			&i.WebhookEndpoint.Url,
+			&i.WebhookEndpoint.Description,
+			&i.WebhookEndpoint.Status,
+			&i.WebhookEndpoint.MaxAttempts,
+			&i.WebhookEndpoint.TimeoutMs,
+			&i.WebhookEndpoint.CreatedAt,
+			&i.WebhookEndpoint.UpdatedAt,
+			&i.WebhookEndpoint.DeletedAt,
 			&i.EventTypes,
-			&i.Status,
-			&i.MaxAttempts,
-			&i.TimeoutMs,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -940,8 +1026,12 @@ func (q *Queries) ListWebhookInboundSources(ctx context.Context, arg ListWebhook
 }
 
 const lockWebhookEndpoint = `-- name: LockWebhookEndpoint :one
-SELECT id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at FROM webhook_endpoints
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+SELECT e.id, e.tenant_id, e.url, e.description, e.status, e.max_attempts, e.timeout_ms, e.created_at, e.updated_at, e.deleted_at,
+       ARRAY(SELECT s.pattern FROM webhook_endpoint_subscriptions s
+             WHERE s.tenant_id = e.tenant_id AND s.endpoint_id = e.id
+             ORDER BY s.pattern COLLATE "C")::text[] AS event_types
+FROM webhook_endpoints e
+WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 FOR UPDATE
 `
 
@@ -950,24 +1040,29 @@ type LockWebhookEndpointParams struct {
 	TenantID int64 `json:"tenant_id"`
 }
 
+type LockWebhookEndpointRow struct {
+	WebhookEndpoint WebhookEndpoint `json:"webhook_endpoint"`
+	EventTypes      []string        `json:"event_types"`
+}
+
 // Serializes concurrent secret rotations: the row lock is held until the
 // rotation transaction commits, so NextWebhookEndpointSecretVersion cannot
 // hand two rotations the same version.
-func (q *Queries) LockWebhookEndpoint(ctx context.Context, arg LockWebhookEndpointParams) (WebhookEndpoint, error) {
+func (q *Queries) LockWebhookEndpoint(ctx context.Context, arg LockWebhookEndpointParams) (LockWebhookEndpointRow, error) {
 	row := q.db.QueryRow(ctx, lockWebhookEndpoint, arg.ID, arg.TenantID)
-	var i WebhookEndpoint
+	var i LockWebhookEndpointRow
 	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Url,
-		&i.Description,
+		&i.WebhookEndpoint.ID,
+		&i.WebhookEndpoint.TenantID,
+		&i.WebhookEndpoint.Url,
+		&i.WebhookEndpoint.Description,
+		&i.WebhookEndpoint.Status,
+		&i.WebhookEndpoint.MaxAttempts,
+		&i.WebhookEndpoint.TimeoutMs,
+		&i.WebhookEndpoint.CreatedAt,
+		&i.WebhookEndpoint.UpdatedAt,
+		&i.WebhookEndpoint.DeletedAt,
 		&i.EventTypes,
-		&i.Status,
-		&i.MaxAttempts,
-		&i.TimeoutMs,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
 	)
 	return i, err
 }
@@ -1051,6 +1146,42 @@ func (q *Queries) NextWebhookEndpointSecretVersion(ctx context.Context, endpoint
 	var version int32
 	err := row.Scan(&version)
 	return version, err
+}
+
+const purgeOrphanWebhookEvents = `-- name: PurgeOrphanWebhookEvents :execrows
+WITH batch AS (
+    SELECT ev.tenant_id, ev.event_id
+    FROM webhook_events AS ev
+    WHERE ev.created_at < NOW() - make_interval(days => $1::integer)
+      AND NOT EXISTS (
+          SELECT 1 FROM webhook_deliveries d
+          WHERE d.tenant_id = ev.tenant_id AND d.event_id = ev.event_id
+      )
+    ORDER BY ev.created_at
+    LIMIT $2::integer
+    FOR UPDATE SKIP LOCKED
+)
+DELETE FROM webhook_events AS ev
+USING batch
+WHERE ev.tenant_id = batch.tenant_id AND ev.event_id = batch.event_id
+`
+
+type PurgeOrphanWebhookEventsParams struct {
+	RetentionDays int32 `json:"retention_days"`
+	BatchSize     int32 `json:"batch_size"`
+}
+
+// One bounded retention batch of events no delivery references any more (run
+// after PurgeWebhookDeliveries). The age bound keeps the pass away from
+// events still being fanned out, and SKIP LOCKED skips an event whose new
+// delivery's FK check holds a key-share lock on it; the RESTRICT FK is the
+// final guard. The caller loops until a batch is short.
+func (q *Queries) PurgeOrphanWebhookEvents(ctx context.Context, arg PurgeOrphanWebhookEventsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, purgeOrphanWebhookEvents, arg.RetentionDays, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const purgeWebhookDeliveries = `-- name: PurgeWebhookDeliveries :execrows
@@ -1206,30 +1337,27 @@ const updateWebhookEndpoint = `-- name: UpdateWebhookEndpoint :one
 UPDATE webhook_endpoints
 SET url = $1,
     description = $2,
-    event_types = $3::text[],
-    status = $4,
-    max_attempts = $5,
-    timeout_ms = $6
-WHERE id = $7 AND tenant_id = $8 AND deleted_at IS NULL
-RETURNING id, tenant_id, url, description, event_types, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
+    status = $3,
+    max_attempts = $4,
+    timeout_ms = $5
+WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL
+RETURNING id, tenant_id, url, description, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
 `
 
 type UpdateWebhookEndpointParams struct {
-	Url         string   `json:"url"`
-	Description string   `json:"description"`
-	EventTypes  []string `json:"event_types"`
-	Status      string   `json:"status"`
-	MaxAttempts int32    `json:"max_attempts"`
-	TimeoutMs   int32    `json:"timeout_ms"`
-	ID          int64    `json:"id"`
-	TenantID    int64    `json:"tenant_id"`
+	Url         string `json:"url"`
+	Description string `json:"description"`
+	Status      string `json:"status"`
+	MaxAttempts int32  `json:"max_attempts"`
+	TimeoutMs   int32  `json:"timeout_ms"`
+	ID          int64  `json:"id"`
+	TenantID    int64  `json:"tenant_id"`
 }
 
 func (q *Queries) UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEndpointParams) (WebhookEndpoint, error) {
 	row := q.db.QueryRow(ctx, updateWebhookEndpoint,
 		arg.Url,
 		arg.Description,
-		arg.EventTypes,
 		arg.Status,
 		arg.MaxAttempts,
 		arg.TimeoutMs,
@@ -1242,7 +1370,6 @@ func (q *Queries) UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEn
 		&i.TenantID,
 		&i.Url,
 		&i.Description,
-		&i.EventTypes,
 		&i.Status,
 		&i.MaxAttempts,
 		&i.TimeoutMs,

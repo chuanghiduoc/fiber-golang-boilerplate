@@ -176,3 +176,26 @@ func TestNullableHelpers(t *testing.T) {
 	require.NotNil(t, nullableString("1.2.3.4"))
 	assert.Equal(t, "1.2.3.4", *nullableString("1.2.3.4"))
 }
+
+// TestNullableIP keeps non-addresses out of the INET column: they are stored
+// as NULL (an insert failure would fail the audited request), never raw.
+func TestNullableIP(t *testing.T) {
+	t.Parallel()
+
+	valid := []struct{ in, want string }{
+		{"203.0.113.9", "203.0.113.9"},
+		{" 203.0.113.9 ", "203.0.113.9"},
+		{"2001:DB8::1", "2001:db8::1"},
+		{"fe80::1%eth0", "fe80::1"},
+		{"::ffff:203.0.113.9", "::ffff:203.0.113.9"},
+		{"0000:0000::0000:0001", "::1"},
+	}
+	for _, tc := range valid {
+		got := nullableIP(tc.in)
+		require.NotNil(t, got, "nullableIP(%q)", tc.in)
+		assert.Equal(t, tc.want, *got, "nullableIP(%q)", tc.in)
+	}
+	for _, in := range []string{"", "unknown", "203.0.113.9:443", "203.0.113.0/24", "1.2.3.4, 5.6.7.8", "999.1.1.1", "\x00", "bad\xff"} {
+		assert.Nil(t, nullableIP(in), "nullableIP(%q)", in)
+	}
+}

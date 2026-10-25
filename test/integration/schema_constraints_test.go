@@ -4,9 +4,11 @@ package integration_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -101,13 +103,19 @@ func TestSchemaConstraints(t *testing.T) {
 	endpointA := schemaInsertID(t, pool,
 		`INSERT INTO webhook_endpoints (tenant_id, url) VALUES (1, 'https://example.com/hook') RETURNING id`)
 
+	// insertDelivery writes the event in the delivery's tenant first, so a
+	// failing insert can only fail on the constraint the subtest targets.
 	insertDelivery := func(tenantID int64, eventID string) (int64, error) {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload)
+			 VALUES ($1, $2, 'test.event', NOW(), '{}') ON CONFLICT DO NOTHING`, tenantID, eventID); err != nil {
+			return 0, err
+		}
 		var id int64
 		err := pool.QueryRow(ctx,
 			`INSERT INTO webhook_deliveries
-			     (tenant_id, endpoint_id, event_id, event_type, event_created_at, url, payload,
-			      secret_ciphertext, max_attempts)
-			 VALUES ($1, $2, $3, 'test.event', NOW(), 'https://example.com/hook', '{}', 'c', 3)
+			     (tenant_id, endpoint_id, event_id, url, secret_ciphertext, max_attempts)
+			 VALUES ($1, $2, $3, 'https://example.com/hook', 'c', 3)
 			 RETURNING id`, tenantID, endpointA, eventID).Scan(&id)
 		return id, err
 	}
@@ -117,15 +125,37 @@ func TestSchemaConstraints(t *testing.T) {
 		requireFKViolation(t, err, "fk_webhook_deliveries_tenant_endpoint")
 	})
 
-	t.Run("endpoint delete is restricted while purging a delivery cascades its attempts", func(t *testing.T) {
+	t.Run("webhook deliveries must reference an event in the same tenant", func(t *testing.T) {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO webhook_deliveries
+			     (tenant_id, endpoint_id, event_id, url, secret_ciphertext, max_attempts)
+			 VALUES (1, $1, 'evt-cross', 'https://example.com/hook', 'c', 3)`, endpointA)
+		requireFKViolation(t, err, "fk_webhook_deliveries_tenant_event")
+	})
+
+	t.Run("webhook subscriptions must reference an endpoint in the same tenant", func(t *testing.T) {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO webhook_endpoint_subscriptions (tenant_id, endpoint_id, pattern) VALUES ($1, $2, '*')`,
+			tenantB, endpointA)
+		requireFKViolation(t, err, "fk_webhook_endpoint_subscriptions_tenant_endpoint")
+	})
+
+	t.Run("endpoint and event deletes are restricted while purging a delivery cascades its attempts", func(t *testing.T) {
 		deliveryID, err := insertDelivery(1, "evt-own")
 		require.NoError(t, err)
 		_, err = pool.Exec(ctx,
 			`INSERT INTO webhook_delivery_attempts (tenant_id, delivery_id, attempt) VALUES (1, $1, 1)`, deliveryID)
 		require.NoError(t, err)
 
+		_, err = pool.Exec(ctx,
+			`INSERT INTO webhook_delivery_attempts (tenant_id, delivery_id, attempt) VALUES ($1, $2, 2)`,
+			tenantB, deliveryID)
+		requireFKViolation(t, err, "fk_webhook_delivery_attempts_tenant_delivery")
+
 		_, err = pool.Exec(ctx, `DELETE FROM webhook_endpoints WHERE id = $1`, endpointA)
 		requireFKViolation(t, err, "fk_webhook_deliveries_tenant_endpoint")
+		_, err = pool.Exec(ctx, `DELETE FROM webhook_events WHERE tenant_id = 1 AND event_id = 'evt-own'`)
+		requireFKViolation(t, err, "fk_webhook_deliveries_tenant_event")
 
 		_, err = pool.Exec(ctx, `DELETE FROM webhook_deliveries WHERE id = $1`, deliveryID)
 		require.NoError(t, err)
@@ -133,5 +163,77 @@ func TestSchemaConstraints(t *testing.T) {
 		require.NoError(t, pool.QueryRow(ctx,
 			`SELECT count(*) FROM webhook_delivery_attempts WHERE delivery_id = $1`, deliveryID).Scan(&attempts))
 		assert.Zero(t, attempts)
+		_, err = pool.Exec(ctx, `DELETE FROM webhook_events WHERE tenant_id = 1 AND event_id = 'evt-own'`)
+		require.NoError(t, err, "an unreferenced event can be deleted")
 	})
+
+	t.Run("state consistency checks", func(t *testing.T) {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO jobs (kind, status, lease_expires_at) VALUES ('schema.check', 'running', NOW() + interval '1 minute')`)
+		requireCheckViolation(t, err, "jobs_running_has_owner")
+		_, err = pool.Exec(ctx, `INSERT INTO jobs (kind, status, locked_by) VALUES ('schema.check', 'queued', 'w')`)
+		requireCheckViolation(t, err, "jobs_running_has_owner")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash, rotated_at)
+			 VALUES (1, $1, 'k', 'p', 'schema-hash-1', NOW())`, userA)
+		requireCheckViolation(t, err, "api_keys_rotation_grace_matches_rotated")
+
+		keyID := schemaInsertID(t, pool,
+			`INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash)
+			 VALUES (1, $1, 'k', 'p', 'schema-hash-2') RETURNING id`, userA)
+		_, err = pool.Exec(ctx,
+			`INSERT INTO api_key_scopes (api_key_id, permission_key) VALUES ($1, 'Files Read')`, keyID)
+		requireCheckViolation(t, err, "api_key_scopes_permission_key_check")
+		_, err = pool.Exec(ctx,
+			`INSERT INTO api_key_scopes (api_key_id, permission_key) VALUES ($1, 'admin:files:read')`, keyID)
+		require.NoError(t, err)
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
+			 VALUES (1, $1, 'x', 'schema/negative', 'text/plain', -1)`, userA)
+		requireCheckViolation(t, err, "files_size_check")
+	})
+
+	t.Run("one tenant-wide feature flag target per tenant and flag", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `INSERT INTO feature_flags (flag_key) VALUES ('schema_flag')`)
+		require.NoError(t, err)
+		insertTarget := `INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled) VALUES ('schema_flag', 1, $1, TRUE)`
+		_, err = pool.Exec(ctx, insertTarget, nil)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx, insertTarget, nil)
+		require.True(t, database.IsUniqueViolation(err), "a second tenant-wide target must collide, got %v", err)
+		_, err = pool.Exec(ctx, insertTarget, userA)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx, insertTarget, userA)
+		require.True(t, database.IsUniqueViolation(err), "a second user target must collide, got %v", err)
+	})
+
+	t.Run("audit events reject admin actor type, non-IP addresses, and dangling parents", func(t *testing.T) {
+		insertAudit := `INSERT INTO audit_events (tenant_id, actor_type, action, resource, ip, parent_id)
+		                VALUES (1, $1, 'schema.check', 'schema', $2, $3)`
+		_, err := pool.Exec(ctx, insertAudit, "admin", nil, nil)
+		requireCheckViolation(t, err, "audit_events_actor_type_check")
+
+		_, err = pool.Exec(ctx, insertAudit, "user", "not-an-ip", nil)
+		require.Error(t, err, "the INET column must reject a non-address")
+
+		_, err = pool.Exec(ctx, insertAudit, "user", "203.0.113.7", int64(987654321))
+		requireFKViolation(t, err, "audit_events_parent_id_fkey")
+
+		parentID := schemaInsertID(t, pool,
+			`INSERT INTO audit_events (tenant_id, actor_type, action, resource, ip)
+			 VALUES (1, 'user', 'schema.check', 'schema', '2001:db8::1') RETURNING id`)
+		_, err = pool.Exec(ctx, insertAudit, "user", "203.0.113.7", parentID)
+		require.NoError(t, err)
+	})
+}
+
+// requireCheckViolation asserts err is a CHECK violation (23514) of constraint.
+func requireCheckViolation(t *testing.T, err error, constraint string) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr), "expected a check violation, got %v", err)
+	assert.Equal(t, "23514", pgErr.Code, "error: %v", err)
+	assert.Equal(t, constraint, pgErr.ConstraintName)
 }

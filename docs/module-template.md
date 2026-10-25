@@ -545,7 +545,7 @@ even in a JOIN; use a contract/read model or a job.
 ```mermaid
 flowchart TD
     A{Has any database<br/>been deployed from<br/>this tree or fork?}
-    A -- "no (upstream boilerplate)" --> B["extend migrations/000001_init_schema.{up,down}.sql"]
+    A -- "no (upstream boilerplate)" --> B["extend or add the owner's baseline file<br/>migrations/20260101000*_&lt;owner&gt;_init.{up,down}.sql"]
     A -- yes --> C["make migrate-create module=widgets name=init<br/>→ &lt;UTC YYYYMMDDHHMMSS&gt;_widgets_init.{up,down}.sql"]
     C --> D{Timestamp older than the<br/>newest migration on main?}
     D -- yes --> E[regenerate before merging]
@@ -556,21 +556,23 @@ flowchart TD
 
 - Only `cmd/migrate` applies DDL; the API and seed commands assume the schema
   exists.
-- Never edit `000001` once deployed, and never reuse or renumber a shipped
-  migration. Timestamp versions do not collide across branches and always sort
-  above the legacy sequential versions; golang-migrate only applies versions
-  above the recorded one.
-- `test/arch/migrations_test.go` fails on duplicate versions, a missing up or
-  down file, a non-timestamp version after the baseline, or a name that does
-  not start with a module (or `platform`) owner. The baseline must be spelled
-  exactly `000001`; golang-migrate compares versions numerically, so two
-  spellings of one version (`000001`/`0000001`) are duplicates.
-- A database that applied the old `000001`–`000003` history is upgraded once,
-  manually: apply the reviewed upgrade DDL, baseline it at version 1 only after
-  the schema matches, then run `cmd/migrate` to verify. Do not restore
-  `000002`/`000003` into `migrations/` (the arch test rejects sequential
-  versions, and a fresh install would run them after the baseline), and never
-  run the consolidated baseline over the old schema. See
+- The fresh-install baseline is split per owner (ADR 0005, listed in
+  [Data Model](data-model.md)): shared functions, identity, platform tables,
+  then modules in FK order. A new module's baseline file needs a timestamp
+  after every table it references.
+- Never edit a migration once a database has applied it, and never reuse or
+  renumber a shipped one. Timestamp versions do not collide across branches;
+  golang-migrate only applies versions above the recorded one.
+- `test/arch/migrations_test.go` fails on duplicate versions (including two
+  zero-padded spellings of one number), a missing up or down file, any
+  version that is not a 14-digit UTC timestamp, a name that does not start
+  with a module (or `platform`) owner, and a file that creates another
+  owner's table.
+- A database recorded at a sequential version (the old `000001`–`000003`
+  history or the former consolidated `000001`) is upgraded once, manually:
+  apply the reviewed upgrade DDL, baseline it with `force 20260101000900` only
+  after the schema matches, then run `cmd/migrate` to verify. Do not restore
+  sequential files into `migrations/` (the arch test rejects them). See
   [Upgrading an existing database](../README.md#upgrading-an-existing-database).
 - The down migration reverses only what its up created. It is for local/test
   reset and reviewed emergency use, not the production rollback plan.

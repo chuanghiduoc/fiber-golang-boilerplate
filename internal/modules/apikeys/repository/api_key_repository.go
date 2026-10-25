@@ -6,7 +6,6 @@ package repository
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -73,23 +72,19 @@ func NewAPIKeyRepository(db apikeyssqlc.DBTX) APIKeyRepository {
 }
 
 func (r *apiKeyRepository) Create(ctx context.Context, params CreateParams) (*APIKey, error) {
-	scopes, err := encodeScopes(params.Scopes)
-	if err != nil {
-		return nil, err
-	}
 	row, err := r.q.CreateAPIKey(ctx, apikeyssqlc.CreateAPIKeyParams{
+		Scopes:    scopeStrings(params.Scopes),
 		TenantID:  tenant.EffectiveID(ctx),
 		UserID:    params.UserID,
 		Name:      params.Name,
 		Prefix:    params.Prefix,
 		KeyHash:   params.Hash,
-		Scopes:    scopes,
 		ExpiresAt: timestamptz(params.ExpiresAt),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) GetByID(ctx context.Context, id int64) (*APIKey, error) {
@@ -100,7 +95,7 @@ func (r *apiKeyRepository) GetByID(ctx context.Context, id int64) (*APIKey, erro
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) GetByHash(ctx context.Context, hash string) (*APIKey, error) {
@@ -108,7 +103,7 @@ func (r *apiKeyRepository) GetByHash(ctx context.Context, hash string) (*APIKey,
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error) {
@@ -123,30 +118,22 @@ func (r *apiKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCurs
 	}
 	keys := make([]APIKey, len(rows))
 	for i := range rows {
-		key, convErr := toAPIKey(rows[i])
-		if convErr != nil {
-			return nil, convErr
-		}
-		keys[i] = *key
+		keys[i] = *toAPIKey(keyRow(rows[i]))
 	}
 	return keys, nil
 }
 
 func (r *apiKeyRepository) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error) {
-	encoded, err := encodeScopes(scopes)
-	if err != nil {
-		return nil, err
-	}
 	row, err := r.q.UpdateAPIKey(ctx, apikeyssqlc.UpdateAPIKeyParams{
+		Scopes:   scopeStrings(scopes),
 		Name:     name,
-		Scopes:   encoded,
 		ID:       id,
 		TenantID: tenant.EffectiveID(ctx),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) Revoke(ctx context.Context, id int64) (*APIKey, error) {
@@ -157,7 +144,7 @@ func (r *apiKeyRepository) Revoke(ctx context.Context, id int64) (*APIKey, error
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error) {
@@ -169,7 +156,7 @@ func (r *apiKeyRepository) MarkRotated(ctx context.Context, id int64, graceSecon
 	if err != nil {
 		return nil, wrapErr(err)
 	}
-	return toAPIKey(row)
+	return toAPIKey(keyRow(row)), nil
 }
 
 func (r *apiKeyRepository) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
@@ -179,35 +166,36 @@ func (r *apiKeyRepository) TouchLastUsed(ctx context.Context, id int64, at time.
 	})
 }
 
-func encodeScopes(scopes []authz.Permission) ([]byte, error) {
-	if scopes == nil {
-		scopes = []authz.Permission{}
+// scopeStrings converts scopes to the text[] parameter. nil becomes an empty
+// array: unnest(NULL) inserts nothing, but the returned scopes column must be
+// an empty list, not NULL.
+func scopeStrings(scopes []authz.Permission) []string {
+	out := make([]string, len(scopes))
+	for i, scope := range scopes {
+		out[i] = string(scope)
 	}
-	encoded, err := json.Marshal(scopes)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to encode API key scopes")
-	}
-	return encoded, nil
+	return out
 }
 
-func decodeScopes(raw []byte) ([]authz.Permission, error) {
-	if len(raw) == 0 {
-		return []authz.Permission{}, nil
-	}
-	var scopes []authz.Permission
-	if err := json.Unmarshal(raw, &scopes); err != nil {
-		return nil, apperror.NewInternal("failed to decode API key scopes")
-	}
-	if scopes == nil {
-		scopes = []authz.Permission{}
-	}
-	return scopes, nil
+// apiKeyRow is the column set every api_keys query returns: the table columns
+// followed by the sorted scopes array. sqlc emits one identically shaped row
+// struct per query; keyRow converts any of them.
+type apiKeyRow = apikeyssqlc.GetAPIKeyByIDRow
+
+type apiKeyRowTypes interface {
+	apikeyssqlc.CreateAPIKeyRow | apikeyssqlc.GetAPIKeyByIDRow | apikeyssqlc.GetAPIKeyByHashRow |
+		apikeyssqlc.ListAPIKeysCursorRow | apikeyssqlc.UpdateAPIKeyRow | apikeyssqlc.RevokeAPIKeyRow |
+		apikeyssqlc.MarkAPIKeyRotatedRow
 }
 
-func toAPIKey(row apikeyssqlc.ApiKey) (*APIKey, error) {
-	scopes, err := decodeScopes(row.Scopes)
-	if err != nil {
-		return nil, err
+func keyRow[T apiKeyRowTypes](row T) apiKeyRow {
+	return apiKeyRow(row)
+}
+
+func toAPIKey(row apiKeyRow) *APIKey {
+	scopes := make([]authz.Permission, len(row.Scopes))
+	for i, scope := range row.Scopes {
+		scopes[i] = authz.Permission(scope)
 	}
 	return &APIKey{
 		ID:                 row.ID,
@@ -224,7 +212,7 @@ func toAPIKey(row apikeyssqlc.ApiKey) (*APIKey, error) {
 		LastUsedAt:         timePtr(row.LastUsedAt),
 		CreatedAt:          row.CreatedAt.Time,
 		UpdatedAt:          row.UpdatedAt.Time,
-	}, nil
+	}
 }
 
 func timePtr(ts pgtype.Timestamptz) *time.Time {

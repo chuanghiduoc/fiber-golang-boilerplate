@@ -46,10 +46,8 @@ notifications/service/notification_service.go -> github.com/chuanghiduoc/fiber-g
 notifications/service/notification_service.go -> github.com/jackc/pgx/v5
 webhooks/service/deliveries.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
 webhooks/service/deliveries.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
-webhooks/service/delivery_worker.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
 webhooks/service/dispatcher.go -> github.com/jackc/pgx/v5
 webhooks/service/endpoints.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
-webhooks/service/endpoints.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
 webhooks/service/inbound_receive.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto
 webhooks/service/inbound_receive.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc
 webhooks/service/inbound_sources.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto

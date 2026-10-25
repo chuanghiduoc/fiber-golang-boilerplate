@@ -76,7 +76,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 		createdAt  time.Time
 	)
 	require.NoError(t, pool.QueryRow(ctx, `
-		SELECT tenant_id, actor_id, action, resource, resource_id, metadata, ip, user_agent, request_id, created_at
+		SELECT tenant_id, actor_id, action, resource, resource_id, metadata, host(ip), user_agent, request_id, created_at
 		FROM audit_events
 		WHERE request_id = $1`, requestID,
 	).Scan(&tenantID, &actorID, &action, &resource, &resourceID, &metadata, &ip, &userAgent, &gotRequest, &createdAt))
@@ -349,7 +349,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 
 	require.NoError(t, recorder.Complete(ctx, id, Completion{
 		ActorID:    42,
-		ActorType:  ActorTypeAdmin,
+		ActorType:  ActorTypeUser,
 		ActorRole:  "admin",
 		Outcome:    OutcomeSucceeded,
 		StatusCode: 200,
@@ -369,7 +369,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NotNil(t, completedAt)
 	require.NotNil(t, actorID)
 	assert.Equal(t, int64(42), *actorID)
-	assert.Equal(t, ActorTypeAdmin, actorType)
+	assert.Equal(t, ActorTypeUser, actorType)
 	require.NotNil(t, actorRole)
 	assert.Equal(t, "admin", *actorRole)
 	require.NotNil(t, statusCode)

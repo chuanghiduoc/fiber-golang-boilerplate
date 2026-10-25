@@ -780,21 +780,64 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Equal(t, 1, active)
 	})
 
-	t.Run("retention purges terminal rows in batches", func(t *testing.T) {
+	t.Run("subscriptions are a sorted set replaced on update", func(t *testing.T) {
+		created := h.createEndpoint(t, h.tokenA, "https://receiver.example/subs", "file.uploaded", "account.*", "file.uploaded")
+		assert.Equal(t, []string{"account.*", "file.uploaded"}, created.EventTypes)
+		path := fmt.Sprintf("/api/v1/webhooks/endpoints/%d", created.ID)
+		status, body, _ := h.do(t, http.MethodGet, path, h.tokenA, nil, nil)
+		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+		assert.Equal(t, []string{"account.*", "file.uploaded"}, decodeJSON[endpointDTO](t, body).EventTypes)
+
+		status, body, _ = h.do(t, http.MethodPut, path, h.tokenA, map[string]any{
+			"url": "https://receiver.example/subs", "status": "active", "eventTypes": []string{"user.*"},
+		}, nil)
+		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+		assert.Equal(t, []string{"user.*"}, decodeJSON[endpointDTO](t, body).EventTypes)
+		status, body, _ = h.do(t, http.MethodGet, path, h.tokenA, nil, nil)
+		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+		assert.Equal(t, []string{"user.*"}, decodeJSON[endpointDTO](t, body).EventTypes)
+
+		var rows int
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT count(*)::int FROM webhook_endpoint_subscriptions WHERE tenant_id = $1 AND endpoint_id = $2`,
+			h.tenantA, created.ID).Scan(&rows))
+		assert.Equal(t, 1, rows, "update replaces the subscription rows")
+
+		active, err := h.repo.ActiveEndpoints(ctx, h.tenantA)
+		require.NoError(t, err)
+		for _, endpoint := range active {
+			if endpoint.ID == created.ID {
+				assert.Equal(t, []string{"user.*"}, endpoint.EventTypes)
+				assert.True(t, webhookcontracts.Matches(endpoint.EventTypes, "user.registered"))
+				assert.False(t, webhookcontracts.Matches(endpoint.EventTypes, "file.uploaded"))
+			}
+		}
+	})
+
+	t.Run("retention purges terminal rows and then unreferenced events in batches", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/purge", "purge.*")
 		_, err := h.pool.Exec(ctx, `
-			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id, event_type, event_created_at,
-			    url, payload, secret_ciphertext, status, max_attempts)
-			SELECT $1, $2, 'evt_purge_' || g, 'purge.old', now(), 'https://receiver.example/purge',
-			       '{}'::jsonb, 'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3
+			INSERT INTO webhook_events (tenant_id, event_id, event_type, occurred_at, payload, created_at)
+			SELECT $1::bigint, 'evt_purge_' || g, 'purge.old', now(), '{}'::jsonb, now() - interval '40 days'
+			FROM generate_series(1, 1500) AS g
+			UNION ALL
+			SELECT $1::bigint, 'evt_purge_pending', 'purge.old', now(), '{}'::jsonb, now() - interval '40 days'
+			UNION ALL
+			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', now(), '{}'::jsonb, now()`,
+			h.tenantA)
+		require.NoError(t, err)
+		_, err = h.pool.Exec(ctx, `
+			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
+			    url, secret_ciphertext, status, max_attempts)
+			SELECT $1, $2, 'evt_purge_' || g, 'https://receiver.example/purge',
+			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3
 			FROM generate_series(1, 1500) AS g`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
 		_, err = h.pool.Exec(ctx, `
-			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id, event_type, event_created_at,
-			    url, payload, secret_ciphertext, status, max_attempts)
-			VALUES ($1, $2, 'evt_purge_pending', 'purge.old', now(), 'https://receiver.example/purge',
-			        '{}'::jsonb, 'sealed', 'pending', 3)`,
+			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
+			    url, secret_ciphertext, status, max_attempts)
+			VALUES ($1, $2, 'evt_purge_pending', 'https://receiver.example/purge', 'sealed', 'pending', 3)`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
 		// The updated_at trigger fires on UPDATE, so disable it to age rows.
@@ -814,6 +857,23 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			`SELECT count(*)::int FROM webhook_deliveries WHERE event_id LIKE 'evt_purge_%'`,
 		).Scan(&pending))
 		assert.Equal(t, 1, pending, "pending deliveries are never purged")
+
+		events, err := h.repo.PurgeOrphanEvents(ctx, 30)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1500), events, "every unreferenced old event is purged across batches")
+		var left []string
+		rows, err := h.pool.Query(ctx,
+			`SELECT event_id FROM webhook_events WHERE event_id LIKE 'evt_purge_%' ORDER BY event_id`)
+		require.NoError(t, err)
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			require.NoError(t, rows.Scan(&id))
+			left = append(left, id)
+		}
+		require.NoError(t, rows.Err())
+		assert.Equal(t, []string{"evt_purge_fresh", "evt_purge_pending"}, left,
+			"a referenced event and an event younger than the window are kept")
 	})
 }
 

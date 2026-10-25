@@ -32,7 +32,7 @@ func TestDeliveryWorker_InvalidPayloadIsPermanent(t *testing.T) {
 }
 
 type fakeWorkerStore struct {
-	delivery   *webhooksqlc.WebhookDelivery
+	delivery   *repository.Delivery
 	claimErr   error
 	getErr     error
 	attempts   []repository.AttemptDraft
@@ -84,7 +84,7 @@ func (f *fakeWorkerStore) ExpireUnclaimableDelivery(context.Context, int64) (boo
 	return f.expire, nil
 }
 
-func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (*webhooksqlc.WebhookDelivery, error) {
+func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (*repository.Delivery, error) {
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
@@ -96,7 +96,7 @@ func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (
 	return &clone, nil
 }
 
-func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*webhooksqlc.WebhookDelivery, error) {
+func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*repository.Delivery, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -148,24 +148,26 @@ func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft repos
 	return nil
 }
 
-func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *webhooksqlc.WebhookDelivery {
+func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *repository.Delivery {
 	created := time.Date(2026, 10, 24, 11, 59, 0, 0, time.UTC)
-	return &webhooksqlc.WebhookDelivery{
-		ID:               7,
-		TenantID:         1,
-		EndpointID:       2,
-		EventID:          "evt_1",
-		EventType:        "file.uploaded",
-		EventCreatedAt:   pgtype.Timestamptz{Time: created, Valid: true},
-		Url:              url,
-		Payload:          []byte(`{"fileId":9}`),
-		SecretCiphertext: ciphertext,
-		Status:           "pending",
-		Attempts:         attempts,
-		MaxAttempts:      maxAttempts,
-		NextAttemptAt:    pgtype.Timestamptz{Time: created, Valid: true},
-		CreatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
-		UpdatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
+	return &repository.Delivery{
+		WebhookDelivery: webhooksqlc.WebhookDelivery{
+			ID:               7,
+			TenantID:         1,
+			EndpointID:       2,
+			EventID:          "evt_1",
+			Url:              url,
+			SecretCiphertext: ciphertext,
+			Status:           "pending",
+			Attempts:         attempts,
+			MaxAttempts:      maxAttempts,
+			NextAttemptAt:    pgtype.Timestamptz{Time: created, Valid: true},
+			CreatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
+			UpdatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
+		},
+		EventType:  "file.uploaded",
+		OccurredAt: pgtype.Timestamptz{Time: created, Valid: true},
+		Payload:    []byte(`{"fileId":9}`),
 	}
 }
 

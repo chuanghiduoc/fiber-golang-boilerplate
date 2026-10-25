@@ -69,7 +69,7 @@ module, and `platform`/`pkg` never import modules.
 | `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient), files (admin), notifications (notifier), webhooks (event/dispatcher) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
-| `migrations` | `000001_init_schema.*` baseline; later `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
+| `migrations` | per-owner `<UTC ts>_<owner>_<purpose>.{up,down}.sql` (baseline: `20260101000000`–`20260101000900`, platform → identity → platform tables → modules; ADR 0005) |
 
 **Request flow:** client → global middleware (request ID, i18n, tracing,
 metrics, logger, audit fallback, timeout) → `/api/vN` guard → tenant
@@ -127,38 +127,37 @@ migrations) to its owners; keep it current when adding a module.
   tables belong to `platform/<pkg>`; the one reviewed exception is
   `platform/features` reading `feature_flags`/`feature_flag_targets`. A CTE
   must not be named like another owner's table.
-- Migrations: the baseline is spelled exactly `000001`; two spellings of one
-  version are duplicates.
+- Migrations: every version is a 14-digit UTC timestamp, owners are real
+  modules or `platform`, two spellings of one version are duplicates, and an
+  owner's file may only create that owner's tables
+  (`TestMigrationsCreateOnlyOwnedTables`).
 
 **Schema ownership**
 - Only `cmd/migrate` applies DDL; API/seed assume the schema exists.
   `cmd/migrate` uses `config.LoadDatabase` (DB_* only; no JWT/admin/SMTP
   secrets).
-- Fresh installs: one `migrations/000001_init_schema.up.sql`.
-- New migrations: `make migrate-create module=<owner> name=<purpose>` →
-  `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`, always above the legacy
-  sequential versions (an old deployment is at 3) and collision-free across
-  branches. `test/arch` rejects duplicate versions, missing up/down pairs,
-  non-timestamp versions, and unknown owners. golang-migrate never applies a
-  version below the recorded one, so regenerate a branch migration older than
-  the newest on main before merging.
-- Legacy `000001`–`000003` databases cannot be upgraded from this repo's files
-  (the arch test rejects restoring sequential versions): apply the reviewed
-  upgrade DDL, `migrate force 1` only after the schema matches, then run
-  `cmd/migrate` to verify (README "Upgrading an existing database"). Never
-  point an old database at the new `000001`, rewrite `schema_migrations` to
-  skip DDL, or edit a shipped migration.
-- `jobs.trace_parent` is folded into the baseline (no deployed database); a
-  database already at version 1 needs
-  `ALTER TABLE jobs ADD COLUMN IF NOT EXISTS trace_parent TEXT` (see
-  `docs/tracing.md`) before running this build.
+- Fresh installs apply the per-owner baseline files in timestamp order
+  (shared functions, identity, platform jobs/scheduler/audit, then modules).
+  There is still no deployed database, so the baseline is edited in place
+  until the first release; after that, only add migrations.
+- New migrations: `make migrate-create module=<owner> name=<purpose>` (or
+  `make gen`) → `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`.
+  `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp
+  versions, unknown owners, and files creating another owner's tables.
+  golang-migrate never applies a version below the recorded one, so
+  regenerate a branch migration older than the newest on main before merging.
+- `cmd/migrate` refuses a database recorded at a legacy sequential version
+  (1–999999) with upgrade guidance; never rewrite `schema_migrations` to skip
+  DDL or edit a shipped migration.
 - Tenant-owned tables (`users`, `files`, `notifications`,
   `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
   `email_verification_tokens`, `api_keys`, `jobs`, `audit_events`,
   `feature_flag_targets`, `webhook_*`) have
   `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones must
   too, and lead tenant-scoped query indexes with `tenant_id`. `feature_flags`
-  is process-wide (deliberate exception). Job claim/lease recovery/purge are
+  is process-wide (deliberate exception); `api_key_scopes` is a pure child of
+  `api_keys` (CASCADE) and inherits its tenant through the parent key. Job
+  claim/lease recovery/purge are
   global, so `jobs` has only the tenant-leading idempotency index.
 - `cmd/migrate` verifies required tables, columns, unique indexes (every
   `ON CONFLICT` target), tenant-leading indexes, and enabled triggers

@@ -301,7 +301,7 @@ func TestAuditTx_RecordsTenantAndActor(t *testing.T) {
 	assert.Equal(t, tenantID, gotTenant)
 	require.NotNil(t, gotActor)
 	assert.Equal(t, adminID, *gotActor)
-	assert.Equal(t, audit.ActorTypeAdmin, gotActorTyp)
+	assert.Equal(t, audit.ActorTypeUser, gotActorTyp)
 	require.NotNil(t, gotRole)
 	assert.Equal(t, "admin", *gotRole)
 	assert.Equal(t, audit.SourceService, gotSource)

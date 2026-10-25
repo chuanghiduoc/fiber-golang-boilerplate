@@ -3,7 +3,9 @@
 -- the request tenant, enforced by the (tenant_id, user_id) foreign key.
 -- Target upserts create the parent flag row on demand, in the same statement,
 -- with a NULL database default so a tenant target never forces a
--- process-wide default on every other tenant.
+-- process-wide default on every other tenant. Both target upserts conflict on
+-- idx_feature_flag_targets_tenant_flag_user, which is UNIQUE NULLS NOT
+-- DISTINCT, so the tenant-wide target (user_id NULL) is unique too.
 
 -- name: ListFeatureFlags :many
 SELECT * FROM feature_flags
@@ -41,7 +43,7 @@ WITH flag AS (
 )
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES (@flag_key, @tenant_id, NULL, @enabled)
-ON CONFLICT (flag_key, tenant_id) WHERE user_id IS NULL
+ON CONFLICT (tenant_id, flag_key, user_id)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING *;
 
@@ -53,7 +55,7 @@ WITH flag AS (
 )
 INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled)
 VALUES (@flag_key, @tenant_id, @user_id, @enabled)
-ON CONFLICT (flag_key, tenant_id, user_id) WHERE user_id IS NOT NULL
+ON CONFLICT (tenant_id, flag_key, user_id)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING *;
 

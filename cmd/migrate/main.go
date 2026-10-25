@@ -21,9 +21,10 @@ import (
 )
 
 // maxSequentialVersion is the largest pre-timestamp (6-digit -seq) version.
-// New migrations use UTC timestamp versions (make migrate-create), so only a
-// database recorded at 2..999999 is a legacy sequential history whose source
-// files were consolidated away.
+// Every migration, including the per-owner baseline (ADR 0005), uses a UTC
+// timestamp version, so a database recorded at 1..999999 is a legacy
+// sequential history (the old 000001 baseline or 000001-000003) whose source
+// files no longer exist in this repository.
 const maxSequentialVersion = 999999
 
 const (
@@ -36,8 +37,9 @@ const (
 )
 
 // requiredTables lists the schema objects the application assumes exist. The
-// check catches a legacy database that reports migration version 1 but predates
-// the consolidated baseline, which golang-migrate alone would treat as current.
+// check catches a database whose recorded version is current but whose schema
+// predates the per-owner baseline (for example one baselined by hand), which
+// golang-migrate alone would treat as current.
 var requiredTables = []string{
 	"tenants",
 	"users",
@@ -45,6 +47,7 @@ var requiredTables = []string{
 	"password_reset_tokens",
 	"email_verification_tokens",
 	"api_keys",
+	"api_key_scopes",
 	"files",
 	"feature_flags",
 	"feature_flag_targets",
@@ -55,7 +58,9 @@ var requiredTables = []string{
 	"scheduler_runs",
 	"audit_events",
 	"webhook_endpoints",
+	"webhook_endpoint_subscriptions",
 	"webhook_endpoint_secrets",
+	"webhook_events",
 	"webhook_deliveries",
 	"webhook_delivery_attempts",
 	"webhook_inbound_sources",
@@ -63,7 +68,7 @@ var requiredTables = []string{
 }
 
 // requiredColumns catches a legacy schema that has the right table names but
-// predates the column hardening folded into the consolidated baseline.
+// predates the column hardening folded into the baseline.
 var requiredColumns = map[string][]string{
 	"tenants":                   {"slug", "status"},
 	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at", "credentials_revoked_at"},
@@ -72,9 +77,10 @@ var requiredColumns = map[string][]string{
 	"email_verification_tokens": {"tenant_id", "email"},
 	"files":                     {"tenant_id", "updated_at"},
 	"api_keys": {
-		"tenant_id", "user_id", "key_hash", "scopes", "expires_at",
+		"tenant_id", "user_id", "key_hash", "expires_at",
 		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",
 	},
+	"api_key_scopes":           {"api_key_id", "permission_key"},
 	"feature_flags":            {"flag_key", "enabled", "kill_switch", "description"},
 	"feature_flag_targets":     {"flag_key", "tenant_id", "user_id", "enabled"},
 	"notifications":            {"tenant_id", "user_id", "type", "title", "body", "data", "read_at", "created_at", "updated_at"},
@@ -86,11 +92,13 @@ var requiredColumns = map[string][]string{
 		"tenant_id", "parent_id", "actor_type", "actor_role", "source", "outcome",
 		"status_code", "error_code", "idempotency_key_hash", "completed_at",
 	},
-	"webhook_endpoints":        {"tenant_id", "url", "event_types", "status", "max_attempts", "timeout_ms", "deleted_at"},
-	"webhook_endpoint_secrets": {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active"},
+	"webhook_endpoints":              {"tenant_id", "url", "status", "max_attempts", "timeout_ms", "deleted_at"},
+	"webhook_endpoint_subscriptions": {"tenant_id", "endpoint_id", "pattern"},
+	"webhook_endpoint_secrets":       {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active"},
+	"webhook_events":                 {"tenant_id", "event_id", "event_type", "occurred_at", "payload", "created_at"},
 	"webhook_deliveries": {
-		"tenant_id", "endpoint_id", "event_id", "event_type", "url", "payload",
-		"secret_ciphertext", "status", "attempts", "max_attempts", "next_attempt_at",
+		"tenant_id", "endpoint_id", "event_id", "url",
+		"secret_ciphertext", "status", "attempts", "max_attempts", "timeout_ms", "next_attempt_at",
 	},
 	"webhook_delivery_attempts": {"tenant_id", "delivery_id", "attempt", "status_code", "duration_ms"},
 	"webhook_inbound_sources":   {"tenant_id", "name", "slug", "secret_ciphertext", "status", "deleted_at"},
@@ -115,12 +123,16 @@ var requiredUniqueIndexes = []string{
 	"idx_notification_preferences_unique",
 	"idx_jobs_tenant_idempotency_key",
 	"idx_scheduler_runs_schedule_slot",
-	"idx_feature_flag_targets_tenant_target",
-	"idx_feature_flag_targets_user_target",
+	"idx_feature_flag_targets_tenant_flag_user",
 	"idx_webhook_endpoint_secrets_active",
 	"idx_webhook_endpoint_secrets_endpoint_version",
 	"idx_webhook_deliveries_endpoint_event",
+	"idx_webhook_deliveries_tenant_id_id",
 	"idx_webhook_delivery_attempts_delivery_attempt",
+	// Primary keys that are ON CONFLICT targets (or composite FK parents).
+	"api_key_scopes_pkey",
+	"webhook_endpoint_subscriptions_pkey",
+	"webhook_events_pkey",
 }
 
 // requiredTriggers are the database-level invariants the application relies
@@ -192,6 +204,7 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	"webhook_deliveries": {
 		"idx_webhook_deliveries_tenant_created_at_id",
 		"idx_webhook_deliveries_tenant_endpoint_created",
+		"idx_webhook_deliveries_tenant_event",
 	},
 	"webhook_delivery_attempts": {
 		"idx_webhook_delivery_attempts_tenant_delivery",
@@ -245,10 +258,10 @@ func run() error {
 		return fmt.Errorf("database migration state is dirty at version %d; repair it manually before retrying", version)
 	}
 	if err := database.RunMigrations(dbCfg.DSN(), "migrations"); err != nil {
-		if hasHistory && version > 1 && version <= maxSequentialVersion {
+		if hasHistory && version >= 1 && version <= maxSequentialVersion {
 			return fmt.Errorf(
-				"run migrations from legacy version %d: %w; this repository ships no sequential "+
-					"migrations after the 000001 baseline, so apply the reviewed upgrade DDL manually, "+
+				"run migrations from legacy version %d: %w; this repository ships only timestamped "+
+					"migrations (the per-owner baseline replaced 000001), so apply the reviewed upgrade DDL manually, "+
 					"verify the schema, then baseline it as described in README.md section %q",
 				version, err, "Upgrading an existing database",
 			)
@@ -293,7 +306,7 @@ const (
 
 // verifySchema fails loudly when the database is missing expected objects.
 // This is the safety net for installations whose migration history is older
-// than the consolidated baseline: their version may be "current" while the
+// than the baseline: their version may be "current" while the
 // schema is not. Each check returns a description of every missing object, so
 // one run reports the whole gap rather than the first difference.
 func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error {

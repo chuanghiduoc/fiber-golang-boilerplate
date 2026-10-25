@@ -6,23 +6,42 @@ import (
 	"time"
 )
 
-// PurgeRetention deletes terminal deliveries and then old inbound events. A
-// failure in the second step still reports the deliveries already purged.
-func (s *service) PurgeRetention(ctx context.Context, retentionDays int32) (deliveries, events int64, err error) {
-	deliveries, err = s.deliveries.PurgeDeliveries(ctx, retentionDays)
-	if err != nil {
-		return 0, 0, err
-	}
-	events, err = s.inbound.PurgeInboundEvents(ctx, retentionDays)
-	if err != nil {
-		return deliveries, 0, err
-	}
-	return deliveries, events, nil
+// RetentionResult counts the rows one retention pass deleted.
+type RetentionResult struct {
+	// Deliveries are terminal outbound deliveries (their attempts cascade).
+	Deliveries int64
+	// OutboundEvents are webhook_events no remaining delivery references.
+	OutboundEvents int64
+	// InboundEvents are received inbound events.
+	InboundEvents int64
 }
 
-// RunRetention periodically purges terminal deliveries and old inbound events.
-// It is best-effort: failures are logged and retried on the next tick. The
-// first pass runs immediately so a restarted process catches up.
+// PurgeRetention deletes terminal deliveries, then the outbound events they
+// left unreferenced, then old inbound events. Each step runs only after the
+// previous one succeeded; the counts of completed steps are returned with the
+// error.
+func (s *service) PurgeRetention(ctx context.Context, retentionDays int32) (RetentionResult, error) {
+	var result RetentionResult
+	var err error
+	result.Deliveries, err = s.deliveries.PurgeDeliveries(ctx, retentionDays)
+	if err != nil {
+		return result, err
+	}
+	result.OutboundEvents, err = s.deliveries.PurgeOrphanEvents(ctx, retentionDays)
+	if err != nil {
+		return result, err
+	}
+	result.InboundEvents, err = s.inbound.PurgeInboundEvents(ctx, retentionDays)
+	if err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+// RunRetention periodically purges terminal deliveries, unreferenced outbound
+// events, and old inbound events. It is best-effort: failures are logged and
+// retried on the next tick. The first pass runs immediately so a restarted
+// process catches up.
 func RunRetention(ctx context.Context, svc Service, retentionDays int32, interval time.Duration) {
 	if svc == nil || retentionDays <= 0 {
 		return
@@ -33,19 +52,21 @@ func RunRetention(ctx context.Context, svc Service, retentionDays int32, interva
 	run := func() {
 		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		deliveries, events, err := svc.PurgeRetention(runCtx, retentionDays)
+		result, err := svc.PurgeRetention(runCtx, retentionDays)
 		if err != nil {
 			slog.Warn("webhooks: retention purge failed",
-				slog.Int64("deliveries", deliveries),
-				slog.Int64("events", events),
+				slog.Int64("deliveries", result.Deliveries),
+				slog.Int64("outbound_events", result.OutboundEvents),
+				slog.Int64("inbound_events", result.InboundEvents),
 				slog.Any("error", err),
 			)
 			return
 		}
-		if deliveries > 0 || events > 0 {
+		if result.Deliveries > 0 || result.OutboundEvents > 0 || result.InboundEvents > 0 {
 			slog.Info("webhooks: retention purged rows",
-				slog.Int64("deliveries", deliveries),
-				slog.Int64("inbound_events", events),
+				slog.Int64("deliveries", result.Deliveries),
+				slog.Int64("outbound_events", result.OutboundEvents),
+				slog.Int64("inbound_events", result.InboundEvents),
 				slog.Int("retention_days", int(retentionDays)),
 			)
 		}

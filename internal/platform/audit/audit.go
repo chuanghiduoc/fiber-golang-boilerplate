@@ -40,7 +40,6 @@ var ErrTxRequired = errors.New("audit: transaction is required")
 // Actor types recorded in audit_events.actor_type.
 const (
 	ActorTypeUser      = "user"
-	ActorTypeAdmin     = "admin"
 	ActorTypeService   = "service"
 	ActorTypeJob       = "job"
 	ActorTypeSystem    = "system"
@@ -283,7 +282,7 @@ func validSource(source string) bool {
 
 func validActorType(actorType string) bool {
 	switch actorType {
-	case ActorTypeUser, ActorTypeAdmin, ActorTypeService, ActorTypeJob, ActorTypeSystem,
+	case ActorTypeUser, ActorTypeService, ActorTypeJob, ActorTypeSystem,
 		ActorTypeAnonymous, ActorTypeUnknown:
 		return true
 	default:
@@ -291,12 +290,12 @@ func validActorType(actorType string) bool {
 	}
 }
 
-// ActorTypeForRole maps an authenticated role to an actor type.
+// ActorTypeForRole maps an authenticated role to an actor type. Every known
+// role is a human user; the role itself is recorded in actor_role, so an
+// admin is actor_type user with actor_role admin.
 func ActorTypeForRole(role string) string {
 	switch strings.ToLower(role) {
-	case "admin":
-		return ActorTypeAdmin
-	case "user":
+	case "admin", "user":
 		return ActorTypeUser
 	default:
 		return ActorTypeUnknown

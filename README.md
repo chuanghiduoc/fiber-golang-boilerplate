@@ -86,7 +86,7 @@ flowchart LR
 | `internal/contracts/<provider>` | Stdlib-only cross-module interfaces, one package per providing module |
 | `internal/platform` | `authz`, `audit`, `events`, `features`, `i18n`, `jobs`, `requestctx`, `scheduler`, `session`, `tenant`, `tracing`, `versioning`, `middleware` (JWT, rate limit, logger, recovery, security headers, metrics, idempotency) |
 | `pkg` | `apperror` (RFC 9457 + catalog), `response`, `database` (pool, TxManager, migrations), `webhook` (HMAC + SSRF-safe client), `validator`, `token`, `cache`, `storage`, `email`, `pagination`, `logger`, `health`, `oauth`, `metrics`, `async` |
-| `migrations` | `000001_init_schema.*` baseline; later migrations are UTC-timestamped |
+| `migrations` | Per-owner `<UTC ts>_<owner>_<purpose>` baseline (ADR 0005); later migrations use the same naming |
 | `deploy/k8s` | Kubernetes production manifests |
 
 Every module follows the same layered slice (`handler → service → repository →
@@ -113,7 +113,7 @@ split and the [ADR 0002](docs/adr/0002-module-layering.md) layering ratchet.
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
-run the single `000001_init_schema.up.sql`; add timestamped migrations
+run the per-owner baseline files in timestamp order; add timestamped migrations
 (`make migrate-create`) only after a database is deployed.
 
 ## Quick Start
@@ -282,22 +282,22 @@ actionable error on a legacy partial schema.
 
 ### Upgrading an existing database
 
-`000001_init_schema` is a **fresh-install baseline**. It replaces the old
-shipped migrations `000001`–`000003` and also creates `jobs`, `audit_events`,
-and every later table. A database that applied the old migrations (normally at
-version 3) must never be pointed at the new `000001`.
+The per-owner baseline (`20260101000000`–`20260101000900`, ADR 0005; see
+[Data Model](docs/data-model.md)) is a **fresh-install baseline**. It replaces
+the old shipped migrations `000001`–`000003` and the former consolidated
+`000001_init_schema`. A database that applied any of those (recorded at a
+sequential version) must never be pointed at the new files.
 
-The repository ships no sequential migrations after the baseline:
-`test/arch/migrations_test.go` rejects any version other than `1` that is not
-a UTC timestamp, so do not restore the old `000002`/`000003` files (a fresh
-install would run them after the new baseline). golang-migrate cannot advance a
+The repository ships no sequential migrations at all:
+`test/arch/migrations_test.go` rejects any version that is not a UTC
+timestamp, so do not restore the old `000001`–`000003` files. golang-migrate cannot advance a
 database whose recorded version is missing from the source, so the supported
 upgrade is a one-time, reviewed manual step:
 
 ```mermaid
 flowchart LR
     A["1. Verified backup<br/>or PITR snapshot"] --> B["2. Apply missing DDL<br/>with psql in one transaction"]
-    B --> C["3. migrate force 1<br/>(only after schema matches)"]
+    B --> C["3. migrate force 20260101000900<br/>(only after schema matches)"]
     C --> D["4. Run cmd/migrate<br/>(newer migrations + verification)"]
     D -->|missing objects| B
 ```
@@ -305,8 +305,8 @@ flowchart LR
 1. Take a verified backup/PITR snapshot.
 2. Apply the missing DDL with `psql` in one transaction (tables, columns,
    indexes, triggers, and the default tenant) so the schema matches
-   `000001_init_schema.up.sql`.
-3. Record the baseline: `migrate -path migrations -database "$DSN" force 1`.
+   the baseline `migrations/20260101000*.up.sql` files.
+3. Record the baseline: `migrate -path migrations -database "$DSN" force 20260101000900`.
    This rewrites the version, not the schema; never use it to skip DDL that
    was not applied.
 4. Run `cmd/migrate`. It applies newer timestamped migrations, then verifies
@@ -325,9 +325,9 @@ The manual upgrade DDL (step 2) must cover:
 | Tenant columns | `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` on `users`, `files`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `jobs`, and `audit_events`. |
 | Indexes | Rebuild user indexes with `tenant_id` leading, then add the tenant-leading indexes used by scoped queries. |
 | Last-admin trigger | Replace `protect_last_admin()` with the per-tenant version. |
-| Feature flags | `feature_flags`, `feature_flag_targets`, their partial unique indexes, and a unique `users(tenant_id, id)` for tenant-safe user targets. Without them the evaluator still uses env/compiled defaults, but the admin API fails. |
+| Feature flags | `feature_flags`, `feature_flag_targets`, the `UNIQUE NULLS NOT DISTINCT (tenant_id, flag_key, user_id)` target index, and a unique `users(tenant_id, id)` for tenant-safe user targets. Without them the evaluator still uses env/compiled defaults, but the admin API fails. |
 | Notifications | `notifications` and `notification_preferences` plus indexes; `cmd/migrate` verifies both tables, tenant columns, and the unique preference index. |
-| `ON CONFLICT` targets | Every unique index an upsert uses: `idx_jobs_tenant_idempotency_key`, `idx_scheduler_runs_schedule_slot`, the feature-flag target indexes, and the webhook secret/delivery/attempt indexes. |
+| `ON CONFLICT` targets | Every unique index an upsert uses: `idx_jobs_tenant_idempotency_key`, `idx_scheduler_runs_schedule_slot`, the feature-flag target index, the `api_key_scopes`/`webhook_events` primary keys, and the webhook secret/delivery/attempt indexes. |
 | Triggers | `trigger_protect_last_admin`, `trigger_audit_events_completion`, `trigger_audit_events_no_delete`, `trigger_audit_events_no_truncate`. `cmd/migrate` reports missing or disabled ones. `audit_events` rejects `DELETE`/`TRUNCATE`; a reviewed retention or erasure job must disable those triggers explicitly as the table owner. |
 
 After the upgrade, access tokens without a `tenant_id` claim are rejected with
@@ -337,8 +337,8 @@ to tenant 1 and usable only there. New uploads use
 `<userID>/<uuid>.<ext>`; if you copy blobs, update `files.storage_path`
 atomically.
 
-A fresh schema created out-of-band that already matches `000001` can be
-baselined with `force 1` after verifying the objects, instead of running the
+A fresh schema created out-of-band that already matches the baseline can be
+baselined with `force 20260101000900` after verifying the objects, instead of running the
 file over populated tables. Never edit a shipped migration after deployment.
 
 ## API Endpoints

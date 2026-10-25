@@ -13,6 +13,8 @@ import (
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 )
 
+// CreateDeliveryWithJob writes the event (first delivery of EventID only),
+// the delivery row, and its first durable job in one transaction.
 func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraft) (deliveryID int64, created bool, err error) {
 	if r == nil || r.pool == nil {
 		return 0, false, ErrNoPool
@@ -21,14 +23,20 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraf
 		return 0, false, ErrNoQueue
 	}
 	err = r.withTx(ctx, func(tx pgx.Tx, q *webhooksqlc.Queries) error {
+		if err := q.CreateWebhookEvent(ctx, webhooksqlc.CreateWebhookEventParams{
+			TenantID:   draft.TenantID,
+			EventID:    draft.EventID,
+			EventType:  draft.EventType,
+			OccurredAt: timestamp(draft.EventCreatedAt),
+			Payload:    draft.Payload,
+		}); err != nil {
+			return err
+		}
 		id, err := q.CreateWebhookDelivery(ctx, webhooksqlc.CreateWebhookDeliveryParams{
 			TenantID:         draft.TenantID,
 			EndpointID:       draft.EndpointID,
 			EventID:          draft.EventID,
-			EventType:        draft.EventType,
-			EventCreatedAt:   timestamp(draft.EventCreatedAt),
 			Url:              draft.URL,
-			Payload:          draft.Payload,
 			SecretCiphertext: draft.SecretCiphertext,
 			MaxAttempts:      draft.MaxAttempts,
 			TimeoutMs:        draft.TimeoutMS,
@@ -55,25 +63,30 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraf
 	return deliveryID, created, nil
 }
 
-func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*webhooksqlc.WebhookDelivery, error) {
+func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
-	delivery, err := r.q.GetWebhookDelivery(ctx, webhooksqlc.GetWebhookDeliveryParams{
+	row, err := r.q.GetWebhookDelivery(ctx, webhooksqlc.GetWebhookDeliveryParams{
 		ID:       id,
 		TenantID: tenantID(ctx),
 	})
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
-	return &delivery, nil
+	return &Delivery{
+		WebhookDelivery: row.WebhookDelivery,
+		EventType:       row.EventType,
+		OccurredAt:      row.OccurredAt,
+		Payload:         row.Payload,
+	}, nil
 }
 
-func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]webhooksqlc.WebhookDelivery, error) {
+func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
-	return r.q.ListWebhookDeliveries(ctx, webhooksqlc.ListWebhookDeliveriesParams{
+	rows, err := r.q.ListWebhookDeliveries(ctx, webhooksqlc.ListWebhookDeliveriesParams{
 		TenantID:        tenantID(ctx),
 		EndpointID:      params.EndpointID,
 		Status:          params.Status,
@@ -81,16 +94,24 @@ func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesPara
 		CursorID:        params.Cursor.IDParam(),
 		RowLimit:        params.Cursor.Limit,
 	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Delivery, len(rows))
+	for i, row := range rows {
+		out[i] = Delivery{WebhookDelivery: row.WebhookDelivery, EventType: row.EventType, OccurredAt: row.OccurredAt}
+	}
+	return out, nil
 }
 
-func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksqlc.WebhookDelivery, error) {
+func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
 	if lease < time.Second {
 		lease = time.Minute
 	}
-	delivery, err := r.q.ClaimWebhookDelivery(ctx, webhooksqlc.ClaimWebhookDeliveryParams{
+	row, err := r.q.ClaimWebhookDelivery(ctx, webhooksqlc.ClaimWebhookDeliveryParams{
 		LeaseSeconds: lease.Seconds(),
 		ID:           id,
 		TenantID:     tenantID(ctx),
@@ -101,7 +122,30 @@ func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Durat
 	if err != nil {
 		return nil, err
 	}
-	return &delivery, nil
+	return &Delivery{
+		WebhookDelivery: webhooksqlc.WebhookDelivery{
+			ID:               row.ID,
+			TenantID:         row.TenantID,
+			EndpointID:       row.EndpointID,
+			EventID:          row.EventID,
+			Url:              row.Url,
+			SecretCiphertext: row.SecretCiphertext,
+			Status:           row.Status,
+			Attempts:         row.Attempts,
+			MaxAttempts:      row.MaxAttempts,
+			TimeoutMs:        row.TimeoutMs,
+			NextAttemptAt:    row.NextAttemptAt,
+			LastStatusCode:   row.LastStatusCode,
+			LastError:        row.LastError,
+			DeliveredAt:      row.DeliveredAt,
+			ReplayedFromID:   row.ReplayedFromID,
+			CreatedAt:        row.CreatedAt,
+			UpdatedAt:        row.UpdatedAt,
+		},
+		EventType:  row.EventType,
+		OccurredAt: row.OccurredAt,
+		Payload:    row.Payload,
+	}, nil
 }
 
 // MarkDeliverySucceeded finishes the claimed attempt. It returns
@@ -224,6 +268,20 @@ func (r *Postgres) PurgeDeliveries(ctx context.Context, retentionDays int32) (in
 	}
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeWebhookDeliveries(ctx, webhooksqlc.PurgeWebhookDeliveriesParams{
+			RetentionDays: retentionDays,
+			BatchSize:     purgeBatchSize,
+		})
+	})
+}
+
+// PurgeOrphanEvents deletes events older than the retention window that no
+// delivery references any more. Run it after PurgeDeliveries.
+func (r *Postgres) PurgeOrphanEvents(ctx context.Context, retentionDays int32) (int64, error) {
+	if r == nil || r.q == nil {
+		return 0, ErrNoPool
+	}
+	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
+		return r.q.PurgeOrphanWebhookEvents(ctx, webhooksqlc.PurgeOrphanWebhookEventsParams{
 			RetentionDays: retentionDays,
 			BatchSize:     purgeBatchSize,
 		})
