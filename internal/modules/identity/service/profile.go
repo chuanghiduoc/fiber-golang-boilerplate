@@ -160,8 +160,8 @@ func deleteAccount(ctx context.Context, st Stores, id int64) error {
 			continue
 		}
 		tctx := tenant.WithID(ctx, m.TenantID)
-		if m.Role == RoleAdmin {
-			if err := ensureNotLastAdmin(tctx, st.Memberships, "cannot delete the account: it is the last active admin of a tenant"); err != nil {
+		if m.Role == RoleOwner {
+			if err := ensureNotLastOwner(tctx, st.Memberships, "cannot delete the account: it is the last active owner of a tenant"); err != nil {
 				return err
 			}
 		}
@@ -210,8 +210,8 @@ func removeMembership(ctx context.Context, st Stores, id int64) error {
 	if member.Membership.Status == MembershipStatusRemoved {
 		return apperror.NewNotFound(notFound)
 	}
-	if member.Membership.Role == RoleAdmin && member.Membership.Status == MembershipStatusActive {
-		if err := ensureNotLastAdmin(ctx, st.Memberships, "cannot delete the last active admin"); err != nil {
+	if member.Membership.Role == RoleOwner && member.Membership.Status == MembershipStatusActive {
+		if err := ensureNotLastOwner(ctx, st.Memberships, "cannot delete the last active owner"); err != nil {
 			return err
 		}
 	}

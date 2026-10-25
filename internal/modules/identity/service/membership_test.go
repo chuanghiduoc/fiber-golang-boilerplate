@@ -36,7 +36,7 @@ func TestRegistrationAndLogin_AreScopedToMemberships(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ada@example.com", user.Email)
 	assert.Equal(t, int64(1), user.TenantID)
-	assert.Equal(t, RoleUser, user.Role)
+	assert.Equal(t, RoleMember, user.Role)
 	assert.Equal(t, string(MembershipStatusActive), user.MembershipStatus)
 
 	_, err = svc.Authenticate(acme, dto.LoginRequest{Email: "ada@example.com", Password: "Password1!"})
@@ -85,7 +85,7 @@ func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 	require.NoError(t, err)
 	require.Positive(t, first.SessionID)
 	require.Len(t, signed, 1)
-	assert.Equal(t, AccessClaims{UserID: user.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com", Role: RoleUser}, signed[0])
+	assert.Equal(t, AccessClaims{UserID: user.ID, TenantID: 1, SessionID: first.SessionID, Email: "s@example.com"}, signed[0])
 
 	rotated, err := sessions.Refresh(ctx, first.RefreshToken, nil)
 	require.NoError(t, err)
@@ -155,13 +155,13 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err), "a password checked at the old version cannot open a session")
 }
 
-func TestAdmin_BanIsPerTenantAndProtectsLastAdmin(t *testing.T) {
+func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
 	st := db.stores()
-	admin := seedMember(t, db, 1, "admin@example.com", RoleAdmin)
-	member := seedMember(t, db, 1, "member@example.com", RoleUser)
-	_, err := st.Memberships.Create(tenant.WithID(ctx, 2), member, RoleUser)
+	admin := seedMember(t, db, 1, "admin@example.com", RoleOwner)
+	member := seedMember(t, db, 1, "member@example.com", RoleMember)
+	_, err := st.Memberships.Create(tenant.WithID(ctx, 2), member, RoleMember)
 	require.NoError(t, err)
 
 	var signed []AccessClaims

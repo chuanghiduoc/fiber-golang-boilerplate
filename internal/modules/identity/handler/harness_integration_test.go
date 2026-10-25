@@ -57,6 +57,7 @@ type identityHarness struct {
 	admin        identityservice.AdminUserService
 	invitations  *identityservice.InvitationService
 	tenants      *identityservice.TenantService
+	roles        identityservice.RoleService
 	mail         *recordingSender
 	auth         *AuthHandler
 }
@@ -102,6 +103,7 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 		admin:        identityservice.NewAdminUserService(stores, transactor, sessionStore),
 		invitations:  identityservice.NewInvitationService(stores, transactor, mail, "https://app.example.test"),
 		tenants:      tenants,
+		roles:        identityservice.NewRoleService(stores, transactor, sessionStore),
 		mail:         mail,
 	}
 	h.auth = NewAuthHandler(AuthDeps{

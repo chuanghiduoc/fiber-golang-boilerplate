@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ const (
 	defaultTenantLocale   = "en"
 	defaultTenantTimezone = "UTC"
 )
+
+// tenantLocalePattern mirrors the tenant_settings.locale CHECK.
+var tenantLocalePattern = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
 
 // TenantStatusTransitionAllowed is the tenant lifecycle state machine:
 //
@@ -47,10 +51,9 @@ func TenantStatusTransitionAllowed(from, to TenantStatus) bool {
 	}
 }
 
-// TenantService owns the tenant lifecycle. Platform-admin HTTP endpoints
-// arrive with platform roles (P2b-2); until then the methods are used by the
-// composition root, operators' tooling, and tests. Every mutation writes a
-// Tier 1 audit row in its transaction.
+// TenantService owns the tenant lifecycle. The platform tenant endpoints and
+// the composition root use it. Every mutation writes a Tier 1 audit row in its
+// transaction.
 type TenantService struct {
 	stores Stores
 	tx     Transactor
@@ -67,6 +70,35 @@ func tenantEvent(ctx context.Context, action string, t *Tenant, metadata map[str
 	event.ResourceID = strconv.FormatInt(t.ID, 10)
 	event.Metadata = metadata
 	return event
+}
+
+// List returns one cursor page of every tenant (platform administration).
+func (s *TenantService) List(ctx context.Context, limit int, startingAfter string) ([]Tenant, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
+	if err != nil {
+		return nil, false, err
+	}
+	tenants, err := s.stores.Tenants.ListCursor(ctx, cur)
+	if err != nil {
+		return nil, false, apperror.NewInternal("failed to list tenants")
+	}
+	hasMore := len(tenants) > pageSize
+	if hasMore {
+		tenants = tenants[:pageSize]
+	}
+	return tenants, hasMore, nil
+}
+
+// Get returns a tenant in any lifecycle state.
+func (s *TenantService) Get(ctx context.Context, id int64) (*Tenant, error) {
+	t, err := s.stores.Tenants.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("tenant not found")
+		}
+		return nil, apperror.NewInternal("failed to load tenant")
+	}
+	return t, nil
 }
 
 // Create creates a tenant (trialing with a trial end, or active) and its
@@ -93,6 +125,12 @@ func (s *TenantService) Create(ctx context.Context, in NewTenant) (*Tenant, erro
 			}
 			return apperror.NewInternal("failed to create tenant")
 		}
+		if in.OwnerUserID > 0 {
+			ownerCtx := tenant.WithID(ctx, t.ID)
+			if _, err := tx.Memberships.Create(ownerCtx, in.OwnerUserID, RoleOwner); err != nil {
+				return apperror.NewInternal("failed to assign the tenant owner")
+			}
+		}
 		created = t
 		return checkAudit(tx.Audit.RecordTx(ctx, tenantEvent(ctx, "tenant.created", t, map[string]any{"status": string(t.Status)})))
 	})
@@ -114,6 +152,9 @@ func normalizeNewTenant(in *NewTenant) error {
 	}
 	if in.Locale == "" {
 		in.Locale = defaultTenantLocale
+	}
+	if !tenantLocalePattern.MatchString(in.Locale) {
+		return apperror.NewBadRequest("locale must be a BCP 47 language tag")
 	}
 	if in.Timezone == "" {
 		in.Timezone = defaultTenantTimezone

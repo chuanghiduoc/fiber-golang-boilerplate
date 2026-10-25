@@ -445,9 +445,9 @@ pending_deletion`, `active ↔ suspended`, `active | suspended →
 pending_deletion`, `pending_deletion → active | deleted`) and writes a Tier 1
 audit row per change. Entering `pending_deletion` schedules deletion after a
 30-day grace; cancelling it clears the schedule. Tenant 1 can never be
-deleted (also a `CHECK`). There are no platform-admin HTTP endpoints for this
-yet (they arrive with platform roles in P2b-2); use operator tooling that calls
-the service rather than raw `UPDATE`s, which skip the audit row. A
+deleted (also a `CHECK`). Platform admins use `PATCH
+/platform/tenants/:id/status`; operator tooling must call the service rather
+than raw `UPDATE`s, which skip the audit row. A
 non-operational tenant returns `404` on tenant resolution after the resolver
 cache TTL (30s) and `401` for existing sessions and API keys.
 
@@ -1066,7 +1066,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 The baseline creates `tenants`, seeds tenant id 1 (`default`), adds
 `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to users, files,
 notifications, notification preferences, refresh/reset/verification tokens,
-jobs, and audit events, adds tenant-leading indexes, and scopes the last-admin
+jobs, and audit events, adds tenant-leading indexes, and scopes the last-owner
 trigger per tenant. A database deployed before this change does **not** get
 those objects from the baseline. The upgrade DDL must:
 

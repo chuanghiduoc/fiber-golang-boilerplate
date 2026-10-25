@@ -177,7 +177,7 @@ func createGoogleAccount(ctx context.Context, st Stores, req GoogleSignIn) (*Mem
 	if err := ensureEmailNotBanned(ctx, st.Memberships, req.Email); err != nil {
 		return nil, err
 	}
-	member, err := createAccount(ctx, st, NewUser{Email: req.Email, Name: req.Name, EmailVerified: true}, "", RoleUser)
+	member, err := createAccount(ctx, st, NewUser{Email: req.Email, Name: req.Name, EmailVerified: true}, "", RoleMember)
 	if err != nil {
 		var appErr *apperror.AppError
 		if errors.As(err, &appErr) && appErr.Code == string(identitycatalog.CodeUserEmailTaken) {

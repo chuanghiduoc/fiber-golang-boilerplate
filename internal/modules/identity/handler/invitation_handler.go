@@ -69,7 +69,7 @@ func (h *InvitationHandler) Create(c fiber.Ctx) error {
 	}
 	role := req.Role
 	if role == "" {
-		role = service.RoleUser
+		role = service.RoleMember
 	}
 	inv, err := h.invitations.Invite(c.Context(), service.InviteInput{
 		InviterID: httpx.AuthUserID(c),

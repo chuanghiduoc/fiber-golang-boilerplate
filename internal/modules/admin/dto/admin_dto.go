@@ -6,12 +6,13 @@ package admindto
 import "time"
 
 const (
-	RoleUser  = "user"
-	RoleAdmin = "admin"
+	RoleMember = "member"
+	RoleAdmin  = "admin"
+	RoleOwner  = "owner"
 )
 
 type UpdateRoleRequest struct {
-	Role string `json:"role" validate:"required,oneof=user admin"`
+	Role string `json:"role" validate:"required,oneof=user member admin owner"`
 }
 
 type AdminStatsResponse struct {
@@ -28,6 +29,7 @@ type UserResponse struct {
 	Email            string     `json:"email"`
 	Name             string     `json:"name"`
 	Role             string     `json:"role"`
+	Roles            []string   `json:"roles"`
 	MembershipStatus string     `json:"membershipStatus" enums:"active,suspended,removed"`
 	EmailVerified    bool       `json:"emailVerified"`
 	HasPassword      bool       `json:"hasPassword"`

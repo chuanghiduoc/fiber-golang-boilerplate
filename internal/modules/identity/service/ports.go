@@ -35,6 +35,12 @@ var (
 	ErrIdentityConflict = errors.New("identity: user already linked to another external identity")
 	// ErrTenantSlugTaken: another tenant has the slug.
 	ErrTenantSlugTaken = errors.New("identity: tenant slug already exists")
+	// ErrRoleKeyTaken: the tenant already defines a role with the key.
+	ErrRoleKeyTaken = errors.New("identity: role key already exists")
+	// ErrRoleInUse: a membership still holds the role.
+	ErrRoleInUse = errors.New("identity: role is still assigned")
+	// ErrRoleNotFound: the role key does not resolve in this tenant.
+	ErrRoleNotFound = errors.New("identity: role not found")
 )
 
 // UserStatus is the global account state (users.status).
@@ -79,14 +85,30 @@ func (s TenantStatus) Operational() bool {
 	}
 }
 
-// Membership roles (transitional until P2b-2 moves roles to tables).
+// System tenant role keys (roles.key where tenant_id IS NULL).
 const (
-	RoleUser  = "user"
-	RoleAdmin = "admin"
+	RoleMember = "member"
+	RoleAdmin  = "admin"
+	RoleOwner  = "owner"
 )
 
-// ValidRole reports whether role is one of the two transitional roles.
-func ValidRole(role string) bool { return role == RoleUser || role == RoleAdmin }
+// ValidRole reports whether role is a system tenant role.
+func ValidRole(role string) bool {
+	switch role {
+	case RoleMember, RoleAdmin, RoleOwner:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeRole accepts the pre-RBAC "user" key as an alias for member.
+func NormalizeRole(role string) string {
+	if role == "user" {
+		return RoleMember
+	}
+	return role
+}
 
 // RevokeReason records why a session ended (sessions.revoked_reason).
 type RevokeReason string
@@ -124,10 +146,13 @@ func (u *User) EmailVerified() bool { return u.EmailVerifiedAt != nil }
 
 // Membership links one user to one tenant.
 type Membership struct {
-	ID                   int64
-	TenantID             int64
-	UserID               int64
-	Role                 string
+	ID       int64
+	TenantID int64
+	UserID   int64
+	// Role is the highest system role key (owner > admin > member).
+	Role string
+	// Roles holds every assigned role key.
+	Roles                []string
 	Status               MembershipStatus
 	BannedAt             *time.Time
 	RemovedAt            *time.Time
@@ -179,12 +204,15 @@ type MemberStats struct {
 
 // Principal is an API-key owner's authorization view (an active membership).
 type Principal struct {
-	UserID               int64
-	TenantID             int64
-	Email                string
-	Name                 string
-	Role                 string
-	TenantStatus         TenantStatus
+	UserID       int64
+	TenantID     int64
+	Email        string
+	Name         string
+	Role         string
+	Permissions  []string
+	Platform     bool
+	TenantStatus TenantStatus
+	// CredentialsRevokedAt is set by a ban or removal and never cleared.
 	CredentialsRevokedAt *time.Time
 }
 
@@ -217,6 +245,8 @@ type SessionState struct {
 	TenantID         int64
 	Revoked          bool
 	Role             string
+	Permissions      []string
+	Platform         bool
 	MembershipStatus MembershipStatus
 	TokenVersion     int32
 	UserStatus       UserStatus
@@ -295,6 +325,9 @@ type NewTenant struct {
 	TrialEndsAt *time.Time
 	Locale      string
 	Timezone    string
+	// OwnerUserID, when positive, becomes the tenant's first owner in the
+	// same transaction (the platform create endpoint uses the caller).
+	OwnerUserID int64
 }
 
 // TenantSettings are a tenant's typed settings.
@@ -345,11 +378,11 @@ type MembershipRepository interface {
 	Ban(ctx context.Context, userID int64) (*Membership, error)
 	Unban(ctx context.Context, userID int64) (*Membership, error)
 	Remove(ctx context.Context, userID int64) (*Membership, error)
-	CountActiveAdmins(ctx context.Context) (int64, error)
-	// LockAdminChanges takes the per-tenant admin-change lock. It is only
+	CountActiveOwners(ctx context.Context) (int64, error)
+	// LockOwnerChanges takes the per-tenant owner-change lock. It is only
 	// meaningful inside a transaction and must run before the target row is
 	// updated.
-	LockAdminChanges(ctx context.Context) error
+	LockOwnerChanges(ctx context.Context) error
 	Stats(ctx context.Context) (MemberStats, error)
 	// EmailBanned reports whether an account with email (live or deleted) is
 	// banned in the request tenant.
@@ -424,6 +457,72 @@ type InvitationRepository interface {
 	MarkAccepted(ctx context.Context, tenantID, id, userID int64) (bool, error)
 }
 
+// Role is a tenant or platform role definition.
+type Role struct {
+	ID          int64
+	TenantID    *int64
+	Scope       string
+	Key         string
+	Name        string
+	Permissions []string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// System reports whether the role is a built-in (tenant_id IS NULL) role.
+func (r *Role) System() bool { return r.TenantID == nil }
+
+// NewRole is a tenant-defined role.
+type NewRole struct {
+	Key         string
+	Name        string
+	Permissions []string
+}
+
+// RoleUpdate replaces the supplied fields of a tenant role.
+type RoleUpdate struct {
+	ID          int64
+	Name        *string
+	Permissions *[]string
+}
+
+// CatalogPermission is one permission the code catalog registers.
+type CatalogPermission struct {
+	Key      string
+	Owner    string
+	Platform bool
+}
+
+// CatalogRole is one system role and its permission set.
+type CatalogRole struct {
+	Key         string
+	Name        string
+	Scope       string
+	Permissions []string
+}
+
+// RoleRepository stores RBAC roles and their assignments.
+type RoleRepository interface {
+	// SyncCatalog upserts permissions and system roles and prunes entries the
+	// catalog no longer contains. It is safe to run concurrently.
+	SyncCatalog(ctx context.Context, permissions []CatalogPermission, roles []CatalogRole) error
+	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]Role, error)
+	// Get returns a system role or a role of the request tenant.
+	Get(ctx context.Context, id int64) (*Role, error)
+	// GetByKey returns a system role or a role of the request tenant.
+	GetByKey(ctx context.Context, key string) (*Role, error)
+	Create(ctx context.Context, in NewRole) (*Role, error)
+	Update(ctx context.Context, id int64, name string, permissions []string) (*Role, error)
+	// Delete removes a tenant role and reports whether it existed. A system
+	// role or a role assigned to a membership is an error.
+	Delete(ctx context.Context, id int64) (bool, error)
+	// MemberIDs returns the users holding roleID in the request tenant.
+	MemberIDs(ctx context.Context, roleID int64) ([]int64, error)
+	ReplaceMemberRoles(ctx context.Context, userID int64, roleKeys []string) error
+	// AssignPlatformRole grants a platform role to a user.
+	AssignPlatformRole(ctx context.Context, userID int64, roleKey string) error
+}
+
 // TenantRepository stores tenants.
 type TenantRepository interface {
 	// GetOperationalBySlug / GetOperationalByID return only tenants that
@@ -434,6 +533,8 @@ type TenantRepository interface {
 	GetByID(ctx context.Context, id int64) (*Tenant, error)
 	GetBySlug(ctx context.Context, slug string) (*Tenant, error)
 	GetByIDForUpdate(ctx context.Context, id int64) (*Tenant, error)
+	// ListCursor lists every tenant (platform administration).
+	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]Tenant, error)
 	// Create inserts the tenant and its settings row.
 	Create(ctx context.Context, tenant NewTenant) (*Tenant, error)
 	UpdateStatus(ctx context.Context, id int64, status TenantStatus, deletionScheduledAt *time.Time) (*Tenant, error)
@@ -461,6 +562,7 @@ type Stores struct {
 	Verifications VerificationRepository
 	Invitations   InvitationRepository
 	Tenants       TenantRepository
+	Roles         RoleRepository
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction.

@@ -29,9 +29,9 @@ func SetSubject(c fiber.Ctx, subject authz.Subject) {
 // SubjectFromFiber returns the subject stored by SetSubject.
 func SubjectFromFiber(c fiber.Ctx) (authz.Subject, bool) {
 	subject := fiber.Locals[authz.Subject](c, subjectLocalKey)
-	// A subject is only meaningful with either a role or an explicit
-	// permission set; reject the zero value so a missing local cannot grant
-	// access through an unknown role.
+	// A subject is only meaningful with a role or an explicit permission set;
+	// reject the zero value so a missing local cannot grant access through an
+	// unknown role.
 	if subject.Role == "" && subject.Permissions == nil {
 		return authz.Subject{}, false
 	}
@@ -54,9 +54,9 @@ func requestSubject(c fiber.Ctx) (authz.Subject, bool) {
 
 // Require returns middleware that allows the request only when the
 // authenticated subject grants permission. It must run after authentication.
-// API-key subjects use their explicit scopes; JWT subjects derive permissions
-// from their role. A missing subject or a denied permission yields a 403
-// problem response.
+// API-key subjects use their explicit scopes; JWT subjects carry the session's
+// effective permission set. A missing subject or a denied permission yields a
+// 403 problem response.
 func Require(permission authz.Permission) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		subject, ok := requestSubject(c)

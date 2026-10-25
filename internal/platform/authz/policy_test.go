@@ -9,7 +9,7 @@ import (
 )
 
 func TestSubject_Permissions(t *testing.T) {
-	roleSubject := NewSubject(10, 1, RoleUser)
+	roleSubject := NewSubject(10, 1, RoleMember)
 	if !roleSubject.Has(testPermissionRead) {
 		t.Fatal("role subject should derive files:read from the user role")
 	}
@@ -35,7 +35,7 @@ func TestSubject_Permissions(t *testing.T) {
 }
 
 func TestSubject_AttributesAreCopied(t *testing.T) {
-	base := NewSubject(1, 2, RoleUser)
+	base := NewSubject(1, 2, RoleMember)
 	withAttr := base.WithAttribute(AttributeAuthMethod, "api_key")
 
 	if got := withAttr.Attribute(AttributeAuthMethod); got != "api_key" {
@@ -51,7 +51,7 @@ func TestSubject_ContextHelpers(t *testing.T) {
 	if _, ok := SubjectFromContext(ctx); ok {
 		t.Fatal("empty context must not contain a subject")
 	}
-	subject := NewSubjectWithPermissions(7, 3, RoleUser, testPermissionRead)
+	subject := NewSubjectWithPermissions(7, 3, RoleMember, testPermissionRead)
 	ctx = WithSubject(ctx, subject)
 	got, ok := SubjectFromContext(ctx)
 	if !ok {
@@ -65,10 +65,10 @@ func TestSubject_ContextHelpers(t *testing.T) {
 func TestPolicies(t *testing.T) {
 	resource := Resource{TenantID: 2, OwnerID: 9}
 
-	if got := (TenantPolicy{}).Evaluate(NewSubject(1, 2, RoleUser), resource); got != Allow {
+	if got := (TenantPolicy{}).Evaluate(NewSubject(1, 2, RoleMember), resource); got != Allow {
 		t.Errorf("same tenant = %s, want allow", got)
 	}
-	if got := (TenantPolicy{}).Evaluate(NewSubject(1, 3, RoleUser), resource); got != Conceal {
+	if got := (TenantPolicy{}).Evaluate(NewSubject(1, 3, RoleMember), resource); got != Conceal {
 		t.Errorf("cross tenant = %s, want conceal", got)
 	}
 	cross := NewSubject(1, 3, RoleAdmin)
@@ -77,10 +77,10 @@ func TestPolicies(t *testing.T) {
 		t.Errorf("cross-tenant subject = %s, want allow", got)
 	}
 
-	if got := (OwnerPolicy{}).Evaluate(NewSubject(9, 2, RoleUser), resource); got != Allow {
+	if got := (OwnerPolicy{}).Evaluate(NewSubject(9, 2, RoleMember), resource); got != Allow {
 		t.Errorf("owner = %s, want allow", got)
 	}
-	if got := (OwnerPolicy{}).Evaluate(NewSubject(8, 2, RoleUser), resource); got != Conceal {
+	if got := (OwnerPolicy{}).Evaluate(NewSubject(8, 2, RoleMember), resource); got != Conceal {
 		t.Errorf("non-owner = %s, want conceal", got)
 	}
 }
@@ -91,16 +91,16 @@ func TestPolicySet_DenyOverridesAndConceal(t *testing.T) {
 	deny := PolicyFunc(func(Subject, Resource) Decision { return Deny })
 	conceal := PolicyFunc(func(Subject, Resource) Decision { return Conceal })
 
-	if got := NewPolicySet(allow, allow).Evaluate(NewSubject(1, 1, RoleUser), resource); got != Allow {
+	if got := NewPolicySet(allow, allow).Evaluate(NewSubject(1, 1, RoleMember), resource); got != Allow {
 		t.Errorf("allow set = %s, want allow", got)
 	}
-	if got := NewPolicySet(allow, deny).Evaluate(NewSubject(1, 1, RoleUser), resource); got != Deny {
+	if got := NewPolicySet(allow, deny).Evaluate(NewSubject(1, 1, RoleMember), resource); got != Deny {
 		t.Errorf("deny set = %s, want deny (deny overrides)", got)
 	}
-	if got := NewPolicySet(allow, conceal).Evaluate(NewSubject(1, 1, RoleUser), resource); got != Conceal {
+	if got := NewPolicySet(allow, conceal).Evaluate(NewSubject(1, 1, RoleMember), resource); got != Conceal {
 		t.Errorf("conceal set = %s, want conceal", got)
 	}
-	if got := NewPolicySet().Evaluate(NewSubject(1, 1, RoleUser), resource); got != Deny {
+	if got := NewPolicySet().Evaluate(NewSubject(1, 1, RoleMember), resource); got != Deny {
 		t.Errorf("empty set = %s, want deny", got)
 	}
 }
@@ -114,26 +114,26 @@ func TestAuthorize_MapsDecisions(t *testing.T) {
 	})
 
 	t.Run("rbac denial is forbidden before policies", func(t *testing.T) {
-		ctx := WithSubject(context.Background(), NewSubject(1, 1, RoleUser))
+		ctx := WithSubject(context.Background(), NewSubject(1, 1, RoleMember))
 		err := Authorize(ctx, PermissionAdminUsersRead, resource, TenantPolicy{})
 		requirePermissionDenied(t, err)
 	})
 
 	t.Run("policy deny is forbidden", func(t *testing.T) {
-		subject := NewSubject(1, 1, RoleUser)
+		subject := NewSubject(1, 1, RoleMember)
 		err := AuthorizeSubject(subject, testPermissionRead, resource,
 			PolicyFunc(func(Subject, Resource) Decision { return Deny }))
 		requirePermissionDenied(t, err)
 	})
 
 	t.Run("policy conceal is not found", func(t *testing.T) {
-		subject := NewSubject(2, 2, RoleUser)
+		subject := NewSubject(2, 2, RoleMember)
 		err := AuthorizeSubject(subject, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{})
 		requireNotFound(t, err)
 	})
 
 	t.Run("allow returns nil", func(t *testing.T) {
-		ctx := WithSubject(context.Background(), NewSubject(1, 1, RoleUser))
+		ctx := WithSubject(context.Background(), NewSubject(1, 1, RoleMember))
 		if err := Authorize(ctx, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{}); err != nil {
 			t.Fatalf("authorize: %v", err)
 		}
@@ -159,7 +159,7 @@ func TestAuthorize_SystemContext(t *testing.T) {
 	})
 
 	t.Run("subject wins over the system marker", func(t *testing.T) {
-		ctx := SystemContext(WithSubject(context.Background(), NewSubject(2, 2, RoleUser)))
+		ctx := SystemContext(WithSubject(context.Background(), NewSubject(2, 2, RoleMember)))
 		requirePermissionDenied(t, Authorize(ctx, PermissionAdminUsersRead, resource, TenantPolicy{}))
 		requireNotFound(t, Authorize(ctx, testPermissionRead, resource, TenantPolicy{}, OwnerPolicy{}))
 	})

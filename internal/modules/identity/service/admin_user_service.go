@@ -51,12 +51,20 @@ func (s *adminUserService) ListUsers(ctx context.Context, limit int, startingAft
 }
 
 func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string) (*dto.UserResponse, error) {
+	role = NormalizeRole(role)
 	if !ValidRole(role) {
-		return nil, apperror.NewBadRequest("role must be one of: user, admin")
+		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
+	}
+	roleDef, err := s.stores.Roles.GetByKey(ctx, role)
+	if err != nil {
+		return nil, apperror.NewInternal("failed to load role")
+	}
+	if err := authorizeGrant(ctx, roleDef.Permissions); err != nil {
+		return nil, err
 	}
 
 	var member *Member
-	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		updated, previousRole, updateErr := changeRole(ctx, tx.Stores, id, role)
 		if updateErr != nil {
 			return updateErr
@@ -73,17 +81,18 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 	return ToUserResponse(member), nil
 }
 
-// changeRole sets the member's role, ends their sessions in this tenant
-// (their tokens carry the old role), and returns the previous role. The
-// final admin is never demoted; that would lock every administrator out.
+// changeRole replaces the member's roles with role, ends their sessions in
+// this tenant (their snapshots carry the old permission set), and returns the
+// previous highest role. The final owner is never demoted; that would leave
+// the tenant without an owner.
 func changeRole(ctx context.Context, st Stores, id int64, role string) (*Member, string, error) {
 	existing, err := getActiveMemberForAdmin(ctx, st.Memberships, id, "user not found")
 	if err != nil {
 		return nil, "", err
 	}
 	previous := existing.Membership.Role
-	if previous == RoleAdmin && role != RoleAdmin {
-		if err := ensureNotLastAdmin(ctx, st.Memberships, "cannot demote the last active admin"); err != nil {
+	if previous == RoleOwner && role != RoleOwner {
+		if err := ensureNotLastOwner(ctx, st.Memberships, "cannot demote the last active owner"); err != nil {
 			return nil, "", err
 		}
 	}
@@ -116,15 +125,15 @@ func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
 
 // banMember suspends the membership (which also revokes the member's API
 // keys in this tenant through credentials_revoked_at) and ends their
-// sessions in this tenant. The last active admin can never be banned.
+// sessions in this tenant. The last active owner can never be banned.
 func banMember(ctx context.Context, st Stores, id int64) error {
 	const notFound = "user not found or already banned"
 	existing, err := getActiveMemberForAdmin(ctx, st.Memberships, id, notFound)
 	if err != nil {
 		return err
 	}
-	if existing.Membership.Role == RoleAdmin {
-		if err := ensureNotLastAdmin(ctx, st.Memberships, "cannot ban the last active admin"); err != nil {
+	if existing.Membership.Role == RoleOwner {
+		if err := ensureNotLastOwner(ctx, st.Memberships, "cannot ban the last active owner"); err != nil {
 			return err
 		}
 	}
@@ -171,23 +180,22 @@ func getActiveMemberForAdmin(ctx context.Context, memberships MembershipReposito
 	return member, nil
 }
 
-// ensureNotLastAdmin returns 409 user.last_admin when removing one admin
+// ensureNotLastOwner returns 409 user.last_admin when removing one owner
 // would leave the request tenant without any. It first takes the per-tenant
-// admin-change lock, so concurrent demote/ban/remove requests run one at a
-// time and the count below sees the previous one's committed result (READ
-// COMMITTED takes a fresh snapshot per statement). Without that lock the
-// protect_last_admin trigger would still keep one admin, but two concurrent
-// requests can deadlock on each other's rows instead of getting a clean 409.
-// The trigger remains the database-level guarantee for other writers.
-func ensureNotLastAdmin(ctx context.Context, memberships MembershipRepository, detail string) error {
-	if err := memberships.LockAdminChanges(ctx); err != nil {
-		return apperror.NewInternal("failed to lock admin changes")
+// owner-change lock (the same advisory key the protect_last_owner trigger
+// uses), so concurrent demote/ban/remove requests run one at a time and the
+// count below sees the previous one's committed result (READ COMMITTED takes
+// a fresh snapshot per statement). The trigger remains the database-level
+// guarantee for other writers.
+func ensureNotLastOwner(ctx context.Context, memberships MembershipRepository, detail string) error {
+	if err := memberships.LockOwnerChanges(ctx); err != nil {
+		return apperror.NewInternal("failed to lock owner changes")
 	}
-	admins, err := memberships.CountActiveAdmins(ctx)
+	owners, err := memberships.CountActiveOwners(ctx)
 	if err != nil {
-		return apperror.NewInternal("failed to count admins")
+		return apperror.NewInternal("failed to count owners")
 	}
-	if admins <= 1 {
+	if owners <= 1 {
 		return apperror.NewCode(apperror.CodeUserLastAdmin, detail)
 	}
 	return nil

@@ -37,7 +37,6 @@ type Membership struct {
 	ID                   int64              `json:"id"`
 	TenantID             int64              `json:"tenant_id"`
 	UserID               int64              `json:"user_id"`
-	Role                 string             `json:"role"`
 	Status               string             `json:"status"`
 	BannedAt             pgtype.Timestamptz `json:"banned_at"`
 	RemovedAt            pgtype.Timestamptz `json:"removed_at"`
@@ -62,6 +61,16 @@ type RefreshToken struct {
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	UsedAt    pgtype.Timestamptz `json:"used_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type Role struct {
+	ID        int64              `json:"id"`
+	TenantID  pgtype.Int8        `json:"tenant_id"`
+	Scope     string             `json:"scope"`
+	Key       string             `json:"key"`
+	Name      string             `json:"name"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Session struct {

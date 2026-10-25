@@ -9,8 +9,8 @@ const (
 
 func init() {
 	if err := Register("authztest",
-		Grant{Permission: testPermissionRead, Roles: []string{RoleUser}},
-		Grant{Permission: testPermissionWrite, Roles: []string{RoleUser}},
+		Grant{Permission: testPermissionRead, Roles: []string{RoleMember}},
+		Grant{Permission: testPermissionWrite, Roles: []string{RoleMember}},
 	); err != nil {
 		panic(err)
 	}

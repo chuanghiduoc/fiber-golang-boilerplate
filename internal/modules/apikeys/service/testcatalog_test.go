@@ -11,7 +11,7 @@ const (
 )
 
 func init() {
-	user := []string{authz.RoleUser}
+	user := []string{authz.RoleMember}
 	if err := authz.Register("files",
 		authz.Grant{Permission: testScopeFilesRead, Roles: user},
 		authz.Grant{Permission: testScopeFilesWrite, Roles: user},

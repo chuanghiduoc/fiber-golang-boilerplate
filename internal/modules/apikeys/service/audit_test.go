@@ -34,7 +34,7 @@ func (r *recordingAudit) RecordTx(ctx context.Context, _ pgx.Tx, event audit.Eve
 
 func auditTestPrincipals() fakePrincipals {
 	return fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 }
 

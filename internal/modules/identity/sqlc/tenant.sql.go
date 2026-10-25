@@ -197,6 +197,50 @@ func (q *Queries) GetTenantSettings(ctx context.Context, tenantID int64) (Tenant
 	return i, err
 }
 
+const listTenantsCursor = `-- name: ListTenantsCursor :many
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+WHERE (created_at, id) < ($1::timestamptz, $2::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT $3::int
+`
+
+type ListTenantsCursorParams struct {
+	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
+	CursorID        int64              `json:"cursor_id"`
+	RowLimit        int32              `json:"row_limit"`
+}
+
+// Platform administration: every tenant, newest first.
+func (q *Queries) ListTenantsCursor(ctx context.Context, arg ListTenantsCursorParams) ([]Tenant, error) {
+	rows, err := q.db.Query(ctx, listTenantsCursor, arg.CursorCreatedAt, arg.CursorID, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Tenant{}
+	for rows.Next() {
+		var i Tenant
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.Status,
+			&i.StatusChangedAt,
+			&i.TrialEndsAt,
+			&i.DeletionScheduledAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const updateTenantStatus = `-- name: UpdateTenantStatus :one
 UPDATE tenants
 SET status = $1,

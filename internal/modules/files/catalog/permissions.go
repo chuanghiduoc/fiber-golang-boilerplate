@@ -14,7 +14,7 @@ const (
 
 // Permissions returns the files grants for app.PermissionProvider.
 func Permissions() []authz.Grant {
-	user := []string{authz.RoleUser}
+	user := []string{authz.RoleMember}
 	return []authz.Grant{
 		{Permission: PermissionFilesRead, Roles: user},
 		{Permission: PermissionFilesWrite, Roles: user},

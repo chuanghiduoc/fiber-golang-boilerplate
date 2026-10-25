@@ -25,9 +25,9 @@ type Member struct {
 }
 
 // MemberOptions tune CreateMember. The zero value creates a verified,
-// passwordless, active "user" member.
+// passwordless, active "member".
 type MemberOptions struct {
-	Role string // "user" (default) or "admin"
+	Role string // system role key: "member" (default), "admin", or "owner"
 	// Password, when set, stores a bcrypt (MinCost) hash in user_passwords.
 	Password   string
 	Unverified bool
@@ -47,8 +47,8 @@ func CreateMember(t testing.TB, ctx context.Context, pool *pgxpool.Pool, tenantI
 
 func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID int64, email string, opts MemberOptions) (Member, error) {
 	role := opts.Role
-	if role == "" {
-		role = "user"
+	if role == "" || role == "user" {
+		role = "member"
 	}
 	email = strings.ToLower(strings.TrimSpace(email))
 	m := Member{TenantID: tenantID, Email: email, Role: role}
@@ -79,9 +79,20 @@ func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID int64, email
 		}
 	}
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO memberships (tenant_id, user_id, role) VALUES ($1, $2, $3)`,
-		tenantID, m.UserID, role); err != nil {
+		`INSERT INTO memberships (tenant_id, user_id) VALUES ($1, $2)`,
+		tenantID, m.UserID); err != nil {
 		return Member{}, fmt.Errorf("create membership: %w", err)
+	}
+	tag, err := pool.Exec(ctx, `
+		INSERT INTO membership_roles (tenant_id, user_id, role_id)
+		SELECT $1, $2, r.id FROM roles r
+		WHERE r.tenant_id IS NULL AND r.scope = 'tenant' AND r.key = $3`,
+		tenantID, m.UserID, role)
+	if err != nil {
+		return Member{}, fmt.Errorf("assign role: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return Member{}, fmt.Errorf("unknown role %q", role)
 	}
 	return m, nil
 }
@@ -102,24 +113,21 @@ func CreateTenant(t testing.TB, ctx context.Context, pool *pgxpool.Pool, slug st
 }
 
 // SessionToken opens a session for m (reading the user's current token
-// version and the membership's current role) and mints an access token for
-// it, the way a real sign-in does. The session validator rejects access
-// tokens without a live session.
+// version) and mints an access token for it, the way a real sign-in does. The
+// session validator rejects access tokens without a live session.
 func SessionToken(t testing.TB, ctx context.Context, pool *pgxpool.Pool, m Member, secret string) string {
 	t.Helper()
 	var (
 		sessionID int64
 		version   int32
-		role      string
 	)
 	err := pool.QueryRow(ctx, `
 		INSERT INTO sessions (tenant_id, user_id, token_version)
 		SELECT m.tenant_id, m.user_id, u.token_version
 		FROM memberships m JOIN users u ON u.id = m.user_id
 		WHERE m.tenant_id = $1 AND m.user_id = $2
-		RETURNING id, token_version,
-			(SELECT role FROM memberships WHERE tenant_id = $1 AND user_id = $2)`,
-		m.TenantID, m.UserID).Scan(&sessionID, &version, &role)
+		RETURNING id, token_version`,
+		m.TenantID, m.UserID).Scan(&sessionID, &version)
 	if err != nil {
 		t.Fatalf("create session for user %d in tenant %d: %v", m.UserID, m.TenantID, err)
 	}
@@ -128,7 +136,6 @@ func SessionToken(t testing.TB, ctx context.Context, pool *pgxpool.Pool, m Membe
 		TenantID:     m.TenantID,
 		SessionID:    sessionID,
 		Email:        m.Email,
-		Role:         role,
 		TokenVersion: version,
 	}, secret, 1)
 	if err != nil {

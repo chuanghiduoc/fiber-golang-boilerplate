@@ -49,8 +49,9 @@ func (s *service) ListUsers(ctx context.Context, limit int, startingAfter string
 }
 
 func (s *service) UpdateRole(ctx context.Context, id int64, role string) (*admindto.UserResponse, error) {
-	if role != admindto.RoleUser && role != admindto.RoleAdmin {
-		return nil, apperror.NewBadRequest("role must be one of: user, admin")
+	role = normalizeRole(role)
+	if role != admindto.RoleMember && role != admindto.RoleAdmin && role != admindto.RoleOwner {
+		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
 	}
 	user, err := s.identity.UpdateRole(ctx, id, role)
 	if err != nil {
@@ -124,12 +125,20 @@ func (s *service) GetStats(ctx context.Context) (*admindto.AdminStatsResponse, e
 	}, nil
 }
 
+func normalizeRole(role string) string {
+	if role == "user" {
+		return admindto.RoleMember
+	}
+	return role
+}
+
 func toUserResponse(user identitycontracts.User) admindto.UserResponse {
 	return admindto.UserResponse{
 		ID:               user.ID,
 		Email:            user.Email,
 		Name:             user.Name,
 		Role:             user.Role,
+		Roles:            user.Roles,
 		MembershipStatus: user.MembershipStatus,
 		EmailVerified:    user.EmailVerified,
 		HasPassword:      user.HasPassword,

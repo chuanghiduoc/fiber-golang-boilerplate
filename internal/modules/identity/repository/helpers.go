@@ -41,9 +41,9 @@ func wrapErr(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch {
-		case pgErr.Code == sqlStateRaiseException && strings.Contains(pgErr.Message, "last active admin"):
-			// protect_last_admin trigger: the database-level last-admin guard.
-			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot remove the last active admin")
+		case pgErr.Code == sqlStateRaiseException && strings.Contains(pgErr.Message, "last owner"):
+			// protect_last_owner trigger: the database-level last-owner guard.
+			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot remove the last active owner")
 		case pgErr.Code == sqlStateDeadlockDetected:
 			// PostgreSQL aborted one side of a lock cycle (for example a
 			// concurrent admin change made outside the service lock). The

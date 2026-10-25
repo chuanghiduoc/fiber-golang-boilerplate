@@ -22,12 +22,12 @@ const (
 	generationTTL = 24 * time.Hour
 )
 
-// Claims are the access-token claims the validator checks.
+// Claims are the access-token claims the validator checks. Tokens minted
+// before tenant-scoped RBAC may still carry a role claim; it is ignored.
 type Claims struct {
 	UserID       int64
 	TenantID     int64
 	SessionID    int64
-	Role         string
 	TokenVersion int32
 }
 
@@ -37,6 +37,8 @@ type State struct {
 	// TenantID is the session's tenant; it must equal the token's claim.
 	TenantID     int64
 	Role         string
+	Permissions  []string
+	Platform     bool
 	TokenVersion int32
 	// Active is true when the session is not revoked, the membership is
 	// active, and the user is active.
@@ -53,20 +55,24 @@ type StateReader interface {
 	SessionState(ctx context.Context, sessionID, userID int64) (State, error)
 }
 
-// Store validates a token against its session. Tokens without a positive
-// tenant or session claim are rejected fail-closed.
+// Store validates a token against its session and returns the current state,
+// including the effective permission set.
 type Store interface {
-	Validate(ctx context.Context, claims Claims) error
+	Validate(ctx context.Context, claims Claims) (State, error)
 	// Invalidate drops every cached snapshot of the user's sessions.
 	Invalidate(ctx context.Context, userID int64) error
+	// InvalidatePermissions drops every cached permission snapshot.
+	InvalidatePermissions(ctx context.Context) error
 }
 
 type snapshot struct {
-	TenantID     int64  `json:"tenantId"`
-	Role         string `json:"role"`
-	TokenVersion int32  `json:"tokenVersion"`
-	Active       bool   `json:"active"`
-	TenantActive bool   `json:"tenantActive"`
+	TenantID     int64    `json:"tenantId"`
+	Role         string   `json:"role"`
+	Permissions  []string `json:"permissions"`
+	Platform     bool     `json:"platform"`
+	TokenVersion int32    `json:"tokenVersion"`
+	Active       bool     `json:"active"`
+	TenantActive bool     `json:"tenantActive"`
 }
 
 type store struct {
@@ -84,19 +90,21 @@ func generationKey(userID int64) string {
 	return fmt.Sprintf("session:generation:%d", userID)
 }
 
-func snapshotKey(userID, generation, sessionID int64) string {
-	return fmt.Sprintf("session:user:%d:%d:%d", userID, generation, sessionID)
+const permissionsGenerationKey = "session:permissions_generation"
+
+func snapshotKey(userID, generation, permissionGeneration, sessionID int64) string {
+	return fmt.Sprintf("session:user:%d:%d:%d:%d", userID, generation, permissionGeneration, sessionID)
 }
 
-// currentGeneration reads a monotonically increasing per-user generation. A
-// snapshot is stored under the generation it was read at, so a slow request
-// that finishes after an invalidation writes to an obsolete key instead of
-// resurrecting a stale role/token version.
-func (s *store) currentGeneration(ctx context.Context, userID int64) int64 {
+// currentGeneration reads a monotonically increasing counter. A snapshot is
+// stored under the generations it was read at, so a slow request that finishes
+// after an invalidation writes to an obsolete key instead of resurrecting a
+// stale role, permission set, or token version.
+func (s *store) currentGeneration(ctx context.Context, key string) int64 {
 	if s.cache == nil {
 		return 0
 	}
-	data, err := s.cache.Get(ctx, generationKey(userID))
+	data, err := s.cache.Get(ctx, key)
 	if err != nil || data == nil {
 		return 0
 	}
@@ -107,21 +115,22 @@ func (s *store) currentGeneration(ctx context.Context, userID int64) int64 {
 	return n
 }
 
-func (s *store) Validate(ctx context.Context, claims Claims) error {
+func (s *store) Validate(ctx context.Context, claims Claims) (State, error) {
 	if claims.TenantID <= 0 {
-		return apperror.NewUnauthorized("token is missing tenant")
+		return State{}, apperror.NewUnauthorized("token is missing tenant")
 	}
 	if claims.SessionID <= 0 {
-		return apperror.NewUnauthorized("token is missing session")
+		return State{}, apperror.NewUnauthorized("token is missing session")
 	}
-	generation := s.currentGeneration(ctx, claims.UserID)
-	key := snapshotKey(claims.UserID, generation, claims.SessionID)
+	generation := s.currentGeneration(ctx, generationKey(claims.UserID))
+	permissionGeneration := s.currentGeneration(ctx, permissionsGenerationKey)
+	key := snapshotKey(claims.UserID, generation, permissionGeneration, claims.SessionID)
 
 	if s.cache != nil {
 		if data, err := s.cache.Get(ctx, key); err == nil && data != nil {
 			var snap snapshot
 			if json.Unmarshal(data, &snap) == nil {
-				return validateSnapshot(snap, claims)
+				return stateOf(snap, claims)
 			}
 		}
 	}
@@ -129,12 +138,12 @@ func (s *store) Validate(ctx context.Context, claims Claims) error {
 	state, err := s.states.SessionState(ctx, claims.SessionID, claims.UserID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return apperror.NewUnauthorized("session is no longer valid")
+			return State{}, apperror.NewUnauthorized("session is no longer valid")
 		}
-		return apperror.NewInternal("failed to validate session")
+		return State{}, apperror.NewInternal("failed to validate session")
 	}
 
-	snap := snapshot(state)
+	snap := toSnapshot(state)
 	if s.cache != nil {
 		if data, err := json.Marshal(snap); err == nil {
 			if err := s.cache.Set(ctx, key, data, cacheTTL); err != nil {
@@ -146,31 +155,41 @@ func (s *store) Validate(ctx context.Context, claims Claims) error {
 		}
 	}
 
-	return validateSnapshot(snap, claims)
+	return stateOf(snap, claims)
 }
 
-func validateSnapshot(snap snapshot, claims Claims) error {
+func toSnapshot(state State) snapshot {
+	return snapshot(state)
+}
+
+func stateOf(snap snapshot, claims Claims) (State, error) {
+	state := State(snap)
 	if !snap.TenantActive {
-		return apperror.NewUnauthorized("tenant is not active")
+		return State{}, apperror.NewUnauthorized("tenant is not active")
 	}
 	if snap.TenantID != claims.TenantID || !snap.Active {
-		return apperror.NewUnauthorized("session is no longer valid")
+		return State{}, apperror.NewUnauthorized("session is no longer valid")
 	}
-	if snap.Role != claims.Role || snap.TokenVersion != claims.TokenVersion {
-		return apperror.NewUnauthorized("session is no longer valid")
+	if snap.TokenVersion != claims.TokenVersion {
+		return State{}, apperror.NewUnauthorized("session is no longer valid")
 	}
-	return nil
+	return state, nil
 }
 
 func (s *store) Invalidate(ctx context.Context, userID int64) error {
+	return s.bump(ctx, generationKey(userID))
+}
+
+func (s *store) InvalidatePermissions(ctx context.Context) error {
+	return s.bump(ctx, permissionsGenerationKey)
+}
+
+func (s *store) bump(ctx context.Context, key string) error {
 	if s.cache == nil {
 		return nil
 	}
-	if _, err := s.cache.Increment(ctx, generationKey(userID), generationTTL); err != nil {
-		slog.Warn("failed to invalidate session cache",
-			slog.Int64("user_id", userID),
-			slog.Any("error", err),
-		)
+	if _, err := s.cache.Increment(ctx, key, generationTTL); err != nil {
+		slog.Warn("failed to invalidate session cache", slog.String("key", key), slog.Any("error", err))
 		return err
 	}
 	return nil

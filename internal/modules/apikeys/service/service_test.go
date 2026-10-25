@@ -153,7 +153,7 @@ func testContext(tenantID int64) context.Context {
 func TestService_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
@@ -176,7 +176,7 @@ func newTestService(repo *fakeRepo, principals identitycontracts.PrincipalReader
 func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
@@ -230,7 +230,7 @@ func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {
 func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
@@ -289,8 +289,8 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 func TestService_TenantIsolation(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
-		20: {ID: 20, TenantID: 2, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+		20: {ID: 20, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 
@@ -335,7 +335,7 @@ func TestService_TenantIsolation(t *testing.T) {
 func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)
@@ -406,7 +406,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	repo := newFakeRepo()
 	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 	svc := newTestService(repo, principals)
 	ctx := testContext(1)

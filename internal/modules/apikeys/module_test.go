@@ -112,7 +112,7 @@ func TestModule_RoutePermissions(t *testing.T) {
 	application := newModuleTestApp(t, svc)
 
 	body := `{"name":"deploy","scopes":["files:read"]}`
-	resp, respBody := request(t, application, http.MethodPost, "/api/v1/admin/api-keys/", authz.RoleUser, body)
+	resp, respBody := request(t, application, http.MethodPost, "/api/v1/admin/api-keys/", authz.RoleMember, body)
 	if resp.StatusCode != fiber.StatusForbidden {
 		t.Fatalf("user create status = %d, want 403 (body=%s)", resp.StatusCode, respBody)
 	}

@@ -17,22 +17,44 @@ var sharedAdminPermissions = []Permission{
 	PermissionAdminStatsRead,
 }
 
-func TestPermissionsForRole_AdminHasAll(t *testing.T) {
-	got := PermissionsForRole(RoleAdmin)
-	all := AllPermissions()
+func TestPermissionsForRole_OwnerAndAdminHaveAllTenantPermissions(t *testing.T) {
+	all := AllTenantPermissions()
+	for _, role := range []string{RoleAdmin, RoleOwner} {
+		got := PermissionsForRole(role)
+		if len(got) != len(all) {
+			t.Fatalf("%s has %d permissions, want %d", role, len(got), len(all))
+		}
+		for _, permission := range all {
+			if _, ok := got[permission]; !ok {
+				t.Errorf("%s missing permission %q", role, permission)
+			}
+		}
+	}
+}
 
+func TestPermissionsForRole_PlatformAdminHasOnlyPlatformPermissions(t *testing.T) {
+	got := PermissionsForRole(RolePlatformAdmin)
+	all := AllPlatformPermissions()
 	if len(got) != len(all) {
-		t.Fatalf("admin has %d permissions, want %d", len(got), len(all))
+		t.Fatalf("platform_admin has %d permissions, want %d", len(got), len(all))
 	}
 	for _, permission := range all {
+		if !IsPlatformPermission(permission) {
+			t.Fatalf("%q is not platform-scoped", permission)
+		}
 		if _, ok := got[permission]; !ok {
-			t.Errorf("admin missing permission %q", permission)
+			t.Errorf("platform_admin missing permission %q", permission)
+		}
+	}
+	for _, permission := range AllTenantPermissions() {
+		if _, ok := got[permission]; ok {
+			t.Errorf("platform_admin unexpectedly has tenant permission %q", permission)
 		}
 	}
 }
 
 func TestSharedCatalogIsAdminOnly(t *testing.T) {
-	user := PermissionsForRole(RoleUser)
+	user := PermissionsForRole(RoleMember)
 	for _, permission := range sharedAdminPermissions {
 		if !IsKnownPermission(permission) {
 			t.Errorf("shared permission %q is not registered", permission)
@@ -47,7 +69,7 @@ func TestSharedCatalogIsAdminOnly(t *testing.T) {
 }
 
 func TestPermissionsForRole_User(t *testing.T) {
-	got := PermissionsForRole(RoleUser)
+	got := PermissionsForRole(RoleMember)
 	for _, permission := range []Permission{testPermissionRead, testPermissionWrite} {
 		if _, ok := got[permission]; !ok {
 			t.Errorf("user missing registered permission %q", permission)
@@ -68,10 +90,10 @@ func TestPermissionsForRole_UnknownRoleIsEmpty(t *testing.T) {
 }
 
 func TestPermissionsForRole_ReturnsCopy(t *testing.T) {
-	got := PermissionsForRole(RoleUser)
+	got := PermissionsForRole(RoleMember)
 	got[PermissionAdminUsersBan] = struct{}{}
 
-	if Has(RoleUser, PermissionAdminUsersBan) {
+	if Has(RoleMember, PermissionAdminUsersBan) {
 		t.Error("mutating the returned map must not alter the role catalog")
 	}
 }
@@ -86,9 +108,9 @@ func TestHas(t *testing.T) {
 		{"admin registered read", RoleAdmin, testPermissionRead, true},
 		{"admin stats read", RoleAdmin, PermissionAdminStatsRead, true},
 		{"admin files delete", RoleAdmin, PermissionAdminFilesDelete, true},
-		{"user registered read", RoleUser, testPermissionRead, true},
-		{"user denied admin users read", RoleUser, PermissionAdminUsersRead, false},
-		{"user denied admin stats", RoleUser, PermissionAdminStatsRead, false},
+		{"user registered read", RoleMember, testPermissionRead, true},
+		{"user denied admin users read", RoleMember, PermissionAdminUsersRead, false},
+		{"user denied admin stats", RoleMember, PermissionAdminStatsRead, false},
 		{"unknown role denied", "guest", testPermissionRead, false},
 		{"empty role denied", "", testPermissionRead, false},
 		{"unknown permission denied", RoleAdmin, Permission("unknown:capability"), false},
@@ -108,14 +130,14 @@ func TestRegisterGrantsAdminImplicitlyAndUserExplicitly(t *testing.T) {
 	const userToo Permission = "registertest:user_too"
 	if err := Register("registertest",
 		Grant{Permission: adminOnly},
-		Grant{Permission: userToo, Roles: []string{RoleUser, RoleAdmin}},
+		Grant{Permission: userToo, Roles: []string{RoleMember, RoleAdmin}},
 	); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if !Has(RoleAdmin, adminOnly) || Has(RoleUser, adminOnly) {
+	if !Has(RoleAdmin, adminOnly) || Has(RoleMember, adminOnly) {
 		t.Errorf("%q must be admin-only", adminOnly)
 	}
-	if !Has(RoleAdmin, userToo) || !Has(RoleUser, userToo) {
+	if !Has(RoleAdmin, userToo) || !Has(RoleMember, userToo) {
 		t.Errorf("%q must be granted to user and admin", userToo)
 	}
 	if owner, ok := OwnerOf(userToo); !ok || owner != "registertest" {
@@ -125,7 +147,7 @@ func TestRegisterGrantsAdminImplicitlyAndUserExplicitly(t *testing.T) {
 	// The identical registration is idempotent (apps built twice in tests).
 	if err := Register("registertest",
 		Grant{Permission: adminOnly},
-		Grant{Permission: userToo, Roles: []string{RoleUser}},
+		Grant{Permission: userToo, Roles: []string{RoleMember}},
 	); err != nil {
 		t.Fatalf("identical re-registration must be a no-op: %v", err)
 	}
@@ -133,7 +155,7 @@ func TestRegisterGrantsAdminImplicitlyAndUserExplicitly(t *testing.T) {
 
 func TestRegisterRejectsConflicts(t *testing.T) {
 	const owned Permission = "conflicttest:read"
-	if err := Register("conflicttest", Grant{Permission: owned, Roles: []string{RoleUser}}); err != nil {
+	if err := Register("conflicttest", Grant{Permission: owned, Roles: []string{RoleMember}}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	before := len(AllPermissions())
@@ -143,7 +165,7 @@ func TestRegisterRejectsConflicts(t *testing.T) {
 		grants []Grant
 		want   string
 	}{
-		"other owner":       {"intruder", []Grant{{Permission: owned, Roles: []string{RoleUser}}}, "already owned"},
+		"other owner":       {"intruder", []Grant{{Permission: owned, Roles: []string{RoleMember}}}, "already owned"},
 		"shared permission": {"intruder", []Grant{{Permission: PermissionAdminUsersRead}}, "already owned"},
 		"changed roles":     {"conflicttest", []Grant{{Permission: owned}}, "re-registered"},
 		"listed twice":      {"conflicttest", []Grant{{Permission: "conflicttest:x"}, {Permission: "conflicttest:x"}}, "twice"},

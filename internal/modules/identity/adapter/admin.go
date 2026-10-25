@@ -71,6 +71,7 @@ func toUser(user dto.UserResponse) identitycontracts.User {
 		Email:            user.Email,
 		Name:             user.Name,
 		Role:             user.Role,
+		Roles:            user.Roles,
 		MembershipStatus: user.MembershipStatus,
 		EmailVerified:    user.EmailVerified,
 		HasPassword:      user.HasPassword,

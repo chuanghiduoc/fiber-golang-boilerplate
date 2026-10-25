@@ -85,7 +85,7 @@ func TestRequire_AllowsGrantedPermission(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	status, _, body := doGet(t, app, "/files", authz.RoleUser)
+	status, _, body := doGet(t, app, "/files", authz.RoleMember)
 	if status != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", status, body)
 	}
@@ -117,7 +117,7 @@ func TestRequire_DeniesUserOnAdminPermission(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	status, contentType, body := doGet(t, app, "/admin/users", authz.RoleUser)
+	status, contentType, body := doGet(t, app, "/admin/users", authz.RoleMember)
 	assertForbidden(t, status, contentType, body)
 	if called {
 		t.Error("protected handler ran despite denied permission")
@@ -156,7 +156,7 @@ func TestRequireAny_AllowsAnyGrantedPermission(t *testing.T) {
 		func(c fiber.Ctx) error { return c.SendString("ok") },
 	)
 
-	status, _, body := doGet(t, app, "/either", authz.RoleUser)
+	status, _, body := doGet(t, app, "/either", authz.RoleMember)
 	if status != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", status, body)
 	}
@@ -173,7 +173,7 @@ func TestRequireAny_DeniesWhenNoPermissionMatches(t *testing.T) {
 		},
 	)
 
-	status, contentType, body := doGet(t, app, "/either", authz.RoleUser)
+	status, contentType, body := doGet(t, app, "/either", authz.RoleMember)
 	assertForbidden(t, status, contentType, body)
 	if called {
 		t.Error("protected handler ran despite no matching permission")

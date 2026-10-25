@@ -73,8 +73,14 @@ func (h *auditTxHarness) adminService() identityservice.AdminUserService {
 // membershipState reads the target's membership in tenantID.
 func (h *auditTxHarness) membershipState(t *testing.T, tenantID, userID int64) (role, status string) {
 	t.Helper()
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT role, status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenantID, userID,
+	require.NoError(t, h.pool.QueryRow(context.Background(), `
+		SELECT COALESCE((
+			SELECT r.key FROM membership_roles mr JOIN roles r ON r.id = mr.role_id
+			WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+			ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+			LIMIT 1
+		), 'member'), m.status
+		FROM memberships m WHERE m.tenant_id = $1 AND m.user_id = $2`, tenantID, userID,
 	).Scan(&role, &status))
 	return role, status
 }
@@ -132,7 +138,7 @@ func TestAuditTx_UpdateRoleRollsBackWhenAuditFails(t *testing.T) {
 	requireAuditUnavailable(t, err)
 
 	role, _ := h.membershipState(t, tenant.DefaultID, targetID)
-	assert.Equal(t, "user", role, "the role update must roll back with the failed audit row")
+	assert.Equal(t, "member", role, "the role update must roll back with the failed audit row")
 }
 
 func TestAuditTx_BanRollsBackWhenAuditFails(t *testing.T) {

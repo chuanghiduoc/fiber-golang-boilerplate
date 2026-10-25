@@ -267,7 +267,7 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 
 // Delete godoc
 // @Summary Delete account or remove member
-// @Description With the caller's own id: delete the caller's global account (every tenant; JWT only, API keys are refused; refused while the caller is the last active admin of any tenant). With another id: remove that user's membership from the request tenant (requires admin:users:delete); the global account and other tenants are untouched.
+// @Description With the caller's own id: delete the caller's global account (every tenant; JWT only, API keys are refused; refused while the caller is the last active owner of any tenant). With another id: remove that user's membership from the request tenant (requires admin:users:delete); the global account and other tenants are untouched.
 // @Tags Users
 // @Security BearerAuth
 // @Param id path int true "User ID"

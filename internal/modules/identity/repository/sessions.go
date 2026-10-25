@@ -145,12 +145,29 @@ func (r *SessionRepository) State(ctx context.Context, sessionID, userID int64) 
 	return &identityservice.SessionState{
 		TenantID:         row.TenantID,
 		Revoked:          row.RevokedAt.Valid,
-		Role:             row.Role,
+		Role:             highestRole(row.RoleKeys),
+		Permissions:      row.PermissionKeys,
+		Platform:         row.Platform,
 		MembershipStatus: identityservice.MembershipStatus(row.MembershipStatus),
 		TokenVersion:     row.TokenVersion,
 		UserStatus:       identityservice.UserStatus(row.UserStatus),
 		TenantStatus:     identityservice.TenantStatus(row.TenantStatus),
 	}, nil
+}
+
+// highestRole maps role keys to the compatibility role field.
+func highestRole(keys []string) string {
+	for _, key := range keys {
+		if key == identityservice.RoleOwner {
+			return identityservice.RoleOwner
+		}
+	}
+	for _, key := range keys {
+		if key == identityservice.RoleAdmin {
+			return identityservice.RoleAdmin
+		}
+	}
+	return identityservice.RoleMember
 }
 
 // RefreshTokenRepository implements service.RefreshTokenRepository.

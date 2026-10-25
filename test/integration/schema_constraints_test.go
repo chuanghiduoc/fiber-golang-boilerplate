@@ -76,10 +76,6 @@ func TestSchemaConstraints(t *testing.T) {
 		requireCheckViolation(t, err, "chk_memberships_removed")
 		_, err = pool.Exec(ctx, insert, 1, userID, "active", nil, now)
 		requireCheckViolation(t, err, "chk_memberships_removed")
-		_, err = pool.Exec(ctx,
-			`INSERT INTO memberships (tenant_id, user_id, role) VALUES (1, $1, 'owner')`, userID)
-		requireCheckViolation(t, err, "memberships_role_check")
-
 		_, err = pool.Exec(ctx, insert, 1, userID, "suspended", now, nil)
 		require.NoError(t, err)
 		_, err = pool.Exec(ctx, insert, 1, userID, "active", nil, nil)
@@ -125,26 +121,56 @@ func TestSchemaConstraints(t *testing.T) {
 		requireFKViolation(t, err, "memberships_user_id_fkey")
 	})
 
-	t.Run("the last active admin of a tenant cannot be demoted, banned, or removed", func(t *testing.T) {
-		tenantC := testutil.CreateTenant(t, ctx, pool, "schema-admins")
-		admin := testutil.CreateMember(t, ctx, pool, tenantC, "schema-admin-c@example.com",
-			testutil.MemberOptions{Role: "admin"}).UserID
-		// An admin of another tenant must not satisfy tenant C's invariant.
-		testutil.CreateMember(t, ctx, pool, tenantB, "schema-admin-b@example.com", testutil.MemberOptions{Role: "admin"})
+	t.Run("the last active owner of a tenant cannot be demoted, banned, or removed", func(t *testing.T) {
+		tenantC := testutil.CreateTenant(t, ctx, pool, "schema-owners")
+		owner := testutil.CreateMember(t, ctx, pool, tenantC, "schema-owner-c@example.com",
+			testutil.MemberOptions{Role: "owner"}).UserID
+		// An owner of another tenant must not satisfy tenant C's invariant.
+		testutil.CreateMember(t, ctx, pool, tenantB, "schema-owner-b@example.com", testutil.MemberOptions{Role: "owner"})
 
 		where := ` WHERE tenant_id = $1 AND user_id = $2`
-		_, err := pool.Exec(ctx, `UPDATE memberships SET role = 'user'`+where, tenantC, admin)
-		requireLastAdminViolation(t, err)
-		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'suspended', banned_at = NOW()`+where, tenantC, admin)
-		requireLastAdminViolation(t, err)
-		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'removed', removed_at = NOW()`+where, tenantC, admin)
-		requireLastAdminViolation(t, err)
-		_, err = pool.Exec(ctx, `DELETE FROM memberships`+where, tenantC, admin)
-		requireLastAdminViolation(t, err)
+		_, err := pool.Exec(ctx, `DELETE FROM membership_roles`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'suspended', banned_at = NOW()`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'removed', removed_at = NOW()`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `DELETE FROM memberships`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
 
-		testutil.CreateMember(t, ctx, pool, tenantC, "schema-admin-c2@example.com", testutil.MemberOptions{Role: "admin"})
-		_, err = pool.Exec(ctx, `UPDATE memberships SET role = 'user'`+where, tenantC, admin)
-		require.NoError(t, err, "a tenant with another active admin may demote one")
+		testutil.CreateMember(t, ctx, pool, tenantC, "schema-owner-c2@example.com", testutil.MemberOptions{Role: "owner"})
+		_, err = pool.Exec(ctx, `DELETE FROM membership_roles`+where, tenantC, owner)
+		require.NoError(t, err, "a tenant with another active owner may remove one")
+	})
+
+	t.Run("membership roles must be tenant-scoped and belong to the membership tenant", func(t *testing.T) {
+		tenantD := testutil.CreateTenant(t, ctx, pool, "schema-roles")
+		tenantRole := schemaInsertID(t, pool,
+			`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'reviewer', 'Reviewer') RETURNING id`,
+			tenantD)
+		member := testutil.CreateMember(t, ctx, pool, tenantB, "schema-role-b@example.com",
+			testutil.MemberOptions{Role: "member"}).UserID
+
+		_, err := pool.Exec(ctx,
+			`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'owner', 'Shadow')`, tenantD)
+		requireCheckViolation(t, err, "chk_roles_tenant_key_system")
+		_, err = pool.Exec(ctx,
+			`INSERT INTO role_permissions (role_id, permission_key) VALUES ($1, 'platform:tenants:read')`, tenantRole)
+		requireTriggerViolation(t, err, "tenant roles cannot hold platform permissions")
+
+		_, err = pool.Exec(ctx, `INSERT INTO membership_roles (tenant_id, user_id, role_id) VALUES ($1, $2, $3)`,
+			tenantB, member, tenantRole)
+		requireTriggerViolation(t, err, "role belongs to another tenant")
+
+		platformRole := schemaInsertID(t, pool,
+			`SELECT id FROM roles WHERE tenant_id IS NULL AND key = 'platform_admin'`)
+		_, err = pool.Exec(ctx, `INSERT INTO membership_roles (tenant_id, user_id, role_id) VALUES ($1, $2, $3)`,
+			tenantB, member, platformRole)
+		requireTriggerViolation(t, err, "membership roles must be tenant-scoped")
+
+		_, err = pool.Exec(ctx, `INSERT INTO platform_role_assignments (user_id, role_id) VALUES ($1, $2)`,
+			member, tenantRole)
+		requireTriggerViolation(t, err, "platform assignments require a platform-scoped role")
 	})
 
 	t.Run("files and notifications maintain updated_at", func(t *testing.T) {
@@ -298,14 +324,19 @@ func TestSchemaConstraints(t *testing.T) {
 	})
 }
 
-// requireLastAdminViolation asserts err is the protect_last_admin trigger's
+// requireLastOwnerViolation asserts err is the protect_last_owner trigger's
 // exception (RAISE EXCEPTION, SQLSTATE P0001).
-func requireLastAdminViolation(t *testing.T, err error) {
+func requireLastOwnerViolation(t *testing.T, err error) {
+	t.Helper()
+	requireTriggerViolation(t, err, "cannot remove the last owner")
+}
+
+func requireTriggerViolation(t *testing.T, err error, message string) {
 	t.Helper()
 	var pgErr *pgconn.PgError
-	require.True(t, errors.As(err, &pgErr), "expected the last-admin trigger error, got %v", err)
+	require.True(t, errors.As(err, &pgErr), "expected the trigger error, got %v", err)
 	assert.Equal(t, "P0001", pgErr.Code, "error: %v", err)
-	assert.Equal(t, "cannot remove the last active admin", pgErr.Message)
+	assert.Equal(t, message, pgErr.Message)
 }
 
 // requireCheckViolation asserts err is a CHECK violation (23514) of constraint.

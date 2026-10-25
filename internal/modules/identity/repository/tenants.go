@@ -6,6 +6,7 @@ import (
 
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
 // uniqueTenantsSlug is PostgreSQL's name for the inline slug UNIQUE.
@@ -65,6 +66,22 @@ func (r *TenantRepository) GetByIDForUpdate(ctx context.Context, id int64) (*ide
 
 // Create inserts the tenant and its settings row. It needs a transaction
 // for the two inserts to be atomic, so callers use it through Transactor.
+func (r *TenantRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]identityservice.Tenant, error) {
+	rows, err := r.q.ListTenantsCursor(ctx, identitysqlc.ListTenantsCursorParams{
+		CursorCreatedAt: cur.CreatedAtParam(),
+		CursorID:        cur.IDParam(),
+		RowLimit:        cur.Limit,
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	tenants := make([]identityservice.Tenant, len(rows))
+	for i := range rows {
+		tenants[i] = *toTenant(rows[i])
+	}
+	return tenants, nil
+}
+
 func (r *TenantRepository) Create(ctx context.Context, t identityservice.NewTenant) (*identityservice.Tenant, error) {
 	row, err := r.q.CreateTenant(ctx, identitysqlc.CreateTenantParams{
 		Slug:        t.Slug,

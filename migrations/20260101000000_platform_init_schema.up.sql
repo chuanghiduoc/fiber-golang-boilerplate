@@ -84,6 +84,10 @@ ON CONFLICT (slug) DO NOTHING;
 
 SELECT setval(pg_get_serial_sequence('tenants', 'id'), (SELECT max(id) FROM tenants));
 
+-- Platform tenant listing (cursor pagination by creation time).
+CREATE INDEX IF NOT EXISTS idx_tenants_created_at_id
+    ON tenants (created_at DESC, id DESC);
+
 DROP TRIGGER IF EXISTS trigger_tenants_updated_at ON tenants;
 CREATE TRIGGER trigger_tenants_updated_at
     BEFORE UPDATE ON tenants
@@ -201,8 +205,7 @@ CREATE TRIGGER trigger_user_identities_updated_at
 -- accepting it creates or reactivates the membership. Rows are never hard
 -- deleted while other modules reference (tenant_id, user_id).
 --
--- role is transitional (P2b-2 replaces it with membership_roles); the id
--- surrogate key is what role assignments will reference.
+-- Roles live in membership_roles (ADR 0003).
 -- credentials_revoked_at is set by a ban or removal and never cleared: API
 -- keys created at or before it stay invalid after the member is restored.
 -- ---------------------------------------------------------------------------
@@ -210,7 +213,6 @@ CREATE TABLE IF NOT EXISTS memberships (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id) ON DELETE RESTRICT,
     user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    role VARCHAR(50) NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
     status VARCHAR(20) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'suspended', 'removed')),
     banned_at TIMESTAMP WITH TIME ZONE,
@@ -235,10 +237,6 @@ CREATE INDEX IF NOT EXISTS idx_memberships_tenant_created_at_user
 CREATE INDEX IF NOT EXISTS idx_memberships_tenant_suspended
     ON memberships (tenant_id, user_id)
     WHERE status = 'suspended';
--- CountActiveAdmins and the last-admin trigger.
-CREATE INDEX IF NOT EXISTS idx_memberships_tenant_active_admins
-    ON memberships (tenant_id, user_id)
-    WHERE role = 'admin' AND status = 'active';
 
 DROP TRIGGER IF EXISTS trigger_memberships_updated_at ON memberships;
 CREATE TRIGGER trigger_memberships_updated_at
@@ -246,42 +244,258 @@ CREATE TRIGGER trigger_memberships_updated_at
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
 
--- A tenant keeps at least one active admin membership, even under concurrent
--- demote/ban/remove requests. Counting and locking are scoped to
--- OLD.tenant_id so one tenant's admins cannot satisfy another's; the other
--- admins are locked in user_id order. Identity services also take a
--- per-tenant advisory lock (LockTenantAdminChanges) before touching an admin
--- membership and return a friendly 409; a deadlock (40P01) or this trigger's
--- exception (P0001) from any other writer is mapped to 409 by the identity
--- repository.
-CREATE OR REPLACE FUNCTION protect_last_admin()
+-- ---------------------------------------------------------------------------
+-- identity: RBAC (ADR 0003)
+--
+-- The permission catalog is code-owned and synchronized into permissions at
+-- API startup. Roles are rows: system roles have tenant_id IS NULL (seeded
+-- here, immutable to tenants); tenant roles belong to one tenant. Membership
+-- roles are tenant-scoped; platform role assignments are the only source of
+-- cross-tenant access.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS permissions (
+    key TEXT PRIMARY KEY
+        CHECK (key ~ '^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)+$'),
+    owner TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+DROP TRIGGER IF EXISTS trigger_permissions_updated_at ON permissions;
+CREATE TRIGGER trigger_permissions_updated_at
+    BEFORE UPDATE ON permissions
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS roles (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id BIGINT REFERENCES tenants(id) ON DELETE RESTRICT,
+    scope VARCHAR(20) NOT NULL CHECK (scope IN ('tenant', 'platform')),
+    key VARCHAR(50) NOT NULL CHECK (key ~ '^[a-z][a-z0-9_]*$'),
+    name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    -- NULLS NOT DISTINCT makes the system roles (tenant_id NULL) unique by key.
+    CONSTRAINT uq_roles_tenant_key UNIQUE NULLS NOT DISTINCT (tenant_id, key),
+    -- A platform role is never owned by a tenant.
+    CONSTRAINT chk_roles_platform_tenant CHECK (scope <> 'platform' OR tenant_id IS NULL),
+    -- A tenant role may not shadow a system role key: assignment by key must
+    -- never resolve to a different role than the caller listed.
+    CONSTRAINT chk_roles_tenant_key_system
+        CHECK (tenant_id IS NULL OR key NOT IN ('owner', 'admin', 'member', 'platform_admin'))
+);
+
+-- System-role listing (small partial index) and tenant role pagination.
+CREATE INDEX IF NOT EXISTS idx_roles_system_created_at_id
+    ON roles (created_at DESC, id DESC)
+    WHERE tenant_id IS NULL;
+CREATE INDEX IF NOT EXISTS idx_roles_tenant_created_at_id
+    ON roles (tenant_id, created_at DESC, id DESC)
+    WHERE tenant_id IS NOT NULL;
+
+INSERT INTO roles (tenant_id, scope, key, name)
+VALUES (NULL, 'tenant', 'owner', 'Owner'),
+       (NULL, 'tenant', 'admin', 'Admin'),
+       (NULL, 'tenant', 'member', 'Member'),
+       (NULL, 'platform', 'platform_admin', 'Platform Admin')
+ON CONFLICT (tenant_id, key) DO NOTHING;
+
+DROP TRIGGER IF EXISTS trigger_roles_updated_at ON roles;
+CREATE TRIGGER trigger_roles_updated_at
+    BEFORE UPDATE ON roles
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id BIGINT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_key TEXT NOT NULL REFERENCES permissions(key) ON DELETE RESTRICT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (role_id, permission_key)
+);
+
+-- Deleting a permission (catalog drift) and the startup sync's prune.
+CREATE INDEX IF NOT EXISTS idx_role_permissions_permission
+    ON role_permissions (permission_key);
+
+-- Tenant roles may only hold tenant-scoped permissions. Every platform
+-- permission uses the reserved `platform:` prefix (authz.Grant.Platform).
+CREATE OR REPLACE FUNCTION validate_role_permission()
 RETURNS TRIGGER AS $$
+DECLARE
+    owner_tenant BIGINT;
 BEGIN
-    IF OLD.role = 'admin'
-       AND OLD.status = 'active'
-       AND (TG_OP = 'DELETE' OR NEW.role <> 'admin' OR NEW.status <> 'active'
-            OR NEW.tenant_id <> OLD.tenant_id) THEN
-        PERFORM 1
-        FROM memberships
-        WHERE tenant_id = OLD.tenant_id
-          AND role = 'admin'
-          AND status = 'active'
-          AND user_id <> OLD.user_id
-        ORDER BY user_id
-        FOR UPDATE;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'cannot remove the last active admin';
+    SELECT tenant_id INTO owner_tenant FROM roles WHERE id = NEW.role_id;
+    IF owner_tenant IS NOT NULL AND NEW.permission_key LIKE 'platform:%' THEN
+        RAISE EXCEPTION 'tenant roles cannot hold platform permissions';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_role_permissions_scope ON role_permissions;
+CREATE TRIGGER trigger_role_permissions_scope
+    BEFORE INSERT OR UPDATE ON role_permissions
+    FOR EACH ROW
+    EXECUTE FUNCTION validate_role_permission();
+
+CREATE TABLE IF NOT EXISTS membership_roles (
+    tenant_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    role_id BIGINT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, user_id, role_id),
+    CONSTRAINT fk_membership_roles_membership FOREIGN KEY (tenant_id, user_id)
+        REFERENCES memberships (tenant_id, user_id) ON DELETE CASCADE
+);
+
+-- Replacing one member's roles (PK) and invalidating everyone holding a role.
+CREATE INDEX IF NOT EXISTS idx_membership_roles_role
+    ON membership_roles (role_id);
+
+CREATE TABLE IF NOT EXISTS platform_role_assignments (
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id BIGINT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_platform_role_assignments_role
+    ON platform_role_assignments (role_id);
+
+-- A membership may only carry a tenant role that is either a system role or
+-- belongs to the membership's own tenant.
+CREATE OR REPLACE FUNCTION validate_membership_role()
+RETURNS TRIGGER AS $$
+DECLARE
+    role_row roles%ROWTYPE;
+BEGIN
+    SELECT * INTO role_row FROM roles WHERE id = NEW.role_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'role does not exist';
+    END IF;
+    IF role_row.scope <> 'tenant' THEN
+        RAISE EXCEPTION 'membership roles must be tenant-scoped';
+    END IF;
+    IF role_row.tenant_id IS NOT NULL AND role_row.tenant_id <> NEW.tenant_id THEN
+        RAISE EXCEPTION 'role belongs to another tenant';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_membership_roles_scope ON membership_roles;
+CREATE TRIGGER trigger_membership_roles_scope
+    BEFORE INSERT OR UPDATE ON membership_roles
+    FOR EACH ROW
+    EXECUTE FUNCTION validate_membership_role();
+
+-- Platform assignments are the only cross-tenant grant; they require a
+-- platform-scoped role.
+CREATE OR REPLACE FUNCTION validate_platform_role()
+RETURNS TRIGGER AS $$
+DECLARE
+    role_row roles%ROWTYPE;
+BEGIN
+    SELECT * INTO role_row FROM roles WHERE id = NEW.role_id;
+    IF NOT FOUND OR role_row.scope <> 'platform' OR role_row.tenant_id IS NOT NULL THEN
+        RAISE EXCEPTION 'platform assignments require a platform-scoped role';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trigger_platform_role_scope ON platform_role_assignments;
+CREATE TRIGGER trigger_platform_role_scope
+    BEFORE INSERT OR UPDATE ON platform_role_assignments
+    FOR EACH ROW
+    EXECUTE FUNCTION validate_platform_role();
+
+-- An operational tenant keeps at least one active member holding the system
+-- owner role. Owner removal is serialized per tenant with an advisory lock so
+-- two concurrent removals cannot each see the other owner and both commit;
+-- identity services take the same lock (LockTenantOwnerChanges) and return a
+-- friendly 409. Non-operational tenants may have no owner.
+CREATE OR REPLACE FUNCTION protect_last_owner()
+RETURNS TRIGGER AS $$
+DECLARE
+    target_tenant BIGINT;
+    owner_role BIGINT;
+    operational BOOLEAN;
+BEGIN
+    target_tenant := OLD.tenant_id;
+    SELECT id INTO owner_role
+    FROM roles WHERE tenant_id IS NULL AND scope = 'tenant' AND key = 'owner';
+
+    IF TG_TABLE_NAME = 'membership_roles' THEN
+        IF TG_OP = 'UPDATE' AND NEW.role_id = OLD.role_id
+           AND NEW.tenant_id = OLD.tenant_id AND NEW.user_id = OLD.user_id THEN
+            RETURN NEW;
         END IF;
+        IF OLD.role_id <> owner_role THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+    ELSE
+        IF OLD.status <> 'active' THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+        IF TG_OP = 'UPDATE' AND NEW.status = 'active' AND NEW.tenant_id = OLD.tenant_id THEN
+            RETURN NEW;
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1 FROM membership_roles
+            WHERE tenant_id = OLD.tenant_id AND user_id = OLD.user_id
+              AND role_id = owner_role
+        ) THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM memberships m
+        JOIN users u ON u.id = m.user_id
+        WHERE m.tenant_id = OLD.tenant_id AND m.user_id = OLD.user_id
+          AND m.status = 'active' AND u.status = 'active'
+    ) THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    SELECT status IN ('trialing', 'active') INTO operational
+    FROM tenants WHERE id = target_tenant;
+    IF NOT COALESCE(operational, FALSE) THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(hashtextextended('identity.last_owner', target_tenant));
+
+    PERFORM 1
+    FROM membership_roles mr
+    JOIN memberships m ON m.tenant_id = mr.tenant_id AND m.user_id = mr.user_id
+    JOIN users u ON u.id = m.user_id
+    WHERE mr.tenant_id = target_tenant
+      AND mr.role_id = owner_role
+      AND mr.user_id <> OLD.user_id
+      AND m.status = 'active'
+      AND u.status = 'active'
+    LIMIT 1
+    FOR UPDATE OF mr;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cannot remove the last owner';
     END IF;
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trigger_protect_last_admin ON memberships;
-CREATE TRIGGER trigger_protect_last_admin
-    BEFORE UPDATE OF role, status, tenant_id OR DELETE ON memberships
+DROP TRIGGER IF EXISTS trigger_protect_last_owner ON membership_roles;
+CREATE TRIGGER trigger_protect_last_owner
+    BEFORE DELETE OR UPDATE ON membership_roles
     FOR EACH ROW
-    EXECUTE FUNCTION protect_last_admin();
+    EXECUTE FUNCTION protect_last_owner();
+
+DROP TRIGGER IF EXISTS trigger_memberships_last_owner ON memberships;
+CREATE TRIGGER trigger_memberships_last_owner
+    BEFORE UPDATE OF status, tenant_id OR DELETE ON memberships
+    FOR EACH ROW
+    EXECUTE FUNCTION protect_last_owner();
 
 -- ---------------------------------------------------------------------------
 -- identity: invitations (hashed single-use token)
@@ -295,7 +509,8 @@ CREATE TABLE IF NOT EXISTS invitations (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id) ON DELETE RESTRICT,
     email_normalized VARCHAR(255) NOT NULL,
-    role VARCHAR(50) NOT NULL DEFAULT 'user' CHECK (role IN ('user', 'admin')),
+    -- A system tenant role key, assigned when the invitation is accepted.
+    role VARCHAR(50) NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'admin', 'member')),
     token_hash VARCHAR(64) NOT NULL UNIQUE,
     invited_by BIGINT NOT NULL,
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
@@ -705,14 +920,18 @@ CREATE TRIGGER trigger_api_keys_updated_at
 -- One row per granted permission. The rows are fully owned by their key
 -- (CASCADE) and carry no tenant_id: the key id is global and the parent row
 -- holds the tenant. permission_key is an authz permission; the CHECK mirrors
--- authz.permissionPattern. Once the RBAC phase adds a permissions catalog
--- table, add FOREIGN KEY (permission_key) REFERENCES permissions (key) here.
+-- authz.permissionPattern and the FK pins it to the synchronized catalog.
 CREATE TABLE IF NOT EXISTS api_key_scopes (
     api_key_id BIGINT NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
     permission_key TEXT NOT NULL
         CHECK (permission_key ~ '^[a-z][a-z0-9_]*(:[a-z][a-z0-9_]*)+$'),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (api_key_id, permission_key)
+    PRIMARY KEY (api_key_id, permission_key),
+    -- The catalog is synchronized at API startup; removing a permission
+    -- cascades to the affected key scopes (fail closed: the key loses it).
+    -- role_permissions keeps RESTRICT (a role must be reviewed explicitly).
+    CONSTRAINT fk_api_key_scopes_permission FOREIGN KEY (permission_key)
+        REFERENCES permissions (key) ON DELETE CASCADE
 );
 
 -- owner: files

@@ -295,7 +295,7 @@ func validActorType(actorType string) bool {
 // admin is actor_type user with actor_role admin.
 func ActorTypeForRole(role string) string {
 	switch strings.ToLower(role) {
-	case "admin", "user":
+	case "owner", "admin", "member", "platform_admin", "user":
 		return ActorTypeUser
 	default:
 		return ActorTypeUnknown

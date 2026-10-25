@@ -76,7 +76,7 @@ func TestListUsers(t *testing.T) {
 	deleted := now.Add(-time.Hour)
 	svc := newTestService(&fakeIdentityAdmin{users: identitycontracts.UserPage{
 		Items: []identitycontracts.User{{
-			ID: 7, Email: "u@example.com", Name: "U", Role: admindto.RoleUser,
+			ID: 7, Email: "u@example.com", Name: "U", Role: admindto.RoleMember,
 			EmailVerified: true, HasPassword: true, CreatedAt: now, UpdatedAt: now, DeletedAt: &deleted,
 		}},
 		HasMore: true,
@@ -107,7 +107,7 @@ func TestUpdateRoleRejectsUnknownRole(t *testing.T) {
 func TestUpdateRoleMapsUser(t *testing.T) {
 	now := time.Now()
 	svc := newTestService(&fakeIdentityAdmin{roleUser: identitycontracts.User{
-		ID: 1, Email: "u@example.com", Name: "U", Role: admindto.RoleUser, CreatedAt: now, UpdatedAt: now,
+		ID: 1, Email: "u@example.com", Name: "U", Role: admindto.RoleMember, CreatedAt: now, UpdatedAt: now,
 	}}, &fakeFilesAdmin{})
 
 	user, err := svc.UpdateRole(context.Background(), 1, admindto.RoleAdmin)

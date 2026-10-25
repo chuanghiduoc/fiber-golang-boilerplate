@@ -9,7 +9,7 @@ const testScopeRead authz.Permission = "apikeytest:read"
 func init() {
 	if err := authz.Register("apikeytest", authz.Grant{
 		Permission: testScopeRead,
-		Roles:      []string{authz.RoleUser},
+		Roles:      []string{authz.RoleMember},
 	}); err != nil {
 		panic(err)
 	}

@@ -53,7 +53,7 @@ Rules the generator enforces:
 - The resource table is `<module>_<plural>` (`--plural` for irregular
   nouns); sqlc's model is the singularized table name.
 
-Generated code is admin-only until you grant roles in `catalog/permissions.go`,
+Generated code is owner/admin-only until you grant roles in `catalog/permissions.go`,
 and commands/queries return `501 <module>.not_implemented` until their
 `Handle` is written, so an unfinished use case never reports success. Do not
 commit a probe module created only to try the generator.
@@ -276,7 +276,7 @@ type InvoiceRepository interface {
 | Service | `authz.Authorize` first (fail closed), input normalization (422), a row from another tenant is `404 billing.invoice_not_found`, a row escaping the tenant filter in a list fails loudly; imports no sqlc, pgx, Fiber, or `dto` |
 | Handler/DTO | `httpx.BindAndValidate`, `httpx.ParamID`, `httpx.CursorQuery`, `pkg/response`, `Location` on create, Swagger annotations |
 | Routes | `rl.Relaxed → authzhttp.Require(read)` for reads; `rl.Normal → authzhttp.Require(write/delete) → deps.Idempotency → audithttp.Guard(ModeRequired)` for writes |
-| Catalog | `billing:invoices:{read,write,delete}` (admin-only), `billing.invoice_not_found` with en/vi titles |
+| Catalog | `billing:invoices:{read,write,delete}` (owner/admin-only), `billing.invoice_not_found` with en/vi titles |
 | Tests | service test over a fake repository (CRUD, validation, tenant isolation, pagination, fail-closed), handler test over a fake service, `invoice_integration_test.go` (`-tags=integration`) running the routes through `app.New` on PostgreSQL: CRUD, cross-tenant id → 404, three succeeded audit rows |
 
 Commands and queries (`make gen command=IssueInvoice module=billing`) get
@@ -373,9 +373,9 @@ const (
 // Admins receive every permission implicitly; grant other roles deliberately.
 func Permissions() []authz.Grant {
 	return []authz.Grant{
-		{Permission: PermissionRead, Roles: []string{authz.RoleUser}},
-		{Permission: PermissionWrite},  // admin-only
-		{Permission: PermissionDelete}, // admin-only
+		{Permission: PermissionRead, Roles: []string{authz.RoleMember}},
+		{Permission: PermissionWrite},  // owner/admin-only
+		{Permission: PermissionDelete}, // owner/admin-only
 	}
 }
 ```

@@ -158,7 +158,7 @@ flowchart TD
 | 403 | Authenticated but not permitted, or tenant mismatch |
 | 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-admin, idempotency key still in progress |
+| 409 | Conflict, duplicate, last-owner, idempotency key still in progress |
 | 413 | Body or upload too large |
 | 415 | Unsupported media type |
 | 422 | Validation failed, or `Idempotency-Key` reused with a different body (`idempotency.key_mismatch`) |
@@ -195,15 +195,15 @@ flowchart TD
     kstate -->|no| r401a
     kstate -->|yes| owner{"owner membership active, tenant active,<br/>key newer than ban?"}
     owner -->|no| r401a
-    owner -->|yes| ksub["subject = key scopes intersected<br/>with owner's current role<br/>auth_method=api_key"]
+    owner -->|yes| ksub["subject = key scopes intersected<br/>with owner's effective permissions<br/>auth_method=api_key"]
     jwt -->|no| r401b["401"]
     jwt -->|yes| claim{"tenant_id and sid claims > 0?"}
     claim -->|no| r401b
     claim -->|yes| jhdr{"explicit X-Tenant-Slug<br/>matches claim?"}
     jhdr -->|no| r403
-    jhdr -->|yes| sess{"session store: session live, membership<br/>and user active, tenant operational,<br/>role and token_version current?"}
+    jhdr -->|yes| sess{"session store: session live, membership<br/>and user active, tenant operational,<br/>token_version current?"}
     sess -->|no| r401b
-    sess -->|yes| jsub["subject from role catalog<br/>auth_method=jwt"]
+    sess -->|yes| jsub["subject = session's effective<br/>permission snapshot<br/>auth_method=jwt"]
     ksub --> authz{"authzhttp.Require(permission)"}
     jsub --> authz
     authz -->|missing| d403["403 permission.denied"]
@@ -212,10 +212,10 @@ flowchart TD
 
 | Aspect | JWT (`Authorization: Bearer <jwt>`) | API key (`Authorization: ApiKey <prefix>_<secret>`) |
 |---|---|---|
-| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries the user id, `tenant_id`, `sid` (session id), `token_version`, and the transitional membership `role`; the `kid` header selects the verification key (`JWT_SECRET` or a `JWT_PREVIOUS_SECRETS` entry), an unknown `kid` is `401`, and a token without `kid` verifies against the active secret only | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
+| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries the user id, `tenant_id`, `sid` (session id), and `token_version`. It does **not** carry a role; a legacy `role` claim still verifies and is ignored. The `kid` header selects the verification key (`JWT_SECRET` or a `JWT_PREVIOUS_SECRETS` entry), an unknown `kid` is `401`, and a token without `kid` verifies against the active secret only | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
 | Tenant | `tenant_id` claim is authoritative; a missing/zero/negative `tenant_id` or `sid` claim is `401` (tokens minted before sessions existed must log in again) | Key's bound tenant is authoritative |
-| Revocation | Session store loads the token's session and requires it unrevoked, the membership and user active, the tenant operational, and the role and token version to match (5s snapshot per session, generation-keyed per-user invalidation); revoking a session, a membership change, or `POST /auth/logout-all` (version bump) apply on the next request | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban or removal revokes keys issued before it |
-| Permissions | Derived from the role catalog | Explicit scopes intersected with the owner's **current** role, so a key never exceeds its scopes or survives a demotion |
+| Revocation | Session store loads the token's session and requires it unrevoked, the membership and user active, the tenant operational, and the token version to match (5s snapshot per session, generation-keyed per-user invalidation plus a global permission generation); revoking a session, a membership/role change, a role-permission change, or `POST /auth/logout-all` (version bump) apply on the next request | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban or removal revokes keys issued before it |
+| Permissions | The session snapshot's effective set: union of the membership's roles and the user's platform role assignments (5s cache, invalidated on role/assignment changes) | Explicit scopes intersected with the owner's **current** effective permissions, so a key never exceeds its scopes or survives a demotion |
 | Locals set | `user_id`, `tenant_id`, `auth_method=jwt` | `user_id`, `tenant_id`, `api_key_id`, `auth_method=api_key` |
 
 - Each sign-in opens a session (the RFC 9700 refresh-token family). Refresh
@@ -224,9 +224,9 @@ flowchart TD
   session is revoked (`refresh_reuse`) and the call returns `401
   auth.refresh_invalid`, so both the legitimate client and an attacker must
   sign in again. Access tokens are short-lived.
-- `POST /auth/logout-all` requires `sessions:revoke` (every built-in role holds
-  it), revokes every session of the user in every tenant, and bumps the token
-  version, invalidating access tokens immediately.
+- `POST /auth/logout-all` requires `sessions:revoke` (the `member` role and
+  therefore every role holds it), revokes every session of the user in every
+  tenant, and bumps the token version, invalidating access tokens immediately.
 - Permissions are declared in module catalogs (`catalog/permissions.go`) and
   shared back-office permissions in `internal/platform/authz/permissions.go`;
   routes use `authzhttp.Require`. Never check role strings ad hoc in handlers.
@@ -244,13 +244,13 @@ flowchart TD
 | Selection | `X-Tenant-Slug` (lowercase `[a-z0-9-]{1,63}`) on `/api/v1` routes. Without it, local/test mode resolves `TENANT_DEFAULT_SLUG` (`default`); `TENANT_REQUIRE_HEADER=true` rejects header-less requests and is **required in production**. |
 | Unknown tenant | Invalid, unknown, or suspended slugs (including the default) return `404 tenant not found`. Startup checks only existence, so a suspended default tenant does not crash the API or seed. |
 | Browser fallback | Validated `?tenant=<slug>` is accepted on `GET /auth/google` and the reset/verify endpoints; an explicit header wins. Reset, verification, and invitation links include `?tenant=<slug>` so the frontend knows where to sign in. |
-| Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership and tenant status are re-read on every authentication, so bans, removals, deletions, role changes, and suspensions apply immediately (`401`). |
+| Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership, effective permissions, and tenant status are re-read on every authentication, so bans, removals, deletions, role/permission changes, and suspensions apply immediately (`401`/`403`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
 | Scoping | Users are global (ADR 0004): an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
 | OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
 | Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
-| Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `membershipStatus`, `joinedAt`, `bannedAt`). |
+| Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `roles`, `membershipStatus`, `joinedAt`, `bannedAt`). `role` is the highest system role key (`owner` > `admin` > `member`); `roles` lists every assigned role key. |
 | Remaining | Row-level security and per-tenant limits/quotas. |
 
 ## Users, memberships, sessions, and invitations
@@ -260,7 +260,7 @@ Users are global identities; a user joins tenants through memberships
 
 | Flow | Behavior |
 |---|---|
-| Register `POST /auth/register` | Creates user + password + active `user` membership in the request tenant (gated by the `user_registration` flag). An address that already has an account in **any** tenant gets `409 user.email_taken`; an existing user joins another tenant only through an invitation. An address banned in this tenant is refused even after the banned account was deleted. |
+| Register `POST /auth/register` | Creates user + password + active `member` membership in the request tenant (gated by the `user_registration` flag). An address that already has an account in **any** tenant gets `409 user.email_taken`; an existing user joins another tenant only through an invitation. An address banned in this tenant is refused even after the banned account was deleted. |
 | Login `POST /auth/login` | Global password plus an active membership in the request tenant; a correct password without one (never joined, banned, removed) gets the same `401 auth.invalid_credentials` as a wrong password. Opens a session; the JWT carries `sid`. |
 | Google OAuth | Resolves the identity through `user_identities`: an existing link, a verified local account with the same address (linking requires both a verified local email and Google `verified_email`), or a new account with a membership in the state tenant (`user_registration` flag). An existing user must already be an active member of the state tenant; Google sign-in never joins a tenant implicitly. |
 | Password reset / email verification | Per user. The emailed link keeps `?tenant=<slug>` only so the frontend knows where to sign in afterwards. |
@@ -268,8 +268,8 @@ Users are global identities; a user joins tenants through memberships
 | `DELETE /auth/sessions/:id` | JWT only, `sessions:revoke`, Tier 2 audited (`auth.session_revoked`). Revokes one of the caller's sessions in the request tenant (`204`); its refresh tokens stop working and its access tokens are rejected. Another user's session is `404`. |
 | `POST /auth/logout-all` | Revokes every session in every tenant and bumps `token_version`. |
 | `PUT /users/:id` | Own id only (the global profile is editable only by its owner); another id is `403 permission.denied`, even for a tenant admin. |
-| `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active admin of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
-| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. |
+| `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active owner of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
+| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
 | Member lists | `GET /users`, `GET /admin/users` paginate members by `(joinedAt, id)`; `UserResponse` adds `membershipStatus` and `joinedAt`. |
 
 Invitations (pending invites are `invitations` rows; there is no "invited"
@@ -277,7 +277,7 @@ membership state):
 
 | Route | Auth | Behavior |
 |---|---|---|
-| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `user`) and emails a link; the token is never returned. Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
+| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `member`; `user` is accepted as an alias) and emails a link; the token is never returned. Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
 | `GET /invitations` | `invitations:read` (admin only) | Cursor list of the tenant's pending invitations, newest first. |
 | `DELETE /invitations/:id` | `invitations:write` | Deletes a pending invitation (`204`); its link stops working. Tier 1 (`invitation.revoked`). |
 | `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
@@ -285,6 +285,39 @@ membership state):
 
 Unknown, expired, already accepted, or misaddressed invitation tokens are
 `400 invitation.invalid`.
+
+## Roles and platform administration
+
+Tenant roles are rows (ADR 0003); the permission catalog stays in code and is
+synchronized into `permissions` at API startup. System roles (`owner`,
+`admin`, `member`) are seeded, immutable, and visible to every tenant.
+
+| Route | Auth | Behavior |
+|---|---|---|
+| `GET /admin/roles` | `admin:roles:read` | Cursor list of system roles plus the request tenant's roles, newest first. Each item has `id`, `key`, `name`, `scope`, `system`, `permissions`, timestamps. |
+| `POST /admin/roles` | `admin:roles:write`, `Idempotency-Key` | Creates a tenant role (`key`, `name`, known tenant `permissions`). A duplicate key is `409`; unknown or platform permissions are `400`. Tier 1 (`admin.role.created`). |
+| `PATCH /admin/roles/:id` | `admin:roles:write`, `Idempotency-Key` | Replaces the supplied `name`/`permissions` of a tenant role; system roles are `400`. Tier 1 (`admin.role.updated`). |
+| `DELETE /admin/roles/:id` | `admin:roles:write`, `Idempotency-Key` | Deletes an unassigned tenant role; system roles are `400`, an assigned role is `409`. Tier 1 (`admin.role.deleted`). |
+| `PUT /admin/users/:id/roles` | `admin:users:role`, `Idempotency-Key` | Replaces every role of a member with the supplied `roles` array (system or same-tenant roles). Refuses to remove the last owner and to change your own roles. Ends the member's sessions. Tier 1 (`admin.user.roles_replaced`); returns the updated `UserResponse`. |
+
+The legacy `PUT /admin/users/:id/role` with one `role` string still works and
+maps to replacing the member's roles with that system role. `user` is accepted
+as an alias for `member` in request bodies.
+
+Platform administration is the only cross-tenant surface. It requires a
+`platform_admin` role assignment (not a tenant role) and the `platform:*`
+permissions; a tenant admin without the assignment gets `403`.
+
+| Route | Auth | Behavior |
+|---|---|---|
+| `GET /platform/tenants` | `platform:tenants:read` | Cursor list of every tenant in any lifecycle state, newest first (`limit`, `startingAfter`). |
+| `POST /platform/tenants` | `platform:tenants:write`, `Idempotency-Key` | Creates a tenant (default status `active`, or `trialing` with a future `trialEndsAt`) and its settings, and makes the caller its first `owner`. A duplicate slug is `409`. Tier 1 (`tenant.created`). |
+| `GET /platform/tenants/:id` | `platform:tenants:read` | Any tenant by id in any state. |
+| `PATCH /platform/tenants/:id/status` | `platform:tenants:write`, `Idempotency-Key` | Moves a tenant along the lifecycle state machine; an invalid transition is `409`, and the default tenant cannot be deleted. Tier 1 (`tenant.status_changed`). |
+
+Global feature-flag rows (database default, kill switch, delete) require
+`platform:features:write` in addition to the tenant feature permissions; tenant
+targets remain `admin:features:write`.
 
 ## Headers
 
@@ -442,8 +475,8 @@ successful no-op; admin send returns `notification: null`,
 |---|---|
 | `GET /admin/features/flags` | Catalog with database default, kill switch, configured marker, and the caller's effective value/source |
 | `GET /admin/features/flags/{key}` | Flag plus current-tenant targets; unknown key `404` |
-| `PUT /admin/features/flags/{key}` | Replaces database default, kill switch, description. `killSwitch` required; omitting `enabled` clears the default (NULL) |
-| `DELETE /admin/features/flags/{key}` | Removes the row (reverts to environment/compiled defaults); idempotent; `409` while any tenant has a target |
+| `PUT /admin/features/flags/{key}` | Replaces database default, kill switch, description. `killSwitch` required; omitting `enabled` clears the default (NULL). Requires `platform:features:write` |
+| `DELETE /admin/features/flags/{key}` | Removes the row (reverts to environment/compiled defaults); idempotent; `409` while any tenant has a target. Requires `platform:features:write` |
 | `GET`/`PUT /admin/features/flags/{key}/targets` | List/upsert targets; omit `userId` for tenant-wide; tenant always from the request context; another tenant's user is `400` |
 | `DELETE .../targets/{id}` | Scoped to tenant and flag |
 

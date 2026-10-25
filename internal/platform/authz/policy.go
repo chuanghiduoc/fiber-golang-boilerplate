@@ -94,6 +94,13 @@ func (p PolicySet) Evaluate(subject Subject, resource Resource) Decision {
 	return decision
 }
 
+// AllowPolicy allows every resource. Use it when the permission check alone
+// is the decision (for example a process-wide platform capability).
+type AllowPolicy struct{}
+
+// Evaluate implements Policy.
+func (AllowPolicy) Evaluate(Subject, Resource) Decision { return Allow }
+
 // TenantPolicy allows access only within the subject's tenant. A
 // platform-level subject with CrossTenant set may pass. A mismatch is concealed
 // (404) so cross-tenant resource ids do not reveal existence.

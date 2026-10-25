@@ -13,12 +13,14 @@ const (
 // Subject is the authenticated caller as seen by authorization decisions.
 //
 // Permissions is an explicit permission set. A nil map means "derive from
-// Role" (normal JWT sessions). A non-nil map is authoritative and may be empty,
-// which grants no permissions. API keys use a non-nil map populated from their
-// scopes, so a key can never exceed the scopes recorded at creation time.
+// Role" (tests and minimal deployments without a session store). A non-nil map
+// is authoritative and may be empty, which grants no permissions. JWT
+// sessions carry the effective set loaded by the session store; API keys carry
+// their scopes intersected with the owner's effective permissions.
 //
-// CrossTenant allows a platform-level caller to pass TenantPolicy. It defaults
-// to false and is never set from JWT or API-key middleware.
+// CrossTenant allows a platform-level caller to pass TenantPolicy. It is set
+// for a subject holding a platform role assignment and never for a plain
+// tenant member.
 type Subject struct {
 	UserID      int64
 	TenantID    int64

@@ -35,7 +35,9 @@ definitions:
       role:
         enum:
         - user
+        - member
         - admin
+        - owner
         type: string
     required:
     - role
@@ -68,6 +70,10 @@ definitions:
         type: string
       role:
         type: string
+      roles:
+        items:
+          type: string
+        type: array
       updatedAt:
         type: string
     type: object
@@ -283,6 +289,51 @@ definitions:
       slug:
         maxLength: 63
         minLength: 1
+        type: string
+    required:
+    - name
+    - slug
+    type: object
+  dto.CreateRoleRequest:
+    properties:
+      key:
+        maxLength: 50
+        minLength: 2
+        type: string
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    required:
+    - key
+    - name
+    type: object
+  dto.CreateTenantRequest:
+    properties:
+      locale:
+        maxLength: 35
+        type: string
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      slug:
+        maxLength: 63
+        minLength: 2
+        type: string
+      status:
+        enum:
+        - trialing
+        - active
+        type: string
+      timezone:
+        maxLength: 64
+        type: string
+      trialEndsAt:
         type: string
     required:
     - name
@@ -548,7 +599,9 @@ definitions:
       role:
         enum:
         - user
+        - member
         - admin
+        - owner
         type: string
     required:
     - email
@@ -642,6 +695,16 @@ definitions:
     - name
     - password
     type: object
+  dto.ReplaceMemberRolesRequest:
+    properties:
+      roles:
+        items:
+          type: string
+        maxItems: 20
+        type: array
+    required:
+    - roles
+    type: object
   dto.ResendVerificationRequest:
     properties:
       email:
@@ -660,6 +723,30 @@ definitions:
     required:
     - password
     - token
+    type: object
+  dto.RoleResponse:
+    properties:
+      createdAt:
+        type: string
+      id:
+        type: integer
+      key:
+        type: string
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+      scope:
+        enum:
+        - tenant
+        - platform
+        type: string
+      system:
+        type: boolean
+      updatedAt:
+        type: string
     type: object
   dto.SendNotificationRequest:
     properties:
@@ -703,6 +790,33 @@ definitions:
       lastUsedAt:
         type: string
       userAgent:
+        type: string
+    type: object
+  dto.TenantResponse:
+    properties:
+      createdAt:
+        type: string
+      deletionScheduledAt:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      slug:
+        type: string
+      status:
+        enum:
+        - trialing
+        - active
+        - suspended
+        - pending_deletion
+        - deleted
+        type: string
+      statusChangedAt:
+        type: string
+      trialEndsAt:
+        type: string
+      updatedAt:
         type: string
     type: object
   dto.UnreadCountResponse:
@@ -776,6 +890,30 @@ definitions:
     - enabled
     - type
     type: object
+  dto.UpdateRoleDefinitionRequest:
+    properties:
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  dto.UpdateTenantStatusRequest:
+    properties:
+      status:
+        enum:
+        - trialing
+        - active
+        - suspended
+        - pending_deletion
+        - deleted
+        type: string
+    required:
+    - status
+    type: object
   dto.UpdateUserRequest:
     properties:
       currentPassword:
@@ -818,10 +956,13 @@ definitions:
       name:
         type: string
       role:
-        description: |-
-          Role is the membership role in TenantID (transitional; P2b-2 replaces
-          it with membership roles).
+        description: Role is the highest system role key (owner, admin, or member).
         type: string
+      roles:
+        description: Roles lists every role assigned in TenantID.
+        items:
+          type: string
+        type: array
       tenantId:
         description: TenantID is the tenant this view (membership) belongs to.
         type: integer
@@ -1645,6 +1786,166 @@ paths:
       summary: Restore a tenant file (admin)
       tags:
       - Admin
+  /admin/roles:
+    get:
+      description: System roles plus the request tenant's roles, newest first
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.RoleResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List roles
+      tags:
+      - Roles
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant role with known tenant permissions
+      parameters:
+      - description: Role
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.RoleResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create a tenant role
+      tags:
+      - Roles
+  /admin/roles/{id}:
+    delete:
+      description: Delete an unassigned tenant role
+      parameters:
+      - description: Role ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete a tenant role
+      tags:
+      - Roles
+    patch:
+      consumes:
+      - application/json
+      description: Change a tenant role's name and/or permission set
+      parameters:
+      - description: Role ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Role update
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateRoleDefinitionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.RoleResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a tenant role
+      tags:
+      - Roles
   /admin/stats:
     get:
       description: 'Get statistics for the caller''s tenant only (admin only): activeUsers
@@ -1801,6 +2102,56 @@ paths:
       summary: Update user role
       tags:
       - Admin
+  /admin/users/{id}/roles:
+    put:
+      consumes:
+      - application/json
+      description: Replace every role of a member in the request tenant; the member's
+        sessions end
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Roles
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.ReplaceMemberRolesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.UserResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Replace a member's roles
+      tags:
+      - Roles
   /admin/users/{id}/unban:
     post:
       description: Lift a member's ban in the caller's tenant (API keys issued before
@@ -3022,6 +3373,167 @@ paths:
       summary: Get unread notification count
       tags:
       - Notifications
+  /platform/tenants:
+    get:
+      description: Every tenant in any lifecycle state, newest first (platform permission)
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.TenantResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List tenants (platform)
+      tags:
+      - Platform
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant and its settings row (platform permission)
+      parameters:
+      - description: Tenant
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateTenantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create a tenant (platform)
+      tags:
+      - Platform
+  /platform/tenants/{id}:
+    get:
+      description: Get any tenant by ID in any lifecycle state (platform permission)
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a tenant (platform)
+      tags:
+      - Platform
+  /platform/tenants/{id}/status:
+    patch:
+      consumes:
+      - application/json
+      description: Move a tenant through its lifecycle state machine (platform permission)
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Status
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateTenantStatusRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a tenant's status (platform)
+      tags:
+      - Platform
   /users:
     get:
       description: Get a paginated list of users
@@ -3070,7 +3582,7 @@ paths:
     delete:
       description: 'With the caller''s own id: delete the caller''s global account
         (every tenant; JWT only, API keys are refused; refused while the caller is
-        the last active admin of any tenant). With another id: remove that user''s
+        the last active owner of any tenant). With another id: remove that user''s
         membership from the request tenant (requires admin:users:delete); the global
         account and other tenants are untouched.'
       parameters:

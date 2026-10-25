@@ -1,7 +1,7 @@
 // Package service owns feature-flag administration rules. Evaluation
 // precedence and caching live in internal/platform/features; this service
-// validates compile-time keys, restricts process-wide flag writes to the
-// platform tenant, scopes targets to the request tenant, and invalidates the
+// validates compile-time keys, restricts process-wide flag writes to a
+// platform role, scopes targets to the request tenant, and invalidates the
 // local snapshot after a successful write.
 package service
 
@@ -17,8 +17,8 @@ import (
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -124,7 +124,7 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	if err != nil {
 		return nil, err
 	}
-	if err := requirePlatformTenant(ctx); err != nil {
+	if err := requirePlatformAdmin(ctx); err != nil {
 		return nil, err
 	}
 	if req.KillSwitch == nil {
@@ -177,7 +177,7 @@ func (s *service) DeleteFlag(ctx context.Context, key string) error {
 	if _, err := lookup(key); err != nil {
 		return err
 	}
-	if err := requirePlatformTenant(ctx); err != nil {
+	if err := requirePlatformAdmin(ctx); err != nil {
 		return err
 	}
 	// Targets reference the flag with ON DELETE RESTRICT; the repository maps
@@ -252,16 +252,11 @@ func (s *service) DeleteTarget(ctx context.Context, key string, id int64) error 
 	return nil
 }
 
-// requirePlatformTenant restricts process-wide flag rows (database default,
-// kill switch, delete) to administrators of the compatibility tenant: those
-// writes change behavior for every tenant. The strict context lookup (no
-// EffectiveID fallback) fails closed when the tenant was never resolved.
-func requirePlatformTenant(ctx context.Context) error {
-	if tenant.IDFromContext(ctx) != tenant.DefaultID {
-		return apperror.NewCode(apperror.CodePermissionDenied,
-			"global feature flag changes require a platform tenant administrator")
-	}
-	return nil
+// requirePlatformAdmin restricts process-wide flag rows (database default,
+// kill switch, delete) to a platform role assignment: those writes change
+// behavior for every tenant.
+func requirePlatformAdmin(ctx context.Context) error {
+	return authz.Authorize(ctx, authz.PermissionPlatformFeaturesWrite, authz.Resource{}, authz.AllowPolicy{})
 }
 
 func (s *service) getRow(ctx context.Context, key string) (*featuressqlc.FeatureFlag, bool, error) {
