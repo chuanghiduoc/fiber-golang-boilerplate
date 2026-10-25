@@ -129,6 +129,11 @@ func TestSeaweedFSStorageRoundTrip(t *testing.T) {
 			if _, err := store.Get(ctx, key); !errors.Is(err, storage.ErrNotFound) {
 				t.Fatalf("Get after Delete error = %v, want storage.ErrNotFound", err)
 			}
+			// Deleting a missing object succeeds: the files trash purge
+			// relies on it when a retry finds the blob already gone.
+			if err := store.Delete(ctx, key); err != nil {
+				t.Fatalf("Delete of a missing object: %v", err)
+			}
 		})
 	}
 }

@@ -8,14 +8,21 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
+	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 )
 
 // Module owns the authenticated notification and preference routes.
 type Module struct {
-	handler *notificationshandler.Handler
+	handler         *notificationshandler.Handler
+	retentionPurger *notificationsservice.RetentionPurger
 }
+
+var (
+	_ app.JobProvider      = (*Module)(nil)
+	_ app.ScheduleProvider = (*Module)(nil)
+)
 
 func New(handler *notificationshandler.Handler) *Module {
 	return &Module{handler: handler}

@@ -719,6 +719,7 @@ See [.env.example](.env.example) for every option and default. Key settings:
 | `SCHEDULER_LEASE_TTL_SECS` / `SCHEDULER_HEARTBEAT_SECS` / `SCHEDULER_POLL_SECS` | Leader lease, renewal, and evaluation timings (defaults 30/10/15) |
 | `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
 | `SCHEDULER_RETENTION_DAYS` | `scheduler_runs` retention (default 30) |
+| `FILES_TRASH_RETENTION_DAYS` / `NOTIFICATIONS_RETENTION_DAYS` | Days a soft-deleted file stays restorable before its blob and row are purged (default 30), and days a read notification is kept after being read (default 180; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
 | `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
 | `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
 | `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |

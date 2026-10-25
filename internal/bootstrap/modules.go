@@ -72,8 +72,9 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	// transactions; webhooks subscribes to them (app.EventProvider), so no
 	// producer is wired to the webhooks module.
 	filesModule, filesProvides := files.Build(infra, files.Settings{
-		MaxFileSize:  cfg.Storage.MaxFileSize,
-		AllowedTypes: cfg.Storage.AllowedTypes(),
+		MaxFileSize:        cfg.Storage.MaxFileSize,
+		AllowedTypes:       cfg.Storage.AllowedTypes(),
+		TrashRetentionDays: cfg.Retention.FilesTrashRetentionDays(),
 	})
 
 	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
@@ -90,7 +91,9 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 			features.Build(infra),
 			webhooksModule,
 			apikeysModule,
-			notifications.Build(infra, identityProvides.Recipients),
+			notifications.Build(infra, identityProvides.Recipients, notifications.Settings{
+				RetentionDays: cfg.Retention.NotificationsRetentionDays(),
+			}),
 			// gen:module-list
 		},
 		Sessions:       identityProvides.Sessions,

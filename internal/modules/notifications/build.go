@@ -1,6 +1,8 @@
 package notifications
 
 import (
+	"fmt"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
@@ -8,17 +10,65 @@ import (
 	notificationsrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 )
+
+// Settings are the configuration notifications owns.
+type Settings struct {
+	// RetentionDays is how long a read notification is kept after it was
+	// read (NOTIFICATIONS_RETENTION_DAYS). Zero disables the purge (tests);
+	// config validates 1..3650.
+	RetentionDays int32
+}
+
+// The repository cannot assert this itself (import cycle with the legacy
+// service), so the composition point does.
+var _ notificationsservice.RetentionRepository = (*notificationsrepo.RetentionRepository)(nil)
 
 // Build constructs the notification feed, preferences, and email channel.
 // Identity supplies the email recipient through the contract, and the queued
 // sender writes the email job into the shared outbox in the same transaction
 // as the in-app row.
-func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup) *Module {
+func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup, settings Settings) *Module {
 	repo := notificationsrepo.NewNotificationRepository(infra.Pool)
 	svc := notificationsservice.NewNotificationService(repo, recipients, infra.Email, infra.Tx)
-	return New(notificationshandler.New(svc))
+	m := New(notificationshandler.New(svc))
+	if settings.RetentionDays > 0 {
+		m.retentionPurger = notificationsservice.NewRetentionPurger(
+			notificationsrepo.NewRetentionRepository(infra.Pool), settings.RetentionDays)
+	}
+	return m
 }
 
 // Permissions implements app.PermissionProvider.
 func (m *Module) Permissions() []authz.Grant { return notificationscatalog.Permissions() }
+
+// RegisterJobs implements app.JobProvider: the worker runs the read
+// notification purge (under authz.SystemContext, via the app's system
+// registrar). A module built with New (tests) registers nothing.
+func (m *Module) RegisterJobs(registrar jobs.Registrar) {
+	if m.retentionPurger != nil {
+		registrar.Register(notificationsservice.RetentionPurgeJobKind, m.retentionPurger.HandleJob)
+	}
+}
+
+// retentionPurgeSchedule enqueues the read-notification purge. The scheduler
+// is optional (SCHEDULER_ENABLED, default false); without it notifications
+// are kept indefinitely.
+var retentionPurgeSchedule = scheduler.Spec{
+	Name:     "notifications.retention.purge",
+	Interval: notificationsservice.RetentionPurgeInterval,
+	Kind:     notificationsservice.RetentionPurgeJobKind,
+}
+
+// RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
+// so a registration error is a programming error and fails startup loudly.
+func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
+	if m.retentionPurger == nil {
+		return
+	}
+	if err := registry.Register(retentionPurgeSchedule); err != nil {
+		panic(fmt.Sprintf("notifications: register %s schedule: %v", retentionPurgeSchedule.Name, err))
+	}
+}

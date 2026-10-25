@@ -417,6 +417,72 @@ another reset email) instead of updating dead rows back to `queued`.
 | Index | `idx_refresh_tokens_expires_at`; the one-row-per-user reset and verification tables are small enough without one. |
 | Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate). |
 
+### Data retention overview
+
+Every purge is idempotent (a redelivered job finds fewer rows), bounded, and a
+deliberate cross-tenant maintenance pass. Module purges are durable jobs
+registered through `JobProvider`/`ScheduleProvider`, so they run under
+`authz.SystemContext` and **only when `SCHEDULER_ENABLED=true`**; the platform
+loops run in every worker process regardless.
+
+| Data | Rule | Trigger | Bounds | Index |
+| --- | --- | --- | --- | --- |
+| `jobs` | `succeeded`/`dead` older than 30 days | Worker loop, hourly | 5s per pass, 1,000-row batches | `idx_jobs_terminal_updated_at` |
+| `scheduler_runs` | Older than `SCHEDULER_RETENTION_DAYS` (30); newest row per schedule kept | Scheduler leader, hourly | See [Scheduler](#scheduler) | — |
+| Identity tokens | Expired | `identity.tokens.purge_expired`, hourly (scheduler) | 1,000-row batches, 1 min per table | `idx_refresh_tokens_expires_at` |
+| Webhook deliveries/events | Terminal, older than `WEBHOOK_RETENTION_DAYS` (30) | Webhooks background loop, hourly | 1,000-row batches, 30s per pass | See [Webhooks](webhooks.md) |
+| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row | `files.trash.purge`, hourly (scheduler) | 100-row locked batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
+| Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
+
+Without the scheduler, trashed files keep their blobs and stay restorable
+indefinitely, and notifications are never deleted. The two retention indexes
+lead with their age column rather than `tenant_id` because the purges scan
+every tenant; they are partial, so live files and unread notifications are not
+indexed. They ship as `CREATE INDEX CONCURRENTLY` migrations
+(`20261025112300_files_trash_purge_index`,
+`20261025112400_notifications_retention_index`).
+
+#### Files trash purge
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as files.trash.purge job
+    participant DB as PostgreSQL (files)
+    participant S as Object storage
+    loop until a short batch, a blob failure, or the 1 min budget
+        W->>DB: BEGIN; SELECT ... WHERE deleted_at < now() - N days<br/>ORDER BY deleted_at LIMIT 100 FOR UPDATE SKIP LOCKED
+        loop each locked row
+            W->>S: Delete(storage_path)
+            alt deleted or already missing
+                S-->>W: ok (row queued for hard delete)
+            else storage error
+                S-->>W: error (row kept, logged)
+            end
+        end
+        W->>DB: DELETE FROM files WHERE id = ANY(ids); COMMIT
+    end
+```
+
+| Rule | Behavior |
+| --- | --- |
+| Order | Blob first, then row. A crash after the blob delete leaves a trashed row with no blob; the next run deletes it (a missing blob counts as deleted). |
+| Restore race | The batch's rows stay locked (`FOR UPDATE`) until the hard delete commits, so a concurrent user/admin restore waits and then gets `404`. |
+| Failures | A blob that cannot be deleted keeps its row, is logged at error level with `file_id`/`tenant_id`, and fails the job after the rest of the batch commits (normal retry/dead-letter path); the next scheduled run tries again. |
+| Events | None. The purge publishes no domain event, so no webhook fires; the user-visible deletion already emitted `file.deleted`. No audit row is written (system retention, like the token purge). |
+
+```sql
+-- Trash waiting for the purge, by tenant
+SELECT tenant_id, count(*), min(deleted_at)
+FROM files
+WHERE deleted_at IS NOT NULL
+GROUP BY tenant_id;
+
+-- Read notifications past retention (should stay near zero)
+SELECT count(*) FROM notifications
+WHERE read_at < now() - interval '180 days';
+```
+
 ### Key rotation
 
 Signing and encryption use separate keys, each with a verify/decrypt-only

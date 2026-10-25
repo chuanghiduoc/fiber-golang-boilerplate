@@ -28,6 +28,8 @@ type Config struct {
 	FeatureFlags FeatureFlagsConfig
 	Scheduler    SchedulerConfig
 	Webhook      WebhookConfig
+	// Retention holds module purge windows (files trash, read notifications).
+	Retention RetentionConfig
 	// DataEncryption seals job payloads at rest.
 	DataEncryption DataEncryptionConfig
 	Jobs           JobsConfig
@@ -107,6 +109,7 @@ func (cfg *Config) Validate() error {
 		// Observability: tracing is inert unless explicitly enabled.
 		cfg.Tracing.Validate,
 		cfg.Scheduler.Validate,
+		cfg.Retention.validate,
 		cfg.Cache.Validate,
 		cfg.Email.validate,
 		cfg.CORS.validate,
