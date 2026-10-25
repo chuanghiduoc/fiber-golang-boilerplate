@@ -45,19 +45,20 @@ func (h *Handler) Create(c fiber.Ctx) error {
 		return err
 	}
 
-	key, err := h.service.Create(c.Context(), httpx.AuthUserID(c), req)
+	key, err := h.service.Create(c.Context(), httpx.AuthUserID(c), toCreateInput(req))
 	if err != nil {
 		return err
 	}
+	resp := toCreatedKeyResponse(key)
 
 	setAuditMetadata(c, map[string]any{
-		"apiKeyId":    key.ID,
-		"apiKeyName":  key.Name,
-		"ownerUserId": key.UserID,
-		"scopes":      key.Scopes,
+		"apiKeyId":    resp.ID,
+		"apiKeyName":  resp.Name,
+		"ownerUserId": resp.UserID,
+		"scopes":      resp.Scopes,
 	})
-	c.Set(fiber.HeaderLocation, "/api/v1/admin/api-keys/"+strconv.FormatInt(key.ID, 10))
-	return response.Created(c, key)
+	c.Set(fiber.HeaderLocation, "/api/v1/admin/api-keys/"+strconv.FormatInt(resp.ID, 10))
+	return response.Created(c, resp)
 }
 
 // List godoc
@@ -83,7 +84,8 @@ func (h *Handler) List(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, keys, hasMore, pagination.NextCursor(keys, func(k apikeydto.APIKeyResponse) (time.Time, int64) { return k.CreatedAt, k.ID }))
+	responses := toAPIKeyResponses(keys)
+	return response.List(c, responses, hasMore, pagination.NextCursor(responses, func(k apikeydto.APIKeyResponse) (time.Time, int64) { return k.CreatedAt, k.ID }))
 }
 
 // Get godoc
@@ -109,7 +111,7 @@ func (h *Handler) Get(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, key)
+	return response.Success(c, toAPIKeyResponse(key))
 }
 
 // Update godoc
@@ -139,16 +141,17 @@ func (h *Handler) Update(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	key, err := h.service.Update(c.Context(), id, req)
+	key, err := h.service.Update(c.Context(), id, toUpdateInput(req))
 	if err != nil {
 		return err
 	}
+	resp := toAPIKeyResponse(key)
 	setAuditMetadata(c, map[string]any{
-		"apiKeyId":   key.ID,
-		"apiKeyName": key.Name,
-		"scopes":     key.Scopes,
+		"apiKeyId":   resp.ID,
+		"apiKeyName": resp.Name,
+		"scopes":     resp.Scopes,
 	})
-	return response.Success(c, key)
+	return response.Success(c, resp)
 }
 
 // Revoke godoc
@@ -217,15 +220,16 @@ func (h *Handler) Rotate(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
+	resp := toRotatedKeyResponse(result)
 	setAuditMetadata(c, map[string]any{
-		"previousKeyId":         result.PreviousKeyID,
-		"previousKeyValidUntil": result.PreviousKeyValidUntil,
-		"apiKeyId":              result.ID,
-		"apiKeyName":            result.Name,
-		"ownerUserId":           result.UserID,
-		"scopes":                result.Scopes,
+		"previousKeyId":         resp.PreviousKeyID,
+		"previousKeyValidUntil": resp.PreviousKeyValidUntil,
+		"apiKeyId":              resp.ID,
+		"apiKeyName":            resp.Name,
+		"ownerUserId":           resp.UserID,
+		"scopes":                resp.Scopes,
 	})
-	return response.Success(c, result)
+	return response.Success(c, resp)
 }
 
 func setAuditMetadata(c fiber.Ctx, metadata map[string]any) {

@@ -25,46 +25,54 @@ const moduleTestSecret = "api-key-module-test-secret"
 
 type fakeService struct {
 	createCalls int
-	created     *apikeydto.KeyWithSecretResponse
+	created     *apikeysvc.CreatedKey
 }
 
 var _ apikeysvc.Service = (*fakeService)(nil)
 
-func (s *fakeService) Create(_ context.Context, callerUserID int64, req apikeydto.CreateRequest) (*apikeydto.KeyWithSecretResponse, error) {
+func (s *fakeService) Create(_ context.Context, callerUserID int64, in apikeysvc.CreateInput) (*apikeysvc.CreatedKey, error) {
 	s.createCalls++
 	if s.created != nil {
 		return s.created, nil
 	}
-	return &apikeydto.KeyWithSecretResponse{
-		APIKeyResponse: apikeydto.APIKeyResponse{
+	return &apikeysvc.CreatedKey{
+		APIKey: apikeysvc.APIKey{
 			ID:        5,
 			UserID:    callerUserID,
-			Name:      req.Name,
+			Name:      in.Name,
 			Prefix:    "fgb",
-			Scopes:    req.Scopes,
+			Scopes:    toPermissions(in.Scopes),
 			CreatedAt: time.Now().UTC(),
 			UpdatedAt: time.Now().UTC(),
 		},
-		Key: "fgb_secret",
+		Secret: "fgb_secret",
 	}, nil
 }
 
-func (s *fakeService) List(context.Context, int, string) ([]apikeydto.APIKeyResponse, bool, error) {
-	return []apikeydto.APIKeyResponse{{ID: 5, Name: "deploy", Scopes: []string{"files:read"}}}, false, nil
+func (s *fakeService) List(context.Context, int, string) ([]apikeysvc.APIKey, bool, error) {
+	return []apikeysvc.APIKey{{ID: 5, Name: "deploy", Scopes: toPermissions([]string{"files:read"})}}, false, nil
 }
 
-func (s *fakeService) Get(context.Context, int64) (*apikeydto.APIKeyResponse, error) {
-	return &apikeydto.APIKeyResponse{ID: 5, Name: "deploy"}, nil
+func (s *fakeService) Get(context.Context, int64) (*apikeysvc.APIKey, error) {
+	return &apikeysvc.APIKey{ID: 5, Name: "deploy"}, nil
 }
 
-func (s *fakeService) Update(context.Context, int64, apikeydto.UpdateRequest) (*apikeydto.APIKeyResponse, error) {
-	return &apikeydto.APIKeyResponse{ID: 5, Name: "deploy"}, nil
+func (s *fakeService) Update(context.Context, int64, apikeysvc.UpdateInput) (*apikeysvc.APIKey, error) {
+	return &apikeysvc.APIKey{ID: 5, Name: "deploy"}, nil
 }
 
 func (s *fakeService) Revoke(context.Context, int64) error { return nil }
 
-func (s *fakeService) Rotate(context.Context, int64) (*apikeydto.RotateResponse, error) {
-	return &apikeydto.RotateResponse{}, nil
+func (s *fakeService) Rotate(context.Context, int64) (*apikeysvc.RotatedKey, error) {
+	return &apikeysvc.RotatedKey{}, nil
+}
+
+func toPermissions(scopes []string) []authz.Permission {
+	out := make([]authz.Permission, len(scopes))
+	for i, scope := range scopes {
+		out[i] = authz.Permission(scope)
+	}
+	return out
 }
 
 func newModuleTestApp(t *testing.T, svc apikeysvc.Service) *fiber.App {

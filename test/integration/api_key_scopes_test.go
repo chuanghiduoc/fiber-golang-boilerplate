@@ -9,33 +9,33 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
+	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 )
 
 // TestIntegration_APIKeyScopesRoundTrip checks that api_key_scopes rows keep
 // the scopes API identical to the former JSONB column: sorted, replaced as a
-// set on update, and carried over on rotation. The harness has no transaction
-// manager, so each write is the repository's single statement.
+// set on update, and carried over on rotation.
 func TestIntegration_APIKeyScopesRoundTrip(t *testing.T) {
 	h := setupAPIKeyHarness(t)
 	ctx := systemTenantCtx(h.tenant)
 
-	created, err := h.svc.Create(ctx, h.user, apikeydto.CreateRequest{
+	created, err := h.svc.Create(ctx, h.user, apikeyservice.CreateInput{
 		Name:   "scopes",
 		Scopes: []string{"files:write", "files:read", "files:read"},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"files:read", "files:write"}, created.Scopes)
+	assert.Equal(t, []authz.Permission{"files:read", "files:write"}, created.Scopes)
 
 	got, err := h.svc.Get(ctx, created.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"files:read", "files:write"}, got.Scopes)
+	assert.Equal(t, []authz.Permission{"files:read", "files:write"}, got.Scopes)
 
-	updated, err := h.svc.Update(ctx, created.ID, apikeydto.UpdateRequest{
+	updated, err := h.svc.Update(ctx, created.ID, apikeyservice.UpdateInput{
 		Scopes: []string{"notifications:read", "files:read"},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, []string{"files:read", "notifications:read"}, updated.Scopes)
+	assert.Equal(t, []authz.Permission{"files:read", "notifications:read"}, updated.Scopes)
 
 	var rows []string
 	result, err := h.pool.Query(context.Background(),
@@ -52,12 +52,12 @@ func TestIntegration_APIKeyScopesRoundTrip(t *testing.T) {
 
 	rotated, err := h.svc.Rotate(ctx, created.ID)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"files:read", "notifications:read"}, rotated.Scopes)
+	assert.Equal(t, []authz.Permission{"files:read", "notifications:read"}, rotated.Scopes)
 
 	keys, _, err := h.svc.List(ctx, 10, "")
 	require.NoError(t, err)
 	require.Len(t, keys, 2)
 	for _, key := range keys {
-		assert.Equal(t, []string{"files:read", "notifications:read"}, key.Scopes, "key %d", key.ID)
+		assert.Equal(t, []authz.Permission{"files:read", "notifications:read"}, key.Scopes, "key %d", key.ID)
 	}
 }
