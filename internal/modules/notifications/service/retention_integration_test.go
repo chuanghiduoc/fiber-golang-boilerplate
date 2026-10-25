@@ -1,6 +1,6 @@
 //go:build integration
 
-package service
+package service_test
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
+	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 )
@@ -59,7 +60,7 @@ func TestRetentionPurgeDeletesOnlyOldReadNotifications(t *testing.T) {
 	unreadOld := insertNotification(t, pool, tenant.DefaultID, userA, 400*day, 0)
 	readRecently := insertNotification(t, pool, tenantB, userB, 400*day, 10*day)
 
-	purger := NewRetentionPurger(repository.NewRetentionRepository(pool), notificationRetentionDays)
+	purger := notificationservice.NewRetentionPurger(repository.NewRetentionRepository(testutil.Scoped(pool)), notificationRetentionDays)
 	ctx := context.Background()
 	require.NoError(t, purger.HandleJob(ctx, nil))
 

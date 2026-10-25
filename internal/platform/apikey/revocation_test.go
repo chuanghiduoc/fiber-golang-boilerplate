@@ -31,7 +31,7 @@ func TestVerifier_RejectsKeysIssuedBeforeCredentialRevocation(t *testing.T) {
 			store := &fakeStore{key: key}
 			revokedAt := tc.revokedAt
 			verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-				ID: 42, TenantID: 1, Role: authz.RoleUser,
+				ID: 42, TenantID: 1, Role: authz.RoleMember,
 				TenantStatus:         identitycontracts.TenantStatusActive,
 				CredentialsRevokedAt: &revokedAt,
 			}})

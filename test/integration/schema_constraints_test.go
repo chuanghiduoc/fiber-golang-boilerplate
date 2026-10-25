@@ -53,11 +53,38 @@ func TestSchemaConstraints(t *testing.T) {
 		require.Error(t, err, "GENERATED ALWAYS must reject an explicit id")
 	})
 
-	tenantB := schemaInsertID(t, pool, `INSERT INTO tenants (slug, name) VALUES ('schema-b', 'B') RETURNING id`)
-	userA := schemaInsertID(t, pool,
-		`INSERT INTO users (tenant_id, email, name) VALUES (1, 'schema-a@example.com', 'A') RETURNING id`)
+	tenantB := testutil.CreateTenant(t, ctx, pool, "schema-b")
+	// userA is a global user with a membership in tenant 1 only.
+	userA := testutil.CreateMember(t, ctx, pool, 1, "schema-a@example.com", testutil.MemberOptions{}).UserID
 
-	t.Run("cross-module children must belong to the user's tenant", func(t *testing.T) {
+	t.Run("users store a normalized email", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `INSERT INTO users (email, name) VALUES ('Schema-Mixed@Example.com', 'M')`)
+		requireCheckViolation(t, err, "chk_users_email_normalized")
+	})
+
+	t.Run("membership state checks and uniqueness", func(t *testing.T) {
+		userID := schemaInsertID(t, pool,
+			`INSERT INTO users (email, name) VALUES ('schema-states@example.com', 'S') RETURNING id`)
+		insert := `INSERT INTO memberships (tenant_id, user_id, status, banned_at, removed_at) VALUES ($1, $2, $3, $4, $5)`
+		now := time.Now()
+
+		_, err := pool.Exec(ctx, insert, 1, userID, "suspended", nil, nil)
+		requireCheckViolation(t, err, "chk_memberships_banned")
+		_, err = pool.Exec(ctx, insert, 1, userID, "active", now, nil)
+		requireCheckViolation(t, err, "chk_memberships_banned")
+		_, err = pool.Exec(ctx, insert, 1, userID, "removed", nil, nil)
+		requireCheckViolation(t, err, "chk_memberships_removed")
+		_, err = pool.Exec(ctx, insert, 1, userID, "active", nil, now)
+		requireCheckViolation(t, err, "chk_memberships_removed")
+		_, err = pool.Exec(ctx, insert, 1, userID, "suspended", now, nil)
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx, insert, 1, userID, "active", nil, nil)
+		require.True(t, database.IsUniqueViolation(err), "a second membership in one tenant must collide, got %v", err)
+		_, err = pool.Exec(ctx, insert, tenantB, userID, "removed", nil, now)
+		require.NoError(t, err, "the same user may be a member of another tenant")
+	})
+
+	t.Run("tenant-owned rows require a membership of the user in that tenant", func(t *testing.T) {
 		_, err := pool.Exec(ctx,
 			`INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
 			 VALUES ($1, $2, 'x', 'schema/cross', 'text/plain', 1)`, tenantB, userA)
@@ -72,15 +99,78 @@ func TestSchemaConstraints(t *testing.T) {
 			`INSERT INTO notification_preferences (tenant_id, user_id, type, channel) VALUES ($1, $2, 't', 'email')`,
 			tenantB, userA)
 		requireFKViolation(t, err, "fk_notification_preferences_tenant_user")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash) VALUES ($1, $2, 'k', 'p', 'schema-cross-key')`,
+			tenantB, userA)
+		requireFKViolation(t, err, "fk_api_keys_tenant_user")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO sessions (tenant_id, user_id, token_version) VALUES ($1, $2, 0)`, tenantB, userA)
+		requireFKViolation(t, err, "fk_sessions_membership")
 	})
 
 	fileID := schemaInsertID(t, pool,
 		`INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
 		 VALUES (1, $1, 'x', 'schema/own', 'text/plain', 1) RETURNING id`, userA)
 
-	t.Run("hard-deleting a user with files is restricted", func(t *testing.T) {
-		_, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userA)
+	t.Run("hard-deleting a member with files or a user with memberships is restricted", func(t *testing.T) {
+		_, err := pool.Exec(ctx, `DELETE FROM memberships WHERE tenant_id = 1 AND user_id = $1`, userA)
 		requireFKViolation(t, err, "fk_files_tenant_user")
+		_, err = pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, userA)
+		requireFKViolation(t, err, "memberships_user_id_fkey")
+	})
+
+	t.Run("the last active owner of a tenant cannot be demoted, banned, or removed", func(t *testing.T) {
+		tenantC := testutil.CreateTenant(t, ctx, pool, "schema-owners")
+		owner := testutil.CreateMember(t, ctx, pool, tenantC, "schema-owner-c@example.com",
+			testutil.MemberOptions{Role: "owner"}).UserID
+		// An owner of another tenant must not satisfy tenant C's invariant.
+		testutil.CreateMember(t, ctx, pool, tenantB, "schema-owner-b@example.com", testutil.MemberOptions{Role: "owner"})
+
+		where := ` WHERE tenant_id = $1 AND user_id = $2`
+		_, err := pool.Exec(ctx, `DELETE FROM membership_roles`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'suspended', banned_at = NOW()`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `UPDATE memberships SET status = 'removed', removed_at = NOW()`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+		_, err = pool.Exec(ctx, `DELETE FROM memberships`+where, tenantC, owner)
+		requireLastOwnerViolation(t, err)
+
+		testutil.CreateMember(t, ctx, pool, tenantC, "schema-owner-c2@example.com", testutil.MemberOptions{Role: "owner"})
+		_, err = pool.Exec(ctx, `DELETE FROM membership_roles`+where, tenantC, owner)
+		require.NoError(t, err, "a tenant with another active owner may remove one")
+	})
+
+	t.Run("membership roles must be tenant-scoped and belong to the membership tenant", func(t *testing.T) {
+		tenantD := testutil.CreateTenant(t, ctx, pool, "schema-roles")
+		tenantRole := schemaInsertID(t, pool,
+			`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'reviewer', 'Reviewer') RETURNING id`,
+			tenantD)
+		member := testutil.CreateMember(t, ctx, pool, tenantB, "schema-role-b@example.com",
+			testutil.MemberOptions{Role: "member"}).UserID
+
+		_, err := pool.Exec(ctx,
+			`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'owner', 'Shadow')`, tenantD)
+		requireCheckViolation(t, err, "chk_roles_tenant_key_system")
+		_, err = pool.Exec(ctx,
+			`INSERT INTO role_permissions (role_id, permission_key) VALUES ($1, 'platform:tenants:read')`, tenantRole)
+		requireTriggerViolation(t, err, "tenant roles cannot hold platform permissions")
+
+		_, err = pool.Exec(ctx, `INSERT INTO membership_roles (tenant_id, user_id, role_id) VALUES ($1, $2, $3)`,
+			tenantB, member, tenantRole)
+		requireTriggerViolation(t, err, "role belongs to another tenant")
+
+		platformRole := schemaInsertID(t, pool,
+			`SELECT id FROM roles WHERE tenant_id IS NULL AND key = 'platform_admin'`)
+		_, err = pool.Exec(ctx, `INSERT INTO membership_roles (tenant_id, user_id, role_id) VALUES ($1, $2, $3)`,
+			tenantB, member, platformRole)
+		requireTriggerViolation(t, err, "membership roles must be tenant-scoped")
+
+		_, err = pool.Exec(ctx, `INSERT INTO platform_role_assignments (user_id, role_id) VALUES ($1, $2)`,
+			member, tenantRole)
+		requireTriggerViolation(t, err, "platform assignments require a platform-scoped role")
 	})
 
 	t.Run("files and notifications maintain updated_at", func(t *testing.T) {
@@ -207,6 +297,11 @@ func TestSchemaConstraints(t *testing.T) {
 		require.NoError(t, err)
 		_, err = pool.Exec(ctx, insertTarget, userA)
 		require.True(t, database.IsUniqueViolation(err), "a second user target must collide, got %v", err)
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO feature_flag_targets (flag_key, tenant_id, user_id, enabled) VALUES ('schema_flag', $1, $2, TRUE)`,
+			tenantB, userA)
+		requireFKViolation(t, err, "feature_flag_targets_user_tenant_fk")
 	})
 
 	t.Run("audit events reject admin actor type, non-IP addresses, and dangling parents", func(t *testing.T) {
@@ -227,6 +322,21 @@ func TestSchemaConstraints(t *testing.T) {
 		_, err = pool.Exec(ctx, insertAudit, "user", "203.0.113.7", parentID)
 		require.NoError(t, err)
 	})
+}
+
+// requireLastOwnerViolation asserts err is the protect_last_owner trigger's
+// exception (RAISE EXCEPTION, SQLSTATE P0001).
+func requireLastOwnerViolation(t *testing.T, err error) {
+	t.Helper()
+	requireTriggerViolation(t, err, "cannot remove the last owner")
+}
+
+func requireTriggerViolation(t *testing.T, err error, message string) {
+	t.Helper()
+	var pgErr *pgconn.PgError
+	require.True(t, errors.As(err, &pgErr), "expected the trigger error, got %v", err)
+	assert.Equal(t, "P0001", pgErr.Code, "error: %v", err)
+	assert.Equal(t, message, pgErr.Message)
 }
 
 // requireCheckViolation asserts err is a CHECK violation (23514) of constraint.

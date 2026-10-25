@@ -66,14 +66,14 @@ module, and `platform`/`pkg` never import modules.
 | `cmd/api` | Infra setup, catalog registration, lifecycle, graceful shutdown |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (shared with `test/arch`) |
 | `cmd/migrate` | The only schema initializer/migrator |
-| `cmd/seed` | Admin seeder (schema must exist) |
+| `cmd/seed` | Admin seeder: tenant `owner` + `platform_admin` (schema must exist) |
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
-| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier) |
+| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
-| `migrations` | per-owner `<UTC ts>_<owner>_<purpose>.{up,down}.sql` (baseline: `20260101000000`–`20260101000900`, platform → identity → platform tables → modules; ADR 0005) |
+| `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
 
 **Request flow:** client → global middleware (request ID, i18n, tracing,
 metrics, logger, audit fallback, timeout) → `/api/vN` guard → tenant
@@ -133,17 +133,18 @@ migrations) to its owners; keep it current when adding a module.
   must not be named like another owner's table.
 - Migrations: every version is a 14-digit UTC timestamp, owners are real
   modules or `platform`, two spellings of one version are duplicates, and an
-  owner's file may only create that owner's tables
+  owner's file or `-- owner:` section may only create that owner's tables
   (`TestMigrationsCreateOnlyOwnedTables`).
 
 **Schema ownership**
 - Only `cmd/migrate` applies DDL; API/seed assume the schema exists.
   `cmd/migrate` uses `config.LoadDatabase` (DB_* only; no JWT/admin/SMTP
   secrets).
-- Fresh installs apply the per-owner baseline files in timestamp order
-  (shared functions, identity, platform jobs/scheduler/audit, then modules).
-  There is still no deployed database, so the baseline is edited in place
-  until the first release; after that, only add migrations.
+- Fresh installs apply the single init migration (ADR 0012), whose
+  `-- owner: <module|platform>` sections run shared functions, identity,
+  platform jobs/scheduler/audit, then modules. There is still no deployed
+  database, so the init is edited in place until the first release; after
+  that, only add migrations.
 - New migrations: `make migrate-create module=<owner> name=<purpose>` (or
   `make gen`) → `<YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`.
   `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp
@@ -153,19 +154,32 @@ migrations) to its owners; keep it current when adding a module.
 - `cmd/migrate` refuses a database recorded at a legacy sequential version
   (1–999999) with upgrade guidance; never rewrite `schema_migrations` to skip
   DDL or edit a shipped migration.
-- Tenant-owned tables (`users`, `files`, `notifications`,
-  `notification_preferences`, `refresh_tokens`, `password_reset_tokens`,
-  `email_verification_tokens`, `api_keys`, `jobs`, `audit_events`,
-  `feature_flag_targets`, `webhook_*`) have
-  `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones must
-  too, and lead tenant-scoped query indexes with `tenant_id`. `feature_flags`
-  is process-wide (deliberate exception); `api_key_scopes` is a pure child of
-  `api_keys` (CASCADE) and inherits its tenant through the parent key. Job
+- Tenant-owned tables (`memberships`, `invitations`, `sessions`,
+  `refresh_tokens`, `data_exports`, `files`, `notifications`,
+  `notification_preferences`, `api_keys`, `jobs`, `audit_events`,
+  `feature_flag_targets`, `webhook_*`)
+  have `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones
+  must too, and lead tenant-scoped
+  query indexes with `tenant_id`. `feature_flags` is process-wide (deliberate
+  exception); `api_key_scopes` is a pure child of `api_keys` (CASCADE) and
+  inherits its tenant through the parent key. `data_exports` is identity-owned:
+  its partial unique index allows one queued/running export per membership,
+  and `storage_path` is the authoritative export blob key.
+- Users are global (ADR 0004): `users`, `user_passwords`, `user_identities`,
+  `password_reset_tokens`, and `email_verification_tokens` have no
+  `tenant_id`; `tenants`/`tenant_settings` are the tenant rows themselves. A
+  user joins a tenant through `memberships` (`UNIQUE (tenant_id, user_id)`,
+  `status active|suspended|removed`); roles live in `membership_roles`
+  (system `owner`/`admin`/`member` or a tenant role) and platform access in
+  `platform_role_assignments`. Every per-member row in another module references
+  `(tenant_id, user_id) → memberships ON DELETE RESTRICT`, never `users`. Job
   claim/lease recovery/purge are
   global, so `jobs` has only the tenant-leading idempotency index.
 - `cmd/migrate` verifies required tables, columns, unique indexes (every
   `ON CONFLICT` target), tenant-leading indexes, and enabled triggers
-  (`trigger_protect_last_admin`, audit completion/no-delete/no-truncate); its
+  (`trigger_memberships_last_owner`, `trigger_protect_last_owner`,
+  `trigger_membership_roles_scope`, `trigger_platform_role_scope`, audit
+  completion/no-delete/no-truncate); its
   test fails when that list drifts from the baseline. `audit_events` rejects
   `DELETE`/`TRUNCATE` at the database.
 - `jobs.idempotency_key` is nullable with a partial unique
@@ -174,13 +188,21 @@ migrations) to its owners; keep it current when adding a module.
   `(schedule, scheduled_for)` ledger) are platform coordination tables with no
   tenant column and no cross-module/jobs foreign keys; do not add them.
 - The baseline seeds tenant id 1 (`default`); keep it as the compatibility
-  tenant. The last-admin trigger is per tenant.
+  tenant (it can never be `pending_deletion`/`deleted`). The last-owner
+  trigger lives on `memberships` and `membership_roles` and is per tenant:
+  removing the last active system `owner` of an operational tenant is refused.
+  The platform tenant create endpoint makes the caller its first owner.
+  Tenant status is `trialing|active|suspended|pending_deletion|deleted`; only
+  `trialing`/`active` serve requests; transitions go through the audited
+  identity `TenantService`, exposed on the platform tenant routes.
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
   every new query keeps a `tenant_id` predicate. Cross-tenant ids behave as
-  not found (`404`), never forbidden. Deliberate exceptions are the
-  cross-tenant retention queries: identity `PurgeExpired*Tokens`
+  not found (`404`), never forbidden. Identity scopes memberships, sessions,
+  refresh tokens, and invitations by tenant; global user/credential rows are
+  reached through the caller's membership. Deliberate exceptions are the
+  cross-tenant retention queries: identity `PurgeExpired*`/`PurgeStaleSessions`
   (`identity.tokens.purge_expired`), files `ClaimTrashedFiles`/
   `HardDeleteTrashedFiles` (`files.trash.purge`), and notifications
   `PurgeReadNotifications` (`notifications.retention.purge`); their indexes
@@ -192,16 +214,33 @@ migrations) to its owners; keep it current when adding a module.
 - `tenanthttp.Middleware` resolves `X-Tenant-Slug` (empty → `TENANT_DEFAULT_SLUG`;
   production requires the header). A validated `?tenant=` fallback is accepted
   only on `/auth/google`, `/auth/reset-password`, `/auth/verify-email` (the
-  header wins; reset/verify links carry it). The OAuth callback is exempt and
-  uses the tenant in signed `state`.
-- Tokens without a positive `tenant_id` claim are rejected fail-closed; rotate
-  legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
+  header wins; reset/verify/invitation links carry it so the frontend knows
+  where to sign in; reset and verification tokens are per user and ignore it
+  for the lookup). The OAuth callback is exempt and uses the tenant in signed
+  `state`.
+- Tokens without a positive `tenant_id` or `sid` claim are rejected
+  fail-closed; rotate legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
   is for jobs/internal/tests only, never HTTP handling.
-- RLS and per-tenant limits remain future work; do not claim
-  whole-application isolation.
+- **Row-level security (ADR 0007):** every table with a `tenant_id` has
+  `ENABLE`+`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy calling
+  `app_tenant_visible(tenant_id)` (`roles` also exposes the shared system roles,
+  `tenant_id IS NULL`, to every tenant; writing one needs the bypass, as the
+  startup catalog sync does). `database.TxManager` sets
+  `app.tenant_id`/`app.rls_bypass` with transaction-local `set_config` right
+  after `BEGIN`; `database.Scoped` does the same for one statement in a single
+  pgx Batch (`BEGIN; set_config; statement; COMMIT`). Repositories are wired
+  with `app.Infra.DB` (the Scoped handle), never the raw pool. A query without
+  a tenant setting sees no rows. `database.WithRLSBypass(ctx)` marks a
+  deliberate cross-tenant path (global job claim/lease/purge, retention
+  purges, feature snapshot, webhook inbound source lookup, global-user
+  identity operations, tenant lifecycle) and must never appear on an HTTP
+  path serving one tenant. The API/worker/seed connect as a non-superuser
+  role without `BYPASSRLS` (`cmd/api` refuses production startup otherwise);
+  `cmd/migrate` uses the owner role via `DB_MIGRATE_*`. Per-tenant limits
+  remain future work; do not claim whole-application isolation.
 
 **Scope:** a boilerplate, not a finished multi-tenant SaaS platform.
-Row-level security, per-tenant quotas, and promotion/rollout automation are
+Per-tenant quotas and promotion/rollout automation are
 future work. Tracing (HTTP, sanitized pgx, jobs) is disabled by default
 (`OTEL_ENABLED=false`). Kubernetes manifests and the GHCR release workflow are
 a production foundation, not a complete CD platform. There is no shared
@@ -256,42 +295,107 @@ handler/service/DTO/repository package.
   match the path, else 406 `api.version_unsupported`; unknown `/api/vN` → 406.
   Responses carry `API-Version`, `Vary: Accept-Version`, optional
   `Deprecation`/`Sunset`/`Link`. Keep Swagger's base path at `/api/v1`.
-- **Auth/session:** JWT carries `token_version` and `tenant_id`;
-  `session.Store` validates version, tenant, and tenant status with
-  generation-keyed invalidation. `JWTAuth` rejects a non-positive tenant and an
+- **Auth/session:** login is the global password plus an *active membership*
+  in the request tenant (otherwise the same 401 as a wrong password). JWT
+  carries user id, `tenant_id`, `sid` (session id), `token_version`, and
+  optional `amr` (pwd/google/otp/rc); it
+  carries no role (a legacy `role` claim verifies but is ignored).
+  `session.Store` loads the session and requires it unrevoked, the membership
+  and user active, the tenant operational, and the token version to match; the
+  same snapshot carries the effective permission set (union of the membership
+  roles and platform assignments) for 5s, with generation-keyed per-user and
+  global permission invalidation. `JWTAuth` rejects a non-positive tenant and an
   explicit header that conflicts with the claim, and clears `tenant_slug` when
   the claim overrides an unresolved default. `pkg/token` pins HS256 and
   requires `exp`; tokens carry a `kid` header derived from the signing secret,
   and a `token.Keyring` (active `JWT_SECRET` + verify-only
   `JWT_PREVIOUS_SECRETS`) picks the key by `kid` (unknown `kid` rejected;
-  tokens without one verify against the active secret only). Refresh tokens are atomic single-use, tenant-scoped, and
-  version-bound; logout deletes by possession; refresh with an inactive owner
-  returns 401. Login lockout counts failures per (tenant, email, IP) and locks
-  the account globally only after 5x that threshold. Lockout/rate-limit cache
-  keys hash the normalized email (SHA-256, 128-bit hex:
-  `<prefix><hash>:tenant=N[:ip=…]`), never store it raw. Banning sets
-  `users.credentials_revoked_at` (`clock_timestamp()`); API keys created at or
-  before it are rejected, so unban never revives them. API-key creation locks
-  the owner row through `PrincipalLocker.LockPrincipalTx` (the only
-  transactional apikeys→identity channel); rotate returns 409 when the owner
-  is inactive or the key predates `credentials_revoked_at`.
-  `(*AppError).Is(apperror.ErrNotFound)` matches any 404 `AppError`. Changing
-  another user's email is refused for API-key callers and for admin targets.
-  Google sign-in (`SignInWithGoogle` with a `Complete` hook) runs the
-  tenant/email checks and session creation in the sign-in transaction before
-  the Tier 1 `auth.google_login` row, so refused logins are never audited as
-  success. The password-reset token insert re-checks the current email (an
-  email change in between skips the send). The admin seed only creates a
-  missing admin; an existing demoted/banned/deleted account is skipped, never
-  re-promoted.
+  tokens without one verify against the active secret only). A session is the
+  RFC 9700 refresh-token family: refresh tokens are atomic single-use,
+  tenant-scoped, and version-bound; presenting a used token revokes the whole
+  session (`refresh_reuse`) and returns 401; logout revokes the session by
+  possession; logout-all revokes every session in every tenant and bumps
+  `token_version`; refresh with an inactive member returns 401. Login lockout
+  counts failures per (email, IP) and locks the account globally only after
+  5x that threshold; neither key is tenant-scoped (the password is global).
+  Lockout/rate-limit cache keys hash the normalized email (SHA-256, 128-bit
+  hex: `<prefix><hash>[:ip=…]`), never store it raw. Admin ban/unban/role
+  change/removal are membership changes in the request tenant; ban, removal,
+  and an actual role change revoke the member's sessions there. The last active
+  owner cannot be demoted, banned, removed, or deleted (DB trigger + advisory
+  lock). A ban or
+  removal sets
+  `memberships.credentials_revoked_at` (`clock_timestamp()`, never cleared);
+  API keys created at or before it are rejected, so unban never revives them.
+  A ban also survives the banned user deleting and re-creating the account
+  (`EmailBannedInTenant`). The API-key principal is an active membership;
+  API-key creation locks the membership row through
+  `PrincipalLocker.LockPrincipalTx` (the only transactional apikeys→identity
+  channel); rotate returns 409 when the owner is inactive or the key predates
+  `credentials_revoked_at`. `(*AppError).Is(apperror.ErrNotFound)` matches any
+  404 `AppError`. The global profile is editable only by its owner
+  (`PUT /users/:id` for another id → 403). `DELETE /users/:id` on yourself
+  deletes the global account (JWT only; refused while you are the last active
+  admin of any tenant); on another id it removes that membership from the
+  request tenant. Registration creates user + password + membership in the
+  request tenant; an email that already has an account gets 409
+  `user.email_taken`, and an existing user joins another tenant only through
+  an invitation (`/invitations`, `/auth/invitations/accept|signup`). Google
+  sign-in links/creates through `user_identities` (linking needs a verified
+  local email and Google `verified_email`); a new Google account gets a
+  membership in the state tenant, an existing user never joins a tenant
+  implicitly. `SignInWithGoogle` with a `Complete` hook runs these checks and
+  session creation in the sign-in transaction before the Tier 1
+  `auth.google_login` row, so refused logins are never audited as success.
+  Password reset and email verification are per user. The password-reset
+  token insert re-checks the current email (an email change in between skips
+  the send). The admin seed only creates a missing admin; an existing
+  demoted/banned/deleted or non-member account is skipped, never re-promoted
+  or added.
+- **MFA (ADR 0010):** TOTP only (RFC 6238, SHA-1/6 digits/30s, ±1 step),
+  per global user, not per tenant. `mfa_factors` keeps at most one confirmed
+  factor and one pending enrollment; the secret is sealed with
+  `infra.PayloadCodec` (`DATA_ENCRYPTION_KEY`, previous keys decrypt) and is
+  returned only inside the enrollment `otpauth://` URI. Confirmation and
+  disable require a current TOTP/recovery code; confirmation issues ten
+  single-use recovery codes (SHA-256 hashes, shown once). `mfa_recovery_codes.used_at`
+  and `mfa_factors.last_used_step` are claimed with conditional UPDATEs, so
+  concurrent uses cannot both pass. Routes: `GET /auth/mfa/status`,
+  `POST /auth/mfa/totp/{enroll,confirm}`, `POST /auth/mfa/disable`,
+  `POST /auth/mfa/recovery-codes/regenerate` (JWT-only, `mfa:read|write`,
+  Tier 1; no Idempotency-Key on secret-returning endpoints). With a confirmed
+  factor, password login and Google sign-in return `mfaRequired` plus a
+  five-minute, single-use, tenant-bound challenge sealed with the same codec
+  (no tokens) that also pins the token version, so a password change or
+  logout-all voids it; `POST /auth/mfa/verify` (challenge + TOTP/recovery
+  code) issues the normal pair. Second-factor guesses (verify, disable,
+  regenerate) use a per-user budget of 5 per 15 minutes that only a successful
+  verification clears (a correct password does not), and confirming/disabling
+  revokes the user's other sessions
+  (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
+  `rc`; refresh repeats the session's `amr`, tokens without it still verify,
+  and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
+  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Every `/platform` route (platform-scope roles) requires it (ADR 0010, enforced
+  by `test/arch` `TestPlatformRoutesRequireMFA`).
+  or added. A newly seeded admin becomes tenant `owner` and gets the
+  `platform_admin` assignment; `cmd/seed` does the same.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
-  via `app.PermissionProvider` (`authz.Grant{Permission, Roles}`; admins get
-  everything). Only permissions shared by several modules (`admin:users:*`,
-  `admin:files:*`, `admin:stats:read`) stay in `platform/authz`. Duplicate or
-  conflicting registrations fail startup. Protect routes with
+  via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).
+  The system tenant roles are `owner`, `admin`, and `member`; owner and admin
+  receive every tenant permission, member receives the listed grants. Platform
+  permissions (`platform:tenants:*`, `platform:features:write`) go to
+  `platform_admin` only and are the only cross-tenant access. Only permissions
+  shared by several modules (`admin:users:*`, `admin:files:*`,
+  `admin:stats:read`, the platform ones) stay in `platform/authz`. The catalog
+  is synchronized into `permissions`/system-role grants at API startup;
+  tenant roles are database rows and may only use known tenant permissions.
+  Duplicate or conflicting registrations fail startup. Protect routes with
   `authzhttp.Require(<m>catalog.PermissionX)` behind `deps.Authenticate()`
-  (API key or JWT; API-key scopes are the subject's permissions). Only
-  `POST /auth/logout-all` is JWT-only (`sessions:revoke`).
+  (API key or JWT; API-key scopes are intersected with the owner's current
+  effective permissions). JWT-only:
+  `POST /auth/logout-all` and `DELETE /auth/sessions/:id` (`sessions:revoke`),
+  `GET /auth/sessions` (`profile:read`), `POST /auth/invitations/accept`
+  (`profile:write`). `invitations:read|write` are admin-only.
   Service-level checks use `authz.Authorize`, the single fail-closed path: a
   subject in ctx ⇒ permission + policies; no subject but
   `authz.SystemContext(ctx)` ⇒ allowed; neither ⇒ `403`. A subject always wins
@@ -310,7 +414,7 @@ handler/service/DTO/repository package.
     enqueues an encrypted `password_reset.request` job (same response and work
     whether or not the account exists); the handler does the lookup and the
     token + email transaction. With transactional email wired (as in
-    `identity.Build`), registration commits user, token, and `email.send` job
+    `identity.Build`), registration commits user, membership, token, and `email.send` job
     together (fail-closed); otherwise the handler falls back to a post-commit
     email. Resend and email-change use a separate post-commit transaction.
   - Retries with backoff, dead-letter after `max_attempts`; unknown kinds retry
@@ -342,9 +446,10 @@ handler/service/DTO/repository package.
     `files.trash.purge` (files soft-deleted more than
     `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
     `purge_started_at` claim that blocks restore, then blob, then row; a
-    missing blob counts as deleted; no event/webhook); and
+    missing blob counts as deleted; no event/webhook);
     `notifications.retention.purge` (notifications read more than
-    `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept). See
+    `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept); and
+    `privacy.exports.purge` (expired data-export blobs, then rows). See
     `docs/operations.md` "Data retention overview".
   - Metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
     `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures,
@@ -390,8 +495,11 @@ handler/service/DTO/repository package.
   `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; pgx's
   `exec`/`simple_protocol` are rejected because json/jsonb `[]byte` binding
   (audit metadata) breaks. `cmd/migrate` uses `DB_MIGRATE_HOST`/
-  `DB_MIGRATE_PORT` when set: golang-migrate holds a session advisory lock,
-  so it must bypass a transaction-mode pooler. `search_path` stays a startup
+  `DB_MIGRATE_PORT` (and `DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD` for the
+  schema owner) when set: golang-migrate holds a session advisory lock,
+  so it must bypass a transaction-mode pooler. The API/worker/seed role is a
+  non-superuser without `BYPASSRLS`; create it with
+  `deploy/postgres/database-roles.sql`. `search_path` stays a startup
   parameter: with PgBouncer either `track_extra_parameters = search_path` or
   `ignore_startup_parameters = search_path` plus
   `ALTER ROLE ... SET search_path`.
@@ -464,11 +572,31 @@ handler/service/DTO/repository package.
   never raw paths, payloads, SQL, headers, or error text. pgx is instrumented
   only under a recording parent. Jobs persist `trace_parent`; each attempt is a
   new-root `job.process` span linked to the enqueue span.
+- **Privacy (GDPR, ADR 0013):** `internal/contracts/privacy` is the stdlib
+  `Exporter`/`Eraser`/`Registry` contract. Every module with per-user data
+  registers through `app.PrivacyProvider` (identity, files, notifications,
+  apikeys, features, and webhooks' stored event history; endpoint config is
+  tenant-wide), and `bootstrap` returns the registry
+  in `Modules.Privacy`, installed in `app.Deps.Privacy`. Identity owns
+  `data_exports` and the routes: `POST/GET /me/data-exports`,
+  `GET /me/data-exports/:id[/download]`, `POST /me/erasure`, and
+  `POST /admin/users/:id/erasure` (`admin:users:delete`). Export jobs write one
+  JSON document per tenant/user for 7 days (blobs embedded up to 64 MiB, later
+  files marked `contentOmitted`); erasure fans out one
+  `privacy.erase` job per membership plus a retryable finalizer that
+  anonymizes the global user only after every membership is `removed`. Self
+  erasure re-authenticates with the current password (an MFA user's session
+  already passed the second factor); the finalizer also deletes the MFA factor
+  and recovery codes; both
+  erasure routes are JWT-only. The last active admin is refused before enqueue
+  and re-checked at job time. Audit rows keep only IDs. The hourly purge also
+  removes failed/stale export rows after one day.
 - **Notifications:** owns the in-app feed, per-type `in_app`/`email`
   preferences, and the email channel. Queries filter `tenant_id` and
   `user_id`; missing preferences mean both channels on. `notifications.Notifier`
   is the cross-module create API; identity implements
-  `NotificationRecipientLookup`, so notifications never reads `users`. With
+  `NotificationRecipientLookup` (only an active member of the context tenant
+  is a recipient), so notifications never reads `users`. With
   email on, the row and `email.send` job commit together (queue failure rolls
   back); both channels off is a successful no-op. Writes use
   `Idempotency-Key`; admin sends need `notifications:send`.
@@ -479,8 +607,9 @@ handler/service/DTO/repository package.
   Precedence: force-off > kill switch > user > tenant > database default >
   environment > compiled default. The `features` module scopes targets to
   `tenant.EffectiveID(ctx)` and invalidates the local snapshot after writes.
-- **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate;
-  never span modules (use jobs/events).
+- **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate
+  and installs the context's RLS scope right after `BEGIN`; never span modules
+  (use jobs/events).
 - **Drivers:** storage `local|s3|seaweedfs` (`pkg/storage/drivers.New`; S3 via
   aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis`, email
   `console|smtp`, chosen by config factories.

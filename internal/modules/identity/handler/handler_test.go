@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -27,33 +26,42 @@ import (
 
 // mockUserService is a manual mock for testing handlers.
 type mockUserService struct {
-	users                           map[int64]*dto.UserResponse
+	users                           map[int64]*service.Member
 	hasMore                         bool
 	registrationEmailsTransactional bool
 	// googleAllowSignUp records the allowSignUp argument of each Google call.
 	googleAllowSignUp []bool
 }
 
-func newMockService() *mockUserService {
-	return &mockUserService{
-		users: map[int64]*dto.UserResponse{
-			1: {ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user", HasPassword: true},
+func testMember(id int64, email, name, role string) *service.Member {
+	return &service.Member{
+		User: service.User{ID: id, Email: email, Name: name, Status: service.UserStatusActive, HasPassword: true},
+		Membership: service.Membership{
+			TenantID: 1, UserID: id, Role: role, Status: service.MembershipStatusActive,
 		},
 	}
 }
 
-func (m *mockUserService) Register(_ context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
-	return &dto.UserResponse{ID: 2, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}, nil
+func newMockService() *mockUserService {
+	return &mockUserService{
+		users: map[int64]*service.Member{
+			1: testMember(1, "test@example.com", "Test User", "user"),
+		},
+	}
 }
 
-func (m *mockUserService) Authenticate(_ context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
+func (m *mockUserService) Register(_ context.Context, req service.RegisterInput) (*service.Member, error) {
+	return testMember(2, req.Email, req.Name, "user"), nil
+}
+
+func (m *mockUserService) Authenticate(_ context.Context, req service.LoginInput) (*service.Member, error) {
 	if req.Email == "test@example.com" && req.Password == "Password1!" {
-		return &dto.UserResponse{ID: 1, TenantID: 1, Email: "test@example.com", Name: "Test User", Role: "user"}, nil
+		return testMember(1, "test@example.com", "Test User", "user"), nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
 }
 
-func (m *mockUserService) GetByID(_ context.Context, id int64) (*dto.UserResponse, error) {
+func (m *mockUserService) GetByID(_ context.Context, id int64) (*service.Member, error) {
 	user, ok := m.users[id]
 	if !ok {
 		return nil, apperror.NewNotFound("user not found")
@@ -61,26 +69,26 @@ func (m *mockUserService) GetByID(_ context.Context, id int64) (*dto.UserRespons
 	return user, nil
 }
 
-func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]dto.UserResponse, bool, error) {
-	users := make([]dto.UserResponse, 0, len(m.users))
+func (m *mockUserService) List(_ context.Context, _ int, _ string) ([]service.Member, bool, error) {
+	users := make([]service.Member, 0, len(m.users))
 	for _, u := range m.users {
 		users = append(users, *u)
 	}
 	return users, m.hasMore, nil
 }
 
-func (m *mockUserService) Update(_ context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
+func (m *mockUserService) Update(_ context.Context, id int64, req service.UpdateProfileInput) (*service.Member, error) {
 	user, ok := m.users[id]
 	if !ok {
 		return nil, apperror.NewNotFound("user not found")
 	}
 	if req.Name != nil {
-		user.Name = *req.Name
+		user.User.Name = *req.Name
 	}
 	return user, nil
 }
 
-func (m *mockUserService) Delete(_ context.Context, id int64) error {
+func (m *mockUserService) DeleteAccount(_ context.Context, id int64) error {
 	if _, ok := m.users[id]; !ok {
 		return apperror.NewNotFound("user not found")
 	}
@@ -88,18 +96,25 @@ func (m *mockUserService) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-func (m *mockUserService) SignInWithGoogle(ctx context.Context, req service.GoogleSignIn) (*dto.UserResponse, error) {
+func (m *mockUserService) RemoveMember(ctx context.Context, id int64) error {
+	return m.DeleteAccount(ctx, id)
+}
+
+func (m *mockUserService) SignInWithGoogle(ctx context.Context, req service.GoogleSignIn) (*service.GoogleSignInResult, error) {
 	m.googleAllowSignUp = append(m.googleAllowSignUp, req.AllowSignUp)
-	user := &dto.UserResponse{ID: 1, TenantID: 1, Email: req.Email, Name: req.Name, Role: "user"}
+	member := testMember(1, req.Email, req.Name, "user")
 	if req.Complete != nil {
-		if err := req.Complete(ctx, nil, user); err != nil {
+		if err := req.Complete(ctx, member); err != nil {
 			return nil, err
 		}
 	}
-	return user, nil
+	return &service.GoogleSignInResult{
+		Member: member,
+		Tokens: service.TokenPair{AccessToken: "mock-access-token", RefreshToken: "mock-refresh-token", SessionID: 1},
+	}, nil
 }
 
-func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ dto.ChangePasswordRequest) error {
+func (m *mockUserService) ChangePassword(_ context.Context, _ int64, _ service.ChangePasswordInput) error {
 	return nil
 }
 
@@ -114,51 +129,18 @@ func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password st
 	return apperror.NewBadRequest("current password is incorrect")
 }
 
-func (m *mockUserService) SetVerificationProvisioner(_ service.VerificationProvisioner) {}
-
 func (m *mockUserService) RegistrationEmailsTransactional() bool {
 	return m.registrationEmailsTransactional
-}
-
-// mockRefreshTokenService is a manual mock for testing handlers.
-type mockRefreshTokenService struct{}
-
-func (m *mockRefreshTokenService) Create(_ context.Context, _ int64, _ int32) (string, error) {
-	return "mock-refresh-token", nil
-}
-
-func (m *mockRefreshTokenService) CreateTx(ctx context.Context, _ pgx.Tx, userID int64, tokenVersion int32) (string, error) {
-	return m.Create(ctx, userID, tokenVersion)
-}
-
-func (m *mockRefreshTokenService) Verify(_ context.Context, tokenStr string) (int64, error) {
-	if tokenStr == "valid-refresh-token" {
-		return 1, nil
-	}
-	return 0, apperror.NewUnauthorized("invalid refresh token")
-}
-
-func (m *mockRefreshTokenService) Consume(ctx context.Context, tokenStr string) (userID, tenantID int64, tokenVersion int32, err error) {
-	userID, err = m.Verify(ctx, tokenStr)
-	return userID, 1, 0, err
-}
-
-func (m *mockRefreshTokenService) Revoke(_ context.Context, _ string) error {
-	return nil
-}
-
-func (m *mockRefreshTokenService) RevokeAllByUserID(_ context.Context, _ int64) error {
-	return nil
 }
 
 // mockPasswordResetService is a manual mock for testing handlers.
 type mockPasswordResetService struct{}
 
-func (m *mockPasswordResetService) ForgotPassword(_ context.Context, _ dto.ForgotPasswordRequest) error {
+func (m *mockPasswordResetService) ForgotPassword(_ context.Context, _ service.ForgotPasswordInput) error {
 	return nil
 }
 
-func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ dto.ResetPasswordRequest) error {
+func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ service.ResetPasswordInput) error {
 	return nil
 }
 
@@ -174,14 +156,6 @@ type mockEmailVerificationService struct {
 func (m *mockEmailVerificationService) SendVerification(_ context.Context, _ int64, _ string) error {
 	m.sendVerificationCalls.Add(1)
 	return nil
-}
-
-func (m *mockEmailVerificationService) SendVerificationTx(_ context.Context, _ pgx.Tx, _ int64, _ string) error {
-	return nil
-}
-
-func (m *mockEmailVerificationService) SupportsTransactionalEnqueue() bool {
-	return false
 }
 
 func (m *mockEmailVerificationService) SendVerificationCallCount() int {
@@ -209,9 +183,9 @@ func setupAppWithEmailService(svc *mockUserService, emailVerifSvc *mockEmailVeri
 		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
-	refreshSvc := &mockRefreshTokenService{}
+	refreshSvc := &mockSessions{}
 	resetSvc := &mockPasswordResetService{}
-	authHandler := NewAuthHandler(svc, refreshSvc, resetSvc, emailVerifSvc, "test-secret", 24, false, nil)
+	authHandler := newTestAuthHandler(svc, refreshSvc, resetSvc, emailVerifSvc, "test-secret", 24, false, nil)
 	userHandler := NewUserHandler(svc)
 
 	app.Post("/auth/register", authHandler.Register)
@@ -381,23 +355,6 @@ func TestUpdate_Forbidden(t *testing.T) {
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
 }
 
-func TestUpdate_AdminBypass(t *testing.T) {
-	app := setupApp(newMockService())
-
-	// Admin trying to update user 1
-	accessToken, _ := token.GenerateWithTenant(2, 1, "admin@example.com", "admin", "test-secret", 24)
-
-	name := "Updated Name"
-	body, _ := json.Marshal(dto.UpdateUserRequest{Name: &name})
-	req, _ := http.NewRequest("PUT", "/users/1", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
-}
-
 func TestDelete_Forbidden(t *testing.T) {
 	app := setupApp(newMockService())
 
@@ -455,22 +412,6 @@ func TestRefreshHandler(t *testing.T) {
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
-}
-
-// A valid token whose owner was deleted/banned is a 401, not a 404 (the
-// service's NewNotFound must match apperror.ErrNotFound).
-func TestRefreshHandler_InactiveOwnerIsUnauthorized(t *testing.T) {
-	svc := newMockService()
-	delete(svc.users, 1)
-	app := setupApp(svc)
-
-	body, _ := json.Marshal(dto.RefreshRequest{RefreshToken: "valid-refresh-token"})
-	req, _ := http.NewRequest("POST", "/auth/refresh", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := app.Test(req)
-	require.NoError(t, err)
-	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestRefreshHandler_InvalidToken(t *testing.T) {
@@ -836,5 +777,5 @@ func TestCrossUserAccess_ScopedAPIKeyCannotUseOwnerRole(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, tc.want, resp.StatusCode, tc.method)
 	}
-	assert.Equal(t, "Test User", svc.users[1].Name)
+	assert.Equal(t, "Test User", svc.users[1].User.Name)
 }

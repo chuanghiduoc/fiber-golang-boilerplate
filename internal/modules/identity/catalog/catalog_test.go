@@ -21,6 +21,10 @@ func TestPublicValuesAreStable(t *testing.T) {
 		string(CodeAuthRefreshInvalid):     "auth.refresh_invalid",
 		string(CodeUserEmailTaken):         "user.email_taken",
 		string(CodeUserNotFound):           "user.not_found",
+		string(CodeInvitationInvalid):      "invitation.invalid",
+		string(CodeMembershipExists):       "membership.exists",
+		string(PermissionInvitationsRead):  "invitations:read",
+		string(PermissionInvitationsWrite): "invitations:write",
 		string(KeyUserRegistration):        "user_registration",
 		string(KeyEmailVerification):       "email_verification",
 		string(KeyGoogleOAuth):             "google_oauth",
@@ -45,7 +49,7 @@ func TestCatalogRegistersAndLocalizes(t *testing.T) {
 	if !features.IsKnown(KeyGoogleOAuth) {
 		t.Error("flags not registered")
 	}
-	if !authz.Has(authz.RoleUser, PermissionProfileWrite) {
+	if !authz.Has(authz.RoleMember, PermissionProfileWrite) {
 		t.Error("users must hold profile:write")
 	}
 	bundle, err := i18n.New("en", i18n.Source{Owner: "identity", FS: Locales()})

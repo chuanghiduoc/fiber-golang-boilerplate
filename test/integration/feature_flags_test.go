@@ -28,10 +28,10 @@ import (
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	featureflags "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 const featureSecret = "feature-flags-integration-secret"
@@ -76,28 +76,30 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('flags-acme', 'Flags Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "flags-acme")
 
+	// User feature-flag targets reference the (tenant, user) membership.
 	insertUser := func(tenantID int64, email string) int64 {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role)
-			 VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, email,
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "flags-a@test.com")
 	userB := insertUser(tenantB, "flags-b@test.com")
+	// Global flag writes require a platform role assignment.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO platform_role_assignments (user_id, role_id)
+		SELECT $1, id FROM roles WHERE tenant_id IS NULL AND scope = 'platform' AND key = 'platform_admin'`,
+		userA)
+	require.NoError(t, err)
 
-	tokenA, err := token.GenerateWithVersionAndTenant(userA, tenant.DefaultID, "flags-a@test.com", "admin", 0, featureSecret, 24)
-	require.NoError(t, err)
-	tokenB, err := token.GenerateWithVersionAndTenant(userB, tenantB, "flags-b@test.com", "admin", 0, featureSecret, 24)
-	require.NoError(t, err)
+	appCache := cache.NewMemoryCache()
+	t.Cleanup(func() { _ = appCache.Close() })
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
+	tokenA := testutil.SessionToken(t, ctx, pool,
+		testutil.Member{UserID: userA, TenantID: tenant.DefaultID, Email: "flags-a@test.com"}, featureSecret)
+	tokenB := testutil.SessionToken(t, ctx, pool,
+		testutil.Member{UserID: userB, TenantID: tenantB, Email: "flags-b@test.com"}, featureSecret)
 
 	flags := featureflags.NewEvaluator(featureflags.Options{
 		Store:        featureflags.NewPostgresStore(pool),
@@ -116,10 +118,11 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	application := app.New(cfg, app.Deps{
-		Cache:          cache.NewMemoryCache(),
+		Cache:          appCache,
 		Audit:          recorder,
-		TenantResolver: identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
+		TenantResolver: identityadapter.NewTenantResolver(stores.Tenants),
 		Flags:          flags,
+		Sessions:       sessionStore,
 	})
 	application.Register(featuresmodule.New(handler))
 
@@ -300,8 +303,9 @@ func TestIntegration_FeatureFlagAdminLifecycle(t *testing.T) {
 	resp, _ = h.request(t, http.MethodGet, "/api/v1/admin/features/flags/typo", h.tokenA, "default", nil)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 
-	userToken, err := token.GenerateWithVersionAndTenant(h.userA, h.tenantA, "flags-a@test.com", "user", 0, featureSecret, 24)
-	require.NoError(t, err)
+	member := testutil.CreateMember(t, context.Background(), h.pool, h.tenantA, "flags-member@test.com",
+		testutil.MemberOptions{Role: "member"})
+	userToken := testutil.SessionToken(t, context.Background(), h.pool, member, featureSecret)
 	resp, _ = h.request(t, http.MethodGet, "/api/v1/admin/features/flags", userToken, "default", nil)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
 

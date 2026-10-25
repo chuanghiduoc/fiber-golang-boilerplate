@@ -2,6 +2,16 @@
   "errors.auth.invalid_credentials.title": "Invalid credentials",
   "errors.auth.email_not_verified.title": "Email not verified",
   "errors.auth.refresh_invalid.title": "Invalid refresh token",
+  "errors.auth.mfa_challenge_invalid.title": "Invalid MFA challenge",
+  "errors.auth.mfa_invalid_code.title": "Invalid MFA code",
+  "errors.auth.mfa_already_enabled.title": "MFA is already enabled",
+  "errors.auth.mfa_not_enabled.title": "MFA is not enabled",
   "errors.user.email_taken.title": "Email already in use",
-  "errors.user.not_found.title": "User not found"
+  "errors.user.not_found.title": "User not found",
+  "errors.invitation.invalid.title": "Invalid invitation",
+  "errors.membership.exists.title": "Already a member",
+  "errors.data_export.in_progress.title": "A data export is already in progress",
+  "errors.data_export.not_found.title": "Data export not found",
+  "errors.data_export.not_ready.title": "Data export is not ready",
+  "errors.data_export.expired.title": "Data export has expired"
 }

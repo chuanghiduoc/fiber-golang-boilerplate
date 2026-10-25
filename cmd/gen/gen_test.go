@@ -42,7 +42,7 @@ func newTestRepo(t *testing.T) (gen *generator, verified *[]string) {
 	root := t.TempDir()
 	files := map[string]string{
 		"go.mod": "module " + testModulePath + "\n\ngo 1.27\n",
-		"migrations/20260101000000_platform_functions.up.sql": "SELECT 1;\n",
+		"migrations/20260101000000_platform_init_schema.up.sql": "SELECT 1;\n",
 		bootstrapFile: fakeBootstrap,
 	}
 	for rel, content := range files {

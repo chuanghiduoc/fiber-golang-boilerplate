@@ -49,7 +49,7 @@ func (h *Handler) ListFlags(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, flags, false)
+	return response.List(c, toFlagResponses(flags), false)
 }
 
 // GetFlag godoc
@@ -73,7 +73,7 @@ func (h *Handler) GetFlag(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, flag)
+	return response.Success(c, toFlagDetailResponse(flag))
 }
 
 // UpsertFlag godoc
@@ -102,11 +102,11 @@ func (h *Handler) UpsertFlag(c fiber.Ctx) error {
 		return err
 	}
 
-	flag, err := h.service.UpsertFlag(c.Context(), key, req, requestSubject(c))
+	flag, err := h.service.UpsertFlag(c.Context(), key, toUpsertFlagInput(req), requestSubject(c))
 	if err != nil {
 		return err
 	}
-	return response.Success(c, flag)
+	return response.Success(c, toFlagResponse(*flag))
 }
 
 // DeleteFlag godoc
@@ -154,7 +154,7 @@ func (h *Handler) ListTargets(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, targets, false)
+	return response.List(c, toTargetResponses(targets), false)
 }
 
 // UpsertTarget godoc
@@ -183,11 +183,11 @@ func (h *Handler) UpsertTarget(c fiber.Ctx) error {
 		return err
 	}
 
-	target, err := h.service.UpsertTarget(c.Context(), key, req)
+	target, err := h.service.UpsertTarget(c.Context(), key, toUpsertTargetInput(req))
 	if err != nil {
 		return err
 	}
-	return response.Success(c, target)
+	return response.Success(c, toTargetResponse(*target))
 }
 
 // DeleteTarget godoc

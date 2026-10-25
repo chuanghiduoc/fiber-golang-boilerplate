@@ -6,35 +6,41 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/crypto/bcrypt"
 
-	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
+
+// RegisterInput creates an account in the request tenant.
+type RegisterInput struct {
+	Email    string
+	Password string
+	Name     string
+}
 
 func emailTaken() error {
 	return apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered")
 }
 
-// Register creates a local account. The user, the optional verification
-// email job, the auth.registered audit row, and the user.registered event
-// commit in one transaction: any failure rolls the account back, so a
-// registration never exists without its audit record or outbox rows.
-func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
+func emailUnavailable() error {
+	return apperror.NewConflict("email is not available")
+}
+
+// Register creates a global user with a password and an active membership
+// in the request tenant. An address that already has an account gets 409
+// user.email_taken even when that account is not a member of this tenant:
+// an existing user joins another tenant by accepting an invitation, never by
+// registering a second account. The user, membership, optional verification
+// email job, auth.registered audit row, and user.registered event commit in
+// one transaction: any failure rolls the account back, so a registration
+// never exists without its audit record or outbox rows.
+func (s *userService) Register(ctx context.Context, req RegisterInput) (*Member, error) {
 	email := NormalizeEmail(req.Email)
 	name := strings.TrimSpace(req.Name)
 
-	if err := s.ensureEmailUnregistered(ctx, email); err != nil {
+	if err := ensureEmailUnregistered(ctx, s.Stores, email); err != nil {
 		return nil, err
 	}
 	// Hash before opening a transaction: bcrypt is intentionally expensive and
@@ -44,22 +50,22 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 		return nil, apperror.NewInternal("failed to hash password")
 	}
 
-	var user *identitysqlc.User
-	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
-		created, createErr := s.createUser(ctx, r.users, email, name, hash)
+	var member *Member
+	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		created, createErr := createAccount(ctx, tx.Stores, NewUser{Email: email, Name: name}, string(hash), RoleMember)
 		if createErr != nil {
 			return createErr
 		}
-		if provErr := s.provisionVerificationTx(ctx, tx, created); provErr != nil {
+		if provErr := s.provisionVerificationTx(ctx, tx, &created.User); provErr != nil {
 			return provErr
 		}
-		if auditErr := checkAudit(audit.RecordInTx(ctx, s.audit, tx, s.registeredEvent(ctx, created))); auditErr != nil {
+		if auditErr := checkAudit(tx.Audit.RecordTx(ctx, s.registeredEvent(ctx, created.User.ID))); auditErr != nil {
 			return auditErr
 		}
-		if pubErr := s.publishRegisteredTx(ctx, tx, created); pubErr != nil {
+		if pubErr := publishRegisteredTx(ctx, tx.Events, created); pubErr != nil {
 			return pubErr
 		}
-		user = created
+		member = created
 		return nil
 	})
 	if err != nil {
@@ -67,68 +73,69 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 	}
 
 	// A previous failed-login lockout must not survive registration.
-	clearLoginAttempts(ctx, s.cache, email)
-	return ToUserResponse(user), nil
+	clearLoginAttempts(ctx, s.Cache, email)
+	return member, nil
 }
 
-// ensureEmailUnregistered rejects an address that belongs to an active or a
-// banned account in the request tenant.
-func (s *userService) ensureEmailUnregistered(ctx context.Context, email string) error {
-	_, err := s.repo.GetByEmail(ctx, email)
+// ensureEmailUnregistered rejects an address that belongs to a live account
+// (in any tenant) or to an account banned in the request tenant.
+func ensureEmailUnregistered(ctx context.Context, st Stores, email string) error {
+	_, err := st.Users.GetByEmail(ctx, email)
 	switch {
 	case err == nil:
 		return emailTaken()
 	case !errors.Is(err, apperror.ErrNotFound):
 		return apperror.NewInternal("failed to check existing user")
 	}
-	return ensureEmailNotBanned(ctx, s.repo, email)
+	return ensureEmailNotBanned(ctx, st.Memberships, email)
 }
 
-// ensureEmailNotBanned keeps a banned account's address from being reused
-// while the ban stands (unban restores the original address).
-func ensureEmailNotBanned(ctx context.Context, repo repository.UserRepository, email string) error {
-	_, err := repo.GetBannedByEmail(ctx, email)
+// ensureEmailNotBanned keeps an address banned in the request tenant from
+// joining it again, even after the banned account deleted itself.
+func ensureEmailNotBanned(ctx context.Context, memberships MembershipRepository, email string) error {
+	banned, err := memberships.EmailBanned(ctx, email)
 	switch {
-	case err == nil:
-		return apperror.NewConflict("email is not available")
-	case errors.Is(err, apperror.ErrNotFound):
-		return nil
-	default:
+	case err != nil:
 		return apperror.NewInternal("failed to check email availability")
+	case banned:
+		return emailUnavailable()
+	default:
+		return nil
 	}
 }
 
-// createUser creates a local account with a precomputed password hash through
-// repo, which may be backed by the pool or by a caller-owned transaction.
-func (s *userService) createUser(
-	ctx context.Context,
-	repo repository.UserRepository,
-	email, name string,
-	hash []byte,
-) (*identitysqlc.User, error) {
-	user, err := repo.Create(ctx, identitysqlc.CreateUserParams{
-		TenantID:     tenant.EffectiveID(ctx),
-		Email:        email,
-		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
-		Name:         name,
-	})
+// createAccount creates a global user, its password (when hash is set), and
+// a membership with role in the request tenant through st.
+func createAccount(ctx context.Context, st Stores, user NewUser, hash, role string) (*Member, error) {
+	created, err := st.Users.Create(ctx, user)
 	if err != nil {
-		if database.IsUniqueViolation(err) {
+		if errors.Is(err, ErrEmailTaken) {
 			return nil, emailTaken()
 		}
 		return nil, apperror.NewInternal("failed to create user")
 	}
-	return user, nil
+	if hash != "" {
+		if err := st.Users.CreatePassword(ctx, created.ID, hash); err != nil {
+			return nil, apperror.NewInternal("failed to create user")
+		}
+		created.HasPassword = true
+	}
+	membership, err := st.Memberships.Create(ctx, created.ID, role)
+	if err != nil {
+		return nil, apperror.NewInternal("failed to create membership")
+	}
+	return &Member{User: *created, Membership: *membership}, nil
 }
 
 // provisionVerificationTx enqueues the verification email in the
-// registration transaction when the provisioner supports it. Otherwise the
+// registration transaction when the email outbox can join it. Otherwise the
 // handler sends it after commit (see RegistrationEmailsTransactional).
-func (s *userService) provisionVerificationTx(ctx context.Context, tx pgx.Tx, user *identitysqlc.User) error {
-	if tx == nil || s.verificationProvisioner == nil || !s.verificationProvisioner.SupportsTransactionalEnqueue() {
+func (s *userService) provisionVerificationTx(ctx context.Context, tx TxRepos, user *User) error {
+	provisioner, ok := s.Verification.(txProvisioner)
+	if !ok || tx.Mail == nil {
 		return nil
 	}
-	if err := s.verificationProvisioner.SendVerificationTx(ctx, tx, user.ID, user.Email); err != nil {
+	if err := provisioner.provisionTx(ctx, tx, user.ID, user.Email); err != nil {
 		slog.Error("failed to provision registration verification email",
 			slog.Int64("user_id", user.ID),
 			slog.Any("error", err),
@@ -140,51 +147,11 @@ func (s *userService) provisionVerificationTx(ctx context.Context, tx pgx.Tx, us
 	return nil
 }
 
-func (s *userService) registeredEvent(ctx context.Context, user *identitysqlc.User) audit.Event {
-	event := userEvent(ctx, "auth.registered", user.ID, map[string]any{
-		"email_verification_required": s.requireEmailVerification,
+func (s *userService) registeredEvent(ctx context.Context, userID int64) audit.Event {
+	event := userEvent(ctx, "auth.registered", userID, map[string]any{
+		"email_verification_required": s.RequireEmailVerification,
 	})
-	event.ActorID = user.ID
+	event.ActorID = userID
 	event.ActorType = audit.ActorTypeUser
 	return event
-}
-
-// publishRegisteredTx publishes user.registered in the registration
-// transaction, so the account never exists without its event (or vice versa)
-// and every durable subscriber (webhooks) sees it. Without a bus or a
-// transaction (unit tests) nothing is published.
-func (s *userService) publishRegisteredTx(ctx context.Context, tx pgx.Tx, user *identitysqlc.User) error {
-	if s.events == nil || tx == nil {
-		return nil
-	}
-	event, err := userRegisteredEvent(user)
-	if err == nil {
-		err = s.events.PublishTx(ctx, tx, event)
-	}
-	if err != nil {
-		slog.Error("failed to publish user.registered",
-			slog.Int64("user_id", user.ID),
-			slog.Any("error", err),
-		)
-		return apperror.NewInternal("failed to create user")
-	}
-	return nil
-}
-
-// userRegisteredEvent builds the user.registered envelope. The new user is the
-// actor, matching the auth.registered audit row.
-func userRegisteredEvent(user *identitysqlc.User) (events.Event, error) {
-	event, err := events.NewEvent(identitycontracts.EventUserRegistered, identitycontracts.UserRegisteredVersion, identitycontracts.UserRegistered{
-		UserID:        user.ID,
-		Email:         user.Email,
-		Name:          user.Name,
-		EmailVerified: user.EmailVerifiedAt.Valid,
-		CreatedAt:     user.CreatedAt.Time.UTC(),
-	})
-	if err != nil {
-		return events.Event{}, err
-	}
-	event.TenantID = user.TenantID
-	event.Actor = events.UserActor(user.ID)
-	return event, nil
 }

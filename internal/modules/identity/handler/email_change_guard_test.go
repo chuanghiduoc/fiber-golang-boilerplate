@@ -60,36 +60,38 @@ func putUser(t *testing.T, app *fiber.App, path string, req dto.UpdateUserReques
 
 func ptr(s string) *string { return &s }
 
-func TestUpdateOtherUserEmail_APIKeyIsDenied(t *testing.T) {
-	svc := newMockService()
-	app := emailChangeApp(svc, true)
+// Users are global identities (ADR 0004): a tenant admin manages
+// memberships, never another person's profile. Moving another account's
+// address and then using forgot-password would take that account over in
+// every tenant, so delegated updates are refused for JWT admins and API keys
+// alike, for both email and name.
+func TestUpdateOtherUser_IsAlwaysDenied(t *testing.T) {
+	for name, viaAPIKey := range map[string]bool{"jwt admin": false, "api key": true} {
+		t.Run(name, func(t *testing.T) {
+			svc := newMockService()
+			app := emailChangeApp(svc, viaAPIKey)
 
-	status, body := putUser(t, app, "/users/1", dto.UpdateUserRequest{Email: ptr("attacker@example.com")})
-	assert.Equal(t, fiber.StatusForbidden, status)
-	assert.Contains(t, body, string(apperror.CodePermissionDenied))
-	assert.Equal(t, "test@example.com", svc.users[1].Email)
+			status, body := putUser(t, app, "/users/1", dto.UpdateUserRequest{Email: ptr("attacker@example.com")})
+			assert.Equal(t, fiber.StatusForbidden, status)
+			assert.Contains(t, body, string(apperror.CodePermissionDenied))
 
-	status, _ = putUser(t, app, "/users/1", dto.UpdateUserRequest{Name: ptr("Renamed")})
-	assert.Equal(t, fiber.StatusOK, status, "a key with admin:users:write may still rename users")
-	assert.Equal(t, "Renamed", svc.users[1].Name)
+			status, _ = putUser(t, app, "/users/1", dto.UpdateUserRequest{Name: ptr("Renamed")})
+			assert.Equal(t, fiber.StatusForbidden, status)
+			assert.Equal(t, "test@example.com", svc.users[1].User.Email)
+			assert.Equal(t, "Test User", svc.users[1].User.Name)
+		})
+	}
 }
 
-func TestUpdateOtherUserEmail_AdminTargetIsDenied(t *testing.T) {
+// PUT /users/{caller id} behaves like PUT /users/me.
+func TestUpdateSelfByID_IsAllowed(t *testing.T) {
 	svc := newMockService()
-	svc.users[2] = &dto.UserResponse{ID: 2, TenantID: 1, Email: "admin@example.com", Name: "Other Admin", Role: dto.RoleAdmin, HasPassword: true}
+	svc.users[9] = testMember(9, "self@example.com", "Self", dto.RoleAdmin)
 	app := emailChangeApp(svc, false)
 
-	status, body := putUser(t, app, "/users/2", dto.UpdateUserRequest{Email: ptr("attacker@example.com")})
-	assert.Equal(t, fiber.StatusForbidden, status)
-	assert.Contains(t, body, string(apperror.CodePermissionDenied))
-
-	// Echoing the current address (any case) is not a change.
-	status, _ = putUser(t, app, "/users/2", dto.UpdateUserRequest{Email: ptr("Admin@Example.com"), Name: ptr("Renamed")})
-	assert.Equal(t, fiber.StatusOK, status)
-
-	// A JWT admin may still correct a regular user's address.
-	status, _ = putUser(t, app, "/users/1", dto.UpdateUserRequest{Email: ptr("fixed@example.com")})
-	assert.Equal(t, fiber.StatusOK, status)
+	status, body := putUser(t, app, "/users/9", dto.UpdateUserRequest{Name: ptr("Renamed")})
+	assert.Equal(t, fiber.StatusOK, status, body)
+	assert.Equal(t, "Renamed", svc.users[9].User.Name)
 }
 
 // strings.EqualFold treats U+017F (long s) as "s" but the service's
@@ -99,7 +101,7 @@ func TestUpdateMeEmail_UnicodeFoldStillRequiresPassword(t *testing.T) {
 	svc := newMockService()
 	app := emailChangeApp(svc, false)
 	// The stub authenticates as user 9, so /users/me targets this account.
-	svc.users[9] = &dto.UserResponse{ID: 9, TenantID: 1, Email: "test@example.com", Name: "Self", Role: dto.RoleAdmin, HasPassword: true}
+	svc.users[9] = testMember(9, "test@example.com", "Self", dto.RoleAdmin)
 
 	status, body := putUser(t, app, "/users/me", dto.UpdateUserRequest{Email: ptr("teſt@example.com")})
 	assert.Equal(t, fiber.StatusBadRequest, status, body)

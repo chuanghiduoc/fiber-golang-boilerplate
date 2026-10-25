@@ -8,6 +8,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -25,7 +26,8 @@ import (
 //
 // On API-key success the middleware sets user_id, email, role, tenant_id,
 // api_key_id, auth_method, and an authz.Subject whose explicit permissions are
-// the key's scopes intersected with the owner's current role. A key can
+// the key's scopes intersected with the owner's current effective permissions.
+// A key can
 // therefore never exceed its recorded scopes or the owner's current
 // permissions, even when its owner is an administrator.
 func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Handler {
@@ -81,9 +83,10 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 		fiber.Locals[int64](c, "tenant_id", key.TenantID)
 		c.SetContext(tenant.WithID(c.Context(), key.TenantID))
 
-		subject := authz.NewSubjectWithPermissions(principal.ID, key.TenantID, principal.Role, effectiveScopes(principal.Role, key.Scopes)...).
+		subject := authz.NewSubjectWithPermissions(principal.ID, key.TenantID, principal.Role, effectiveScopes(principal, key.Scopes)...).
 			WithAttribute(authz.AttributeAuthMethod, apikey.AuthMethodAPIKey).
 			WithAttribute(authz.AttributeAPIKeyID, strconv.FormatInt(key.ID, 10))
+		subject.CrossTenant = principal.Platform
 		authzhttp.SetSubject(c, subject)
 
 		// Services publish events and Tier 1 audit rows from the request
@@ -102,20 +105,33 @@ func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Han
 }
 
 // effectiveScopes intersects the key's stored scopes with the owner's current
-// role. A key issued while its owner was an administrator therefore loses
-// admin capabilities immediately after a demotion, matching the principal
-// revalidation performed on every request.
-func effectiveScopes(role string, scopes []authz.Permission) []authz.Permission {
-	if role == "" {
+// effective permissions. A key issued while its owner could grant a scope
+// therefore loses it immediately after a role change, matching the principal
+// revalidation performed on every request. A principal without a loaded
+// permission set (tests, minimal deployments) falls back to its role.
+func effectiveScopes(principal identitycontracts.Principal, scopes []authz.Permission) []authz.Permission {
+	if principal.Role == "" && principal.Permissions == nil {
 		return scopes
 	}
 	effective := make([]authz.Permission, 0, len(scopes))
 	for _, scope := range scopes {
-		if authz.Has(role, scope) {
+		if hasPermission(principal, scope) {
 			effective = append(effective, scope)
 		}
 	}
 	return effective
+}
+
+func hasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
+	if principal.Permissions == nil {
+		return principal.Role != "" && authz.Has(principal.Role, permission)
+	}
+	for _, granted := range principal.Permissions {
+		if granted == string(permission) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseAuthorization(header string) (scheme, credential string, ok bool) {

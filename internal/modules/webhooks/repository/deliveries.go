@@ -10,13 +10,49 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
+
+func toDelivery(row webhooksqlc.WebhookDelivery) webhooksvc.Delivery {
+	return webhooksvc.Delivery{
+		ID:               row.ID,
+		TenantID:         row.TenantID,
+		EndpointID:       row.EndpointID,
+		EventID:          row.EventID,
+		URL:              row.Url,
+		SecretCiphertext: row.SecretCiphertext,
+		Status:           row.Status,
+		Attempts:         row.Attempts,
+		MaxAttempts:      row.MaxAttempts,
+		TimeoutMS:        row.TimeoutMs,
+		NextAttemptAt:    row.NextAttemptAt.Time,
+		LastStatusCode:   intPtr(row.LastStatusCode),
+		LastError:        row.LastError.String,
+		DeliveredAt:      timePtr(row.DeliveredAt),
+		ReplayedFromID:   int64Ptr(row.ReplayedFromID),
+		CreatedAt:        row.CreatedAt.Time,
+		UpdatedAt:        row.UpdatedAt.Time,
+	}
+}
+
+func toDeliveryAttempt(row webhooksqlc.WebhookDeliveryAttempt) webhooksvc.DeliveryAttempt {
+	return webhooksvc.DeliveryAttempt{
+		ID:         row.ID,
+		DeliveryID: row.DeliveryID,
+		Attempt:    row.Attempt,
+		StatusCode: intPtr(row.StatusCode),
+		DurationMS: row.DurationMs,
+		Error:      row.Error.String,
+		CreatedAt:  row.CreatedAt.Time,
+	}
+}
 
 // CreateDeliveryWithJob writes the event (first delivery of EventID only),
 // the delivery row, and its first durable job in one transaction.
-func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraft) (deliveryID int64, created bool, err error) {
-	if r == nil || r.pool == nil {
+func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft webhooksvc.DeliveryDraft) (deliveryID int64, created bool, err error) {
+	if r == nil || r.db == nil {
 		return 0, false, ErrNoPool
 	}
 	if r.queue == nil {
@@ -66,7 +102,7 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft DeliveryDraf
 	return deliveryID, created, nil
 }
 
-func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*Delivery, error) {
+func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*webhooksvc.Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -77,18 +113,17 @@ func (r *Postgres) GetDelivery(ctx context.Context, id int64) (*Delivery, error)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
-	return &Delivery{
-		WebhookDelivery: row.WebhookDelivery,
-		EventType:       row.EventType,
-		DataVersion:     row.DataVersion,
-		ActorType:       row.ActorType,
-		ActorID:         row.ActorID.String,
-		OccurredAt:      row.OccurredAt,
-		Payload:         row.Payload,
-	}, nil
+	delivery := toDelivery(row.WebhookDelivery)
+	delivery.EventType = row.EventType
+	delivery.DataVersion = row.DataVersion
+	delivery.ActorType = row.ActorType
+	delivery.ActorID = row.ActorID.String
+	delivery.OccurredAt = row.OccurredAt.Time
+	delivery.Payload = row.Payload
+	return &delivery, nil
 }
 
-func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesParams) ([]Delivery, error) {
+func (r *Postgres) ListDeliveries(ctx context.Context, params webhooksvc.ListDeliveriesParams) ([]webhooksvc.Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -103,14 +138,17 @@ func (r *Postgres) ListDeliveries(ctx context.Context, params ListDeliveriesPara
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Delivery, len(rows))
+	out := make([]webhooksvc.Delivery, len(rows))
 	for i, row := range rows {
-		out[i] = Delivery{WebhookDelivery: row.WebhookDelivery, EventType: row.EventType, OccurredAt: row.OccurredAt}
+		delivery := toDelivery(row.WebhookDelivery)
+		delivery.EventType = row.EventType
+		delivery.OccurredAt = row.OccurredAt.Time
+		out[i] = delivery
 	}
 	return out, nil
 }
 
-func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*Delivery, error) {
+func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*webhooksvc.Delivery, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -123,37 +161,35 @@ func (r *Postgres) ClaimDelivery(ctx context.Context, id int64, lease time.Durat
 		TenantID:     tenantID(ctx),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotClaimable
+		return nil, webhooksvc.ErrNotClaimable
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &Delivery{
-		WebhookDelivery: webhooksqlc.WebhookDelivery{
-			ID:               row.ID,
-			TenantID:         row.TenantID,
-			EndpointID:       row.EndpointID,
-			EventID:          row.EventID,
-			Url:              row.Url,
-			SecretCiphertext: row.SecretCiphertext,
-			Status:           row.Status,
-			Attempts:         row.Attempts,
-			MaxAttempts:      row.MaxAttempts,
-			TimeoutMs:        row.TimeoutMs,
-			NextAttemptAt:    row.NextAttemptAt,
-			LastStatusCode:   row.LastStatusCode,
-			LastError:        row.LastError,
-			DeliveredAt:      row.DeliveredAt,
-			ReplayedFromID:   row.ReplayedFromID,
-			CreatedAt:        row.CreatedAt,
-			UpdatedAt:        row.UpdatedAt,
-		},
-		EventType:   row.EventType,
-		DataVersion: row.DataVersion,
-		ActorType:   row.ActorType,
-		ActorID:     row.ActorID.String,
-		OccurredAt:  row.OccurredAt,
-		Payload:     row.Payload,
+	return &webhooksvc.Delivery{
+		ID:               row.ID,
+		TenantID:         row.TenantID,
+		EndpointID:       row.EndpointID,
+		EventID:          row.EventID,
+		URL:              row.Url,
+		SecretCiphertext: row.SecretCiphertext,
+		Status:           row.Status,
+		Attempts:         row.Attempts,
+		MaxAttempts:      row.MaxAttempts,
+		TimeoutMS:        row.TimeoutMs,
+		NextAttemptAt:    row.NextAttemptAt.Time,
+		LastStatusCode:   intPtr(row.LastStatusCode),
+		LastError:        row.LastError.String,
+		DeliveredAt:      timePtr(row.DeliveredAt),
+		ReplayedFromID:   int64Ptr(row.ReplayedFromID),
+		CreatedAt:        row.CreatedAt.Time,
+		UpdatedAt:        row.UpdatedAt.Time,
+		EventType:        row.EventType,
+		DataVersion:      row.DataVersion,
+		ActorType:        row.ActorType,
+		ActorID:          row.ActorID.String,
+		OccurredAt:       row.OccurredAt.Time,
+		Payload:          row.Payload,
 	}, nil
 }
 
@@ -208,13 +244,13 @@ func fencedResult(affected int64, err error) error {
 		return err
 	}
 	if affected == 0 {
-		return ErrDeliveryLeaseLost
+		return webhooksvc.ErrDeliveryLeaseLost
 	}
 	return nil
 }
 
-func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error {
-	if r == nil || r.pool == nil {
+func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft webhooksvc.RetryDraft) error {
+	if r == nil || r.db == nil {
 		return ErrNoPool
 	}
 	if r.queue == nil {
@@ -236,13 +272,13 @@ func (r *Postgres) RescheduleDeliveryWithJob(ctx context.Context, draft RetryDra
 		if affected == 0 {
 			// The delivery became terminal, or a newer attempt was claimed,
 			// between claim and reschedule. Do not enqueue work for it.
-			return ErrDeliveryLeaseLost
+			return webhooksvc.ErrDeliveryLeaseLost
 		}
 		return enqueueDeliveryJob(ctx, tx, r.queue, tid, draft.DeliveryID, draft.NextAttemptAt)
 	})
 }
 
-func (r *Postgres) CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error {
+func (r *Postgres) CreateDeliveryAttempt(ctx context.Context, draft webhooksvc.AttemptDraft) error {
 	if r == nil || r.q == nil {
 		return ErrNoPool
 	}
@@ -261,20 +297,29 @@ func (r *Postgres) CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft
 	return err
 }
 
-func (r *Postgres) ListDeliveryAttempts(ctx context.Context, deliveryID int64) ([]webhooksqlc.WebhookDeliveryAttempt, error) {
+func (r *Postgres) ListDeliveryAttempts(ctx context.Context, deliveryID int64) ([]webhooksvc.DeliveryAttempt, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
-	return r.q.ListWebhookDeliveryAttempts(ctx, webhooksqlc.ListWebhookDeliveryAttemptsParams{
+	rows, err := r.q.ListWebhookDeliveryAttempts(ctx, webhooksqlc.ListWebhookDeliveryAttemptsParams{
 		TenantID:   tenantID(ctx),
 		DeliveryID: deliveryID,
 	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]webhooksvc.DeliveryAttempt, len(rows))
+	for i, row := range rows {
+		out[i] = toDeliveryAttempt(row)
+	}
+	return out, nil
 }
 
 func (r *Postgres) PurgeDeliveries(ctx context.Context, retentionDays int32) (int64, error) {
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeWebhookDeliveries(ctx, webhooksqlc.PurgeWebhookDeliveriesParams{
 			RetentionDays: retentionDays,
@@ -289,6 +334,7 @@ func (r *Postgres) PurgeOrphanEvents(ctx context.Context, retentionDays int32) (
 	if r == nil || r.q == nil {
 		return 0, ErrNoPool
 	}
+	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return purgeInBatches(ctx, func(ctx context.Context) (int64, error) {
 		return r.q.PurgeOrphanWebhookEvents(ctx, webhooksqlc.PurgeOrphanWebhookEventsParams{
 			RetentionDays: retentionDays,

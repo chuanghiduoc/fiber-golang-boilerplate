@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
+	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -21,23 +21,12 @@ import (
 
 func createUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
 	t.Helper()
-	var id int64
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`,
-		tenantID, email,
-	).Scan(&id)
-	require.NoError(t, err)
-	return id
+	return testutil.CreateMember(t, context.Background(), pool, tenantID, email, testutil.MemberOptions{}).UserID
 }
 
 func createTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
 	t.Helper()
-	var id int64
-	err := pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug,
-	).Scan(&id)
-	require.NoError(t, err)
-	return id
+	return testutil.CreateTenant(t, context.Background(), pool, slug)
 }
 
 func TestRepositoryUserAndTenantIsolation(t *testing.T) {
@@ -52,23 +41,22 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-two@example.com")
 
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
-	first, err := repo.Create(ctxOne, notificationsqlc.CreateNotificationParams{
-		TenantID: 999, // must be overridden by the context tenant
-		UserID:   userOne,
-		Type:     "security.alert",
-		Title:    "Tenant one",
-		Body:     "Body one",
-		Data:     []byte(`{"source":"test"}`),
+	first, err := repo.Create(ctxOne, notificationservice.NewNotification{
+		UserID: userOne,
+		Type:   "security.alert",
+		Title:  "Tenant one",
+		Body:   "Body one",
+		Data:   []byte(`{"source":"test"}`),
 	})
 	require.NoError(t, err)
 	assert.Equal(t, tenant.DefaultID, first.TenantID)
 	assert.Equal(t, userOne, first.UserID)
 
-	second, err := repo.Create(ctxTwo, notificationsqlc.CreateNotificationParams{
+	second, err := repo.Create(ctxTwo, notificationservice.NewNotification{
 		UserID: userTwo,
 		Type:   "security.alert",
 		Title:  "Tenant two",
@@ -116,10 +104,11 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 
 	read, err := repo.MarkRead(ctxOne, first.ID, userOne)
 	require.NoError(t, err)
-	require.True(t, read.ReadAt.Valid)
+	require.NotNil(t, read.ReadAt)
 	readAgain, err := repo.MarkRead(ctxOne, first.ID, userOne)
 	require.NoError(t, err)
-	assert.Equal(t, read.ReadAt.Time, readAgain.ReadAt.Time)
+	require.NotNil(t, readAgain.ReadAt)
+	assert.Equal(t, *read.ReadAt, *readAgain.ReadAt)
 
 	count, err := repo.CountUnread(ctxOne, userOne)
 	require.NoError(t, err)
@@ -139,7 +128,7 @@ func TestRepositoryUnreadListAndCursor(t *testing.T) {
 
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	userID := createUser(t, pool, tenant.DefaultID, "notifications-cursor@example.com")
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 
 	base := time.Now().UTC().Add(-time.Hour)
 	for i, title := range []string{"one", "two", "three"} {
@@ -186,17 +175,17 @@ func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
 	tenantTwo := createTenant(t, pool, "notifications-prefs-two")
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-prefs-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-prefs-two@example.com")
-	repo := NewNotificationRepository(pool)
+	repo := NewNotificationRepository(testutil.Scoped(pool))
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
-	first, err := repo.UpsertPreference(ctxOne, notificationsqlc.UpsertNotificationPreferenceParams{
+	first, err := repo.UpsertPreference(ctxOne, notificationservice.NewPreference{
 		UserID: userOne, Type: "security.alert", Channel: "email", Enabled: false,
 	})
 	require.NoError(t, err)
 	assert.False(t, first.Enabled)
 
-	same, err := repo.UpsertPreference(ctxOne, notificationsqlc.UpsertNotificationPreferenceParams{
+	same, err := repo.UpsertPreference(ctxOne, notificationservice.NewPreference{
 		UserID: userOne, Type: "security.alert", Channel: "email", Enabled: true,
 	})
 	require.NoError(t, err)

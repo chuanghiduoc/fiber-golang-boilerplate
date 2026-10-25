@@ -32,7 +32,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -59,10 +58,13 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 
 	// Infrastructure and the webhooks module, built like cmd/api does.
 	const encryptionKey = "webhook-e2e-encryption-key"
-	queue := jobs.NewQueue(pool)
+	queue := jobs.NewQueue(testutil.Scoped(pool))
 	bus := events.New(queue)
-	recorder := audit.NewPostgresRecorder(pool)
-	module, err := webhooks.Build(app.Infra{Pool: pool, Queue: queue, Audit: recorder, Events: bus}, webhooks.Settings{
+	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
+	module, err := webhooks.Build(app.Infra{
+		Pool: pool, DB: testutil.Scoped(pool), Tx: testutil.NewTxManager(pool),
+		Queue: queue, Audit: recorder, Events: bus,
+	}, webhooks.Settings{
 		Webhook: config.WebhookConfig{
 			ConnectTimeoutSeconds:     2,
 			RequestTimeoutSeconds:     5,
@@ -78,7 +80,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(module.Close)
 	module.RegisterEvents(bus)
-	worker := jobs.NewWorker(pool, "webhooks-e2e", jobs.WithPollInterval(50*time.Millisecond))
+	worker := jobs.NewWorker(testutil.Scoped(pool), "webhooks-e2e", jobs.WithPollInterval(50*time.Millisecond))
 	module.RegisterJobs(worker)
 	require.NoError(t, bus.RegisterJobs(worker))
 
@@ -88,7 +90,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	ciphertext, err := codec.Seal([]byte(wireSecret))
 	require.NoError(t, err)
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	_, err = webhookrepo.New(pool, queue).CreateEndpoint(tenantCtx, webhookrepo.CreateEndpointDraft{
+	_, err = webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue).CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
 		URL:              server.URL + "/hook",
 		EventTypes:       []string{"file.*"},
 		Status:           "active",
@@ -99,15 +101,11 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// The producer: a user uploads a file through the files service.
-	var userID int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, 'e2e@test.com', 'E2E', 'user') RETURNING id`,
-		tenant.DefaultID,
-	).Scan(&userID))
+	userID := testutil.CreateMember(t, ctx, pool, tenant.DefaultID, "e2e@test.com", testutil.MemberOptions{}).UserID
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(pool),
-		filesrepo.NewTransactor(database.NewTxManager(pool), recorder, bus), store)
+	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(testutil.Scoped(pool)),
+		filesrepo.NewTransactor(testutil.NewTxManager(pool), recorder, bus), store)
 	userCtx := requestctx.WithActorID(authz.WithSubject(tenantCtx, authz.NewSubject(userID, tenant.DefaultID, "user")), userID)
 	file, err := uploads.Upload(userCtx, userID, "report.pdf", strings.NewReader("%PDF-1"), 6, "application/pdf")
 	require.NoError(t, err)

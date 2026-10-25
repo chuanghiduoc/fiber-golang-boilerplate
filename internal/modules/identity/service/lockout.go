@@ -11,23 +11,54 @@ import (
 )
 
 const (
-	// maxLoginAttempts is the per-(tenant, email, client IP) budget. Keying by
-	// source means a stranger cannot lock a victim out from one address.
+	// maxLoginAttempts is the per-(email, client IP) budget. Keying by source
+	// means a stranger cannot lock a victim out from one address.
 	maxLoginAttempts = 5
-	// accountLockoutMultiplier sets the global per-(tenant, email) budget,
-	// which still stops guessing distributed across many addresses. One source
+	// accountLockoutMultiplier sets the global per-email budget, which still
+	// stops guessing distributed across many addresses. One source
 	// contributes at most maxLoginAttempts per window to it.
 	accountLockoutMultiplier = 5
 	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
 	lockoutDuration          = 15 * time.Minute
 	loginAttemptPrefix       = "login_attempts:"
+
+	// maxMFAAttempts bounds second-factor guesses per user across every
+	// source. It is separate from the password counters because a correct
+	// password clears those: sharing them would let a caller who knows the
+	// password reset the TOTP guessing budget at will.
+	maxMFAAttempts   = 5
+	mfaAttemptPrefix = "mfa_attempts:"
 )
 
-// loginAttemptKeys returns the per-source key (tenant, email, client IP) and
-// the global per-account key (tenant, email) for one password attempt. The
-// email is hashed by scopedKey, so neither key contains the address.
+// reserveMFAAttempt counts one second-factor attempt for userID and rejects
+// it once the budget is spent. Only a successful verification clears it.
+func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if attempts > maxMFAAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
+}
+
+func clearMFAAttempts(ctx context.Context, store cache.Cache, userID int64) {
+	if err := store.Delete(ctx, mfaAttemptKey(userID)); err != nil {
+		slog.Warn("cache error clearing MFA attempts", slog.Any("error", err))
+	}
+}
+
+func mfaAttemptKey(userID int64) string {
+	return fmt.Sprintf("%s%d", mfaAttemptPrefix, userID)
+}
+
+// loginAttemptKeys returns the per-source key (email, client IP) and the
+// global per-account key (email) for one password attempt. The email is
+// hashed by emailKey, so neither key contains the address. The password is
+// a global credential (ADR 0004), so neither key is tenant-scoped.
 func loginAttemptKeys(ctx context.Context, email string) (source, account string) {
-	account = scopedKey(ctx, loginAttemptPrefix, email)
+	account = emailKey(loginAttemptPrefix, email)
 	return account + ":ip=" + clientIPFromContext(ctx), account
 }
 

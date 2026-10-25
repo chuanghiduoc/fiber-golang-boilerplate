@@ -7,14 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
-	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -29,24 +26,25 @@ func newTestService(repo *mockRepository, sender *mockEmailSender) NotificationS
 		10: {UserID: 10, Email: "user10@example.com", Name: "User Ten"},
 		11: {UserID: 11, Email: "user11@example.com", Name: "User Eleven"},
 	}}
-	return NewNotificationService(repo, recipients, sender, &mockTxManager{repo: repo})
+	return NewNotificationService(repo, recipients, sender, &mockTransactor{repo: repo, mail: sender})
 }
 
-func seedNotification(repo *mockRepository, tenantID, userID int64, title string, read bool, createdAt time.Time) *notificationsqlc.Notification {
-	readAt := pgtype.Timestamptz{}
+func seedNotification(repo *mockRepository, tenantID, userID int64, title string, read bool, createdAt time.Time) *Notification {
+	var readAt *time.Time
 	if read {
-		readAt = pgtype.Timestamptz{Time: createdAt.Add(time.Minute), Valid: true}
+		read := createdAt.Add(time.Minute)
+		readAt = &read
 	}
-	row := &notificationsqlc.Notification{
+	row := &Notification{
 		ID:        repo.nextNotifID,
 		TenantID:  tenantID,
 		UserID:    userID,
 		Type:      "system.info",
 		Title:     title,
 		Body:      title + " body",
-		Data:      []byte(`{}`),
+		Data:      map[string]any{},
 		ReadAt:    readAt,
-		CreatedAt: pgtype.Timestamptz{Time: createdAt, Valid: true},
+		CreatedAt: createdAt,
 	}
 	repo.notifications[row.ID] = row
 	repo.nextNotifID++
@@ -93,7 +91,7 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 	svc := newTestService(repo, sender)
 	ctx := testContext(1)
 
-	_, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelInApp, Enabled: new(false)})
+	_, err := svc.SetPreference(ctx, 10, PreferenceUpdate{Type: "security.alert", Channel: ChannelInApp, Enabled: new(false)})
 	require.NoError(t, err)
 
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -105,9 +103,9 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 	assert.Empty(t, repo.notifications)
 	require.Len(t, sender.messages, 1)
 
-	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelInApp, Enabled: new(true)})
+	_, err = svc.SetPreference(ctx, 10, PreferenceUpdate{Type: "security.alert", Channel: ChannelInApp, Enabled: new(true)})
 	require.NoError(t, err)
-	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelEmail, Enabled: new(false)})
+	_, err = svc.SetPreference(ctx, 10, PreferenceUpdate{Type: "security.alert", Channel: ChannelEmail, Enabled: new(false)})
 	require.NoError(t, err)
 
 	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -119,7 +117,7 @@ func TestCreateHonorsChannelPreferences(t *testing.T) {
 	assert.Len(t, repo.notifications, 1)
 	assert.Len(t, sender.messages, 1, "disabled email channel must not enqueue")
 
-	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "security.alert", Channel: ChannelInApp, Enabled: new(false)})
+	_, err = svc.SetPreference(ctx, 10, PreferenceUpdate{Type: "security.alert", Channel: ChannelInApp, Enabled: new(false)})
 	require.NoError(t, err)
 	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: 10, Type: "security.alert", Title: "Suppressed", Body: "Body",
@@ -235,7 +233,7 @@ func TestCreateEmailOnlyWithoutTransactionManager(t *testing.T) {
 	svc := NewNotificationService(repo, recipients, sender, nil)
 	ctx := testContext(1)
 
-	_, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{Type: "system.info", Channel: ChannelInApp, Enabled: new(false)})
+	_, err := svc.SetPreference(ctx, 10, PreferenceUpdate{Type: "system.info", Channel: ChannelInApp, Enabled: new(false)})
 	require.NoError(t, err)
 
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -355,7 +353,7 @@ func TestPreferences(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, prefs)
 
-	pref, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{
+	pref, err := svc.SetPreference(ctx, 10, PreferenceUpdate{
 		Type: "security.alert", Channel: ChannelEmail, Enabled: new(false),
 	})
 	require.NoError(t, err)
@@ -363,7 +361,7 @@ func TestPreferences(t *testing.T) {
 	assert.Equal(t, int64(1), pref.TenantID)
 	assert.Equal(t, int64(10), pref.UserID)
 
-	same, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{
+	same, err := svc.SetPreference(ctx, 10, PreferenceUpdate{
 		Type: "security.alert", Channel: ChannelEmail, Enabled: new(true),
 	})
 	require.NoError(t, err)
@@ -374,7 +372,7 @@ func TestPreferences(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, prefs, 1)
 
-	for _, req := range []dto.UpdatePreferenceRequest{
+	for _, req := range []PreferenceUpdate{
 		{Type: "security.alert", Channel: "push", Enabled: new(true)},
 		{Type: "", Channel: ChannelEmail, Enabled: new(true)},
 		{Type: "Security.Alert", Channel: ChannelEmail, Enabled: new(true)},
@@ -428,7 +426,7 @@ func TestNotifyHonorsSuppressionAndQueueErrors(t *testing.T) {
 	ctx := testContext(1)
 
 	for _, channel := range []string{ChannelInApp, ChannelEmail} {
-		_, err := svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{
+		_, err := svc.SetPreference(ctx, 10, PreferenceUpdate{
 			Type: "system.info", Channel: channel, Enabled: new(false),
 		})
 		require.NoError(t, err)
@@ -439,7 +437,7 @@ func TestNotifyHonorsSuppressionAndQueueErrors(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, sender.messages)
 
-	_, err = svc.SetPreference(ctx, 10, dto.UpdatePreferenceRequest{
+	_, err = svc.SetPreference(ctx, 10, PreferenceUpdate{
 		Type: "system.info", Channel: ChannelEmail, Enabled: new(true),
 	})
 	require.NoError(t, err)

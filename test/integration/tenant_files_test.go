@@ -37,7 +37,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -88,20 +87,11 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('files-acme', 'Files Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "files-acme")
 
 	insertUser := func(tenantID int64, email string) int64 {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role)
-			 VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, strings.Split(email, "@")[0],
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "files-a@test.com")
 	userB := insertUser(tenantB, "files-b@test.com")
@@ -111,11 +101,11 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	tokenB, err := token.GenerateWithVersionAndTenant(userB, tenantB, "files-b@test.com", "admin", 0, tenantFilesSecret, 24)
 	require.NoError(t, err)
 
-	fileRepo := filesrepo.NewFileRepository(pool)
+	fileRepo := filesrepo.NewFileRepository(testutil.Scoped(pool))
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 
-	filesTx := filesrepo.NewTransactor(database.NewTxManager(pool), audit.NewPostgresRecorder(pool), nil)
+	filesTx := filesrepo.NewTransactor(testutil.NewTxManager(pool), audit.NewPostgresRecorder(testutil.Scoped(pool)), nil)
 	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
 	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store))
@@ -123,7 +113,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
-		identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool)),
+		identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants),
 		tenant.DefaultSlug,
 	))
 
@@ -346,7 +336,7 @@ func TestTenantFiles_Isolation(t *testing.T) {
 	// The admin adapter must carry the tenant id into contract types.
 	adminPage, err := adapter.NewAdminFiles(filesvc.NewAdminFileService(
 		h.fileRepo,
-		filesrepo.NewTransactor(database.NewTxManager(h.pool), audit.NewPostgresRecorder(h.pool), nil),
+		filesrepo.NewTransactor(testutil.NewTxManager(h.pool), audit.NewPostgresRecorder(testutil.Scoped(h.pool)), nil),
 		h.store,
 	)).ListFiles(ctxA, 10, "")
 	require.NoError(t, err)

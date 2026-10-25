@@ -270,10 +270,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # The baseline is split per owner (ADR 0005): apply every up file in
-      # version order, then every down file in reverse, then up again, so each
-      # down drops exactly what its up created.
-      - name: Apply baseline migrations up, down, and up again with psql
+      # Apply every up file in version order (the init, ADR 0012, then later
+      # migrations), every down file in reverse, then up again, so each down
+      # drops exactly what its up created.
+      - name: Apply migrations up, down, and up again with psql
         run: |
           expected_tables="tenants users refresh_tokens password_reset_tokens email_verification_tokens api_keys api_key_scopes files feature_flags feature_flag_targets notifications notification_preferences jobs scheduler_leases scheduler_runs audit_events webhook_endpoints webhook_endpoint_subscriptions webhook_endpoint_secrets webhook_events webhook_deliveries webhook_delivery_attempts webhook_inbound_sources webhook_inbound_events"
           apply() {
@@ -324,6 +324,25 @@ jobs:
             "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('tenants', 'users', 'refresh_tokens', 'password_reset_tokens', 'email_verification_tokens', 'api_keys', 'api_key_scopes', 'files', 'feature_flags', 'feature_flag_targets', 'notifications', 'notification_preferences', 'jobs', 'scheduler_leases', 'scheduler_runs', 'audit_events', 'webhook_endpoints', 'webhook_endpoint_subscriptions', 'webhook_endpoint_secrets', 'webhook_events', 'webhook_deliveries', 'webhook_delivery_attempts', 'webhook_inbound_sources', 'webhook_inbound_events')")
           if [ "$migrated_tables" -ne 24 ]; then
             echo "::error::expected 24 tables after cmd/migrate, found $migrated_tables"
+            exit 1
+          fi
+
+      - name: Create the non-superuser app role and verify RLS
+        run: |
+          psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
+            -v app_user=app -v app_password=app -v owner="$DB_USERNAME" -v schema=public \
+            -f deploy/postgres/database-roles.sql
+          unsafe=$(psql -h "$DB_HOST" -U app -d "$DB_DATABASE" -tAc \
+            "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user")
+          if [ "$unsafe" != "f" ]; then
+            echo "::error::the app role must be a non-superuser without BYPASSRLS"
+            exit 1
+          fi
+          guarded=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relrowsecurity AND c.relforcerowsecurity")
+          if [ "$guarded" -ne 23 ]; then
+            echo "::error::expected 23 tables with forced RLS, found $guarded"
             exit 1
           fi
 

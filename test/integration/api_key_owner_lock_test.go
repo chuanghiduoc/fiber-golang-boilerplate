@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
-	apikeydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto"
 	apikeyrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/repository"
 	apikeyservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
@@ -24,7 +23,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 type ownerLockHarness struct {
@@ -45,24 +43,19 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	t.Cleanup(cleanup)
 
 	insertAdmin := func(email string) int64 {
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, $2, 'admin') RETURNING id`,
-			tenant.DefaultID, email,
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenant.DefaultID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	owner := insertAdmin("lock-owner@test.com")
-	insertAdmin("lock-other-admin@test.com") // the owner is not the last admin
+	insertAdmin("lock-other-admin@test.com") // the owner is not the last owner
 
-	txManager := database.NewTxManager(pool)
-	userRepo := identityrepo.NewUserRepository(pool)
-	principals := identityadapter.NewPrincipalReader(userRepo)
+	txManager := testutil.NewTxManager(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	principals := identityadapter.NewPrincipalReader(stores.Memberships)
 	keyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	return &ownerLockHarness{
 		pool:     pool,
-		keys:     apikeyservice.NewService(keyRepo, principals, txManager, audit.Noop{}),
-		admin:    identityservice.NewAdminUserService(userRepo, identityrepo.NewRefreshTokenRepository(pool), txManager, audit.Noop{}),
+		keys:     apikeyservice.NewService(keyRepo, principals, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals)),
+		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil), nil),
 		verifier: apikey.NewVerifier(apikeyadapter.NewVerifierStore(keyRepo), principals),
 		owner:    owner,
 	}
@@ -72,8 +65,8 @@ func ownerLockCtx() context.Context {
 	return authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 }
 
-func (h *ownerLockHarness) createKey(ctx context.Context) (*apikeydto.KeyWithSecretResponse, error) {
-	return h.keys.Create(ctx, h.owner, apikeydto.CreateRequest{Name: "lock", Scopes: []string{"files:read"}})
+func (h *ownerLockHarness) createKey(ctx context.Context) (*apikeyservice.CreatedKey, error) {
+	return h.keys.Create(ctx, h.owner, apikeyservice.CreateInput{Name: "lock", Scopes: []string{"files:read"}})
 }
 
 // A key created while its owner's ban is in flight must not be minted: the
@@ -84,8 +77,9 @@ func TestAPIKeyCreateWaitsForInFlightBan(t *testing.T) {
 
 	ban, err := h.pool.Begin(ctx)
 	require.NoError(t, err)
-	_, err = ban.Exec(ctx, `UPDATE users SET deleted_at = NOW(), banned_at = NOW(),
-		credentials_revoked_at = clock_timestamp() WHERE id = $1`, h.owner)
+	_, err = ban.Exec(ctx, `UPDATE memberships SET status = 'suspended', banned_at = NOW(),
+		credentials_revoked_at = clock_timestamp() WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, h.owner)
 	require.NoError(t, err)
 
 	done := make(chan error, 1)
@@ -129,19 +123,19 @@ func TestAPIKeyCreatedDuringBanStaysRevokedAfterUnban(t *testing.T) {
 	keyTx, err := h.pool.Begin(ctx)
 	require.NoError(t, err)
 	defer func() { _ = keyTx.Rollback(ctx) }()
-	_, err = identityadapter.NewPrincipalReader(identityrepo.NewUserRepository(h.pool)).
+	_, err = identityadapter.NewPrincipalReader(identityrepo.NewMembershipRepository(h.pool)).
 		LockPrincipalTx(ctx, keyTx, tenant.DefaultID, h.owner)
 	require.NoError(t, err)
 	credentials, err := apikey.Generate()
 	require.NoError(t, err)
-	_, err = apikeyrepo.NewAPIKeyRepository(keyTx).Create(ctx, apikeyrepo.CreateParams{
+	_, err = apikeyrepo.NewAPIKeyRepository(keyTx).Create(ctx, apikeyservice.NewKey{
 		UserID: h.owner, Name: "racing", Prefix: credentials.Prefix, Hash: credentials.Hash,
 	})
 	require.NoError(t, err)
 
 	banned := make(chan error, 1)
 	go func() {
-		_, banErr := identityrepo.NewUserRepository(banTx).Ban(ctx, h.owner)
+		_, banErr := identityrepo.NewMembershipRepository(banTx).Ban(ctx, h.owner)
 		banned <- banErr
 	}()
 	time.Sleep(300 * time.Millisecond) // the ban UPDATE is now blocked on the owner row

@@ -15,14 +15,17 @@ import (
 // an open transaction.
 const rollbackTimeout = 5 * time.Second
 
-// TxManager manages database transactions.
+// TxManager manages database transactions. Every transaction starts with the
+// RLS scope resolved from its context, so a pooled connection is never reused
+// with another tenant's settings.
 type TxManager struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	resolve ScopeResolver
 }
 
 // NewTxManager creates a new TxManager.
-func NewTxManager(pool *pgxpool.Pool) *TxManager {
-	return &TxManager{pool: pool}
+func NewTxManager(pool *pgxpool.Pool, opts ...ScopeOption) *TxManager {
+	return &TxManager{pool: pool, resolve: newScopeConfig(opts).resolve}
 }
 
 // WithTx executes fn within a database transaction.
@@ -61,6 +64,11 @@ func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) (err 
 		}
 		err = fmt.Errorf("rollback failed: %w", rbErr)
 	}()
+
+	tenant, bypass := scopeArgs(tm.resolve(ctx))
+	if _, err := tx.Exec(ctx, setScopeSQL, tenant, bypass); err != nil {
+		return fmt.Errorf("set transaction scope: %w", err)
+	}
 
 	if err := fn(tx); err != nil {
 		return err

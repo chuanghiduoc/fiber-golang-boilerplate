@@ -46,20 +46,28 @@ type ResendVerificationRequest struct {
 	Email string `json:"email" validate:"required,email,max=255"`
 }
 
+// UserResponse is a global user as seen from one tenant: identity fields
+// come from the user, role/status/joinedAt/bannedAt from the membership.
 type UserResponse struct {
-	ID            int64      `json:"id"`
-	Email         string     `json:"email"`
-	Name          string     `json:"name"`
-	Role          string     `json:"role"`
-	EmailVerified bool       `json:"emailVerified"`
-	HasPassword   bool       `json:"hasPassword"`
-	CreatedAt     time.Time  `json:"createdAt"`
-	UpdatedAt     time.Time  `json:"updatedAt"`
-	DeletedAt     *time.Time `json:"deletedAt,omitempty"`
-	BannedAt      *time.Time `json:"bannedAt,omitempty"`
+	ID    int64  `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	// Role is the highest system role key (owner, admin, or member).
+	Role string `json:"role"`
+	// Roles lists every role assigned in TenantID.
+	Roles []string `json:"roles"`
+	// MembershipStatus is active, suspended (banned), or removed.
+	MembershipStatus string     `json:"membershipStatus" enums:"active,suspended,removed"`
+	EmailVerified    bool       `json:"emailVerified"`
+	HasPassword      bool       `json:"hasPassword"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UpdatedAt        time.Time  `json:"updatedAt"`
+	JoinedAt         time.Time  `json:"joinedAt"`
+	DeletedAt        *time.Time `json:"deletedAt,omitempty"`
+	BannedAt         *time.Time `json:"bannedAt,omitempty"`
 	// TokenVersion is internal and must never be serialized to clients.
 	TokenVersion int32 `json:"-"`
-	// TenantID identifies the owning tenant. It is additive and read-only.
+	// TenantID is the tenant this view (membership) belongs to.
 	TenantID int64 `json:"tenantId"`
 }
 
@@ -67,4 +75,10 @@ type LoginResponse struct {
 	AccessToken  string       `json:"accessToken"`
 	RefreshToken string       `json:"refreshToken"`
 	User         UserResponse `json:"user"`
+	// MFARequired is true when the password or Google sign-in succeeded but a
+	// second factor is needed. Tokens are empty in that case; the caller
+	// completes the sign-in with MFAChallengeToken at /auth/mfa/verify.
+	MFARequired bool `json:"mfaRequired,omitempty"`
+	// MFAChallengeToken is a five-minute, single-use, tenant-bound challenge.
+	MFAChallengeToken string `json:"mfaChallengeToken,omitempty"`
 }

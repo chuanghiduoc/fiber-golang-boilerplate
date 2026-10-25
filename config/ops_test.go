@@ -219,4 +219,14 @@ func TestDBConfig_QueryExecModeAndMigrationTarget(t *testing.T) {
 	if db.Host != "pgbouncer" {
 		t.Fatal("ForMigration must not modify the API settings")
 	}
+
+	db = DBConfig{Host: "db", Username: "app", Password: "app-password"}
+	db.MigrateUsername, db.MigratePassword = "owner", "owner-password"
+	got := db.ForMigration()
+	if got.Username != "owner" || got.Password != "owner-password" {
+		t.Fatalf("ForMigration() credentials = %q/%q, want the DB_MIGRATE_* role", got.Username, got.Password)
+	}
+	if db.Username != "app" || db.Password != "app-password" {
+		t.Fatal("ForMigration must not modify the API credentials")
+	}
 }

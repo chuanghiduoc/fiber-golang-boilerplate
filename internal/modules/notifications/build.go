@@ -7,6 +7,7 @@ import (
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
+	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
 	notificationsrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -22,21 +23,20 @@ type Settings struct {
 	RetentionDays int32
 }
 
-// The repository cannot assert this itself (import cycle with the legacy
-// service), so the composition point does.
-var _ notificationsservice.RetentionRepository = (*notificationsrepo.RetentionRepository)(nil)
-
 // Build constructs the notification feed, preferences, and email channel.
 // Identity supplies the email recipient through the contract, and the queued
 // sender writes the email job into the shared outbox in the same transaction
 // as the in-app row.
 func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup, settings Settings) *Module {
-	repo := notificationsrepo.NewNotificationRepository(infra.Pool)
-	svc := notificationsservice.NewNotificationService(repo, recipients, infra.Email, infra.Tx)
+	repo := notificationsrepo.NewNotificationRepository(infra.DB)
+	svc := notificationsservice.NewNotificationService(
+		repo, recipients, infra.Email, notificationsrepo.NewTransactor(infra.Tx, infra.Email))
 	m := New(notificationshandler.New(svc))
+	m.notifier = svc
+	m.privacy = notificationsprivacy.New(notificationsrepo.NewPrivacyStore(infra.DB))
 	if settings.RetentionDays > 0 {
 		m.retentionPurger = notificationsservice.NewRetentionPurger(
-			notificationsrepo.NewRetentionRepository(infra.Pool), settings.RetentionDays)
+			notificationsrepo.NewRetentionRepository(infra.DB), settings.RetentionDays)
 	}
 	return m
 }

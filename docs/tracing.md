@@ -188,7 +188,7 @@ the collector.
 
 ## Schema upgrade note
 
-`jobs.trace_parent` is part of the baseline (`migrations/20260101000200_platform_jobs.up.sql`) for
+`jobs.trace_parent` is part of the init migration (`migrations/20260101000000_platform_init_schema.up.sql`) for
 fresh installs. The project has no deployed database yet, so no new migration
 file was added. If a database applied the former consolidated `000001`
 baseline (version 1) before this column existed, add the column

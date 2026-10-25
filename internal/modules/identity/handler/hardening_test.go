@@ -12,14 +12,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 func TestGetByID_OtherUserForbidden(t *testing.T) {
 	svc := newMockService()
-	svc.users[2] = &dto.UserResponse{ID: 2, Email: "other@example.com", Name: "Other", Role: "user"}
+	svc.users[2] = testMember(2, "other@example.com", "Other", "user")
 	app := setupApp(svc)
 
 	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)
@@ -88,7 +87,7 @@ func TestLogoutAll_RequiresAuth(t *testing.T) {
 func TestUserList_ReturnsNextCursor(t *testing.T) {
 	svc := newMockService()
 	svc.hasMore = true
-	svc.users[1].CreatedAt = time.Now()
+	svc.users[1].User.CreatedAt = time.Now()
 	app := setupApp(svc)
 
 	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "test-secret", 24)

@@ -11,13 +11,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -214,7 +214,6 @@ func WithTracerProvider(tp trace.TracerProvider) Option {
 
 // Worker claims due jobs and dispatches them to registered handlers.
 type Worker struct {
-	pool              *pgxpool.Pool
 	id                string
 	pollInterval      time.Duration
 	concurrency       int
@@ -238,15 +237,15 @@ type Worker struct {
 	store store
 }
 
-// NewWorker returns a worker that claims jobs through pool. workerID is
-// recorded in jobs.locked_by; an empty value becomes "worker".
-func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
+// NewWorker returns a worker that claims jobs through db (a Scoped handle in
+// production). workerID is recorded in jobs.locked_by; an empty value becomes
+// "worker".
+func NewWorker(db database.DBTX, workerID string, opts ...Option) *Worker {
 	if strings.TrimSpace(workerID) == "" {
 		workerID = "worker"
 	}
 
 	w := &Worker{
-		pool:              pool,
 		id:                workerID,
 		pollInterval:      defaultPollInterval,
 		concurrency:       defaultConcurrency,
@@ -266,7 +265,7 @@ func NewWorker(pool *pgxpool.Pool, workerID string, opts ...Option) *Worker {
 		}
 	}
 	w.normalizeLease()
-	w.store = &pgStore{pool: pool, includeKinds: w.includeKinds, excludeKinds: w.excludeKinds}
+	w.store = &pgStore{db: db, includeKinds: w.includeKinds, excludeKinds: w.excludeKinds}
 	return w
 }
 

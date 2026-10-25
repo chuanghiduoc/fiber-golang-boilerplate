@@ -10,7 +10,6 @@ import (
 
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -67,137 +66,80 @@ func (f *fakeFilesAdmin) GetFileStats(context.Context) (filescontracts.FileStats
 	return f.stats, f.err
 }
 
-func newTestService(identity *fakeIdentityAdmin, files *fakeFilesAdmin) Service {
-	return NewService(identity, files)
-}
-
-func TestListUsers(t *testing.T) {
-	now := time.Now()
-	deleted := now.Add(-time.Hour)
-	svc := newTestService(&fakeIdentityAdmin{users: identitycontracts.UserPage{
-		Items: []identitycontracts.User{{
-			ID: 7, Email: "u@example.com", Name: "U", Role: admindto.RoleUser,
-			EmailVerified: true, HasPassword: true, CreatedAt: now, UpdatedAt: now, DeletedAt: &deleted,
-		}},
-		HasMore: true,
-	}}, &fakeFilesAdmin{})
-
-	users, hasMore, err := svc.ListUsers(context.Background(), 20, "")
+func TestListUsersPassesOwnerPage(t *testing.T) {
+	page := identitycontracts.UserPage{Items: []identitycontracts.User{{ID: 7, Role: RoleMember}}, HasMore: true}
+	got, err := NewService(&fakeIdentityAdmin{users: page}, &fakeFilesAdmin{}).ListUsers(context.Background(), 20, "")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("ListUsers: %v", err)
 	}
-	if !hasMore {
-		t.Error("HasMore should be preserved")
-	}
-	if len(users) != 1 || users[0].ID != 7 || users[0].DeletedAt == nil {
-		t.Fatalf("users = %+v", users)
+	if !got.HasMore || len(got.Items) != 1 || got.Items[0].ID != 7 {
+		t.Fatalf("ListUsers = %+v, want the owner page", got)
 	}
 }
 
 func TestUpdateRoleRejectsUnknownRole(t *testing.T) {
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{})
-
-	_, err := svc.UpdateRole(context.Background(), 1, "superuser")
+	_, err := NewService(&fakeIdentityAdmin{}, &fakeFilesAdmin{}).UpdateRole(context.Background(), 1, "superuser")
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 400 {
-		t.Fatalf("expected bad request, got %v", err)
+		t.Fatalf("UpdateRole(superuser) error = %v, want 400", err)
 	}
 }
 
-func TestUpdateRoleMapsUser(t *testing.T) {
-	now := time.Now()
-	svc := newTestService(&fakeIdentityAdmin{roleUser: identitycontracts.User{
-		ID: 1, Email: "u@example.com", Name: "U", Role: admindto.RoleUser, CreatedAt: now, UpdatedAt: now,
-	}}, &fakeFilesAdmin{})
-
-	user, err := svc.UpdateRole(context.Background(), 1, admindto.RoleAdmin)
+func TestUpdateRoleAcceptsLegacyUserAsMember(t *testing.T) {
+	svc := NewService(&fakeIdentityAdmin{roleUser: identitycontracts.User{ID: 1}}, &fakeFilesAdmin{})
+	user, err := svc.UpdateRole(context.Background(), 1, "user")
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("UpdateRole(user): %v", err)
 	}
-	if user.Role != admindto.RoleAdmin || user.ID != 1 {
-		t.Fatalf("user = %+v", user)
+	if user.Role != RoleMember {
+		t.Fatalf("role = %q, want %q", user.Role, RoleMember)
 	}
 }
 
-func TestListFilesMapsAdminURL(t *testing.T) {
-	now := time.Now()
-	deleted := now.Add(-time.Hour)
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{files: filescontracts.FilePage{
-		Items: []filescontracts.File{
-			{ID: 1, OriginalName: "active.txt", CreatedAt: now},
-			{ID: 2, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: &deleted},
-		},
-	}})
-
-	files, _, err := svc.ListFiles(context.Background(), 20, "")
+func TestUpdateRoleReturnsOwnerUser(t *testing.T) {
+	svc := NewService(&fakeIdentityAdmin{roleUser: identitycontracts.User{ID: 1}}, &fakeFilesAdmin{})
+	user, err := svc.UpdateRole(context.Background(), 1, RoleAdmin)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("UpdateRole: %v", err)
 	}
-	if files[0].URL != "/api/v1/admin/files/1/download" {
-		t.Errorf("active URL = %q", files[0].URL)
-	}
-	if files[1].URL != "" || files[1].DeletedAt == nil {
-		t.Errorf("deleted file = %+v", files[1])
+	if user.ID != 1 || user.Role != RoleAdmin {
+		t.Fatalf("UpdateRole = %+v, want user 1 with role admin", user)
 	}
 }
 
-func TestDownloadReturnsReader(t *testing.T) {
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{download: filescontracts.FileDownload{
-		File:   filescontracts.File{ID: 3, OriginalName: "f.bin", MimeType: "application/octet-stream", Size: 3},
-		Reader: io.NopCloser(bytes.NewReader([]byte("abc"))),
-	}})
-
-	file, reader, err := svc.Download(context.Background(), 3)
+func TestDownloadPassesFileAndReader(t *testing.T) {
+	reader := io.NopCloser(bytes.NewReader([]byte("data")))
+	file := filescontracts.File{ID: 3, MimeType: "image/png", Size: 4, CreatedAt: time.Now()}
+	svc := NewService(&fakeIdentityAdmin{}, &fakeFilesAdmin{download: filescontracts.FileDownload{File: file, Reader: reader}})
+	got, err := svc.Download(context.Background(), 3)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("Download: %v", err)
 	}
-	defer func() { _ = reader.Close() }()
-	if file.URL != "/api/v1/admin/files/3/download" {
-		t.Errorf("URL = %q", file.URL)
-	}
-	data, _ := io.ReadAll(reader)
-	if string(data) != "abc" {
-		t.Errorf("payload = %q", data)
-	}
-}
-
-func TestRestoreFileMapsResponse(t *testing.T) {
-	now := time.Now()
-	svc := newTestService(&fakeIdentityAdmin{}, &fakeFilesAdmin{restored: filescontracts.File{
-		ID: 4, OriginalName: "r.txt", CreatedAt: now,
-	}})
-
-	file, err := svc.RestoreFile(context.Background(), 4)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if file.DeletedAt != nil || file.URL != "/api/v1/admin/files/4/download" {
-		t.Fatalf("file = %+v", file)
+	if got.File.ID != 3 || got.Reader != reader {
+		t.Fatalf("Download = %+v, want the owner file and reader", got)
 	}
 }
 
 func TestGetStatsComposesOwnerQueries(t *testing.T) {
-	svc := newTestService(
-		&fakeIdentityAdmin{stats: identitycontracts.UserStats{ActiveUsers: 10, DeletedUsers: 2}},
-		&fakeFilesAdmin{stats: filescontracts.FileStats{TotalFiles: 5, TotalFileSize: 50000}},
+	svc := NewService(
+		&fakeIdentityAdmin{stats: identitycontracts.UserStats{ActiveUsers: 5, DeletedUsers: 2}},
+		&fakeFilesAdmin{stats: filescontracts.FileStats{TotalFiles: 9, TotalFileSize: 1024}},
 	)
-
 	stats, err := svc.GetStats(context.Background())
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("GetStats: %v", err)
 	}
-	want := admindto.AdminStatsResponse{ActiveUsers: 10, DeletedUsers: 2, TotalFiles: 5, TotalFileSize: 50000}
-	if *stats != want {
-		t.Errorf("stats = %+v, want %+v", *stats, want)
+	want := Stats{ActiveUsers: 5, DeletedUsers: 2, TotalFiles: 9, TotalFileSize: 1024}
+	if stats != want {
+		t.Fatalf("GetStats = %+v, want %+v", stats, want)
 	}
 }
 
-func TestGetStatsWrapsOwnerFailure(t *testing.T) {
-	svc := newTestService(&fakeIdentityAdmin{err: apperror.NewInternal("boom")}, &fakeFilesAdmin{})
-
+func TestGetStatsHidesOwnerFailure(t *testing.T) {
+	svc := NewService(&fakeIdentityAdmin{}, &fakeFilesAdmin{err: errors.New("db down")})
 	_, err := svc.GetStats(context.Background())
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 500 || appErr.Detail != "failed to get system stats" {
-		t.Fatalf("expected stable system stats error, got %v", err)
+		t.Fatalf("GetStats error = %v, want public 500", err)
 	}
 }

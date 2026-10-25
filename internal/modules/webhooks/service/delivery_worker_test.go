@@ -16,10 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -37,14 +33,14 @@ func TestDeliveryWorker_InvalidPayloadIsPermanent(t *testing.T) {
 }
 
 type fakeWorkerStore struct {
-	delivery   *repository.Delivery
+	delivery   *Delivery
 	claimErr   error
 	getErr     error
-	attempts   []repository.AttemptDraft
+	attempts   []AttemptDraft
 	succeeded  bool
 	dead       bool
 	deadReason string
-	retryDraft *repository.RetryDraft
+	retryDraft *RetryDraft
 	expire     bool
 	expired    bool
 	// rejectCanceled makes bookkeeping writes fail on a canceled context,
@@ -52,7 +48,7 @@ type fakeWorkerStore struct {
 	rejectCanceled bool
 	// activeSecret is the endpoint's current secret; nil means the snapshot
 	// is still active.
-	activeSecret *repository.SigningSecret
+	activeSecret *SigningSecret
 	// leaseLost makes every fenced outcome write match no row.
 	leaseLost bool
 	// fencedAttempts records the attempt each fenced write was fenced on.
@@ -62,14 +58,14 @@ type fakeWorkerStore struct {
 	beforeAttempt func()
 }
 
-func (f *fakeWorkerStore) ActiveSigningSecret(context.Context, int64) (*repository.SigningSecret, error) {
+func (f *fakeWorkerStore) ActiveSigningSecret(context.Context, int64) (*SigningSecret, error) {
 	if f.activeSecret != nil {
 		return f.activeSecret, nil
 	}
 	if f.delivery == nil {
 		return nil, errors.New("not found")
 	}
-	return &repository.SigningSecret{Ciphertext: f.delivery.SecretCiphertext}, nil
+	return &SigningSecret{Ciphertext: f.delivery.SecretCiphertext}, nil
 }
 
 func (f *fakeWorkerStore) ReleaseDeliveryClaim(ctx context.Context, _ int64, attempt int32) error {
@@ -78,7 +74,7 @@ func (f *fakeWorkerStore) ReleaseDeliveryClaim(ctx context.Context, _ int64, att
 	}
 	f.fencedAttempts = append(f.fencedAttempts, attempt)
 	if f.leaseLost {
-		return repository.ErrDeliveryLeaseLost
+		return ErrDeliveryLeaseLost
 	}
 	f.released = true
 	return nil
@@ -89,19 +85,19 @@ func (f *fakeWorkerStore) ExpireUnclaimableDelivery(context.Context, int64) (boo
 	return f.expire, nil
 }
 
-func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (*repository.Delivery, error) {
+func (f *fakeWorkerStore) ClaimDelivery(context.Context, int64, time.Duration) (*Delivery, error) {
 	if f.claimErr != nil {
 		return nil, f.claimErr
 	}
 	if f.delivery == nil {
-		return nil, repository.ErrNotClaimable
+		return nil, ErrNotClaimable
 	}
 	clone := *f.delivery
 	clone.Attempts++
 	return &clone, nil
 }
 
-func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*repository.Delivery, error) {
+func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*Delivery, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -114,7 +110,7 @@ func (f *fakeWorkerStore) GetDelivery(context.Context, int64) (*repository.Deliv
 func (f *fakeWorkerStore) MarkDeliverySucceeded(_ context.Context, _ int64, attempt int32, _ int) error {
 	f.fencedAttempts = append(f.fencedAttempts, attempt)
 	if f.leaseLost {
-		return repository.ErrDeliveryLeaseLost
+		return ErrDeliveryLeaseLost
 	}
 	f.succeeded = true
 	return nil
@@ -123,26 +119,26 @@ func (f *fakeWorkerStore) MarkDeliverySucceeded(_ context.Context, _ int64, atte
 func (f *fakeWorkerStore) MarkDeliveryDead(_ context.Context, _ int64, attempt int32, _ int, reason string) error {
 	f.fencedAttempts = append(f.fencedAttempts, attempt)
 	if f.leaseLost {
-		return repository.ErrDeliveryLeaseLost
+		return ErrDeliveryLeaseLost
 	}
 	f.dead = true
 	f.deadReason = reason
 	return nil
 }
 
-func (f *fakeWorkerStore) RescheduleDeliveryWithJob(ctx context.Context, draft repository.RetryDraft) error {
+func (f *fakeWorkerStore) RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error {
 	if f.rejectCanceled && ctx.Err() != nil {
 		return ctx.Err()
 	}
 	f.fencedAttempts = append(f.fencedAttempts, draft.Attempt)
 	if f.leaseLost {
-		return repository.ErrDeliveryLeaseLost
+		return ErrDeliveryLeaseLost
 	}
 	f.retryDraft = &draft
 	return nil
 }
 
-func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft repository.AttemptDraft) error {
+func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error {
 	if f.beforeAttempt != nil {
 		f.beforeAttempt()
 	}
@@ -153,29 +149,27 @@ func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft repos
 	return nil
 }
 
-func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *repository.Delivery {
+func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *Delivery {
 	created := time.Date(2026, 10, 24, 11, 59, 0, 0, time.UTC)
-	return &repository.Delivery{
-		WebhookDelivery: webhooksqlc.WebhookDelivery{
-			ID:               7,
-			TenantID:         1,
-			EndpointID:       2,
-			EventID:          "evt_1",
-			Url:              url,
-			SecretCiphertext: ciphertext,
-			Status:           "pending",
-			Attempts:         attempts,
-			MaxAttempts:      maxAttempts,
-			NextAttemptAt:    pgtype.Timestamptz{Time: created, Valid: true},
-			CreatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
-			UpdatedAt:        pgtype.Timestamptz{Time: created, Valid: true},
-		},
-		EventType:   "file.uploaded",
-		DataVersion: 1,
-		ActorType:   "user",
-		ActorID:     "3",
-		OccurredAt:  pgtype.Timestamptz{Time: created, Valid: true},
-		Payload:     []byte(`{"fileId":9}`),
+	return &Delivery{
+		ID:               7,
+		TenantID:         1,
+		EndpointID:       2,
+		EventID:          "evt_1",
+		URL:              url,
+		SecretCiphertext: ciphertext,
+		Status:           "pending",
+		Attempts:         attempts,
+		MaxAttempts:      maxAttempts,
+		NextAttemptAt:    created,
+		CreatedAt:        created,
+		UpdatedAt:        created,
+		EventType:        "file.uploaded",
+		DataVersion:      1,
+		ActorType:        "user",
+		ActorID:          "3",
+		OccurredAt:       created,
+		Payload:          []byte(`{"fileId":9}`),
 	}
 }
 
@@ -275,7 +269,7 @@ func TestDeliveryWorker_SuccessSignsAndRecordsAttempt(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3)}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}
@@ -300,7 +294,7 @@ func TestDeliveryWorker_PermanentFailureIsDead(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3)}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}
@@ -323,7 +317,7 @@ func TestDeliveryWorker_RetryAfterSchedulesNextJob(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3)}
 	worker, now := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}
@@ -351,7 +345,7 @@ func TestDeliveryWorker_ExhaustedRetriesAreDead(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 2, 3)}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}
@@ -371,7 +365,7 @@ func TestDeliveryWorker_RedirectAndBlockedTargetAreDead(t *testing.T) {
 		store := &fakeWorkerStore{delivery: fixedDelivery(redirect.URL, ciphertext, 0, 3)}
 		worker, _ := testWorker(store, loopbackWebhookClient(t))
 		worker.codec = codec
-		payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+		payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 		if err := worker.Handle(context.Background(), payload); err != nil {
 			t.Fatalf("Handle(): %v", err)
 		}
@@ -386,7 +380,7 @@ func TestDeliveryWorker_RedirectAndBlockedTargetAreDead(t *testing.T) {
 		store := &fakeWorkerStore{delivery: fixedDelivery(redirect.URL, ciphertext, 0, 3)}
 		worker, _ := testWorker(store, client)
 		worker.codec = codec
-		payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+		payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 		if err := worker.Handle(context.Background(), payload); err != nil {
 			t.Fatalf("Handle(): %v", err)
 		}
@@ -400,11 +394,11 @@ func TestDeliveryWorker_NotClaimable(t *testing.T) {
 	codec, ciphertext := testCodec(t)
 	store := &fakeWorkerStore{
 		delivery: fixedDelivery("https://example.com/hook", ciphertext, 0, 3),
-		claimErr: repository.ErrNotClaimable,
+		claimErr: ErrNotClaimable,
 	}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 
 	if err := worker.Handle(context.Background(), payload); err == nil {
 		t.Fatal("pending delivery with an active claim should retry the job")
@@ -443,7 +437,7 @@ func TestDeliveryWorker_RecordsAttemptAfterShutdownCancel(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3), rejectCanceled: true, beforeAttempt: cancel}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(ctx, payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}
@@ -468,11 +462,11 @@ func TestDeliveryWorker_AppliesEndpointTimeout(t *testing.T) {
 	defer close(release)
 
 	delivery := fixedDelivery(server.URL, ciphertext, 0, 3)
-	delivery.TimeoutMs = 100
+	delivery.TimeoutMS = 100
 	store := &fakeWorkerStore{delivery: delivery}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 
 	started := time.Now()
 	if err := worker.Handle(context.Background(), payload); err != nil {
@@ -519,7 +513,7 @@ func TestDeliveryWorker_ShutdownBeforeResponseReleasesAttempt(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 2, 3), rejectCanceled: true}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 
 	err := worker.Handle(ctx, payload)
 	if !errors.Is(err, context.Canceled) {
@@ -551,7 +545,7 @@ func TestDeliveryWorker_StaleOutcomeIsDiscarded(t *testing.T) {
 		store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 1, 3), leaseLost: lost}
 		worker, _ := testWorker(store, loopbackWebhookClient(t))
 		worker.codec = codec
-		payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+		payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 		if err := worker.Handle(context.Background(), payload); err != nil {
 			t.Fatalf("leaseLost=%v: Handle(): %v", lost, err)
 		}
@@ -599,11 +593,11 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 
 			store := &fakeWorkerStore{
 				delivery:     fixedDelivery(server.URL, oldCiphertext, 0, 3),
-				activeSecret: &repository.SigningSecret{Ciphertext: newCiphertext, CreatedAt: tc.rotatedAt},
+				activeSecret: &SigningSecret{Ciphertext: newCiphertext, CreatedAt: tc.rotatedAt},
 			}
 			worker, _ := testWorker(store, loopbackWebhookClient(t))
 			worker.codec = codec
-			payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+			payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 			if err := worker.Handle(context.Background(), payload); err != nil {
 				t.Fatalf("Handle(): %v", err)
 			}
@@ -640,7 +634,7 @@ func TestDeliveryWorker_LegacySecretIsDead(t *testing.T) {
 	store := &fakeWorkerStore{delivery: fixedDelivery("https://example.com/hook", legacy, 0, 3)}
 	worker, _ := testWorker(store, loopbackWebhookClient(t))
 	worker.codec = codec
-	payload, _ := json.Marshal(repository.DeliveryJobPayload{DeliveryID: 7})
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
 	if err := worker.Handle(context.Background(), payload); err != nil {
 		t.Fatalf("Handle(): %v", err)
 	}

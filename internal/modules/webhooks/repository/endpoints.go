@@ -5,19 +5,36 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	webhooksvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
+func toEndpoint(row webhooksqlc.WebhookEndpoint, eventTypes []string) webhooksvc.Endpoint {
+	return webhooksvc.Endpoint{
+		ID:          row.ID,
+		TenantID:    row.TenantID,
+		URL:         row.Url,
+		Description: row.Description,
+		EventTypes:  eventTypes,
+		Status:      row.Status,
+		MaxAttempts: row.MaxAttempts,
+		TimeoutMS:   row.TimeoutMs,
+		CreatedAt:   row.CreatedAt.Time,
+		UpdatedAt:   row.UpdatedAt.Time,
+		DeletedAt:   timePtr(row.DeletedAt),
+	}
+}
+
 // CreateEndpoint inserts the endpoint, its subscriptions, and its first
 // secret in one transaction.
-func (r *Postgres) CreateEndpoint(ctx context.Context, draft CreateEndpointDraft) (*Endpoint, error) {
-	if r == nil || r.pool == nil {
+func (r *Postgres) CreateEndpoint(ctx context.Context, draft webhooksvc.CreateEndpointDraft) (*webhooksvc.Endpoint, error) {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)
-	var endpoint *Endpoint
+	var endpoint *webhooksvc.Endpoint
 	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
 		created, err := q.CreateWebhookEndpoint(ctx, webhooksqlc.CreateWebhookEndpointParams{
 			TenantID:    tid,
@@ -45,7 +62,8 @@ func (r *Postgres) CreateEndpoint(ctx context.Context, draft CreateEndpointDraft
 		}); err != nil {
 			return err
 		}
-		endpoint = &Endpoint{WebhookEndpoint: created, EventTypes: draft.EventTypes}
+		mapped := toEndpoint(created, draft.EventTypes)
+		endpoint = &mapped
 		return nil
 	})
 	if err != nil {
@@ -54,7 +72,7 @@ func (r *Postgres) CreateEndpoint(ctx context.Context, draft CreateEndpointDraft
 	return endpoint, nil
 }
 
-func (r *Postgres) GetEndpoint(ctx context.Context, id int64) (*Endpoint, error) {
+func (r *Postgres) GetEndpoint(ctx context.Context, id int64) (*webhooksvc.Endpoint, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -65,10 +83,11 @@ func (r *Postgres) GetEndpoint(ctx context.Context, id int64) (*Endpoint, error)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
-	return &Endpoint{WebhookEndpoint: row.WebhookEndpoint, EventTypes: row.EventTypes}, nil
+	endpoint := toEndpoint(row.WebhookEndpoint, row.EventTypes)
+	return &endpoint, nil
 }
 
-func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]Endpoint, error) {
+func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]webhooksvc.Endpoint, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -81,21 +100,21 @@ func (r *Postgres) ListEndpoints(ctx context.Context, cur pagination.DBCursor) (
 	if err != nil {
 		return nil, err
 	}
-	out := make([]Endpoint, len(rows))
+	out := make([]webhooksvc.Endpoint, len(rows))
 	for i, row := range rows {
-		out[i] = Endpoint{WebhookEndpoint: row.WebhookEndpoint, EventTypes: row.EventTypes}
+		out[i] = toEndpoint(row.WebhookEndpoint, row.EventTypes)
 	}
 	return out, nil
 }
 
 // UpdateEndpoint replaces the endpoint configuration and its subscription set
 // in one transaction.
-func (r *Postgres) UpdateEndpoint(ctx context.Context, draft UpdateEndpointDraft) (*Endpoint, error) {
-	if r == nil || r.pool == nil {
+func (r *Postgres) UpdateEndpoint(ctx context.Context, draft webhooksvc.UpdateEndpointDraft) (*webhooksvc.Endpoint, error) {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)
-	var endpoint *Endpoint
+	var endpoint *webhooksvc.Endpoint
 	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
 		updated, err := q.UpdateWebhookEndpoint(ctx, webhooksqlc.UpdateWebhookEndpointParams{
 			Url:         draft.URL,
@@ -122,7 +141,8 @@ func (r *Postgres) UpdateEndpoint(ctx context.Context, draft UpdateEndpointDraft
 		}); err != nil {
 			return err
 		}
-		endpoint = &Endpoint{WebhookEndpoint: updated, EventTypes: draft.EventTypes}
+		mapped := toEndpoint(updated, draft.EventTypes)
+		endpoint = &mapped
 		return nil
 	})
 	if err != nil {
@@ -150,12 +170,12 @@ func (r *Postgres) DeleteEndpoint(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*Endpoint, error) {
-	if r == nil || r.pool == nil {
+func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*webhooksvc.Endpoint, error) {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
 	tid := tenantID(ctx)
-	var endpoint *Endpoint
+	var endpoint *webhooksvc.Endpoint
 	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
 		// Lock the endpoint row so concurrent rotations serialize instead of
 		// both reading the same next version and failing the unique index.
@@ -181,7 +201,8 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 		}); err != nil {
 			return err
 		}
-		endpoint = &Endpoint{WebhookEndpoint: current.WebhookEndpoint, EventTypes: current.EventTypes}
+		mapped := toEndpoint(current.WebhookEndpoint, current.EventTypes)
+		endpoint = &mapped
 		return nil
 	})
 	if err != nil {
@@ -190,7 +211,7 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 	return endpoint, nil
 }
 
-func (r *Postgres) ActiveEndpoints(ctx context.Context, tenant int64) ([]ActiveEndpoint, error) {
+func (r *Postgres) ActiveEndpoints(ctx context.Context, tenant int64) ([]webhooksvc.ActiveEndpoint, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -198,9 +219,9 @@ func (r *Postgres) ActiveEndpoints(ctx context.Context, tenant int64) ([]ActiveE
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ActiveEndpoint, len(rows))
+	out := make([]webhooksvc.ActiveEndpoint, len(rows))
 	for i, row := range rows {
-		out[i] = ActiveEndpoint{
+		out[i] = webhooksvc.ActiveEndpoint{
 			ID:               row.ID,
 			TenantID:         row.TenantID,
 			URL:              row.Url,
@@ -230,7 +251,7 @@ func (r *Postgres) ActiveEndpointSecret(ctx context.Context, endpointID int64) (
 // ActiveSigningSecret returns the endpoint's active sealed secret and its
 // rotation time, so the delivery worker can co-sign retries during the
 // rotation grace period.
-func (r *Postgres) ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error) {
+func (r *Postgres) ActiveSigningSecret(ctx context.Context, endpointID int64) (*webhooksvc.SigningSecret, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
@@ -241,5 +262,5 @@ func (r *Postgres) ActiveSigningSecret(ctx context.Context, endpointID int64) (*
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
-	return &SigningSecret{Ciphertext: secret.SecretCiphertext, CreatedAt: secret.CreatedAt.Time}, nil
+	return &webhooksvc.SigningSecret{Ciphertext: secret.SecretCiphertext, CreatedAt: secret.CreatedAt.Time}, nil
 }

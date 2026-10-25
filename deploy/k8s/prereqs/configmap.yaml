@@ -70,7 +70,12 @@ data:
   DB_HOST: "db.example.com"
   DB_PORT: "5432"
   DB_DATABASE: "boilerplate"
+  # Runtime role: non-superuser, subject to FORCE row-level security. Create it
+  # with deploy/postgres/database-roles.sql before the first migration.
   DB_USERNAME: "app"
+  # Schema owner for the migration Job only; its password is DB_MIGRATE_PASSWORD
+  # in the Secret. The API never uses this role.
+  DB_MIGRATE_USERNAME: "postgres"
   DB_SCHEMA: "public"
   # "require" or "verify-full" is mandatory when APP_ENV=production.
   DB_SSLMODE: "require"

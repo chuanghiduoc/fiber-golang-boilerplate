@@ -18,6 +18,7 @@
   "errors.bad_gateway.title": "Bad Gateway",
   "errors.user.last_admin.title": "Cannot remove the last administrator",
   "errors.permission.denied.title": "Permission denied",
+  "errors.auth.mfa_required.title": "Multi-factor authentication required",
   "errors.feature.disabled.title": "Feature disabled",
   "errors.rate_limit.exceeded.title": "Rate limit exceeded",
   "errors.system.internal.title": "Internal server error",

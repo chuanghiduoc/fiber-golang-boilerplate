@@ -1,6 +1,6 @@
 //go:build integration
 
-package service
+package service_test
 
 import (
 	"context"
@@ -15,44 +15,41 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
+	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
 func integrationTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
 	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug,
-	).Scan(&id))
-	return id
+	return testutil.CreateTenant(t, context.Background(), pool, slug)
 }
 
 func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address string) int64 {
 	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`,
-		tenantID, address,
-	).Scan(&id))
-	return id
+	return testutil.CreateMember(t, context.Background(), pool, tenantID, address, testutil.MemberOptions{}).UserID
 }
 
-func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) NotificationService {
+func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) notificationservice.NotificationService {
 	t.Helper()
-	sender := jobs.NewQueuedSender(jobs.NewQueue(pool))
-	return NewNotificationService(
-		repository.NewNotificationRepository(pool),
+	sender := jobs.NewQueuedSender(jobs.NewQueue(testutil.Scoped(pool)))
+	return notificationservice.NewNotificationService(
+		repository.NewNotificationRepository(testutil.Scoped(pool)),
 		recipients,
 		sender,
-		database.NewTxManager(pool),
+		repository.NewTransactor(testutil.NewTxManager(pool), sender),
 	)
+}
+
+// failingSender returns an error while the notification transaction is open.
+type failingSender struct{}
+
+func (failingSender) Send(context.Context, email.Message) error {
+	return errors.New("queue unavailable")
 }
 
 type staticRecipients map[int64]identitycontracts.NotificationRecipient
@@ -154,8 +151,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	svc := newIntegrationService(t, pool, recipients)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelEmail, Enabled: new(false),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelEmail, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -171,8 +168,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	).Scan(&jobsForType))
 	assert.Zero(t, jobsForType, "a disabled email channel must not enqueue a job")
 
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(false),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelInApp, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -183,8 +180,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	assert.False(t, result.EmailQueued)
 
 	// Re-enable in-app and exercise unread/read/read-all against real SQL.
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(true),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelInApp, Enabled: new(true),
 	})
 	require.NoError(t, err)
 	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -224,11 +221,15 @@ func TestCreateIntegrationRollsBackNotificationWhenQueueFails(t *testing.T) {
 
 	userID := integrationUser(t, pool, tenant.DefaultID, "notifications-queue-fail@example.com")
 	recipients := staticRecipients{userID: {UserID: userID, Email: "notifications-queue-fail@example.com"}}
-	svc := newIntegrationService(t, pool, recipients)
+	// The sender stands in for a full job queue: it fails while the row's
+	// transaction is open, like an INSERT into jobs would.
+	svc := notificationservice.NewNotificationService(
+		repository.NewNotificationRepository(testutil.Scoped(pool)),
+		recipients,
+		failingSender{},
+		repository.NewTransactor(testutil.NewTxManager(pool), failingSender{}),
+	)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-
-	_, err = pool.Exec(ctx, `DROP TABLE jobs`)
-	require.NoError(t, err)
 
 	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
 		UserID: userID, Type: "system.info", Title: "Atomic", Body: "Body",

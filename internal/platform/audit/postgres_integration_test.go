@@ -1,56 +1,53 @@
+//go:build integration
+
 package audit
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
-// TestPostgresRecorderIntegration inserts an event and reads it back. It is
-// gated on TEST_DATABASE_URL so the normal unit-test run stays Docker-free:
-// without the variable the test skips, and with it the target database must
-// already have the schema applied (make migrate-run or cmd/migrate).
-func TestPostgresRecorderIntegration(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
+// setupAuditTestDB gives each test its own migrated schema and a pool
+// connected as the non-superuser app role, so the recorder runs with RLS
+// enforced. Dropping the schema removes the rows; audit_events rejects DELETE.
+func setupAuditTestDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pool, cleanup, err := pgtest.SetupTestDB(ctx)
+	require.NoError(t, err)
+	t.Cleanup(cleanup)
+	return pool
+}
 
+// TestPostgresRecorderIntegration inserts an event and reads it back.
+func TestPostgresRecorderIntegration(t *testing.T) {
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
-
-	var tableExists bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT to_regclass('audit_events') IS NOT NULL`).Scan(&tableExists))
-	if !tableExists {
-		t.Skip("audit_events table not found; run cmd/migrate first")
-	}
-
 	requestID := fmt.Sprintf("audit-test-%d", time.Now().UnixNano())
-	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
 
-	recorder := NewPostgresRecorder(pool)
+	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
 	wantMetadata := map[string]any{
 		"reason": "admin-request",
 		"admin":  true,
 	}
 	wantCreatedAt := time.Now().UTC().Truncate(time.Microsecond)
 
-	err = recorder.Record(ctx, Event{
+	err := recorder.Record(ctx, Event{
 		ActorID:    42,
 		Action:     "user.role_changed",
 		Resource:   "user",
@@ -105,20 +102,13 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 // invalid UTF-8 or NUL bytes is stored instead of failing the insert (22021),
 // which would 503 guarded routes and drop fallback audit rows.
 func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
 
 	requestID := fmt.Sprintf("audit-hostile-%d", time.Now().UnixNano())
-	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
 
-	recorder := NewPostgresRecorder(pool)
+	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
 	require.NoError(t, recorder.Record(ctx, Event{
 		Action:     "POST /files",
 		Resource:   "/files",
@@ -142,26 +132,9 @@ func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
 // TestPostgresRecorderIntegrationTenant writes tenant-scoped rows and verifies
 // that the recorder resolves a missing Event.TenantID from the context.
 func TestPostgresRecorderIntegrationTenant(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
-
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
-
-	var tableExists bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT to_regclass('audit_events') IS NOT NULL AND to_regclass('tenants') IS NOT NULL`).
-		Scan(&tableExists))
-	if !tableExists {
-		t.Skip("audit_events/tenants tables not found; run cmd/migrate first")
-	}
 
 	slug := fmt.Sprintf("audit-tenant-%d", time.Now().UnixNano())
 	var tenantID int64
@@ -171,17 +144,10 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 
 	requestID := fmt.Sprintf("audit-tenant-test-%d", time.Now().UnixNano())
 	ctxRequestID := requestID + "-ctx"
-	t.Cleanup(func() {
-		deleteTestAuditRows(t, pool, requestID, ctxRequestID)
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		if _, err := pool.Exec(cleanupCtx, `DELETE FROM tenants WHERE id = $1`, tenantID); err != nil {
-			t.Errorf("cleanup tenant: %v", err)
-		}
-	})
+	ctxTenant := tenant.WithID(ctx, tenantID)
 
-	recorder := NewPostgresRecorder(pool)
-	require.NoError(t, recorder.Record(ctx, Event{
+	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	require.NoError(t, recorder.Record(ctxTenant, Event{
 		TenantID:   tenantID,
 		Action:     "tenant.settings_changed",
 		Resource:   "tenant",
@@ -190,7 +156,7 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 	}))
 
 	// Explicit domain events may omit the tenant; the context supplies it.
-	require.NoError(t, recorder.Record(tenant.WithID(ctx, tenantID), Event{
+	require.NoError(t, recorder.Record(ctxTenant, Event{
 		Action:    "tenant.export_requested",
 		Resource:  "tenant",
 		RequestID: ctxRequestID,
@@ -210,31 +176,14 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 // TestPostgresRecorderIntegrationDefaults covers the nullable columns and the
 // default metadata/created_at handling against a real database.
 func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
-
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
-
-	var tableExists bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT to_regclass('audit_events') IS NOT NULL`).Scan(&tableExists))
-	if !tableExists {
-		t.Skip("audit_events table not found; run cmd/migrate first")
-	}
-
 	requestID := fmt.Sprintf("audit-test-defaults-%d", time.Now().UnixNano())
-	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID) })
 
 	before := time.Now().UTC().Add(-time.Minute)
-	require.NoError(t, NewPostgresRecorder(pool).Record(ctx, Event{
+	require.NoError(t, NewPostgresRecorder(pgtest.Scoped(pool)).Record(ctx, Event{
 		Action:    "system.cleanup",
 		Resource:  "job",
 		RequestID: requestID,
@@ -267,37 +216,26 @@ func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 // TestPostgresRecorderRecordTxRollback proves a transactional audit write
 // disappears with the mutation when the transaction rolls back.
 func TestPostgresRecorderRecordTxRollback(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
-
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
-
-	var tableExists bool
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT to_regclass('audit_events') IS NOT NULL`).Scan(&tableExists))
-	if !tableExists {
-		t.Skip("audit_events table not found; run cmd/migrate first")
-	}
-
 	requestID := fmt.Sprintf("audit-tx-rollback-%d", time.Now().UnixNano())
-	tx, err := pool.Begin(ctx)
-	require.NoError(t, err)
-	require.NoError(t, NewPostgresRecorder(pool).RecordTx(ctx, tx, Event{
-		Action:    "user.role_changed",
-		Resource:  "user",
-		Source:    SourceService,
-		Outcome:   OutcomeSucceeded,
-		RequestID: requestID,
-	}))
-	require.NoError(t, tx.Rollback(ctx))
+	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	rolledBack := errors.New("roll back")
+	err := pgtest.NewTxManager(pool).WithTx(ctx, func(tx pgx.Tx) error {
+		if err := recorder.RecordTx(ctx, tx, Event{
+			Action:    "user.role_changed",
+			Resource:  "user",
+			Source:    SourceService,
+			Outcome:   OutcomeSucceeded,
+			RequestID: requestID,
+		}); err != nil {
+			return err
+		}
+		return rolledBack
+	})
+	require.ErrorIs(t, err, rolledBack)
 
 	var count int64
 	require.NoError(t, pool.QueryRow(ctx,
@@ -308,23 +246,13 @@ func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 // TestPostgresRecorderCompleteOnce covers intent creation, completion fields,
 // one-shot semantics, and the completion-only trigger.
 func TestPostgresRecorderCompleteOnce(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping audit integration test")
-	}
-
+	pool := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, dsn)
-	require.NoError(t, err)
-	t.Cleanup(pool.Close)
-	require.NoError(t, pool.Ping(ctx))
-
 	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
-	t.Cleanup(func() { deleteTestAuditRows(t, pool, requestID, requestID+"-service") })
 
-	recorder := NewPostgresRecorder(pool)
+	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
 	id, err := recorder.RecordID(ctx, Event{
 		ActorType:  ActorTypeAnonymous,
 		Action:     "auth.login",
@@ -415,35 +343,4 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, id, serviceID).Scan(&remaining))
 	assert.Equal(t, int64(2), remaining)
-}
-
-// deleteTestAuditRows removes this test's rows from a shared TEST_DATABASE_URL
-// database. audit_events rejects DELETE, so the cleanup disables the
-// append-only row trigger inside one transaction (requires table ownership,
-// like running migrations); other sessions never observe it disabled.
-func deleteTestAuditRows(t *testing.T, pool *pgxpool.Pool, requestIDs ...string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Errorf("cleanup audit rows: %v", err)
-		return
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `ALTER TABLE audit_events DISABLE TRIGGER trigger_audit_events_no_delete`); err != nil {
-		t.Errorf("cleanup audit rows: disable trigger: %v", err)
-		return
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM audit_events WHERE request_id = ANY($1)`, requestIDs); err != nil {
-		t.Errorf("cleanup audit rows: delete: %v", err)
-		return
-	}
-	if _, err := tx.Exec(ctx, `ALTER TABLE audit_events ENABLE TRIGGER trigger_audit_events_no_delete`); err != nil {
-		t.Errorf("cleanup audit rows: enable trigger: %v", err)
-		return
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Errorf("cleanup audit rows: commit: %v", err)
-	}
 }

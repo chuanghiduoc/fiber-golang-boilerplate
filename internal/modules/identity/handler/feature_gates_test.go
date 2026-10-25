@@ -13,7 +13,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -65,7 +65,7 @@ func testGoogleOAuth() *oauth.GoogleOAuth {
 }
 
 func TestRegisterGatedByUserRegistrationFlag(t *testing.T) {
-	authHandler := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, nil)
 	authHandler.SetFeatureFlags(tenantTargetFlags(identitycatalog.KeyUserRegistration, 2))
 	body := []byte(`{"email":"new@example.com","password":"Password1!","name":"New User"}`)
@@ -87,7 +87,7 @@ func TestRegisterGatedByUserRegistrationFlag(t *testing.T) {
 }
 
 func TestLoginRequiresVerificationWhenEmailVerificationFlagOn(t *testing.T) {
-	authHandler := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, nil)
 	login := []byte(`{"email":"test@example.com","password":"Password1!"}`)
 	doLogin := func() *http.Response {
@@ -112,7 +112,7 @@ func TestLoginRequiresVerificationWhenEmailVerificationFlagOn(t *testing.T) {
 }
 
 func TestGoogleRedirectGatedByGoogleOAuthFlag(t *testing.T) {
-	authHandler := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, testGoogleOAuth())
 
 	// No evaluator installed: the compiled default (on) applies.
@@ -132,9 +132,9 @@ func TestGoogleRedirectGatedByGoogleOAuthFlag(t *testing.T) {
 
 func TestGoogleCallbackGatedOnSignedStateTenant(t *testing.T) {
 	tenants := &fakeTenantRepository{
-		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
+		tenant: service.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
 	}
-	authHandler := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, testGoogleOAuth(), tenants)
 	authHandler.SetFeatureFlags(tenantTargetFlags(identitycatalog.KeyGoogleOAuth, 2))
 

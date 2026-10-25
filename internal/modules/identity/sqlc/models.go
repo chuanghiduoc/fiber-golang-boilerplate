@@ -5,61 +5,139 @@
 package sqlc
 
 import (
+	"net/netip"
+
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type DataExport struct {
+	ID          int64              `json:"id"`
+	TenantID    int64              `json:"tenant_id"`
+	UserID      int64              `json:"user_id"`
+	Status      string             `json:"status"`
+	StoragePath pgtype.Text        `json:"storage_path"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type EmailVerificationToken struct {
 	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
 	Email     string             `json:"email"`
-	Token     string             `json:"token"`
+	TokenHash string             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type Invitation struct {
+	ID              int64              `json:"id"`
+	TenantID        int64              `json:"tenant_id"`
+	EmailNormalized string             `json:"email_normalized"`
+	Role            string             `json:"role"`
+	TokenHash       string             `json:"token_hash"`
+	InvitedBy       int64              `json:"invited_by"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
+	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type Membership struct {
+	ID                   int64              `json:"id"`
+	TenantID             int64              `json:"tenant_id"`
+	UserID               int64              `json:"user_id"`
+	Status               string             `json:"status"`
+	BannedAt             pgtype.Timestamptz `json:"banned_at"`
+	RemovedAt            pgtype.Timestamptz `json:"removed_at"`
+	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
+type MfaFactor struct {
+	ID               int64              `json:"id"`
+	UserID           int64              `json:"user_id"`
+	Type             string             `json:"type"`
+	SecretCiphertext string             `json:"secret_ciphertext"`
+	ConfirmedAt      pgtype.Timestamptz `json:"confirmed_at"`
+	LastUsedStep     int64              `json:"last_used_step"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type PasswordResetToken struct {
 	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
 	UserID    int64              `json:"user_id"`
-	Token     string             `json:"token"`
+	TokenHash string             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type RefreshToken struct {
-	ID           int64              `json:"id"`
-	TenantID     int64              `json:"tenant_id"`
-	UserID       int64              `json:"user_id"`
-	Token        string             `json:"token"`
-	TokenVersion int32              `json:"token_version"`
-	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
-	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	ID        int64              `json:"id"`
+	TenantID  int64              `json:"tenant_id"`
+	SessionID int64              `json:"session_id"`
+	TokenHash string             `json:"token_hash"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+	UsedAt    pgtype.Timestamptz `json:"used_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type Role struct {
+	ID        int64              `json:"id"`
+	TenantID  pgtype.Int8        `json:"tenant_id"`
+	Scope     string             `json:"scope"`
+	Key       string             `json:"key"`
+	Name      string             `json:"name"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
+type Session struct {
+	ID            int64              `json:"id"`
+	TenantID      int64              `json:"tenant_id"`
+	UserID        int64              `json:"user_id"`
+	TokenVersion  int32              `json:"token_version"`
+	UserAgent     pgtype.Text        `json:"user_agent"`
+	Ip            *netip.Addr        `json:"ip"`
+	Amr           []string           `json:"amr"`
+	LastUsedAt    pgtype.Timestamptz `json:"last_used_at"`
+	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
+	RevokedReason pgtype.Text        `json:"revoked_reason"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type Tenant struct {
-	ID        int64              `json:"id"`
-	Slug      string             `json:"slug"`
-	Name      string             `json:"name"`
-	Status    string             `json:"status"`
+	ID                  int64              `json:"id"`
+	Slug                string             `json:"slug"`
+	Name                string             `json:"name"`
+	Status              string             `json:"status"`
+	StatusChangedAt     pgtype.Timestamptz `json:"status_changed_at"`
+	TrialEndsAt         pgtype.Timestamptz `json:"trial_ends_at"`
+	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TenantSetting struct {
+	TenantID  int64              `json:"tenant_id"`
+	Locale    string             `json:"locale"`
+	Timezone  string             `json:"timezone"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
 }
 
 type User struct {
 	ID                   int64              `json:"id"`
-	TenantID             int64              `json:"tenant_id"`
 	Email                string             `json:"email"`
-	PasswordHash         pgtype.Text        `json:"password_hash"`
 	Name                 string             `json:"name"`
-	Role                 string             `json:"role"`
-	GoogleID             pgtype.Text        `json:"google_id"`
-	AuthProvider         string             `json:"auth_provider"`
 	EmailVerifiedAt      pgtype.Timestamptz `json:"email_verified_at"`
+	Status               string             `json:"status"`
 	TokenVersion         int32              `json:"token_version"`
-	PasswordChangedAt    pgtype.Timestamptz `json:"password_changed_at"`
-	BannedAt             pgtype.Timestamptz `json:"banned_at"`
-	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
+	CredentialsChangedAt pgtype.Timestamptz `json:"credentials_changed_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	DeletedAt            pgtype.Timestamptz `json:"deleted_at"`

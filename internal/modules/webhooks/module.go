@@ -6,8 +6,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
+	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
@@ -25,7 +27,10 @@ type Module struct {
 	deliveryWorker *webhookservice.DeliveryWorker
 	client         *webhook.Client
 	retentionDays  int32
+	privacy        *webhooksprivacy.Provider
 }
+
+var _ app.PrivacyProvider = (*Module)(nil)
 
 // New returns the webhooks module.
 func New(handler *webhookshandler.Handler) *Module {
@@ -34,6 +39,15 @@ func New(handler *webhookshandler.Handler) *Module {
 
 // Name identifies the module in the registry.
 func (m *Module) Name() string { return webhookscatalog.Owner }
+
+// RegisterPrivacy implements app.PrivacyProvider: stored event history can
+// name a user even though endpoint configuration is tenant-wide.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacy == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "webhooks", Exporter: m.privacy, Eraser: m.privacy})
+}
 
 // RegisterRoutes mounts tenant-scoped administration and the public receiver.
 // Secret-returning routes (endpoint/source create and rotate-secret)

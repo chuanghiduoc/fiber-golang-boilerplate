@@ -250,6 +250,9 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := checkRLSRole(ctx, pool, cfg.App.Env); err != nil {
+		return err
+	}
 
 	store, err := drivers.New(cfg.Storage)
 	if err != nil {
@@ -263,11 +266,19 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	}
 	slog.Info("cache initialized", slog.String("driver", cfg.Cache.Driver))
 
+	// Every statement runs with the tenant's RLS scope; the resolver is
+	// injected here because pkg/database cannot import internal packages.
+	scoped := database.NewScoped(pool, database.WithResolver(app.RLSResolver))
+
 	// Feature flags: database defaults/targets are optional. The evaluator
 	// serves environment/compiled defaults when the store is unavailable and
-	// bounds stale snapshots with FEATURE_FLAGS_MAX_STALENESS_SECONDS.
+	// bounds stale snapshots with FEATURE_FLAGS_MAX_STALENESS_SECONDS. The
+	// snapshot covers every tenant, so its reads bypass RLS (ADR 0007).
+	flagStoreDB := database.NewScoped(pool, database.WithResolver(func(context.Context) database.Scope {
+		return database.Scope{Bypass: true}
+	}))
 	flagEvaluator := featureflags.NewEvaluator(featureflags.Options{
-		Store:        featureflags.NewPostgresStore(pool),
+		Store:        featureflags.NewPostgresStore(flagStoreDB),
 		Env:          cfg.FeatureFlags.EnvValues(),
 		ForceOff:     cfg.FeatureFlags.ForceOffValues(),
 		CacheTTL:     cfg.FeatureFlags.CacheTTL(),
@@ -280,17 +291,18 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	}
 	slog.Info("email sender initialized", slog.String("driver", cfg.Email.Driver))
 
-	jobQueue := rt.buildDurableWork(pool)
+	jobQueue := rt.buildDurableWork(pool, scoped)
 
 	rt.infra = app.Infra{
 		Platform: app.NewPlatformConfig(cfg),
 		Pool:     pool,
+		DB:       scoped,
 		// Transaction manager and the process-wide audit recorder. Tier 1
 		// services write through the transaction; Tier 2 routes use it for
 		// intent rows.
-		Tx:           database.NewTxManager(pool),
+		Tx:           database.NewTxManager(pool, database.WithResolver(app.RLSResolver)),
 		Cache:        appCache,
-		Audit:        audit.NewPostgresRecorder(pool),
+		Audit:        audit.NewPostgresRecorder(scoped),
 		Queue:        jobQueue,
 		PayloadCodec: rt.payloadCodec,
 		Email:        jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(rt.payloadCodec)),
@@ -327,8 +339,8 @@ func (rt *runtime) connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
 // that runs it (worker, all) claims jobs, limited to JOBS_WORKER_KINDS minus
 // JOBS_WORKER_EXCLUDE_KINDS when set. The schedule registry exists only where
 // the scheduler can run.
-func (rt *runtime) buildDurableWork(pool *pgxpool.Pool) *jobs.Queue {
-	jobQueue := jobs.NewQueue(pool)
+func (rt *runtime) buildDurableWork(pool *pgxpool.Pool, db database.DBTX) *jobs.Queue {
+	jobQueue := jobs.NewQueue(db)
 	rt.instanceID = newInstanceID()
 	workerOpts := []jobs.Option{
 		jobs.WithConcurrency(workerConcurrency),
@@ -338,7 +350,7 @@ func (rt *runtime) buildDurableWork(pool *pgxpool.Pool) *jobs.Queue {
 	if rt.trace.Enabled() {
 		workerOpts = append(workerOpts, jobs.WithTracerProvider(rt.trace.TracerProvider()))
 	}
-	rt.worker = jobs.NewWorker(pool, rt.instanceID, workerOpts...)
+	rt.worker = jobs.NewWorker(db, rt.instanceID, workerOpts...)
 	rt.events = events.New(jobQueue)
 	if rt.cfg.Scheduler.Enabled && rt.cfg.App.RunsWorker() {
 		rt.schedules = scheduler.NewRegistry()
@@ -413,6 +425,7 @@ func (rt *runtime) composeApplication() {
 		Jobs:           rt.worker,
 		Schedules:      rt.schedules,
 		APIKeyVerifier: rt.modules.APIKeyVerifier,
+		Privacy:        rt.modules.Privacy,
 	})
 	// Module providers register routes, event subscriptions, job handlers
 	// (for example webhook delivery/dispatch), and schedules. The bus turns
@@ -481,7 +494,7 @@ func (rt *runtime) startScheduler() (context.CancelFunc, <-chan struct{}, error)
 	if err != nil {
 		return nil, nil, startupFailed("invalid scheduler catch-up policy", err)
 	}
-	sched := scheduler.New(rt.infra.Pool, rt.schedules, rt.infra.Queue, rt.instanceID,
+	sched := scheduler.New(rt.infra.Pool, rt.infra.Tx, rt.schedules, rt.infra.Queue, rt.instanceID,
 		scheduler.WithLeaseTTL(cfg.LeaseTTL()),
 		scheduler.WithHeartbeatInterval(cfg.HeartbeatInterval()),
 		scheduler.WithPollInterval(cfg.PollInterval()),

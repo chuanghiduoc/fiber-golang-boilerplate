@@ -19,20 +19,17 @@ import (
 
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
-	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -41,7 +38,7 @@ const integrationTenantSecret = "tenant-integration-secret"
 type tenantHarness struct {
 	app       *fiber.App
 	pool      *pgxpool.Pool
-	userRepo  identityrepo.UserRepository
+	stores    identityservice.Stores
 	adminSvc  identityservice.AdminUserService
 	tenantOne int64
 	tenantTwo int64
@@ -55,48 +52,30 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantTwo int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('acme', 'Acme') RETURNING id`,
-	).Scan(&tenantTwo))
+	tenantTwo := testutil.CreateTenant(t, ctx, pool, "acme")
 
-	userRepo := identityrepo.NewUserRepository(pool)
-	tenantRepo := identityrepo.NewTenantRepository(pool)
-	resolver := identityadapter.NewTenantResolver(tenantRepo)
-	refreshRepo := identityrepo.NewRefreshTokenRepository(pool)
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	txManager := database.NewTxManager(pool)
-	auditRecorder := audit.NewPostgresRecorder(pool)
-	sessionStore := session.NewStore(userRepo, appCache)
-
-	userSvc := identityservice.NewUserService(userRepo, refreshRepo, false, appCache, txManager, auditRecorder, sessionStore)
-	refreshSvc := identityservice.NewRefreshTokenService(refreshRepo, 7)
-	authHandler := identityhandler.NewAuthHandler(
-		userSvc, refreshSvc, nil, nil,
-		integrationTenantSecret, 24, false, nil, tenantRepo,
-	)
-	userHandler := identityhandler.NewUserHandler(userSvc)
-	adminSvc := identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, auditRecorder, sessionStore)
+	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(testutil.Scoped(pool)), integrationTenantSecret, nil)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
-	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "default"))
-	api.Post("/auth/register", authHandler.Register)
-	api.Post("/auth/login", authHandler.Login)
-	api.Post("/auth/refresh", authHandler.Refresh)
+	api := app.Group("/api/v1", tenanthttp.Middleware(identityadapter.NewTenantResolver(kit.stores.Tenants), "default"))
+	api.Post("/auth/register", kit.auth.Register)
+	api.Post("/auth/login", kit.auth.Login)
+	api.Post("/auth/refresh", kit.auth.Refresh)
 
-	users := api.Group("/users", middleware.JWTAuth(integrationTenantSecret, sessionStore))
-	users.Get("/me", userHandler.GetMe)
-	users.Get("/:id", userHandler.GetByID)
-	users.Put("/:id", userHandler.Update)
-	users.Delete("/:id", userHandler.Delete)
-	users.Get("/", middleware.RequireRole("admin"), userHandler.List)
+	users := api.Group("/users", middleware.JWTAuth(integrationTenantSecret, kit.sessions))
+	users.Get("/me", kit.userHandler.GetMe)
+	users.Get("/:id", kit.userHandler.GetByID)
+	users.Put("/:id", kit.userHandler.Update)
+	users.Delete("/:id", kit.userHandler.Delete)
+	users.Get("/", authzhttp.Require(authz.PermissionAdminUsersRead), kit.userHandler.List)
 
 	return &tenantHarness{
 		app:       app,
 		pool:      pool,
-		userRepo:  userRepo,
-		adminSvc:  adminSvc,
+		stores:    kit.stores,
+		adminSvc:  kit.admin,
 		tenantOne: tenant.DefaultID,
 		tenantTwo: tenantTwo,
 	}
@@ -145,15 +124,29 @@ func loginTenantUser(t *testing.T, h *tenantHarness, slug, email, password strin
 	return login
 }
 
+func (h *tenantHarness) tenantCtx(id int64) context.Context {
+	return tenant.WithID(context.Background(), id)
+}
+
 func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 	h := setupTenantHarness(t)
 
-	// The same address is a different account in each tenant.
 	userA := registerTenantUser(t, h, "default", "shared@example.com", "Password1!", "Tenant One")
-	userB := registerTenantUser(t, h, "acme", "shared@example.com", "Password2@", "Tenant Two")
 	assert.Equal(t, h.tenantOne, userA.TenantID)
-	assert.Equal(t, h.tenantTwo, userB.TenantID)
-	assert.NotEqual(t, userA.ID, userB.ID)
+
+	// One global account per address: registering it again from another
+	// tenant is a conflict, not a second account.
+	body, err := json.Marshal(identitydto.RegisterRequest{Email: "Shared@Example.com", Password: "Password2@", Name: "Tenant Two"})
+	require.NoError(t, err)
+	resp, respBody := tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/register", "acme", body, "")
+	assert.Equal(t, fiber.StatusConflict, resp.StatusCode, "body: %s", respBody)
+	assert.Contains(t, string(respBody), "user.email_taken")
+
+	// An account without a membership in a tenant cannot sign in there.
+	body, err = json.Marshal(identitydto.LoginRequest{Email: "shared@example.com", Password: "Password1!"})
+	require.NoError(t, err)
+	resp, _ = tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/login", "acme", body, "")
+	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
 	// A header-less login uses the default tenant.
 	loginA := loginTenantUser(t, h, "", "shared@example.com", "Password1!")
@@ -162,25 +155,24 @@ func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 	assert.Equal(t, h.tenantOne, claimsA.TenantID)
 	assert.Equal(t, h.tenantOne, loginA.User.TenantID)
 
-	loginB := loginTenantUser(t, h, "acme", "shared@example.com", "Password2@")
+	// Joining tenant two adds a membership to the same global user, who signs
+	// in there with the same (global) password and gets a tenant-two token.
+	testutil.CreateMember(t, context.Background(), h.pool, h.tenantTwo, "shared@example.com", testutil.MemberOptions{})
+	loginB := loginTenantUser(t, h, "acme", "shared@example.com", "Password1!")
 	claimsB, err := token.Parse(loginB.AccessToken, integrationTenantSecret)
 	require.NoError(t, err)
 	assert.Equal(t, h.tenantTwo, claimsB.TenantID)
 	assert.Equal(t, h.tenantTwo, loginB.User.TenantID)
+	assert.Equal(t, userA.ID, loginB.User.ID)
+	assert.NotEqual(t, claimsA.SessionID, claimsB.SessionID, "each tenant sign-in is its own session")
 
-	// Tenant one's password is not valid for tenant two's account.
-	body, err := json.Marshal(identitydto.LoginRequest{Email: "shared@example.com", Password: "Password1!"})
-	require.NoError(t, err)
-	resp, _ := tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/login", "acme", body, "")
-	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
-
-	// Repository lookups are scoped as well.
-	got, err := h.userRepo.GetByEmail(tenant.WithID(context.Background(), h.tenantTwo), "shared@example.com")
-	require.NoError(t, err)
-	assert.Equal(t, userB.ID, got.ID)
-
-	_, err = h.userRepo.GetByID(tenant.WithID(context.Background(), h.tenantTwo), userA.ID)
+	// Membership lookups are tenant scoped.
+	solo := registerTenantUser(t, h, "default", "solo@example.com", "Password1!", "Solo")
+	_, err = h.stores.Memberships.Get(h.tenantCtx(h.tenantTwo), solo.ID)
 	assert.ErrorIs(t, err, apperror.ErrNotFound)
+	member, err := h.stores.Memberships.Get(h.tenantCtx(h.tenantTwo), userA.ID)
+	require.NoError(t, err)
+	assert.Equal(t, h.tenantTwo, member.Membership.TenantID)
 }
 
 func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
@@ -189,23 +181,28 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	adminA := registerTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!", "Admin A")
 	userB := registerTenantUser(t, h, "acme", "user-b@example.com", "UserPass1!", "User B")
 
-	_, err := h.userRepo.UpdateRole(tenant.WithID(context.Background(), h.tenantOne), identitysqlc.UpdateUserRoleParams{
-		ID: adminA.ID, Role: identitydto.RoleAdmin,
-	})
+	_, err := h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleOwner)
 	require.NoError(t, err)
 	loginAdmin := loginTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!")
 
-	// A tenant-one admin cannot read, update, or delete a tenant-two user.
+	// A tenant-one admin cannot read or remove a tenant-two user: the user has
+	// no membership here, which is not found (not forbidden).
 	pathB := "/api/v1/users/" + strconv.FormatInt(userB.ID, 10)
 	resp, _ := tenantRequest(t, h.app, http.MethodGet, pathB, "", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 
-	nameBody, _ := json.Marshal(identitydto.UpdateUserRequest{Name: stringPtr("Hijacked")})
-	resp, _ = tenantRequest(t, h.app, http.MethodPut, pathB, "", nameBody, loginAdmin.AccessToken)
-	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
-
 	resp, _ = tenantRequest(t, h.app, http.MethodDelete, pathB, "", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+
+	// Profiles are global and only editable by their owner, so another
+	// user's profile is forbidden for every caller, including admins.
+	nameBody, _ := json.Marshal(identitydto.UpdateUserRequest{Name: stringPtr("Hijacked")})
+	resp, respBody := tenantRequest(t, h.app, http.MethodPut, pathB, "", nameBody, loginAdmin.AccessToken)
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(respBody), string(apperror.CodePermissionDenied))
+	var name string
+	require.NoError(t, h.pool.QueryRow(context.Background(), `SELECT name FROM users WHERE id = $1`, userB.ID).Scan(&name))
+	assert.Equal(t, "User B", name)
 
 	// Listing only returns the admin's own tenant.
 	resp, listBody := tenantRequest(t, h.app, http.MethodGet, "/api/v1/users", "", nil, loginAdmin.AccessToken)
@@ -222,28 +219,24 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
 
-	// Tenant two's admin count is independent of tenant one.
-	_, err = h.userRepo.UpdateRole(tenant.WithID(context.Background(), h.tenantTwo), identitysqlc.UpdateUserRoleParams{
-		ID: userB.ID, Role: identitydto.RoleAdmin,
-	})
+	// Tenant two's owner count is independent of tenant one.
+	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantTwo), userB.ID, identitydto.RoleOwner)
 	require.NoError(t, err)
-	countA, err := h.userRepo.CountActiveAdmins(tenant.WithID(context.Background(), h.tenantOne))
+	countA, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantOne))
 	require.NoError(t, err)
-	countB, err := h.userRepo.CountActiveAdmins(tenant.WithID(context.Background(), h.tenantTwo))
+	countB, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantTwo))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), countA)
 	assert.Equal(t, int64(1), countB)
 
-	// The database trigger also counts per tenant: tenant two's admin cannot
-	// satisfy tenant one's last-admin invariant.
-	_, err = h.userRepo.UpdateRole(tenant.WithID(context.Background(), h.tenantOne), identitysqlc.UpdateUserRoleParams{
-		ID: adminA.ID, Role: identitydto.RoleUser,
-	})
-	require.Error(t, err, "demoting the only tenant-one admin must fail despite tenant two's admin")
+	// The database trigger also counts per tenant: tenant two's owner cannot
+	// satisfy tenant one's last-owner invariant.
+	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleMember)
+	require.Error(t, err, "demoting the only tenant-one owner must fail despite tenant two's owner")
 
-	statsA, err := h.adminSvc.GetUserStats(tenant.WithID(context.Background(), h.tenantOne))
+	statsA, err := h.adminSvc.GetUserStats(h.tenantCtx(h.tenantOne))
 	require.NoError(t, err)
-	statsB, err := h.adminSvc.GetUserStats(tenant.WithID(context.Background(), h.tenantTwo))
+	statsB, err := h.adminSvc.GetUserStats(h.tenantCtx(h.tenantTwo))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), statsA.ActiveUsers)
 	assert.Equal(t, int64(1), statsB.ActiveUsers)
@@ -283,14 +276,16 @@ func TestTenantIdentity_SuspendedTenantAndLegacyToken(t *testing.T) {
 	resp, _ := tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "", nil, legacy)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
-	_, err = h.userRepo.UpdateRole(tenant.WithID(context.Background(), h.tenantTwo), identitysqlc.UpdateUserRoleParams{
-		ID: login.User.ID, Role: identitydto.RoleAdmin,
-	})
+	// A tenant-bound token without a session id is rejected too.
+	sessionless, err := token.GenerateWithVersionAndTenant(login.User.ID, h.tenantTwo, login.User.Email,
+		login.User.Role, 0, integrationTenantSecret, 24)
 	require.NoError(t, err)
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, sessionless)
+	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
-	// Suspend the tenant after a token was issued.
-	_, err = h.userRepo.GetByID(tenant.WithID(context.Background(), h.tenantTwo), login.User.ID)
-	require.NoError(t, err)
+	// Suspend the tenant after the session was issued. (No request validates
+	// the token first: the validator caches session snapshots, and this raw
+	// UPDATE bypasses the identity service's cache invalidation.)
 	h.suspendTenant(t, "acme")
 
 	// The middleware refuses to resolve a suspended tenant for public auth.

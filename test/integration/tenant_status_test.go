@@ -32,7 +32,7 @@ func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
 	).Scan(&suspendedID))
 	require.NotZero(t, suspendedID)
 
-	resolver := identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool))
+	resolver := identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "suspended-default"))
 	api.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })
@@ -50,4 +50,23 @@ func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
 	resp, err = app.Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
+
+	// Only trialing and active tenants serve requests.
+	_, err = pool.Exec(ctx, `
+		INSERT INTO tenants (slug, name, status, trial_ends_at, deletion_scheduled_at) VALUES
+			('status-trialing', 'Trialing', 'trialing', NOW() + INTERVAL '7 days', NULL),
+			('status-pending-deletion', 'Pending', 'pending_deletion', NULL, NOW() + INTERVAL '7 days')`)
+	require.NoError(t, err)
+	for slug, want := range map[string]int{
+		"default":                 fiber.StatusOK,
+		"status-trialing":         fiber.StatusOK,
+		"status-pending-deletion": fiber.StatusNotFound,
+	} {
+		req, err = http.NewRequest(http.MethodGet, "/api/v1/ping", http.NoBody)
+		require.NoError(t, err)
+		req.Header.Set(tenant.Header, slug)
+		resp, err = app.Test(req)
+		require.NoError(t, err)
+		assert.Equal(t, want, resp.StatusCode, "tenant %s", slug)
+	}
 }

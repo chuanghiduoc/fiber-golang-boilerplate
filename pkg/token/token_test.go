@@ -101,6 +101,29 @@ func TestGenerateWithVersionAndTenant_RejectsNegativeTenant(t *testing.T) {
 	}
 }
 
+func TestGenerateForSession_CarriesSessionID(t *testing.T) {
+	tok, err := GenerateForSession(SessionClaims{
+		UserID: 42, TenantID: 3, SessionID: 99, Email: "user@test.com", Role: "admin", TokenVersion: 5,
+	}, testSecret, 1)
+	if err != nil {
+		t.Fatalf("GenerateForSession: %v", err)
+	}
+	claims, err := Parse(tok, testSecret)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if claims.UserID != 42 || claims.TenantID != 3 || claims.SessionID != 99 || claims.Role != "admin" || claims.TokenVersion != 5 {
+		t.Fatalf("claims = %+v", claims)
+	}
+	if _, err := GenerateForSession(SessionClaims{UserID: 1, TenantID: 1, SessionID: -1}, testSecret, 1); err == nil {
+		t.Fatal("negative session ID must be rejected")
+	}
+	legacy, _ := GenerateWithVersionAndTenant(1, 1, "a@b.com", "user", 0, testSecret, 1)
+	if claims, _ := Parse(legacy, testSecret); claims.SessionID != 0 {
+		t.Fatalf("a token without a session has sid %d", claims.SessionID)
+	}
+}
+
 func TestParse_WrongSecret(t *testing.T) {
 	tok, _ := Generate(1, "a@b.com", "user", testSecret, 1)
 	_, err := Parse(tok, "wrong-secret")

@@ -23,6 +23,11 @@ func Created(c fiber.Ctx, data any) error {
 	return c.Status(fiber.StatusCreated).JSON(data)
 }
 
+// Accepted returns a single resource with 202 Accepted for durable work.
+func Accepted(c fiber.Ctx, data any) error {
+	return c.Status(fiber.StatusAccepted).JSON(data)
+}
+
 // NoContent returns 204 with no body.
 func NoContent(c fiber.Ctx) error {
 	return c.SendStatus(fiber.StatusNoContent)

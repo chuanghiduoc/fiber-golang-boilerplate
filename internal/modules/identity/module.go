@@ -7,6 +7,8 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -22,18 +24,27 @@ import (
 type Module struct {
 	auth  *identityhandler.AuthHandler
 	users *identityhandler.UserHandler
+	// sessions and invitations are set by Build (or WithSessions /
+	// WithInvitations); their routes are mounted only when present.
+	sessions    *identityhandler.SessionHandler
+	invitations *identityhandler.InvitationHandler
+	mfa         *identityhandler.MFAHandler
+	privacy     *identityhandler.PrivacyHandler
+	roles       *identityhandler.RoleHandler
+	platform    *identityhandler.PlatformHandler
 
-	// userSvc and startup are set by Build; a module built with New (tests)
-	// has neither.
-	userSvc     identityservice.UserService
+	// The job, schedule, and startup collaborators are set by Build; a module
+	// built with New (tests) has none.
 	resetSvc    identityservice.PasswordResetService
 	tokenPurger *identityservice.TokenPurger
+	privacySvc  *identityservice.PrivacyService
 	startup     func(ctx context.Context) error
 }
 
 var (
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
+	_ app.PrivacyProvider  = (*Module)(nil)
 )
 
 // New builds the module from its handlers. Production uses Build.
@@ -90,6 +101,33 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// state tenant and the signed-in user in the sign-in transaction.
 	auth.Get("/google/callback", rl.Normal, m.auth.GoogleCallback)
 
+	// Sessions belong to JWT sign-ins; an API key has none, so these routes
+	// are JWT-only like logout-all.
+	jwtOnly := middleware.JWTAuthKeys(cfg.JWT.Keyring(), deps.Sessions)
+	if m.sessions != nil {
+		auth.Get("/sessions", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.sessions.List)
+		auth.Delete("/sessions/:id", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.session_revoked", "session"), m.sessions.Revoke)
+	}
+	if m.invitations != nil {
+		m.registerInvitationRoutes(v1, auth, jwtOnly, deps)
+	}
+	if m.mfa != nil {
+		// MFA management is JWT-only: an API key has no session to keep and
+		// must not change the owner's second factor. Enroll/confirm/regenerate
+		// return one-time secrets, so they never take Idempotency-Key.
+		auth.Get("/mfa/status", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionMFARead), m.mfa.Status)
+		auth.Post("/mfa/totp/enroll", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Enroll)
+		auth.Post("/mfa/totp/confirm", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Confirm)
+		auth.Post("/mfa/disable", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Disable)
+		auth.Post("/mfa/recovery-codes/regenerate", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Regenerate)
+		// The two-step login verification is public: the sealed, single-use
+		// challenge plus the second factor are the credentials.
+		auth.Post("/mfa/verify", rl.Strict, m.mfa.Verify)
+	}
+	if m.privacy != nil {
+		m.registerPrivacyRoutes(v1, deps, jwtOnly, guard)
+	}
+
 	users := v1.Group("/users", deps.Authenticate())
 	users.Get("/me", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
 	users.Put("/me", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
@@ -98,4 +136,94 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
 	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
 	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+
+	if m.roles != nil {
+		m.registerRoleRoutes(v1, deps)
+	}
+	if m.platform != nil {
+		m.registerPlatformRoutes(v1, deps)
+	}
+}
+
+// registerRoleRoutes mounts tenant role management. Every mutation is Tier 1:
+// RoleService writes its audit row in the mutation transaction.
+func (m *Module) registerRoleRoutes(v1 fiber.Router, deps app.Deps) {
+	rl := deps.Limiters
+	roles := v1.Group("/admin/roles", deps.Authenticate())
+	roles.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionAdminRolesRead), m.roles.ListRoles)
+	roles.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.CreateRole)
+	roles.Patch("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.UpdateRole)
+	roles.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.DeleteRole)
+	// The legacy role-change endpoint maps to replacing the member's roles;
+	// this one accepts several roles (including tenant-defined ones).
+	v1.Put("/admin/users/:id/roles", deps.Authenticate(), rl.Normal,
+		authzhttp.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.roles.ReplaceMemberRoles)
+}
+
+// registerPlatformRoutes mounts cross-tenant tenant administration. It is
+// protected by platform permissions, which only a platform role assignment
+// grants.
+func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
+	rl := deps.Limiters
+	// Platform-scope access requires a second factor (ADR 0010).
+	mfa := authzhttp.RequireMFA()
+	tenants := v1.Group("/platform/tenants", deps.Authenticate())
+	tenants.Get("/", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.ListTenants)
+	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)
+	tenants.Get("/:id", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.GetTenant)
+	tenants.Patch("/:id/status", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.UpdateTenantStatus)
+}
+
+// registerPrivacyRoutes mounts the caller's exports/erasure and the admin
+// erasure variant. Erasure is Tier 1 (the service records in the mutation
+// transaction); export creation is Tier 2.
+func (m *Module) registerPrivacyRoutes(v1 fiber.Router, deps app.Deps, jwtOnly fiber.Handler, guard func(string, string) fiber.Handler) {
+	rl := deps.Limiters
+	me := v1.Group("/me", deps.Authenticate())
+	me.Post("/data-exports", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileRead), deps.Idempotency, guard("data_export.requested", "data_export"), m.privacy.CreateExport)
+	me.Get("/data-exports", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.ListExports)
+	me.Get("/data-exports/:id", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.GetExport)
+	me.Get("/data-exports/:id/download", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.DownloadExport)
+	me.Post("/erasure", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.privacy.EraseMe)
+
+	// /admin is shared with the admin module, so middleware stays per route
+	// (a group middleware would run on the other module's admin routes).
+	// Global account erasure is JWT-only, like self-deletion: a tenant-scoped
+	// API key must not end access in every tenant.
+	admin := v1.Group("/admin")
+	admin.Post("/users/:id/erasure", jwtOnly, rl.Normal, authzhttp.Require(authz.PermissionAdminUsersDelete), deps.Idempotency, m.privacy.EraseUser)
+}
+
+// RegisterPrivacy implements app.PrivacyProvider: identity's own exporter and
+// eraser participate in the fan-out.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacySvc == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: m.privacySvc, Eraser: m.privacySvc})
+}
+
+// SetNotifier wires the export-ready notification after notifications.Build.
+func (m *Module) SetNotifier(notifier notificationcontracts.Notifier) {
+	if m.privacySvc != nil {
+		m.privacySvc.SetNotifier(notifier)
+	}
+}
+
+// registerInvitationRoutes mounts the invitation flow. Create, revoke,
+// accept, and sign-up are Tier 1: InvitationService writes invitation.* in
+// the mutation transaction, so no route-level Guard is added.
+func (m *Module) registerInvitationRoutes(v1, auth fiber.Router, jwtOnly fiber.Handler, deps app.Deps) {
+	rl := deps.Limiters
+	invitations := v1.Group("/invitations", deps.Authenticate())
+	invitations.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), deps.Idempotency, m.invitations.Create)
+	invitations.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionInvitationsRead), m.invitations.List)
+	invitations.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), m.invitations.Revoke)
+
+	// Accepting joins another tenant with the global identity, which a
+	// tenant-scoped API key must not do: JWT only. Mounted under /auth (no
+	// group middleware) so /invitations' API-key chain does not apply.
+	auth.Post("/invitations/accept", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.invitations.Accept)
+	// Public: the emailed token authorizes creating the invited account.
+	auth.Post("/invitations/signup", rl.Strict, deps.Idempotency, m.invitations.SignUp)
 }

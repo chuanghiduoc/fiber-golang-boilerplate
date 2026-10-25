@@ -9,6 +9,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
+	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -59,7 +60,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 		Timeout:        cfg.RequestTimeout(),
 		ConnectTimeout: cfg.ConnectTimeout(),
 	})
-	repo := webhookrepo.New(infra.Pool, infra.Queue)
+	repo := webhookrepo.New(infra.DB, infra.Tx, infra.Queue)
 	var tenants webhookservice.TenantChecker
 	if tenantActive != nil {
 		tenants = webhookservice.TenantCheckerFunc(tenantActive)
@@ -81,6 +82,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 		RetryMax:  cfg.RetryMax(),
 	})
 	m.retentionDays = int32(cfg.RetentionDays) // #nosec G115 -- validated 1..3650 days
+	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.DB))
 	return m, nil
 }
 

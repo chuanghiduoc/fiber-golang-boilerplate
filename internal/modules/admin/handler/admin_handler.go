@@ -25,7 +25,7 @@ func NewHandler(svc adminsvc.Service) *Handler {
 
 // GetStats godoc
 // @Summary Get tenant statistics
-// @Description Get statistics for the caller's tenant only (admin only)
+// @Description Get statistics for the caller's tenant only (admin only): activeUsers counts active memberships of active users, deletedUsers every other membership
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -39,12 +39,12 @@ func (h *Handler) GetStats(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, stats)
+	return response.Success(c, toStatsResponse(stats))
 }
 
 // ListUsers godoc
 // @Summary List tenant users (admin)
-// @Description Get a paginated list of users in the caller's tenant, including soft-deleted
+// @Description Get a paginated list of the members of the caller's tenant in every membership state (active, suspended, removed), ordered by join time
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -60,17 +60,18 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	users, hasMore, err := h.service.ListUsers(c.Context(), limit, startingAfter)
+	page, err := h.service.ListUsers(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u admindto.UserResponse) (time.Time, int64) { return u.CreatedAt, u.ID }))
+	resp := toUserResponses(page.Items)
+	return response.List(c, resp, page.HasMore, pagination.NextCursor(resp, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
 }
 
 // UpdateRole godoc
 // @Summary Update user role
-// @Description Update a user's role (admin only)
+// @Description Change a member's role in the caller's tenant (admin only); the member's sessions in this tenant end
 // @Tags Admin
 // @Accept json
 // @Produce json
@@ -103,12 +104,12 @@ func (h *Handler) UpdateRole(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(user))
 }
 
 // BanUser godoc
 // @Summary Ban a user
-// @Description Soft delete a user (admin only)
+// @Description Ban a member of the caller's tenant (membership suspended; sessions and API keys in this tenant end; the global account and other tenants are untouched)
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -138,7 +139,7 @@ func (h *Handler) BanUser(c fiber.Ctx) error {
 
 // UnbanUser godoc
 // @Summary Unban a user
-// @Description Restore a soft-deleted user (admin only)
+// @Description Lift a member's ban in the caller's tenant (API keys issued before the ban stay revoked)
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
@@ -161,7 +162,7 @@ func (h *Handler) UnbanUser(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(user))
 }
 
 // ListFiles godoc
@@ -182,12 +183,13 @@ func (h *Handler) ListFiles(c fiber.Ctx) error {
 		return err
 	}
 
-	files, hasMore, err := h.service.ListFiles(c.Context(), limit, startingAfter)
+	page, err := h.service.ListFiles(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	return response.List(c, files, hasMore, pagination.NextCursor(files, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
+	resp := toFileResponses(page.Items)
+	return response.List(c, resp, page.HasMore, pagination.NextCursor(resp, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
 // DownloadFile godoc
@@ -209,14 +211,15 @@ func (h *Handler) DownloadFile(c fiber.Ctx) error {
 		return err
 	}
 
-	file, reader, err := h.service.Download(c.Context(), id)
+	download, err := h.service.Download(c.Context(), id)
 	if err != nil {
 		return err
 	}
 
+	file := download.File
 	c.Set("Content-Type", file.MimeType)
 	c.Set("Content-Disposition", httpx.ContentDispositionAttachment(file.OriginalName))
-	return c.SendStream(reader, int(file.Size))
+	return c.SendStream(download.Reader, int(file.Size))
 }
 
 // DeleteFile godoc
@@ -266,5 +269,5 @@ func (h *Handler) RestoreFile(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, file)
+	return response.Success(c, toFileResponse(file))
 }

@@ -52,7 +52,7 @@ func TestUploadService_ABACOwnerAndTenantPolicies(t *testing.T) {
 	seedABACFiles(repo, store)
 	svc := NewUploadService(repo, newFakeTx(repo), store)
 
-	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleUser))
+	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleMember))
 
 	if _, err := svc.GetFileInfo(ctx, 1, 10); err != nil {
 		t.Fatalf("owner get: %v", err)
@@ -85,7 +85,7 @@ func TestUploadService_ABACOwnerAndTenantPolicies(t *testing.T) {
 
 	// The owning tenant/user path still works.
 	repo.files[3].DeletedAt = timePtr(time.Now())
-	ownerCtx := abacCtx(1, authz.NewSubject(11, 1, authz.RoleUser))
+	ownerCtx := abacCtx(1, authz.NewSubject(11, 1, authz.RoleMember))
 	if _, err := svc.Restore(ownerCtx, 3, 11); err != nil {
 		t.Fatalf("owner restore: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestUploadService_ABACPermissionPreCheck(t *testing.T) {
 	svc := NewUploadService(repo, newFakeTx(repo), store)
 
 	// A JWT-equivalent subject whose role grants files:read.
-	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleUser))
+	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleMember))
 	if _, err := svc.GetFileInfo(ctx, 1, 10); err != nil {
 		t.Fatalf("allowed read: %v", err)
 	}

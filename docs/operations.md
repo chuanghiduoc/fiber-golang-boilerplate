@@ -406,16 +406,50 @@ do not linger in a dump. It also means **a dead job cannot be replayed from its
 row**: re-trigger the business flow (for example ask the user to request
 another reset email) instead of updating dead rows back to `queued`.
 
-### Expired identity tokens
+### Expired identity tokens and stale sessions
 
 | Rule | Value |
 | --- | --- |
 | Job | `identity.tokens.purge_expired`, scheduled hourly by the identity `ScheduleProvider`. |
 | Prerequisite | `SCHEDULER_ENABLED=true`. Without the scheduler, expired tokens are still rejected on use but never deleted. |
-| Tables | `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, in that order. |
+| Tables | In order: expired `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`; expired **pending** `invitations` (accepted rows are kept as the membership's provenance); then stale `sessions`, so sessions whose last refresh token expired in the same run are already eligible. |
+| Session retention | A session is purged when it was revoked more than 30 days ago (kept that long so `revoked_reason`, for example `refresh_reuse`, is visible for incident review), or when it has been idle (`last_used_at`) for more than 24 hours **and** has no refresh-token rows left. The 24-hour grace keeps a rotation in flight from losing its session row. Used refresh tokens stay until they expire so a replay is still recognized as reuse. |
 | Bounds | `DELETE` batches of 1,000 rows chosen with `FOR UPDATE SKIP LOCKED`; at most 1 minute per table per run, the remainder goes to the next run. |
-| Index | `idx_refresh_tokens_expires_at`; the one-row-per-user reset and verification tables are small enough without one. |
-| Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate). |
+| Index | `idx_refresh_tokens_expires_at`, `idx_invitations_expires_at_pending`, `idx_sessions_last_used_at` (plus `idx_refresh_tokens_tenant_session_id` for the live-token check); the one-row-per-user reset and verification tables are small enough without one. |
+| Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate besides the global per-user rows). Reset and verification tokens are per user and have no tenant. |
+
+### Sessions and legacy tokens
+
+- Every sign-in creates a `sessions` row; the access token's `sid` claim names
+  it. Tokens without a positive `sid` (or `tenant_id`) claim are rejected with
+  `401` fail-closed, so after deploying this release every user signs in again;
+  no migration of old tokens is possible or needed.
+- Revocation reasons in `sessions.revoked_reason`: `logout`, `logout_all`,
+  `revoked` (`DELETE /auth/sessions/:id`), `refresh_reuse`,
+  `credentials_changed`, `membership_changed` (ban, removal, role change),
+  `account_deleted`. A burst of `refresh_reuse` (also logged as
+  `refresh token reuse detected; session revoked`) points at stolen refresh
+  tokens or a client that retries refresh with an old token.
+- To force everyone to sign in again without rotating `JWT_SECRET`, revoke
+  live sessions (`UPDATE sessions SET revoked_at = now(), revoked_reason =
+  'revoked' WHERE revoked_at IS NULL`) and wait out the 5-second session cache,
+  or bump users' `token_version`.
+
+### Tenant lifecycle
+
+Tenant status is `trialing | active | suspended | pending_deletion |
+deleted`; only `trialing` and `active` serve requests. Transitions go through
+the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
+which enforces the state machine (`trialing → active | suspended |
+pending_deletion`, `active ↔ suspended`, `active | suspended →
+pending_deletion`, `pending_deletion → active | deleted`) and writes a Tier 1
+audit row per change. Entering `pending_deletion` schedules deletion after a
+30-day grace; cancelling it clears the schedule. Tenant 1 can never be
+deleted (also a `CHECK`). Platform admins use `PATCH
+/platform/tenants/:id/status`; operator tooling must call the service rather
+than raw `UPDATE`s, which skip the audit row. A
+non-operational tenant returns `404` on tenant resolution after the resolver
+cache TTL (30s) and `401` for existing sessions and API keys.
 
 ### Data retention overview
 
@@ -433,15 +467,46 @@ loops run in every worker process regardless.
 | Webhook deliveries/events | Terminal, older than `WEBHOOK_RETENTION_DAYS` (30) | Webhooks background loop, hourly | 1,000-row batches, 30s per pass | See [Webhooks](webhooks.md) |
 | Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
+| Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
-indefinitely, and notifications are never deleted. The two retention indexes
+indefinitely, notifications are never deleted, and expired export documents
+stay in storage until the scheduler is enabled. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
-every tenant; they are partial, so live files and unread notifications are not
-indexed. They ship as `CREATE INDEX CONCURRENTLY` migrations
-(`20261025112300_files_trash_purge_index`,
-`20261025112400_notifications_retention_index`); the purge claim column
-`files.purge_started_at` ships as `20261025112500_files_trash_purge_claim`.
+every tenant; they are partial, so live files, unread notifications, and active
+exports are not indexed. These indexes and the purge claim column
+`files.purge_started_at` are part of the init migration.
+
+#### Privacy exports and erasure (ADR 0013)
+
+`POST /me/data-exports` commits a `data_exports` row and a
+`privacy.data_export` job in one transaction. The job runs every registered
+`privacy.Exporter`, writes one JSON document to
+`<tenantID>/<userID>/exports/<uuid>.json`, marks the row `ready` with a 7-day
+expiry, and sends an in-app notification. Re-delivery is a no-op once the row
+is `ready`; a failed module export marks the row `failed` and the job retries.
+
+| Race | Guard |
+| --- | --- |
+| Two export requests for one membership | The partial unique index `idx_data_exports_active` makes the second insert fail; the service returns `409 data_export.in_progress` (the request idempotency key additionally collapses retries). The request also holds the active membership `FOR SHARE` so it cannot slip past an erasure. |
+| Erasure while an export is building | The erasure request updates the tenant's active/ready exports to `expired`; the export job's `running → ready` update is conditional, so a late writer cannot revive it and deletes its own document. The identity eraser deletes every export document (including already-expired ones), and the finalizer sweeps an export that committed just before the last membership was removed. |
+| Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. |
+| Already-deleted account | The finalizer upgrades an account deleted by the older self-service path: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. |
+| Last-admin erasure | The service takes the per-tenant admin lock and returns `409 user.last_admin` before any job or audit row is written; the per-tenant job re-checks before running any eraser. |
+
+Erasure has two stages: one `privacy.erase` job per membership runs every
+tenant `Eraser` (identity, files, notifications, apikeys, features, and stored
+webhook event history), then `privacy.erase.finalize` checks that every
+membership is `removed` before deleting credentials, identities, sessions, and
+tokens and anonymizing the global user (`erased+<id>@invalid`, empty name,
+`status = deleted`). Until then the finalizer fails and retries with backoff.
+The finalizer also sweeps leftover export documents. Pending `email.send`
+payloads are encrypted at rest and terminal jobs clear them; a queued email
+already committed before the request may still be delivered, and delivered
+webhooks cannot be recalled from third-party receivers.
+Audit rows are append-only and contain only ids/outcomes (`user.erasure_requested`,
+`admin.user.erasure_requested`, `user.erased`), never email, name, or document
+content; that is the retention basis for the request history itself.
 
 #### Files trash purge
 
@@ -514,7 +579,8 @@ JWT notes:
 
 - Refresh tokens are opaque database rows, not JWTs: rotation does not revoke
   them, and a valid refresh token mints an access token with the new key. To
-  force a full re-login, revoke refresh tokens or bump users' token version.
+  force a full re-login, revoke sessions or bump users' token version (see
+  [Sessions and legacy tokens](#sessions-and-legacy-tokens)).
 - Google OAuth `state` is HMAC-signed with a key derived from the **active**
   `JWT_SECRET` only, so sign-ins started before the swap fail once and must be
   restarted.
@@ -970,17 +1036,54 @@ uses a separate Job (see [section 8](#8-kubernetes-deployment-notes)).
 ```mermaid
 flowchart TD
     start([Which database?]) --> fresh{Empty database?}
-    fresh -- yes --> base[cmd/migrate applies<br/>the per-owner baseline]
+    fresh -- yes --> base[cmd/migrate applies<br/>the init migration]
     fresh -- no --> hist{schema_migrations version}
     hist -- "a timestamp" --> newer[Add a timestamped migration<br/>make migrate-create, then cmd/migrate]
     hist -- "legacy 1, 2, or 3" --> manual[Backup, apply missing DDL<br/>manually in one transaction]
     hist -- "none, schema created<br/>out of band" --> verify[Verify objects match the baseline]
-    manual --> force[migrate force 20260101000900]
+    manual --> force[migrate force 20260101000000]
     verify --> force
     force --> run[cmd/migrate: newer migrations<br/>plus schema verification]
     base --> run
     newer --> run
 ```
+
+### Database roles and row-level security
+
+Every tenant-owned table has forced row-level security (ADR 0007). The API,
+worker, and `cmd/seed` must connect as a dedicated non-superuser role without
+`BYPASSRLS`; a superuser or a `BYPASSRLS` role ignores every policy. `cmd/api`
+logs an error when it detects one and refuses to start when
+`APP_ENV=production`. `cmd/migrate` needs the schema owner instead
+(`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
+`DB_USERNAME`/`DB_PASSWORD`).
+
+Create the runtime role once, before the first migration:
+
+```bash
+psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
+  -f deploy/postgres/database-roles.sql
+```
+
+The script grants schema access, table/sequence/function privileges, and
+`ALTER DEFAULT PRIVILEGES` for tables later migrations create. Docker Compose
+runs it automatically on a fresh volume (`deploy/postgres/init-app-role.sh`).
+
+Scoping is per transaction and never session-level:
+`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
+set_config('app.rls_bypass', $2, true)` right after `BEGIN`; a statement
+outside a transaction (`database.Scoped`) runs
+`BEGIN; set_config(...); <statement>; COMMIT` as one pgx Batch. This keeps
+transaction-mode PgBouncer working. A connection with no setting sees no
+tenant-owned rows.
+
+`database.WithRLSBypass(ctx)` marks deliberate cross-tenant work (global job
+claim/lease/purge, retention purges, the feature-flag snapshot, the public
+webhook receiver's source lookup, invitation token acceptance, and identity
+operations on a global user across tenants). Never mark an HTTP path that
+serves one tenant. `cmd/migrate` verifies `relrowsecurity`,
+`relforcerowsecurity`, and the `tenant_isolation` policy on every table with a
+`tenant_id` column.
 
 ### Connection poolers (PgBouncer)
 
@@ -989,13 +1092,13 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 | Setting | Rule |
 | --- | --- |
 | `DB_QUERY_EXEC_MODE` | `cache_statement` (default, pgx named prepared statements per connection) needs PgBouncer 1.21+ with `max_prepared_statements > 0` in transaction mode. `cache_describe` and `describe_exec` use unnamed statements and keep server-side parameter types. `exec` and `simple_protocol` are rejected at startup: without described parameter types, `[]byte` values bound to `json`/`jsonb` columns (audit metadata) are sent as `bytea` and the insert fails. |
-| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT` (credentials, database, schema, and TLS settings are shared). golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` / `DB_MIGRATE_USERNAME` / `DB_MIGRATE_PASSWORD` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT`/`DB_USERNAME`/`DB_PASSWORD`; database, schema, and TLS settings are shared. Use the schema owner here and the non-superuser role for the API. golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
 | `search_path` | Sent as a startup parameter from `DB_SCHEMA`, never as a `SET` after connect (behind a transaction pooler that `SET` would land on one server connection only). Configure PgBouncer to forward it (`track_extra_parameters = search_path`, on versions that support it) or to ignore it (`ignore_startup_parameters = search_path`) and set it on the role with `ALTER ROLE ... SET search_path`. |
 
 ### Fresh installs vs deployed databases
 
-- A fresh install applies the per-owner baseline (ADR 0005): the
-  `migrations/20260101000*_<owner>_*.up.sql` files in version order (see
+- A fresh install applies the single init (ADR 0012):
+  `migrations/20260101000000_platform_init_schema.up.sql` (see
   [Data Model](data-model.md)).
 - Once a database is deployed, never edit a migration it applied. Add one with
   only the new objects: `make migrate-create module=<owner> name=<purpose>`
@@ -1005,8 +1108,8 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
   versions above the recorded one, so a branch migration older than main's
   newest must be regenerated before merge. `test/arch/migrations_test.go`
   (part of `make test`/CI) rejects duplicate versions, missing up/down pairs,
-  non-timestamp versions, unknown owners, and files that create another
-  owner's table.
+  non-timestamp versions, unknown owners, and files or `-- owner:` sections
+  that create another owner's table.
 - A database recorded at a sequential version (the old `000001`–`000003`
   history, or the former consolidated `000001`) keeps it, but those files are
   **not** restored into `migrations/` (the architecture test rejects
@@ -1017,15 +1120,15 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
   2. apply the missing DDL (see below and the README upgrade section) with
      `psql` in one transaction so the schema matches the baseline;
   3. record the baseline with
-     `migrate -path migrations -database "$DSN" force 20260101000900` only
+     `migrate -path migrations -database "$DSN" force 20260101000000` only
      after the schema matches; it rewrites the version, not the schema;
   4. run `cmd/migrate`, which applies newer timestamped migrations and verifies
      the schema, failing with the missing objects if step 2 was incomplete.
 
-  Never point an old database at the baseline files without that manual DDL,
+  Never point an old database at the init without that manual DDL,
   and never reset `schema_migrations` to force it through.
 - If a fresh schema was created out of band and already matches the baseline,
-  verify the objects and `force 20260101000900` instead of applying the files
+  verify the objects and `force 20260101000000` instead of applying the files
   over populated tables.
 
 ### Multi-tenant foundation upgrade
@@ -1033,7 +1136,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 The baseline creates `tenants`, seeds tenant id 1 (`default`), adds
 `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` to users, files,
 notifications, notification preferences, refresh/reset/verification tokens,
-jobs, and audit events, adds tenant-leading indexes, and scopes the last-admin
+jobs, and audit events, adds tenant-leading indexes, and scopes the last-owner
 trigger per tenant. A database deployed before this change does **not** get
 those objects from the baseline. The upgrade DDL must:
 
@@ -1048,13 +1151,22 @@ those objects from the baseline. The upgrade DDL must:
 6. create `notifications` and `notification_preferences` with tenant/user
    columns, the feed/unread indexes, and the unique preference index.
 
+The steps above describe the earlier per-tenant `users` foundation. The
+current baseline goes further (ADR 0004): `users` are global, tenant access is
+a `memberships` row, and every cross-module `(tenant_id, user_id)` FK
+references `memberships`. Moving a per-tenant `users` database onto it is a
+data migration (merge accounts sharing an email, create memberships, move
+passwords/Google IDs to `user_passwords`/`user_identities`, drop old
+tokens); see the identity note in the README's
+[Upgrading an existing database](../README.md#upgrading-an-existing-database).
+
 Keep tenant id 1 as the compatibility anchor unless you also change the column
 defaults and backfill every row. Existing rows default to tenant 1, and their
 old `<userID>/<uuid>.<ext>` storage keys stay valid because downloads read
 `files.storage_path`. New uploads use `<tenantID>/<userID>/<uuid>.<ext>`; if you
 migrate existing blobs, copy first and update `files.storage_path` in the same
-operation. RLS and per-tenant limits are future work (see the README scope
-note).
+operation. Row-level security (ADR 0007) is enforced on every tenant-owned
+table; per-tenant limits are future work (see the README scope note).
 
 | Setting | Behavior |
 | --- | --- |

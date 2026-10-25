@@ -9,12 +9,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,16 +28,11 @@ import (
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 const tenantAdminSecret = "tenant-admin-integration-secret"
@@ -47,7 +40,6 @@ const tenantAdminSecret = "tenant-admin-integration-secret"
 type tenantAdminHarness struct {
 	app        *fiber.App
 	pool       *pgxpool.Pool
-	userRepo   identityrepo.UserRepository
 	adminToken string
 	tenantB    int64
 	adminAID   int64
@@ -63,51 +55,33 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('admin-acme', 'Admin Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "admin-acme")
 
-	insertUser := func(tenantID int64, email, role string, deleted bool) int64 {
+	member := func(tenantID int64, email, role string) testutil.Member {
 		t.Helper()
-		var deletedAt pgtype.Timestamptz
-		if deleted {
-			deletedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
-		}
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role, deleted_at)
-			 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-			tenantID, email, strings.Split(email, "@")[0], role, deletedAt,
-		).Scan(&id))
-		return id
+		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: role})
 	}
-
-	adminAID := insertUser(tenant.DefaultID, "admin-a@example.com", identitydto.RoleAdmin, false)
-	insertUser(tenant.DefaultID, "user-a@example.com", identitydto.RoleUser, false)
-	userBID := insertUser(tenantB, "user-b@example.com", identitydto.RoleUser, false)
-	bannedBID := insertUser(tenantB, "banned-b@example.com", identitydto.RoleUser, true)
-
-	adminToken, err := token.GenerateWithVersionAndTenant(
-		adminAID, tenant.DefaultID, "admin-a@example.com", identitydto.RoleAdmin, 0,
-		tenantAdminSecret, 24,
-	)
+	adminA := member(tenant.DefaultID, "admin-a@example.com", identitydto.RoleAdmin)
+	member(tenant.DefaultID, "user-a@example.com", identitydto.RoleMember)
+	userBID := member(tenantB, "user-b@example.com", identitydto.RoleMember).UserID
+	bannedBID := member(tenantB, "banned-b@example.com", identitydto.RoleMember).UserID
+	_, err = pool.Exec(ctx,
+		`UPDATE memberships SET status = 'suspended', banned_at = NOW() WHERE tenant_id = $1 AND user_id = $2`,
+		tenantB, bannedBID)
 	require.NoError(t, err)
 
-	userRepo := identityrepo.NewUserRepository(pool)
-	tenantRepo := identityrepo.NewTenantRepository(pool)
+	adminToken := testutil.SessionToken(t, ctx, pool, adminA, tenantAdminSecret)
+
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
-	txManager := database.NewTxManager(pool)
-	auditRecorder := audit.NewPostgresRecorder(pool)
-	sessionStore := session.NewStore(userRepo, appCache)
+	txManager := testutil.NewTxManager(pool)
+	auditRecorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
+	kit := newIdentityKit(pool, appCache, auditRecorder, tenantAdminSecret, nil)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 
-	identityAdmin := identityadapter.NewAdminIdentity(
-		identityservice.NewAdminUserService(userRepo, identityrepo.NewRefreshTokenRepository(pool), txManager, auditRecorder, sessionStore),
-	)
-	filesRepo := filesrepo.NewFileRepository(pool)
+	identityAdmin := identityadapter.NewAdminIdentity(kit.admin)
+	filesRepo := filesrepo.NewFileRepository(testutil.Scoped(pool))
 	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
 
@@ -126,18 +100,17 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 	}
 	application := app.New(cfg, app.Deps{
 		Cache:          appCache,
-		Sessions:       sessionStore,
-		TenantResolver: identityadapter.NewTenantResolver(tenantRepo),
+		Sessions:       kit.sessions,
+		TenantResolver: identityadapter.NewTenantResolver(kit.stores.Tenants),
 	})
 	application.Register(admin.New(adminHandler))
 
 	return &tenantAdminHarness{
 		app:        application.Fiber(),
 		pool:       pool,
-		userRepo:   userRepo,
 		adminToken: adminToken,
 		tenantB:    tenantB,
-		adminAID:   adminAID,
+		adminAID:   adminA.UserID,
 		userBID:    userBID,
 		bannedBID:  bannedBID,
 	}
@@ -165,10 +138,25 @@ func (h *tenantAdminHarness) request(t *testing.T, method, path, body string) (s
 	return resp.StatusCode, respBody
 }
 
+// membership reads a user's membership role and status in tenantID.
+func (h *tenantAdminHarness) membership(t *testing.T, tenantID, userID int64) (role, status string) {
+	t.Helper()
+	require.NoError(t, h.pool.QueryRow(context.Background(), `
+		SELECT COALESCE((
+			SELECT r.key FROM membership_roles mr JOIN roles r ON r.id = mr.role_id
+			WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+			ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+			LIMIT 1
+		), 'member'), m.status
+		FROM memberships m WHERE m.tenant_id = $1 AND m.user_id = $2`, tenantID, userID,
+	).Scan(&role, &status))
+	return role, status
+}
+
 func TestTenantAdminModule_CrossTenantOperationsAreNotFound(t *testing.T) {
 	h := setupTenantAdminHarness(t)
 
-	// List: only tenant A accounts are visible.
+	// List: only tenant A members are visible.
 	status, body := h.request(t, http.MethodGet, "/api/v1/admin/users", "")
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 	var page struct {
@@ -181,7 +169,7 @@ func TestTenantAdminModule_CrossTenantOperationsAreNotFound(t *testing.T) {
 		assert.NotEqual(t, h.bannedBID, user.ID)
 	}
 
-	// Stats: tenant A's two active users only.
+	// Stats: tenant A's two active members only.
 	status, body = h.request(t, http.MethodGet, "/api/v1/admin/stats", "")
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 	var stats admindto.AdminStatsResponse
@@ -189,12 +177,13 @@ func TestTenantAdminModule_CrossTenantOperationsAreNotFound(t *testing.T) {
 	assert.Equal(t, int64(2), stats.ActiveUsers)
 	assert.Zero(t, stats.DeletedUsers)
 
-	// Role update for a tenant B user id: not found, not forbidden.
+	// Role update for a user without a tenant A membership: not found, not
+	// forbidden.
 	status, body = h.request(t, http.MethodPut,
 		"/api/v1/admin/users/"+strconv.FormatInt(h.userBID, 10)+"/role", `{"role":"admin"}`)
 	assert.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
 
-	// Ban/unban a tenant B user id: not found, and rows are unchanged.
+	// Ban/unban of tenant B members: not found, and memberships are unchanged.
 	status, body = h.request(t, http.MethodPost,
 		"/api/v1/admin/users/"+strconv.FormatInt(h.userBID, 10)+"/ban", "")
 	assert.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
@@ -203,21 +192,16 @@ func TestTenantAdminModule_CrossTenantOperationsAreNotFound(t *testing.T) {
 		"/api/v1/admin/users/"+strconv.FormatInt(h.bannedBID, 10)+"/unban", "")
 	assert.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
 
-	userB, err := h.userRepo.GetByID(tenant.WithID(context.Background(), h.tenantB), h.userBID)
-	require.NoError(t, err)
-	assert.Equal(t, identitydto.RoleUser, userB.Role)
-	assert.False(t, userB.DeletedAt.Valid, "tenant B active user must not be banned")
+	role, memberStatus := h.membership(t, h.tenantB, h.userBID)
+	assert.Equal(t, identitydto.RoleMember, role)
+	assert.Equal(t, "active", memberStatus, "tenant B active member must not be banned")
 
-	var bannedRole string
-	var bannedDeleted bool
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT role, deleted_at IS NOT NULL FROM users WHERE id = $1`, h.bannedBID,
-	).Scan(&bannedRole, &bannedDeleted))
-	assert.Equal(t, identitydto.RoleUser, bannedRole)
-	assert.True(t, bannedDeleted, "tenant B banned user must stay banned")
+	role, memberStatus = h.membership(t, h.tenantB, h.bannedBID)
+	assert.Equal(t, identitydto.RoleMember, role)
+	assert.Equal(t, "suspended", memberStatus, "tenant B banned member must stay banned")
 
 	// The tenant A admin still exists and was not affected by the attempts.
-	adminA, err := h.userRepo.GetByID(context.Background(), h.adminAID)
-	require.NoError(t, err)
-	assert.Equal(t, identitydto.RoleAdmin, adminA.Role)
+	role, memberStatus = h.membership(t, tenant.DefaultID, h.adminAID)
+	assert.Equal(t, identitydto.RoleAdmin, role)
+	assert.Equal(t, "active", memberStatus)
 }

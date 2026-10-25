@@ -133,7 +133,7 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	credentials, key := newTestKey(t)
 	store := &fakeStore{key: key}
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive}
+	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
 	verifier := NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now))
 
 	verified, err := verifier.Verify(context.Background(), credentials.Key, 1)
@@ -167,7 +167,7 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 func TestVerifier_RejectsInvalidStates(t *testing.T) {
 	credentials, baseKey := newTestKey(t)
 	now := time.Unix(1_700_000_100, 0).UTC()
-	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive}
+	principal := identitycontracts.Principal{ID: 42, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
 
 	past := now.Add(-time.Minute)
 	future := now.Add(time.Hour)
@@ -288,7 +288,7 @@ func TestVerifier_RejectsUnknownMalformedAndInactiveOwner(t *testing.T) {
 			raw:   credentials.Key,
 			store: &fakeStore{key: key},
 			principals: fakePrincipals{principal: identitycontracts.Principal{
-				ID: 42, TenantID: 2, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive,
+				ID: 42, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive,
 			}},
 		},
 	}
@@ -309,7 +309,7 @@ func TestVerifier_RejectsSuspendedTenant(t *testing.T) {
 	credentials, key := newTestKey(t)
 	store := &fakeStore{key: key}
 	verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-		ID: 42, TenantID: 1, Role: authz.RoleUser, TenantStatus: "suspended",
+		ID: 42, TenantID: 1, Role: authz.RoleMember, TenantStatus: "suspended",
 	}})
 
 	_, err := verifier.Verify(context.Background(), credentials.Key, 0)

@@ -41,7 +41,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
@@ -114,54 +113,37 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	var tenantB int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('webhooks-acme', 'Webhooks Acme') RETURNING id`,
-	).Scan(&tenantB))
+	tenantB := testutil.CreateTenant(t, ctx, pool, "webhooks-acme")
 
-	insertAdmin := func(tenantID int64, email string) int64 {
+	// The session store validates every token against a live session row.
+	sessionToken := func(tenantID int64, email, role string) string {
 		t.Helper()
-		var id int64
-		require.NoError(t, pool.QueryRow(ctx,
-			`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, $3, 'admin') RETURNING id`,
-			tenantID, email, strings.Split(email, "@")[0],
-		).Scan(&id))
-		return id
+		member := testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: role})
+		return testutil.SessionToken(t, ctx, pool, member, webhookIntegrationSecret)
 	}
-	userA := insertAdmin(tenant.DefaultID, "webhooks-a@test.com")
-	userB := insertAdmin(tenantB, "webhooks-b@test.com")
-	var regularUser int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, $3, 'user') RETURNING id`,
-		tenant.DefaultID, "webhooks-user@test.com", "webhooks-user",
-	).Scan(&regularUser))
-
-	tokenA, err := token.GenerateWithVersionAndTenant(userA, tenant.DefaultID, "webhooks-a@test.com", "admin", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
-	tokenB, err := token.GenerateWithVersionAndTenant(userB, tenantB, "webhooks-b@test.com", "admin", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
-	tokenUser, err := token.GenerateWithVersionAndTenant(regularUser, tenant.DefaultID, "webhooks-user@test.com", "user", 0, webhookIntegrationSecret, 24)
-	require.NoError(t, err)
+	tokenA := sessionToken(tenant.DefaultID, "webhooks-a@test.com", "admin")
+	tokenB := sessionToken(tenantB, "webhooks-b@test.com", "admin")
+	tokenUser := sessionToken(tenant.DefaultID, "webhooks-user@test.com", "user")
 
 	appCache, err := cache.NewCache(config.CacheConfig{Driver: "memory"})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = appCache.Close() })
 
-	userRepo := identityrepo.NewUserRepository(pool)
-	tenantRepo := identityrepo.NewTenantRepository(pool)
+	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	tenantRepo := stores.Tenants
 	resolver := identityadapter.NewTenantResolver(tenantRepo)
-	sessionStore := session.NewStore(userRepo, appCache)
-	jobQueue := jobs.NewQueue(pool)
-	repo := webhookrepo.New(pool, jobQueue)
+	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
+	jobQueue := jobs.NewQueue(testutil.Scoped(pool))
+	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), jobQueue)
 	codec, err := webhookservice.NewSecretCodec("webhook-integration-encryption-key")
 	require.NoError(t, err)
-	recorder := audit.NewPostgresRecorder(pool)
+	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
 	svc := webhookservice.New(repo, repo, repo, codec, recorder, webhookservice.Options{
 		DefaultMaxAttempts: 3,
 		DefaultTimeoutMS:   2000,
 		TimestampTolerance: 5 * time.Minute,
 		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id int64) (bool, error) {
-			if _, err := tenantRepo.GetByID(ctx, id); err != nil {
+			if _, err := tenantRepo.GetOperationalByID(ctx, id); err != nil {
 				if errors.Is(err, apperror.ErrNotFound) {
 					return false, nil
 				}
@@ -465,7 +447,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.Equal(t, 1, created)
 
 		deliveryID := h.deliveryID(t, successEvent.ID)
-		payload, _ := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: deliveryID})
+		payload, _ := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", deliveryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
@@ -505,7 +487,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), badEvent)
 		require.NoError(t, err)
 		badID := h.deliveryID(t, badEvent.ID)
-		payload, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: badID})
+		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: badID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", badID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
@@ -519,7 +501,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), retryEvent)
 		require.NoError(t, err)
 		retryID := h.deliveryID(t, retryEvent.ID)
-		payload, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: retryID})
+		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: retryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
 		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", retryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
@@ -674,7 +656,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("transactional publish commits with the producer", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/tx", "tx.*")
-		bus := events.New(jobs.NewQueue(h.pool))
+		bus := events.New(jobs.NewQueue(testutil.Scoped(h.pool)))
 		for _, eventType := range []string{"tx.rolled_back", "tx.committed"} {
 			require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", h.dispatcher.HandleEvent))
 		}
@@ -740,13 +722,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			`UPDATE webhook_deliveries SET attempts = max_attempts, next_attempt_at = now() - interval '1 second' WHERE id = $1`,
 			exhausted)
 		require.NoError(t, err)
-		job, _ := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: exhausted})
+		job, _ := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: exhausted})
 		require.NoError(t, h.worker.Handle(tenantCtx, job))
 
 		// A disabled endpoint stops receiving retries.
 		_, err = h.pool.Exec(ctx, `UPDATE webhook_endpoints SET status = 'disabled' WHERE id = $1`, endpoint.ID)
 		require.NoError(t, err)
-		job, _ = json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: disabled})
+		job, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: disabled})
 		require.NoError(t, h.worker.Handle(tenantCtx, job))
 
 		for id, reason := range map[int64]string{
@@ -842,11 +824,14 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', 1, 'system', now(), '{}'::jsonb, now()`,
 			h.tenantA)
 		require.NoError(t, err)
+		// Insert terminal rows already old: the updated_at trigger only fires on
+		// UPDATE, and the app role must not need table ownership for DDL.
 		_, err = h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
-			    url, secret_ciphertext, status, max_attempts)
+			    url, secret_ciphertext, status, max_attempts, updated_at)
 			SELECT $1, $2, 'evt_purge_' || g, 'https://receiver.example/purge',
-			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3
+			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3,
+			       now() - interval '40 days'
 			FROM generate_series(1, 1500) AS g`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
@@ -856,15 +841,6 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			VALUES ($1, $2, 'evt_purge_pending', 'https://receiver.example/purge', 'sealed', 'pending', 3)`,
 			h.tenantA, endpoint.ID)
 		require.NoError(t, err)
-		// The updated_at trigger fires on UPDATE, so disable it to age rows.
-		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries DISABLE TRIGGER trigger_webhook_deliveries_updated_at`)
-		require.NoError(t, err)
-		_, err = h.pool.Exec(ctx,
-			`UPDATE webhook_deliveries SET updated_at = now() - interval '40 days' WHERE event_id LIKE 'evt_purge_%'`)
-		require.NoError(t, err)
-		_, err = h.pool.Exec(ctx, `ALTER TABLE webhook_deliveries ENABLE TRIGGER trigger_webhook_deliveries_updated_at`)
-		require.NoError(t, err)
-
 		purged, err := h.repo.PurgeDeliveries(ctx, 30)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1500), purged, "every terminal row is purged across batches")
@@ -947,11 +923,11 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	require.Equal(t, int32(2), current.Attempts)
 
 	// Every outcome write from the stale attempt is discarded.
-	require.ErrorIs(t, h.repo.MarkDeliverySucceeded(ctx, id, stale.Attempts, http.StatusOK), webhookrepo.ErrDeliveryLeaseLost)
-	require.ErrorIs(t, h.repo.MarkDeliveryDead(ctx, id, stale.Attempts, http.StatusBadRequest, "stale"), webhookrepo.ErrDeliveryLeaseLost)
-	require.ErrorIs(t, h.repo.RescheduleDeliveryWithJob(ctx, webhookrepo.RetryDraft{
+	require.ErrorIs(t, h.repo.MarkDeliverySucceeded(ctx, id, stale.Attempts, http.StatusOK), webhookservice.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.MarkDeliveryDead(ctx, id, stale.Attempts, http.StatusBadRequest, "stale"), webhookservice.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.RescheduleDeliveryWithJob(ctx, webhookservice.RetryDraft{
 		DeliveryID: id, Attempt: stale.Attempts, NextAttemptAt: time.Now().Add(time.Hour),
-	}), webhookrepo.ErrDeliveryLeaseLost)
+	}), webhookservice.ErrDeliveryLeaseLost)
 	got, err := h.repo.GetDelivery(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, "pending", got.Status)
@@ -960,7 +936,7 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	// The current attempt is interrupted by shutdown: it is given back and
 	// immediately claimable again with the same attempt number.
 	require.NoError(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts))
-	require.ErrorIs(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts), webhookrepo.ErrDeliveryLeaseLost)
+	require.ErrorIs(t, h.repo.ReleaseDeliveryClaim(ctx, id, current.Attempts), webhookservice.ErrDeliveryLeaseLost)
 	reclaimed, err := h.repo.ClaimDelivery(ctx, id, time.Minute)
 	require.NoError(t, err, "a released claim must be claimable without waiting for the lease")
 	assert.Equal(t, int32(2), reclaimed.Attempts)

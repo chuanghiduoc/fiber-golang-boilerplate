@@ -7,669 +7,213 @@ package sqlc
 
 import (
 	"context"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const adminCountUsers = `-- name: AdminCountUsers :one
-SELECT count(*) FROM users
-WHERE tenant_id = $1
-`
-
-func (q *Queries) AdminCountUsers(ctx context.Context, tenantID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, adminCountUsers, tenantID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const adminListUsers = `-- name: AdminListUsers :many
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1
-ORDER BY id LIMIT $2 OFFSET $3
-`
-
-type AdminListUsersParams struct {
-	TenantID int64 `json:"tenant_id"`
-	Limit    int32 `json:"limit"`
-	Offset   int32 `json:"offset"`
-}
-
-func (q *Queries) AdminListUsers(ctx context.Context, arg AdminListUsersParams) ([]User, error) {
-	rows, err := q.db.Query(ctx, adminListUsers, arg.TenantID, arg.Limit, arg.Offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []User{}
-	for rows.Next() {
-		var i User
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Email,
-			&i.PasswordHash,
-			&i.Name,
-			&i.Role,
-			&i.GoogleID,
-			&i.AuthProvider,
-			&i.EmailVerifiedAt,
-			&i.TokenVersion,
-			&i.PasswordChangedAt,
-			&i.BannedAt,
-			&i.CredentialsRevokedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const adminListUsersCursor = `-- name: AdminListUsersCursor :many
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1::bigint
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
-ORDER BY created_at DESC, id DESC
-LIMIT $4::int
-`
-
-type AdminListUsersCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
-	RowLimit        int32              `json:"row_limit"`
-}
-
-func (q *Queries) AdminListUsersCursor(ctx context.Context, arg AdminListUsersCursorParams) ([]User, error) {
-	rows, err := q.db.Query(ctx, adminListUsersCursor,
-		arg.TenantID,
-		arg.CursorCreatedAt,
-		arg.CursorID,
-		arg.RowLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []User{}
-	for rows.Next() {
-		var i User
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Email,
-			&i.PasswordHash,
-			&i.Name,
-			&i.Role,
-			&i.GoogleID,
-			&i.AuthProvider,
-			&i.EmailVerifiedAt,
-			&i.TokenVersion,
-			&i.PasswordChangedAt,
-			&i.BannedAt,
-			&i.CredentialsRevokedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const adminUserStats = `-- name: AdminUserStats :one
-SELECT
-    count(*) FILTER (WHERE deleted_at IS NULL)::bigint AS active_users,
-    count(*) FILTER (WHERE deleted_at IS NOT NULL)::bigint AS deleted_users
-FROM users
-WHERE tenant_id = $1
-`
-
-type AdminUserStatsRow struct {
-	ActiveUsers  int64 `json:"active_users"`
-	DeletedUsers int64 `json:"deleted_users"`
-}
-
-func (q *Queries) AdminUserStats(ctx context.Context, tenantID int64) (AdminUserStatsRow, error) {
-	row := q.db.QueryRow(ctx, adminUserStats, tenantID)
-	var i AdminUserStatsRow
-	err := row.Scan(&i.ActiveUsers, &i.DeletedUsers)
-	return i, err
-}
-
-const banUser = `-- name: BanUser :one
-UPDATE users
-SET deleted_at = NOW(), banned_at = NOW(), updated_at = NOW(),
-    token_version = token_version + 1, password_changed_at = NOW(),
-    -- Kept by RestoreUser, so API keys issued before the ban stay dead.
-    -- clock_timestamp(), not NOW(): an API-key insert holding the owner row
-    -- FOR SHARE (LockUserPrincipal) makes this UPDATE wait, and that key's
-    -- created_at (its transaction start) must still compare at or before the
-    -- revocation, which NOW() (this transaction's start) does not guarantee.
-    credentials_revoked_at = clock_timestamp()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
-`
-
-type BanUserParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-}
-
-func (q *Queries) BanUser(ctx context.Context, arg BanUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, banUser, arg.ID, arg.TenantID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const countActiveAdmins = `-- name: CountActiveAdmins :one
-SELECT count(*) FROM users
-WHERE tenant_id = $1 AND role = 'admin' AND deleted_at IS NULL
-`
-
-func (q *Queries) CountActiveAdmins(ctx context.Context, tenantID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countActiveAdmins, tenantID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countDeletedUsers = `-- name: CountDeletedUsers :one
-SELECT count(*) FROM users
-WHERE tenant_id = $1 AND deleted_at IS NOT NULL
-`
-
-func (q *Queries) CountDeletedUsers(ctx context.Context, tenantID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countDeletedUsers, tenantID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const countUsers = `-- name: CountUsers :one
-SELECT count(*) FROM users
-WHERE tenant_id = $1 AND deleted_at IS NULL
-`
-
-func (q *Queries) CountUsers(ctx context.Context, tenantID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countUsers, tenantID)
-	var count int64
-	err := row.Scan(&count)
-	return count, err
-}
-
-const createAdminUser = `-- name: CreateAdminUser :one
-INSERT INTO users (tenant_id, email, password_hash, name, role, email_verified_at)
-VALUES ($1, $2, $3, $4, 'admin', NOW())
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
-`
-
-type CreateAdminUserParams struct {
-	TenantID     int64       `json:"tenant_id"`
-	Email        string      `json:"email"`
-	PasswordHash pgtype.Text `json:"password_hash"`
-	Name         string      `json:"name"`
-}
-
-// Startup admin seed: the role and verification are set in the same INSERT,
-// so a crash can never leave a half-seeded non-admin account behind.
-func (q *Queries) CreateAdminUser(ctx context.Context, arg CreateAdminUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, createAdminUser,
-		arg.TenantID,
-		arg.Email,
-		arg.PasswordHash,
-		arg.Name,
-	)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const createOAuthUser = `-- name: CreateOAuthUser :one
-INSERT INTO users (tenant_id, email, name, google_id, auth_provider, email_verified_at)
-VALUES ($1, $2, $3, $4, $5, NOW())
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
-`
-
-type CreateOAuthUserParams struct {
-	TenantID     int64       `json:"tenant_id"`
-	Email        string      `json:"email"`
-	Name         string      `json:"name"`
-	GoogleID     pgtype.Text `json:"google_id"`
-	AuthProvider string      `json:"auth_provider"`
-}
-
-func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, createOAuthUser,
-		arg.TenantID,
-		arg.Email,
-		arg.Name,
-		arg.GoogleID,
-		arg.AuthProvider,
-	)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
 const createUser = `-- name: CreateUser :one
-INSERT INTO users (tenant_id, email, password_hash, name)
-VALUES ($1, $2, $3, $4)
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+INSERT INTO users (email, name, email_verified_at)
+VALUES ($1, $2, CASE WHEN $3::boolean THEN NOW() END)
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
 type CreateUserParams struct {
-	TenantID     int64       `json:"tenant_id"`
-	Email        string      `json:"email"`
-	PasswordHash pgtype.Text `json:"password_hash"`
-	Name         string      `json:"name"`
+	Email         string `json:"email"`
+	Name          string `json:"name"`
+	EmailVerified bool   `json:"email_verified"`
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, createUser,
-		arg.TenantID,
+	row := q.db.QueryRow(ctx, createUser, arg.Email, arg.Name, arg.EmailVerified)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Name,
+		&i.EmailVerifiedAt,
+		&i.Status,
+		&i.TokenVersion,
+		&i.CredentialsChangedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const createUserIdentity = `-- name: CreateUserIdentity :exec
+INSERT INTO user_identities (user_id, provider, subject, email)
+VALUES ($1, $2, $3, $4)
+`
+
+type CreateUserIdentityParams struct {
+	UserID   int64  `json:"user_id"`
+	Provider string `json:"provider"`
+	Subject  string `json:"subject"`
+	Email    string `json:"email"`
+}
+
+func (q *Queries) CreateUserIdentity(ctx context.Context, arg CreateUserIdentityParams) error {
+	_, err := q.db.Exec(ctx, createUserIdentity,
+		arg.UserID,
+		arg.Provider,
+		arg.Subject,
 		arg.Email,
-		arg.PasswordHash,
-		arg.Name,
 	)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
+	return err
 }
 
-const deleteUser = `-- name: DeleteUser :one
-UPDATE users
-SET deleted_at = NOW(), updated_at = NOW(), token_version = token_version + 1,
-    password_changed_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+const createUserPassword = `-- name: CreateUserPassword :exec
+INSERT INTO user_passwords (user_id, password_hash)
+VALUES ($1, $2)
 `
 
-type DeleteUserParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+type CreateUserPasswordParams struct {
+	UserID       int64  `json:"user_id"`
+	PasswordHash string `json:"password_hash"`
 }
 
-func (q *Queries) DeleteUser(ctx context.Context, arg DeleteUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, deleteUser, arg.ID, arg.TenantID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const getBannedUserByEmail = `-- name: GetBannedUserByEmail :one
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1 AND lower(email) = lower($2) AND banned_at IS NOT NULL
-LIMIT 1
-`
-
-type GetBannedUserByEmailParams struct {
-	TenantID int64  `json:"tenant_id"`
-	Lower    string `json:"lower"`
-}
-
-func (q *Queries) GetBannedUserByEmail(ctx context.Context, arg GetBannedUserByEmailParams) (User, error) {
-	row := q.db.QueryRow(ctx, getBannedUserByEmail, arg.TenantID, arg.Lower)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const getDeletedUserByEmail = `-- name: GetDeletedUserByEmail :one
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NOT NULL
-LIMIT 1
-`
-
-type GetDeletedUserByEmailParams struct {
-	TenantID int64  `json:"tenant_id"`
-	Lower    string `json:"lower"`
-}
-
-// Startup admin seed only (one query per boot): finds a banned or
-// self-deleted account so the seed never resurrects it.
-func (q *Queries) GetDeletedUserByEmail(ctx context.Context, arg GetDeletedUserByEmailParams) (User, error) {
-	row := q.db.QueryRow(ctx, getDeletedUserByEmail, arg.TenantID, arg.Lower)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
+func (q *Queries) CreateUserPassword(ctx context.Context, arg CreateUserPasswordParams) error {
+	_, err := q.db.Exec(ctx, createUserPassword, arg.UserID, arg.PasswordHash)
+	return err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1 AND lower(email) = lower($2) AND deleted_at IS NULL
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at,
+       EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
+FROM users u
+WHERE u.email = $1 AND u.status <> 'deleted'
 `
 
-type GetUserByEmailParams struct {
-	TenantID int64  `json:"tenant_id"`
-	Lower    string `json:"lower"`
+type GetUserByEmailRow struct {
+	User        User `json:"user"`
+	HasPassword bool `json:"has_password"`
 }
 
-func (q *Queries) GetUserByEmail(ctx context.Context, arg GetUserByEmailParams) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByEmail, arg.TenantID, arg.Lower)
-	var i User
+// The address is stored normalized (chk_users_email_normalized), so the
+// lookup is an equality on idx_users_email_live.
+func (q *Queries) GetUserByEmail(ctx context.Context, email string) (GetUserByEmailRow, error) {
+	row := q.db.QueryRow(ctx, getUserByEmail, email)
+	var i GetUserByEmailRow
 	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const getUserByGoogleID = `-- name: GetUserByGoogleID :one
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1 AND google_id = $2 AND deleted_at IS NULL
-`
-
-type GetUserByGoogleIDParams struct {
-	TenantID int64       `json:"tenant_id"`
-	GoogleID pgtype.Text `json:"google_id"`
-}
-
-func (q *Queries) GetUserByGoogleID(ctx context.Context, arg GetUserByGoogleIDParams) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByGoogleID, arg.TenantID, arg.GoogleID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
+		&i.User.ID,
+		&i.User.Email,
+		&i.User.Name,
+		&i.User.EmailVerifiedAt,
+		&i.User.Status,
+		&i.User.TokenVersion,
+		&i.User.CredentialsChangedAt,
+		&i.User.CreatedAt,
+		&i.User.UpdatedAt,
+		&i.User.DeletedAt,
+		&i.HasPassword,
 	)
 	return i, err
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at,
+       EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
+FROM users u
+WHERE u.id = $1 AND u.status <> 'deleted'
 `
 
-type GetUserByIDParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+type GetUserByIDRow struct {
+	User        User `json:"user"`
+	HasPassword bool `json:"has_password"`
 }
 
-func (q *Queries) GetUserByID(ctx context.Context, arg GetUserByIDParams) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByID, arg.ID, arg.TenantID)
+// Global user identities (ADR 0004). These queries are deliberately not
+// tenant-scoped: a user exists once across tenants. Tenant-facing reads go
+// through membership.sql, which always filters by tenant_id.
+func (q *Queries) GetUserByID(ctx context.Context, id int64) (GetUserByIDRow, error) {
+	row := q.db.QueryRow(ctx, getUserByID, id)
+	var i GetUserByIDRow
+	err := row.Scan(
+		&i.User.ID,
+		&i.User.Email,
+		&i.User.Name,
+		&i.User.EmailVerifiedAt,
+		&i.User.Status,
+		&i.User.TokenVersion,
+		&i.User.CredentialsChangedAt,
+		&i.User.CreatedAt,
+		&i.User.UpdatedAt,
+		&i.User.DeletedAt,
+		&i.HasPassword,
+	)
+	return i, err
+}
+
+const getUserByIdentity = `-- name: GetUserByIdentity :one
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at,
+       EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
+FROM user_identities i
+JOIN users u ON u.id = i.user_id
+WHERE i.provider = $1 AND i.subject = $2 AND u.status <> 'deleted'
+`
+
+type GetUserByIdentityParams struct {
+	Provider string `json:"provider"`
+	Subject  string `json:"subject"`
+}
+
+type GetUserByIdentityRow struct {
+	User        User `json:"user"`
+	HasPassword bool `json:"has_password"`
+}
+
+func (q *Queries) GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (GetUserByIdentityRow, error) {
+	row := q.db.QueryRow(ctx, getUserByIdentity, arg.Provider, arg.Subject)
+	var i GetUserByIdentityRow
+	err := row.Scan(
+		&i.User.ID,
+		&i.User.Email,
+		&i.User.Name,
+		&i.User.EmailVerifiedAt,
+		&i.User.Status,
+		&i.User.TokenVersion,
+		&i.User.CredentialsChangedAt,
+		&i.User.CreatedAt,
+		&i.User.UpdatedAt,
+		&i.User.DeletedAt,
+		&i.HasPassword,
+	)
+	return i, err
+}
+
+const getUserPasswordHash = `-- name: GetUserPasswordHash :one
+SELECT p.password_hash
+FROM user_passwords p
+JOIN users u ON u.id = p.user_id
+WHERE p.user_id = $1 AND u.status <> 'deleted'
+`
+
+func (q *Queries) GetUserPasswordHash(ctx context.Context, userID int64) (string, error) {
+	row := q.db.QueryRow(ctx, getUserPasswordHash, userID)
+	var password_hash string
+	err := row.Scan(&password_hash)
+	return password_hash, err
+}
+
+const markUserDeleted = `-- name: MarkUserDeleted :one
+UPDATE users
+SET status = 'deleted', deleted_at = NOW(),
+    token_version = token_version + 1, credentials_changed_at = NOW()
+WHERE id = $1 AND status <> 'deleted'
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
+`
+
+func (q *Queries) MarkUserDeleted(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRow(ctx, markUserDeleted, id)
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
 		&i.Email,
-		&i.PasswordHash,
 		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
 		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const getUserPrincipal = `-- name: GetUserPrincipal :one
-SELECT u.id, u.tenant_id, u.email, u.name, u.role, u.credentials_revoked_at, t.status AS tenant_status
-FROM users u
-JOIN tenants t ON t.id = u.tenant_id
-WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-`
-
-type GetUserPrincipalParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-}
-
-type GetUserPrincipalRow struct {
-	ID                   int64              `json:"id"`
-	TenantID             int64              `json:"tenant_id"`
-	Email                string             `json:"email"`
-	Name                 string             `json:"name"`
-	Role                 string             `json:"role"`
-	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
-	TenantStatus         string             `json:"tenant_status"`
-}
-
-// API-key authentication needs the owner's current role and the owning
-// tenant's status in one lookup, so a suspended tenant's keys stop working.
-// credentials_revoked_at lets the verifier reject keys created before a ban.
-func (q *Queries) GetUserPrincipal(ctx context.Context, arg GetUserPrincipalParams) (GetUserPrincipalRow, error) {
-	row := q.db.QueryRow(ctx, getUserPrincipal, arg.ID, arg.TenantID)
-	var i GetUserPrincipalRow
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.Name,
-		&i.Role,
-		&i.CredentialsRevokedAt,
-		&i.TenantStatus,
-	)
-	return i, err
-}
-
-const getUserSessionState = `-- name: GetUserSessionState :one
-SELECT u.role, u.token_version, u.tenant_id, t.status
-FROM users u
-JOIN tenants t ON t.id = u.tenant_id
-WHERE u.id = $1 AND u.deleted_at IS NULL
-`
-
-type GetUserSessionStateRow struct {
-	Role         string `json:"role"`
-	TokenVersion int32  `json:"token_version"`
-	TenantID     int64  `json:"tenant_id"`
-	Status       string `json:"status"`
-}
-
-// Deliberately keyed only by user id: the session validator compares the
-// token's tenant claim with the row's tenant and rejects mismatches and
-// suspended tenants. This is not used for any tenant-facing data read.
-func (q *Queries) GetUserSessionState(ctx context.Context, id int64) (GetUserSessionStateRow, error) {
-	row := q.db.QueryRow(ctx, getUserSessionState, id)
-	var i GetUserSessionStateRow
-	err := row.Scan(
-		&i.Role,
-		&i.TokenVersion,
-		&i.TenantID,
 		&i.Status,
-	)
-	return i, err
-}
-
-const linkGoogleAccount = `-- name: LinkGoogleAccount :one
-UPDATE users SET google_id = $1, auth_provider = 'google', updated_at = NOW()
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-  AND (google_id IS NULL OR google_id = $1)
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
-`
-
-type LinkGoogleAccountParams struct {
-	GoogleID pgtype.Text `json:"google_id"`
-	ID       int64       `json:"id"`
-	TenantID int64       `json:"tenant_id"`
-}
-
-// Never replaces a different Google identity: zero rows means the account is
-// already linked to another Google account (or is no longer active).
-func (q *Queries) LinkGoogleAccount(ctx context.Context, arg LinkGoogleAccountParams) (User, error) {
-	row := q.db.QueryRow(ctx, linkGoogleAccount, arg.GoogleID, arg.ID, arg.TenantID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
 		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
+		&i.CredentialsChangedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
@@ -677,201 +221,27 @@ func (q *Queries) LinkGoogleAccount(ctx context.Context, arg LinkGoogleAccountPa
 	return i, err
 }
 
-const listUsers = `-- name: ListUsers :many
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1 AND deleted_at IS NULL
-ORDER BY id LIMIT $2 OFFSET $3
-`
-
-type ListUsersParams struct {
-	TenantID int64 `json:"tenant_id"`
-	Limit    int32 `json:"limit"`
-	Offset   int32 `json:"offset"`
-}
-
-func (q *Queries) ListUsers(ctx context.Context, arg ListUsersParams) ([]User, error) {
-	rows, err := q.db.Query(ctx, listUsers, arg.TenantID, arg.Limit, arg.Offset)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []User{}
-	for rows.Next() {
-		var i User
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Email,
-			&i.PasswordHash,
-			&i.Name,
-			&i.Role,
-			&i.GoogleID,
-			&i.AuthProvider,
-			&i.EmailVerifiedAt,
-			&i.TokenVersion,
-			&i.PasswordChangedAt,
-			&i.BannedAt,
-			&i.CredentialsRevokedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listUsersCursor = `-- name: ListUsersCursor :many
-SELECT id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at FROM users
-WHERE tenant_id = $1::bigint
-  AND deleted_at IS NULL
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
-ORDER BY created_at DESC, id DESC
-LIMIT $4::int
-`
-
-type ListUsersCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
-	RowLimit        int32              `json:"row_limit"`
-}
-
-func (q *Queries) ListUsersCursor(ctx context.Context, arg ListUsersCursorParams) ([]User, error) {
-	rows, err := q.db.Query(ctx, listUsersCursor,
-		arg.TenantID,
-		arg.CursorCreatedAt,
-		arg.CursorID,
-		arg.RowLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []User{}
-	for rows.Next() {
-		var i User
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.Email,
-			&i.PasswordHash,
-			&i.Name,
-			&i.Role,
-			&i.GoogleID,
-			&i.AuthProvider,
-			&i.EmailVerifiedAt,
-			&i.TokenVersion,
-			&i.PasswordChangedAt,
-			&i.BannedAt,
-			&i.CredentialsRevokedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.DeletedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const lockTenantAdminChanges = `-- name: LockTenantAdminChanges :exec
-SELECT pg_advisory_xact_lock(hashtextextended('identity.last_admin', $1::bigint))
-`
-
-// Serializes admin demotion/ban/delete per tenant for the rest of the
-// transaction. It must run before the target row is updated: the
-// protect_last_admin trigger locks the other admins' rows, and without this
-// lock two concurrent demotions each hold their own row and wait on the
-// other's (deadlock).
-func (q *Queries) LockTenantAdminChanges(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, lockTenantAdminChanges, tenantID)
-	return err
-}
-
-const lockUserPrincipal = `-- name: LockUserPrincipal :one
-SELECT u.id, u.tenant_id, u.email, u.name, u.role, u.credentials_revoked_at, t.status AS tenant_status
-FROM users u
-JOIN tenants t ON t.id = u.tenant_id
-WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-FOR SHARE OF u
-`
-
-type LockUserPrincipalParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-}
-
-type LockUserPrincipalRow struct {
-	ID                   int64              `json:"id"`
-	TenantID             int64              `json:"tenant_id"`
-	Email                string             `json:"email"`
-	Name                 string             `json:"name"`
-	Role                 string             `json:"role"`
-	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
-	TenantStatus         string             `json:"tenant_status"`
-}
-
-// GetUserPrincipal under a FOR SHARE lock on the user row, for a caller's
-// transaction that writes a credential for this owner (API-key create and
-// rotate). A concurrent ban/delete waits for that transaction, and one that
-// committed first makes this return no row, so no key is minted for it.
-func (q *Queries) LockUserPrincipal(ctx context.Context, arg LockUserPrincipalParams) (LockUserPrincipalRow, error) {
-	row := q.db.QueryRow(ctx, lockUserPrincipal, arg.ID, arg.TenantID)
-	var i LockUserPrincipalRow
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.Name,
-		&i.Role,
-		&i.CredentialsRevokedAt,
-		&i.TenantStatus,
-	)
-	return i, err
-}
-
-const restoreUser = `-- name: RestoreUser :one
+const recordUserCredentialChange = `-- name: RecordUserCredentialChange :one
 UPDATE users
-SET deleted_at = NULL, banned_at = NULL, updated_at = NOW(),
-    token_version = token_version + 1, password_changed_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NOT NULL AND banned_at IS NOT NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+SET token_version = token_version + 1,
+    credentials_changed_at = NOW()
+WHERE id = $1 AND status <> 'deleted'
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
-type RestoreUserParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-}
-
-// Unban only reverses a ban. A self-deleted account (deleted_at set,
-// banned_at NULL) is not restorable through this path.
-func (q *Queries) RestoreUser(ctx context.Context, arg RestoreUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, restoreUser, arg.ID, arg.TenantID)
+// A password set/reset ends every access token and session of the user in
+// every tenant and invalidates reset links issued before it.
+func (q *Queries) RecordUserCredentialChange(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRow(ctx, recordUserCredentialChange, id)
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
 		&i.Email,
-		&i.PasswordHash,
 		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
 		&i.EmailVerifiedAt,
+		&i.Status,
 		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
+		&i.CredentialsChangedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
@@ -879,35 +249,24 @@ func (q *Queries) RestoreUser(ctx context.Context, arg RestoreUserParams) (User,
 	return i, err
 }
 
-const revokeUserSessions = `-- name: RevokeUserSessions :one
+const revokeUserTokens = `-- name: RevokeUserTokens :one
 UPDATE users
-SET token_version = token_version + 1, updated_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+SET token_version = token_version + 1
+WHERE id = $1 AND status <> 'deleted'
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
-type RevokeUserSessionsParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-}
-
-func (q *Queries) RevokeUserSessions(ctx context.Context, arg RevokeUserSessionsParams) (User, error) {
-	row := q.db.QueryRow(ctx, revokeUserSessions, arg.ID, arg.TenantID)
+func (q *Queries) RevokeUserTokens(ctx context.Context, id int64) (User, error) {
+	row := q.db.QueryRow(ctx, revokeUserTokens, id)
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
 		&i.Email,
-		&i.PasswordHash,
 		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
 		&i.EmailVerifiedAt,
+		&i.Status,
 		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
+		&i.CredentialsChangedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
@@ -915,61 +274,52 @@ func (q *Queries) RevokeUserSessions(ctx context.Context, arg RevokeUserSessions
 	return i, err
 }
 
-const updateUser = `-- name: UpdateUser :one
+const updateUserProfile = `-- name: UpdateUserProfile :one
 UPDATE users
 SET name = $1,
     -- Omit email when the caller did not supply one, so a name-only update
     -- cannot clobber a concurrent email change.
-    email = CASE WHEN $5::boolean THEN $2 ELSE email END,
+    email = CASE WHEN $2::boolean THEN $3 ELSE email END,
     -- Changing the address invalidates any prior verification of the old one,
-    -- pending reset links, and every access/refresh token for the old identity.
+    -- pending reset links, and every access/refresh token for the identity.
     email_verified_at = CASE
-        WHEN $5::boolean AND email IS DISTINCT FROM $2 THEN NULL
+        WHEN $2::boolean AND email IS DISTINCT FROM $3 THEN NULL
         ELSE email_verified_at
     END,
     token_version = token_version + CASE
-        WHEN $5::boolean AND email IS DISTINCT FROM $2 THEN 1 ELSE 0
+        WHEN $2::boolean AND email IS DISTINCT FROM $3 THEN 1 ELSE 0
     END,
-    password_changed_at = CASE
-        WHEN $5::boolean AND email IS DISTINCT FROM $2 THEN NOW()
-        ELSE password_changed_at
-    END,
-    updated_at = NOW()
-WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+    credentials_changed_at = CASE
+        WHEN $2::boolean AND email IS DISTINCT FROM $3 THEN NOW()
+        ELSE credentials_changed_at
+    END
+WHERE id = $4 AND status <> 'deleted'
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
-type UpdateUserParams struct {
+type UpdateUserProfileParams struct {
 	Name        string `json:"name"`
+	UpdateEmail bool   `json:"update_email"`
 	Email       string `json:"email"`
 	ID          int64  `json:"id"`
-	TenantID    int64  `json:"tenant_id"`
-	UpdateEmail bool   `json:"update_email"`
 }
 
-func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUser,
+func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
+	row := q.db.QueryRow(ctx, updateUserProfile,
 		arg.Name,
+		arg.UpdateEmail,
 		arg.Email,
 		arg.ID,
-		arg.TenantID,
-		arg.UpdateEmail,
 	)
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
 		&i.Email,
-		&i.PasswordHash,
 		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
 		&i.EmailVerifiedAt,
+		&i.Status,
 		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
+		&i.CredentialsChangedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
@@ -977,112 +327,46 @@ func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (User, e
 	return i, err
 }
 
-const updateUserPassword = `-- name: UpdateUserPassword :one
-UPDATE users
-SET password_hash = $1,
-    updated_at = NOW(),
-    token_version = token_version + 1,
-    password_changed_at = NOW()
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+const upsertUserPassword = `-- name: UpsertUserPassword :exec
+INSERT INTO user_passwords (user_id, password_hash)
+VALUES ($1, $2)
+ON CONFLICT (user_id) DO UPDATE
+SET password_hash = EXCLUDED.password_hash,
+    changed_at = NOW()
 `
 
-type UpdateUserPasswordParams struct {
-	PasswordHash pgtype.Text `json:"password_hash"`
-	ID           int64       `json:"id"`
-	TenantID     int64       `json:"tenant_id"`
+type UpsertUserPasswordParams struct {
+	UserID       int64  `json:"user_id"`
+	PasswordHash string `json:"password_hash"`
 }
 
-func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUserPassword, arg.PasswordHash, arg.ID, arg.TenantID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const updateUserRole = `-- name: UpdateUserRole :one
-UPDATE users
-SET role = $1, updated_at = NOW(), token_version = token_version + 1
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
-`
-
-type UpdateUserRoleParams struct {
-	Role     string `json:"role"`
-	ID       int64  `json:"id"`
-	TenantID int64  `json:"tenant_id"`
-}
-
-func (q *Queries) UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (User, error) {
-	row := q.db.QueryRow(ctx, updateUserRole, arg.Role, arg.ID, arg.TenantID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Email,
-		&i.PasswordHash,
-		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
-		&i.EmailVerifiedAt,
-		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
+func (q *Queries) UpsertUserPassword(ctx context.Context, arg UpsertUserPasswordParams) error {
+	_, err := q.db.Exec(ctx, upsertUserPassword, arg.UserID, arg.PasswordHash)
+	return err
 }
 
 const verifyUserEmail = `-- name: VerifyUserEmail :one
-UPDATE users SET email_verified_at = NOW(), updated_at = NOW()
-WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND email = $3
-RETURNING id, tenant_id, email, password_hash, name, role, google_id, auth_provider, email_verified_at, token_version, password_changed_at, banned_at, credentials_revoked_at, created_at, updated_at, deleted_at
+UPDATE users SET email_verified_at = COALESCE(email_verified_at, NOW())
+WHERE id = $1 AND status <> 'deleted' AND email = $2
+RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
 type VerifyUserEmailParams struct {
-	ID       int64  `json:"id"`
-	TenantID int64  `json:"tenant_id"`
-	Email    string `json:"email"`
+	ID    int64  `json:"id"`
+	Email string `json:"email"`
 }
 
 func (q *Queries) VerifyUserEmail(ctx context.Context, arg VerifyUserEmailParams) (User, error) {
-	row := q.db.QueryRow(ctx, verifyUserEmail, arg.ID, arg.TenantID, arg.Email)
+	row := q.db.QueryRow(ctx, verifyUserEmail, arg.ID, arg.Email)
 	var i User
 	err := row.Scan(
 		&i.ID,
-		&i.TenantID,
 		&i.Email,
-		&i.PasswordHash,
 		&i.Name,
-		&i.Role,
-		&i.GoogleID,
-		&i.AuthProvider,
 		&i.EmailVerifiedAt,
+		&i.Status,
 		&i.TokenVersion,
-		&i.PasswordChangedAt,
-		&i.BannedAt,
-		&i.CredentialsRevokedAt,
+		&i.CredentialsChangedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,

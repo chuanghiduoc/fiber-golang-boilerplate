@@ -8,14 +8,33 @@ const (
 	PermissionProfileRead    authz.Permission = "profile:read"
 	PermissionProfileWrite   authz.Permission = "profile:write"
 	PermissionSessionsRevoke authz.Permission = "sessions:revoke"
+	// PermissionMFARead reads the caller's MFA status.
+	PermissionMFARead authz.Permission = "mfa:read"
+	// PermissionMFAWrite enrolls, confirms, disables, and regenerates.
+	PermissionMFAWrite authz.Permission = "mfa:write"
+	// PermissionInvitationsRead lists the tenant's pending invitations.
+	PermissionInvitationsRead authz.Permission = "invitations:read"
+	// PermissionInvitationsWrite invites members and revokes invitations.
+	PermissionInvitationsWrite authz.Permission = "invitations:write"
+	// PermissionAdminRolesRead lists system and tenant roles.
+	PermissionAdminRolesRead authz.Permission = "admin:roles:read"
+	// PermissionAdminRolesWrite creates, updates, and deletes tenant roles.
+	PermissionAdminRolesWrite authz.Permission = "admin:roles:write"
 )
 
-// Permissions returns identity's grants for app.PermissionProvider.
+// Permissions returns identity's grants for app.PermissionProvider. Admins
+// receive every permission; invitations are admin-only.
 func Permissions() []authz.Grant {
-	user := []string{authz.RoleUser}
+	user := []string{authz.RoleMember}
 	return []authz.Grant{
 		{Permission: PermissionProfileRead, Roles: user},
 		{Permission: PermissionProfileWrite, Roles: user},
 		{Permission: PermissionSessionsRevoke, Roles: user},
+		{Permission: PermissionMFARead, Roles: user},
+		{Permission: PermissionMFAWrite, Roles: user},
+		{Permission: PermissionInvitationsRead},
+		{Permission: PermissionInvitationsWrite},
+		{Permission: PermissionAdminRolesRead},
+		{Permission: PermissionAdminRolesWrite},
 	}
 }

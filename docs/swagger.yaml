@@ -35,7 +35,9 @@ definitions:
       role:
         enum:
         - user
+        - member
         - admin
+        - owner
         type: string
     required:
     - role
@@ -56,10 +58,22 @@ definitions:
         type: boolean
       id:
         type: integer
+      joinedAt:
+        type: string
+      membershipStatus:
+        enum:
+        - active
+        - suspended
+        - removed
+        type: string
       name:
         type: string
       role:
         type: string
+      roles:
+        items:
+          type: string
+        type: array
       updatedAt:
         type: string
     type: object
@@ -225,6 +239,14 @@ definitions:
       type:
         type: string
     type: object
+  dto.AcceptInvitationRequest:
+    properties:
+      token:
+        maxLength: 256
+        type: string
+    required:
+    - token
+    type: object
   dto.ChangePasswordRequest:
     properties:
       currentPassword:
@@ -271,6 +293,76 @@ definitions:
     required:
     - name
     - slug
+    type: object
+  dto.CreateRoleRequest:
+    properties:
+      key:
+        maxLength: 50
+        minLength: 2
+        type: string
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    required:
+    - key
+    - name
+    type: object
+  dto.CreateTenantRequest:
+    properties:
+      locale:
+        maxLength: 35
+        type: string
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      slug:
+        maxLength: 63
+        minLength: 2
+        type: string
+      status:
+        enum:
+        - trialing
+        - active
+        type: string
+      timezone:
+        maxLength: 64
+        type: string
+      trialEndsAt:
+        type: string
+    required:
+    - name
+    - slug
+    type: object
+  dto.DataExportResponse:
+    properties:
+      createdAt:
+        type: string
+      downloadUrl:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      status:
+        enum:
+        - queued
+        - running
+        - ready
+        - failed
+        - expired
+        type: string
+      tenantId:
+        type: integer
+      updatedAt:
+        type: string
+      userId:
+        type: integer
     type: object
   dto.DeliveryAttemptResponse:
     properties:
@@ -379,6 +471,18 @@ definitions:
         type: string
       url:
         type: string
+    type: object
+  dto.ErasureAccepted:
+    properties:
+      status:
+        type: string
+    type: object
+  dto.ErasureRequest:
+    properties:
+      currentPassword:
+        type: string
+    required:
+    - currentPassword
     type: object
   dto.FileResponse:
     properties:
@@ -489,6 +593,56 @@ definitions:
       updatedAt:
         type: string
     type: object
+  dto.InvitationResponse:
+    properties:
+      acceptedAt:
+        type: string
+      createdAt:
+        type: string
+      email:
+        type: string
+      expiresAt:
+        type: string
+      id:
+        type: integer
+      invitedBy:
+        type: integer
+      role:
+        type: string
+      tenantId:
+        type: integer
+    type: object
+  dto.InvitationSignUpRequest:
+    properties:
+      name:
+        maxLength: 255
+        minLength: 2
+        type: string
+      password:
+        type: string
+      token:
+        maxLength: 256
+        type: string
+    required:
+    - name
+    - password
+    - token
+    type: object
+  dto.InviteRequest:
+    properties:
+      email:
+        maxLength: 255
+        type: string
+      role:
+        enum:
+        - user
+        - member
+        - admin
+        - owner
+        type: string
+    required:
+    - email
+    type: object
   dto.LoginRequest:
     properties:
       email:
@@ -504,10 +658,81 @@ definitions:
     properties:
       accessToken:
         type: string
+      mfaChallengeToken:
+        description: MFAChallengeToken is a five-minute, single-use, tenant-bound
+          challenge.
+        type: string
+      mfaRequired:
+        description: |-
+          MFARequired is true when the password or Google sign-in succeeded but a
+          second factor is needed. Tokens are empty in that case; the caller
+          completes the sign-in with MFAChallengeToken at /auth/mfa/verify.
+        type: boolean
       refreshToken:
         type: string
       user:
         $ref: '#/definitions/dto.UserResponse'
+    type: object
+  dto.MFAConfirmRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFADisableRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFAEnrollResponse:
+    properties:
+      otpauthUri:
+        type: string
+      type:
+        enum:
+        - totp
+        type: string
+    type: object
+  dto.MFARecoveryCodesResponse:
+    properties:
+      recoveryCodes:
+        items:
+          type: string
+        type: array
+    type: object
+  dto.MFARegenerateRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFAStatusResponse:
+    properties:
+      confirmedAt:
+        type: string
+      enabled:
+        type: boolean
+      recoveryCodesRemaining:
+        type: integer
+    type: object
+  dto.MFAVerifyRequest:
+    properties:
+      challenge:
+        maxLength: 4096
+        type: string
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - challenge
+    - code
     type: object
   dto.NotificationResponse:
     properties:
@@ -578,6 +803,16 @@ definitions:
     - name
     - password
     type: object
+  dto.ReplaceMemberRolesRequest:
+    properties:
+      roles:
+        items:
+          type: string
+        maxItems: 20
+        type: array
+    required:
+    - roles
+    type: object
   dto.ResendVerificationRequest:
     properties:
       email:
@@ -596,6 +831,30 @@ definitions:
     required:
     - password
     - token
+    type: object
+  dto.RoleResponse:
+    properties:
+      createdAt:
+        type: string
+      id:
+        type: integer
+      key:
+        type: string
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+      scope:
+        enum:
+        - tenant
+        - platform
+        type: string
+      system:
+        type: boolean
+      updatedAt:
+        type: string
     type: object
   dto.SendNotificationRequest:
     properties:
@@ -624,6 +883,49 @@ definitions:
         type: boolean
       notification:
         $ref: '#/definitions/dto.NotificationResponse'
+    type: object
+  dto.SessionResponse:
+    properties:
+      createdAt:
+        type: string
+      current:
+        description: Current marks the session of the access token making the request.
+        type: boolean
+      id:
+        type: integer
+      ip:
+        type: string
+      lastUsedAt:
+        type: string
+      userAgent:
+        type: string
+    type: object
+  dto.TenantResponse:
+    properties:
+      createdAt:
+        type: string
+      deletionScheduledAt:
+        type: string
+      id:
+        type: integer
+      name:
+        type: string
+      slug:
+        type: string
+      status:
+        enum:
+        - trialing
+        - active
+        - suspended
+        - pending_deletion
+        - deleted
+        type: string
+      statusChangedAt:
+        type: string
+      trialEndsAt:
+        type: string
+      updatedAt:
+        type: string
     type: object
   dto.UnreadCountResponse:
     properties:
@@ -696,6 +998,30 @@ definitions:
     - enabled
     - type
     type: object
+  dto.UpdateRoleDefinitionRequest:
+    properties:
+      name:
+        maxLength: 255
+        minLength: 1
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  dto.UpdateTenantStatusRequest:
+    properties:
+      status:
+        enum:
+        - trialing
+        - active
+        - suspended
+        - pending_deletion
+        - deleted
+        type: string
+    required:
+    - status
+    type: object
   dto.UpdateUserRequest:
     properties:
       currentPassword:
@@ -726,12 +1052,27 @@ definitions:
         type: boolean
       id:
         type: integer
+      joinedAt:
+        type: string
+      membershipStatus:
+        description: MembershipStatus is active, suspended (banned), or removed.
+        enum:
+        - active
+        - suspended
+        - removed
+        type: string
       name:
         type: string
       role:
+        description: Role is the highest system role key (owner, admin, or member).
         type: string
+      roles:
+        description: Roles lists every role assigned in TenantID.
+        items:
+          type: string
+        type: array
       tenantId:
-        description: TenantID identifies the owning tenant. It is additive and read-only.
+        description: TenantID is the tenant this view (membership) belongs to.
         type: integer
       updatedAt:
         type: string
@@ -1553,9 +1894,170 @@ paths:
       summary: Restore a tenant file (admin)
       tags:
       - Admin
+  /admin/roles:
+    get:
+      description: System roles plus the request tenant's roles, newest first
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.RoleResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List roles
+      tags:
+      - Roles
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant role with known tenant permissions
+      parameters:
+      - description: Role
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.RoleResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create a tenant role
+      tags:
+      - Roles
+  /admin/roles/{id}:
+    delete:
+      description: Delete an unassigned tenant role
+      parameters:
+      - description: Role ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Delete a tenant role
+      tags:
+      - Roles
+    patch:
+      consumes:
+      - application/json
+      description: Change a tenant role's name and/or permission set
+      parameters:
+      - description: Role ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Role update
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateRoleDefinitionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.RoleResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a tenant role
+      tags:
+      - Roles
   /admin/stats:
     get:
-      description: Get statistics for the caller's tenant only (admin only)
+      description: 'Get statistics for the caller''s tenant only (admin only): activeUsers
+        counts active memberships of active users, deletedUsers every other membership'
       produces:
       - application/json
       responses:
@@ -1578,8 +2080,8 @@ paths:
       - Admin
   /admin/users:
     get:
-      description: Get a paginated list of users in the caller's tenant, including
-        soft-deleted
+      description: Get a paginated list of the members of the caller's tenant in every
+        membership state (active, suspended, removed), ordered by join time
       parameters:
       - default: 20
         description: Max items to return
@@ -1619,7 +2121,9 @@ paths:
       - Admin
   /admin/users/{id}/ban:
     post:
-      description: Soft delete a user (admin only)
+      description: Ban a member of the caller's tenant (membership suspended; sessions
+        and API keys in this tenant end; the global account and other tenants are
+        untouched)
       parameters:
       - description: User ID
         in: path
@@ -1656,11 +2160,59 @@ paths:
       summary: Ban a user
       tags:
       - Admin
+  /admin/users/{id}/erasure:
+    post:
+      description: Queue erasure of every tenant membership's data and the global
+        account for a member of the request tenant. The last active admin cannot be
+        erased.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/dto.ErasureAccepted'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.last_admin
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Erase a member and their global account
+      tags:
+      - Admin
   /admin/users/{id}/role:
     put:
       consumes:
       - application/json
-      description: Update a user's role (admin only)
+      description: Change a member's role in the caller's tenant (admin only); the
+        member's sessions in this tenant end
       parameters:
       - description: User ID
         in: path
@@ -1705,9 +2257,60 @@ paths:
       summary: Update user role
       tags:
       - Admin
+  /admin/users/{id}/roles:
+    put:
+      consumes:
+      - application/json
+      description: Replace every role of a member in the request tenant; the member's
+        sessions end
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Roles
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.ReplaceMemberRolesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.UserResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Replace a member's roles
+      tags:
+      - Roles
   /admin/users/{id}/unban:
     post:
-      description: Restore a soft-deleted user (admin only)
+      description: Lift a member's ban in the caller's tenant (API keys issued before
+        the ban stay revoked)
       parameters:
       - description: User ID
         in: path
@@ -1848,6 +2451,90 @@ paths:
       summary: Google OAuth callback
       tags:
       - Auth
+  /auth/invitations/accept:
+    post:
+      consumes:
+      - application/json
+      description: Join the invitation's tenant as the signed-in user. The token is
+        checked by possession (the caller is signed in to another tenant); the invitation
+        must be addressed to the caller's current email. Afterwards sign in with X-Tenant-Slug
+        of the new tenant.
+      parameters:
+      - description: Invitation token
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.AcceptInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: the membership in the invitation's tenant
+          schema:
+            $ref: '#/definitions/dto.UserResponse'
+        "400":
+          description: invitation.invalid
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: membership.exists
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Accept an invitation
+      tags:
+      - Invitations
+  /auth/invitations/signup:
+    post:
+      consumes:
+      - application/json
+      description: 'Create an account for the invited address and join the invitation''s
+        tenant (send X-Tenant-Slug from the link''s tenant parameter). The email is
+        verified by the token. An address that already has an account gets 409 user.email_taken:
+        sign in and accept instead. Not gated by user_registration.'
+      parameters:
+      - description: Invitation sign-up
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.InvitationSignUpRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.UserResponse'
+        "400":
+          description: invitation.invalid
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.email_taken
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      summary: Sign up from an invitation
+      tags:
+      - Auth
   /auth/login:
     post:
       consumes:
@@ -1890,10 +2577,10 @@ paths:
     post:
       consumes:
       - application/json
-      description: Revoke one refresh token by possession. The tenant header is not
-        required because possession of the opaque token authorizes revocation.
+      description: Revoke the session of a refresh token by possession. The tenant
+        header is not required because possession of the opaque token authorizes revocation.
       parameters:
-      - description: Refresh token to revoke
+      - description: Refresh token whose session is revoked
         in: body
         name: request
         required: true
@@ -1917,7 +2604,8 @@ paths:
       - Auth
   /auth/logout-all:
     post:
-      description: Revoke every refresh token for the authenticated user
+      description: Revoke every session of the authenticated user in every tenant
+        and invalidate every access token (token version bump)
       responses:
         "204":
           description: No Content
@@ -1931,7 +2619,228 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Revoke all refresh tokens
+      summary: Log out everywhere
+      tags:
+      - Auth
+  /auth/mfa/disable:
+    post:
+      consumes:
+      - application/json
+      description: Remove the TOTP factor and recovery codes after proving a current
+        TOTP or recovery code. The user's other sessions are revoked.
+      parameters:
+      - description: TOTP or recovery code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFADisableRequest'
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: auth.mfa_not_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Disable MFA
+      tags:
+      - Auth
+  /auth/mfa/recovery-codes/regenerate:
+    post:
+      consumes:
+      - application/json
+      description: Replace all recovery codes after proving a current TOTP or recovery
+        code. The new codes are returned once and the old set stops working.
+      parameters:
+      - description: TOTP or recovery code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFARegenerateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Regenerate recovery codes
+      tags:
+      - Auth
+  /auth/mfa/status:
+    get:
+      description: Return whether TOTP is enabled and how many recovery codes are
+        unused.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFAStatusResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: MFA status
+      tags:
+      - Auth
+  /auth/mfa/totp/confirm:
+    post:
+      consumes:
+      - application/json
+      description: Verify the first TOTP code, enable the factor, and return ten single-use
+        recovery codes. This is the only time the recovery codes are shown.
+      parameters:
+      - description: TOTP code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAConfirmRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Confirm TOTP enrollment
+      tags:
+      - Auth
+  /auth/mfa/totp/enroll:
+    post:
+      description: Generate a TOTP secret and return its otpauth provisioning URI.
+        The secret is never returned again; re-enrolling before confirmation replaces
+        it.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFAEnrollResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: auth.mfa_already_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Start TOTP enrollment
+      tags:
+      - Auth
+  /auth/mfa/verify:
+    post:
+      consumes:
+      - application/json
+      description: Exchange a two-step login challenge plus a TOTP or recovery code
+        for the normal access and refresh token pair.
+      parameters:
+      - description: Challenge and MFA code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAVerifyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.LoginResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      summary: Complete MFA login
       tags:
       - Auth
   /auth/refresh:
@@ -2090,6 +2999,78 @@ paths:
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       summary: Reset password
+      tags:
+      - Auth
+  /auth/sessions:
+    get:
+      description: Live sign-in sessions of the authenticated user in the request
+        tenant, newest first. current marks the session of the calling access token.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.SessionResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List my sessions
+      tags:
+      - Auth
+  /auth/sessions/{id}:
+    delete:
+      description: Ends one live session of the authenticated user in the request
+        tenant (its refresh tokens stop working and its access tokens are rejected).
+        Another user's session behaves as not found.
+      parameters:
+      - description: Session ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Revoke one of my sessions
       tags:
       - Auth
   /auth/verify-email:
@@ -2354,6 +3335,320 @@ paths:
       summary: Upload a file
       tags:
       - Files
+  /invitations:
+    get:
+      description: Pending invitations of the request tenant, newest first.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.InvitationResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List pending invitations
+      tags:
+      - Invitations
+    post:
+      consumes:
+      - application/json
+      description: Invite an email address into the request tenant (role defaults
+        to user). Re-inviting a pending address replaces its token, role, and expiry.
+        The link is emailed; the token is never returned.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Invitation
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.InviteRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.InvitationResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: membership.exists
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Invite a member
+      tags:
+      - Invitations
+  /invitations/{id}:
+    delete:
+      description: Delete a pending invitation of the request tenant; its link stops
+        working.
+      parameters:
+      - description: Invitation ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Revoke an invitation
+      tags:
+      - Invitations
+  /me/data-exports:
+    get:
+      description: List the caller's export requests in the request tenant, newest
+        first.
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.DataExportResponse'
+                  type: array
+              type: object
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List data exports
+      tags:
+      - Privacy
+    post:
+      description: Queue a JSON export of the caller's data in the request tenant.
+        At most one queued or running export exists per membership.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.DataExportResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: data_export.in_progress
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Request a data export
+      tags:
+      - Privacy
+  /me/data-exports/{id}:
+    get:
+      description: Status of one of the caller's exports. Another user's or tenant's
+        id is not found.
+      parameters:
+      - description: Export ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.DataExportResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a data export
+      tags:
+      - Privacy
+  /me/data-exports/{id}/download:
+    get:
+      description: Stream the caller's ready JSON export. Other users and tenants
+        get 404; an expired export is 410.
+      parameters:
+      - description: Export ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            type: file
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: data_export.not_ready
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "410":
+          description: data_export.expired
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Download a data export
+      tags:
+      - Privacy
+  /me/erasure:
+    post:
+      consumes:
+      - application/json
+      description: Re-authenticate with the current password, then queue erasure of
+        every tenant membership's data and the global account. Refused while the caller
+        is the last active admin of a tenant.
+      parameters:
+      - description: Idempotency key
+        in: header
+        name: Idempotency-Key
+        type: string
+      - description: Current password
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.ErasureRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/dto.ErasureAccepted'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.last_admin
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Erase the caller's account data
+      tags:
+      - Privacy
   /notification-preferences:
     get:
       description: List explicit channel preferences for the authenticated user. Missing
@@ -2641,6 +3936,167 @@ paths:
       summary: Get unread notification count
       tags:
       - Notifications
+  /platform/tenants:
+    get:
+      description: Every tenant in any lifecycle state, newest first (platform permission)
+      parameters:
+      - default: 20
+        description: Max items to return
+        in: query
+        name: limit
+        type: integer
+      - description: Cursor from the last item of the previous page
+        in: query
+        name: startingAfter
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/response.ListResponse'
+            - properties:
+                data:
+                  items:
+                    $ref: '#/definitions/dto.TenantResponse'
+                  type: array
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: List tenants (platform)
+      tags:
+      - Platform
+    post:
+      consumes:
+      - application/json
+      description: Create a tenant and its settings row (platform permission)
+      parameters:
+      - description: Tenant
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.CreateTenantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Create a tenant (platform)
+      tags:
+      - Platform
+  /platform/tenants/{id}:
+    get:
+      description: Get any tenant by ID in any lifecycle state (platform permission)
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Get a tenant (platform)
+      tags:
+      - Platform
+  /platform/tenants/{id}/status:
+    patch:
+      consumes:
+      - application/json
+      description: Move a tenant through its lifecycle state machine (platform permission)
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Status
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.UpdateTenantStatusRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.TenantResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Update a tenant's status (platform)
+      tags:
+      - Platform
   /users:
     get:
       description: Get a paginated list of users
@@ -2687,7 +4143,11 @@ paths:
       - Users
   /users/{id}:
     delete:
-      description: Delete a user by ID
+      description: 'With the caller''s own id: delete the caller''s global account
+        (every tenant; JWT only, API keys are refused; refused while the caller is
+        the last active owner of any tenant). With another id: remove that user''s
+        membership from the request tenant (requires admin:users:delete); the global
+        account and other tenants are untouched.'
       parameters:
       - description: User ID
         in: path
@@ -2713,9 +4173,13 @@ paths:
           description: Not Found
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: user.last_admin
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Delete user
+      summary: Delete account or remove member
       tags:
       - Users
     get:
@@ -2753,9 +4217,12 @@ paths:
     put:
       consumes:
       - application/json
-      description: Update a user's profile (admin or self)
+      description: Update the caller's own global profile. Users are global identities
+        shared across tenants, so another user's profile (name or email) can never
+        be changed, not even by a tenant admin; admins manage memberships (role, ban,
+        removal).
       parameters:
-      - description: User ID
+      - description: User ID (must be the caller)
         in: path
         name: id
         required: true

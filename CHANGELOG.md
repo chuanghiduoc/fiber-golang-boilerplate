@@ -6,12 +6,74 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added (P3b PostgreSQL row-level security, ADR 0007)
+- Every table with `tenant_id` (23 tables: `tenant_settings`, `memberships`, `membership_roles`, `roles` (system roles with a NULL tenant stay readable by every tenant; writing one needs the bypass), `invitations`, `sessions`, `refresh_tokens`, `data_exports`, `api_keys`, `files`, `feature_flag_targets`, `notifications`, `notification_preferences`, `jobs`, `audit_events`, and the eight `webhook_*` tables) has `ENABLE`/`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy over `app_tenant_visible(tenant_id)`. `api_key_scopes` has no tenant column and is reachable only through its key; `feature_flags`, `scheduler_leases`, and `scheduler_runs` are platform-wide.
+- `pkg/database` gains `Scope`, an injected `ScopeResolver`, `WithRLSBypass`/`RLSBypass`, and `Scoped` (a sqlc `DBTX` that runs `BEGIN; set_config; statement; COMMIT` as one pgx Batch). `TxManager.WithTx` installs the scope right after `BEGIN`; both are transaction-local and PgBouncer-safe.
+- Repositories are wired through `app.Infra.DB` (the scoped handle) instead of the raw pool. Deliberate cross-tenant paths (job claim/lease/purge and enqueue-once, scheduler enqueue, identity/files/notifications/webhooks/privacy retention, feature-flag snapshots, the webhook inbound source lookup, invitation acceptance, global-user identity operations, tenant lifecycle, audit rows for another tenant) are marked with `database.WithRLSBypass` and a comment.
+- Roles: the API/worker/seed connect as a non-superuser `app` role (no `BYPASSRLS`); `cmd/api` logs and, in production, refuses a superuser/`BYPASSRLS` connection. `cmd/migrate` uses the owner role via `DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`. `deploy/postgres/database-roles.sql` (docker-compose init hook), the Kubernetes ConfigMap/Secret, `.env.example`, and CI create the role; `cmd/migrate` verifies RLS is enabled and forced with the policy on every tenant table.
+- Integration tests connect as the non-superuser role (testutil creates it and grants each schema); `TestRLSTenantIsolation` proves a predicate-free query sees only the context tenant, a cross-tenant write is rejected by `WITH CHECK`, no setting sees nothing, and bypass sees all. The full integration suite passes as that role.
+
+### Added (P2b-3 MFA with TOTP and recovery codes, ADR 0010)
+- TOTP second factor per global user (RFC 6238: SHA-1, 6 digits, 30 s, ±1 step) with RFC 6238 test vectors, and ten single-use recovery codes shown once. Secrets and login challenges are sealed with the existing `DATA_ENCRYPTION_KEY` codec (previous keys decrypt); recovery codes are stored as SHA-256 hashes.
+- Schema (`identity` section of the init migration): `mfa_factors` (`secret_ciphertext`, `confirmed_at`, `last_used_step`; partial unique indexes for one confirmed factor and one pending enrollment per user) and `mfa_recovery_codes` (`code_hash`, `used_at`). `sessions.amr` records the authentication methods set and `mfa_changed` is a session revocation reason.
+- Endpoints: `GET /auth/mfa/status`, `POST /auth/mfa/totp/enroll`, `POST /auth/mfa/totp/confirm`, `POST /auth/mfa/disable`, `POST /auth/mfa/recovery-codes/regenerate` (JWT, `mfa:read|write`, Tier 1) and public `POST /auth/mfa/verify`. Confirming or disabling revokes the user's other sessions.
+- Two-step login: password login and Google sign-in return `mfaRequired` plus a five-minute, single-use, tenant-bound challenge instead of tokens when a factor is confirmed. `POST /auth/mfa/verify` consumes the challenge and a TOTP/recovery code and issues the normal pair; wrong codes spend a per-user second-factor budget (5 per 15 minutes) that a correct password cannot reset, and a password change or logout-all voids pending challenges.
+- Access tokens carry `amr` (`pwd`, `google`, `otp`, `rc`); refresh preserves the session's set and tokens without `amr` still verify. `authz.Subject.AMR` and `authzhttp.RequireMFA()` (403 `auth.mfa_required`) let routes require a second factor; every `/platform` route requires it (platform-scope roles, ADR 0010), enforced by `test/arch`.
+- Additive API change only: login responses keep their shape when MFA is off, and `oasdiff breaking` stays clean.
+### Added (P3b GDPR data export and erasure, ADR 0013)
+- `internal/contracts/privacy` (`Exporter`, `Eraser`, `Registry`) and the optional `app.PrivacyProvider` hook. Identity, files, notifications, apikeys, features, and webhooks (stored event history/deliveries that name a user) register exporters/erasers. `bootstrap.Modules.Privacy` carries the registry.
+- Identity-owned `data_exports` table (partial unique active request per membership, 7-day expiry, `updated_at` trigger) in the `-- owner: identity` section.
+- `POST/GET /me/data-exports`, `GET /me/data-exports/:id`, `GET /me/data-exports/:id/download`, `POST /me/erasure` (current-password re-auth), and `POST /admin/users/:id/erasure` (`admin:users:delete`). Exports are tenant-scoped JSON documents (`<tenantID>/<userID>/exports/<uuid>.json`) with identity, files (metadata + base64 blobs up to 64 MiB per export; later files are marked `contentOmitted`), notifications, apikeys metadata, and user feature targets. Other users/tenants get 404; expired downloads are 410.
+- Jobs `privacy.data_export`, `privacy.erase` (one per membership), `privacy.erase.finalize`, and hourly `privacy.exports.purge` (blob, then row). Erasure is idempotent, deletes ready export documents and the user's MFA factor and recovery codes, sweeps exports created just before the last membership was removed, and upgrades accounts deleted by the older self-service path; the last active admin is refused before enqueue and re-checked in the job. Both erasure routes are JWT-only. Audit rows keep only ids. A failed/timed-out/panicking export is marked `failed` and stale active rows are purged after a day.
+- Error codes `data_export.in_progress` (409), `data_export.not_found` (404), `data_export.not_ready` (409), and `data_export.expired` (410), with en/vi titles.
+### Added (P2b-2 tenant-scoped RBAC, ADR 0003)
+- Schema in the identity section of the init migration: `permissions`,
+  `roles`, `role_permissions`, `membership_roles`,
+  `platform_role_assignments`; `memberships.role` is removed. System roles are
+  tenant `owner`/`admin`/`member` and platform `platform_admin`. Triggers
+  reject cross-tenant/platform membership roles and keep at least one active
+  owner in an operational tenant (`protect_last_owner`, serialized per tenant
+  with an advisory lock).
+- The code-owned permission catalog is synchronized into `permissions` and the
+  system roles' grants at API startup (concurrent-safe upserts, stale grants
+  pruned). Owner and admin get every tenant permission; member gets the listed
+  grants; platform permissions go to `platform_admin` only.
+- Effective permissions are the union of the membership's roles and platform
+  assignments, cached in the session snapshot (global permission generation on
+  role/permission changes). The JWT no longer carries `role`; legacy tokens
+  with the claim still verify and the claim is ignored. `authz.Subject` carries
+  the permission set; API-key scopes are intersected with the owner's current
+  effective permissions at authentication time.
+- New endpoints (Tier 1 audited where they mutate, `Idempotency-Key` on
+  writes, cursor pagination): `GET/POST /admin/roles`,
+  `PATCH/DELETE /admin/roles/:id`, `PUT /admin/users/:id/roles`, and the
+  platform group `GET/POST /platform/tenants`, `GET /platform/tenants/:id`,
+  `PATCH /platform/tenants/:id/status` (`platform:tenants:*`).
+- Existing admin endpoints keep working; `PUT /admin/users/:id/role` now
+  replaces the member's roles. `UserResponse` keeps `role` (highest system
+  role key) and adds `roles`. `user` is accepted as an alias for `member` in
+  request bodies.
+- Global feature-flag writes require `platform:features:write` (previously a
+  tenant-1 admin); tenant targets stay `admin:features:write`.
+- `cmd/seed` creates the admin as tenant `owner` and grants `platform_admin`.
+- Safety details: creating a tenant through `/platform/tenants` makes the
+  caller its first `owner`; tenant role keys may not shadow system role keys;
+  tenant roles may not hold `platform:*` permissions (service + trigger);
+  role replacement is a locked delta (same-role replacements and supersets are
+  no-ops for unchanged rows), so the sole owner can be updated without a false
+  409; removing a member deletes their role assignments; a permission removed
+  from the catalog cascades to API-key scopes instead of blocking startup.
+  Role management cannot grant permissions the caller does not hold.
+
+### Changed (ADR 0012 single init migration)
+- `migrations/` holds one init pair, `20260101000000_platform_init_schema.{up,down}.sql`, with an `-- owner: <module|platform>` marker per section; ADR 0012 supersedes ADR 0005's file layout. `test/arch` checks table ownership per section. Every later change is a `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>` migration. A legacy database is recorded with `force 20260101000000` after manual DDL. No deployed database exists, so recreate local databases.
+
 ### Added (P3b API compatibility and data retention)
 - CI `API compatibility` job (ADR 0006, pull requests only): `cmd/openapi3` (kin-openapi v0.149.0 `openapi2conv`) converts the base branch's and the PR's `docs/swagger.json` to OpenAPI 3, and `oasdiff breaking --fail-on ERR` (oasdiff v1.33.0) fails the PR on breaking changes. Editing `docs/api-breaking-changes.md` in the same PR acknowledges an intentional break (the report is still printed).
-- `files.trash.purge` (hourly, `files` `ScheduleProvider`/`JobProvider`): files soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (default 30, 1..3650) ago are permanently removed across tenants, blob first and then the row, in 100-row `FOR UPDATE SKIP LOCKED` batches (a concurrent restore waits, then gets 404). A missing blob counts as deleted; a failed blob delete keeps its row and fails the job after the rest commits. No domain event or webhook is emitted.
+- `files.trash.purge` (hourly, `files` `ScheduleProvider`/`JobProvider`): files soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (default 30, 1..3650) ago are permanently removed across tenants, in 100-row batches: a committed `purge_started_at` claim first (restore of a claimed row gets 404, even if the purge later fails), then the blob, then the row. A missing blob counts as deleted; a failed blob delete keeps its row and fails the job after the rest commits. No domain event or webhook is emitted.
 - `notifications.retention.purge` (hourly): notifications **read** more than `NOTIFICATIONS_RETENTION_DAYS` (default 180, 1..3650) ago are deleted across tenants in 1,000-row batches; unread notifications are never purged.
 - Both purges require `SCHEDULER_ENABLED=true` (like `identity.tokens.purge_expired`); without it nothing is purged.
-- Migrations `20261025112300_files_trash_purge_index` (partial `idx_files_deleted_at`) and `20261025112400_notifications_retention_index` (partial `idx_notifications_read_at`), both `CREATE INDEX CONCURRENTLY`.
+- Init schema: `files.purge_started_at`, partial `idx_files_deleted_at`, and partial `idx_notifications_read_at`.
 - `notifications.Build` takes `notifications.Settings`; `files.Settings` gains `TrashRetentionDays`; `config.RetentionConfig` (`cfg.Retention`).
 
 ### Breaking (P2c event envelope, Standard Webhooks, idempotency 422)
@@ -29,9 +91,33 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 - `pkg/webhook`: `NewSecret`, `DecodeSecret`, `SignatureHeader(sigs...)`, `SecretPrefix`, `ErrInvalidSecret`; `Sign`/`Verify`/`VerifyRequest` take the decoded key and drop the event type. Pinned to the specification's published test vector.
 - Tests: an independent Standard Webhooks verifier in the delivery worker unit test and the wire-format golden test, and an end-to-end integration test (file upload → `PublishTx` → durable subscription on a real jobs worker → delivery → captured request verified).
 
+### Breaking (P2b-1 global users and memberships, ADR 0004)
+- Schema (`20260101000100_identity_init`, changed in place; recreate local databases): `users` is global (normalized `email` with a partial unique index on live rows, `name`, `email_verified_at`, `status active|suspended|deleted`, `token_version`, `credentials_changed_at`, `deleted_at`) and loses `tenant_id`, `role`, `password_hash`, `password_changed_at`, `google_id`, `auth_provider`, `banned_at`, and `credentials_revoked_at`. New identity tables: `tenant_settings` (locale, timezone), `user_passwords`, `user_identities` (`provider = 'google'`, `UNIQUE (provider, subject)`, `UNIQUE (user_id, provider)`), `memberships` (`UNIQUE (tenant_id, user_id)`, `role user|admin` (replaced by `membership_roles` in P2b-2), `status active|suspended|removed`, `banned_at`, `removed_at`, `credentials_revoked_at`; the last-admin trigger moved here), `invitations` (hashed token, expiry, role, one pending row per `(tenant_id, email_normalized)`), and `sessions` (the RFC 9700 refresh-token family: `token_version`, `user_agent`, `ip INET`, `last_used_at`, `revoked_at`/`revoked_reason`). `refresh_tokens` reference `(tenant_id, session_id) → sessions` and store `token_hash`/`used_at`; `password_reset_tokens` and `email_verification_tokens` are per user (no `tenant_id`, `user_id UNIQUE`, `token_hash`).
+- `tenants.status` is `trialing|active|suspended|pending_deletion|deleted` with `status_changed_at`, `trial_ends_at`, `deletion_scheduled_at`, and `CHECK`s; only `trialing`/`active` serve requests and tenant 1 can never be deleted.
+- Cross-module FKs from `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` now reference `memberships (tenant_id, user_id) ON DELETE RESTRICT` instead of `users (tenant_id, id)`.
+- Access tokens carry `sid` (session id) plus the membership `role`; tokens without a positive `sid` are rejected with `401`, so every user signs in again after upgrading. The session store validates the session (not revoked), membership and user (active), tenant (operational), and role/token version.
+- Login requires the global password **and** an active membership in the request tenant (otherwise the same `401` as a wrong password). Registration creates user + password + membership in the request tenant; an email that already has an account in any tenant gets `409 user.email_taken`, and existing users join other tenants only through invitations.
+- Refresh-token reuse revokes the whole session (`refresh_reuse`) and returns `401`; `POST /auth/logout` revokes the session by possession; `POST /auth/logout-all` revokes every session in every tenant and bumps `token_version`.
+- `PUT /users/:id` for another user is `403` (the global profile is editable only by its owner). `DELETE /users/:id` on yourself deletes the global account (JWT only; refused while you are the last active admin of any tenant); on another user it removes that membership from the request tenant. Admin ban/unban/role change are membership changes in the request tenant; ban, removal, and role change end the member's sessions there. A ban survives the banned user deleting and re-creating the account.
+- Password reset and email verification are per user; the emailed link keeps `?tenant=<slug>` only so the frontend knows where to sign in. Login lockout keys are per (email, IP) and per email, no longer per tenant.
+- Google OAuth links or creates through `user_identities`; linking needs a verified local email and Google `verified_email`. A new Google account gets a membership in the state tenant; an existing user must already be a member (Google sign-in never joins a tenant implicitly).
+- The API-key principal and the notification recipient are an active membership of the context tenant.
+- `user.registered` (P2c envelope) describes the global user; the envelope `tenantId` is the tenant of the membership created at registration. Identity publishes it through its transaction-bound `TxRepos.Events` port (`repository.NewTransactor(..., bus)`), so the event commits with the account, membership, and audit row.
+
+### Added (P2b-1)
+- `GET /api/v1/auth/sessions` (JWT only, `profile:read`) and `DELETE /api/v1/auth/sessions/:id` (JWT only, `sessions:revoke`, guarded `auth.session_revoked`).
+- Invitations: `POST /api/v1/invitations` (`invitations:write`, admin only, `Idempotency-Key`, Tier 1 `invitation.created`, emails a 7-day link), `GET /api/v1/invitations` (`invitations:read`), `DELETE /api/v1/invitations/:id` (`invitations:write`, Tier 1 `invitation.revoked`), `POST /api/v1/auth/invitations/accept` (JWT only, `profile:write`, Tier 1 `invitation.accepted`), and the public `POST /api/v1/auth/invitations/signup` (token possession, not gated by `user_registration`, Tier 1 `invitation.accepted`).
+- Error codes `invitation.invalid` (400) and `membership.exists` (409).
+- `UserResponse` gains `membershipStatus` and `joinedAt`; member lists paginate by `(joinedAt, id)`.
+- Identity `TenantService` (`internal/modules/identity/service/tenants.go`): audited lifecycle transitions with a 30-day deletion grace. Platform-admin tenant endpoints ship with RBAC in P2b-2 (see above).
+- `identity.tokens.purge_expired` also purges expired pending invitations and stale sessions (revoked more than 30 days ago, or idle more than 24 hours with no refresh tokens left).
+
+### Open (later)
+- Row-level security (ADR 0007) and MFA (ADR 0010).
+
 ### Breaking (P2a per-owner baseline and normalization)
-- ADR 0005: `migrations/000001_init_schema.*` is split into ten per-owner baseline files `20260101000000_platform_functions` … `20260101000900_webhooks_init` (shared functions, identity, platform jobs/scheduler/audit, then apikeys, files, features, notifications, webhooks). There are no sequential versions any more; `test/arch` rejects them and also rejects a migration that creates another owner's table. A database recorded at version 1 is a legacy history: `cmd/migrate` refuses it with the upgrade guidance (`force 20260101000900` after manual DDL). No deployed database exists, so recreate local databases.
-- `api_keys.scopes JSONB` → `api_key_scopes(api_key_id, permission_key)` (CASCADE, format `CHECK`; the RBAC phase adds the `permissions` FK). The API still returns a sorted `scopes` array.
+- ADR 0005: `migrations/000001_init_schema.*` is split into ten per-owner baseline files `20260101000000_platform_functions` … `20260101000900_webhooks_init` (shared functions, identity, platform jobs/scheduler/audit, then apikeys, files, features, notifications, webhooks). There are no sequential versions any more; `test/arch` rejects them and also rejects a migration that creates another owner's table. A database recorded at version 1 is a legacy history: `cmd/migrate` refuses it with the upgrade guidance (`force 20260101000000` after manual DDL). No deployed database exists, so recreate local databases.
+- `api_keys.scopes JSONB` → `api_key_scopes(api_key_id, permission_key)` (CASCADE, format `CHECK`; P2b-2 adds the `permissions` FK with `ON DELETE CASCADE`). The API still returns a sorted `scopes` array.
 - `webhook_endpoints.event_types TEXT[]` → `webhook_endpoint_subscriptions(tenant_id, endpoint_id, pattern)`; matching is unchanged, and `eventTypes` is now returned sorted.
 - Webhook payloads are stored once in `webhook_events(tenant_id, event_id, event_type, occurred_at, payload)`; `webhook_deliveries` drops `event_type`/`event_created_at`/`payload` and references the event (RESTRICT). Retention deletes unreferenced events after terminal deliveries. Signed requests are byte-identical (`TestWebhookDeliveryWireFormatIsStable`).
 - `webhook_delivery_attempts` references `(tenant_id, delivery_id)`; `audit_events.ip` is `INET` (non-addresses stored as NULL), `actor_type` no longer allows `admin` (admins are `user` + `actor_role = 'admin'`; `audit.ActorTypeAdmin` is removed), and `parent_id` references `audit_events(id)`.

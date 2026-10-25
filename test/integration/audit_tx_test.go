@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,12 +38,48 @@ import (
 
 type auditTxHarness struct {
 	pool     *pgxpool.Pool
-	recorder *audit.PostgresRecorder
+	recorder *toggleRecorder
 	tx       *database.TxManager
-	users    identityrepo.UserRepository
-	refresh  identityrepo.RefreshTokenRepository
+	identity identityservice.Stores
 	files    *filesrepo.FileRepository
 	store    storage.Storage
+}
+
+// toggleRecorder fails every audit write on demand, so a test can prove a
+// mutation rolls back with its Tier 1 row without table-owner DDL.
+type toggleRecorder struct {
+	inner *audit.PostgresRecorder
+	fail  bool
+}
+
+var errAuditDown = errors.New("forced audit insert failure")
+
+func (r *toggleRecorder) Record(ctx context.Context, event audit.Event) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.Record(ctx, event)
+}
+
+func (r *toggleRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event audit.Event) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.RecordTx(ctx, tx, event)
+}
+
+func (r *toggleRecorder) RecordID(ctx context.Context, event audit.Event) (int64, error) {
+	if r.fail {
+		return 0, errAuditDown
+	}
+	return r.inner.RecordID(ctx, event)
+}
+
+func (r *toggleRecorder) Complete(ctx context.Context, id int64, completion audit.Completion) error {
+	if r.fail {
+		return errAuditDown
+	}
+	return r.inner.Complete(ctx, id, completion)
 }
 
 func setupAuditTxHarness(t *testing.T) *auditTxHarness {
@@ -57,13 +94,33 @@ func setupAuditTxHarness(t *testing.T) *auditTxHarness {
 
 	return &auditTxHarness{
 		pool:     pool,
-		recorder: audit.NewPostgresRecorder(pool),
-		tx:       database.NewTxManager(pool),
-		users:    identityrepo.NewUserRepository(pool),
-		refresh:  identityrepo.NewRefreshTokenRepository(pool),
-		files:    filesrepo.NewFileRepository(pool),
+		recorder: &toggleRecorder{inner: audit.NewPostgresRecorder(testutil.Scoped(pool))},
+		tx:       testutil.NewTxManager(pool),
+		identity: identityrepo.NewStores(testutil.Scoped(pool)),
+		files:    filesrepo.NewFileRepository(testutil.Scoped(pool)),
 		store:    store,
 	}
+}
+
+// adminService is the identity admin service writing its Tier 1 audit rows
+// through the harness recorder.
+func (h *auditTxHarness) adminService() identityservice.AdminUserService {
+	return identityservice.NewAdminUserService(h.identity, identityrepo.NewTransactor(h.tx, h.recorder, nil, nil), nil)
+}
+
+// membershipState reads the target's membership in tenantID.
+func (h *auditTxHarness) membershipState(t *testing.T, tenantID, userID int64) (role, status string) {
+	t.Helper()
+	require.NoError(t, h.pool.QueryRow(context.Background(), `
+		SELECT COALESCE((
+			SELECT r.key FROM membership_roles mr JOIN roles r ON r.id = mr.role_id
+			WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+			ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+			LIMIT 1
+		), 'member'), m.status
+		FROM memberships m WHERE m.tenant_id = $1 AND m.user_id = $2`, tenantID, userID,
+	).Scan(&role, &status))
+	return role, status
 }
 
 func (h *auditTxHarness) actorCtx(tenantID, actorID int64, role string) context.Context {
@@ -75,34 +132,12 @@ func (h *auditTxHarness) actorCtx(tenantID, actorID int64, role string) context.
 
 func (h *auditTxHarness) insertUser(t *testing.T, tenantID int64, email, role string) int64 {
 	t.Helper()
-	var id int64
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name, role) VALUES ($1, $2, 'Audit User', $3) RETURNING id`,
-		tenantID, email, role,
-	).Scan(&id))
-	return id
+	return testutil.CreateMember(t, context.Background(), h.pool, tenantID, email, testutil.MemberOptions{Role: role}).UserID
 }
 
 func (h *auditTxHarness) installInsertFailure(t *testing.T) {
 	t.Helper()
-	ctx := context.Background()
-	_, err := h.pool.Exec(ctx, `
-		CREATE OR REPLACE FUNCTION test_audit_insert_failure() RETURNS trigger AS $$
-		BEGIN
-			RAISE EXCEPTION 'forced audit insert failure';
-		END;
-		$$ LANGUAGE plpgsql;
-		CREATE TRIGGER test_audit_insert_failure
-			BEFORE INSERT ON audit_events
-			FOR EACH ROW EXECUTE FUNCTION test_audit_insert_failure();`)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, _ = h.pool.Exec(cleanupCtx,
-			`DROP TRIGGER IF EXISTS test_audit_insert_failure ON audit_events`)
-		_, _ = h.pool.Exec(cleanupCtx, `DROP FUNCTION IF EXISTS test_audit_insert_failure()`)
-	})
+	h.recorder.fail = true
 }
 
 func requireAuditUnavailable(t *testing.T, err error) {
@@ -120,42 +155,45 @@ func TestAuditTx_UpdateRoleRollsBackWhenAuditFails(t *testing.T) {
 	targetID := h.insertUser(t, tenant.DefaultID, "audit-target@test.com", "user")
 	h.installInsertFailure(t)
 
-	svc := identityservice.NewAdminUserService(h.users, h.refresh, h.tx, h.recorder)
-	_, err := svc.UpdateRole(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID, "admin")
+	_, err := h.adminService().UpdateRole(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID, "admin")
 	requireAuditUnavailable(t, err)
 
-	var role string
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT role FROM users WHERE id = $1`, targetID).Scan(&role))
-	assert.Equal(t, "user", role, "the role update must roll back with the failed audit row")
+	role, _ := h.membershipState(t, tenant.DefaultID, targetID)
+	assert.Equal(t, "member", role, "the role update must roll back with the failed audit row")
 }
 
 func TestAuditTx_BanRollsBackWhenAuditFails(t *testing.T) {
 	h := setupAuditTxHarness(t)
 	adminID := h.insertUser(t, tenant.DefaultID, "audit-admin-ban@test.com", "admin")
 	targetID := h.insertUser(t, tenant.DefaultID, "audit-target-ban@test.com", "user")
+	var sessionID int64
+	require.NoError(t, h.pool.QueryRow(context.Background(),
+		`INSERT INTO sessions (tenant_id, user_id, token_version) VALUES ($1, $2, 0) RETURNING id`,
+		tenant.DefaultID, targetID).Scan(&sessionID))
 	_, err := h.pool.Exec(context.Background(),
-		`INSERT INTO refresh_tokens (tenant_id, user_id, token, expires_at)
-		 VALUES ($1, $2, 'audit-refresh-token', NOW() + INTERVAL '1 day')`,
-		tenant.DefaultID, targetID)
+		`INSERT INTO refresh_tokens (tenant_id, session_id, token_hash, expires_at)
+		 VALUES ($1, $2, 'audit-refresh-token-hash', NOW() + INTERVAL '1 day')`,
+		tenant.DefaultID, sessionID)
 	require.NoError(t, err)
 	h.installInsertFailure(t)
 
-	svc := identityservice.NewAdminUserService(h.users, h.refresh, h.tx, h.recorder)
-	err = svc.BanUser(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID)
+	err = h.adminService().BanUser(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID)
 	requireAuditUnavailable(t, err)
 
-	var deleted, banned bool
+	var banned, apiKeysRevoked bool
 	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT deleted_at IS NOT NULL, banned_at IS NOT NULL FROM users WHERE id = $1`, targetID).
-		Scan(&deleted, &banned))
-	assert.False(t, deleted)
+		`SELECT banned_at IS NOT NULL, credentials_revoked_at IS NOT NULL
+		 FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, targetID).
+		Scan(&banned, &apiKeysRevoked))
+	_, status := h.membershipState(t, tenant.DefaultID, targetID)
+	assert.Equal(t, "active", status)
 	assert.False(t, banned)
+	assert.False(t, apiKeysRevoked, "the API-key revocation must roll back too")
 
-	var tokens int64
+	var revoked bool
 	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1`, targetID).Scan(&tokens))
-	assert.Equal(t, int64(1), tokens, "refresh token revocation must roll back too")
+		`SELECT revoked_at IS NOT NULL FROM sessions WHERE id = $1`, sessionID).Scan(&revoked))
+	assert.False(t, revoked, "the session revocation must roll back too")
 }
 
 func TestAuditTx_UnbanRollsBackWhenAuditFails(t *testing.T) {
@@ -163,18 +201,16 @@ func TestAuditTx_UnbanRollsBackWhenAuditFails(t *testing.T) {
 	adminID := h.insertUser(t, tenant.DefaultID, "audit-admin-unban@test.com", "admin")
 	targetID := h.insertUser(t, tenant.DefaultID, "audit-target-unban@test.com", "user")
 	_, err := h.pool.Exec(context.Background(),
-		`UPDATE users SET deleted_at = NOW(), banned_at = NOW() WHERE id = $1`, targetID)
+		`UPDATE memberships SET status = 'suspended', banned_at = NOW()
+		 WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, targetID)
 	require.NoError(t, err)
 	h.installInsertFailure(t)
 
-	svc := identityservice.NewAdminUserService(h.users, h.refresh, h.tx, h.recorder)
-	_, err = svc.UnbanUser(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID)
+	_, err = h.adminService().UnbanUser(h.actorCtx(tenant.DefaultID, adminID, "admin"), targetID)
 	requireAuditUnavailable(t, err)
 
-	var deleted bool
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT deleted_at IS NOT NULL FROM users WHERE id = $1`, targetID).Scan(&deleted))
-	assert.True(t, deleted, "restore must roll back with the failed audit row")
+	_, status := h.membershipState(t, tenant.DefaultID, targetID)
+	assert.Equal(t, "suspended", status, "the unban must roll back with the failed audit row")
 }
 
 func TestAuditTx_FileDeleteAndRestoreRollBackWhenAuditFails(t *testing.T) {
@@ -227,8 +263,8 @@ func TestFilesEvents_AdminAndRestorePublishInTx(t *testing.T) {
 		tenant.DefaultID, ownerID,
 	).Scan(&fileID))
 
-	queue := jobs.NewQueue(h.pool)
-	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(h.pool, queue))
+	queue := jobs.NewQueue(testutil.Scoped(h.pool))
+	dispatcher := webhookservice.NewDispatcher(webhookrepo.New(testutil.Scoped(h.pool), testutil.NewTxManager(h.pool), queue))
 	bus := events.New(queue)
 	for _, eventType := range []string{filescontracts.EventFileDeleted, filescontracts.EventFileRestored} {
 		require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", dispatcher.HandleEvent))
@@ -279,15 +315,11 @@ func TestFilesEvents_AdminAndRestorePublishInTx(t *testing.T) {
 func TestAuditTx_RecordsTenantAndActor(t *testing.T) {
 	h := setupAuditTxHarness(t)
 	ctx := context.Background()
-	var tenantID int64
-	require.NoError(t, h.pool.QueryRow(ctx,
-		`INSERT INTO tenants (slug, name) VALUES ('audit-tx-tenant', 'Audit Tx') RETURNING id`).
-		Scan(&tenantID))
+	tenantID := testutil.CreateTenant(t, ctx, h.pool, "audit-tx-tenant")
 	adminID := h.insertUser(t, tenantID, "tenant-audit-admin@test.com", "admin")
 	targetID := h.insertUser(t, tenantID, "tenant-audit-target@test.com", "user")
 
-	svc := identityservice.NewAdminUserService(h.users, h.refresh, h.tx, h.recorder)
-	_, err := svc.UpdateRole(h.actorCtx(tenantID, adminID, "admin"), targetID, "admin")
+	_, err := h.adminService().UpdateRole(h.actorCtx(tenantID, adminID, "admin"), targetID, "admin")
 	require.NoError(t, err)
 
 	var (

@@ -3,16 +3,20 @@ package service
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
+
+// UpdateProfileInput changes the caller's global profile. Email is only
+// applied when set.
+type UpdateProfileInput struct {
+	Name  *string
+	Email *string
+}
 
 // profileChange is a validated profile update: the values to store and what
 // actually changes.
@@ -31,37 +35,44 @@ func (c profileChange) auditMetadata() map[string]any {
 	}
 }
 
-func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
-	existing, err := s.getUser(ctx, id)
+// Update changes the global profile of an active member of the request
+// tenant. The handler only allows a user to change their own profile: a
+// tenant admin manages memberships, never another person's global identity.
+func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInput) (*Member, error) {
+	existing, err := getMember(ctx, s.Stores.Memberships, id)
 	if err != nil {
 		return nil, err
 	}
-	change, err := s.planProfileChange(ctx, existing, req)
+	change, err := s.planProfileChange(ctx, &existing.User, req)
 	if err != nil {
 		return nil, err
 	}
 
-	var user *identitysqlc.User
-	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
-		updated, updateErr := applyProfileChange(ctx, r, id, change)
+	var updated *User
+	if change.emailChanged {
+		ctx = database.WithRLSBypass(ctx) // An email change ends the user's sessions in every tenant.
+	}
+	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		user, updateErr := applyProfileChange(ctx, tx.Stores, id, change)
 		if updateErr != nil {
 			return updateErr
 		}
-		user = updated
-		return checkAudit(audit.RecordInTx(ctx, s.audit, tx, userEvent(ctx, "user.profile_updated", id, change.auditMetadata())))
+		updated = user
+		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "user.profile_updated", id, change.auditMetadata())))
 	})
 	if err != nil {
 		return nil, err
 	}
 	if change.emailChanged {
-		invalidateSessions(ctx, s.sessions, id)
+		invalidateSessions(ctx, s.SessionCache, id)
 	}
-	return ToUserResponse(user), nil
+	existing.User = *updated
+	return existing, nil
 }
 
 // planProfileChange resolves the requested name/email against the stored
 // account and checks that a new address is available.
-func (s *userService) planProfileChange(ctx context.Context, existing *identitysqlc.User, req dto.UpdateUserRequest) (profileChange, error) {
+func (s *userService) planProfileChange(ctx context.Context, existing *User, req UpdateProfileInput) (profileChange, error) {
 	change := profileChange{
 		name:        existing.Name,
 		email:       existing.Email,
@@ -75,10 +86,10 @@ func (s *userService) planProfileChange(ctx context.Context, existing *identitys
 		return change, nil
 	}
 	requested := NormalizeEmail(*req.Email)
-	if requested == NormalizeEmail(existing.Email) {
+	if requested == existing.Email {
 		return change, nil
 	}
-	if err := s.ensureEmailFreeForChange(ctx, requested); err != nil {
+	if err := ensureEmailFreeForChange(ctx, s.Stores, requested); err != nil {
 		return profileChange{}, err
 	}
 	change.email = requested
@@ -86,95 +97,160 @@ func (s *userService) planProfileChange(ctx context.Context, existing *identitys
 	return change, nil
 }
 
-func (s *userService) ensureEmailFreeForChange(ctx context.Context, email string) error {
-	_, err := s.repo.GetByEmail(ctx, email)
+func ensureEmailFreeForChange(ctx context.Context, st Stores, email string) error {
+	_, err := st.Users.GetByEmail(ctx, email)
 	switch {
 	case err == nil:
 		return apperror.NewConflict("email already in use")
 	case !errors.Is(err, apperror.ErrNotFound):
 		return apperror.NewInternal("failed to check email availability")
 	}
-	return ensureEmailNotBanned(ctx, s.repo, email)
+	return ensureEmailNotBanned(ctx, st.Memberships, email)
 }
 
 // applyProfileChange stores the change. Changing the identity address ends
-// every existing session (the UPDATE also bumps the token version).
-func applyProfileChange(ctx context.Context, r repos, id int64, change profileChange) (*identitysqlc.User, error) {
-	user, err := r.users.Update(ctx, identitysqlc.UpdateUserParams{
+// every session of the user in every tenant (the UPDATE also bumps the token
+// version).
+func applyProfileChange(ctx context.Context, st Stores, id int64, change profileChange) (*User, error) {
+	user, err := st.Users.UpdateProfile(ctx, ProfileUpdate{
 		ID:          id,
 		Name:        change.name,
 		Email:       change.email,
 		UpdateEmail: change.updateEmail,
 	})
 	if err != nil {
-		if database.IsUniqueViolation(err) {
+		if errors.Is(err, ErrEmailTaken) {
 			return nil, apperror.NewConflict("email already in use")
 		}
-		return nil, apperror.NewInternal("failed to update user")
+		return nil, userWriteError(err, "user not found", "failed to update user")
 	}
 	if change.emailChanged {
-		if err := r.refresh.DeleteByUserID(ctx, id); err != nil {
+		if err := st.Sessions.RevokeAllForUser(ctx, id, RevokeCredentialsChanged); err != nil {
 			return nil, apperror.NewInternal("failed to revoke sessions")
+		}
+		if err := st.Resets.DeleteByUser(ctx, id); err != nil {
+			return nil, apperror.NewInternal("failed to revoke reset tokens")
 		}
 	}
 	return user, nil
 }
 
-func (s *userService) Delete(ctx context.Context, id int64) error {
-	target, err := s.getUser(ctx, id)
-	if err != nil {
+// DeleteAccount deletes the caller's global account: every active
+// membership is removed (bans stay recorded), every session ends, and the
+// address becomes reusable. It refuses when the account is the last active
+// admin of any tenant.
+func (s *userService) DeleteAccount(ctx context.Context, id int64) error {
+	if _, err := getMember(ctx, s.Stores.Memberships, id); err != nil {
 		return err
 	}
-	err = inTx(ctx, s.txManager, s.fallbackRepos(), func(tx pgx.Tx, r repos) error {
-		if deleteErr := deleteAccount(ctx, r, target); deleteErr != nil {
-			return deleteErr
+	ctx = database.WithRLSBypass(ctx) // Deleting the global account removes memberships and sessions in every tenant.
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := deleteAccount(ctx, tx.Stores, id); err != nil {
+			return err
 		}
-		return checkAudit(audit.RecordInTx(ctx, s.audit, tx, userEvent(ctx, "user.deleted", id, nil)))
+		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "user.deleted", id, map[string]any{"scope": "account"})))
 	})
 	if err != nil {
 		return err
 	}
-	invalidateSessions(ctx, s.sessions, id)
+	invalidateSessions(ctx, s.SessionCache, id)
 	return nil
 }
 
-// deleteAccount soft-deletes target and revokes its refresh tokens, so a
-// deleted user's sessions cannot outlive the account.
-func deleteAccount(ctx context.Context, r repos, target *identitysqlc.User) error {
-	// Checked on the transaction's repository, under the per-tenant
-	// admin-change lock, so it serializes with concurrent demotions/bans.
-	if target.Role == dto.RoleAdmin {
-		if err := ensureNotLastAdmin(ctx, r.users, "cannot delete the last active admin"); err != nil {
+func deleteAccount(ctx context.Context, st Stores, id int64) error {
+	memberships, err := st.Memberships.ListForUser(ctx, id)
+	if err != nil {
+		return apperror.NewInternal("failed to load memberships")
+	}
+	// Lock each tenant's admin changes in tenant order (ListForUser sorts by
+	// tenant), so two concurrent deletions cannot deadlock on the locks.
+	sort.Slice(memberships, func(i, j int) bool { return memberships[i].TenantID < memberships[j].TenantID })
+	for i := range memberships {
+		m := &memberships[i]
+		if m.Status != MembershipStatusActive {
+			continue
+		}
+		tctx := tenant.WithID(ctx, m.TenantID)
+		if m.Role == RoleOwner {
+			if err := ensureNotLastOwner(tctx, st.Memberships, "cannot delete the account: it is the last active owner of a tenant"); err != nil {
+				return err
+			}
+		}
+		if _, err := st.Memberships.Remove(tctx, id); err != nil {
+			return userWriteError(err, "user not found", "failed to remove membership")
+		}
+	}
+	if _, err := st.Users.MarkDeleted(ctx, id); err != nil {
+		return userWriteError(err, "user not found", "failed to delete user")
+	}
+	if err := st.Sessions.RevokeAllForUser(ctx, id, RevokeAccountDeleted); err != nil {
+		return apperror.NewInternal("failed to revoke sessions")
+	}
+	if err := st.Resets.DeleteByUser(ctx, id); err != nil {
+		return apperror.NewInternal("failed to revoke reset tokens")
+	}
+	if err := st.Verifications.DeleteByUser(ctx, id); err != nil {
+		return apperror.NewInternal("failed to revoke verification tokens")
+	}
+	return nil
+}
+
+// RemoveMember removes another user's membership from the request tenant
+// (the user's global account and other tenants are untouched). The last
+// active admin can never be removed.
+func (s *userService) RemoveMember(ctx context.Context, id int64) error {
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := removeMembership(ctx, tx.Stores, id); err != nil {
+			return err
+		}
+		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "user.deleted", id, map[string]any{"scope": "membership"})))
+	})
+	if err != nil {
+		return err
+	}
+	invalidateSessions(ctx, s.SessionCache, id)
+	return nil
+}
+
+func removeMembership(ctx context.Context, st Stores, id int64) error {
+	const notFound = "user not found"
+	member, err := st.Memberships.Get(ctx, id)
+	if err != nil {
+		return userWriteError(err, notFound, "failed to get user")
+	}
+	if member.Membership.Status == MembershipStatusRemoved {
+		return apperror.NewNotFound(notFound)
+	}
+	if member.Membership.Role == RoleOwner && member.Membership.Status == MembershipStatusActive {
+		if err := ensureNotLastOwner(ctx, st.Memberships, "cannot delete the last active owner"); err != nil {
 			return err
 		}
 	}
-	if _, err := r.users.Delete(ctx, target.ID); err != nil {
-		return userWriteError(err, "user not found", "failed to delete user")
+	if _, err := st.Memberships.Remove(ctx, id); err != nil {
+		return userWriteError(err, notFound, "failed to remove membership")
 	}
-	if err := r.refresh.DeleteByUserID(ctx, target.ID); err != nil {
-		return apperror.NewInternal("failed to revoke refresh tokens")
+	if err := st.Sessions.RevokeAllInTenant(ctx, id, RevokeMembershipChanged); err != nil {
+		return apperror.NewInternal("failed to revoke sessions")
 	}
 	return nil
 }
 
-// RevokeSessions invalidates every access and refresh token for a user, used
-// by the "logout all devices" endpoint.
+// RevokeSessions invalidates every access token and session of the user in
+// every tenant ("log out all devices").
 func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
-	err := inTx(ctx, s.txManager, s.fallbackRepos(), func(_ pgx.Tx, r repos) error {
-		if _, err := r.users.RevokeSessions(ctx, userID); err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return apperror.NewNotFound("user not found")
-			}
-			return apperror.NewInternal("failed to revoke sessions")
+	ctx = database.WithRLSBypass(ctx) // Logout-all ends the user's sessions in every tenant.
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
+			return userWriteError(err, "user not found", "failed to revoke sessions")
 		}
-		if err := r.refresh.DeleteByUserID(ctx, userID); err != nil {
-			return apperror.NewInternal("failed to revoke refresh tokens")
+		if err := tx.Sessions.RevokeAllForUser(ctx, userID, RevokeLogoutAll); err != nil {
+			return apperror.NewInternal("failed to revoke sessions")
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
-	invalidateSessions(ctx, s.sessions, userID)
+	invalidateSessions(ctx, s.SessionCache, userID)
 	return nil
 }

@@ -23,7 +23,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -37,22 +36,6 @@ func setupTrashDB(t *testing.T) *pgxpool.Pool {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 	return pool
-}
-
-func insertTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
-	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug).Scan(&id))
-	return id
-}
-
-func insertUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
-	t.Helper()
-	var id int64
-	require.NoError(t, pool.QueryRow(context.Background(),
-		`INSERT INTO users (tenant_id, email, name) VALUES ($1, $2, $2) RETURNING id`, tenantID, email).Scan(&id))
-	return id
 }
 
 // insertFile creates a metadata row (soft-deleted deletedAgo ago when
@@ -101,9 +84,9 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
 
-	tenantB := insertTenant(t, pool, "trash-b")
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-a@example.com")
-	userB := insertUser(t, pool, tenantB, "trash-b@example.com")
+	tenantB := testutil.CreateTenant(t, context.Background(), pool, "trash-b")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-a@example.com", testutil.MemberOptions{}).UserID
+	userB := testutil.CreateMember(t, context.Background(), pool, tenantB, "trash-b@example.com", testutil.MemberOptions{}).UserID
 
 	const old, recent = 40 * 24 * time.Hour, 5 * 24 * time.Hour
 	_, oldA := insertFile(t, pool, store, tenant.DefaultID, userA, "old-a", old, true)
@@ -112,7 +95,7 @@ func TestTrashPurgeRemovesExpiredTrashAcrossTenants(t *testing.T) {
 	recentID, recentPath := insertFile(t, pool, store, tenant.DefaultID, userA, "recent", recent, true)
 	liveID, livePath := insertFile(t, pool, store, tenantB, userB, "live", 0, true)
 
-	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(database.NewTxManager(pool)), store, trashRetentionDays)
+	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(testutil.NewTxManager(pool)), store, trashRetentionDays)
 	ctx := context.Background()
 	require.NoError(t, purger.HandleJob(ctx, nil))
 
@@ -141,13 +124,13 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	root := t.TempDir()
 	store, err := storage.NewLocalStorage(root)
 	require.NoError(t, err)
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-claim@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-claim@example.com", testutil.MemberOptions{}).UserID
 	id, path := insertFile(t, pool, store, tenant.DefaultID, userA, "claimed", 40*24*time.Hour, true)
 
 	ctx := context.Background()
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	files := filesrepo.NewFileRepository(pool)
-	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
+	files := filesrepo.NewFileRepository(testutil.Scoped(pool))
+	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
 	failure := errors.New("hard delete never ran")
 	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
 		require.Len(t, batch, 1)
@@ -177,7 +160,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	pool := setupTrashDB(t)
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-skip@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-skip@example.com", testutil.MemberOptions{}).UserID
 	id, _ := insertFile(t, pool, store, tenant.DefaultID, userA, "restoring", 40*24*time.Hour, true)
 
 	ctx := context.Background()
@@ -187,7 +170,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	_, err = tx.Exec(ctx, `UPDATE files SET deleted_at = NULL WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	repo := filesrepo.NewTrashRepository(database.NewTxManager(pool))
+	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
 	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, error) {
 		t.Fatal("a row locked by a restore must be skipped")
 		return nil, nil
@@ -202,7 +185,7 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
 	pool := setupTrashDB(t)
 	ctx := context.Background()
-	userA := insertUser(t, pool, tenant.DefaultID, "trash-plan@example.com")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-plan@example.com", testutil.MemberOptions{}).UserID
 	_, err := pool.Exec(ctx, `
 		INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size, deleted_at)
 		SELECT 1, $1, 'f', 'seed/' || g, 'image/png', 1,

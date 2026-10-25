@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 )
 
 const (
@@ -27,15 +25,27 @@ const (
 	// huge refresh-token backlog cannot starve the other tables. Whatever is
 	// left is purged by the next run.
 	tokenPurgeTableBudget = time.Minute
+
+	// revokedSessionRetention keeps revoked sessions visible (revoked_reason)
+	// for incident review before they are purged.
+	revokedSessionRetention = 30 * 24 * time.Hour
+	// idleSessionGrace delays purging a session whose refresh tokens are all
+	// gone, so a rotation in flight never loses its session row.
+	idleSessionGrace = 24 * time.Hour
 )
 
 // TokenPurger runs the expired-token retention job.
 type TokenPurger struct {
-	repo repository.TokenPurgeRepository
+	repo TokenPurgeRepository
 }
 
-func NewTokenPurger(repo repository.TokenPurgeRepository) *TokenPurger {
+func NewTokenPurger(repo TokenPurgeRepository) *TokenPurger {
 	return &TokenPurger{repo: repo}
+}
+
+func (p *TokenPurger) purgeStaleSessions(ctx context.Context, batchSize int32) (int64, error) {
+	now := time.Now()
+	return p.repo.PurgeStaleSessions(ctx, now.Add(-revokedSessionRetention), now.Add(-idleSessionGrace), batchSize)
 }
 
 // HandleJob purges every token table in bounded batches. It is idempotent:
@@ -49,6 +59,10 @@ func (p *TokenPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 		{"refresh_tokens", p.repo.PurgeExpiredRefreshTokens},
 		{"password_reset_tokens", p.repo.PurgeExpiredPasswordResetTokens},
 		{"email_verification_tokens", p.repo.PurgeExpiredEmailVerificationTokens},
+		{"invitations", p.repo.PurgeExpiredInvitations},
+		// After refresh_tokens, so sessions whose last token expired in this
+		// run are already eligible.
+		{"sessions", p.purgeStaleSessions},
 	}
 	for _, table := range tables {
 		if err := purgeTable(ctx, table.name, table.purge); err != nil {

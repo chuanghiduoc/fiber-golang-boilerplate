@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,11 +11,9 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
-	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
@@ -25,53 +22,6 @@ import (
 // that exercise the OAuth flow itself.
 func googleOAuthEnabled() features.Evaluator {
 	return features.NewEvaluator(features.Options{Env: map[features.Key]bool{identitycatalog.KeyGoogleOAuth: true}})
-}
-
-type fakeTenantRepository struct {
-	tenant identitysqlc.Tenant
-	err    error
-}
-
-var _ identityrepo.TenantRepository = (*fakeTenantRepository)(nil)
-
-func (f *fakeTenantRepository) ResolveBySlug(_ context.Context, slug string) (identitysqlc.Tenant, error) {
-	if f.err != nil {
-		return identitysqlc.Tenant{}, f.err
-	}
-	if f.tenant.Slug != slug {
-		return identitysqlc.Tenant{}, apperror.ErrNotFound
-	}
-	return f.tenant, nil
-}
-
-func (f *fakeTenantRepository) GetByID(_ context.Context, id int64) (identitysqlc.Tenant, error) {
-	if f.err != nil {
-		return identitysqlc.Tenant{}, f.err
-	}
-	if f.tenant.ID != id || f.tenant.Status != "active" {
-		return identitysqlc.Tenant{}, apperror.ErrNotFound
-	}
-	return f.tenant, nil
-}
-
-func (f *fakeTenantRepository) GetBySlugIncludingSuspended(_ context.Context, slug string) (identitysqlc.Tenant, error) {
-	if f.err != nil {
-		return identitysqlc.Tenant{}, f.err
-	}
-	if f.tenant.Slug != slug {
-		return identitysqlc.Tenant{}, apperror.ErrNotFound
-	}
-	return f.tenant, nil
-}
-
-func (f *fakeTenantRepository) GetByIDIncludingSuspended(_ context.Context, id int64) (identitysqlc.Tenant, error) {
-	if f.err != nil {
-		return identitysqlc.Tenant{}, f.err
-	}
-	if f.tenant.ID != id {
-		return identitysqlc.Tenant{}, apperror.ErrNotFound
-	}
-	return f.tenant, nil
 }
 
 func TestOAuthState_RoundTrip(t *testing.T) {
@@ -102,8 +52,8 @@ func TestGoogleCallback_RejectsForgedStateEvenWithMatchingCookie(t *testing.T) {
 		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
 		FrontendURL:        "http://localhost:3000",
 	})
-	tenants := &fakeTenantRepository{tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Status: "active"}}
-	h := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	tenants := &fakeTenantRepository{tenant: service.Tenant{ID: 2, Slug: "acme", Status: "active"}}
+	h := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", h.GoogleCallback)
@@ -124,8 +74,8 @@ func TestGoogleRedirect_BindsTenantToState(t *testing.T) {
 		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
 		FrontendURL:        "http://localhost:3000",
 	})
-	authHandler := NewAuthHandler(
-		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth,
 	)
 
@@ -156,10 +106,10 @@ func TestGoogleRedirect_AcceptsTenantQueryWhenMiddlewareIsAbsent(t *testing.T) {
 		FrontendURL:        "http://localhost:3000",
 	})
 	tenants := &fakeTenantRepository{
-		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
+		tenant: service.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
 	}
-	authHandler := NewAuthHandler(
-		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
@@ -191,8 +141,8 @@ func TestGoogleRedirect_HeaderResolvedTenantWinsOverQuery(t *testing.T) {
 		GoogleRedirectURL:  "http://localhost:8080/api/v1/auth/google/callback",
 		FrontendURL:        "http://localhost:3000",
 	})
-	authHandler := NewAuthHandler(
-		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
@@ -229,10 +179,10 @@ func TestGoogleCallback_UsesStateTenantAndRejectsUnknown(t *testing.T) {
 		FrontendURL:        "http://localhost:3000",
 	})
 	tenants := &fakeTenantRepository{
-		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
+		tenant: service.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "active"},
 	}
-	authHandler := NewAuthHandler(
-		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
@@ -264,10 +214,10 @@ func TestGoogleCallback_RejectsSuspendedTenant(t *testing.T) {
 		FrontendURL:        "http://localhost:3000",
 	})
 	tenants := &fakeTenantRepository{
-		tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "suspended"},
+		tenant: service.Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: "suspended"},
 	}
-	authHandler := NewAuthHandler(
-		newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())

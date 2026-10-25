@@ -21,7 +21,7 @@ import (
 )
 
 // maxSequentialVersion is the largest pre-timestamp (6-digit -seq) version.
-// Every migration, including the per-owner baseline (ADR 0005), uses a UTC
+// Every migration, including the init (ADR 0012), uses a UTC
 // timestamp version, so a database recorded at 1..999999 is a legacy
 // sequential history (the old 000001 baseline or 000001-000003) whose source
 // files no longer exist in this repository.
@@ -38,14 +38,28 @@ const (
 
 // requiredTables lists the schema objects the application assumes exist. The
 // check catches a database whose recorded version is current but whose schema
-// predates the per-owner baseline (for example one baselined by hand), which
+// predates the init (for example one baselined by hand), which
 // golang-migrate alone would treat as current.
 var requiredTables = []string{
 	"tenants",
+	"tenant_settings",
 	"users",
+	"user_passwords",
+	"user_identities",
+	"memberships",
+	"permissions",
+	"roles",
+	"role_permissions",
+	"membership_roles",
+	"platform_role_assignments",
+	"invitations",
+	"sessions",
 	"refresh_tokens",
 	"password_reset_tokens",
 	"email_verification_tokens",
+	"mfa_factors",
+	"mfa_recovery_codes",
+	"data_exports",
 	"api_keys",
 	"api_key_scopes",
 	"files",
@@ -70,11 +84,30 @@ var requiredTables = []string{
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the baseline.
 var requiredColumns = map[string][]string{
-	"tenants":                   {"slug", "status"},
-	"users":                     {"tenant_id", "token_version", "password_changed_at", "banned_at", "credentials_revoked_at"},
-	"refresh_tokens":            {"tenant_id", "token_version"},
-	"password_reset_tokens":     {"tenant_id"},
-	"email_verification_tokens": {"tenant_id", "email"},
+	"tenants":         {"slug", "status", "status_changed_at", "trial_ends_at", "deletion_scheduled_at"},
+	"tenant_settings": {"tenant_id", "locale", "timezone"},
+	// Global users (ADR 0004): no tenant_id, role, or credential columns.
+	"users":           {"email", "status", "token_version", "credentials_changed_at", "deleted_at"},
+	"user_passwords":  {"user_id", "password_hash", "changed_at"},
+	"user_identities": {"user_id", "provider", "subject", "email"},
+	"memberships": {
+		"tenant_id", "user_id", "status", "banned_at", "removed_at", "credentials_revoked_at",
+	},
+	"permissions":               {"key", "owner"},
+	"roles":                     {"tenant_id", "scope", "key", "name"},
+	"role_permissions":          {"role_id", "permission_key"},
+	"membership_roles":          {"tenant_id", "user_id", "role_id"},
+	"platform_role_assignments": {"user_id", "role_id"},
+	"invitations": {
+		"tenant_id", "email_normalized", "role", "token_hash", "invited_by", "expires_at", "accepted_at", "accepted_by",
+	},
+	"sessions":                  {"tenant_id", "user_id", "token_version", "amr", "ip", "last_used_at", "revoked_at", "revoked_reason"},
+	"refresh_tokens":            {"tenant_id", "session_id", "token_hash", "used_at"},
+	"password_reset_tokens":     {"user_id", "token_hash"},
+	"email_verification_tokens": {"user_id", "email", "token_hash"},
+	"mfa_factors":               {"user_id", "type", "secret_ciphertext", "confirmed_at", "last_used_step"},
+	"mfa_recovery_codes":        {"user_id", "code_hash", "used_at"},
+	"data_exports":              {"tenant_id", "user_id", "status", "storage_path", "expires_at"},
 	"files":                     {"tenant_id", "updated_at"},
 	"api_keys": {
 		"tenant_id", "user_id", "key_hash", "expires_at",
@@ -106,21 +139,38 @@ var requiredColumns = map[string][]string{
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset
-// and verification tokens, duplicate active emails per tenant, duplicate
-// tenant slugs, and duplicate API-key hashes, plus every unique index an
-// ON CONFLICT target relies on (without it the upsert fails at runtime with
-// "no unique or exclusion constraint matching the ON CONFLICT specification").
+// and verification tokens, duplicate live emails, duplicate memberships and
+// external identities, duplicate pending invitations, duplicate tenant slugs,
+// and duplicate API-key hashes, plus every unique index an ON CONFLICT target
+// or composite FK parent relies on (without it the upsert fails at runtime
+// with "no unique or exclusion constraint matching the ON CONFLICT
+// specification").
 var requiredUniqueIndexes = []string{
 	"tenants_slug_key",
-	"idx_users_tenant_email_lower_active",
-	"idx_users_tenant_google_id_active",
-	"idx_users_tenant_id_id",
-	"idx_password_reset_tokens_tenant_user_id",
-	"idx_email_verification_tokens_tenant_user_id",
+	"idx_users_email_live",
+	"idx_data_exports_active",
+	"uq_user_identities_provider_subject",
+	"uq_user_identities_user_provider",
+	"uq_memberships_tenant_user",
+	"uq_roles_tenant_key",
+	"permissions_pkey",
+	"role_permissions_pkey",
+	"membership_roles_pkey",
+	"platform_role_assignments_pkey",
+	"uq_sessions_tenant_id",
+	"idx_invitations_tenant_email_pending",
+	"invitations_token_hash_key",
+	"refresh_tokens_token_hash_key",
+	"password_reset_tokens_user_id_key",
+	"password_reset_tokens_token_hash_key",
+	"email_verification_tokens_user_id_key",
+	"email_verification_tokens_token_hash_key",
 	"idx_webhook_inbound_sources_tenant_slug_active",
 	"idx_webhook_inbound_events_source_event",
 	"idx_api_keys_key_hash",
 	"idx_notification_preferences_unique",
+	"idx_mfa_factors_user_confirmed_totp",
+	"idx_mfa_factors_user_unconfirmed_totp",
 	"idx_jobs_tenant_idempotency_key",
 	"idx_scheduler_runs_schedule_slot",
 	"idx_feature_flag_targets_tenant_flag_user",
@@ -136,9 +186,14 @@ var requiredUniqueIndexes = []string{
 }
 
 // requiredTriggers are the database-level invariants the application relies
-// on: the per-tenant last-admin guard and the audit append-only guards.
+// on: the per-tenant last-owner and role-scope guards, and the audit
+// append-only guards.
 var requiredTriggers = map[string][]string{
-	"users": {"trigger_protect_last_admin"},
+	"memberships":               {"trigger_memberships_last_owner"},
+	"membership_roles":          {"trigger_membership_roles_scope", "trigger_protect_last_owner"},
+	"platform_role_assignments": {"trigger_platform_role_scope"},
+	"role_permissions":          {"trigger_role_permissions_scope"},
+	"data_exports":              {"trigger_data_exports_updated_at"},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",
@@ -146,25 +201,62 @@ var requiredTriggers = map[string][]string{
 	},
 }
 
+// requiredRLS lists every table with a tenant_id column. Row-level security
+// must be enabled and forced on each, with the tenant_isolation policy, or a
+// query that forgot its tenant predicate could read another tenant's rows.
+var requiredRLS = []string{
+	"tenant_settings",
+	"memberships",
+	"membership_roles",
+	"roles",
+	"invitations",
+	"sessions",
+	"refresh_tokens",
+	"data_exports",
+	"api_keys",
+	"files",
+	"feature_flag_targets",
+	"notifications",
+	"notification_preferences",
+	"jobs",
+	"audit_events",
+	"webhook_endpoints",
+	"webhook_endpoint_subscriptions",
+	"webhook_endpoint_secrets",
+	"webhook_events",
+	"webhook_deliveries",
+	"webhook_delivery_attempts",
+	"webhook_inbound_sources",
+	"webhook_inbound_events",
+}
+
 // requiredTenantLeadingIndexes are the query indexes that must start with
 // tenant_id. Checking the first key column (not just the index name) catches a
 // legacy global index that kept its name after the tenant rewrite.
 var requiredTenantLeadingIndexes = map[string][]string{
-	"users": {
-		"idx_users_tenant_email_lower_active",
-		"idx_users_tenant_google_id_active",
-		"idx_users_tenant_role_active",
-		"idx_users_tenant_created_at_id",
-		"idx_users_tenant_email_lower_banned",
+	// users, user_passwords, user_identities, and the reset/verification
+	// tokens are global (ADR 0004) and have no tenant_id.
+	// uq_memberships_tenant_user (tenant_id, user_id) is verified as a
+	// required unique index above.
+	"memberships": {
+		"idx_memberships_tenant_created_at_user",
+		"idx_memberships_tenant_suspended",
+	},
+	"roles": {
+		"idx_roles_tenant_created_at_id",
+	},
+	"invitations": {
+		"idx_invitations_tenant_email_pending",
+		"idx_invitations_tenant_created_at_id",
+	},
+	"sessions": {
+		"idx_sessions_tenant_user_created_at",
+	},
+	"data_exports": {
+		"idx_data_exports_tenant_user_created_at_id",
 	},
 	"refresh_tokens": {
-		"idx_refresh_tokens_tenant_user_id",
-	},
-	"password_reset_tokens": {
-		"idx_password_reset_tokens_tenant_user_id",
-	},
-	"email_verification_tokens": {
-		"idx_email_verification_tokens_tenant_user_id",
+		"idx_refresh_tokens_tenant_session_id",
 	},
 	"files": {
 		"idx_files_tenant_user_created",
@@ -261,7 +353,7 @@ func run() error {
 		if hasHistory && version >= 1 && version <= maxSequentialVersion {
 			return fmt.Errorf(
 				"run migrations from legacy version %d: %w; this repository ships only timestamped "+
-					"migrations (the per-owner baseline replaced 000001), so apply the reviewed upgrade DDL manually, "+
+					"migrations (the init replaced 000001), so apply the reviewed upgrade DDL manually, "+
 					"verify the schema, then baseline it as described in README.md section %q",
 				version, err, "Upgrading an existing database",
 			)
@@ -319,6 +411,7 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 		func() ([]string, error) { return checkColumns(ctx, pool, schema, foundTables) },
 		func() ([]string, error) { return checkUniqueIndexes(ctx, pool, schema) },
 		func() ([]string, error) { return checkTenantLeadingIndexes(ctx, pool, schema) },
+		func() ([]string, error) { return checkRLS(ctx, pool, schema) },
 		func() ([]string, error) { return checkTriggers(ctx, pool, schema) },
 		func() ([]string, error) { return checkDefaultTenant(ctx, pool, foundTables) },
 	}
@@ -480,6 +573,55 @@ func checkTenantLeadingIndexes(ctx context.Context, pool *pgxpool.Pool, schema s
 				missing = append(missing, "tenant-leading index "+table+"."+index+
 					" starts with "+firstColumn+", want tenant_id")
 			}
+		}
+	}
+	return missing, nil
+}
+
+// checkRLS reports tenant-owned tables where row-level security is not enabled
+// and forced, or where the tenant_isolation policy is missing. A missing table
+// is already reported by checkTables.
+func checkRLS(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	type state struct {
+		enabled bool
+		forced  bool
+		policy  bool
+	}
+	found := make(map[string]state, len(requiredRLS))
+	err := scanRows(ctx, pool, "verify row-level security", "verify schema: scan row-level security",
+		func(rows pgx.Rows) error {
+			var table string
+			var s state
+			if err := rows.Scan(&table, &s.enabled, &s.forced, &s.policy); err != nil {
+				return err
+			}
+			found[table] = s
+			return nil
+		},
+		`SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+		        EXISTS (SELECT 1 FROM pg_policy p
+		                WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation')
+		 FROM pg_class c
+		 JOIN pg_namespace n ON n.oid = c.relnamespace
+		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
+		schema, requiredRLS,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, table := range requiredRLS {
+		s, ok := found[table]
+		switch {
+		case !ok:
+			continue
+		case !s.enabled:
+			missing = append(missing, "row-level security on "+table)
+		case !s.forced:
+			missing = append(missing, "forced row-level security on "+table)
+		case !s.policy:
+			missing = append(missing, "tenant_isolation policy on "+table)
 		}
 	}
 	return missing, nil
