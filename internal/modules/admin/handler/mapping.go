@@ -3,11 +3,13 @@ package handler
 import (
 	"fmt"
 
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	adminsvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 )
 
-func toUserResponse(user *adminsvc.User) admindto.UserResponse {
+func toUserResponse(user identitycontracts.User) admindto.UserResponse {
 	return admindto.UserResponse{
 		ID:               user.ID,
 		Email:            user.Email,
@@ -24,17 +26,17 @@ func toUserResponse(user *adminsvc.User) admindto.UserResponse {
 	}
 }
 
-func toUserResponses(users []adminsvc.User) []admindto.UserResponse {
+func toUserResponses(users []identitycontracts.User) []admindto.UserResponse {
 	out := make([]admindto.UserResponse, len(users))
 	for i := range users {
-		out[i] = toUserResponse(&users[i])
+		out[i] = toUserResponse(users[i])
 	}
 	return out
 }
 
-// toFileResponse maps a service file to the admin response. A live file
+// toFileResponse maps a files contract file to the admin response. A live file
 // carries its download URL; a soft-deleted one carries deletedAt instead.
-func toFileResponse(file *adminsvc.File) admindto.FileResponse {
+func toFileResponse(file filescontracts.File) admindto.FileResponse {
 	resp := admindto.FileResponse{
 		ID:           file.ID,
 		UserID:       file.UserID,
@@ -50,15 +52,15 @@ func toFileResponse(file *adminsvc.File) admindto.FileResponse {
 	return resp
 }
 
-func toFileResponses(files []adminsvc.File) []admindto.FileResponse {
+func toFileResponses(files []filescontracts.File) []admindto.FileResponse {
 	out := make([]admindto.FileResponse, len(files))
 	for i := range files {
-		out[i] = toFileResponse(&files[i])
+		out[i] = toFileResponse(files[i])
 	}
 	return out
 }
 
-func toStatsResponse(stats *adminsvc.Stats) admindto.AdminStatsResponse {
+func toStatsResponse(stats adminsvc.Stats) admindto.AdminStatsResponse {
 	return admindto.AdminStatsResponse{
 		ActiveUsers:   stats.ActiveUsers,
 		DeletedUsers:  stats.DeletedUsers,

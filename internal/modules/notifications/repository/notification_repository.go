@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 
@@ -158,8 +159,12 @@ func (r *NotificationRepository) UpsertPreference(ctx context.Context, in notifi
 
 func toNotification(row notificationsqlc.Notification) *notificationservice.Notification {
 	data := map[string]any{}
+	// Create only stores validated JSON objects, so a decode failure means the
+	// row was written outside the service.
 	if len(row.Data) > 0 {
-		_ = json.Unmarshal(row.Data, &data)
+		if err := json.Unmarshal(row.Data, &data); err != nil {
+			slog.Error("notification data is not a JSON object", slog.Int64("notification_id", row.ID), slog.Any("error", err))
+		}
 	}
 	n := &notificationservice.Notification{
 		ID:        row.ID,

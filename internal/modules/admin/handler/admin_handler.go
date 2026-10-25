@@ -60,13 +60,13 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	users, hasMore, err := h.service.ListUsers(c.Context(), limit, startingAfter)
+	page, err := h.service.ListUsers(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	resp := toUserResponses(users)
-	return response.List(c, resp, hasMore, pagination.NextCursor(resp, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
+	resp := toUserResponses(page.Items)
+	return response.List(c, resp, page.HasMore, pagination.NextCursor(resp, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
 }
 
 // UpdateRole godoc
@@ -183,13 +183,13 @@ func (h *Handler) ListFiles(c fiber.Ctx) error {
 		return err
 	}
 
-	files, hasMore, err := h.service.ListFiles(c.Context(), limit, startingAfter)
+	page, err := h.service.ListFiles(c.Context(), limit, startingAfter)
 	if err != nil {
 		return err
 	}
 
-	resp := toFileResponses(files)
-	return response.List(c, resp, hasMore, pagination.NextCursor(resp, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
+	resp := toFileResponses(page.Items)
+	return response.List(c, resp, page.HasMore, pagination.NextCursor(resp, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
 // DownloadFile godoc
@@ -211,14 +211,15 @@ func (h *Handler) DownloadFile(c fiber.Ctx) error {
 		return err
 	}
 
-	file, reader, err := h.service.Download(c.Context(), id)
+	download, err := h.service.Download(c.Context(), id)
 	if err != nil {
 		return err
 	}
 
+	file := download.File
 	c.Set("Content-Type", file.MimeType)
 	c.Set("Content-Disposition", httpx.ContentDispositionAttachment(file.OriginalName))
-	return c.SendStream(reader, int(file.Size))
+	return c.SendStream(download.Reader, int(file.Size))
 }
 
 // DeleteFile godoc

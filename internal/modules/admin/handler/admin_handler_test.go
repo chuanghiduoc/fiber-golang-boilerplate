@@ -12,6 +12,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	adminsvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
@@ -22,90 +24,79 @@ import (
 
 // mockAdminService is a manual mock for testing admin handlers.
 type mockAdminService struct {
-	users []adminsvc.User
-	files []adminsvc.File
-	stats *adminsvc.Stats
+	users []identitycontracts.User
+	files []filescontracts.File
+	stats adminsvc.Stats
 }
 
 func newMockAdminService() *mockAdminService {
 	return &mockAdminService{
-		users: []adminsvc.User{
+		users: []identitycontracts.User{
 			{ID: 1, Email: "user1@example.com", Name: "User 1", Role: adminsvc.RoleUser},
 			{ID: 2, Email: "user2@example.com", Name: "User 2", Role: adminsvc.RoleAdmin},
 		},
-		files: []adminsvc.File{
+		files: []filescontracts.File{
 			{ID: 1, OriginalName: "file.txt", MimeType: "text/plain", Size: 1024},
 		},
-		stats: &adminsvc.Stats{
-			ActiveUsers: 10, DeletedUsers: 2, TotalFiles: 5, TotalFileSize: 50000,
-		},
+		stats: adminsvc.Stats{ActiveUsers: 10, DeletedUsers: 2, TotalFiles: 5, TotalFileSize: 50000},
 	}
 }
 
-func (m *mockAdminService) ListUsers(_ context.Context, _ int, _ string) ([]adminsvc.User, bool, error) {
-	return m.users, false, nil
+func (m *mockAdminService) ListUsers(context.Context, int, string) (identitycontracts.UserPage, error) {
+	return identitycontracts.UserPage{Items: m.users}, nil
 }
 
-func (m *mockAdminService) UpdateRole(_ context.Context, id int64, role string) (*adminsvc.User, error) {
+func (m *mockAdminService) UpdateRole(_ context.Context, id int64, role string) (identitycontracts.User, error) {
 	for i, u := range m.users {
 		if u.ID == id {
 			m.users[i].Role = role
-			return &m.users[i], nil
+			return m.users[i], nil
 		}
 	}
-	return nil, apperror.NewNotFound("user not found")
+	return identitycontracts.User{}, apperror.NewNotFound("user not found")
 }
 
 func (m *mockAdminService) BanUser(_ context.Context, id int64) error {
+	_, err := m.UnbanUser(context.Background(), id)
+	return err
+}
+
+func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (identitycontracts.User, error) {
 	for _, u := range m.users {
 		if u.ID == id {
-			return nil
+			return u, nil
 		}
 	}
-	return apperror.NewNotFound("user not found")
+	return identitycontracts.User{}, apperror.NewNotFound("user not found")
 }
 
-func (m *mockAdminService) UnbanUser(_ context.Context, id int64) (*adminsvc.User, error) {
-	for _, u := range m.users {
-		if u.ID == id {
-			return &u, nil
-		}
+func (m *mockAdminService) ListFiles(context.Context, int, string) (filescontracts.FilePage, error) {
+	return filescontracts.FilePage{Items: m.files}, nil
+}
+
+func (m *mockAdminService) Download(_ context.Context, id int64) (filescontracts.FileDownload, error) {
+	file, err := m.RestoreFile(context.Background(), id)
+	if err != nil {
+		return filescontracts.FileDownload{}, apperror.NewNotFound("file not found")
 	}
-	return nil, apperror.NewNotFound("user not found")
-}
-
-func (m *mockAdminService) ListFiles(_ context.Context, _ int, _ string) ([]adminsvc.File, bool, error) {
-	return m.files, false, nil
-}
-
-func (m *mockAdminService) Download(_ context.Context, id int64) (*adminsvc.File, io.ReadCloser, error) {
-	for i := range m.files {
-		if m.files[i].ID == id {
-			return &m.files[i], io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(m.files[i].Size)))), nil
-		}
-	}
-	return nil, nil, apperror.NewNotFound("file not found")
+	return filescontracts.FileDownload{File: file, Reader: io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(file.Size))))}, nil
 }
 
 func (m *mockAdminService) DeleteFile(_ context.Context, id int64) error {
-	for i := range m.files {
-		if m.files[i].ID == id {
-			return nil
-		}
-	}
-	return apperror.NewNotFound("file not found")
+	_, err := m.RestoreFile(context.Background(), id)
+	return err
 }
 
-func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (*adminsvc.File, error) {
-	for i := range m.files {
-		if m.files[i].ID == id {
-			return &m.files[i], nil
+func (m *mockAdminService) RestoreFile(_ context.Context, id int64) (filescontracts.File, error) {
+	for _, f := range m.files {
+		if f.ID == id {
+			return f, nil
 		}
 	}
-	return nil, apperror.NewNotFound("file not found or not deleted")
+	return filescontracts.File{}, apperror.NewNotFound("file not found or not deleted")
 }
 
-func (m *mockAdminService) GetStats(_ context.Context) (*adminsvc.Stats, error) {
+func (m *mockAdminService) GetStats(context.Context) (adminsvc.Stats, error) {
 	return m.stats, nil
 }
 
