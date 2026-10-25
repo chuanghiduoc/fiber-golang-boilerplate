@@ -2,7 +2,6 @@
   "errors.auth.invalid_credentials.title": "Thông tin đăng nhập không hợp lệ",
   "errors.auth.email_not_verified.title": "Email chưa được xác thực",
   "errors.auth.refresh_invalid.title": "Mã làm mới không hợp lệ",
-  "errors.auth.mfa_required.title": "Yêu cầu xác thực đa yếu tố",
   "errors.auth.mfa_challenge_invalid.title": "Thử thách MFA không hợp lệ",
   "errors.auth.mfa_invalid_code.title": "Mã MFA không hợp lệ",
   "errors.auth.mfa_already_enabled.title": "MFA đã được bật",

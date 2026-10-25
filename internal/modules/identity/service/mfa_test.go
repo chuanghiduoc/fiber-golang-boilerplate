@@ -246,7 +246,7 @@ func TestMFAVerifyFailuresCountTowardLockout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginChallenge: %v", err)
 	}
-	for i := range maxLoginAttempts {
+	for i := range maxMFAAttempts {
 		_, err := h.svc.Verify(ctx, challenge, "000000")
 		if statusOf(err) != 401 {
 			t.Fatalf("attempt %d: err = %v, want 401", i+1, err)
@@ -462,5 +462,71 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 	}
 	if h.db.sessions[current.SessionID].RevokedAt != nil {
 		t.Fatal("current session must stay live")
+	}
+}
+
+func TestMFAChallengeVoidedByTokenVersionBump(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	secret, _ := h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+
+	challenge, err := h.svc.BeginChallenge(ctx, 100, AMRPassword)
+	if err != nil {
+		t.Fatalf("BeginChallenge: %v", err)
+	}
+	// A password change or logout-all between the two steps bumps the version.
+	h.db.mu.Lock()
+	h.db.users[100].TokenVersion++
+	h.db.mu.Unlock()
+
+	code, err := totp.Code(secret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.Verify(ctx, challenge, code); err == nil {
+		t.Fatal("Verify after a token version bump succeeded, want refusal")
+	}
+}
+
+func TestMFABeginChallengeRequiresCompareAndDelete(t *testing.T) {
+	h := newMFAHarness(t)
+	svc := NewMFAService(MFADeps{
+		Stores: h.db.stores(), Tx: memTx{h.db}, Cache: plainCache{cache.NewMemoryCache()},
+		Sealer: reversibleSealer{}, Sessions: h.sessions, Now: h.clock.now,
+	})
+	_, err := svc.BeginChallenge(context.Background(), 100, AMRPassword)
+	if errorCode(err) != string(apperror.CodeSystemUnavailable) {
+		t.Fatalf("BeginChallenge err = %v, want system.unavailable", err)
+	}
+}
+
+// plainCache hides CompareAndDelete from a cache.
+type plainCache struct{ cache.Cache }
+
+// A correct password clears the password counters; it must not reset the
+// second-factor budget, or a caller who knows the password could keep
+// guessing TOTP codes by logging in again between guesses.
+func TestMFABudgetSurvivesPasswordSuccess(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	h.enrollAndConfirm(t)
+	h.clock.at = h.clock.at.Add(totp.Period)
+	store := h.svc.(*mfaService).Cache
+
+	challenge, err := h.svc.BeginChallenge(ctx, 100, AMRPassword)
+	if err != nil {
+		t.Fatalf("BeginChallenge: %v", err)
+	}
+	for i := range maxMFAAttempts {
+		if i == maxMFAAttempts/2 {
+			clearLoginAttempts(ctx, store, "mfa@example.com") // what a password login does
+		}
+		if _, err := h.svc.Verify(ctx, challenge, "000000"); statusOf(err) != 401 {
+			t.Fatalf("attempt %d: err = %v, want 401", i+1, err)
+		}
+	}
+	if _, err := h.svc.Verify(ctx, challenge, "000000"); statusOf(err) != 429 {
+		t.Fatalf("attempt after the budget err = %v, want 429", err)
 	}
 }

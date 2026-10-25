@@ -234,7 +234,7 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 }
 
 func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code string) error {
-	matched, err := s.matchCode(ctx, s.Stores, userID, code)
+	matched, err := s.checkCode(ctx, userID, code)
 	if err != nil {
 		return err
 	}
@@ -258,6 +258,7 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 	if err != nil {
 		return err
 	}
+	clearMFAAttempts(ctx, s.Cache, userID)
 	if s.Sessions != nil {
 		s.Sessions.invalidate(ctx, userID)
 	}
@@ -265,7 +266,7 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 }
 
 func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID int64, code string) ([]string, error) {
-	matched, err := s.matchCode(ctx, s.Stores, userID, code)
+	matched, err := s.checkCode(ctx, userID, code)
 	if err != nil {
 		return nil, err
 	}
@@ -291,6 +292,7 @@ func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID int64, 
 	if err != nil {
 		return nil, err
 	}
+	clearMFAAttempts(ctx, s.Cache, userID)
 	return plain, nil
 }
 
@@ -303,6 +305,18 @@ type mfaCode struct {
 }
 
 func (c *mfaCode) auditMethod() string { return c.method }
+
+// checkCode counts one second-factor guess against the per-user MFA budget,
+// then matches code. Callers clear the budget after the code is claimed.
+func (s *mfaService) checkCode(ctx context.Context, userID int64, code string) (*mfaCode, error) {
+	if s.Cache == nil {
+		return nil, loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
+	}
+	if err := reserveMFAAttempt(ctx, s.Cache, userID); err != nil {
+		return nil, err
+	}
+	return s.matchCode(ctx, s.Stores, userID, code)
+}
 
 // matchCode checks code against the confirmed factor. A non-matching TOTP
 // value is treated as a recovery code; claimCode decides whether it exists.
@@ -351,23 +365,33 @@ func (s *mfaService) consumeCode(ctx context.Context, st Stores, userID int64, m
 }
 
 // mfaChallenge is the sealed two-step login payload. It carries only data the
-// server re-validates: the user, the tenant, the first-factor methods, and an
-// expiry. The nonce keys the cache entry that makes it single use.
+// server re-validates: the user, the tenant, the token version the first
+// factor saw (a password change or logout-all voids the challenge), the
+// first-factor methods, and an expiry. The nonce keys the cache entry that
+// makes it single use.
 type mfaChallenge struct {
-	Version   int      `json:"v"`
-	UserID    int64    `json:"uid"`
-	TenantID  int64    `json:"tid"`
-	AMR       []string `json:"amr"`
-	ExpiresAt int64    `json:"exp"`
-	Nonce     string   `json:"nonce"`
+	Version      int      `json:"v"`
+	UserID       int64    `json:"uid"`
+	TenantID     int64    `json:"tid"`
+	TokenVersion int32    `json:"tv"`
+	AMR          []string `json:"amr"`
+	ExpiresAt    int64    `json:"exp"`
+	Nonce        string   `json:"nonce"`
 }
 
 func (s *mfaService) BeginChallenge(ctx context.Context, userID int64, method string) (string, error) {
 	if method != AMRPassword && method != AMRGoogle {
 		return "", apperror.NewInternal("unsupported MFA first factor")
 	}
-	if s.Cache == nil || s.Sealer == nil {
+	if _, ok := s.Cache.(cache.CompareDeleter); !ok || s.Sealer == nil {
 		return "", loginLockoutUnavailable(errors.New("MFA challenge store is not configured"))
+	}
+	user, err := s.Stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return "", accountNotActive()
+		}
+		return "", apperror.NewInternal("failed to load user")
 	}
 	nonce, err := newNonce()
 	if err != nil {
@@ -375,12 +399,13 @@ func (s *mfaService) BeginChallenge(ctx context.Context, userID int64, method st
 	}
 	tenantID := tenant.EffectiveID(ctx)
 	payload, err := json.Marshal(mfaChallenge{
-		Version:   mfaChallengeVersion,
-		UserID:    userID,
-		TenantID:  tenantID,
-		AMR:       []string{method},
-		ExpiresAt: s.now().Add(mfaChallengeTTL).Unix(),
-		Nonce:     nonce,
+		Version:      mfaChallengeVersion,
+		UserID:       userID,
+		TenantID:     tenantID,
+		TokenVersion: user.TokenVersion,
+		AMR:          []string{method},
+		ExpiresAt:    s.now().Add(mfaChallengeTTL).Unix(),
+		Nonce:        nonce,
 	})
 	if err != nil {
 		return "", apperror.NewInternal("failed to encode MFA challenge")
@@ -418,10 +443,7 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		}
 		return nil, apperror.NewInternal("failed to load user")
 	}
-	if err := reserveLoginAttempt(ctx, s.Cache, user.Email); err != nil {
-		return nil, err
-	}
-	matched, err := s.matchCode(ctx, s.Stores, user.ID, code)
+	matched, err := s.checkCode(ctx, user.ID, code)
 	if err != nil {
 		return nil, err
 	}
@@ -434,10 +456,11 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		if err := s.consumeCode(ctx, tx.Stores, user.ID, matched); err != nil {
 			return err
 		}
-		if !s.consumeChallenge(ctx, payload) {
-			return mfaChallengeInvalid()
+		if err := s.consumeChallenge(ctx, payload); err != nil {
+			return err
 		}
-		tokens, err := s.Sessions.issueTx(ctx, tx.Stores, user.ID, user.TokenVersion, amr)
+		// The session insert requires the token version the first factor saw.
+		tokens, err := s.Sessions.issueTx(ctx, tx.Stores, user.ID, payload.TokenVersion, amr)
 		if err != nil {
 			return err
 		}
@@ -462,6 +485,7 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 	if err != nil {
 		return nil, err
 	}
+	clearMFAAttempts(ctx, s.Cache, user.ID)
 	clearLoginAttempts(ctx, s.Cache, user.Email)
 	return result, nil
 }
@@ -488,14 +512,21 @@ func (s *mfaService) openChallenge(challenge string) (*mfaChallenge, error) {
 
 // consumeChallenge deletes the cache entry only when its value still is this
 // challenge's nonce. Two concurrent verifications of one challenge: exactly
-// one CompareAndDelete succeeds.
-func (s *mfaService) consumeChallenge(ctx context.Context, payload *mfaChallenge) bool {
+// one CompareAndDelete succeeds. BeginChallenge guarantees the cache supports
+// it; a cache failure is 503, not an invalid challenge.
+func (s *mfaService) consumeChallenge(ctx context.Context, payload *mfaChallenge) error {
 	cd, ok := s.Cache.(cache.CompareDeleter)
 	if !ok {
-		return false
+		return loginLockoutUnavailable(errors.New("MFA challenge store cannot compare-and-delete"))
 	}
 	consumed, err := cd.CompareAndDelete(ctx, mfaChallengeKey(payload.TenantID, payload.Nonce), []byte(payload.Nonce))
-	return err == nil && consumed
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if !consumed {
+		return mfaChallengeInvalid()
+	}
+	return nil
 }
 
 func mfaChallengeKey(tenantID int64, nonce string) string {

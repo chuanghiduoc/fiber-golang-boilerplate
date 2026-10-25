@@ -51,12 +51,15 @@ func Code(secret string, t time.Time) (string, error) {
 
 // CodeAt returns the code for one step.
 func CodeAt(secret string, step int64) (string, error) {
+	if step < 0 {
+		return "", fmt.Errorf("totp: negative step %d", step)
+	}
 	key, err := decodeSecret(secret)
 	if err != nil {
 		return "", err
 	}
 	var counter [8]byte
-	binary.BigEndian.PutUint64(counter[:], uint64(step)) //nolint:gosec // step is a non-negative RFC 6238 counter
+	binary.BigEndian.PutUint64(counter[:], uint64(step))
 	mac := hmac.New(sha1.New, key)
 	mac.Write(counter[:])
 	sum := mac.Sum(nil)

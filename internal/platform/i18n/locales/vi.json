@@ -18,6 +18,7 @@
   "errors.bad_gateway.title": "Cổng kết nối lỗi",
   "errors.user.last_admin.title": "Không thể xóa quản trị viên cuối cùng",
   "errors.permission.denied.title": "Không có quyền",
+  "errors.auth.mfa_required.title": "Yêu cầu xác thực đa yếu tố",
   "errors.feature.disabled.title": "Tính năng đã bị tắt",
   "errors.rate_limit.exceeded.title": "Đã vượt quá giới hạn yêu cầu",
   "errors.system.internal.title": "Lỗi máy chủ nội bộ",

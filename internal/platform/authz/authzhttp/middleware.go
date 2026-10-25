@@ -85,10 +85,6 @@ func RequireAny(permissions ...authz.Permission) fiber.Handler {
 	}
 }
 
-// mfaRequiredCode is registered by the identity module; referring to it by
-// value keeps this platform package free of a module import.
-const mfaRequiredCode apperror.Code = "auth.mfa_required"
-
 // RequireMFA returns middleware that allows the request only when the
 // authenticated subject's access token carries an MFA method (otp or rc). It
 // must run after authentication. API-key subjects have no amr and are denied.
@@ -96,7 +92,7 @@ func RequireMFA() fiber.Handler {
 	return func(c fiber.Ctx) error {
 		subject, ok := requestSubject(c)
 		if !ok || !subject.HasMFA() {
-			return apperror.NewCode(mfaRequiredCode, "multi-factor authentication is required")
+			return apperror.NewCode(apperror.CodeMFARequired, "multi-factor authentication is required")
 		}
 		return c.Next()
 	}

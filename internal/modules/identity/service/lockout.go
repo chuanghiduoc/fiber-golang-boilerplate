@@ -21,7 +21,37 @@ const (
 	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
 	lockoutDuration          = 15 * time.Minute
 	loginAttemptPrefix       = "login_attempts:"
+
+	// maxMFAAttempts bounds second-factor guesses per user across every
+	// source. It is separate from the password counters because a correct
+	// password clears those: sharing them would let a caller who knows the
+	// password reset the TOTP guessing budget at will.
+	maxMFAAttempts   = 5
+	mfaAttemptPrefix = "mfa_attempts:"
 )
+
+// reserveMFAAttempt counts one second-factor attempt for userID and rejects
+// it once the budget is spent. Only a successful verification clears it.
+func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if attempts > maxMFAAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
+}
+
+func clearMFAAttempts(ctx context.Context, store cache.Cache, userID int64) {
+	if err := store.Delete(ctx, mfaAttemptKey(userID)); err != nil {
+		slog.Warn("cache error clearing MFA attempts", slog.Any("error", err))
+	}
+}
+
+func mfaAttemptKey(userID int64) string {
+	return fmt.Sprintf("%s%d", mfaAttemptPrefix, userID)
+}
 
 // loginAttemptKeys returns the per-source key (email, client IP) and the
 // global per-account key (email) for one password attempt. The email is

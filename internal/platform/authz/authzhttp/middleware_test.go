@@ -217,3 +217,41 @@ func TestRequire_UsesExplicitSubjectScopes(t *testing.T) {
 	status, contentType, body := doGet(t, app, "/admin", "")
 	assertForbidden(t, status, contentType, body)
 }
+
+func TestRequireMFA(t *testing.T) {
+	cases := map[string]struct {
+		amr  []string
+		want int
+	}{
+		"password only": {amr: []string{"pwd"}, want: fiber.StatusForbidden},
+		"no amr":        {want: fiber.StatusForbidden},
+		"totp":          {amr: []string{"pwd", "otp"}, want: fiber.StatusOK},
+		"recovery code": {amr: []string{"google", "rc"}, want: fiber.StatusOK},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+			app.Use(func(c fiber.Ctx) error {
+				SetSubject(c, authz.NewSubject(1, 1, authz.RoleUser).WithAMR(tc.amr))
+				return c.Next()
+			})
+			app.Get("/secure", RequireMFA(), func(c fiber.Ctx) error { return c.SendString("ok") })
+
+			status, _, body := doGet(t, app, "/secure", "")
+			if status != tc.want {
+				t.Fatalf("status = %d, want %d (body=%s)", status, tc.want, body)
+			}
+			if tc.want == fiber.StatusForbidden && !json.Valid(body) {
+				t.Fatalf("body = %s, want a problem document", body)
+			}
+		})
+	}
+}
+
+func TestRequireMFADeniesAnonymous(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	app.Get("/secure", RequireMFA(), func(c fiber.Ctx) error { return c.SendString("ok") })
+	if status, _, body := doGet(t, app, "/secure", ""); status != fiber.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", status, body)
+	}
+}

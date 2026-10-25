@@ -12,8 +12,6 @@ const (
 	CodeAuthInvalidCredentials apperror.Code = "auth.invalid_credentials"
 	CodeAuthEmailNotVerified   apperror.Code = "auth.email_not_verified"
 	CodeAuthRefreshInvalid     apperror.Code = "auth.refresh_invalid"
-	// CodeAuthMFARequired: the access token lacks an otp/rc amr entry.
-	CodeAuthMFARequired apperror.Code = "auth.mfa_required"
 	// CodeAuthMFAChallengeInvalid: the challenge expired, was already used,
 	// or belongs to another tenant.
 	CodeAuthMFAChallengeInvalid apperror.Code = "auth.mfa_challenge_invalid"
@@ -51,11 +49,6 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid refresh token",
 			DocPath: "/errors/auth-refresh-invalid",
-		},
-		CodeAuthMFARequired: {
-			Status:  http.StatusForbidden,
-			Title:   "Multi-factor authentication required",
-			DocPath: "/errors/auth-mfa-required",
 		},
 		CodeAuthMFAChallengeInvalid: {
 			Status:  http.StatusUnauthorized,

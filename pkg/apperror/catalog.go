@@ -25,7 +25,10 @@ const (
 	// identity catalog together with that repository change.
 	CodeUserLastAdmin Code = "user.last_admin"
 
-	CodePermissionDenied  Code = "permission.denied"
+	CodePermissionDenied Code = "permission.denied"
+	// CodeMFARequired is enforced by the platform RequireMFA guard: the access
+	// token lacks an otp/rc amr entry.
+	CodeMFARequired       Code = "auth.mfa_required"
 	CodeFeatureDisabled   Code = "feature.disabled"
 	CodeRateLimitExceeded Code = "rate_limit.exceeded"
 
@@ -86,6 +89,11 @@ var platformSpecs = map[Code]Spec{
 		Status:  http.StatusForbidden,
 		Title:   "Permission denied",
 		DocPath: "/errors/permission-denied",
+	},
+	CodeMFARequired: {
+		Status:  http.StatusForbidden,
+		Title:   "Multi-factor authentication required",
+		DocPath: "/errors/auth-mfa-required",
 	},
 	// A disabled feature behaves like an absent route (404), matching the
 	// existing "Google OAuth not configured" response; the stable code still
