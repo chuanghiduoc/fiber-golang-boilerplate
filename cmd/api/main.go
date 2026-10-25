@@ -43,7 +43,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/drivers"
 
 	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
 )
@@ -121,7 +121,7 @@ type runtime struct {
 type background struct {
 	schedulerCancel context.CancelFunc // nil unless SCHEDULER_ENABLED
 	schedulerDone   <-chan struct{}
-	workerCancel    context.CancelFunc
+	workerCancel    context.CancelFunc // nil for APP_ROLE=api
 	workerDone      <-chan struct{}
 }
 
@@ -236,10 +236,12 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 		)
 	}
 
-	// Email job payloads are encrypted at rest with a key derived from
-	// JWT_SECRET. Rotating that secret invalidates already-queued encrypted
-	// jobs, so drain the queue before rotating it.
-	rt.payloadCodec, err = jobs.NewPayloadCodec(cfg.JWT.Secret)
+	// Email and password-reset job payloads are encrypted at rest with
+	// DATA_ENCRYPTION_KEY (JWT_SECRET is the local-only fallback). Envelopes
+	// record their key id, so a rotation keeps the old key in
+	// DATA_ENCRYPTION_PREVIOUS_KEYS until queued jobs sealed with it drain.
+	rt.payloadCodec, err = jobs.NewPayloadCodec(
+		cfg.DataEncryption.ResolvedKey(cfg.JWT.Secret), cfg.DataEncryption.PreviousKeyList()...)
 	if err != nil {
 		return startupFailed("failed to initialize job payload encryption", err)
 	}
@@ -249,7 +251,7 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 		return err
 	}
 
-	store, err := storage.NewStorage(cfg.Storage)
+	store, err := drivers.New(cfg.Storage)
 	if err != nil {
 		return startupFailed("failed to initialize storage", err)
 	}
@@ -281,18 +283,19 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	jobQueue := rt.buildDurableWork(pool)
 
 	rt.infra = app.Infra{
-		Config: cfg,
-		Pool:   pool,
+		Platform: app.NewPlatformConfig(cfg),
+		Pool:     pool,
 		// Transaction manager and the process-wide audit recorder. Tier 1
 		// services write through the transaction; Tier 2 routes use it for
 		// intent rows.
-		Tx:      database.NewTxManager(pool),
-		Cache:   appCache,
-		Audit:   audit.NewPostgresRecorder(pool),
-		Queue:   jobQueue,
-		Email:   jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(rt.payloadCodec)),
-		Storage: store,
-		Flags:   flagEvaluator,
+		Tx:           database.NewTxManager(pool),
+		Cache:        appCache,
+		Audit:        audit.NewPostgresRecorder(pool),
+		Queue:        jobQueue,
+		PayloadCodec: rt.payloadCodec,
+		Email:        jobs.NewQueuedSender(jobQueue, jobs.WithPayloadCodec(rt.payloadCodec)),
+		Storage:      store,
+		Flags:        flagEvaluator,
 	}
 	return nil
 }
@@ -319,17 +322,24 @@ func (rt *runtime) connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
 
 // buildDurableWork creates the job queue, the worker, the event bus, and the
 // optional schedule registry. The queue is shared by email, events, and the
-// scheduler; one worker processes every registered kind.
+// scheduler. Every role registers job handlers on the worker, but only a role
+// that runs it (worker, all) claims jobs, limited to JOBS_WORKER_KINDS minus
+// JOBS_WORKER_EXCLUDE_KINDS when set. The schedule registry exists only where
+// the scheduler can run.
 func (rt *runtime) buildDurableWork(pool *pgxpool.Pool) *jobs.Queue {
 	jobQueue := jobs.NewQueue(pool)
 	rt.instanceID = newInstanceID()
-	workerOpts := []jobs.Option{jobs.WithConcurrency(workerConcurrency)}
+	workerOpts := []jobs.Option{
+		jobs.WithConcurrency(workerConcurrency),
+		jobs.WithKinds(rt.cfg.Jobs.WorkerKindList()...),
+		jobs.WithExcludeKinds(rt.cfg.Jobs.WorkerExcludeKindList()...),
+	}
 	if rt.trace.Enabled() {
 		workerOpts = append(workerOpts, jobs.WithTracerProvider(rt.trace.TracerProvider()))
 	}
 	rt.worker = jobs.NewWorker(pool, rt.instanceID, workerOpts...)
 	rt.events = events.New(jobQueue)
-	if rt.cfg.Scheduler.Enabled {
+	if rt.cfg.Scheduler.Enabled && rt.cfg.App.RunsWorker() {
 		rt.schedules = scheduler.NewRegistry()
 	}
 	return jobQueue
@@ -350,7 +360,7 @@ func (rt *runtime) buildModules(ctx context.Context) error {
 	// internal/bootstrap holds the single ordered module list and the
 	// contract cross-wiring; each module builds its own repositories,
 	// services, and handlers from this shared infrastructure.
-	modules, err := bootstrap.Build(rt.infra)
+	modules, err := bootstrap.Build(rt.cfg, rt.infra)
 	if err != nil {
 		return startupFailed("failed to build modules", err)
 	}
@@ -407,8 +417,13 @@ func (rt *runtime) composeApplication() {
 	// Module providers register routes, event subscriptions, job handlers
 	// (for example webhook delivery/dispatch), and schedules. The bus turns
 	// durable subscriptions into worker handlers once every module has
-	// registered.
-	rt.app.Register(rt.modules.List...)
+	// registered. APP_ROLE=worker mounts no /api route: the listener serves
+	// only health and metrics (readiness checks the database and cache).
+	if rt.cfg.App.ServesAPI() {
+		rt.app.Register(rt.modules.List...)
+	} else {
+		rt.app.RegisterBackground(rt.modules.List...)
+	}
 
 	// Durable email worker. email.send is a platform outbox kind: identity
 	// and notifications both enqueue it through jobs.QueuedSender and the
@@ -424,9 +439,16 @@ func (rt *runtime) composeApplication() {
 
 // startBackground starts the optional scheduler, the job worker, and module
 // background loops (webhook retention), which share the worker lifecycle.
+//
+// APP_ROLE=api starts none of them: jobs it enqueues are processed by worker
+// (or all) replicas.
 func (rt *runtime) startBackground() (background, error) {
 	var bg background
-	if rt.cfg.Scheduler.Enabled {
+	if !rt.cfg.App.RunsWorker() {
+		slog.Info("APP_ROLE=api: job worker, scheduler, and background loops are not started")
+		return bg, nil
+	}
+	if rt.schedules != nil {
 		cancel, done, err := rt.startScheduler()
 		if err != nil {
 			return background{}, err
@@ -485,7 +507,8 @@ func (rt *runtime) serve() int {
 	serverErr := make(chan error, 1)
 	go func() {
 		addr := fmt.Sprintf(":%d", rt.cfg.App.Port)
-		slog.Info("server starting", slog.String("addr", addr), slog.String("env", rt.cfg.App.Env))
+		slog.Info("server starting", slog.String("addr", addr), slog.String("env", rt.cfg.App.Env),
+			slog.String("role", rt.cfg.App.EffectiveRole()))
 		serverErr <- rt.app.Listen(addr)
 	}()
 
@@ -538,8 +561,10 @@ func (rt *runtime) drain(ctx context.Context, bg background) bool {
 		bg.schedulerCancel()
 		waitForShutdown(ctx, bg.schedulerDone, "scheduler")
 	}
-	bg.workerCancel()
-	waitForShutdown(ctx, bg.workerDone, "job worker")
+	if bg.workerCancel != nil {
+		bg.workerCancel()
+		waitForShutdown(ctx, bg.workerDone, "job worker")
+	}
 
 	clean := true
 	if err := <-httpDone; err != nil {

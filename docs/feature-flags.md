@@ -61,7 +61,7 @@ lets clients distinguish it from a mistyped URL. `403` was rejected because it
 implies a permission problem the caller could fix by changing role.
 
 Platform helpers: `features.Require(ctx, evaluator, key, subject)` returns the
-typed error, and `features.Middleware(evaluator, key)` gates a route using the
+typed error, and `featureshttp.Middleware(evaluator, key)` gates a route using the
 request tenant and `user_id` local. A nil evaluator uses compiled defaults
 only, so an unwired gate fails closed for default-off flags.
 
@@ -119,7 +119,7 @@ last good snapshot is older than the max staleness), evaluation skips the
 database layers entirely.
 
 A target can be `true` or `false`; both override lower levels. Tenant/user
-lookups use the request tenant resolved by `tenant.Middleware` (and the JWT
+lookups use the request tenant resolved by `tenanthttp.Middleware` (and the JWT
 claim for authenticated routes). A user target is keyed by both tenant and
 user, so the same user ID in another tenant does not inherit it.
 
@@ -201,7 +201,7 @@ flowchart TD
 All routes require a JWT and are mounted under `/api/v1/admin/features`.
 `admin:features:read` guards reads; `admin:features:write` guards mutations.
 Mutating routes accept `Idempotency-Key` through the normal middleware and then
-run behind a required `audit.Guard` (fail-closed: an unavailable audit store
+run behind a required `audithttp.Guard` (fail-closed: an unavailable audit store
 returns `503 system.audit_unavailable` before the write).
 
 | Method | Path | Description |

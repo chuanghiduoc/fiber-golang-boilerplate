@@ -191,7 +191,7 @@ func (b *Bundle) Translate(locale, key string, params map[string]any) string {
 	return key
 }
 
-// Localize implements apperror.Localizer. It resolves the request locale from
+// Localize implements apperrorhttp.Localizer. It resolves the request locale from
 // Fiber locals and returns "" when the key is absent so callers can keep their
 // existing English text as a fallback.
 func (b *Bundle) Localize(c fiber.Ctx, key string, params map[string]any) string {

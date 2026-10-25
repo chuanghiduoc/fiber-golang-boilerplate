@@ -15,25 +15,27 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 // emailChangeApp mounts the user routes behind a stub authenticator for an
-// admin caller (id 9). viaAPIKey mirrors what apikey.Authenticate installs.
+// admin caller (id 9). viaAPIKey mirrors what apikeyhttp.Authenticate installs.
 func emailChangeApp(svc *mockUserService, viaAPIKey bool) *fiber.App {
 	userHandler := NewUserHandler(svc)
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	users := app.Group("/users", func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "user_id", 9)
 		fiber.Locals[string](c, "role", authz.RoleAdmin)
 		if viaAPIKey {
 			fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodAPIKey)
-			authz.SetSubject(c, authz.NewSubjectWithPermissions(9, 1, authz.RoleAdmin,
+			authzhttp.SetSubject(c, authz.NewSubjectWithPermissions(9, 1, authz.RoleAdmin,
 				identitycatalog.PermissionProfileWrite, authz.PermissionAdminUsersWrite).
 				WithAttribute(authz.AttributeAuthMethod, apikey.AuthMethodAPIKey))
 		} else {
 			fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
-			authz.SetSubject(c, authz.NewSubject(9, 1, authz.RoleAdmin))
+			authzhttp.SetSubject(c, authz.NewSubject(9, 1, authz.RoleAdmin))
 		}
 		return c.Next()
 	})

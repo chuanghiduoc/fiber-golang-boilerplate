@@ -11,6 +11,9 @@ services:
     environment:
       APP_PORT: ${APP_PORT:-8080}
       APP_ENV: ${APP_ENV:-local}
+      # One container runs the API, job worker, and scheduler. Split into
+      # api/worker services with APP_ROLE=api and APP_ROLE=worker if needed.
+      APP_ROLE: ${APP_ROLE:-all}
       APP_BODY_LIMIT: ${APP_BODY_LIMIT:-12582912}
       APP_REQUEST_TIMEOUT: ${APP_REQUEST_TIMEOUT:-12}
       APP_FRONTEND_URL: ${APP_FRONTEND_URL:-http://localhost:3000}
@@ -47,6 +50,8 @@ services:
       DB_SSLMODE: ${DB_SSLMODE:-disable}
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
       JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-24}
+      # Empty falls back to JWT_SECRET locally; production requires its own key.
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:-}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
       STORAGE_LOCAL_PATH: ${STORAGE_LOCAL_PATH:-./uploads}
       STORAGE_MAX_FILE_SIZE: ${STORAGE_MAX_FILE_SIZE:-10485760}

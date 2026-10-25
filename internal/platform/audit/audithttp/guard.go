@@ -1,9 +1,10 @@
-package audit
+// Package audithttp is the Fiber adapter for internal/platform/audit: the
+// route-level Guard (Tier 2 intent rows) and the fallback Middleware. Services
+// record through package audit and never import this package.
+package audithttp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
@@ -88,9 +91,9 @@ func (p Policy) target(c fiber.Ctx) guardTarget {
 // [CompletionRecorder]. Noop deliberately implements neither, so a
 // misconfigured required route returns 503 instead of accepting an unaudited
 // mutation.
-func Guard(recorder Recorder, policy Policy) fiber.Handler {
+func Guard(recorder audit.Recorder, policy Policy) fiber.Handler {
 	if recorder == nil {
-		recorder = Noop{}
+		recorder = audit.Noop{}
 	}
 	mode := policy.effectiveMode()
 
@@ -109,7 +112,7 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 		}
 
 		info := requestInfoFor(c, eventID, target.action, target.resource)
-		c.SetContext(WithRequestInfo(c.Context(), info))
+		c.SetContext(audit.WithRequestInfo(c.Context(), info))
 		fiber.Locals[int64](c, "audit_event_id", eventID)
 		fiber.Locals[bool](c, auditGuardedLocal, true)
 
@@ -124,8 +127,8 @@ func Guard(recorder Recorder, policy Policy) fiber.Handler {
 // beginIntent stores the started intent row and returns its id. When the row
 // cannot be stored it returns system.audit_unavailable in required mode and a
 // zero id with no error in best-effort mode.
-func beginIntent(c fiber.Ctx, recorder Recorder, mode Mode, target guardTarget) (int64, error) {
-	idRecorder, ok := recorder.(IDRecorder)
+func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTarget) (int64, error) {
+	idRecorder, ok := recorder.(audit.IDRecorder)
 	if !ok {
 		metrics.AuditIntentFailuresTotal.Inc()
 		slog.Error("audit guard recorder cannot write intent rows",
@@ -137,7 +140,7 @@ func beginIntent(c fiber.Ctx, recorder Recorder, mode Mode, target guardTarget) 
 	}
 
 	intent := intentEvent(c, target)
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), WriteTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
 	id, err := idRecorder.RecordID(ctx, intent)
 	if err != nil {
@@ -159,39 +162,39 @@ func intentUnavailable(mode Mode) error {
 	return nil
 }
 
-func intentEvent(c fiber.Ctx, target guardTarget) Event {
+func intentEvent(c fiber.Ctx, target guardTarget) audit.Event {
 	info := requestInfoFor(c, 0, target.action, target.resource)
-	intent := Event{
+	intent := audit.Event{
 		TenantID:  info.TenantID,
 		ActorID:   info.ActorID,
 		ActorType: info.ActorType,
 		ActorRole: info.ActorRole,
 		Action:    target.action,
 		Resource:  target.resource,
-		// Like audit.Middleware, fall back to :key so a denied feature-flag
+		// Like Middleware, fall back to :key so a denied feature-flag
 		// attempt still records its target.
 		ResourceID:         routeResourceID(c),
 		Metadata:           map[string]any{"method": c.Method(), "route": target.routePath},
 		IP:                 info.IP,
 		UserAgent:          info.UserAgent,
 		RequestID:          info.RequestID,
-		Source:             SourceHTTP,
-		Outcome:            OutcomeStarted,
+		Source:             audit.SourceHTTP,
+		Outcome:            audit.OutcomeStarted,
 		IdempotencyKeyHash: info.IdempotencyKeyHash,
 	}
 	if intent.ActorType == "" {
-		intent.ActorType = ActorTypeAnonymous
+		intent.ActorType = audit.ActorTypeAnonymous
 	}
 	return intent
 }
 
 // runAndCompleteIntent runs the handler and completes the intent row with the
 // observed outcome, including a panic, which is recorded and re-raised.
-func runAndCompleteIntent(c fiber.Ctx, recorder Recorder, policy Policy, eventID int64, info *RequestInfo) error {
+func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, eventID int64, info *audit.RequestInfo) error {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			completeGuarded(c, recorder, eventID, Completion{
-				Outcome:    OutcomeFailed,
+			completeGuarded(c, recorder, eventID, audit.Completion{
+				Outcome:    audit.OutcomeFailed,
 				StatusCode: fiber.StatusInternalServerError,
 				ErrorCode:  "panic",
 			})
@@ -201,9 +204,9 @@ func runAndCompleteIntent(c fiber.Ctx, recorder Recorder, policy Policy, eventID
 
 	handlerErr := c.Next()
 	completion := classifyOutcome(c, handlerErr, info)
-	if policy.RequireDomain && completion.Outcome == OutcomeSucceeded && info.DomainEvents == 0 {
+	if policy.RequireDomain && completion.Outcome == audit.OutcomeSucceeded && info.DomainEvents == 0 {
 		metrics.AuditDomainMissingTotal.Inc()
-		completion.Outcome = OutcomeUnknown
+		completion.Outcome = audit.OutcomeUnknown
 		completion.ErrorCode = "audit.domain_missing"
 		slog.Warn("guarded mutation completed without a domain audit event",
 			slog.String("action", info.Action),
@@ -214,8 +217,8 @@ func runAndCompleteIntent(c fiber.Ctx, recorder Recorder, policy Policy, eventID
 	return handlerErr
 }
 
-func completeGuarded(c fiber.Ctx, recorder Recorder, eventID int64, completion Completion) {
-	completer, ok := recorder.(CompletionRecorder)
+func completeGuarded(c fiber.Ctx, recorder audit.Recorder, eventID int64, completion audit.Completion) {
+	completer, ok := recorder.(audit.CompletionRecorder)
 	if !ok {
 		metrics.AuditCompletionFailuresTotal.Inc()
 		slog.Error("audit guard recorder cannot complete intent rows",
@@ -227,11 +230,11 @@ func completeGuarded(c fiber.Ctx, recorder Recorder, eventID int64, completion C
 	completion.ActorID = fiber.Locals[int64](c, "user_id")
 	role := fiber.Locals[string](c, "role")
 	completion.ActorRole = role
-	completion.ActorType = ActorTypeForRole(role)
+	completion.ActorType = audit.ActorTypeForRole(role)
 	if completion.ActorID == 0 {
-		completion.ActorType = ActorTypeAnonymous
+		completion.ActorType = audit.ActorTypeAnonymous
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), WriteTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
 	if err := completer.Complete(ctx, eventID, completion); err != nil {
 		metrics.AuditCompletionFailuresTotal.Inc()
@@ -243,20 +246,20 @@ func completeGuarded(c fiber.Ctx, recorder Recorder, eventID int64, completion C
 	}
 }
 
-func classifyOutcome(c fiber.Ctx, handlerErr error, info *RequestInfo) Completion {
-	completion := Completion{Outcome: OutcomeSucceeded, StatusCode: c.Response().StatusCode()}
+func classifyOutcome(c fiber.Ctx, handlerErr error, info *audit.RequestInfo) audit.Completion {
+	completion := audit.Completion{Outcome: audit.OutcomeSucceeded, StatusCode: c.Response().StatusCode()}
 	if completion.StatusCode == 0 {
 		completion.StatusCode = fiber.StatusOK
 	}
 	if handlerErr == nil {
 		switch {
 		case completion.StatusCode >= fiber.StatusOK && completion.StatusCode < fiber.StatusMultipleChoices:
-			completion.Outcome = OutcomeSucceeded
+			completion.Outcome = audit.OutcomeSucceeded
 		case completion.StatusCode == fiber.StatusUnauthorized || completion.StatusCode == fiber.StatusForbidden:
-			completion.Outcome = OutcomeDenied
+			completion.Outcome = audit.OutcomeDenied
 			completion.ErrorCode = statusErrorCode(completion.StatusCode)
 		default:
-			completion.Outcome = OutcomeFailed
+			completion.Outcome = audit.OutcomeFailed
 			completion.ErrorCode = statusErrorCode(completion.StatusCode)
 		}
 		return completion
@@ -276,9 +279,9 @@ func classifyOutcome(c fiber.Ctx, handlerErr error, info *RequestInfo) Completio
 		completion.ErrorCode = statusErrorCode(completion.StatusCode)
 	}
 	if completion.StatusCode == fiber.StatusUnauthorized || completion.StatusCode == fiber.StatusForbidden {
-		completion.Outcome = OutcomeDenied
+		completion.Outcome = audit.OutcomeDenied
 	} else {
-		completion.Outcome = OutcomeFailed
+		completion.Outcome = audit.OutcomeFailed
 	}
 	return completion
 }
@@ -294,27 +297,27 @@ func statusErrorCode(status int) string {
 	return strings.ToLower(strings.ReplaceAll(title, " ", "_"))
 }
 
-func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *RequestInfo {
+func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *audit.RequestInfo {
 	// IP and User-Agent are cloned: Fiber strings are zero-copy views into
 	// pooled buffers, while RequestInfo lives in the context beyond the handler.
-	info := &RequestInfo{
+	info := &audit.RequestInfo{
 		EventID:            eventID,
-		TenantID:           tenant.ID(c),
+		TenantID:           tenanthttp.ID(c),
 		Action:             action,
 		Resource:           resource,
 		RequestID:          fiber.Locals[string](c, "request_id"),
 		IP:                 strings.Clone(c.IP()),
 		UserAgent:          strings.Clone(c.Get("User-Agent")),
-		IdempotencyKeyHash: HashIdempotencyKey(c.Get("Idempotency-Key")),
+		IdempotencyKeyHash: audit.HashIdempotencyKey(c.Get("Idempotency-Key")),
 	}
 	if info.TenantID == 0 {
 		info.TenantID = tenant.EffectiveID(c.Context())
 	}
-	if existing := RequestInfoFromContext(c.Context()); existing != nil {
+	if existing := audit.RequestInfoFromContext(c.Context()); existing != nil {
 		if existing.ActorID != 0 {
 			info.ActorID = existing.ActorID
 		}
-		if existing.ActorType != "" && existing.ActorType != ActorTypeUnknown {
+		if existing.ActorType != "" && existing.ActorType != audit.ActorTypeUnknown {
 			info.ActorType = existing.ActorType
 		}
 		if existing.ActorRole != "" {
@@ -327,25 +330,15 @@ func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *Reques
 	if info.ActorRole == "" {
 		info.ActorRole = fiber.Locals[string](c, "role")
 	}
-	if info.ActorType == "" || info.ActorType == ActorTypeUnknown {
+	if info.ActorType == "" || info.ActorType == audit.ActorTypeUnknown {
 		if info.ActorID != 0 {
-			info.ActorType = ActorTypeForRole(info.ActorRole)
-			if info.ActorType == ActorTypeUnknown {
-				info.ActorType = ActorTypeUser
+			info.ActorType = audit.ActorTypeForRole(info.ActorRole)
+			if info.ActorType == audit.ActorTypeUnknown {
+				info.ActorType = audit.ActorTypeUser
 			}
 		} else {
-			info.ActorType = ActorTypeAnonymous
+			info.ActorType = audit.ActorTypeAnonymous
 		}
 	}
 	return info
-}
-
-// HashIdempotencyKey returns a stable SHA-256 digest for an Idempotency-Key.
-// The raw key is client-controlled and must never be stored in the trail.
-func HashIdempotencyKey(key string) string {
-	if key == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(key))
-	return hex.EncodeToString(sum[:])
 }

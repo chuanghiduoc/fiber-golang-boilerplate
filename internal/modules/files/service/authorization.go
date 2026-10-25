@@ -7,15 +7,16 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 )
 
-// authorizeFile applies ABAC to an existing file. Subject-authenticated
-// requests (JWT or API key) get the tenant policy plus the owner policy, so a
-// cross-tenant file or another user's file is concealed as 404. Direct service
-// callers without a subject (unit tests, trusted background jobs) keep the
-// legacy tenant/owner checks in the calling method.
+// The helpers below all go through authz.Authorize, the single authorization
+// path: a subject (JWT or API key) is checked against the RBAC permission and
+// the policies, a context marked by authz.SystemContext (trusted background
+// callers) is allowed, and anything else is denied (fail closed). The calling
+// methods keep their own tenant/owner checks as defense in depth.
+
+// authorizeFile applies ABAC to an existing file: the tenant policy plus the
+// owner policy, so a cross-tenant file or another user's file is concealed as
+// 404.
 func authorizeFile(ctx context.Context, permission authz.Permission, file *filesqlc.File) error {
-	if _, ok := authz.SubjectFromContext(ctx); !ok {
-		return nil
-	}
 	return authz.Authorize(
 		ctx,
 		permission,
@@ -29,9 +30,6 @@ func authorizeFile(ctx context.Context, permission authz.Permission, file *files
 // not exist yet (upload) or when the operation is scoped to the caller's own
 // collection (list).
 func authorizeUserResource(ctx context.Context, permission authz.Permission, tenantID, userID int64) error {
-	if _, ok := authz.SubjectFromContext(ctx); !ok {
-		return nil
-	}
 	return authz.Authorize(
 		ctx,
 		permission,
@@ -45,9 +43,6 @@ func authorizeUserResource(ctx context.Context, permission authz.Permission, ten
 // administrator cannot cross the tenant boundary even with every admin
 // permission.
 func authorizeTenant(ctx context.Context, permission authz.Permission, tenantID int64) error {
-	if _, ok := authz.SubjectFromContext(ctx); !ok {
-		return nil
-	}
 	return authz.Authorize(
 		ctx,
 		permission,

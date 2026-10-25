@@ -34,7 +34,8 @@ flowchart LR
     P1 -.->|"OTLP gRPC 4317<br/>(OTEL_ENABLED=false by default)"| OTEL[OTel collector]
 ```
 
-The NetworkPolicy selects every pod in the namespace (API and migration Job).
+The NetworkPolicy selects every pod in the namespace (API, the optional
+worker, and the migration Job).
 Ingress is allowed only from the `ingress-nginx` namespace on 8080; egress is
 limited to DNS, the ports above, and HTTPS (S3, Google OAuth). A SeaweedFS
 gateway on a non-443 port (for example `seaweedfs-s3.storage.svc:8333`) needs
@@ -45,6 +46,7 @@ an extra egress rule.
 | Path | Purpose |
 | --- | --- |
 | `base/` | Deployment, Service, HPA, PDB, NetworkPolicy, Ingress |
+| `base/worker/` | Optional kustomize Component: separate job-worker Deployment (`APP_ROLE=worker`) and `APP_ROLE=api` on the API; enabled by no overlay (see [Job workers](#job-workers)) |
 | `base/kustomization.yaml` | Reusable app base (includes `../prereqs`) + image transformer; omits the Job and Secret |
 | `prereqs/` | Namespace + ConfigMap kustomization, applied before the migration Job |
 | `migration/job.yaml` | One-shot `/app/migrate` Job; applied separately, before the app |
@@ -194,7 +196,9 @@ Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
 
 | Secret value | Behavior |
 | --- | --- |
-| `JWT_SECRET`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `METRICS_AUTH_TOKEN`, `ADMIN_PASSWORD` | short `REPLACE_ME` placeholders on purpose: production validation rejects them, so an unedited template fails closed |
+| `JWT_SECRET`, `DATA_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `METRICS_AUTH_TOKEN`, `ADMIN_PASSWORD` | short `REPLACE_ME` placeholders on purpose: production validation rejects them, so an unedited template fails closed. `DATA_ENCRYPTION_KEY` must also differ from `JWT_SECRET` |
+| `*_PREVIOUS_*` keys | commented out; set only during a [rotation](#secret-rotation) |
+| `<NAME>_FILE` | any secret setting may instead point at a mounted file (for example `JWT_SECRET_FILE=/run/secrets/jwt`); setting both forms fails startup |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` (+ optional `ADMIN_NAME`) | commented out, so no admin is bootstrapped. Uncomment both to create one on API startup; password ≥ 12 characters. Setting only one fails production config validation |
 
 If the GHCR package is private, create a pull Secret and uncomment
@@ -280,7 +284,7 @@ garbage-collected by its TTL, rerun step 3 first.
 | --- | --- |
 | `spec.replicas` | intentionally absent: the HPA owns the count (`minReplicas` 2 staging, 3 production). Adding it makes the controllers fight |
 | Rolling update | `maxUnavailable: 0`, `maxSurge: 1`; a new pod must pass `/readyz` before an old pod is removed |
-| Job workers | in-process, PostgreSQL queue with `SKIP LOCKED`, so multiple replicas are safe |
+| Job workers | in-process (`APP_ROLE=all` from the ConfigMap), PostgreSQL queue with `SKIP LOCKED`, so multiple replicas are safe; the optional [worker component](#job-workers) moves them to their own Deployment |
 | Probes | startup `/healthz` (5s × 24), readiness `/readyz` (5s × 3), liveness `/healthz` (10s × 3) on the `http` port |
 | Shutdown | `preStop` sleeps 5s, then the API's 20s shared shutdown budget; `terminationGracePeriodSeconds: 30` adds 5s margin. Raise it together with the shutdown budget; `APP_REQUEST_TIMEOUT` plus 3s of post-handler audit/idempotency work must stay within the budget minus its 5s reserve (max 12s) |
 | Security | `runAsNonRoot`, UID 100 / GID 101, `fsGroup: 101`, `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, no service-account token |
@@ -406,6 +410,7 @@ backups/point-in-time recovery, and private networking.
 | `DB_MAX_CONNS` | per pod. Production 10 × HPA max 10, so keep the database connection limit above 100; staging 5 × max 4 |
 | `CACHE_DRIVER=redis`, `REDIS_URL` | required for multi-replica session invalidation; use `rediss://` when the provider supports TLS |
 | NetworkPolicy CIDRs | update DB/Redis CIDRs and ports in `base/networkpolicy.yaml` if not private `10.0.0.0/8`; a blocked migration Job fails to connect |
+| PgBouncer (transaction mode) | the API works with `DB_QUERY_EXEC_MODE=cache_statement` on PgBouncer 1.21+ (`max_prepared_statements > 0`) or `cache_describe`/`describe_exec`. Point the migration Job at PostgreSQL directly with `DB_MIGRATE_HOST`/`DB_MIGRATE_PORT` (golang-migrate holds a session advisory lock), and handle `search_path` in PgBouncer: [docs/operations.md](../../docs/operations.md#connection-poolers-pgbouncer) |
 
 ### Object storage versus local uploads
 
@@ -442,8 +447,39 @@ If you must use `STORAGE_DRIVER=local`:
 
 | Secret | Effect of rotation | Procedure |
 | --- | --- | --- |
-| `JWT_SECRET` | All access tokens fail validation (refresh tokens are opaque DB rows and stay valid unless revoked or the token version is bumped). It also derives the AES key for queued email payloads, so encrypted jobs already queued can no longer be decrypted, and a rolling update mixing secrets lets old replicas claim jobs they cannot open. | Drain the queue (stop email-producing traffic until no pending/processing jobs remain), stop all replicas (pause/delete the HPA, scale to 0), update the Secret, scale back up. If draining is impossible, expect failed jobs and inspect dead/failed rows afterwards. |
-| `WEBHOOK_SECRET_ENCRYPTION_KEY` | Seals outbound endpoint and inbound source signing secrets (AES-256-GCM); required in production, ≥ 32 characters. Rotation does **not** re-encrypt rows: every stored webhook secret becomes unreadable. It does not sign tokens or affect the email queue; keep it distinct from `JWT_SECRET`. | 1. Announce a receiver maintenance window. 2. Update the Secret and restart all replicas. 3. Rotate every endpoint and inbound source secret through the API and deliver the new values. 4. In-flight deliveries sealed with the old key become `dead`; replay them. Inbound senders get `401` until they use the new secret. |
+| `JWT_SECRET` (+ `JWT_PREVIOUS_SECRETS`) | Signs access tokens; each token's `kid` selects the key, and previous secrets only verify. Refresh tokens are opaque DB rows and survive rotation. Google OAuth `state` uses the active secret only, so sign-ins in flight during the swap must restart. Tokens without a `kid` verify against the active secret only. | 1. Add the new value to `JWT_PREVIOUS_SECRETS`, roll out. 2. Make it `JWT_SECRET`, move the old one to `JWT_PREVIOUS_SECRETS`, roll out. 3. Remove the old one after `JWT_EXPIRE_HOUR`. |
+| `DATA_ENCRYPTION_KEY` (+ `DATA_ENCRYPTION_PREVIOUS_KEYS`) | Seals queued email and password-reset payloads; required in production, ≥ 32 characters, different from `JWT_SECRET`. Envelopes name their key, and a replica missing a key retries the job instead of dead-lettering it. | Same two phases; remove the old key once no queued/running job is sealed with it. Upgrading a deployment whose queue holds jobs sealed with the old `JWT_SECRET`-derived key: set the old `JWT_SECRET` value as `DATA_ENCRYPTION_PREVIOUS_KEYS` until those jobs drain. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` (+ `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`) | Seals outbound endpoint and inbound source signing secrets; required in production, ≥ 32 characters. Rows keep the key that sealed them, so previous keys keep them readable. | Same two phases; remove the old key only after every endpoint and source secret has been rotated through the API and no pending delivery snapshot uses it. |
+
+Details and the rationale for the two phases:
+[docs/operations.md](../../docs/operations.md#key-rotation). Workers built
+before envelope v2 cannot open payloads or webhook secrets sealed by newer
+pods: when upgrading, let the rollout replace every pod (including a separate
+worker Deployment) before relying on new jobs.
+
+### Job workers
+
+By default every API pod also runs the job worker, the scheduler (when
+`SCHEDULER_ENABLED=true`), and module background loops (`APP_ROLE=all` in the
+ConfigMap). To scale and fail them independently, enable the optional
+component in an overlay:
+
+```yaml
+components:
+  - ../../base/worker
+```
+
+| Effect | Detail |
+| --- | --- |
+| API Deployment | gets `APP_ROLE=api`: serves HTTP and enqueues jobs, never claims them |
+| `fiber-boilerplate-worker` Deployment | `APP_ROLE=worker`, 1 replica, same image transformer, ConfigMap, and Secret; serves only `/healthz`, `/readyz` (database and cache), and `/metrics` on 8080 and mounts no `/api` route |
+| Selection | worker pods use their own `app.kubernetes.io/instance` label, so the API Service, HPA, and PDB never select them |
+| Scaling | replicas are safe: claims use `FOR UPDATE SKIP LOCKED` and the scheduler elects one leader through `scheduler_leases`. Count worker pods in the `DB_MAX_CONNS × replicas` budget |
+| Bulkheads | copy the Deployment under another name with `JOBS_WORKER_KINDS=<kinds>` and set `JOBS_WORKER_EXCLUDE_KINDS=<kinds>` on the general worker, so every kind is claimed by exactly one group |
+
+Apply it after the migration Job like the rest of the app overlay. No overlay
+enables it today, so the CI-rendered manifests keep the single-Deployment
+topology.
 
 ### Configuration changes
 
@@ -485,7 +521,8 @@ deadlocking.
 | Build | `linux/amd64` and `linux/arm64` with Buildx/QEMU, GitHub Actions cache |
 | Push | `ghcr.io/${{ github.repository }}` using `GITHUB_TOKEN` |
 | Tags | `1.4.2`, `1.4`, `1`, and `latest` for **stable** semver; pre-releases keep only the full version. Every run gets a full-SHA tag; manual branch dispatches get the branch name |
-| Supply chain | provenance and SBOM; actions pinned to full commit SHAs (version comments alongside) verified on 2026-10-24 |
+| Supply chain | provenance and SBOM; actions pinned to full commit SHAs (version comments alongside) verified on 2026-10-24; base images pinned by digest in the Dockerfile |
+| Signing | the pushed digest is signed keyless with cosign (the workflow's OIDC identity); `deploy.yml` runs `cosign verify` against `release.yml@refs/tags/v*` (or a dispatched branch) before rollout whenever the image preflight is enabled |
 
 The CI `Manifests` job runs `actionlint`, renders the base and both
 environment overlays (including `prereqs` and `migration`) with kustomize,

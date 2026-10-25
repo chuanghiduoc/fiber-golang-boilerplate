@@ -1,0 +1,115 @@
+# Dedicated job worker (APP_ROLE=worker): the durable job worker, the optional
+# scheduler, and module background loops, plus /healthz, /readyz (database and
+# cache), and /metrics on 8080. It mounts no /api route and no Service selects
+# it. Replicas are safe to scale: jobs are claimed with FOR UPDATE SKIP LOCKED
+# and the scheduler elects one leader through scheduler_leases.
+#
+# For bulkheads, copy this Deployment under another name and set
+# JOBS_WORKER_KINDS on the copy and JOBS_WORKER_EXCLUDE_KINDS here (same
+# kinds), so every kind is claimed by exactly one worker group.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fiber-boilerplate-worker
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/instance: fiber-boilerplate-worker
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fiber-boilerplate
+      app.kubernetes.io/instance: fiber-boilerplate-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fiber-boilerplate
+        app.kubernetes.io/instance: fiber-boilerplate-worker
+        app.kubernetes.io/part-of: fiber-boilerplate
+        app.kubernetes.io/component: worker
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The worker shares the API's 20s shutdown budget (job drain, scheduler,
+      # span flush, pool close) plus margin. It receives no traffic, so it
+      # needs no preStop delay.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          # Rewritten by the same kustomize images: transformer as the API.
+          image: ghcr.io/OWNER/REPO:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: fiber-boilerplate-config
+            - secretRef:
+                name: fiber-boilerplate-secrets
+          env:
+            - name: APP_ROLE
+              value: worker
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

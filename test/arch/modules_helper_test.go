@@ -45,7 +45,7 @@ func productionModules(t *testing.T) ([]app.Module, app.Deps) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{Secret: archTestSecret, ExpireHour: 1, RefreshExpireDays: 1},
 	}
-	modules, err := bootstrap.Build(app.Infra{Config: cfg})
+	modules, err := bootstrap.Build(cfg, app.Infra{Platform: app.NewPlatformConfig(cfg)})
 	if err != nil {
 		t.Fatalf("bootstrap.Build: %v", err)
 	}
@@ -138,8 +138,8 @@ func routeKey(route fiber.Route) string {
 const modulePath = "github.com/chuanghiduoc/fiber-golang-boilerplate"
 
 // isPlatformFunc reports whether a runtime function name is fn (or one of its
-// closures) in pkg, e.g. isPlatformFunc(name, "internal/platform/authz",
-// "Require") matches ".../internal/platform/authz.Require.func1".
+// closures) in pkg, e.g. isPlatformFunc(name, "internal/platform/authz/authzhttp",
+// "Require") matches ".../internal/platform/authz/authzhttp.Require.func1".
 func isPlatformFunc(name, pkg, fn string) bool {
 	full := modulePath + "/" + pkg + "." + fn
 	return name == full || strings.HasPrefix(name, full+".")

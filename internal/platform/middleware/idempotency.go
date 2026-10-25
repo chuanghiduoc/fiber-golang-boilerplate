@@ -14,7 +14,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
@@ -97,7 +97,7 @@ func Idempotency(appCache cache.Cache) fiber.Handler {
 		}
 
 		scope := idempotencyScope(
-			c.Method(), idempotencyRoutePath(c), tenant.ID(c), tenant.Slug(c), idempotencyIdentity(c), key,
+			c.Method(), idempotencyRoutePath(c), tenanthttp.ID(c), tenanthttp.Slug(c), idempotencyIdentity(c), key,
 		)
 		req := idempotentRequest{
 			c:           c,

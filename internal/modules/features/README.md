@@ -10,7 +10,7 @@ defaults/targets, and invalidates the local snapshot.
 All routes are under `/api/v1/admin/features`, require JWT authentication, and
 are rate limited. Reads use `admin:features:read`; writes use
 `admin:features:write`, accept `Idempotency-Key`, and run behind a required
-`audit.Guard`. `PUT`/`DELETE /flags/:key` change process-wide state and are
+`audithttp.Guard`. `PUT`/`DELETE /flags/:key` change process-wide state and are
 limited to platform-tenant (id 1) admins; other tenants manage only their own
 targets.
 

@@ -15,8 +15,21 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
+
+func TestDeliveryWorker_InvalidPayloadIsPermanent(t *testing.T) {
+	codec, _ := testCodec(t)
+	worker, _ := testWorker(&fakeWorkerStore{}, loopbackWebhookClient(t))
+	worker.codec = codec
+	for _, payload := range []string{`not-json`, `{"deliveryId":0}`, `{}`} {
+		err := worker.Handle(context.Background(), json.RawMessage(payload))
+		if err == nil || !jobs.IsPermanent(err) {
+			t.Fatalf("Handle(%s) error = %v, want a permanent job error", payload, err)
+		}
+	}
+}
 
 type fakeWorkerStore struct {
 	delivery   *webhooksqlc.WebhookDelivery

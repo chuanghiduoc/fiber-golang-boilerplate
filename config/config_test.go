@@ -718,6 +718,7 @@ func productionValidConfig() Config {
 	cfg.App.FrontendURL = "https://app.example.com"
 	cfg.JWT.Secret = strings.Repeat("a", 32)
 	cfg.Webhook.SecretEncryptionKey = strings.Repeat("w", 32)
+	cfg.DataEncryption.Key = strings.Repeat("d", 32)
 	cfg.Storage.AllowedMIMETypes = "image/png,application/pdf"
 	cfg.CORS.AllowOrigins = "https://app.example.com"
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}

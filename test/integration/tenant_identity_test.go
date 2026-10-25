@@ -27,8 +27,10 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
@@ -77,8 +79,8 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 	userHandler := identityhandler.NewUserHandler(userSvc)
 	adminSvc := identityservice.NewAdminUserService(userRepo, refreshRepo, txManager, auditRecorder, sessionStore)
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
-	api := app.Group("/api/v1", tenant.Middleware(resolver, "default"))
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "default"))
 	api.Post("/auth/register", authHandler.Register)
 	api.Post("/auth/login", authHandler.Login)
 	api.Post("/auth/refresh", authHandler.Refresh)

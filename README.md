@@ -40,9 +40,10 @@ Production-minded REST API boilerplate built with Go Fiber v3, PostgreSQL, and s
 ## Architecture
 
 A **modular monolith**: one deployable, module-owned route tables, and platform
-packages for cross-cutting mechanics. The job worker (and the optional
-scheduler) run inside the API process; schema changes run as a separate
-one-shot `cmd/migrate` step.
+packages for cross-cutting mechanics. By default (`APP_ROLE=all`) the job
+worker and the optional scheduler run inside the API process; `APP_ROLE=api`
+and `APP_ROLE=worker` split them into separate processes from the same image.
+Schema changes run as a separate one-shot `cmd/migrate` step.
 
 ```mermaid
 flowchart LR
@@ -90,6 +91,10 @@ flowchart LR
 
 Every module follows the same layered slice (`handler → service → repository →
 sqlc → PostgreSQL`) and owns its own `queries/` and generated `sqlc/` package.
+Core packages and module services/repositories are Fiber-free; Fiber adapters
+live in `<pkg>http` subpackages (`apperrorhttp`, `authzhttp`, `tenanthttp`,
+`audithttp`, `featureshttp`, `apikeyhttp`), and `test/arch` enforces both that
+split and the [ADR 0002](docs/adr/0002-module-layering.md) layering ratchet.
 
 ### Documentation map
 
@@ -104,6 +109,7 @@ sqlc → PostgreSQL`) and owns its own `queries/` and generated `sqlc/` package.
 | [docs/feature-flags.md](docs/feature-flags.md) | Flag catalog, precedence, cache, admin API |
 | [docs/tracing.md](docs/tracing.md) | OpenTelemetry configuration, privacy rules, collector |
 | [deploy/k8s/README.md](deploy/k8s/README.md) | Kubernetes deployment flow |
+| [docs/adr/README.md](docs/adr/README.md) | Architecture Decision Records |
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
@@ -214,7 +220,7 @@ flowchart TD
 | Webhooks | Endpoints, versioned secrets, deliveries, attempts, inbound sources, and inbound events are tenant-scoped in SQL and indexes. The public receiver resolves the tenant from the source id and writes/audits under it regardless of `X-Tenant-Slug`. |
 | Notifications | Feed and preference queries filter both `tenant_id` and `user_id`; cross-tenant or other-user ids return `404`. Email jobs inherit the notification tenant. |
 | Idempotency | Keys are scoped by method, path, tenant ID/slug, and caller (user, or IP for public routes), so a key/body/IP in two tenants cannot replay one tenant's `201` into another. |
-| Audit | Fail-closed for privileged mutations: Tier 1 services write the audit row in the mutation transaction; Tier 2 routes write a pre-write intent row through `audit.Guard`. A required intent that cannot be stored returns `503 system.audit_unavailable` before the handler runs. |
+| Audit | Fail-closed for privileged mutations: Tier 1 services write the audit row in the mutation transaction; Tier 2 routes write a pre-write intent row through `audithttp.Guard`. A required intent that cannot be stored returns `503 system.audit_unavailable` before the handler runs. |
 | Internal fallback | `tenant.EffectiveID(ctx)` falls back to tenant 1 only for jobs, internal callers, and tests. HTTP writes must resolve a tenant through middleware. |
 | Remaining | Row-level security and per-tenant limits/quotas. |
 
@@ -250,7 +256,10 @@ services.
 The migration Job is deliberately outside every app overlay: apply the
 environment prereqs, apply and await the migration overlay, then apply the app
 overlay. The deploy README covers placeholders, secrets, promotion,
-verification, and rollback.
+verification, rollback, and the optional `base/worker` component that splits
+job workers into their own Deployment (`APP_ROLE=worker`). Release images are
+signed keyless with cosign, and the deploy workflow verifies the signature
+before rollout when its image preflight is enabled.
 
 ## Database & Migrations
 
@@ -538,7 +547,9 @@ run without `CONFIRM=yes`; use it only on a disposable database. `swag` and
 `internal/platform/jobs` is a PostgreSQL-backed durable queue. Delivery is
 **at-least-once**: a handler can run again after a retry, panic, or lease
 expiry, so handlers must be idempotent. The full job state machine is in
-[docs/operations.md](docs/operations.md).
+[docs/operations.md](docs/operations.md). `APP_ROLE` decides which processes run
+the worker: `all` (default) runs it next to the API, `api` only enqueues, and
+`worker` runs the worker and scheduler without `/api` routes.
 
 ```mermaid
 sequenceDiagram
@@ -569,24 +580,24 @@ sequenceDiagram
 | Idempotent enqueue | `EnqueueOnce`/`EnqueueOnceTx` take a deterministic `Job.IdempotencyKey` and insert at most one job per `(tenant_id, key)`, returning the existing id and `created=false` for a duplicate. The key is a nullable column with a partial unique index; plain `Enqueue`/`EnqueueTx` do not deduplicate. |
 | Tenancy | Enqueue writes `jobs.tenant_id` from `tenant.EffectiveID` (default tenant 1) unless `Job.TenantID` is positive; the worker installs `tenant.WithID` before calling the handler. Claim, lease recovery, retention, and metric labels stay global, so the only tenant-leading jobs index is the `(tenant_id, idempotency_key)` dedupe key; ad-hoc per-tenant inspection scans `idx_jobs_status_run_at`. |
 | Tracing | Enqueue stores the active W3C `traceparent`; each attempt starts a new-root `job.process` span linked to the enqueue span. See [docs/tracing.md](docs/tracing.md). |
-| Claim and retry | Claims use `FOR UPDATE SKIP LOCKED` and increment `attempts`. Failures retry with exponential backoff (1s doubling up to 1h) until `max_attempts` (default 10), then become `dead`. Unregistered kinds are not special-cased: they retry and dead-letter only when the budget is exhausted, so a rollout can register a handler before pending work dies. |
+| Claim and retry | Claims use `FOR UPDATE SKIP LOCKED` and increment `attempts`. Failures retry with exponential backoff (1s doubling up to 1h) until `max_attempts` (default 10), then become `dead`. A handler error wrapped with `jobs.Permanent(err)` (undecodable or invalid payloads) dead-letters immediately with `last_error` prefixed `permanent failure (not retried): `. Unregistered kinds are not special-cased: they retry and dead-letter only when the budget is exhausted, so a rollout can register a handler before pending work dies. |
 | Claim errors | Retried in-process with exponential backoff from the poll interval, capped at 30s; `Run` returns only when its context is canceled. |
 | Handler timeout | 10m (`WithJobTimeout`; non-positive disables). A timed-out handler is canceled and recorded as a normal failure that consumes an attempt; one that ignores cancellation and returns nil is recorded as succeeded with a warning. The final bookkeeping write uses a detached 5s context. |
 | Leases | Each running row stores `lease_expires_at` = now() + the owning worker's lease (`WithLeaseDuration`, default 5m), written on claim and on every heartbeat (`WithHeartbeatInterval`, default 30s); a `CHECK` requires it while `running`. Only a row whose `lease_expires_at < now()` is reclaimed, so workers with different lease durations are safe together. An expired lease is reclaimed by the next claim from any polling worker and consumes an attempt. Heartbeat and completion writes are fenced by owner and attempt count, so a reclaimed worker cannot renew or finish the job, though it may still be running the old handler (duplicate concurrent execution is possible). |
 | Inspection | `jobs` stores run time, lease ownership, `attempts`, and `last_error`. Succeeded and dead jobs have `payload` cleared, so reset/verification links are not retained after delivery. |
-| Encrypted email payloads | A 32-byte AES-256-GCM key is derived from `JWT_SECRET` with HKDF-SHA256 (`jobs/payload/v1` context) and passed as a `jobs.PayloadCodec`. `jobs.payload` holds a versioned envelope (`v`, `nonce`, `data`), so dumps, backups, and replication streams do not expose links. Encrypted jobs use kind `email.send.encrypted`; new workers register both kinds. Legacy plaintext jobs still deliver but stay readable until delivered or cleared. During a rolling deploy old workers leave encrypted jobs queued (unknown-kind retry) until new workers drain them. Rotating `JWT_SECRET` makes queued encrypted jobs undecryptable; drain first. |
+| Encrypted payloads | Email and password-reset job payloads are sealed by a `jobs.PayloadCodec`: AES-256-GCM with keys derived by HKDF-SHA256 (`jobs/payload/v1` context) from `DATA_ENCRYPTION_KEY` (required in production and different from `JWT_SECRET`; outside production an empty key falls back to `JWT_SECRET`) plus decrypt-only `DATA_ENCRYPTION_PREVIOUS_KEYS`. `jobs.payload` holds a versioned envelope: v2 (`v`, `kid`, `nonce`, `data`) names the sealing key; v1 (no `kid`) still opens by trying every key. Dumps, backups, and replication streams do not expose links. Encrypted email uses kind `email.send.encrypted`; workers register both kinds and legacy plaintext jobs still deliver. A decryption failure (for example a replica missing a key) retries; a malformed envelope is permanent. Workers older than v2 cannot open v2 envelopes, so finish rolling out every worker promptly. Rotation: [docs/operations.md](docs/operations.md#key-rotation). |
 | Retention | `succeeded` and `dead` rows whose `updated_at` is older than 30 days are purged hourly, first pass at worker start (`WithRetention`, default `30*24h`, non-positive disables; `WithPurgeInterval`, default `1h`, non-positive ignored). Queued and running jobs are never deleted. Each pass uses a detached 5s context and batches of at most 1,000 rows; failures retry next interval. |
 | Webhook delivery | Kind `webhook.delivery`. The delivery row and first job commit atomically; each attempt schedules the next as a **new** job with webhook backoff or `Retry-After`. Permanent 3xx/4xx (except `408`, `425`, `429`) mark the delivery `dead`. Receivers deduplicate on `X-Webhook-Delivery`; every attempt is kept in `webhook_delivery_attempts`. An hourly loop deletes terminal deliveries and old inbound events after `WEBHOOK_RETENTION_DAYS`. |
 | Shutdown | On SIGINT/SIGTERM the scheduler stops, then the worker stops claiming and cancels running handlers. HTTP, workers, and async work drain in parallel within a **15s** window inside a single **20s** shutdown budget; the remaining 5s covers the tracing flush and closing cache/DB. Handlers must honor cancellation: a non-cooperative handler keeps heartbeating until it returns and can overrun the drain window. See [docs/operations.md](docs/operations.md). |
 
 **Job metrics:** `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
 `jobs_retried_total{kind}`, `jobs_dead_total{kind}`,
-`jobs_claim_errors_total`, `jobs_purged_total`. **Audit metrics:**
+`jobs_claim_errors_total`, `jobs_purged_total`, `jobs_queue_lag_seconds{kind}`. **Audit metrics:**
 `audit_write_failures_total`, `audit_intent_failures_total`,
 `audit_completion_failures_total`, `audit_tx_missing_total`,
 `audit_domain_missing_total`. Outcome counters advance only after the matching
 database write succeeds. `jobs_dead_total` counts handler failures that
-exhaust attempts; a lease-expiry dead letter shows as `status = 'dead'` but is
+exhaust attempts or are permanent; a lease-expiry dead letter shows as `status = 'dead'` but is
 not counted.
 
 ## Scheduler and Events
@@ -656,15 +667,17 @@ flowchart LR
    only through `internal/contracts` or a narrow exported interface.
 3. Declare permissions, error codes, flags, and en/vi strings in the module's
    `catalog/` (self-registered through provider hooks) and protect every route
-   with `authz.Require(...)`. Do not copy the
+   with `authzhttp.Require(...)`. Do not copy the
    [legacy exceptions](docs/module-template.md#legacy-exceptions-do-not-copy).
 4. Write queries in `internal/modules/<name>/queries/<name>.sql` (the scaffold
    appends the `sqlc.yaml` block) and run `make sqlc-generate`.
 5. For a deployed database run `make migrate-create module=<name>
    name=<purpose>`; for this boilerplate's fresh installs update
    `000001_init_schema`.
-6. Register the module once in `internal/bootstrap/modules.go`.
-7. Add unit and integration tests; `test/arch` rejects cross-module imports.
+6. Register the module once in `internal/bootstrap/modules.go`; module-owned
+   settings go in the module's `Settings` struct, filled there from `config`.
+7. Add unit and integration tests; `test/arch` rejects cross-module imports
+   and new layering violations.
 8. Run `make swagger` and `make check` before opening a PR.
 
 Each module with SQL owns its DTOs, repositories, services, handlers, and
@@ -678,9 +691,15 @@ See [.env.example](.env.example) for every option and default. Key settings:
 | Variable | Purpose |
 |----------|---------|
 | `APP_ENV` | `local` \| `test` \| `development` \| `staging` \| `production` (log format and production safety checks) |
+| `APP_ROLE` | `all` (default: API + job worker + scheduler) \| `api` (HTTP only; jobs are enqueued but not processed) \| `worker` (job worker, scheduler, background loops; only `/healthz`, `/readyz`, `/metrics`) |
+| `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` | Comma-separated job kinds this process claims / skips (bulkhead workers); every kind must be claimed by some worker, and a kind in both lists fails startup |
 | `APP_BODY_LIMIT` | Must exceed `STORAGE_MAX_FILE_SIZE` (multipart overhead) |
 | `DB_CONNECT_TIMEOUT` | Database connect timeout in seconds (default 10) |
 | `DB_SSLMODE` | `disable`, `allow`, `prefer` rejected in production; use `require` or `verify-full` |
+| `DB_QUERY_EXEC_MODE` | pgx execution mode: `cache_statement` (default; behind a transaction-mode PgBouncer needs 1.21+ with `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; `exec`/`simple_protocol` are rejected (json parameters break) |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | `cmd/migrate` only: connect here instead of `DB_HOST`/`DB_PORT`, so migrations (which hold a session advisory lock) bypass a transaction-mode pooler. See [docs/operations.md](docs/operations.md#connection-poolers-pgbouncer) |
+| `JWT_SECRET` / `JWT_PREVIOUS_SECRETS` | Active signing key (32+ chars outside local/test; tokens carry its derived `kid`) and comma-separated verify-only retired keys |
+| `DATA_ENCRYPTION_KEY` / `DATA_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for email/password-reset job payloads (32+ chars; required in production and must differ from `JWT_SECRET`; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `REQUIRE_EMAIL_VERIFICATION` | Require a verified email before login/refresh |
 | `TENANT_DEFAULT_SLUG` | Tenant for header-less requests in compatibility mode (default `default`) |
 | `TENANT_REQUIRE_HEADER` | Require `X-Tenant-Slug` on `/api/v1`/`/api/v2` (default `false`; **must be `true` in production**, recommended in staging) |
@@ -698,9 +717,10 @@ See [.env.example](.env.example) for every option and default. Key settings:
 | `METRICS_AUTH_TOKEN` | Required in production; sent as `Authorization: Bearer <token>` |
 | `OTEL_ENABLED` | Enable tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`; `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Admin seeded on API startup (also `make seed`); password 12+ chars in production |
-| `WEBHOOK_SECRET_ENCRYPTION_KEY` | AES-256-GCM key for stored webhook secrets; required in production (local/test fall back to `JWT_SECRET`) |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (required in production; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
 | `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |
+| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
 
 ## Pagination
 
@@ -755,6 +775,8 @@ migration entrypoint, and tenant foundation exist.
 | Logout | `POST /auth/logout` revokes one refresh token by possession; `/auth/logout-all` bumps the token version and invalidates access tokens. |
 | Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
 | Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. HMAC-SHA256 signing with a per-endpoint secret and timestamp; receivers deduplicate on `X-Webhook-Delivery`. |
-| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Rotating the encryption key requires rotating every webhook secret. |
+| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |
+| Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [docs/operations.md](docs/operations.md#key-rotation). |
+| Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |
-| Production startup | Rejects the sample JWT secret and default admin password, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |
+| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |

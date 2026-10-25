@@ -1,0 +1,32 @@
+# Code owners per module and platform area. Replace the owner below with the
+# team that owns each area (e.g. @org/identity-team) as the project grows; the
+# order matters: the last matching pattern wins.
+*                                   @chuanghiduoc
+
+# Platform and shared packages
+/internal/platform/                 @chuanghiduoc
+/internal/app/                      @chuanghiduoc
+/internal/bootstrap/                @chuanghiduoc
+/pkg/                               @chuanghiduoc
+/cmd/                               @chuanghiduoc
+/config/                            @chuanghiduoc
+
+# Business modules: module code, its contracts, and its migrations
+/internal/modules/identity/         @chuanghiduoc
+/internal/contracts/identity/       @chuanghiduoc
+/internal/modules/files/            @chuanghiduoc
+/internal/contracts/files/          @chuanghiduoc
+/internal/modules/notifications/    @chuanghiduoc
+/internal/contracts/notifications/  @chuanghiduoc
+/internal/modules/webhooks/         @chuanghiduoc
+/internal/contracts/webhooks/       @chuanghiduoc
+/internal/modules/features/         @chuanghiduoc
+/internal/modules/apikeys/          @chuanghiduoc
+/internal/modules/admin/            @chuanghiduoc
+
+# Schema, architecture rules, delivery
+/migrations/                        @chuanghiduoc
+/test/arch/                         @chuanghiduoc
+/deploy/                            @chuanghiduoc
+/.github/                           @chuanghiduoc
+/docs/adr/                          @chuanghiduoc

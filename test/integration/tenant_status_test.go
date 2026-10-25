@@ -14,8 +14,9 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
@@ -32,8 +33,8 @@ func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
 	require.NotZero(t, suspendedID)
 
 	resolver := identityadapter.NewTenantResolver(identityrepo.NewTenantRepository(pool))
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
-	api := app.Group("/api/v1", tenant.Middleware(resolver, "suspended-default"))
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "suspended-default"))
 	api.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })
 
 	req, err := http.NewRequest(http.MethodGet, "/api/v1/ping", http.NoBody)

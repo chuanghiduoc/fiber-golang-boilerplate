@@ -1,6 +1,11 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
+)
 
 // Credential strength rules for every environment except local and test.
 const (
@@ -16,9 +21,24 @@ var sampleJWTSecrets = []string{"", "secret", "your-super-secret-key-change-in-p
 const sampleAdminPassword = "Admin123!" // ggignore: public sample value, rejected in production
 
 type JWTConfig struct {
-	Secret            string `env:"JWT_SECRET" envDefault:"secret"`
+	// Secret is the active signing key. Tokens carry its derived kid.
+	Secret string `env:"JWT_SECRET" envDefault:"secret"`
+	// PreviousSecrets are comma-separated retired signing keys that still
+	// verify tokens during a rotation. They never sign.
+	PreviousSecrets   string `env:"JWT_PREVIOUS_SECRETS"`
 	ExpireHour        int    `env:"JWT_EXPIRE_HOUR" envDefault:"24"`
 	RefreshExpireDays int    `env:"JWT_REFRESH_EXPIRE_DAYS" envDefault:"30"`
+}
+
+// PreviousSecretList returns the parsed JWT_PREVIOUS_SECRETS entries.
+func (j JWTConfig) PreviousSecretList() []string {
+	return splitCSV(j.PreviousSecrets)
+}
+
+// Keyring returns the verification keyring: the active secret plus every
+// previous secret.
+func (j JWTConfig) Keyring() *token.Keyring {
+	return token.NewKeyring(j.Secret, j.PreviousSecretList()...)
 }
 
 type AdminConfig struct {
@@ -48,11 +68,29 @@ func (j JWTConfig) validateSigningSecret(appEnv string) error {
 	if len(j.Secret) < minJWTSecretLength {
 		return fmt.Errorf("JWT_SECRET must be at least %d characters for security", minJWTSecretLength)
 	}
+	for _, previous := range j.PreviousSecretList() {
+		if slices.Contains(sampleJWTSecrets, previous) || len(previous) < minJWTSecretLength {
+			return fmt.Errorf("JWT_PREVIOUS_SECRETS entries must be at least %d characters and not a sample value", minJWTSecretLength)
+		}
+	}
 	return nil
 }
 
-// validate checks token lifetimes.
+// validatePreviousSecrets rejects listing the active secret as a previous
+// one: that is always an operator mistake during a rotation (the new secret
+// was not set, or the lists were swapped).
+func (j JWTConfig) validatePreviousSecrets() error {
+	if slices.Contains(j.PreviousSecretList(), j.Secret) {
+		return fmt.Errorf("JWT_PREVIOUS_SECRETS must not contain the active JWT_SECRET")
+	}
+	return nil
+}
+
+// validate checks the previous-secret list and token lifetimes.
 func (j JWTConfig) validate() error {
+	if err := j.validatePreviousSecrets(); err != nil {
+		return err
+	}
 	if j.ExpireHour < 1 {
 		return fmt.Errorf("JWT_EXPIRE_HOUR must be at least 1")
 	}

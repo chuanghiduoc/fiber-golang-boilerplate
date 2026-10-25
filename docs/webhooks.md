@@ -249,6 +249,7 @@ the window, a receiver still on the intermediate secret rejects the request.
 | `5xx` | Retry while attempts remain. |
 | Transport/DNS/timeout | Retry while attempts remain. |
 | Blocked/invalid target | Dead immediately. |
+| Undecodable `webhook.delivery`/`webhook.dispatch` job payload (or missing delivery id / event id / tenant) | The job is dead-lettered at once via `jobs.Permanent` (`last_error` starts with `permanent failure (not retried): `). |
 
 - Backoff is `base * 2^(attempt-1)` capped at `WEBHOOK_RETRY_MAX_SECS`.
 - A valid `Retry-After` (seconds or HTTP date) can only **lengthen** the
@@ -361,20 +362,22 @@ The stored row keeps the signature and payload but does not echo them back.
 | Inbound source secret | `whin_...` | `webhook_inbound_sources` |
 
 Both are sealed with AES-256-GCM using HKDF-SHA256 domain separation from
-`WEBHOOK_SECRET_ENCRYPTION_KEY`. Local/test falls back to `JWT_SECRET` when the
-dedicated key is empty; **production requires the dedicated key** (at least 32
-characters). Only ciphertext is stored; plaintext is returned exactly once on
-create or rotate.
+`WEBHOOK_SECRET_ENCRYPTION_KEY`. Outside production an empty dedicated key
+falls back to `JWT_SECRET`; **production requires the dedicated key** (at
+least 32 characters). Only ciphertext is stored; plaintext is returned exactly
+once on create or rotate. The stored envelope (v2) records the sealing key's
+`kid`; v1 envelopes without one are tried against every configured key.
 
 | Rotation | Behavior |
 |---|---|
 | Endpoint | Locks the endpoint row, deactivates the old secret, inserts the next version (concurrent rotations serialize). Queued deliveries keep their ciphertext snapshot and are co-signed for 24 hours (see [Signing during secret rotation](#signing-during-secret-rotation)). If the current secret cannot be loaded or decrypted, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
 | Inbound source | Replaces the verification secret immediately; old signatures fail on the next request. |
-| `WEBHOOK_SECRET_ENCRYPTION_KEY` | Makes every stored endpoint/inbound secret unreadable. Rotate every webhook secret after changing the key. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | empty (JWT fallback) | AES-256-GCM secret-encryption key; required in production. |
+| `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | empty | Comma-separated decrypt-only keys kept during a rotation; must not contain the active key. |
 | `WEBHOOK_CONNECT_TIMEOUT_SECS` | `5` | Bounds both the TCP dial and the TLS handshake. |
 | `WEBHOOK_REQUEST_TIMEOUT_SECS` | `10` | Per-attempt timeout, max 120. |
 | `WEBHOOK_RETRY_BASE_SECS` | `5` | First retry backoff. |
@@ -388,12 +391,12 @@ create or rotate.
 
 `webhooks:read` and `webhooks:write` are granted to the built-in `admin` role.
 Administration routes accept a JWT or an API key scoped to these permissions
-(`app.Deps.Authenticate()`) and use `authz.Require`; regular users receive
+(`app.Deps.Authenticate()`) and use `authzhttp.Require`; regular users receive
 `403`. The public receiver is the only unauthenticated route.
 
 | Route kind | Audit |
 |---|---|
-| Endpoint/source create, update, delete, rotate-secret; delivery replay | Tier 2: a required `audit.Guard` writes a `started` intent row before the handler and completes it with the outcome. An unavailable audit store returns `503 system.audit_unavailable` and the mutation does not run. The service then records the domain event as a child (`parent_id`) of the intent; a domain-event write failure is logged and does not fail the mutation. |
+| Endpoint/source create, update, delete, rotate-secret; delivery replay | Tier 2: a required `audithttp.Guard` writes a `started` intent row before the handler and completes it with the outcome. An unavailable audit store returns `503 system.audit_unavailable` and the mutation does not run. The service then records the domain event as a child (`parent_id`) of the intent; a domain-event write failure is logged and does not fail the mutation. |
 | Public receiver | `webhook.inbound.received`, best-effort, under the source tenant. |
 
 Domain events: `webhook.endpoint.created|updated|deleted|secret_rotated`,

@@ -13,6 +13,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
@@ -216,7 +217,7 @@ func (h *Handler) Send(c fiber.Ctx) error {
 		data = encoded
 	}
 
-	tenantID := tenant.ID(c)
+	tenantID := tenanthttp.ID(c)
 	if tenantID == 0 {
 		tenantID = tenant.EffectiveID(c.Context())
 	}

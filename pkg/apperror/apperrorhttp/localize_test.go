@@ -1,4 +1,4 @@
-package apperror
+package apperrorhttp
 
 import (
 	"encoding/json"
@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 type mapLocalizer map[string]string
@@ -54,7 +56,7 @@ func TestLocalizedTitleAndDetail(t *testing.T) {
 	body, _, status := decodeWithHandler(t,
 		FiberErrorHandlerWithLocalizer(localizer),
 		func(c fiber.Ctx) error {
-			return NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.user.not_found", map[string]any{"id": 7})
+			return apperror.NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.user.not_found", map[string]any{"id": 7})
 		},
 	)
 
@@ -92,7 +94,7 @@ func TestLocalizedValidationMessages(t *testing.T) {
 	body, _, status := decodeWithHandler(t,
 		FiberErrorHandlerWithLocalizer(localizer),
 		func(c fiber.Ctx) error {
-			return NewValidation("fallback detail", []FieldError{
+			return apperror.NewValidation("fallback detail", []apperror.FieldError{
 				{Path: "name", Code: "required", Message: "name is required"},
 				{Path: "bio", Code: "too_short", Message: "bio is too short", Params: map[string]string{"min": "3"}},
 				{Path: "code", Code: "too_long", Message: "code is too long", Params: map[string]string{"max": "5"}},
@@ -135,7 +137,7 @@ func TestLocalizerFallbackKeepsEnglish(t *testing.T) {
 	body, _, _ := decodeWithHandler(t,
 		FiberErrorHandlerWithLocalizer(mapLocalizer{}),
 		func(c fiber.Ctx) error {
-			return NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.unknown", nil)
+			return apperror.NewCode(CodeUserNotFound, "user missing").WithDetailKey("detail.unknown", nil)
 		},
 	)
 	if body["title"] != "User not found" {
@@ -153,7 +155,7 @@ func TestNilLocalizerPreservesCurrentBehavior(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			body, _, _ := decodeWithHandler(t, handler, func(c fiber.Ctx) error {
-				return NewValidation("bad fields", []FieldError{
+				return apperror.NewValidation("bad fields", []apperror.FieldError{
 					{Path: "name", Code: "required", Message: "name is required"},
 				})
 			})

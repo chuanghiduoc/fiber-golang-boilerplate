@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -49,6 +51,53 @@ func TestSecretCodec_WrongKeyAndTamper(t *testing.T) {
 	}
 	if _, err := codec.Open(""); !errors.Is(err, ErrInvalidSecretEnvelope) {
 		t.Fatalf("empty envelope error = %v, want ErrInvalidSecretEnvelope", err)
+	}
+}
+
+func TestSecretCodec_EnvelopeNamesActiveKey(t *testing.T) {
+	codec, _ := NewSecretCodec("key-one")
+	sealed, _ := codec.Seal([]byte("secret"))
+	var envelope secretEnvelope
+	if err := json.Unmarshal([]byte(sealed), &envelope); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if envelope.Version != secretEnvelopeVer || envelope.KeyID != codec.ring.Active().ID || len(envelope.KeyID) != 8 {
+		t.Fatalf("envelope = %+v, want v%d with the active key id", envelope, secretEnvelopeVer)
+	}
+}
+
+func TestSecretCodec_RotationKeepsOldSecretsReadable(t *testing.T) {
+	old, _ := NewSecretCodec("key-one")
+	sealedOld, _ := old.Seal([]byte("old-secret"))
+
+	// A version 1 envelope (no key id), as stored before key ids existed.
+	aead := old.ring.Active().AEAD
+	nonce := make([]byte, aead.NonceSize())
+	legacy, _ := json.Marshal(secretEnvelope{
+		Version: legacySecretEnvelopeVer,
+		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
+		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, nonce, []byte("legacy-secret"), []byte(secretKeyInfo))),
+	})
+
+	rotated, err := NewSecretCodec("key-two", "key-one")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	for envelope, want := range map[string]string{sealedOld: "old-secret", string(legacy): "legacy-secret"} {
+		plain, err := rotated.Open(envelope)
+		if err != nil || string(plain) != want {
+			t.Fatalf("Open with previous key = %q, %v; want %q", plain, err, want)
+		}
+	}
+
+	sealedNew, _ := rotated.Seal([]byte("new-secret"))
+	if _, err := old.Open(sealedNew); !errors.Is(err, ErrSecretDecryption) {
+		t.Fatalf("codec without the new key: err = %v, want ErrSecretDecryption", err)
+	}
+
+	missingKID := strings.Replace(sealedNew, `"kid":"`+rotated.ring.Active().ID+`",`, "", 1)
+	if _, err := rotated.Open(missingKID); !errors.Is(err, ErrInvalidSecretEnvelope) {
+		t.Fatalf("v2 envelope without kid: err = %v, want ErrInvalidSecretEnvelope", err)
 	}
 }
 

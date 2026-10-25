@@ -17,8 +17,10 @@ import (
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
@@ -78,10 +80,10 @@ func setupOAuthIntegrationApp(t *testing.T, info *oauth.GoogleUserInfo) (*fiber.
 	)
 
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	// require-header mode: defaultSlug is empty, so only a header or the
 	// validated browser `tenant` query can start a flow.
-	api := app.Group("/api/v1", tenant.Middleware(tenantResolver{repo: tenantRepo}, ""))
+	api := app.Group("/api/v1", tenanthttp.Middleware(tenantResolver{repo: tenantRepo}, ""))
 	api.Get("/auth/google", authHandler.GoogleRedirect)
 	api.Get("/auth/google/callback", authHandler.GoogleCallback)
 

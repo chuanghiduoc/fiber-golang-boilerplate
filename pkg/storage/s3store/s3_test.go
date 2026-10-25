@@ -1,4 +1,4 @@
-package storage
+package s3store
 
 import (
 	"errors"

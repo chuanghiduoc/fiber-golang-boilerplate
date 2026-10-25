@@ -23,10 +23,13 @@ import (
 	webhookrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -64,6 +67,8 @@ func setupAuditTxHarness(t *testing.T) *auditTxHarness {
 
 func (h *auditTxHarness) actorCtx(tenantID, actorID int64, role string) context.Context {
 	ctx := tenant.WithID(context.Background(), tenantID)
+	// Mirror JWTAuth: services authorize through the request subject.
+	ctx = authz.WithSubject(ctx, authz.NewSubject(actorID, tenantID, role))
 	return audit.WithActor(ctx, actorID, role)
 }
 
@@ -313,7 +318,7 @@ func TestAuditGuard_IntegrationIntentCompletionAndFailClosed(t *testing.T) {
 	adminID := h.insertUser(t, tenant.DefaultID, "guard-admin@test.com", "admin")
 
 	buildApp := func() *fiber.App {
-		app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+		app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 		app.Use(func(c fiber.Ctx) error {
 			fiber.Locals[string](c, "request_id", fmt.Sprintf("guard-%d", time.Now().UnixNano()))
 			fiber.Locals[int64](c, "user_id", adminID)
@@ -321,8 +326,8 @@ func TestAuditGuard_IntegrationIntentCompletionAndFailClosed(t *testing.T) {
 			c.SetContext(h.actorCtx(tenant.DefaultID, adminID, "admin"))
 			return c.Next()
 		})
-		app.Post("/mutate", audit.Guard(h.recorder, audit.Policy{
-			Mode: audit.ModeRequired, Action: "test.guarded", Resource: "test",
+		app.Post("/mutate", audithttp.Guard(h.recorder, audithttp.Policy{
+			Mode: audithttp.ModeRequired, Action: "test.guarded", Resource: "test",
 		}), func(c fiber.Ctx) error {
 			return c.SendStatus(fiber.StatusNoContent)
 		})

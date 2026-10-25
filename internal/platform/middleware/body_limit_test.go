@@ -12,7 +12,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 func TestIsMultipartForm(t *testing.T) {
@@ -33,7 +33,7 @@ func TestIsMultipartForm(t *testing.T) {
 
 func TestBodyLimit(t *testing.T) {
 	const limit = 16
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler, BodyLimit: 1 << 20})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler, BodyLimit: 1 << 20})
 	app.Use(BodyLimit(limit))
 	app.Post("/", func(c fiber.Ctx) error { return c.SendString("ok") })
 
@@ -92,7 +92,7 @@ func TestBodyLimit(t *testing.T) {
 
 func TestBodyLimit_RejectsCompressedBodies(t *testing.T) {
 	const limit = 1024
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler, BodyLimit: 1 << 20})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler, BodyLimit: 1 << 20})
 	app.Use(BodyLimit(limit))
 	app.Post("/", func(c fiber.Ctx) error {
 		// c.Body() would transparently decompress; the middleware must stop

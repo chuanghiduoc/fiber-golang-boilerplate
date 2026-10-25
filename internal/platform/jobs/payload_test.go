@@ -131,6 +131,7 @@ func TestPayloadCodecOpenCaseVariantEnvelope(t *testing.T) {
 	require.NoError(t, json.Unmarshal(sealed, &envelope))
 	mixedCase, err := json.Marshal(map[string]any{
 		"V":     envelope.Version,
+		"Kid":   envelope.KeyID,
 		"Nonce": envelope.Nonce,
 		"Data":  envelope.Data,
 	})
@@ -148,18 +149,102 @@ func TestPayloadCodecRejectsEnvelopeWithoutAAD(t *testing.T) {
 	codec, err := NewPayloadCodec(testPayloadSecret)
 	require.NoError(t, err)
 
-	nonce := make([]byte, codec.aead.NonceSize())
-	ciphertext := codec.aead.Seal(nil, nonce, []byte(`{"token":"secret-token"}`), nil)
+	key := codec.ring.Active()
+	nonce := make([]byte, key.AEAD.NonceSize())
+	ciphertext := key.AEAD.Seal(nil, nonce, []byte(`{"token":"secret-token"}`), nil)
+	for _, envelope := range []payloadEnvelope{
+		{Version: legacyPayloadEnvelopeVersion},
+		{Version: payloadEnvelopeVersion, KeyID: key.ID},
+	} {
+		envelope.Nonce = base64.RawURLEncoding.EncodeToString(nonce)
+		envelope.Data = base64.RawURLEncoding.EncodeToString(ciphertext)
+		encoded, err := json.Marshal(envelope)
+		require.NoError(t, err)
+
+		_, err = codec.Open(encoded)
+		require.ErrorIs(t, err, ErrPayloadDecryption,
+			"a v%d envelope sealed without the version/context AAD must not authenticate", envelope.Version)
+	}
+}
+
+// sealLegacyPayload builds a version 1 envelope (no key id) the way codecs
+// sealed payloads before key ids existed.
+func sealLegacyPayload(t *testing.T, codec *PayloadCodec, plaintext []byte) json.RawMessage {
+	t.Helper()
+	aead := codec.ring.Active().AEAD
+	nonce := make([]byte, aead.NonceSize())
 	envelope, err := json.Marshal(payloadEnvelope{
-		Version: payloadEnvelopeVersion,
+		Version: legacyPayloadEnvelopeVersion,
 		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
-		Data:    base64.RawURLEncoding.EncodeToString(ciphertext),
+		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, nonce, plaintext, []byte(payloadKeyInfo))),
 	})
 	require.NoError(t, err)
+	return envelope
+}
 
-	_, err = codec.Open(envelope)
-	require.ErrorIs(t, err, ErrPayloadDecryption,
-		"an envelope sealed without the version/context AAD must not authenticate")
+func TestPayloadCodecSealsWithActiveKeyID(t *testing.T) {
+	t.Parallel()
+
+	codec, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	sealed, err := codec.Seal([]byte(`{}`))
+	require.NoError(t, err)
+
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(sealed, &envelope))
+	assert.Equal(t, payloadEnvelopeVersion, envelope.Version)
+	assert.Equal(t, codec.ring.Active().ID, envelope.KeyID)
+	assert.Len(t, envelope.KeyID, 8)
+}
+
+func TestPayloadCodecOpensLegacyEnvelopes(t *testing.T) {
+	t.Parallel()
+
+	plaintext := []byte(`{"token":"legacy-token"}`)
+	old, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	legacy := sealLegacyPayload(t, old, plaintext)
+
+	// Same secret: an envelope queued before this release still opens.
+	opened, err := old.Open(legacy)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, opened)
+
+	// The secret moved to the previous list (JWT_SECRET -> DATA_ENCRYPTION_KEY
+	// migration): the legacy envelope is tried against every key.
+	rotated, err := NewPayloadCodec("new-data-encryption-key-at-least-32-chars", testPayloadSecret)
+	require.NoError(t, err)
+	opened, err = rotated.Open(legacy)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, opened)
+}
+
+func TestPayloadCodecRotation(t *testing.T) {
+	t.Parallel()
+
+	const newKey = "new-data-encryption-key-at-least-32-chars"
+	plaintext := []byte(`{"token":"secret-token"}`)
+	old, err := NewPayloadCodec(testPayloadSecret)
+	require.NoError(t, err)
+	sealedOld, err := old.Seal(plaintext)
+	require.NoError(t, err)
+
+	rotated, err := NewPayloadCodec(newKey, testPayloadSecret)
+	require.NoError(t, err)
+	opened, err := rotated.Open(sealedOld)
+	require.NoError(t, err, "a previous key must open envelopes it sealed")
+	assert.Equal(t, plaintext, opened)
+
+	sealedNew, err := rotated.Seal(plaintext)
+	require.NoError(t, err)
+	var envelope payloadEnvelope
+	require.NoError(t, json.Unmarshal(sealedNew, &envelope))
+	assert.Equal(t, rotated.ring.Active().ID, envelope.KeyID, "new envelopes use the active key")
+
+	// A worker that does not know the new key yet cannot open it.
+	_, err = old.Open(sealedNew)
+	require.ErrorIs(t, err, ErrPayloadDecryption)
+	assert.Contains(t, err.Error(), envelope.KeyID)
 }
 
 func TestPayloadLooksEncrypted(t *testing.T) {
@@ -238,7 +323,7 @@ func TestPayloadCodecRejectsInvalidPayloads(t *testing.T) {
 	codec, err := NewPayloadCodec(testPayloadSecret)
 	require.NoError(t, err)
 
-	validNonce := base64.RawURLEncoding.EncodeToString(make([]byte, codec.aead.NonceSize()))
+	validNonce := base64.RawURLEncoding.EncodeToString(make([]byte, codec.ring.Active().AEAD.NonceSize()))
 	validData := base64.RawURLEncoding.EncodeToString([]byte("not-really-ciphertext"))
 
 	tests := []struct {
@@ -252,7 +337,7 @@ func TestPayloadCodecRejectsInvalidPayloads(t *testing.T) {
 		{name: "missing nonce", payload: `{"v":1,"data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "nonce only", payload: `{"nonce":"` + validNonce + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "mixed case envelope missing nonce", payload: `{"V":1,"Data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
-		{name: "unsupported version", payload: `{"v":2,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
+		{name: "unsupported version", payload: `{"v":3,"nonce":"` + validNonce + `","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "invalid nonce encoding", payload: `{"v":1,"nonce":"***","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "invalid nonce length", payload: `{"v":1,"nonce":"c2hvcnQ","data":"` + validData + `"}`, wantErr: ErrInvalidPayloadEnvelope},
 		{name: "invalid data encoding", payload: `{"v":1,"nonce":"` + validNonce + `","data":"***"}`, wantErr: ErrInvalidPayloadEnvelope},

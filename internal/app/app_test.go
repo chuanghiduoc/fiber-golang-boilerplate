@@ -349,3 +349,39 @@ func TestOptionalModuleProvidersAreNilSafe(t *testing.T) {
 	assert.Equal(t, 0, module.jobs)
 	assert.Equal(t, 0, module.schedules)
 }
+
+// APP_ROLE=worker: providers register, but no /api route is mounted.
+func TestRegisterBackgroundRegistersProvidersWithoutRoutes(t *testing.T) {
+	cfg := &config.Config{
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5, Role: config.RoleWorker},
+		CORS:      config.CORSConfig{AllowOrigins: "*"},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		Tenant:    config.TenantConfig{DefaultSlug: "default"},
+	}
+	registry := scheduler.NewRegistry()
+	registrar := &recordingRegistrar{}
+	module := &providerModule{}
+
+	application := app.New(cfg, app.Deps{
+		Events:    events.New(nil),
+		Jobs:      registrar,
+		Schedules: registry,
+		Health:    health.NewChecker(nil, nil),
+	})
+	application.RegisterBackground(module)
+
+	assert.Equal(t, 1, module.jobs)
+	assert.Equal(t, 1, module.schedules)
+	assert.Contains(t, registrar.kinds, "provider.reindex")
+	assert.Contains(t, registrar.kinds, "events.provider.changed.refresh")
+
+	req, _ := http.NewRequest("GET", "/api/v1/provider", http.NoBody)
+	resp, err := application.Fiber().Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode, "worker role must not mount API routes")
+
+	req, _ = http.NewRequest("GET", "/healthz", http.NoBody)
+	resp, err = application.Fiber().Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "worker role keeps the health endpoints")
+}

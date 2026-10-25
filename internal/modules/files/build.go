@@ -15,16 +15,23 @@ type Provides struct {
 	Admin filescontracts.FilesAdmin
 }
 
+// Settings are the upload limits files owns (STORAGE_MAX_FILE_SIZE and
+// STORAGE_ALLOWED_MIME_TYPES). The storage driver itself is platform
+// infrastructure (infra.Storage).
+type Settings struct {
+	MaxFileSize  int64
+	AllowedTypes []string
+}
+
 // Build constructs the files repository, services, and handler from infra.
 // It performs no I/O.
-func Build(infra app.Infra) (*Module, Provides) {
-	cfg := infra.Config
+func Build(infra app.Infra, settings Settings) (*Module, Provides) {
 	fileRepo := filesrepo.NewFileRepository(infra.Pool)
 	uploadSvc := filesvc.NewUploadService(fileRepo, infra.Storage)
 	// With a transaction manager, file mutations and their webhook outbox
 	// jobs commit atomically (see AttachWebhooks).
 	filesvc.AttachTxManager(uploadSvc, infra.Tx)
-	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, cfg.Storage.MaxFileSize, cfg.Storage.AllowedTypes())
+	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, settings.MaxFileSize, settings.AllowedTypes)
 	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, infra.Tx, infra.Audit, infra.Storage)
 
 	m := New(uploadHandler)

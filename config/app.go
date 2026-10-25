@@ -23,9 +23,23 @@ const maxTCPPort = 65535
 // production.
 const minMetricsTokenLength = 16
 
+// APP_ROLE values: what one process runs.
+const (
+	// RoleAll serves the API and runs the job worker and scheduler.
+	RoleAll = "all"
+	// RoleAPI serves the API only; jobs are enqueued but not processed.
+	RoleAPI = "api"
+	// RoleWorker runs the job worker and scheduler plus health and metrics
+	// endpoints, without API routes.
+	RoleWorker = "worker"
+)
+
 type AppConfig struct {
 	Port int    `env:"APP_PORT" envDefault:"8080"`
 	Env  string `env:"APP_ENV" envDefault:"local"`
+	// Role selects what the process runs (api, worker, or all). Split roles
+	// let API and worker replicas scale and fail independently.
+	Role string `env:"APP_ROLE" envDefault:"all"`
 	// BodyLimit must be larger than STORAGE_MAX_FILE_SIZE because multipart
 	// framing adds overhead before the upload handler sees the file.
 	BodyLimit int `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
@@ -91,6 +105,27 @@ func (a AppConfig) EffectiveJSONBodyLimit() int {
 	return a.JSONBodyLimit
 }
 
+// EffectiveRole returns Role, or RoleAll for a zero value. Load always sets
+// the APP_ROLE default; the fallback only covers AppConfig literals built in
+// tests and tools.
+func (a AppConfig) EffectiveRole() string {
+	if a.Role == "" {
+		return RoleAll
+	}
+	return a.Role
+}
+
+// ServesAPI reports whether the process mounts the /api routes.
+func (a AppConfig) ServesAPI() bool {
+	return a.EffectiveRole() != RoleWorker
+}
+
+// RunsWorker reports whether the process runs the job worker, the scheduler,
+// and module background loops.
+func (a AppConfig) RunsWorker() bool {
+	return a.EffectiveRole() != RoleAPI
+}
+
 // usesSampleSecrets reports whether the environment may run with the public
 // sample JWT secret and admin password (local and test only).
 func usesSampleSecrets(appEnv string) bool {
@@ -115,6 +150,11 @@ func (a AppConfig) validate() error {
 	}
 	if err := validateAppEnv(a.Env, a.Env); err != nil {
 		return err
+	}
+	switch a.EffectiveRole() {
+	case RoleAll, RoleAPI, RoleWorker:
+	default:
+		return fmt.Errorf("APP_ROLE must be one of: all, api, worker (got %q)", a.Role)
 	}
 	if a.RequestTimeout < 1 {
 		return fmt.Errorf("APP_REQUEST_TIMEOUT must be at least 1 second")

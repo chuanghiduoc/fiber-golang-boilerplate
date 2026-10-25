@@ -522,10 +522,11 @@ func (w *Worker) recordRelease(ctx context.Context, span trace.Span, job claimed
 // recordFailure schedules a retry while attempts remain and dead-letters the
 // job otherwise. Every failure retries, including an unregistered kind: a
 // rollout may register the missing handler before the budget runs out, and
-// the attempt cap still dead-letters genuinely unknown work.
+// the attempt cap still dead-letters genuinely unknown work. The exception is
+// a handler error wrapped with Permanent, which dead-letters immediately.
 func (w *Worker) recordFailure(ctx context.Context, span trace.Span, job claimedJob, handlerErr error) error {
 	var retryAt *time.Time
-	if job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
+	if !IsPermanent(handlerErr) && job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
 		next := time.Now().Add(scaledBackoff(job.Attempts, w.retryBase, w.retryMax))
 		retryAt = &next
 	}

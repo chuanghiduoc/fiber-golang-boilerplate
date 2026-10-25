@@ -172,7 +172,7 @@ flowchart TD
 
 Every authenticated module route accepts both credential types through one
 chain (`app.Deps.Authenticate()`), after a per-IP `auth` limiter. The route's
-`authz.Require` then decides access, so an API key reaches a route only when
+`authzhttp.Require` then decides access, so an API key reaches a route only when
 its scopes include the permission. `POST /auth/logout-all` is the exception:
 JWT-only.
 
@@ -201,7 +201,7 @@ flowchart TD
     jhdr -->|yes| sess{"session store: role, token_version,<br/>tenant, tenant status current?"}
     sess -->|no| r401b
     sess -->|yes| jsub["subject from role catalog<br/>auth_method=jwt"]
-    ksub --> authz{"authz.Require(permission)"}
+    ksub --> authz{"authzhttp.Require(permission)"}
     jsub --> authz
     authz -->|missing| d403["403 permission.denied"]
     authz -->|granted| next["route limiter, idempotency, handler"]
@@ -209,7 +209,7 @@ flowchart TD
 
 | Aspect | JWT (`Authorization: Bearer <jwt>`) | API key (`Authorization: ApiKey <prefix>_<secret>`) |
 |---|---|---|
-| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries `token_version` and `tenant_id` | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
+| Credential | HS256 pinned; requires `exp`, checks `iss`/`aud`, rejects a future `iat` (30s leeway); carries `token_version` and `tenant_id`; the `kid` header selects the verification key (`JWT_SECRET` or a `JWT_PREVIOUS_SECRETS` entry), an unknown `kid` is `401`, and a token without `kid` verifies against the active secret only | Secret is 32 random bytes, unpadded base64url; only its SHA-256 hash is stored; shown once at creation/rotation |
 | Tenant | `tenant_id` claim is authoritative; missing/zero/negative claim is `401` (tokens minted before multi-tenancy must log in again) | Key's bound tenant is authoritative |
 | Revocation | Session store compares role, token version, tenant, and tenant status (5s cache, generation-keyed invalidation); `POST /auth/logout-all` bumps the version | Revoke is immediate; rotation keeps the old key valid for a 24-hour grace window unless revoked; a ban revokes keys issued before it |
 | Permissions | Derived from the role catalog | Explicit scopes intersected with the owner's **current** role, so a key never exceeds its scopes or survives a demotion |
@@ -222,11 +222,13 @@ flowchart TD
   access tokens immediately.
 - Permissions are declared in module catalogs (`catalog/permissions.go`) and
   shared back-office permissions in `internal/platform/authz/permissions.go`;
-  routes use `authz.Require`. Never check role strings ad hoc in handlers.
+  routes use `authzhttp.Require`. Never check role strings ad hoc in handlers.
 - Object-level checks use `authz.Subject` (explicit permissions, tenant, owner,
   cross-tenant flag, attributes) with `Policy`/`PolicySet`, `TenantPolicy`, and
   `OwnerPolicy`. `Authorize` runs an RBAC pre-check, then deny-overrides
-  evaluation: deny is `403 permission.denied`, conceal is `404`.
+  evaluation: deny is `403 permission.denied`, conceal is `404`. With no
+  subject, only an `authz.SystemContext` (trusted background caller) is
+  allowed; any other subject-less call is `403` (fail closed).
 
 ## Tenants
 
@@ -325,7 +327,7 @@ flowchart TD
 | Route group | Contract |
 |---|---|
 | `/api/v1/webhooks/endpoints`, `/deliveries`, `/inbound-sources` | `webhooks:read` / `webhooks:write` (`admin` role). Endpoint/source create return a plaintext `secret` once; `rotate-secret` returns the new one once; reads never include it. |
-| Mutations | Create/update/delete, `rotate-secret`, and delivery replay are Tier 2: a required `audit.Guard` intent is written first (`503 system.audit_unavailable` changes nothing). The domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`, `webhook.delivery.replayed`) is recorded as its child. Update/delete/replay accept `Idempotency-Key`. |
+| Mutations | Create/update/delete, `rotate-secret`, and delivery replay are Tier 2: a required `audithttp.Guard` intent is written first (`503 system.audit_unavailable` changes nothing). The domain event (`webhook.endpoint.*`, `webhook.inbound_source.*`, `webhook.delivery.replayed`) is recorded as its child. Update/delete/replay accept `Idempotency-Key`. |
 | Delivery list | Filters `endpointId`, `status=pending|succeeded|dead`, cursor `limit`/`startingAfter`. `GET /deliveries/:id` includes the payload snapshot; lists omit it. |
 | Replay | `POST /deliveries/:id/replay` creates a new delivery with the endpoint's current URL and active secret; `201`. |
 | Outbound requests | At-least-once. Headers `X-Webhook-Id`, `X-Webhook-Delivery` (dedupe key), `X-Webhook-Event`, `X-Webhook-Timestamp`, `X-Webhook-Signature: v1=<hex>`, `X-Webhook-Attempt`. HMAC-SHA256 over `<X-Webhook-Id>.<timestamp>.<X-Webhook-Event>.<raw-body>`. |
@@ -409,7 +411,7 @@ successful no-op; admin send returns `notification: null`,
   tenant (id 1); others get `403 permission.denied`.
 - Reads require `admin:features:read`; mutations require
   `admin:features:write`, accept `Idempotency-Key`, and use a required
-  `audit.Guard`.
+  `audithttp.Guard`.
 - A route gated by a disabled flag returns `404 feature.disabled`.
 
 ## Compatibility checklist

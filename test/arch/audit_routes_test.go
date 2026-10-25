@@ -10,6 +10,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 )
 
 // tier1Audit names the module whose service records a Tier 1 route's audit
@@ -45,14 +46,14 @@ var tier1Mutations = map[string]tier1Audit{
 	"POST /api/v1/admin/api-keys/:id/rotate": {"apikeys", "api_key.rotated"},
 }
 
-// auditPackage identifies audit.Guard by full import path.
-const auditPackage = "internal/platform/audit"
+// auditPackage identifies audithttp.Guard by full import path.
+const auditPackage = "internal/platform/audit/audithttp"
 
 // tier1Recorders are the in-transaction audit calls a Tier 1 service uses.
 var tier1Recorders = []string{"audit.RecordInTx(", ".RecordTx("}
 
 // TestTier1RoutesRecordInTransaction makes the Tier 1 exemption verifiable:
-// a route may skip audit.Guard only if the owning module has a non-test
+// a route may skip audithttp.Guard only if the owning module has a non-test
 // source file that both names the route's action literal and calls
 // RecordInTx/RecordTx. This is a source grep, not a call-graph proof: it
 // catches a renamed action, a removed in-transaction write, or a wrong owner,
@@ -115,8 +116,8 @@ func containsAny(s string, needles []string) bool {
 }
 
 // fallbackAudited are existing mutating routes that are neither Tier 1 nor
-// wrapped by audit.Guard. They are recorded only by the best-effort global
-// audit.Middleware (plus, for the receiver, a best-effort service event), so
+// wrapped by audithttp.Guard. They are recorded only by the best-effort global
+// audithttp.Middleware (plus, for the receiver, a best-effort service event), so
 // an unavailable audit store does not fail them. Privileged mutations must be
 // Tier 1 or guarded; only non-privileged writes belong here.
 var fallbackAudited = map[string]bool{
@@ -149,7 +150,7 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 		if _, tier1 := tier1Mutations[key]; tier1 {
 			seenTier1[key] = true
 			if handlerChainHas(route, auditPackage, "Guard") {
-				t.Errorf("Tier 1 route %s must not also carry audit.Guard (double intent row)", key)
+				t.Errorf("Tier 1 route %s must not also carry audithttp.Guard (double intent row)", key)
 			}
 			continue
 		}
@@ -176,7 +177,7 @@ func TestEveryMutatingRouteIsTier1OrGuarded(t *testing.T) {
 }
 
 // guardedRouteProblem returns why a mutating route that is neither Tier 1
-// nor fallback-audited breaks the audit rule, or "". audit.Guard must run
+// nor fallback-audited breaks the audit rule, or "". audithttp.Guard must run
 // before the final handler (otherwise it never wraps the mutation) and after
 // idempotency when the route has one (so replays are not audited again).
 func guardedRouteProblem(route fiber.Route) string {
@@ -189,17 +190,17 @@ func guardedRouteProblem(route fiber.Route) string {
 	}
 	switch {
 	case guardIndex < 0:
-		return "is neither Tier 1 nor wrapped by audit.Guard"
+		return "is neither Tier 1 nor wrapped by audithttp.Guard"
 	case !handlerBeforeFinal(route, auditPackage, "Guard"):
-		return "runs audit.Guard only after its final handler; move it before the handler"
+		return "runs audithttp.Guard only after its final handler; move it before the handler"
 	case idempotencyIndex > guardIndex:
-		return fmt.Sprintf("must run idempotency before audit.Guard (idempotency=%d guard=%d)", idempotencyIndex, guardIndex)
+		return fmt.Sprintf("must run idempotency before audithttp.Guard (idempotency=%d guard=%d)", idempotencyIndex, guardIndex)
 	}
 	return ""
 }
 
 func TestGuardedRouteProblem(t *testing.T) {
-	guard := audit.Guard(audit.Noop{}, audit.Policy{})
+	guard := audithttp.Guard(audit.Noop{}, audithttp.Policy{})
 	cases := map[string]struct {
 		handlers []fiber.Handler
 		ok       bool

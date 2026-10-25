@@ -1,4 +1,4 @@
-package audit
+package audithttp
 
 import (
 	"context"
@@ -12,16 +12,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type recordingRecorder struct {
-	events []Event
+	events []audit.Event
 	err    error
 }
 
-func (r *recordingRecorder) Record(_ context.Context, event Event) error {
+func (r *recordingRecorder) Record(_ context.Context, event audit.Event) error {
 	r.events = append(r.events, event)
 	return r.err
 }
@@ -63,7 +65,7 @@ func TestMiddleware_MergesHandlerMetadata(t *testing.T) {
 	app := fiber.New()
 	app.Use(Middleware(recorder))
 	app.Post("/admin/api-keys", func(c fiber.Ctx) error {
-		fiber.Locals[map[string]any](c, MetadataLocalKey, map[string]any{
+		fiber.Locals[map[string]any](c, audit.MetadataLocalKey, map[string]any{
 			"apiKeyId":   int64(5),
 			"apiKeyName": "deploy",
 			"scopes":     []string{"files:read"},
@@ -90,7 +92,7 @@ func TestMiddleware_RecordsResolvedTenant(t *testing.T) {
 	})
 
 	app := fiber.New()
-	app.Use(tenant.Middleware(resolver, "default"))
+	app.Use(tenanthttp.Middleware(resolver, "default"))
 	app.Use(Middleware(recorder))
 	app.Post("/tenant/things/:id", func(c fiber.Ctx) error {
 		return c.SendStatus(fiber.StatusNoContent)
@@ -163,14 +165,6 @@ func TestMiddleware_SkipsGuardedRoute(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusNoContent, resp.StatusCode)
 	assert.Empty(t, recorder.events, "a Guard-owned route must not also use the global fallback")
-}
-
-func TestNoopIsNotAnIntentRecorder(t *testing.T) {
-	var recorder any = Noop{}
-	_, implementsID := recorder.(IDRecorder)
-	_, implementsCompletion := recorder.(CompletionRecorder)
-	assert.False(t, implementsID)
-	assert.False(t, implementsCompletion)
 }
 
 func TestMiddleware_SkipsIdempotentReplay(t *testing.T) {

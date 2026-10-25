@@ -120,16 +120,21 @@ func (OwnerPolicy) Evaluate(subject Subject, resource Resource) Decision {
 	return Conceal
 }
 
-// Authorize performs an RBAC pre-check followed by policy evaluation using the
-// subject stored in ctx by WithSubject (normally installed by JWTAuth or the
-// API-key middleware). Deny maps to 403 permission.denied; Conceal maps to 404
-// not found. A missing subject fails closed with 403.
+// Authorize is the single service-level authorization path. With a subject in
+// ctx (installed by JWTAuth or the API-key middleware through WithSubject) it
+// performs an RBAC pre-check followed by policy evaluation: Deny maps to 403
+// permission.denied and Conceal to 404 not found. A subject always wins over
+// the system marker, so a request context can never escalate by also carrying
+// it. Without a subject, a context marked by SystemContext is allowed; any
+// other context fails closed with 403.
 func Authorize(ctx context.Context, permission Permission, resource Resource, policies ...Policy) error {
-	subject, ok := SubjectFromContext(ctx)
-	if !ok {
-		return permissionDenied()
+	if subject, ok := SubjectFromContext(ctx); ok {
+		return AuthorizeSubject(subject, permission, resource, policies...)
 	}
-	return AuthorizeSubject(subject, permission, resource, policies...)
+	if IsSystemContext(ctx) {
+		return nil
+	}
+	return permissionDenied()
 }
 
 // AuthorizeSubject is Authorize for callers that already hold a Subject.

@@ -1,4 +1,4 @@
-package authz
+package authzhttp
 
 import (
 	"encoding/json"
@@ -8,13 +8,14 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 // newTestApp builds an app whose pre-middleware copies the X-Test-Role header
 // into Fiber locals exactly as JWTAuth does in production.
 func newTestApp() *fiber.App {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		if role := c.Get("X-Test-Role"); role != "" {
 			fiber.Locals[string](c, "role", role)
@@ -84,7 +85,7 @@ func TestRequire_AllowsGrantedPermission(t *testing.T) {
 		return c.SendString("ok")
 	})
 
-	status, _, body := doGet(t, app, "/files", RoleUser)
+	status, _, body := doGet(t, app, "/files", authz.RoleUser)
 	if status != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", status, body)
 	}
@@ -98,11 +99,11 @@ func TestRequire_AllowsGrantedPermission(t *testing.T) {
 
 func TestRequire_AllowsAdminOnAdminPermission(t *testing.T) {
 	app := newTestApp()
-	app.Get("/admin/users", Require(PermissionAdminUsersRead), func(c fiber.Ctx) error {
+	app.Get("/admin/users", Require(authz.PermissionAdminUsersRead), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	status, _, body := doGet(t, app, "/admin/users", RoleAdmin)
+	status, _, body := doGet(t, app, "/admin/users", authz.RoleAdmin)
 	if status != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", status, body)
 	}
@@ -111,12 +112,12 @@ func TestRequire_AllowsAdminOnAdminPermission(t *testing.T) {
 func TestRequire_DeniesUserOnAdminPermission(t *testing.T) {
 	app := newTestApp()
 	called := false
-	app.Get("/admin/users", Require(PermissionAdminUsersRead), func(c fiber.Ctx) error {
+	app.Get("/admin/users", Require(authz.PermissionAdminUsersRead), func(c fiber.Ctx) error {
 		called = true
 		return c.SendString("ok")
 	})
 
-	status, contentType, body := doGet(t, app, "/admin/users", RoleUser)
+	status, contentType, body := doGet(t, app, "/admin/users", authz.RoleUser)
 	assertForbidden(t, status, contentType, body)
 	if called {
 		t.Error("protected handler ran despite denied permission")
@@ -151,11 +152,11 @@ func TestRequire_DeniesUnknownRole(t *testing.T) {
 func TestRequireAny_AllowsAnyGrantedPermission(t *testing.T) {
 	app := newTestApp()
 	app.Get("/either",
-		RequireAny(PermissionAdminStatsRead, testPermissionRead),
+		RequireAny(authz.PermissionAdminStatsRead, testPermissionRead),
 		func(c fiber.Ctx) error { return c.SendString("ok") },
 	)
 
-	status, _, body := doGet(t, app, "/either", RoleUser)
+	status, _, body := doGet(t, app, "/either", authz.RoleUser)
 	if status != fiber.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", status, body)
 	}
@@ -165,14 +166,14 @@ func TestRequireAny_DeniesWhenNoPermissionMatches(t *testing.T) {
 	app := newTestApp()
 	called := false
 	app.Get("/either",
-		RequireAny(PermissionAdminStatsRead, PermissionAdminUsersRole),
+		RequireAny(authz.PermissionAdminStatsRead, authz.PermissionAdminUsersRole),
 		func(c fiber.Ctx) error {
 			called = true
 			return c.SendString("ok")
 		},
 	)
 
-	status, contentType, body := doGet(t, app, "/either", RoleUser)
+	status, contentType, body := doGet(t, app, "/either", authz.RoleUser)
 	assertForbidden(t, status, contentType, body)
 	if called {
 		t.Error("protected handler ran despite no matching permission")
@@ -183,14 +184,14 @@ func TestRequireAny_EmptyListDeniesEvenAdmin(t *testing.T) {
 	app := newTestApp()
 	app.Get("/either", RequireAny(), func(c fiber.Ctx) error { return c.SendString("ok") })
 
-	status, contentType, body := doGet(t, app, "/either", RoleAdmin)
+	status, contentType, body := doGet(t, app, "/either", authz.RoleAdmin)
 	assertForbidden(t, status, contentType, body)
 }
 
 func TestRequireAny_DeniesMissingRole(t *testing.T) {
 	app := newTestApp()
 	app.Get("/either",
-		RequireAny(testPermissionWrite, PermissionAdminStatsRead),
+		RequireAny(testPermissionWrite, authz.PermissionAdminStatsRead),
 		func(c fiber.Ctx) error { return c.SendString("ok") },
 	)
 
@@ -199,15 +200,15 @@ func TestRequireAny_DeniesMissingRole(t *testing.T) {
 }
 
 func TestRequire_UsesExplicitSubjectScopes(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		// An administrator's API key limited to files:read must not inherit the
 		// administrator role catalog.
-		SetSubject(c, NewSubjectWithPermissions(1, 1, RoleAdmin, testPermissionRead))
+		SetSubject(c, authz.NewSubjectWithPermissions(1, 1, authz.RoleAdmin, testPermissionRead))
 		return c.Next()
 	})
 	app.Get("/files", Require(testPermissionRead), func(c fiber.Ctx) error { return c.SendString("ok") })
-	app.Get("/admin", Require(PermissionAdminUsersRead), func(c fiber.Ctx) error { return c.SendString("ok") })
+	app.Get("/admin", Require(authz.PermissionAdminUsersRead), func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	status, _, body := doGet(t, app, "/files", "")
 	if status != fiber.StatusOK {

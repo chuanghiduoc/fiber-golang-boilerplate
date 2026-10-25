@@ -256,7 +256,7 @@ audited in two tiers:
 | Tier | Mechanism | Failure behavior | Used by |
 | --- | --- | --- | --- |
 | 1 | The service writes a terminal event with `RecordTx` inside the mutation transaction. A successful write marks the request so the fallback middleware does not write a second row. | Insert failure rolls the mutation back and returns `503 system.audit_unavailable`; a service built without a recorder fails closed the same way. | Identity registration/profile/password/delete, admin role/ban/unban, admin file delete/restore. |
-| 2 | `audit.Guard` runs after idempotency, inserts an `outcome=started`, `source=http` intent row before the handler, then completes it as `succeeded`, `failed`, or `denied` with the HTTP status/error code. | A required guard returns the same 503 when the intent cannot be stored, so the handler never runs unaudited. Completion failures are counted and leave a stale `started` row; they cannot roll back a committed mutation. | Guarded routes, for example `POST /notifications/send`. |
+| 2 | `audithttp.Guard` runs after idempotency, inserts an `outcome=started`, `source=http` intent row before the handler, then completes it as `succeeded`, `failed`, or `denied` with the HTTP status/error code. | A required guard returns the same 503 when the intent cannot be stored, so the handler never runs unaudited. Completion failures are counted and leave a stale `started` row; they cannot roll back a committed mutation. | Guarded routes, for example `POST /notifications/send`. |
 
 - Idempotent replays are not audited again, and audit rows are never cached
   with the idempotency response.
@@ -267,7 +267,7 @@ audited in two tiers:
   crafted header cannot fail the insert (which would turn guarded mutations
   into 503s). Metadata strings in the `jsonb` column drop invalid UTF-8 and NUL
   bytes the same way.
-- A zero `audit.Policy` mode means `ModeRequired`; best-effort guards must
+- A zero `audithttp.Policy` mode means `ModeRequired`; best-effort guards must
   opt in with `ModeBestEffort`.
 - `audit_events` is append-only: only a started HTTP intent can move to a
   terminal outcome, only completion fields may change, and `DELETE`/`TRUNCATE`
@@ -282,9 +282,9 @@ audited in two tiers:
 
 ## 4. Background jobs
 
-`internal/platform/jobs` is a PostgreSQL-backed durable queue. The API hosts
-the worker in-process; every replica runs one with concurrency 4. Claims use
-`FOR UPDATE SKIP LOCKED`, so multiple replicas are safe. Delivery is
+`internal/platform/jobs` is a PostgreSQL-backed durable queue. Every process
+whose `APP_ROLE` runs the worker hosts one in-process with concurrency 4.
+Claims use `FOR UPDATE SKIP LOCKED`, so multiple replicas are safe. Delivery is
 **at-least-once**, never exactly-once: expect duplicate emails and side
 effects, and keep handlers idempotent.
 
@@ -294,6 +294,8 @@ effects, and keep handlers idempotent.
 | Dedupe | `EnqueueOnce`/`EnqueueOnceTx` use the nullable `jobs.idempotency_key` with a partial unique `(tenant_id, idempotency_key)` index. A duplicate returns the existing id and inserts nothing, so producer and event fan-out retries cannot create a second row. Plain `Enqueue` does not dedupe. Terminal rows keep their key until retention removes them. |
 | Global passes | Claim, lease recovery, and purge are global, so the only tenant-leading jobs index is the dedupe key; ad-hoc per-tenant inspection scans `idx_jobs_status_run_at`. Retention and metric labels (`kind` only) are deliberately global to avoid cardinality growth. |
 | Tracing | Enqueue stores the active W3C `traceparent` in `jobs.trace_parent` when the caller has a recording span. Each attempt runs as a new-root `job.process` span linked to the enqueue span, with `job.id`, `job.kind`, tenant, attempt, and outcome attributes; database spans nest under it. `NULL`/malformed traceparents are ignored. See [Tracing](tracing.md) and [Jobs `trace_parent`](#jobs-trace_parent). |
+| Process role | `APP_ROLE=all` (default) serves the API and runs the worker, the scheduler, and module background loops. `api` serves HTTP only: it enqueues jobs but never claims them, so some `worker`/`all` process must run. `worker` runs the worker, scheduler, and background loops, and its listener serves only `/healthz`, `/readyz` (database and cache), and `/metrics`. Every role registers the same job handlers. |
+| Authorization | Module (`JobProvider`) and durable-event handlers run under `authz.SystemContext`, so `authz.Authorize` allows their subject-less calls; without it they would be denied (fail closed). |
 | Identity | Worker and scheduler identities (`locked_by`, lease `holder`) are `<hostname>-<pid>-<random>`, so replicas with the same hostname never share one. |
 
 ### Lifecycle and retries
@@ -306,6 +308,7 @@ stateDiagram-v2
     running --> succeeded: handler returns nil (payload cleared)
     running --> queued: handler error, attempts remain (backoff 1s doubling, max 1h)
     running --> dead: handler error, attempts exhausted (payload cleared)
+    running --> dead: jobs.Permanent error (payload cleared, not retried)
     running --> queued: worker shutdown interrupts handler (attempt given back)
     running --> queued: lease_expires_at < now(), attempts remain (reclaimed by any worker)
     running --> dead: lease_expires_at < now() on final attempt
@@ -318,6 +321,7 @@ stateDiagram-v2
 | Attempts | `attempts` increments at claim time; `max_attempts` defaults to 10. |
 | Retry backoff | Exponential, 1s doubling, capped at 1h, while `attempts < max_attempts`. |
 | Dead letter | Budget exhausted: the job becomes `dead` and its payload is cleared. |
+| Permanent failure | A handler error wrapped with `jobs.Permanent(err)` dead-letters on that attempt; `last_error` starts with `permanent failure (not retried): ` and `jobs_dead_total{kind}` counts it. Used for undecodable or invalid payloads (email, password-reset request, webhook dispatch/delivery). Decryption failures are **not** permanent: a replica missing a key another one already seals with retries until the rollout completes. |
 | Unknown kind | Follows the same retry path, so a rollout can register the handler before pending work dies; a permanently missing handler eventually dead-letters. |
 | Handler timeout | 10m by default. A timeout is a normal failure that consumes the attempt. Cancellation is cooperative: a handler that ignores its context keeps running and heartbeating, and one that still returns success after its deadline is recorded as succeeded with a warning. |
 | Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt). The crashed attempt counts. The previous owner may still be executing, so concurrent duplicate execution is possible. |
@@ -346,6 +350,13 @@ is the row's `lease_expires_at`, written by the owning worker, so a
 short-lease worker never reclaims its healthy jobs. Register a handler for every kind a worker claims, and make sure
 every kind is claimed by some worker: an excluded kind with no dedicated worker
 waits in the queue.
+
+`cmd/api` applies the same filters from `JOBS_WORKER_KINDS` and
+`JOBS_WORKER_EXCLUDE_KINDS` (comma-separated; a kind in both lists fails
+startup). A typical bulkhead runs one `APP_ROLE=worker` deployment with
+`JOBS_WORKER_KINDS=webhook.delivery` and the general workers with
+`JOBS_WORKER_EXCLUDE_KINDS=webhook.delivery`. On Kubernetes, start from the
+optional `deploy/k8s/base/worker/` component.
 
 ### Notification email
 
@@ -406,32 +417,50 @@ another reset email) instead of updating dead rows back to `queued`.
 | Index | `idx_refresh_tokens_expires_at`; the one-row-per-user reset and verification tables are small enough without one. |
 | Tenancy | A deliberate cross-tenant maintenance pass (the only identity queries without a `tenant_id` predicate). |
 
-### Draining and JWT rotation
+### Key rotation
 
-`JWT_SECRET` also derives the AES-256-GCM key that seals queued email
-payloads. Rotating it:
+Signing and encryption use separate keys, each with a verify/decrypt-only
+previous list. Listing the active key as a previous key fails startup.
 
-1. invalidates existing access tokens (they must be reissued);
-2. makes encrypted jobs already in `jobs` undecryptable.
+| Key | Previous list | Protects | Old key can be dropped when |
+| --- | --- | --- | --- |
+| `JWT_SECRET` | `JWT_PREVIOUS_SECRETS` | Access tokens. Each token's `kid` header (a fingerprint of the signing secret) selects the verification key; an unknown `kid` is rejected. | Every token it signed has expired (`JWT_EXPIRE_HOUR`). Tokens without a `kid` (issued before kid headers) verify against the active secret only, so they fail as soon as their secret stops being active. |
+| `DATA_ENCRYPTION_KEY` | `DATA_ENCRYPTION_PREVIOUS_KEYS` | Email and password-reset job payloads (envelope v2 names the sealing `kid`; v1 envelopes are tried against every key). | No `queued`/`running` job is still sealed with it. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | Stored endpoint/source secrets and delivery snapshots. Rows keep the key that sealed them. | Every endpoint and source secret has been rotated (re-sealed) and no pending delivery snapshot uses it. See [Secrets and key rotation](#secrets-and-key-rotation). |
 
-Refresh tokens are opaque database rows, not JWTs, so rotation does **not**
-revoke them; a valid refresh token can mint a new access token signed with the
-new secret. To force a full re-login, revoke refresh tokens (or bump the
-user's token version) separately. The queue drain is still required because of
-the encrypted payloads: a rolling update that mixes secrets lets a worker claim
-a job it cannot decrypt.
+Rotation is two-phase, so no replica ever sees a key it cannot verify or
+decrypt:
 
-1. Stop new email-producing traffic (or pause the producer) and watch `queued`
-   and `running` counts until both are zero.
-2. Suspend/delete the HPA and scale the Deployment to 0 so no worker runs
-   during the swap. Do not rely on a rolling update for this rotation.
-3. Update the Secret and scale the Deployment back up.
-4. Verify `/readyz`, then run a registration/reset flow and confirm its job
-   reaches `succeeded`.
+```mermaid
+flowchart LR
+    A["Phase 1: add NEW to the<br/>previous list on every replica<br/>(rollout complete)"] --> B["Phase 2: NEW becomes active,<br/>OLD moves to the previous list<br/>(rollout complete)"]
+    B --> C{"Old tokens expired /<br/>old jobs drained /<br/>rows re-sealed?"}
+    C -- no --> C
+    C -- yes --> D["Phase 3: remove OLD<br/>from the previous list"]
+```
 
-If draining is impossible, expect failures and inspect `dead` rows afterwards;
-recovery means re-triggering the user flow, not requeueing the old row. See the
-JWT rotation notes in [deploy/k8s/README.md](../deploy/k8s/README.md).
+Skipping phase 1 lets a replica that has not restarted yet reject tokens (or
+fail to open jobs) produced by an updated replica. A job it cannot decrypt
+retries rather than dead-lettering, but only until `max_attempts`.
+
+JWT notes:
+
+- Refresh tokens are opaque database rows, not JWTs: rotation does not revoke
+  them, and a valid refresh token mints an access token with the new key. To
+  force a full re-login, revoke refresh tokens or bump users' token version.
+- Google OAuth `state` is HMAC-signed with a key derived from the **active**
+  `JWT_SECRET` only, so sign-ins started before the swap fail once and must be
+  restarted.
+- A leaked key needs no two-phase care: make the new key active, drop the
+  leaked one immediately, and accept that every session signed with it ends.
+
+Upgrading from a release where job payloads were sealed with a
+`JWT_SECRET`-derived key: set a dedicated `DATA_ENCRYPTION_KEY` (32+
+characters, different from `JWT_SECRET`) and put the current `JWT_SECRET`
+value in `DATA_ENCRYPTION_PREVIOUS_KEYS`; the same HKDF derivation reproduces
+the old key, so queued v1 envelopes still open. Remove it once those jobs have
+drained. Roll out every worker before relying on it: workers from before
+envelope v2 cannot open v2 payloads and retry them until `max_attempts`.
 
 ### Inspecting jobs
 
@@ -494,8 +523,8 @@ the worker runs; the app does this after all `EventProvider` modules register.
 
 ### Scheduler
 
-`internal/platform/scheduler` runs in-process in every API replica when
-enabled. Only the holder of the single `scheduler_leases` row evaluates
+`internal/platform/scheduler` runs in-process in every replica whose
+`APP_ROLE` runs the worker (`all` or `worker`) when enabled. Only the holder of the single `scheduler_leases` row evaluates
 schedules; `scheduler_runs` is the unique `(schedule, scheduled_for)` ledger.
 
 ```mermaid
@@ -661,19 +690,27 @@ instead of bulk-editing state.
 
 Outbound endpoint secrets (`whsec_...`) and inbound source secrets
 (`whin_...`) are sealed with AES-256-GCM using
-`WEBHOOK_SECRET_ENCRYPTION_KEY`; local/test fall back to `JWT_SECRET`, while
-production **requires** a dedicated key of at least 32 characters.
+`WEBHOOK_SECRET_ENCRYPTION_KEY`; outside production an empty key falls back to
+`JWT_SECRET`, while production **requires** a dedicated key of at least 32
+characters. Envelopes (v2) record the sealing key's `kid`; v1 envelopes are
+tried against every configured key.
 
-Rotating that key makes every stored webhook secret unreadable, so plan it as a
-secret reset:
+Rotating the encryption key follows the two-phase procedure in
+[Key rotation](#key-rotation) with `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`:
 
-1. Announce a receiver maintenance window.
-2. Deploy the new encryption key.
-3. Rotate every endpoint and inbound source secret; deliver the new plaintext
-   values to the owners.
-4. Expect in-flight outbound deliveries sealed under the old key to become
-   `dead` with a decryption error; replay them after rotation if needed.
-5. Inbound requests fail `401` until their senders use the new secrets.
+1. Add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` on every
+   replica.
+2. Make it `WEBHOOK_SECRET_ENCRYPTION_KEY` and move the old key to the
+   previous list. New and rotated secrets are sealed with the new key; stored
+   rows keep the key that sealed them and still decrypt.
+3. Rotate endpoint and inbound source secrets over time (each rotation
+   re-seals with the active key and returns a new plaintext secret to deliver
+   to its owner).
+4. Remove the old key only when no endpoint, source, or pending delivery
+   snapshot is still sealed with it; a row whose key is gone fails decryption.
+
+Workers from before envelope v2 cannot open secrets sealed by an updated
+replica, so finish the rollout before creating or rotating webhook secrets.
 
 Endpoint secret rotation is safe for in-flight work because queued deliveries
 keep their snapshot. Inbound rotation is immediate: the old secret stops
@@ -871,6 +908,16 @@ flowchart TD
     newer --> run
 ```
 
+### Connection poolers (PgBouncer)
+
+The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
+
+| Setting | Rule |
+| --- | --- |
+| `DB_QUERY_EXEC_MODE` | `cache_statement` (default, pgx named prepared statements per connection) needs PgBouncer 1.21+ with `max_prepared_statements > 0` in transaction mode. `cache_describe` and `describe_exec` use unnamed statements and keep server-side parameter types. `exec` and `simple_protocol` are rejected at startup: without described parameter types, `[]byte` values bound to `json`/`jsonb` columns (audit metadata) are sent as `bytea` and the insert fails. |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT` (credentials, database, schema, and TLS settings are shared). golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
+| `search_path` | Sent as a startup parameter from `DB_SCHEMA`, never as a `SET` after connect (behind a transaction pooler that `SET` would land on one server connection only). Configure PgBouncer to forward it (`track_extra_parameters = search_path`, on versions that support it) or to ignore it (`ignore_startup_parameters = search_path`) and set it on the role with `ALTER ROLE ... SET search_path`. |
+
 ### Fresh installs vs deployed databases
 
 - A fresh install uses `migrations/000001_init_schema.up.sql`.
@@ -1050,7 +1097,8 @@ flowchart LR
 | NetworkPolicy probes | CNI-dependent: some CNIs allow kubelet probes regardless of policy, others drop them. If probes fail, use the commented node/node-pod CIDR rule, never `0.0.0.0/0`. A Prometheus scrape also needs the commented monitoring-namespace ingress rule. |
 | Config reload | None. `envFrom` is read at container start; after editing the ConfigMap component or Secret, run `kubectl rollout restart deployment/<name>`. |
 | Database connections | `DB_MAX_CONNS` (default 25) is per pod. Keep `DB_MAX_CONNS * maxReplicas` below the database limit: production uses 10 with HPA max 10 (at most 100 connections); staging uses 5 with max 4. |
-| Secrets | Never commit a rendered Secret. Use External Secrets, Sealed Secrets, SOPS, or the platform secret manager. |
+| Secrets | Never commit a rendered Secret. Use External Secrets, Sealed Secrets, SOPS, or the platform secret manager. Secret settings also accept `<NAME>_FILE` pointing at a mounted file (setting both forms fails startup); the list is in [`config/secretfile.go`](../config/secretfile.go). |
+| Worker split | Every pod runs `APP_ROLE=all` by default. The optional `base/worker` component (not enabled by any overlay) adds a `fiber-boilerplate-worker` Deployment with `APP_ROLE=worker` and sets `APP_ROLE=api` on the API Deployment; worker pods are not selected by the API Service, HPA, or PDB. See [deploy/k8s/README.md](../deploy/k8s/README.md#job-workers). |
 | SMTP | STARTTLS, normally port 587; implicit TLS on 465 is not supported. Set `EMAIL_DRIVER=smtp`, `SMTP_HOST`, `SMTP_PORT`, credentials, and `EMAIL_FROM_ADDRESS`. Production requires `SMTP_REQUIRE_TLS=true` and rejects `EMAIL_DRIVER=console`. A relay that does not advertise STARTTLS fails sends. |
 | Redis | `CACHE_DRIVER=redis` and `REDIS_URL` (`rediss://` when available) are required for shared rate limits, session invalidation, and idempotency across replicas. Memory cache is single-replica only and rejected in production unless `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true`. |
 
@@ -1277,12 +1325,19 @@ Symptoms: old `queued`/`running` rows, rising queue age or
 `jobs_queue_lag_seconds`, no claim activity, `jobs_claim_errors_total`
 increasing, slow requests.
 
-1. Confirm workers run. They are in-process: scaling the API to zero stops
-   processing, and a crashed pod stops its worker.
+1. Confirm workers run. They are in-process in every `APP_ROLE=all` or
+   `worker` pod: scaling those to zero stops processing (an `APP_ROLE=api` pod
+   never claims), and a crashed pod stops its worker. With
+   `JOBS_WORKER_KINDS`/`JOBS_WORKER_EXCLUDE_KINDS`, check that the stuck kind
+   is claimed by some running worker.
 2. Check PostgreSQL health and `jobs` locks; claim failures back off to 30s.
 3. Look for an unregistered kind, a poison payload, or a handler exceeding its
-   10m timeout. Unknown kinds retry until `max_attempts` before dying.
-4. Scale API replicas within the DB connection budget to add workers; do not
+   10m timeout. Unknown kinds retry until `max_attempts` before dying; invalid
+   payloads dead-letter at once (`last_error` starts with
+   `permanent failure (not retried): `). Repeated `payload decryption failed`
+   means a replica lacks a `DATA_ENCRYPTION_*` key (see
+   [Key rotation](#key-rotation)).
+4. Scale worker-running replicas within the DB connection budget; do not
    exceed `DB_MAX_CONNS * replicas`.
 5. Let lease expiry reclaim crashed work. Manual lock clearing is a last resort
    and accepts duplicate execution.

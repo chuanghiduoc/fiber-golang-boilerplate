@@ -229,6 +229,7 @@ import (
 	__MODULE__repository "__MODULE_PATH__/internal/modules/__MODULE__/repository"
 	__MODULE__service "__MODULE_PATH__/internal/modules/__MODULE__/service"
 	"__MODULE_PATH__/internal/platform/authz"
+	"__MODULE_PATH__/internal/platform/authz/authzhttp"
 	"__MODULE_PATH__/pkg/apperror"
 )
 
@@ -271,11 +272,11 @@ func (m *Module) Locales() fs.FS { return __MODULE__catalog.Locales() }
 //   RegisterV2Routes(fiber.Router, app.Deps) (app.V2Module)
 
 // RegisterRoutes mounts routes below /api/v1. Every route needs
-// authz.Require (test/arch enforces it). Mount group middleware only on a
+// authzhttp.Require (test/arch enforces it). Mount group middleware only on a
 // prefix this module owns exclusively; see docs/module-template.md.
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	group := v1.Group("/__ROUTE__", deps.Authenticate())
-	group.Get("/health", deps.Limiters.Relaxed, authz.Require(__MODULE__catalog.PermissionRead), m.handler.Health)
+	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require(__MODULE__catalog.PermissionRead), m.handler.Health)
 }
 EOF
 

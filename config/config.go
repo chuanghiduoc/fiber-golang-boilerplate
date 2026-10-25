@@ -28,11 +28,18 @@ type Config struct {
 	FeatureFlags FeatureFlagsConfig
 	Scheduler    SchedulerConfig
 	Webhook      WebhookConfig
+	// DataEncryption seals job payloads at rest.
+	DataEncryption DataEncryptionConfig
+	Jobs           JobsConfig
 }
 
 func Load() (*Config, error) {
+	environment, err := loadEnvironment()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
 	cfg := &Config{}
-	if err := env.Parse(cfg); err != nil {
+	if err := env.ParseWithOptions(cfg, env.Options{Environment: environment}); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	if err := cfg.Validate(); err != nil {
@@ -52,7 +59,11 @@ func LoadDatabase() (DBConfig, error) {
 		}
 		DB DBConfig
 	}
-	if err := env.Parse(&parsed); err != nil {
+	environment, err := loadEnvironment()
+	if err != nil {
+		return DBConfig{}, fmt.Errorf("failed to load database config: %w", err)
+	}
+	if err := env.ParseWithOptions(&parsed, env.Options{Environment: environment}); err != nil {
 		return DBConfig{}, fmt.Errorf("failed to parse database config: %w", err)
 	}
 	if err := parsed.DB.Validate(); err != nil {
@@ -87,6 +98,8 @@ func (cfg *Config) Validate() error {
 		cfg.Tenant.validate,
 		cfg.FeatureFlags.validate,
 		func() error { return cfg.Webhook.validate(cfg.App.Env, cfg.JWT.Secret) },
+		func() error { return cfg.DataEncryption.validate(cfg.App.Env, cfg.JWT.Secret) },
+		cfg.Jobs.validate,
 		cfg.App.validateBodyLimits,
 		cfg.RateLimit.validate,
 		cfg.Storage.validateMaxFileSize,

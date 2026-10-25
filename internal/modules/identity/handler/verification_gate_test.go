@@ -13,7 +13,7 @@ import (
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
 
@@ -33,7 +33,7 @@ func TestRefresh_UnverifiedEmailDoesNotConsumeToken(t *testing.T) {
 	refreshSvc := &countingRefreshService{}
 	h := NewAuthHandler(newMockService(), refreshSvc, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, true, nil)
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Post("/auth/refresh", h.Refresh)
 
 	req, err := http.NewRequest(http.MethodPost, "/auth/refresh",
@@ -69,7 +69,7 @@ func TestGoogleCallback_RequiresVerifiedEmailWhenConfigured(t *testing.T) {
 	// a Google-linked account whose address was later changed.
 	h := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, true, provider, tenants)
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", h.GoogleCallback)
 
 	state := encodeOAuthState(oauthStateKey("test-secret"), "nonce", 1)
@@ -95,7 +95,7 @@ func TestGoogleCallback_UserRegistrationGatesSignUp(t *testing.T) {
 		h.SetFeatureFlags(features.NewEvaluator(features.Options{
 			Env: map[features.Key]bool{identitycatalog.KeyUserRegistration: enabled},
 		}))
-		app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+		app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 		app.Get("/auth/google/callback", h.GoogleCallback)
 
 		state := encodeOAuthState(oauthStateKey("test-secret"), "nonce", 1)

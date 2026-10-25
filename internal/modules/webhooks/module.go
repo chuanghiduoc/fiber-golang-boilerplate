@@ -9,8 +9,8 @@ import (
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
@@ -48,14 +48,14 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// unavailable audit store rejects the change with 503. The service's
 	// domain event is recorded as a child of that intent.
 	guard := func(action, resource string) fiber.Handler {
-		return audit.Guard(deps.Audit, audit.Policy{
-			Mode:     audit.ModeRequired,
+		return audithttp.Guard(deps.Audit, audithttp.Policy{
+			Mode:     audithttp.ModeRequired,
 			Action:   action,
 			Resource: resource,
 		})
 	}
-	read := authz.Require(webhookscatalog.PermissionWebhooksRead)
-	write := authz.Require(webhookscatalog.PermissionWebhooksWrite)
+	read := authzhttp.Require(webhookscatalog.PermissionWebhooksRead)
+	write := authzhttp.Require(webhookscatalog.PermissionWebhooksWrite)
 
 	// The /webhooks prefix is shared by protected administration and the
 	// public receiver. Mount auth per route rather than on the group so the

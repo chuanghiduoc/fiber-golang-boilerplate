@@ -26,7 +26,7 @@ func TestUpload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		resp, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
+		resp, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -54,7 +54,7 @@ func TestUpload(t *testing.T) {
 		store.putErr = fmt.Errorf("disk full")
 		svc := newTestUploadService(repo, store)
 
-		_, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		if err == nil {
 			t.Fatal("expected error for storage failure")
 		}
@@ -73,7 +73,7 @@ func TestUpload(t *testing.T) {
 		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), failCreate: true}
 		svc := NewUploadService(failRepo, store)
 
-		_, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		if err == nil {
 			t.Fatal("expected error for DB failure")
 		}
@@ -112,7 +112,7 @@ func TestGetFileInfo(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		resp, err := svc.GetFileInfo(context.Background(), 1, 10)
+		resp, err := svc.GetFileInfo(systemCtx(), 1, 10)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -126,7 +126,7 @@ func TestGetFileInfo(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		_, err := svc.GetFileInfo(context.Background(), 999, 10)
+		_, err := svc.GetFileInfo(systemCtx(), 999, 10)
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -149,7 +149,7 @@ func TestGetFileInfo(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, err := svc.GetFileInfo(context.Background(), 1, 99) // wrong user
+		_, err := svc.GetFileInfo(systemCtx(), 1, 99) // wrong user
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -178,7 +178,7 @@ func TestUploadDelete(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		err := svc.Delete(context.Background(), 1, 10)
+		err := svc.Delete(systemCtx(), 1, 10)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -194,7 +194,7 @@ func TestUploadDelete(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		err := svc.Delete(context.Background(), 999, 10)
+		err := svc.Delete(systemCtx(), 999, 10)
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -213,7 +213,7 @@ func TestUploadDelete(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		err := svc.Delete(context.Background(), 1, 99) // wrong user
+		err := svc.Delete(systemCtx(), 1, 99) // wrong user
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -243,7 +243,7 @@ func TestUploadDownload(t *testing.T) {
 		}
 		store.files["10/abc.pdf"] = []byte("pdf-content")
 
-		file, reader, err := svc.Download(context.Background(), 1, 10)
+		file, reader, err := svc.Download(systemCtx(), 1, 10)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
@@ -261,7 +261,7 @@ func TestUploadDownload(t *testing.T) {
 		store := newMockStorage()
 		svc := newTestUploadService(repo, store)
 
-		_, _, err := svc.Download(context.Background(), 999, 10)
+		_, _, err := svc.Download(systemCtx(), 999, 10)
 		if err == nil {
 			t.Fatal("expected not found error")
 		}
@@ -284,7 +284,7 @@ func TestUploadDownload(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(context.Background(), 1, 99)
+		_, _, err := svc.Download(systemCtx(), 1, 99)
 		if err == nil {
 			t.Fatal("expected not-found error")
 		}
@@ -308,7 +308,7 @@ func TestUploadDownload(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(context.Background(), 1, 10)
+		_, _, err := svc.Download(systemCtx(), 1, 10)
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) || appErr.Status != 500 {
 			t.Fatalf("expected 500 storage error, got %v", err)
@@ -326,7 +326,7 @@ func TestUploadDownload(t *testing.T) {
 			StoragePath: "10/abc.pdf", MimeType: "application/pdf", Size: 100,
 		}
 
-		_, _, err := svc.Download(context.Background(), 1, 10)
+		_, _, err := svc.Download(systemCtx(), 1, 10)
 		var appErr *apperror.AppError
 		if !errors.As(err, &appErr) || appErr.Status != 404 {
 			t.Fatalf("expected 404 for a missing blob, got %v", err)
@@ -349,7 +349,7 @@ func TestUploadList(t *testing.T) {
 		repo.files[3] = &filesqlc.File{ID: 3, TenantID: 1, UserID: 20, OriginalName: "c.txt", StoragePath: "20/c.txt", MimeType: "text/plain", Size: 3}
 		repo.nextID = 4
 
-		files, hasMore, err := svc.List(context.Background(), 10, 10, "", false)
+		files, hasMore, err := svc.List(systemCtx(), 10, 10, "", false)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}

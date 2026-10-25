@@ -27,8 +27,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
@@ -139,10 +140,10 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 		"links-integration-secret", 24, false, nil, tenantRepo,
 	)
 
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	// require-header mode: password-reset and verification links must be able
 	// to complete through the validated ?tenant= fallback.
-	api := app.Group("/api/v1", tenant.Middleware(tenantResolver{repo: tenantRepo}, ""))
+	api := app.Group("/api/v1", tenanthttp.Middleware(tenantResolver{repo: tenantRepo}, ""))
 	api.Post("/auth/forgot-password", authHandler.ForgotPassword)
 	api.Post("/auth/reset-password", authHandler.ResetPassword)
 	api.Post("/auth/verify-email", authHandler.VerifyEmail)

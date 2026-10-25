@@ -16,12 +16,13 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 func newTestApp() *fiber.App {
 	return fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 }
 
@@ -372,7 +373,7 @@ func TestRequestID_Generated(t *testing.T) {
 func TestRequestID_PassthroughFromTrustedProxy(t *testing.T) {
 	// app.Test connections come from 0.0.0.0.
 	app := fiber.New(fiber.Config{
-		ErrorHandler:     apperror.FiberErrorHandler,
+		ErrorHandler:     apperrorhttp.FiberErrorHandler,
 		TrustProxy:       true,
 		TrustProxyConfig: fiber.TrustProxyConfig{Proxies: []string{"0.0.0.0"}},
 	})
@@ -396,9 +397,9 @@ func TestRequestID_PassthroughFromTrustedProxy(t *testing.T) {
 
 func TestRequestID_IgnoresUntrustedClientHeader(t *testing.T) {
 	for name, cfg := range map[string]fiber.Config{
-		"proxy trust disabled": {ErrorHandler: apperror.FiberErrorHandler},
+		"proxy trust disabled": {ErrorHandler: apperrorhttp.FiberErrorHandler},
 		"peer not in trusted proxies": {
-			ErrorHandler:     apperror.FiberErrorHandler,
+			ErrorHandler:     apperrorhttp.FiberErrorHandler,
 			TrustProxy:       true,
 			TrustProxyConfig: fiber.TrustProxyConfig{Proxies: []string{"10.0.0.1"}},
 		},

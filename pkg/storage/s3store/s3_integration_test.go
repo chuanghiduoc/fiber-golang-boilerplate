@@ -1,6 +1,6 @@
 //go:build integration
 
-package storage
+package s3store
 
 import (
 	"bytes"
@@ -16,6 +16,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 const (
@@ -63,7 +64,7 @@ func seaweedEndpoint(t *testing.T) string {
 
 // newSeaweedStorage retries because the S3 gateway logs readiness slightly
 // before the filer accepts bucket operations.
-func newSeaweedStorage(t *testing.T, endpoint, bucket string) *S3Storage {
+func newSeaweedStorage(t *testing.T, endpoint, bucket string) *Storage {
 	t.Helper()
 	cfg := config.StorageConfig{
 		Driver:      DriverSeaweedFS,
@@ -75,12 +76,12 @@ func newSeaweedStorage(t *testing.T, endpoint, bucket string) *S3Storage {
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		store, err := NewS3Storage(cfg)
+		store, err := New(cfg)
 		if err == nil {
 			return store
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("NewS3Storage: %v", err)
+			t.Fatalf("New: %v", err)
 		}
 		time.Sleep(time.Second)
 	}
@@ -125,8 +126,8 @@ func TestSeaweedFSStorageRoundTrip(t *testing.T) {
 			if err := store.Delete(ctx, key); err != nil {
 				t.Fatalf("Delete: %v", err)
 			}
-			if _, err := store.Get(ctx, key); !errors.Is(err, ErrNotFound) {
-				t.Fatalf("Get after Delete error = %v, want ErrNotFound", err)
+			if _, err := store.Get(ctx, key); !errors.Is(err, storage.ErrNotFound) {
+				t.Fatalf("Get after Delete error = %v, want storage.ErrNotFound", err)
 			}
 		})
 	}
@@ -134,7 +135,7 @@ func TestSeaweedFSStorageRoundTrip(t *testing.T) {
 
 func TestSeaweedFSStorageRejectsBadCredentials(t *testing.T) {
 	endpoint := seaweedEndpoint(t)
-	_, err := NewS3Storage(config.StorageConfig{
+	_, err := New(config.StorageConfig{
 		Driver:      DriverSeaweedFS,
 		S3Endpoint:  endpoint,
 		S3Region:    "us-east-1",
@@ -143,6 +144,6 @@ func TestSeaweedFSStorageRejectsBadCredentials(t *testing.T) {
 		S3SecretKey: "wrong-secret",
 	})
 	if err == nil {
-		t.Fatal("NewS3Storage should fail with an invalid secret key")
+		t.Fatal("New should fail with an invalid secret key")
 	}
 }

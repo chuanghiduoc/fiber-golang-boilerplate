@@ -10,12 +10,13 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 func tenantCtx(id int64) context.Context {
-	return tenant.WithID(context.Background(), id)
+	return authz.SystemContext(tenant.WithID(context.Background(), id))
 }
 
 func requireNotFound(t *testing.T, err error) {

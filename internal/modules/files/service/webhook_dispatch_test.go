@@ -27,7 +27,7 @@ func TestUploadDispatchesWebhookEvent(t *testing.T) {
 	dispatcher := &recordingWebhookDispatcher{}
 	AttachWebhookDispatcher(svc, dispatcher)
 
-	resp, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
+	resp, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestUploadDispatchesWebhookEvent(t *testing.T) {
 		t.Errorf("payload = %s, want file id", event.Data)
 	}
 
-	if err := svc.Delete(context.Background(), resp.ID, 1); err != nil {
+	if err := svc.Delete(systemCtx(), resp.ID, 1); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if len(dispatcher.events) != 2 {
@@ -62,14 +62,14 @@ func TestUserRestoreDispatchesWebhookEvent(t *testing.T) {
 	dispatcher := &recordingWebhookDispatcher{}
 	AttachWebhookDispatcher(svc, dispatcher)
 
-	resp, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
+	resp, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("image-data"), 10, "image/jpeg")
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
-	if err := svc.Delete(context.Background(), resp.ID, 1); err != nil {
+	if err := svc.Delete(systemCtx(), resp.ID, 1); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := svc.Restore(context.Background(), resp.ID, 1); err != nil {
+	if _, err := svc.Restore(systemCtx(), resp.ID, 1); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if len(dispatcher.events) != 3 {
@@ -91,10 +91,10 @@ func TestAdminDeleteAndRestoreDispatchWebhookEvents(t *testing.T) {
 	AttachAdminWebhookDispatcher(svc, dispatcher)
 	seedAdminFiles(repo, 1)
 
-	if err := svc.DeleteFile(context.Background(), 1); err != nil {
+	if err := svc.DeleteFile(systemCtx(), 1); err != nil {
 		t.Fatalf("admin delete: %v", err)
 	}
-	if _, err := svc.RestoreFile(context.Background(), 1); err != nil {
+	if _, err := svc.RestoreFile(systemCtx(), 1); err != nil {
 		t.Fatalf("admin restore: %v", err)
 	}
 	if len(dispatcher.events) != 2 {
@@ -117,7 +117,7 @@ func TestUploadWebhookFailureDoesNotFailMutation(t *testing.T) {
 	svc := newTestUploadService(repo, store)
 	AttachWebhookDispatcher(svc, &recordingWebhookDispatcher{err: errors.New("dispatch unavailable")})
 
-	if _, err := svc.Upload(context.Background(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg"); err != nil {
+	if _, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg"); err != nil {
 		t.Fatalf("upload must succeed when webhook dispatch fails: %v", err)
 	}
 	if len(store.files) != 1 {

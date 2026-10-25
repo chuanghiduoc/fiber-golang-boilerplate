@@ -16,6 +16,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
@@ -83,7 +84,7 @@ func userToken() string {
 
 func setupUploadApp() *fiber.App {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	uploadSvc := newMockUploadService()
@@ -178,7 +179,7 @@ func TestUploadHandler_Delete_NotFound(t *testing.T) {
 
 func TestUploadHandler_Upload(t *testing.T) {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	uploadSvc := newMockUploadService()
@@ -205,7 +206,7 @@ func TestUploadHandler_Upload(t *testing.T) {
 
 func TestUploadHandler_Upload_NoFile(t *testing.T) {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	uploadSvc := newMockUploadService()
@@ -225,7 +226,7 @@ func TestUploadHandler_Upload_NoFile(t *testing.T) {
 
 func TestUploadHandler_Upload_DisallowedMIME(t *testing.T) {
 	app := fiber.New(fiber.Config{
-		ErrorHandler: apperror.FiberErrorHandler,
+		ErrorHandler: apperrorhttp.FiberErrorHandler,
 	})
 
 	// Only allow image/jpeg
@@ -251,7 +252,7 @@ func TestUploadHandler_Upload_DisallowedMIME(t *testing.T) {
 }
 
 func TestUploadHandler_RejectsOversizedFile(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	uploadHandler := NewUploadHandler(newMockUploadService(), 10, []string{"text/plain; charset=utf-8"})
 	app.Post("/upload", middleware.JWTAuth("test-secret"), uploadHandler.Upload)
 

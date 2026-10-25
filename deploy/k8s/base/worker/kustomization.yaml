@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Optional split of the API and the job worker into separate Deployments.
+# Not enabled by any overlay. To enable it, add to an overlay:
+#
+#   components:
+#     - ../../base/worker
+#
+# The component adds the fiber-boilerplate-worker Deployment (APP_ROLE=worker:
+# job worker + scheduler + /healthz,/readyz,/metrics, no /api routes) and sets
+# APP_ROLE=api on the API Deployment so API pods stop claiming jobs. The
+# worker pods use their own instance label, so the API Service, HPA, and PDB
+# never select them. Apply it after the migration Job like the base.
+resources:
+  - deployment.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: fiber-boilerplate
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: APP_ROLE
+            value: api

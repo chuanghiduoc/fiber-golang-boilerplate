@@ -12,16 +12,31 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 )
+
+// QueryExecModes maps DB_QUERY_EXEC_MODE values onto pgx execution modes.
+// config validates the same names. Only modes that describe parameter types
+// are supported (see config.DBConfig.QueryExecMode).
+var QueryExecModes = map[string]pgx.QueryExecMode{
+	"cache_statement": pgx.QueryExecModeCacheStatement,
+	"cache_describe":  pgx.QueryExecModeCacheDescribe,
+	"describe_exec":   pgx.QueryExecModeDescribeExec,
+}
 
 func NewPool(ctx context.Context, dbCfg config.DBConfig, opts ...PoolOption) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(dbCfg.DSN())
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse pool config: %w", err)
 	}
+	execMode, ok := QueryExecModes[dbCfg.EffectiveQueryExecMode()]
+	if !ok {
+		return nil, fmt.Errorf("unsupported DB_QUERY_EXEC_MODE %q", dbCfg.QueryExecMode)
+	}
+	poolCfg.ConnConfig.DefaultQueryExecMode = execMode
 
 	poolCfg.MaxConns = dbCfg.MaxConns
 	poolCfg.MinConns = dbCfg.MinConns

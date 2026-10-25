@@ -19,6 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
 type fakeService struct {
@@ -111,7 +112,7 @@ func (f *fakeService) SetPreference(_ context.Context, userID int64, req dto.Upd
 }
 
 func setupHandlerApp(h *Handler) *fiber.App {
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "user_id", 10)
 		fiber.Locals[string](c, "role", "user")

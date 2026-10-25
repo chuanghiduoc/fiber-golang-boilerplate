@@ -8,6 +8,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -27,6 +28,15 @@ import (
 // minted before multi-tenancy carry no tenant claim and are rejected
 // fail-closed: deployments must rotate those tokens after upgrading.
 func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
+	return JWTAuthKeys(token.NewKeyring(secret), stores...)
+}
+
+// JWTAuthKeys is JWTAuth verifying against a keyring, so tokens signed with
+// a previous JWT secret (JWT_PREVIOUS_SECRETS) stay valid during a rotation.
+func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
+	if keys == nil {
+		panic("middleware: JWTAuthKeys requires a keyring")
+	}
 	var store session.Store
 	if len(stores) > 0 {
 		store = stores[0]
@@ -43,7 +53,7 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 			return apperror.NewUnauthorized("invalid authorization header format")
 		}
 
-		claims, err := token.Parse(parts[1], secret)
+		claims, err := keys.Parse(parts[1])
 		if err != nil {
 			return apperror.NewUnauthorized("invalid or expired token")
 		}
@@ -80,7 +90,7 @@ func JWTAuth(secret string, stores ...session.Store) fiber.Handler {
 		fiber.Locals[string](c, "email", claims.Email)
 		fiber.Locals[string](c, "role", claims.Role)
 		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
-		authz.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role))
+		authzhttp.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role))
 
 		// Services publish events with the request context, so the actor must
 		// be available there too, not only in Fiber locals.

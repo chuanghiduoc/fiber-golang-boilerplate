@@ -1,4 +1,6 @@
-package apikey
+// Package apikeyhttp is the Fiber adapter for internal/platform/apikey: the
+// Authenticate middleware that accepts an API key or delegates to JWT auth.
+package apikeyhttp
 
 import (
 	"strconv"
@@ -6,26 +8,14 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-)
-
-// APIKeyScheme is the Authorization scheme for API-key credentials.
-const APIKeyScheme = "ApiKey"
-
-// Fiber locals populated on successful API-key authentication.
-const (
-	LocalAPIKeyID   = "api_key_id"
-	LocalAuthMethod = "auth_method"
-)
-
-// Authentication methods recorded in locals/authz attributes.
-const (
-	AuthMethodAPIKey = "api_key"
-	AuthMethodJWT    = "jwt"
 )
 
 // Authenticate accepts either an API key or a JWT. Requests using
@@ -38,11 +28,11 @@ const (
 // the key's scopes intersected with the owner's current role. A key can
 // therefore never exceed its recorded scopes or the owner's current
 // permissions, even when its owner is an administrator.
-func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
+func Authenticate(jwtHandler fiber.Handler, verifier *apikey.Verifier) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		header := c.Get(fiber.HeaderAuthorization)
 		scheme, credential, ok := parseAuthorization(header)
-		if !ok || !strings.EqualFold(scheme, APIKeyScheme) {
+		if !ok || !strings.EqualFold(scheme, apikey.APIKeyScheme) {
 			// Missing headers, Bearer tokens, and unknown schemes keep their
 			// existing JWT error behavior.
 			if jwtHandler == nil {
@@ -63,7 +53,7 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 		headerSlug := strings.TrimSpace(c.Get(tenant.Header))
 		expectedTenantID := int64(0)
 		if headerSlug != "" {
-			expectedTenantID = tenant.ID(c)
+			expectedTenantID = tenanthttp.ID(c)
 		}
 
 		verified, err := verifier.Verify(c.Context(), credential, expectedTenantID)
@@ -77,14 +67,14 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 		// Mirror JWTAuth: when the key's tenant overrides a header-less
 		// default resolution, the resolved slug describes another tenant, so
 		// clear it rather than leave a misleading value for link builders.
-		resolvedTenantID := tenant.ID(c)
+		resolvedTenantID := tenanthttp.ID(c)
 		if headerSlug == "" && resolvedTenantID != 0 && resolvedTenantID != key.TenantID {
 			fiber.Locals[string](c, "tenant_slug", "")
 			c.SetContext(tenant.WithSlug(c.Context(), ""))
 		}
 
-		fiber.Locals[int64](c, LocalAPIKeyID, key.ID)
-		fiber.Locals[string](c, LocalAuthMethod, AuthMethodAPIKey)
+		fiber.Locals[int64](c, apikey.LocalAPIKeyID, key.ID)
+		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodAPIKey)
 		fiber.Locals[int64](c, "user_id", principal.ID)
 		fiber.Locals[string](c, "email", principal.Email)
 		fiber.Locals[string](c, "role", principal.Role)
@@ -92,9 +82,9 @@ func Authenticate(jwtHandler fiber.Handler, verifier *Verifier) fiber.Handler {
 		c.SetContext(tenant.WithID(c.Context(), key.TenantID))
 
 		subject := authz.NewSubjectWithPermissions(principal.ID, key.TenantID, principal.Role, effectiveScopes(principal.Role, key.Scopes)...).
-			WithAttribute(authz.AttributeAuthMethod, AuthMethodAPIKey).
+			WithAttribute(authz.AttributeAuthMethod, apikey.AuthMethodAPIKey).
 			WithAttribute(authz.AttributeAPIKeyID, strconv.FormatInt(key.ID, 10))
-		authz.SetSubject(c, subject)
+		authzhttp.SetSubject(c, subject)
 
 		// Services publish events and Tier 1 audit rows from the request
 		// context, so the actor and request metadata must be there too, exactly

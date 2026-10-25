@@ -20,6 +20,7 @@ import (
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -67,7 +68,9 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	}
 }
 
-func ownerLockCtx() context.Context { return tenant.WithID(context.Background(), tenant.DefaultID) }
+func ownerLockCtx() context.Context {
+	return authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
+}
 
 func (h *ownerLockHarness) createKey(ctx context.Context) (*apikeydto.KeyWithSecretResponse, error) {
 	return h.keys.Create(ctx, h.owner, apikeydto.CreateRequest{Name: "lock", Scopes: []string{"files:read"}})

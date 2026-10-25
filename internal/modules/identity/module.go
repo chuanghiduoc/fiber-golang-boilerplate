@@ -10,8 +10,9 @@ import (
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -61,8 +62,8 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	// handler because the OAuth callback evaluates its signed-state tenant.
 	m.auth.SetFeatureFlags(deps.Flags)
 	guard := func(action, resource string) fiber.Handler {
-		return audit.Guard(deps.Audit, audit.Policy{
-			Mode:     audit.ModeRequired,
+		return audithttp.Guard(deps.Audit, audithttp.Policy{
+			Mode:     audithttp.ModeRequired,
 			Action:   action,
 			Resource: resource,
 		})
@@ -77,7 +78,7 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	auth.Post("/logout", rl.Normal, guard("auth.logout", "auth"), m.auth.Logout)
 	// logout-all stays JWT-only: it revokes the caller's login sessions
 	// (refresh tokens + token version), which an API key does not have.
-	auth.Post("/logout-all", middleware.JWTAuth(cfg.JWT.Secret, deps.Sessions), rl.Normal, authz.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.logout_all", "auth"), m.auth.LogoutAll)
+	auth.Post("/logout-all", middleware.JWTAuthKeys(cfg.JWT.Keyring(), deps.Sessions), rl.Normal, authzhttp.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.logout_all", "auth"), m.auth.LogoutAll)
 	auth.Post("/forgot-password", rl.Strict, guard("auth.password_reset_requested", "auth"), m.auth.ForgotPassword)
 	auth.Post("/reset-password", rl.Strict, guard("auth.password_reset_completed", "auth"), m.auth.ResetPassword)
 	auth.Post("/verify-email", rl.Normal, guard("auth.email_verified", "auth"), m.auth.VerifyEmail)
@@ -90,11 +91,11 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	auth.Get("/google/callback", rl.Normal, m.auth.GoogleCallback)
 
 	users := v1.Group("/users", deps.Authenticate())
-	users.Get("/me", rl.Relaxed, authz.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
-	users.Put("/me", rl.Normal, authz.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
-	users.Put("/me/password", rl.Normal, authz.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.ChangePassword)
-	users.Get("/:id", rl.Relaxed, authz.Require(identitycatalog.PermissionProfileRead), m.users.GetByID)
-	users.Get("/", rl.Relaxed, authz.Require(authz.PermissionAdminUsersRead), m.users.List)
-	users.Put("/:id", rl.Normal, authz.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
-	users.Delete("/:id", rl.Normal, authz.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+	users.Get("/me", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
+	users.Put("/me", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
+	users.Put("/me/password", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.ChangePassword)
+	users.Get("/:id", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetByID)
+	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
+	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
+	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
 }

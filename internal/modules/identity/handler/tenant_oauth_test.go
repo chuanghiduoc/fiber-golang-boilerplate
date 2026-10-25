@@ -17,6 +17,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 )
 
@@ -104,7 +105,7 @@ func TestGoogleCallback_RejectsForgedStateEvenWithMatchingCookie(t *testing.T) {
 	tenants := &fakeTenantRepository{tenant: identitysqlc.Tenant{ID: 2, Slug: "acme", Status: "active"}}
 	h := NewAuthHandler(newMockService(), &mockRefreshTokenService{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants)
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", h.GoogleCallback)
 
 	// The pre-HMAC format: nonce.tenantID, set as both query and cookie.
@@ -162,7 +163,7 @@ func TestGoogleRedirect_AcceptsTenantQueryWhenMiddlewareIsAbsent(t *testing.T) {
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google", authHandler.GoogleRedirect)
 
 	resp, err := app.Test(oauthTestRequest(t, http.MethodGet, "/auth/google?tenant=acme"))
@@ -195,7 +196,7 @@ func TestGoogleRedirect_HeaderResolvedTenantWinsOverQuery(t *testing.T) {
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google", func(c fiber.Ctx) error {
 		fiber.Locals[int64](c, "tenant_id", 1)
 		fiber.Locals[string](c, "tenant_slug", "default")
@@ -235,7 +236,7 @@ func TestGoogleCallback_UsesStateTenantAndRejectsUnknown(t *testing.T) {
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", authHandler.GoogleCallback)
 
 	// The state names a different tenant than the cookie/state's active tenant.
@@ -270,7 +271,7 @@ func TestGoogleCallback_RejectsSuspendedTenant(t *testing.T) {
 		&mockEmailVerificationService{}, "test-secret", 24, false, googleOAuth, tenants,
 	)
 	authHandler.SetFeatureFlags(googleOAuthEnabled())
-	app := fiber.New(fiber.Config{ErrorHandler: apperror.FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Get("/auth/google/callback", authHandler.GoogleCallback)
 
 	state := encodeOAuthState(oauthStateKey("test-secret"), "nonce", 2)

@@ -1,10 +1,6 @@
 package authz
 
-import (
-	"context"
-
-	"github.com/gofiber/fiber/v3"
-)
+import "context"
 
 // Attribute keys used by the built-in policies and middleware. Attributes are
 // intentionally plain strings so modules can attach their own facts without
@@ -96,26 +92,23 @@ func SubjectFromContext(ctx context.Context) (Subject, bool) {
 	return subject, ok
 }
 
-// subjectLocalKey is the Fiber locals key used by the authentication
-// middleware. Keeping the subject in Fiber locals lets route middleware make a
-// decision without re-reading the context, while SetSubject also updates the
-// context for services and repositories.
-const subjectLocalKey = "authz_subject"
+type systemContextKey struct{}
 
-// SetSubject stores the subject in Fiber locals and the request context.
-func SetSubject(c fiber.Ctx, subject Subject) {
-	fiber.Locals[Subject](c, subjectLocalKey, subject)
-	c.SetContext(WithSubject(c.Context(), subject))
+// SystemContext marks ctx as a trusted system caller: a durable job handler,
+// the scheduler, the seeder, or another in-process worker acting for the
+// platform rather than for a user. Authorize allows such a context when it
+// carries no subject; with neither a subject nor this marker it denies (fail
+// closed).
+//
+// Never derive a system context from an HTTP request: it skips every policy.
+// Request handling authorizes through the subject installed by
+// authentication middleware.
+func SystemContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, systemContextKey{}, true)
 }
 
-// SubjectFromFiber returns the subject stored by SetSubject.
-func SubjectFromFiber(c fiber.Ctx) (Subject, bool) {
-	subject := fiber.Locals[Subject](c, subjectLocalKey)
-	// A subject is only meaningful with either a role or an explicit
-	// permission set; reject the zero value so a missing local cannot grant
-	// access through an unknown role.
-	if subject.Role == "" && subject.Permissions == nil {
-		return Subject{}, false
-	}
-	return subject, true
+// IsSystemContext reports whether ctx was marked by SystemContext.
+func IsSystemContext(ctx context.Context) bool {
+	marked, _ := ctx.Value(systemContextKey{}).(bool)
+	return marked
 }

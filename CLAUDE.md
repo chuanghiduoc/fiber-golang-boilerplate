@@ -63,7 +63,7 @@ module, and `platform`/`pkg` never import modules.
 | `cmd/migrate` | The only schema initializer/migrator |
 | `cmd/seed` | Admin seeder (schema must exist) |
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
-| `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` |
+| `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
 | `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient), files (admin), notifications (notifier), webhooks (event/dispatcher) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
@@ -88,6 +88,10 @@ PostgreSQL. Diagram: `docs/architecture.md`.
 | `docs/tracing.md` | OpenTelemetry config, span privacy rules, collector, job trace links |
 | `docs/feature-flags.md` | Catalog, precedence, cache, admin API, metrics |
 | `docs/webhooks.md` | Outbound dispatch/signing/SSRF/retries, inbound receiver, secrets |
+| `docs/adr/README.md` | Architecture Decision Records (layering, RBAC, tenancy, migrations, ...); add one for a decision that changes a boundary |
+
+`.github/CODEOWNERS` maps platform areas and each module (code, contracts,
+migrations) to its owners; keep it current when adding a module.
 
 **Dependency rules** (enforced by `test/arch`; do not weaken it)
 - A module must not import another module's internals; use
@@ -95,12 +99,27 @@ PostgreSQL. Diagram: `docs/architecture.md`.
 - `platform`/`pkg` must not import business modules.
 - One module owns each table; cross-module reads use a contract/read model.
 - `test/arch` builds every module from `internal/bootstrap` (v1 and v2 routes)
-  and fails when: a `/api/v1`/`/api/v2` route lacks `authz.Require` (explicit
-  public allowlist); a mutating route is neither Tier 1 (owning module records
-  with `RecordInTx`) nor `audit.Guard`ed; `authz.Require`/`audit.Guard` sit
-  after the final handler, or `Guard` before `Idempotency`; one module's group
-  middleware covers another module's routes (the `/admin` overlap class); or a
-  module directory is not registered in bootstrap.
+  and fails when: a `/api/v1`/`/api/v2` route lacks `authzhttp.Require`
+  (explicit public allowlist); a mutating route is neither Tier 1 (owning
+  module records with `RecordInTx`) nor `audithttp.Guard`ed;
+  `authzhttp.Require`/`audithttp.Guard` sit after the final handler, or
+  `Guard` before `Idempotency`; one module's group middleware covers another
+  module's routes (the `/admin` overlap class); or a module directory is not
+  registered in bootstrap.
+- Framework-free cores: `pkg/apperror`, `pkg/storage`, `platform/authz`,
+  `tenant`, `audit`, `apikey`, `features`, and every module `service`/
+  `repository` must not import Fiber/fasthttp, even transitively
+  (`test/arch/framework_free_test.go`). Fiber adapters live in a `<pkg>http`
+  subpackage (`apperrorhttp`, `tenanthttp`, `authzhttp`, `audithttp`,
+  `featureshttp`, `apikeyhttp`). `pkg/storage` (interface + local driver) and
+  `files/service` must not import the AWS SDK; S3/SeaweedFS is
+  `pkg/storage/s3store`, selected by `pkg/storage/drivers.New`.
+- Layering ratchet ([ADR 0002](docs/adr/0002-module-layering.md),
+  `test/arch/layering_test.go`): `service/` may not import sqlc, pgx, Fiber,
+  or the module's own `dto/`/`handler/`; `handler/` may not import
+  `repository/`, sqlc, or pgx. Existing violations are listed in
+  `test/arch/layering_allowlist.txt`, which only shrinks: never add a line,
+  delete one when its violation is fixed.
 - `TestCodeSQLOnlyTouchesOwnedTables` scans module `queries/*.sql` and inline
   SQL string literals in non-test Go under `internal/modules/**` and
   `internal/platform/**` (detected only with UPPERCASE keywords). Platform
@@ -162,7 +181,7 @@ PostgreSQL. Diagram: `docs/architecture.md`.
 - Startup checks tenant *existence* (`StartupTenants`, ignoring status)
   separately from request resolution: a suspended configured/default tenant
   must not crash `cmd/api`/`cmd/seed`; its requests return 404.
-- `tenant.Middleware` resolves `X-Tenant-Slug` (empty → `TENANT_DEFAULT_SLUG`;
+- `tenanthttp.Middleware` resolves `X-Tenant-Slug` (empty → `TENANT_DEFAULT_SLUG`;
   production requires the header). A validated `?tenant=` fallback is accepted
   only on `/auth/google`, `/auth/reset-password`, `/auth/verify-email` (the
   header wins; reset/verify links carry it). The OAuth callback is exempt and
@@ -199,7 +218,9 @@ handler/service/DTO/repository package.
 - `Deps.I18n` localizes titles and validation messages; localize a detail with
   `WithDetailKey("errors.<code>.detail", params)`. A nil bundle keeps English;
   `code`/`type`/`status`/`instance` never change.
-- Permission failures go through `authz.Require` (`permission.denied`).
+- Permission failures go through `authzhttp.Require` or `authz.Authorize`
+  (`permission.denied`). Fiber rendering lives in
+  `pkg/apperror/apperrorhttp` (`FiberErrorHandler`, `Localizer`).
 
 ## Response & Pagination
 
@@ -232,7 +253,10 @@ handler/service/DTO/repository package.
   generation-keyed invalidation. `JWTAuth` rejects a non-positive tenant and an
   explicit header that conflicts with the claim, and clears `tenant_slug` when
   the claim overrides an unresolved default. `pkg/token` pins HS256 and
-  requires `exp`. Refresh tokens are atomic single-use, tenant-scoped, and
+  requires `exp`; tokens carry a `kid` header derived from the signing secret,
+  and a `token.Keyring` (active `JWT_SECRET` + verify-only
+  `JWT_PREVIOUS_SECRETS`) picks the key by `kid` (unknown `kid` rejected;
+  tokens without one verify against the active secret only). Refresh tokens are atomic single-use, tenant-scoped, and
   version-bound; logout deletes by possession; refresh with an inactive owner
   returns 401. Login lockout counts failures per (tenant, email, IP) and locks
   the account globally only after 5x that threshold. Lockout/rate-limit cache
@@ -257,9 +281,16 @@ handler/service/DTO/repository package.
   everything). Only permissions shared by several modules (`admin:users:*`,
   `admin:files:*`, `admin:stats:read`) stay in `platform/authz`. Duplicate or
   conflicting registrations fail startup. Protect routes with
-  `authz.Require(<m>catalog.PermissionX)` behind `deps.Authenticate()` (API key
-  or JWT; API-key scopes are the subject's permissions). Only
+  `authzhttp.Require(<m>catalog.PermissionX)` behind `deps.Authenticate()`
+  (API key or JWT; API-key scopes are the subject's permissions). Only
   `POST /auth/logout-all` is JWT-only (`sessions:revoke`).
+  Service-level checks use `authz.Authorize`, the single fail-closed path: a
+  subject in ctx ⇒ permission + policies; no subject but
+  `authz.SystemContext(ctx)` ⇒ allowed; neither ⇒ `403`. A subject always wins
+  over the marker. Job handlers registered through `JobProvider` and durable
+  event handlers run under `SystemContext` (`internal/app/system_jobs.go`), as
+  does the admin seed; never derive a system context from an HTTP request.
+  apikeys `ensureCallerCanGrant` follows the same rule.
 - **Files:** repositories always pass `tenant.EffectiveID(ctx)`; services also
   compare the row's `TenantID`/`UserID` before exposing it. Uploads reject an
   invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`.
@@ -275,7 +306,10 @@ handler/service/DTO/repository package.
     together (fail-closed); otherwise the handler falls back to a post-commit
     email. Resend and email-change use a separate post-commit transaction.
   - Retries with backoff, dead-letter after `max_attempts`; unknown kinds retry
-    until then. Claim errors back off up to 30s. Handler timeout 10m
+    until then. A handler error wrapped with `jobs.Permanent(err)` dead-letters
+    immediately (`last_error` prefix `permanent failure (not retried): `); use
+    it for undecodable/invalid payloads only. Decryption failures stay
+    retryable (a replica may lack a key another already seals with). Claim errors back off up to 30s. Handler timeout 10m
     (`WithJobTimeout`, non-positive disables); a timeout is a normal failure.
   - Each row stores `lease_expires_at` = now() + the owning worker's lease
     (`WithLeaseDuration`, default 5m), set on claim and every heartbeat
@@ -296,19 +330,54 @@ handler/service/DTO/repository package.
     `WithPurgeInterval`, non-positive ignored), 5s per pass, ≤1,000-row
     batches.
   - Metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
-    `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures
-    only, not lease-expiry dead letters), `jobs_claim_errors_total`,
+    `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures,
+    permanent ones included; not lease-expiry dead letters), `jobs_claim_errors_total`,
     `jobs_purged_total`, `audit_write_failures_total`, and the
     `jobs_queue_lag_seconds{kind}` histogram (from the claim query, no extra
     query; a stalled queue shows as missing observations).
   - `jobs.WithKinds(...)`/`WithExcludeKinds(...)` filter claims for dedicated
-    workers; lease reclaim stays global. A worker must register a handler for
-    every kind it claims.
-  - Email payloads are AES-256-GCM sealed with an HKDF-SHA256 key from
-    `JWT_SECRET` (`jobs.PayloadCodec`) under kind `email.send.encrypted`; new
-    workers register both kinds and still read legacy plaintext. Old workers
-    leave encrypted jobs queued during a rolling deploy. Drain the queue
-    before rotating `JWT_SECRET`.
+    workers (`JOBS_WORKER_KINDS`/`JOBS_WORKER_EXCLUDE_KINDS`; a kind in both
+    fails startup); lease reclaim stays global. A worker must register a
+    handler for every kind it claims, and every kind needs some worker.
+  - `APP_ROLE=api|worker|all` (default `all`): `api` serves HTTP only (jobs
+    are enqueued, not processed); `worker` runs the job worker, scheduler, and
+    module background loops with only `/healthz`, `/readyz`, `/metrics`;
+    `all` does both. Optional Kubernetes component `deploy/k8s/base/worker/`
+    (not enabled by any overlay).
+  - Email and password-reset payloads are AES-256-GCM sealed
+    (`jobs.PayloadCodec`, HKDF-SHA256) with `DATA_ENCRYPTION_KEY` (required in
+    production and must differ from `JWT_SECRET`; outside production an empty
+    key falls back to `JWT_SECRET`) plus decrypt-only
+    `DATA_ENCRYPTION_PREVIOUS_KEYS`. Envelope v2 carries the sealing key's
+    `kid`; v1 (no kid) still opens by trying every key. Email uses kind
+    `email.send.encrypted`; workers register both kinds and still read legacy
+    plaintext. Workers from before v2 cannot open v2 envelopes: roll every
+    worker out before relying on new pods' sealed jobs.
+- **Keys and secrets:** `JWT_SECRET`, `DATA_ENCRYPTION_KEY`, and
+  `WEBHOOK_SECRET_ENCRYPTION_KEY` each have a `*_PREVIOUS_*` list
+  (`JWT_PREVIOUS_SECRETS`, `DATA_ENCRYPTION_PREVIOUS_KEYS`,
+  `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`) that only verifies/decrypts.
+  Rotation is two-phase: add the new key as a previous key on every replica,
+  then promote it to active and keep the old one as previous until its tokens
+  expire / its jobs drain / its rows are re-sealed. Listing the active key as
+  previous fails startup. OAuth `state` is still derived from the active
+  `JWT_SECRET` only, so in-flight Google sign-ins fail across a JWT swap.
+  Secret settings also accept `<NAME>_FILE` (`config/secretfile.go`:
+  `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DATA_ENCRYPTION_KEY`,
+  `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`,
+  `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`,
+  `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`,
+  `STORAGE_S3_SECRET_KEY`, `REDIS_URL`); setting both forms is an error.
+- **Database connections:** `DB_QUERY_EXEC_MODE` is `cache_statement`
+  (default; behind a transaction-mode PgBouncer needs 1.21+ with
+  `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; pgx's
+  `exec`/`simple_protocol` are rejected because json/jsonb `[]byte` binding
+  (audit metadata) breaks. `cmd/migrate` uses `DB_MIGRATE_HOST`/
+  `DB_MIGRATE_PORT` when set: golang-migrate holds a session advisory lock,
+  so it must bypass a transaction-mode pooler. `search_path` stays a startup
+  parameter: with PgBouncer either `track_extra_parameters = search_path` or
+  `ignore_startup_parameters = search_path` plus
+  `ALTER ROLE ... SET search_path`.
 - **Webhooks** (`docs/webhooks.md`): identity registration and file
   upload/delete/restore emit through `internal/contracts/webhooks.Dispatcher`
   (`app.Deps.Webhooks`). Dispatch writes a tenant-scoped delivery row plus a
@@ -337,7 +406,8 @@ handler/service/DTO/repository package.
   Payload has `schedule`/`scheduledFor`/`data`; key `scheduler:<name>:<slot>`.
 - **Module hooks:** `app.EventProvider`/`JobProvider`/`ScheduleProvider` run
   only when the dependency is non-nil, then durable event handlers register
-  (webhooks registers `webhook.delivery`/`webhook.dispatch` this way). Catalog
+  (webhooks registers `webhook.delivery`/`webhook.dispatch` this way); both
+  go through a registrar that wraps every handler in `authz.SystemContext`. Catalog
   hooks (`PermissionProvider`, `ErrorProvider`, `FlagProvider`,
   `LocaleProvider`) are registered by `app.RegisterCatalogs`, which `cmd/api`
   calls right after `bootstrap.Build` and before FEATURE_FLAGS validation,
@@ -346,13 +416,14 @@ handler/service/DTO/repository package.
   several modules).
 - **Audit:** privileged mutations are fail-closed. Tier 1 services call
   `audit.TxRecorder.RecordTx` in the mutation transaction (failure rolls back,
-  `503 system.audit_unavailable`); Tier 2 routes use `audit.Guard` after
+  `503 system.audit_unavailable`); Tier 2 routes use `audithttp.Guard` after
   idempotency (started intent row, completed as succeeded/failed/denied;
   webhook admin mutations and `POST /notifications/send` are Guarded).
-  `audit.Middleware` is a fallback (only the webhook receiver and a user's own
-  notification state rely on it) and skips routes that set `audit_guarded`;
-  `status`/`path` are its reserved metadata keys. A zero `audit.Policy` mode is
-  `ModeRequired` (best-effort must be explicit). Client-supplied text and
+  `audithttp.Middleware` is a fallback (only the webhook receiver and a user's
+  own notification state rely on it) and skips routes that set
+  `audit_guarded`; `status`/`path` are its reserved metadata keys. A zero
+  `audithttp.Policy` mode is `audithttp.ModeRequired` (best-effort must be
+  explicit). Client-supplied text and
   metadata are sanitized before storage (invalid UTF-8 → U+FFFD in text
   columns, dropped in `jsonb`; NUL stripped). Use `audit.NewServiceEvent`;
   never put secrets or PII in metadata.
@@ -379,8 +450,9 @@ handler/service/DTO/repository package.
   `tenant.EffectiveID(ctx)` and invalidates the local snapshot after writes.
 - **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate;
   never span modules (use jobs/events).
-- **Drivers:** storage `local|s3|seaweedfs` (S3 via aws-sdk-go-v2), cache
-  `memory|redis`, email `console|smtp`, chosen by config factories.
+- **Drivers:** storage `local|s3|seaweedfs` (`pkg/storage/drivers.New`; S3 via
+  aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis`, email
+  `console|smtp`, chosen by config factories.
 - **Rate limits:** tiered, cache-backed; authenticated requests keyed per user,
   unauthenticated per IP.
 - **Idempotency** (`docs/operations.md` flowchart): opt-in `Idempotency-Key`
@@ -407,12 +479,16 @@ handler/service/repository/dto, `queries/<name>.sql`, a `sqlc.yaml` block, and
 `README.md`, then builds, vets, and tests the module.
 
 1. Register it in `internal/bootstrap/modules.go` (`<name>.Build(infra)` in
-   `List`, passing only contracts from earlier modules). This is the only
+   `List`, passing only contracts from earlier modules). Module-owned
+   configuration goes in a module `Settings` struct that `bootstrap.Build(cfg,
+   infra)` fills from its own `config` section (as identity, files, and
+   webhooks do); `app.Infra.Platform` carries only App, JWT, and Tenant. This is the only
    central edit: catalogs self-register through the catalog providers, and
    jobs/events/schedules through `JobProvider`/`EventProvider`/
    `ScheduleProvider`. Add `RegisterV2Routes` only for a breaking v2 surface.
 2. Keep handler/service/repository/DTO/catalog inside the module; protect
-   every route with `authz.Require`.
+   every route with `authzhttp.Require`; keep `service/` free of sqlc, pgx,
+   Fiber, and `dto/` (layering ratchet).
 3. Name tables `<name>`/`<name>_*` (or add them to the `test/arch` table
    ownership list); queries must not touch other modules' tables. Run
    `make sqlc-generate`.
@@ -431,3 +507,6 @@ handler/service/repository/dto, `queries/<name>.sql`, a `sqlc.yaml` block, and
   `cmd/migrate` first; platform integration tests use that database as-is).
 - Run `go test -race ./...` before merging.
 - Architecture tests live in `test/arch`.
+- Identity service tests set `bcryptCost = bcrypt.MinCost` in
+  `internal/modules/identity/service/main_test.go`; production hashes use cost
+  12. Use `bcrypt.MinCost` for fixture hashes in tests.
