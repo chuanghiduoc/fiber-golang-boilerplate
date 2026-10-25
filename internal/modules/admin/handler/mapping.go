@@ -15,6 +15,7 @@ func toUserResponse(user identitycontracts.User) admindto.UserResponse {
 		Email:            user.Email,
 		Name:             user.Name,
 		Role:             user.Role,
+		Roles:            user.Roles,
 		MembershipStatus: user.MembershipStatus,
 		EmailVerified:    user.EmailVerified,
 		HasPassword:      user.HasPassword,

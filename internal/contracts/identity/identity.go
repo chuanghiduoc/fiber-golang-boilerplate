@@ -19,6 +19,8 @@ type User struct {
 	Email string
 	Name  string
 	Role  string
+	// Roles lists every role assigned in the tenant.
+	Roles []string
 	// MembershipStatus is "active", "suspended" (banned), or "removed".
 	MembershipStatus string
 	EmailVerified    bool
@@ -44,15 +46,18 @@ type UserStats struct {
 }
 
 // Principal is the identity-owned view needed to authenticate a request on
-// behalf of an API key's owner: an active membership (ID is the user, Role
-// the membership role). It intentionally excludes credentials and session
-// fields.
+// behalf of an API key's owner: an active membership with its effective
+// permissions. It intentionally excludes credentials and session fields.
 type Principal struct {
 	ID       int64
 	TenantID int64
 	Email    string
 	Name     string
 	Role     string
+	// Permissions is the owner's effective permission set in TenantID.
+	Permissions []string
+	// Platform is true when the owner holds a platform role assignment.
+	Platform bool
 	// TenantStatus is TenantStatusActive for every tenant state that serves
 	// requests (trialing or active) and the raw lifecycle state otherwise.
 	// API-key authentication rejects anything but TenantStatusActive.

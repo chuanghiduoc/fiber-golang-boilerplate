@@ -21,7 +21,7 @@ SET status = 'suspended', banned_at = NOW(),
     -- before the revocation, which NOW() does not guarantee.
     credentials_revoked_at = clock_timestamp()
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type BanMembershipParams struct {
@@ -36,7 +36,6 @@ func (q *Queries) BanMembership(ctx context.Context, arg BanMembershipParams) (M
 		&i.ID,
 		&i.TenantID,
 		&i.UserID,
-		&i.Role,
 		&i.Status,
 		&i.BannedAt,
 		&i.RemovedAt,
@@ -47,39 +46,41 @@ func (q *Queries) BanMembership(ctx context.Context, arg BanMembershipParams) (M
 	return i, err
 }
 
-const countActiveAdmins = `-- name: CountActiveAdmins :one
-SELECT count(*) FROM memberships m
+const countActiveOwners = `-- name: CountActiveOwners :one
+SELECT count(*) FROM membership_roles mr
+JOIN memberships m ON m.tenant_id = mr.tenant_id AND m.user_id = mr.user_id
 JOIN users u ON u.id = m.user_id
-WHERE m.tenant_id = $1 AND m.role = 'admin' AND m.status = 'active' AND u.status = 'active'
+JOIN roles r ON r.id = mr.role_id
+WHERE mr.tenant_id = $1
+  AND r.tenant_id IS NULL AND r.scope = 'tenant' AND r.key = 'owner'
+  AND m.status = 'active' AND u.status = 'active'
 `
 
-func (q *Queries) CountActiveAdmins(ctx context.Context, tenantID int64) (int64, error) {
-	row := q.db.QueryRow(ctx, countActiveAdmins, tenantID)
+func (q *Queries) CountActiveOwners(ctx context.Context, tenantID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveOwners, tenantID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
 }
 
 const createMembership = `-- name: CreateMembership :one
-INSERT INTO memberships (tenant_id, user_id, role)
-VALUES ($1, $2, $3)
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
+INSERT INTO memberships (tenant_id, user_id)
+VALUES ($1, $2)
+RETURNING id, tenant_id, user_id, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type CreateMembershipParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Role     string `json:"role"`
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
 }
 
 func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipParams) (Membership, error) {
-	row := q.db.QueryRow(ctx, createMembership, arg.TenantID, arg.UserID, arg.Role)
+	row := q.db.QueryRow(ctx, createMembership, arg.TenantID, arg.UserID)
 	var i Membership
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.UserID,
-		&i.Role,
 		&i.Status,
 		&i.BannedAt,
 		&i.RemovedAt,
@@ -115,7 +116,21 @@ func (q *Queries) EmailBannedInTenant(ctx context.Context, arg EmailBannedInTena
 }
 
 const getActiveMember = `-- name: GetActiveMember :one
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.role, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles,
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
@@ -131,6 +146,8 @@ type GetActiveMemberParams struct {
 type GetActiveMemberRow struct {
 	User        User       `json:"user"`
 	Membership  Membership `json:"membership"`
+	Role        string     `json:"role"`
+	Roles       []string   `json:"roles"`
 	HasPassword bool       `json:"has_password"`
 }
 
@@ -151,13 +168,14 @@ func (q *Queries) GetActiveMember(ctx context.Context, arg GetActiveMemberParams
 		&i.Membership.ID,
 		&i.Membership.TenantID,
 		&i.Membership.UserID,
-		&i.Membership.Role,
 		&i.Membership.Status,
 		&i.Membership.BannedAt,
 		&i.Membership.RemovedAt,
 		&i.Membership.CredentialsRevokedAt,
 		&i.Membership.CreatedAt,
 		&i.Membership.UpdatedAt,
+		&i.Role,
+		&i.Roles,
 		&i.HasPassword,
 	)
 	return i, err
@@ -165,7 +183,21 @@ func (q *Queries) GetActiveMember(ctx context.Context, arg GetActiveMemberParams
 
 const getMember = `-- name: GetMember :one
 
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.role, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles,
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
@@ -180,12 +212,15 @@ type GetMemberParams struct {
 type GetMemberRow struct {
 	User        User       `json:"user"`
 	Membership  Membership `json:"membership"`
+	Role        string     `json:"role"`
+	Roles       []string   `json:"roles"`
 	HasPassword bool       `json:"has_password"`
 }
 
 // Tenant membership queries. Every query filters by tenant_id except
 // ListUserMemberships, which global account deletion uses to visit each of
-// the user's tenants.
+// the user's tenants. role/roles are derived from membership_roles; the
+// highest system role (owner > admin > member) is the compatibility role.
 func (q *Queries) GetMember(ctx context.Context, arg GetMemberParams) (GetMemberRow, error) {
 	row := q.db.QueryRow(ctx, getMember, arg.TenantID, arg.UserID)
 	var i GetMemberRow
@@ -203,20 +238,51 @@ func (q *Queries) GetMember(ctx context.Context, arg GetMemberParams) (GetMember
 		&i.Membership.ID,
 		&i.Membership.TenantID,
 		&i.Membership.UserID,
-		&i.Membership.Role,
 		&i.Membership.Status,
 		&i.Membership.BannedAt,
 		&i.Membership.RemovedAt,
 		&i.Membership.CredentialsRevokedAt,
 		&i.Membership.CreatedAt,
 		&i.Membership.UpdatedAt,
+		&i.Role,
+		&i.Roles,
 		&i.HasPassword,
 	)
 	return i, err
 }
 
 const getMemberPrincipal = `-- name: GetMemberPrincipal :one
-SELECT u.id, m.tenant_id, u.email, u.name, m.role, m.credentials_revoked_at, t.status AS tenant_status
+SELECT u.id, m.tenant_id, u.email, u.name,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(DISTINCT p.permission_key)
+           FROM (
+               SELECT rp.permission_key
+               FROM membership_roles mr
+               JOIN roles r ON r.id = mr.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+               UNION
+               SELECT rp.permission_key
+               FROM platform_role_assignments pra
+               JOIN roles r ON r.id = pra.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE pra.user_id = m.user_id AND r.scope = 'platform'
+           ) p
+       ), '{}'::text[])::text[] AS permissions,
+       EXISTS (
+           SELECT 1 FROM platform_role_assignments pra
+           JOIN roles r ON r.id = pra.role_id
+           WHERE pra.user_id = m.user_id AND r.scope = 'platform'
+       ) AS platform,
+       m.credentials_revoked_at, t.status AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id
@@ -235,13 +301,16 @@ type GetMemberPrincipalRow struct {
 	Email                string             `json:"email"`
 	Name                 string             `json:"name"`
 	Role                 string             `json:"role"`
+	Permissions          []string           `json:"permissions"`
+	Platform             bool               `json:"platform"`
 	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
 	TenantStatus         string             `json:"tenant_status"`
 }
 
-// API-key authentication needs the owner's current role and the owning
-// tenant's status in one lookup, so a suspended tenant's keys stop working.
-// credentials_revoked_at lets the verifier reject keys created before a ban.
+// API-key authentication needs the owner's current role and effective
+// permissions plus the owning tenant's status in one lookup, so a suspended
+// tenant's keys stop working. credentials_revoked_at lets the verifier reject
+// keys created before a ban.
 func (q *Queries) GetMemberPrincipal(ctx context.Context, arg GetMemberPrincipalParams) (GetMemberPrincipalRow, error) {
 	row := q.db.QueryRow(ctx, getMemberPrincipal, arg.TenantID, arg.UserID)
 	var i GetMemberPrincipalRow
@@ -251,6 +320,8 @@ func (q *Queries) GetMemberPrincipal(ctx context.Context, arg GetMemberPrincipal
 		&i.Email,
 		&i.Name,
 		&i.Role,
+		&i.Permissions,
+		&i.Platform,
 		&i.CredentialsRevokedAt,
 		&i.TenantStatus,
 	)
@@ -258,7 +329,21 @@ func (q *Queries) GetMemberPrincipal(ctx context.Context, arg GetMemberPrincipal
 }
 
 const listActiveMembersCursor = `-- name: ListActiveMembersCursor :many
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.role, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles,
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
@@ -279,6 +364,8 @@ type ListActiveMembersCursorParams struct {
 type ListActiveMembersCursorRow struct {
 	User        User       `json:"user"`
 	Membership  Membership `json:"membership"`
+	Role        string     `json:"role"`
+	Roles       []string   `json:"roles"`
 	HasPassword bool       `json:"has_password"`
 }
 
@@ -310,13 +397,14 @@ func (q *Queries) ListActiveMembersCursor(ctx context.Context, arg ListActiveMem
 			&i.Membership.ID,
 			&i.Membership.TenantID,
 			&i.Membership.UserID,
-			&i.Membership.Role,
 			&i.Membership.Status,
 			&i.Membership.BannedAt,
 			&i.Membership.RemovedAt,
 			&i.Membership.CredentialsRevokedAt,
 			&i.Membership.CreatedAt,
 			&i.Membership.UpdatedAt,
+			&i.Role,
+			&i.Roles,
 			&i.HasPassword,
 		); err != nil {
 			return nil, err
@@ -330,7 +418,21 @@ func (q *Queries) ListActiveMembersCursor(ctx context.Context, arg ListActiveMem
 }
 
 const listMembersCursor = `-- name: ListMembersCursor :many
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.role, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles,
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
@@ -350,6 +452,8 @@ type ListMembersCursorParams struct {
 type ListMembersCursorRow struct {
 	User        User       `json:"user"`
 	Membership  Membership `json:"membership"`
+	Role        string     `json:"role"`
+	Roles       []string   `json:"roles"`
 	HasPassword bool       `json:"has_password"`
 }
 
@@ -382,13 +486,14 @@ func (q *Queries) ListMembersCursor(ctx context.Context, arg ListMembersCursorPa
 			&i.Membership.ID,
 			&i.Membership.TenantID,
 			&i.Membership.UserID,
-			&i.Membership.Role,
 			&i.Membership.Status,
 			&i.Membership.BannedAt,
 			&i.Membership.RemovedAt,
 			&i.Membership.CredentialsRevokedAt,
 			&i.Membership.CreatedAt,
 			&i.Membership.UpdatedAt,
+			&i.Role,
+			&i.Roles,
 			&i.HasPassword,
 		); err != nil {
 			return nil, err
@@ -402,31 +507,53 @@ func (q *Queries) ListMembersCursor(ctx context.Context, arg ListMembersCursorPa
 }
 
 const listUserMemberships = `-- name: ListUserMemberships :many
-SELECT id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at FROM memberships
-WHERE user_id = $1
-ORDER BY tenant_id
+SELECT m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles
+FROM memberships m
+WHERE m.user_id = $1
+ORDER BY m.tenant_id
 `
 
-func (q *Queries) ListUserMemberships(ctx context.Context, userID int64) ([]Membership, error) {
+type ListUserMembershipsRow struct {
+	Membership Membership `json:"membership"`
+	Role       string     `json:"role"`
+	Roles      []string   `json:"roles"`
+}
+
+func (q *Queries) ListUserMemberships(ctx context.Context, userID int64) ([]ListUserMembershipsRow, error) {
 	rows, err := q.db.Query(ctx, listUserMemberships, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Membership{}
+	items := []ListUserMembershipsRow{}
 	for rows.Next() {
-		var i Membership
+		var i ListUserMembershipsRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
+			&i.Membership.ID,
+			&i.Membership.TenantID,
+			&i.Membership.UserID,
+			&i.Membership.Status,
+			&i.Membership.BannedAt,
+			&i.Membership.RemovedAt,
+			&i.Membership.CredentialsRevokedAt,
+			&i.Membership.CreatedAt,
+			&i.Membership.UpdatedAt,
 			&i.Role,
-			&i.Status,
-			&i.BannedAt,
-			&i.RemovedAt,
-			&i.CredentialsRevokedAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
+			&i.Roles,
 		); err != nil {
 			return nil, err
 		}
@@ -439,7 +566,37 @@ func (q *Queries) ListUserMemberships(ctx context.Context, userID int64) ([]Memb
 }
 
 const lockMemberPrincipal = `-- name: LockMemberPrincipal :one
-SELECT u.id, m.tenant_id, u.email, u.name, m.role, m.credentials_revoked_at, t.status AS tenant_status
+SELECT u.id, m.tenant_id, u.email, u.name,
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(DISTINCT p.permission_key)
+           FROM (
+               SELECT rp.permission_key
+               FROM membership_roles mr
+               JOIN roles r ON r.id = mr.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+               UNION
+               SELECT rp.permission_key
+               FROM platform_role_assignments pra
+               JOIN roles r ON r.id = pra.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE pra.user_id = m.user_id AND r.scope = 'platform'
+           ) p
+       ), '{}'::text[])::text[] AS permissions,
+       EXISTS (
+           SELECT 1 FROM platform_role_assignments pra
+           JOIN roles r ON r.id = pra.role_id
+           WHERE pra.user_id = m.user_id AND r.scope = 'platform'
+       ) AS platform,
+       m.credentials_revoked_at, t.status AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id
@@ -459,6 +616,8 @@ type LockMemberPrincipalRow struct {
 	Email                string             `json:"email"`
 	Name                 string             `json:"name"`
 	Role                 string             `json:"role"`
+	Permissions          []string           `json:"permissions"`
+	Platform             bool               `json:"platform"`
 	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
 	TenantStatus         string             `json:"tenant_status"`
 }
@@ -476,23 +635,23 @@ func (q *Queries) LockMemberPrincipal(ctx context.Context, arg LockMemberPrincip
 		&i.Email,
 		&i.Name,
 		&i.Role,
+		&i.Permissions,
+		&i.Platform,
 		&i.CredentialsRevokedAt,
 		&i.TenantStatus,
 	)
 	return i, err
 }
 
-const lockTenantAdminChanges = `-- name: LockTenantAdminChanges :exec
-SELECT pg_advisory_xact_lock(hashtextextended('identity.last_admin', $1::bigint))
+const lockTenantOwnerChanges = `-- name: LockTenantOwnerChanges :exec
+SELECT pg_advisory_xact_lock(hashtextextended('identity.last_owner', $1::bigint))
 `
 
-// Serializes admin demotion/ban/removal per tenant for the rest of the
-// transaction. It must run before the target row is updated: the
-// protect_last_admin trigger locks the other admins' rows, and without this
-// lock two concurrent demotions each hold their own row and wait on the
-// other's (deadlock).
-func (q *Queries) LockTenantAdminChanges(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, lockTenantAdminChanges, tenantID)
+// Serializes owner demotion/ban/removal per tenant for the rest of the
+// transaction. It uses the same advisory key as the protect_last_owner
+// trigger, so concurrent changes cannot both observe a surviving owner.
+func (q *Queries) LockTenantOwnerChanges(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, lockTenantOwnerChanges, tenantID)
 	return err
 }
 
@@ -519,27 +678,25 @@ func (q *Queries) MembershipStats(ctx context.Context, tenantID int64) (Membersh
 
 const reactivateMembership = `-- name: ReactivateMembership :one
 UPDATE memberships
-SET status = 'active', removed_at = NULL, role = $3
+SET status = 'active', removed_at = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'removed'
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type ReactivateMembershipParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Role     string `json:"role"`
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
 }
 
 // Re-joining after removal (invitation acceptance). A ban is never lifted
 // here: a suspended membership matches no row.
 func (q *Queries) ReactivateMembership(ctx context.Context, arg ReactivateMembershipParams) (Membership, error) {
-	row := q.db.QueryRow(ctx, reactivateMembership, arg.TenantID, arg.UserID, arg.Role)
+	row := q.db.QueryRow(ctx, reactivateMembership, arg.TenantID, arg.UserID)
 	var i Membership
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.UserID,
-		&i.Role,
 		&i.Status,
 		&i.BannedAt,
 		&i.RemovedAt,
@@ -555,7 +712,7 @@ UPDATE memberships
 SET status = 'removed', removed_at = NOW(), banned_at = NULL,
     credentials_revoked_at = clock_timestamp()
 WHERE tenant_id = $1 AND user_id = $2 AND status <> 'removed'
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type RemoveMembershipParams struct {
@@ -570,7 +727,6 @@ func (q *Queries) RemoveMembership(ctx context.Context, arg RemoveMembershipPara
 		&i.ID,
 		&i.TenantID,
 		&i.UserID,
-		&i.Role,
 		&i.Status,
 		&i.BannedAt,
 		&i.RemovedAt,
@@ -585,7 +741,7 @@ const unbanMembership = `-- name: UnbanMembership :one
 UPDATE memberships
 SET status = 'active', banned_at = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'suspended'
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type UnbanMembershipParams struct {
@@ -600,38 +756,6 @@ func (q *Queries) UnbanMembership(ctx context.Context, arg UnbanMembershipParams
 		&i.ID,
 		&i.TenantID,
 		&i.UserID,
-		&i.Role,
-		&i.Status,
-		&i.BannedAt,
-		&i.RemovedAt,
-		&i.CredentialsRevokedAt,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-	)
-	return i, err
-}
-
-const updateMembershipRole = `-- name: UpdateMembershipRole :one
-UPDATE memberships
-SET role = $3
-WHERE tenant_id = $1 AND user_id = $2 AND status = 'active'
-RETURNING id, tenant_id, user_id, role, status, banned_at, removed_at, credentials_revoked_at, created_at, updated_at
-`
-
-type UpdateMembershipRoleParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   int64  `json:"user_id"`
-	Role     string `json:"role"`
-}
-
-func (q *Queries) UpdateMembershipRole(ctx context.Context, arg UpdateMembershipRoleParams) (Membership, error) {
-	row := q.db.QueryRow(ctx, updateMembershipRole, arg.TenantID, arg.UserID, arg.Role)
-	var i Membership
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.UserID,
-		&i.Role,
 		&i.Status,
 		&i.BannedAt,
 		&i.RemovedAt,

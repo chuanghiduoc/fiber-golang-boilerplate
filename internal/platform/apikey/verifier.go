@@ -56,7 +56,8 @@ func WithLastUsedInterval(interval time.Duration) Option {
 // NewVerifier builds a verifier. principals may be nil for tests or minimal
 // deployments; in that case the key's own tenant/user binding is used and the
 // principal role is left empty. Production always supplies the identity
-// adapter so bans and role changes take effect immediately.
+// adapter so bans, role changes, and permission changes take effect
+// immediately.
 func NewVerifier(store Store, principals identitycontracts.PrincipalReader, opts ...Option) *Verifier {
 	v := &Verifier{
 		store:           store,

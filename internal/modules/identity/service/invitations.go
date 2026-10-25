@@ -75,8 +75,16 @@ func invitationEvent(ctx context.Context, action string, inv *Invitation, metada
 // row commit together.
 func (s *InvitationService) Invite(ctx context.Context, in InviteInput) (*Invitation, error) {
 	addr := NormalizeEmail(in.Email)
+	in.Role = NormalizeRole(in.Role)
 	if !ValidRole(in.Role) {
-		return nil, apperror.NewBadRequest("role must be one of: user, admin")
+		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
+	}
+	role, err := s.stores.Roles.GetByKey(ctx, in.Role)
+	if err != nil {
+		return nil, apperror.NewInternal("failed to load invitation role")
+	}
+	if err := authorizeGrant(ctx, role.Permissions); err != nil {
+		return nil, err
 	}
 	if err := s.ensureNotMember(ctx, addr); err != nil {
 		return nil, err

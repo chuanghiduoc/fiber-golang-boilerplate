@@ -15,9 +15,11 @@ type Claims struct {
 	UserID   int64 `json:"user_id"`
 	TenantID int64 `json:"tenant_id,omitempty"`
 	// SessionID is the sign-in session (sessions.id) the token belongs to.
-	SessionID    int64  `json:"sid,omitempty"`
-	Email        string `json:"email"`
-	Role         string `json:"role"`
+	SessionID int64  `json:"sid,omitempty"`
+	Email     string `json:"email"`
+	// Role is legacy and no longer minted: authorization comes from the
+	// permission snapshot. It stays readable so older tokens still verify.
+	Role         string `json:"role,omitempty"`
 	TokenVersion int32  `json:"token_version"`
 	// AMR is the Authentication Methods References set (RFC 8176): pwd,
 	// google, otp, rc. Tokens issued before MFA have no amr and still verify.

@@ -85,18 +85,24 @@ func TestEffectiveScopes_CurrentRoleBoundsKey(t *testing.T) {
 		authz.PermissionAdminUsersRead,
 		testScopeRead,
 	}
-	got := effectiveScopes(authz.RoleUser, scopes)
+	got := effectiveScopes(identitycontracts.Principal{
+		Role: authz.RoleMember, Permissions: []string{string(testScopeRead)},
+	}, scopes)
 	if len(got) != 1 || got[0] != testScopeRead {
 		t.Fatalf("effective scopes = %v, want only apikeytest:read after demotion", got)
 	}
 
-	got = effectiveScopes(authz.RoleAdmin, scopes)
+	got = effectiveScopes(identitycontracts.Principal{
+		Role: authz.RoleAdmin, Permissions: []string{
+			string(authz.PermissionAdminUsersRead), string(testScopeRead),
+		},
+	}, scopes)
 	if len(got) != 2 {
 		t.Fatalf("effective scopes = %v, want both scopes for admin", got)
 	}
 
-	if got := effectiveScopes("", scopes); len(got) != 2 {
-		t.Fatalf("effective scopes without a role = %v, want scopes unchanged", got)
+	if got := effectiveScopes(identitycontracts.Principal{}, scopes); len(got) != 2 {
+		t.Fatalf("effective scopes without a principal = %v, want scopes unchanged", got)
 	}
 }
 

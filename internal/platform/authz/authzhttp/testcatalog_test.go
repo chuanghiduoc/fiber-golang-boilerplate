@@ -11,8 +11,8 @@ const (
 
 func init() {
 	if err := authz.Register("authzhttptest",
-		authz.Grant{Permission: testPermissionRead, Roles: []string{authz.RoleUser}},
-		authz.Grant{Permission: testPermissionWrite, Roles: []string{authz.RoleUser}},
+		authz.Grant{Permission: testPermissionRead, Roles: []string{authz.RoleMember}},
+		authz.Grant{Permission: testPermissionWrite, Roles: []string{authz.RoleMember}},
 	); err != nil {
 		panic(err)
 	}

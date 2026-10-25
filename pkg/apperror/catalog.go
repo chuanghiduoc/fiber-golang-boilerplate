@@ -81,7 +81,7 @@ func init() {
 var platformSpecs = map[Code]Spec{
 	CodeUserLastAdmin: {
 		Status:  http.StatusConflict,
-		Title:   "Cannot remove the last administrator",
+		Title:   "Cannot remove the last owner",
 		DocPath: "/errors/user-last-admin",
 	},
 

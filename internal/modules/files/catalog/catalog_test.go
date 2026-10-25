@@ -42,7 +42,7 @@ func TestCatalogRegistersAndLocalizes(t *testing.T) {
 	if !features.IsKnown(KeyFileUploads) {
 		t.Error("flags not registered")
 	}
-	if !authz.Has(authz.RoleUser, PermissionFilesWrite) {
+	if !authz.Has(authz.RoleMember, PermissionFilesWrite) {
 		t.Error("users must hold files:write")
 	}
 	bundle, err := i18n.New("en", i18n.Source{Owner: "files", FS: Locales()})

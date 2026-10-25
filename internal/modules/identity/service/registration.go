@@ -46,7 +46,7 @@ func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*d
 
 	var member *Member
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		created, createErr := createAccount(ctx, tx.Stores, NewUser{Email: email, Name: name}, string(hash), RoleUser)
+		created, createErr := createAccount(ctx, tx.Stores, NewUser{Email: email, Name: name}, string(hash), RoleMember)
 		if createErr != nil {
 			return createErr
 		}

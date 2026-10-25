@@ -47,6 +47,11 @@ var requiredTables = []string{
 	"user_passwords",
 	"user_identities",
 	"memberships",
+	"permissions",
+	"roles",
+	"role_permissions",
+	"membership_roles",
+	"platform_role_assignments",
 	"invitations",
 	"sessions",
 	"refresh_tokens",
@@ -86,8 +91,13 @@ var requiredColumns = map[string][]string{
 	"user_passwords":  {"user_id", "password_hash", "changed_at"},
 	"user_identities": {"user_id", "provider", "subject", "email"},
 	"memberships": {
-		"tenant_id", "user_id", "role", "status", "banned_at", "removed_at", "credentials_revoked_at",
+		"tenant_id", "user_id", "status", "banned_at", "removed_at", "credentials_revoked_at",
 	},
+	"permissions":               {"key", "owner"},
+	"roles":                     {"tenant_id", "scope", "key", "name"},
+	"role_permissions":          {"role_id", "permission_key"},
+	"membership_roles":          {"tenant_id", "user_id", "role_id"},
+	"platform_role_assignments": {"user_id", "role_id"},
 	"invitations": {
 		"tenant_id", "email_normalized", "role", "token_hash", "invited_by", "expires_at", "accepted_at", "accepted_by",
 	},
@@ -142,6 +152,11 @@ var requiredUniqueIndexes = []string{
 	"uq_user_identities_provider_subject",
 	"uq_user_identities_user_provider",
 	"uq_memberships_tenant_user",
+	"uq_roles_tenant_key",
+	"permissions_pkey",
+	"role_permissions_pkey",
+	"membership_roles_pkey",
+	"platform_role_assignments_pkey",
 	"uq_sessions_tenant_id",
 	"idx_invitations_tenant_email_pending",
 	"invitations_token_hash_key",
@@ -171,10 +186,14 @@ var requiredUniqueIndexes = []string{
 }
 
 // requiredTriggers are the database-level invariants the application relies
-// on: the per-tenant last-admin guard and the audit append-only guards.
+// on: the per-tenant last-owner and role-scope guards, and the audit
+// append-only guards.
 var requiredTriggers = map[string][]string{
-	"memberships":  {"trigger_protect_last_admin"},
-	"data_exports": {"trigger_data_exports_updated_at"},
+	"memberships":               {"trigger_memberships_last_owner"},
+	"membership_roles":          {"trigger_membership_roles_scope", "trigger_protect_last_owner"},
+	"platform_role_assignments": {"trigger_platform_role_scope"},
+	"role_permissions":          {"trigger_role_permissions_scope"},
+	"data_exports":              {"trigger_data_exports_updated_at"},
 	"audit_events": {
 		"trigger_audit_events_completion",
 		"trigger_audit_events_no_delete",
@@ -192,8 +211,10 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	// required unique index above.
 	"memberships": {
 		"idx_memberships_tenant_created_at_user",
-		"idx_memberships_tenant_active_admins",
 		"idx_memberships_tenant_suspended",
+	},
+	"roles": {
+		"idx_roles_tenant_created_at_id",
 	},
 	"invitations": {
 		"idx_invitations_tenant_email_pending",

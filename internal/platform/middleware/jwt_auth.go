@@ -22,8 +22,9 @@ const LocalSessionID = "session_id"
 
 // JWTAuth validates the bearer token and, when a session store is supplied,
 // confirms that its session is live, the membership and user are active, and
-// that the role/token version match the claims. The optional variadic form keeps tests and simple deployments
-// working without a session store.
+// that the token version still matches. A session store also supplies the
+// permission snapshot. The optional variadic form keeps tests and simple
+// deployments working without a session store.
 //
 // The global tenant middleware runs first and resolves X-Tenant-Slug (or the
 // configured default) into the tenant_id local. A token's positive tenant_id
@@ -84,24 +85,36 @@ func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
 		fiber.Locals[int64](c, "tenant_id", claims.TenantID)
 		c.SetContext(tenant.WithID(c.Context(), claims.TenantID))
 
+		subject := authz.NewSubject(claims.UserID, claims.TenantID, claims.Role)
 		if store != nil {
-			if err := store.Validate(c.Context(), session.Claims{
+			state, err := store.Validate(c.Context(), session.Claims{
 				UserID:       claims.UserID,
 				TenantID:     claims.TenantID,
 				SessionID:    claims.SessionID,
-				Role:         claims.Role,
 				TokenVersion: claims.TokenVersion,
-			}); err != nil {
+			})
+			if err != nil {
 				return err
+			}
+			permissions := make(map[authz.Permission]struct{}, len(state.Permissions))
+			for _, permission := range state.Permissions {
+				permissions[authz.Permission(permission)] = struct{}{}
+			}
+			subject = authz.Subject{
+				UserID:      claims.UserID,
+				TenantID:    claims.TenantID,
+				Role:        state.Role,
+				Permissions: permissions,
+				CrossTenant: state.Platform,
 			}
 		}
 
 		fiber.Locals[int64](c, "user_id", claims.UserID)
 		fiber.Locals[int64](c, LocalSessionID, claims.SessionID)
 		fiber.Locals[string](c, "email", claims.Email)
-		fiber.Locals[string](c, "role", claims.Role)
+		fiber.Locals[string](c, "role", subject.Role)
 		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
-		authzhttp.SetSubject(c, authz.NewSubject(claims.UserID, claims.TenantID, claims.Role).WithAMR(claims.AMR))
+		authzhttp.SetSubject(c, subject.WithAMR(claims.AMR))
 
 		// Services publish events with the request context, so the actor must
 		// be available there too, not only in Fiber locals.
@@ -110,7 +123,7 @@ func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
 		// Tier 1 services write their audit rows inside the mutation
 		// transaction; they need the actor and request metadata in the
 		// context passed to the service.
-		ctx := audit.WithActor(c.Context(), claims.UserID, claims.Role)
+		ctx := audit.WithActor(c.Context(), claims.UserID, subject.Role)
 		ctx = audit.WithRequestMeta(ctx,
 			fiber.Locals[string](c, "request_id"), c.IP(), c.Get("User-Agent"))
 		c.SetContext(ctx)

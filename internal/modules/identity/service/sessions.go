@@ -138,7 +138,6 @@ func (s *SessionService) signFor(member *Member, sessionID int64, amr []string) 
 		TenantID:     member.Membership.TenantID,
 		SessionID:    sessionID,
 		Email:        member.User.Email,
-		Role:         member.Membership.Role,
 		TokenVersion: member.User.TokenVersion,
 		AMR:          amr,
 	})

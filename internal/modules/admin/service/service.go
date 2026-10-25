@@ -8,9 +8,12 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
+// System role keys (ADR 0003). "user" is accepted as the legacy name of member.
 const (
-	RoleUser  = "user"
-	RoleAdmin = "admin"
+	RoleMember     = "member"
+	RoleAdmin      = "admin"
+	RoleOwner      = "owner"
+	roleLegacyUser = "user"
 )
 
 // Stats is the dashboard aggregation over both owner modules.
@@ -51,8 +54,11 @@ func (s *service) ListUsers(ctx context.Context, limit int, startingAfter string
 }
 
 func (s *service) UpdateRole(ctx context.Context, id int64, role string) (identitycontracts.User, error) {
-	if role != RoleUser && role != RoleAdmin {
-		return identitycontracts.User{}, apperror.NewBadRequest("role must be one of: user, admin")
+	if role == roleLegacyUser {
+		role = RoleMember
+	}
+	if role != RoleMember && role != RoleAdmin && role != RoleOwner {
+		return identitycontracts.User{}, apperror.NewBadRequest("role must be one of: member, admin, owner")
 	}
 	return s.identity.UpdateRole(ctx, id, role)
 }

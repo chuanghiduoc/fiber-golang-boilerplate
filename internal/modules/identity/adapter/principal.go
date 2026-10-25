@@ -64,6 +64,8 @@ func toPrincipal(p *identityservice.Principal, err error) (identitycontracts.Pri
 		Email:                p.Email,
 		Name:                 p.Name,
 		Role:                 p.Role,
+		Permissions:          p.Permissions,
+		Platform:             p.Platform,
 		TenantStatus:         status,
 		CredentialsRevokedAt: p.CredentialsRevokedAt,
 	}, nil

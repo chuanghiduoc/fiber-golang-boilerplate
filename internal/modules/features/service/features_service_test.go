@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -147,6 +148,15 @@ func tenantCtx(id int64) context.Context {
 	return tenant.WithID(context.Background(), id)
 }
 
+// platformCtx is a tenant 1 request whose subject holds the platform flag
+// permission.
+func platformCtx() context.Context {
+	return authz.WithSubject(tenantCtx(1), authz.Subject{
+		UserID: 1, TenantID: 1,
+		Permissions: map[authz.Permission]struct{}{authz.PermissionPlatformFeaturesWrite: {}},
+	})
+}
+
 func TestListFlagsMergesCatalogAndDatabaseState(t *testing.T) {
 	repo := newFakeRepository()
 	repo.flags[string(testKeyUserRegistration)] = Flag{
@@ -214,7 +224,7 @@ func TestUpsertFlagPreservesExistingDescriptionAndInvalidates(t *testing.T) {
 	svc := New(repo, evaluator, nil)
 	enabled, kill := false, true
 
-	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyFileUploads), UpsertFlagInput{
+	flag, err := svc.UpsertFlag(platformCtx(), string(testKeyFileUploads), UpsertFlagInput{
 		Enabled:    &enabled,
 		KillSwitch: &kill,
 	}, features.Subject{TenantID: 1})
@@ -237,7 +247,7 @@ func TestUpsertFlagUsesCatalogDescriptionForNewRow(t *testing.T) {
 	svc := New(repo, &fakeEvaluator{}, nil)
 	enabled, kill := true, false
 
-	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyGoogleOAuth), UpsertFlagInput{
+	flag, err := svc.UpsertFlag(platformCtx(), string(testKeyGoogleOAuth), UpsertFlagInput{
 		Enabled:    &enabled,
 		KillSwitch: &kill,
 	}, features.Subject{TenantID: 1})
@@ -276,7 +286,7 @@ func TestDeleteFlagIsIdempotent(t *testing.T) {
 	evaluator := &fakeEvaluator{}
 	svc := New(repo, evaluator, nil)
 
-	if err := svc.DeleteFlag(tenantCtx(1), string(testKeyFileUploads)); err != nil {
+	if err := svc.DeleteFlag(platformCtx(), string(testKeyFileUploads)); err != nil {
 		t.Fatalf("DeleteFlag missing row: %v", err)
 	}
 	if evaluator.invalidations != 1 {
@@ -376,7 +386,7 @@ func TestUpsertFlagWithoutEnabledClearsDatabaseDefault(t *testing.T) {
 	svc := New(repo, &fakeEvaluator{}, nil)
 	kill := true
 
-	flag, err := svc.UpsertFlag(tenantCtx(1), string(testKeyGoogleOAuth), UpsertFlagInput{
+	flag, err := svc.UpsertFlag(platformCtx(), string(testKeyGoogleOAuth), UpsertFlagInput{
 		KillSwitch: &kill,
 	}, features.Subject{TenantID: 1})
 	if err != nil {
@@ -394,7 +404,7 @@ func TestUpsertFlagWithoutEnabledClearsDatabaseDefault(t *testing.T) {
 func TestDeleteFlagPropagatesTargetConflict(t *testing.T) {
 	svc := New(&conflictRepository{fakeRepository: newFakeRepository()}, &fakeEvaluator{}, nil)
 
-	err := svc.DeleteFlag(tenantCtx(1), string(testKeyFileUploads))
+	err := svc.DeleteFlag(platformCtx(), string(testKeyFileUploads))
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 409 {
 		t.Fatalf("DeleteFlag error = %v, want 409", err)
@@ -413,7 +423,7 @@ func TestMutationsRecordDomainEventsWithMetadata(t *testing.T) {
 	repo := newFakeRepository()
 	recorder := &recordingAudit{}
 	svc := New(repo, &fakeEvaluator{result: features.Result{Source: features.SourceKillSwitch}}, recorder)
-	ctx := tenantCtx(1)
+	ctx := platformCtx()
 	enabled, kill := false, true
 	key := string(testKeyFileUploads)
 	userID := int64(42)

@@ -61,6 +61,22 @@ func identityApp(h *identityHarness) *fiber.App {
 	invitations.Get("/", authzhttp.Require(identitycatalog.PermissionInvitationsRead), invitationHandler.List)
 	invitations.Delete("/:id", authzhttp.Require(identitycatalog.PermissionInvitationsWrite), invitationHandler.Revoke)
 
+	roles := NewRoleHandler(h.roles)
+	adminRoles := api.Group("/admin/roles", jwt)
+	adminRoles.Get("/", authzhttp.Require(identitycatalog.PermissionAdminRolesRead), roles.ListRoles)
+	adminRoles.Post("/", authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), roles.CreateRole)
+	adminRoles.Patch("/:id", authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), roles.UpdateRole)
+	adminRoles.Delete("/:id", authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), roles.DeleteRole)
+	api.Put("/admin/users/:id/roles", jwt, authzhttp.Require(authz.PermissionAdminUsersRole), roles.ReplaceMemberRoles)
+
+	platform := NewPlatformHandler(h.tenants)
+	mfa := authzhttp.RequireMFA()
+	tenants := api.Group("/platform/tenants", jwt)
+	tenants.Get("/", mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), platform.ListTenants)
+	tenants.Post("/", mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), platform.CreateTenant)
+	tenants.Get("/:id", mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), platform.GetTenant)
+	tenants.Patch("/:id/status", mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), platform.UpdateTenantStatus)
+
 	users := api.Group("/users", jwt)
 	users.Get("/me", authzhttp.Require(identitycatalog.PermissionProfileRead), userHandler.GetMe)
 	users.Delete("/:id", authzhttp.Require(identitycatalog.PermissionProfileWrite), userHandler.Delete)
@@ -281,7 +297,7 @@ func TestIntegration_InvitationJoinsAnotherTenant(t *testing.T) {
 	var joined dto.UserResponse
 	require.NoError(t, json.Unmarshal(body, &joined))
 	assert.Equal(t, acme.ID, joined.TenantID)
-	assert.Equal(t, "user", joined.Role)
+	assert.Equal(t, "member", joined.Role)
 
 	inAcme := mustLogin(t, app, "acme", "dev@example.com", pw)
 	assert.Equal(t, acme.ID, inAcme.User.TenantID)

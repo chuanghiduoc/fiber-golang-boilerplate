@@ -159,7 +159,7 @@ func TestIntegration_AdminOperations(t *testing.T) {
 	restoredToken := testutil.SessionToken(t, ctx, pool, regular, adminIntegrationSecret)
 	assert.Equal(t, fiber.StatusOK, do("GET", "/users/me", restoredToken, nil))
 
-	// Promote after unbanning, otherwise the last-admin guard would (by
+	// Promote after unbanning, otherwise the last-owner guard would (by
 	// design) reject banning the only active admin.
 	body, _ := json.Marshal(admindto.UpdateRoleRequest{Role: "admin"})
 	assert.Equal(t, fiber.StatusOK, do("PUT", regularPath+"/role", adminToken, body))

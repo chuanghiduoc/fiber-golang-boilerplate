@@ -25,6 +25,13 @@ SELECT * FROM tenants
 WHERE id = $1
 FOR UPDATE;
 
+-- name: ListTenantsCursor :many
+-- Platform administration: every tenant, newest first.
+SELECT * FROM tenants
+WHERE (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+ORDER BY created_at DESC, id DESC
+LIMIT @row_limit::int;
+
 -- name: CreateTenant :one
 INSERT INTO tenants (slug, name, status, trial_ends_at)
 VALUES (@slug, @name, @status, @trial_ends_at)

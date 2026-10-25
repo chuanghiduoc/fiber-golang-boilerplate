@@ -73,7 +73,7 @@ func (h *mfaHarness) seedUser(id int64, email string) {
 		CreatedAt: now, UpdatedAt: now,
 	}
 	h.db.memberships[[2]int64{1, id}] = &Membership{
-		ID: h.db.id(), TenantID: 1, UserID: id, Role: RoleUser,
+		ID: h.db.id(), TenantID: 1, UserID: id, Role: RoleMember,
 		Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now,
 	}
 	h.db.passwords[id] = "hash"

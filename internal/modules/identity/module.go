@@ -30,6 +30,8 @@ type Module struct {
 	invitations *identityhandler.InvitationHandler
 	mfa         *identityhandler.MFAHandler
 	privacy     *identityhandler.PrivacyHandler
+	roles       *identityhandler.RoleHandler
+	platform    *identityhandler.PlatformHandler
 
 	// The job, schedule, and startup collaborators are set by Build; a module
 	// built with New (tests) has none.
@@ -134,6 +136,42 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
 	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
 	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+
+	if m.roles != nil {
+		m.registerRoleRoutes(v1, deps)
+	}
+	if m.platform != nil {
+		m.registerPlatformRoutes(v1, deps)
+	}
+}
+
+// registerRoleRoutes mounts tenant role management. Every mutation is Tier 1:
+// RoleService writes its audit row in the mutation transaction.
+func (m *Module) registerRoleRoutes(v1 fiber.Router, deps app.Deps) {
+	rl := deps.Limiters
+	roles := v1.Group("/admin/roles", deps.Authenticate())
+	roles.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionAdminRolesRead), m.roles.ListRoles)
+	roles.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.CreateRole)
+	roles.Patch("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.UpdateRole)
+	roles.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.DeleteRole)
+	// The legacy role-change endpoint maps to replacing the member's roles;
+	// this one accepts several roles (including tenant-defined ones).
+	v1.Put("/admin/users/:id/roles", deps.Authenticate(), rl.Normal,
+		authzhttp.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.roles.ReplaceMemberRoles)
+}
+
+// registerPlatformRoutes mounts cross-tenant tenant administration. It is
+// protected by platform permissions, which only a platform role assignment
+// grants.
+func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
+	rl := deps.Limiters
+	// Platform-scope access requires a second factor (ADR 0010).
+	mfa := authzhttp.RequireMFA()
+	tenants := v1.Group("/platform/tenants", deps.Authenticate())
+	tenants.Get("/", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.ListTenants)
+	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)
+	tenants.Get("/:id", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.GetTenant)
+	tenants.Patch("/:id/status", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.UpdateTenantStatus)
 }
 
 // registerPrivacyRoutes mounts the caller's exports/erasure and the admin

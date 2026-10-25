@@ -47,7 +47,7 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 		return testutil.CreateMember(t, ctx, pool, tenant.DefaultID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	owner := insertAdmin("lock-owner@test.com")
-	insertAdmin("lock-other-admin@test.com") // the owner is not the last admin
+	insertAdmin("lock-other-admin@test.com") // the owner is not the last owner
 
 	txManager := database.NewTxManager(pool)
 	stores := identityrepo.NewStores(pool)

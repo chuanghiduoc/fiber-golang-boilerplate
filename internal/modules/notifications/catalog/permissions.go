@@ -25,7 +25,7 @@ func Register() error { return authz.Register(Owner, Permissions()...) }
 
 // Permissions returns the notifications grants for app.PermissionProvider.
 func Permissions() []authz.Grant {
-	user := []string{authz.RoleUser}
+	user := []string{authz.RoleMember}
 	return []authz.Grant{
 		{Permission: PermissionNotificationsRead, Roles: user},
 		{Permission: PermissionNotificationsWrite, Roles: user},

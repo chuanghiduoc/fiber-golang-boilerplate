@@ -67,7 +67,7 @@ func (f *fakeFilesAdmin) GetFileStats(context.Context) (filescontracts.FileStats
 }
 
 func TestListUsersPassesOwnerPage(t *testing.T) {
-	page := identitycontracts.UserPage{Items: []identitycontracts.User{{ID: 7, Role: RoleUser}}, HasMore: true}
+	page := identitycontracts.UserPage{Items: []identitycontracts.User{{ID: 7, Role: RoleMember}}, HasMore: true}
 	got, err := NewService(&fakeIdentityAdmin{users: page}, &fakeFilesAdmin{}).ListUsers(context.Background(), 20, "")
 	if err != nil {
 		t.Fatalf("ListUsers: %v", err)
@@ -78,10 +78,21 @@ func TestListUsersPassesOwnerPage(t *testing.T) {
 }
 
 func TestUpdateRoleRejectsUnknownRole(t *testing.T) {
-	_, err := NewService(&fakeIdentityAdmin{}, &fakeFilesAdmin{}).UpdateRole(context.Background(), 1, "owner")
+	_, err := NewService(&fakeIdentityAdmin{}, &fakeFilesAdmin{}).UpdateRole(context.Background(), 1, "superuser")
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Status != 400 {
-		t.Fatalf("UpdateRole(owner) error = %v, want 400", err)
+		t.Fatalf("UpdateRole(superuser) error = %v, want 400", err)
+	}
+}
+
+func TestUpdateRoleAcceptsLegacyUserAsMember(t *testing.T) {
+	svc := NewService(&fakeIdentityAdmin{roleUser: identitycontracts.User{ID: 1}}, &fakeFilesAdmin{})
+	user, err := svc.UpdateRole(context.Background(), 1, "user")
+	if err != nil {
+		t.Fatalf("UpdateRole(user): %v", err)
+	}
+	if user.Role != RoleMember {
+		t.Fatalf("role = %q, want %q", user.Role, RoleMember)
 	}
 }
 

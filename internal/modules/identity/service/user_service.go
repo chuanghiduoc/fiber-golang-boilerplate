@@ -127,7 +127,7 @@ func memberPage(members []Member, pageSize int) ([]dto.UserResponse, bool, error
 }
 
 // userWriteError maps a failed write: a missing row becomes 404 with
-// notFoundDetail, a repository AppError (last admin, concurrent change) is
+// notFoundDetail, a repository AppError (last owner, concurrent change) is
 // kept, and anything else becomes a 500 with internalDetail.
 func userWriteError(err error, notFoundDetail, internalDetail string) error {
 	if errors.Is(err, apperror.ErrNotFound) {
@@ -150,6 +150,7 @@ func ToUserResponse(member *Member) *dto.UserResponse {
 		Email:            user.Email,
 		Name:             user.Name,
 		Role:             membership.Role,
+		Roles:            membership.Roles,
 		MembershipStatus: string(membership.Status),
 		EmailVerified:    user.EmailVerified(),
 		HasPassword:      user.HasPassword,

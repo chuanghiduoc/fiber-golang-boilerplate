@@ -33,8 +33,8 @@ detection per RFC 9700). The tenant of a request is selected explicitly
   [Data Model](../data-model.md#tenants-identity-and-credentials).
 - `memberships.status` is `active | suspended | removed`; there is no
   `invited` state because a pending invite is an `invitations` row (it can
-  target an address with no account). `memberships.role` is transitional
-  until P2b-2 introduces `membership_roles`.
+  target an address with no account). `memberships.role` was transitional and
+  is removed by P2b-2; roles now live in `membership_roles` (ADR 0003).
 - A session is the refresh-token family, so there is no separate family id;
   reuse revokes the session (`revoked_reason = 'refresh_reuse'`). Access
   tokens carry `sid`; tokens without it are rejected.
@@ -45,5 +45,5 @@ detection per RFC 9700). The tenant of a request is selected explicitly
   Google sign-in never adds a membership to an existing user.
 - Other modules reference `(tenant_id, user_id) → memberships ON DELETE
   RESTRICT`.
-- Deferred: RBAC tables and platform-admin tenant endpoints (P2b-2), RLS
-  (ADR 0007), MFA (ADR 0010).
+- P2b-2 implements the RBAC tables and platform-admin tenant endpoints
+  (ADR 0003). Deferred: RLS (ADR 0007), MFA (ADR 0010).

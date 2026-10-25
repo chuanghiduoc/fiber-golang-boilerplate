@@ -42,13 +42,23 @@ DROP TABLE IF EXISTS jobs;
 DROP TABLE IF EXISTS mfa_recovery_codes;
 DROP TABLE IF EXISTS mfa_factors;
 DROP TABLE IF EXISTS data_exports;
+DROP TABLE IF EXISTS platform_role_assignments;
+DROP TABLE IF EXISTS membership_roles;
+DROP TABLE IF EXISTS role_permissions;
+DROP TABLE IF EXISTS roles;
+DROP TABLE IF EXISTS permissions;
 DROP TABLE IF EXISTS email_verification_tokens;
 DROP TABLE IF EXISTS password_reset_tokens;
 DROP TABLE IF EXISTS refresh_tokens;
 DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS invitations;
 DROP TABLE IF EXISTS memberships;
-DROP FUNCTION IF EXISTS protect_last_admin();
+-- Dropping memberships removes the last trigger that depends on these
+-- functions.
+DROP FUNCTION IF EXISTS protect_last_owner();
+DROP FUNCTION IF EXISTS validate_membership_role();
+DROP FUNCTION IF EXISTS validate_platform_role();
+DROP FUNCTION IF EXISTS validate_role_permission();
 DROP TABLE IF EXISTS user_identities;
 DROP TABLE IF EXISTS user_passwords;
 DROP TABLE IF EXISTS users;

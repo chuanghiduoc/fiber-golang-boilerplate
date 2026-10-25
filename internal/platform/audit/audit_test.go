@@ -199,3 +199,14 @@ func TestNullableIP(t *testing.T) {
 		assert.Nil(t, nullableIP(in), "nullableIP(%q)", in)
 	}
 }
+
+func TestActorTypeForRole(t *testing.T) {
+	for _, role := range []string{"owner", "admin", "member", "platform_admin", "user"} {
+		if got := ActorTypeForRole(role); got != ActorTypeUser {
+			t.Errorf("ActorTypeForRole(%q) = %q, want %q", role, got, ActorTypeUser)
+		}
+	}
+	if got := ActorTypeForRole(""); got != ActorTypeUnknown {
+		t.Errorf("ActorTypeForRole(\"\") = %q, want unknown", got)
+	}
+}

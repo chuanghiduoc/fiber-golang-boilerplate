@@ -21,6 +21,8 @@ import (
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
@@ -67,7 +69,7 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 	users.Get("/:id", kit.userHandler.GetByID)
 	users.Put("/:id", kit.userHandler.Update)
 	users.Delete("/:id", kit.userHandler.Delete)
-	users.Get("/", middleware.RequireRole("admin"), kit.userHandler.List)
+	users.Get("/", authzhttp.Require(authz.PermissionAdminUsersRead), kit.userHandler.List)
 
 	return &tenantHarness{
 		app:       app,
@@ -179,7 +181,7 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	adminA := registerTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!", "Admin A")
 	userB := registerTenantUser(t, h, "acme", "user-b@example.com", "UserPass1!", "User B")
 
-	_, err := h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleAdmin)
+	_, err := h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleOwner)
 	require.NoError(t, err)
 	loginAdmin := loginTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!")
 
@@ -217,20 +219,20 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
 
-	// Tenant two's admin count is independent of tenant one.
-	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantTwo), userB.ID, identitydto.RoleAdmin)
+	// Tenant two's owner count is independent of tenant one.
+	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantTwo), userB.ID, identitydto.RoleOwner)
 	require.NoError(t, err)
-	countA, err := h.stores.Memberships.CountActiveAdmins(h.tenantCtx(h.tenantOne))
+	countA, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantOne))
 	require.NoError(t, err)
-	countB, err := h.stores.Memberships.CountActiveAdmins(h.tenantCtx(h.tenantTwo))
+	countB, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantTwo))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), countA)
 	assert.Equal(t, int64(1), countB)
 
-	// The database trigger also counts per tenant: tenant two's admin cannot
-	// satisfy tenant one's last-admin invariant.
-	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleUser)
-	require.Error(t, err, "demoting the only tenant-one admin must fail despite tenant two's admin")
+	// The database trigger also counts per tenant: tenant two's owner cannot
+	// satisfy tenant one's last-owner invariant.
+	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleMember)
+	require.Error(t, err, "demoting the only tenant-one owner must fail despite tenant two's owner")
 
 	statsA, err := h.adminSvc.GetUserStats(h.tenantCtx(h.tenantOne))
 	require.NoError(t, err)

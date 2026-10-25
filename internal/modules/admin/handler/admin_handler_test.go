@@ -32,7 +32,7 @@ type mockAdminService struct {
 func newMockAdminService() *mockAdminService {
 	return &mockAdminService{
 		users: []identitycontracts.User{
-			{ID: 1, Email: "user1@example.com", Name: "User 1", Role: adminsvc.RoleUser},
+			{ID: 1, Email: "user1@example.com", Name: "User 1", Role: adminsvc.RoleMember},
 			{ID: 2, Email: "user2@example.com", Name: "User 2", Role: adminsvc.RoleAdmin},
 		},
 		files: []filescontracts.File{

@@ -7,7 +7,7 @@ The fresh-install schema is one init migration (ADR 0012),
 | Section owner | Creates |
 |---|---|
 | `platform` | `update_updated_at()` trigger function |
-| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `platform` | `jobs` |
 | `platform` | `scheduler_leases`, `scheduler_runs` |
 | `platform` | `audit_events` and its append-only triggers |
@@ -28,7 +28,7 @@ migration policy.
 
 | Owner | Tables |
 |---|---|
-| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `permissions`, `roles`, `role_permissions`, `membership_roles`, `platform_role_assignments`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
 | `files` | `files` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -89,6 +89,13 @@ erDiagram
     sessions ||--o{ refresh_tokens : "(tenant_id, session_id), CASCADE"
     memberships ||--o{ api_keys : "(tenant_id, user_id), RESTRICT"
     api_keys ||--o{ api_key_scopes : "CASCADE"
+    permissions ||--o{ api_key_scopes : "permission RESTRICT"
+    roles ||--o{ role_permissions : "CASCADE"
+    permissions ||--o{ role_permissions : "RESTRICT"
+    roles ||--o{ membership_roles : "RESTRICT"
+    memberships ||--o{ membership_roles : "(tenant_id, user_id), CASCADE"
+    roles ||--o{ platform_role_assignments : "RESTRICT"
+    users ||--o{ platform_role_assignments : "CASCADE"
 
     tenants {
         bigint id PK
@@ -130,7 +137,6 @@ erDiagram
         bigint id PK
         bigint tenant_id FK "unique with user_id"
         bigint user_id FK
-        varchar role "user | admin, transitional until P2b-2"
         varchar status "active | suspended | removed"
         timestamptz banned_at "set iff suspended"
         timestamptz removed_at "set iff removed"
@@ -150,7 +156,7 @@ erDiagram
         bigint id PK
         bigint tenant_id FK
         varchar email_normalized "one pending row per tenant"
-        varchar role "user | admin"
+        varchar role "owner | admin | member"
         varchar token_hash UK "SHA-256 only"
         bigint invited_by FK
         timestamptz expires_at
@@ -218,7 +224,31 @@ erDiagram
     }
     api_key_scopes {
         bigint api_key_id PK, FK
-        text permission_key PK "authz permission format"
+        text permission_key PK, FK "authz permission format"
+    }
+    permissions {
+        text key PK "catalog key, owner TEXT"
+        text owner "module or platform"
+    }
+    roles {
+        bigint id PK
+        bigint tenant_id FK "NULL = system role"
+        varchar scope "tenant | platform"
+        varchar key "unique per tenant, NULLS NOT DISTINCT"
+        varchar name
+    }
+    role_permissions {
+        bigint role_id PK, FK
+        text permission_key PK, FK
+    }
+    membership_roles {
+        bigint tenant_id PK, FK "with user_id -> memberships"
+        bigint user_id PK
+        bigint role_id PK, FK
+    }
+    platform_role_assignments {
+        bigint user_id PK, FK
+        bigint role_id PK, FK "platform role only"
     }
 ```
 
@@ -235,7 +265,8 @@ erDiagram
   allows one live account per address; deleting an account (`status =
   'deleted'` + `deleted_at`) frees the address. There is no `tenant_id`,
   `role`, or password column: credentials live in `user_passwords` and
-  `user_identities`, roles and bans on `memberships`. `token_version` is bumped
+  `user_identities`, roles in `membership_roles`, and bans on `memberships`.
+  `token_version` is bumped
   by every global credential event (password change or reset, email change,
   logout-all, account deletion) and invalidates every token and session of
   the user in every tenant.
@@ -247,18 +278,30 @@ erDiagram
   invite is an `invitations` row (it can target an address with no account).
   `credentials_revoked_at` is set by a ban or removal and never cleared, so
   API keys created at or before it stay invalid after an unban or re-join.
-  `role` is transitional; P2b-2 replaces it with `membership_roles`.
 - **Data exports** (ADR 0013) belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while
   the job has attempts. Expired, failed, and stale (>1 day) queued/running rows
   are removed by `privacy.exports.purge` (blob, then row); erasure removes them
   immediately.
-- The last-admin trigger (`protect_last_admin`) lives on `memberships`: a
-  tenant keeps at least one active admin membership. Counting and locking are
-  scoped to the tenant; services also take a per-tenant advisory lock, and the
-  repository maps the trigger exception (`P0001`) or a deadlock (`40P01`) to
-  `409`.
+- **RBAC** (ADR 0003): `permissions` is the code-owned catalog synchronized at
+  API startup (key + registering owner). `roles` holds system roles
+  (`tenant_id IS NULL`, seeded: tenant `owner`, `admin`, `member`; platform
+  `platform_admin`) and tenant-defined roles (`tenant_id` set, `scope =
+  'tenant'`). `role_permissions` is the grant table; `membership_roles` assigns
+  tenant-scoped roles to a membership (a trigger rejects cross-tenant and
+  platform roles). `platform_role_assignments` is the only cross-tenant grant
+  and accepts only `scope = 'platform'` roles. `api_key_scopes.permission_key`
+  references the catalog (`RESTRICT`).
+- The last-owner trigger (`protect_last_owner`) lives on `memberships` and
+  `membership_roles`: removing the last active system `owner` of an
+  operational tenant is refused. Counting and locking are scoped to the
+  tenant; services take the same per-tenant advisory lock, and the repository
+  maps the trigger exception (`P0001`) or a deadlock (`40P01`) to `409`.
+  Concurrent owner removals serialize on the advisory lock, so two requests
+  cannot each observe the other owner and both commit. The platform tenant
+  create endpoint makes the caller the tenant's first owner, so an HTTP-created
+  tenant never starts ownerless.
 - **Invitations**: one pending row per `(tenant_id, email_normalized)`
   (partial unique `WHERE accepted_at IS NULL`); re-inviting refreshes the
   token, role, and expiry. Revoking deletes the pending row (the trail is in
@@ -284,16 +327,19 @@ erDiagram
   returns the scopes as one array sorted in byte order, so the API still
   returns a `scopes` array exactly as before. Create and update change the key
   and its scope rows in a single statement. `permission_key` is checked
-  against the authz permission format; the RBAC phase adds a `permissions`
-  catalog table and replaces that `CHECK` with a foreign key.
+  against the authz permission format and pinned to `permissions(key)` by a
+  `RESTRICT` foreign key.
 - `CHECK ((rotation_grace_until IS NULL) = (rotated_at IS NULL))`: rotation is
   the only writer of either column and always sets both.
 
 | Table | Key constraint / index | Why |
 |---|---|---|
 | `users` | partial unique `(email) WHERE status <> 'deleted'` | One live account per address, globally. |
-| `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows and for active admins | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check; last-admin count. |
 | `data_exports` | partial unique `(tenant_id, user_id) WHERE status IN ('queued','running')`; `(tenant_id, user_id, created_at DESC, id DESC)`; partial `(expires_at)` | One active export per membership; caller list cursor; hourly expiry purge. |
+| `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check. |
+| `roles` | unique `(tenant_id, key) NULLS NOT DISTINCT` | One system role per key, one tenant role per key. |
+| `membership_roles` | primary key `(tenant_id, user_id, role_id)`; `(role_id)` | Load a member's roles; invalidate the holders of a changed role and reject a role delete in use. |
+| `role_permissions` | primary key `(role_id, permission_key)`; `(permission_key)` | Grant set; catalog prune and permission delete. |
 | `invitations` | `token_hash` unique; partial unique `(tenant_id, email_normalized) WHERE accepted_at IS NULL`; `(tenant_id, created_at DESC, id DESC)`; partial `(expires_at)` on pending rows | Token lookup; one pending invite per address; list cursor; expiry purge. |
 | `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; "my sessions"; revoking a user's live sessions across tenants; stale-session purge. |
 | `refresh_tokens` | `token_hash` unique; `(tenant_id, session_id)`; `(expires_at)` | Rotation lookup; FK cascade and the purge's live-token check; expiry purge. |
@@ -493,7 +539,7 @@ erDiagram
         bigint tenant_id FK
         bigint parent_id FK "intent row"
         text actor_type "user | service | job | system | anonymous | unknown"
-        text actor_role "user | admin | ..."
+        text actor_role "owner | admin | member | ..."
         text action
         text resource
         inet ip "NULL when not an address"

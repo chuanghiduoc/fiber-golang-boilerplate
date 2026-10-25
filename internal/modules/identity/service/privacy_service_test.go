@@ -198,7 +198,7 @@ func privacyTestStores(repo *fakePrivacyRepo) (Stores, *memDB) {
 	db := newMemDB()
 	db.users[10] = &User{ID: 10, Email: "privacy@example.com", Name: "Privacy", Status: UserStatusActive}
 	db.memberships[[2]int64{tenant.DefaultID, 10}] = &Membership{
-		ID: 100, TenantID: tenant.DefaultID, UserID: 10, Role: RoleUser,
+		ID: 100, TenantID: tenant.DefaultID, UserID: 10, Role: RoleMember,
 		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}
 	stores := db.stores()
@@ -320,7 +320,7 @@ func TestIdentityExportIncludesProfileMembershipAndSessions(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(section.Data, &out))
 	assert.Equal(t, "privacy@example.com", out.Profile.Email)
-	assert.Equal(t, RoleUser, out.Membership.Role)
+	assert.Equal(t, RoleMember, out.Membership.Role)
 	require.Len(t, out.Sessions, 1)
 	assert.Equal(t, int64(7), out.Sessions[0].ID)
 	assert.NotContains(t, strings.ToLower(string(section.Data)), "password")
@@ -360,7 +360,7 @@ func TestFinalizeWaitsUntilEveryMembershipIsRemoved(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
 	acme := int64(2)
-	db.memberships[[2]int64{acme, 10}] = &Membership{ID: 101, TenantID: acme, UserID: 10, Role: RoleUser, Status: MembershipStatusRemoved}
+	db.memberships[[2]int64{acme, 10}] = &Membership{ID: 101, TenantID: acme, UserID: 10, Role: RoleMember, Status: MembershipStatusRemoved}
 	tx := &fakePrivateTx{stores: stores}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx})
 	err := svc.HandleFinalizeJob(context.Background(), mustJSON(finalizeJob{UserID: 10}))
@@ -444,10 +444,10 @@ func TestExportJobPanicMarksRowFailed(t *testing.T) {
 	assert.Equal(t, DataExportFailed, got.Status)
 }
 
-func TestEraseJobRefusesTheLastAdminBeforeAnyEraser(t *testing.T) {
+func TestEraseJobRefusesTheLastOwnerBeforeAnyEraser(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
-	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleAdmin
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
 	eraser := &recordingEraser{}
 	registry := privacycontracts.NewRegistry()
 	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: eraser})

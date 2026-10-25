@@ -309,7 +309,7 @@ func (r memMemberships) Create(ctx context.Context, userID int64, role string) (
 		return nil, ErrAlreadyMember
 	}
 	now := time.Now()
-	m := &Membership{ID: r.db.id(), TenantID: key[0], UserID: userID, Role: role, Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now}
+	m := &Membership{ID: r.db.id(), TenantID: key[0], UserID: userID, Role: role, Roles: []string{role}, Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now}
 	r.db.memberships[key] = m
 	c := *m
 	return &c, nil
@@ -334,12 +334,14 @@ func is(s MembershipStatus) func(MembershipStatus) bool {
 
 func (r memMemberships) Reactivate(ctx context.Context, userID int64, role string) (*Membership, error) {
 	return r.update(ctx, userID, is(MembershipStatusRemoved), func(m *Membership) {
-		m.Status, m.RemovedAt, m.Role = MembershipStatusActive, nil, role
+		m.Status, m.RemovedAt, m.Role, m.Roles = MembershipStatusActive, nil, role, []string{role}
 	})
 }
 
 func (r memMemberships) UpdateRole(ctx context.Context, userID int64, role string) (*Membership, error) {
-	return r.update(ctx, userID, is(MembershipStatusActive), func(m *Membership) { m.Role = role })
+	return r.update(ctx, userID, is(MembershipStatusActive), func(m *Membership) {
+		m.Role, m.Roles = role, []string{role}
+	})
 }
 
 func (r memMemberships) Ban(ctx context.Context, userID int64) (*Membership, error) {
@@ -362,19 +364,19 @@ func (r memMemberships) Remove(ctx context.Context, userID int64) (*Membership, 
 	})
 }
 
-func (r memMemberships) CountActiveAdmins(ctx context.Context) (int64, error) {
+func (r memMemberships) CountActiveOwners(ctx context.Context) (int64, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	var n int64
 	for key, m := range r.db.memberships {
-		if key[0] == tenant.EffectiveID(ctx) && m.Role == RoleAdmin && m.Status == MembershipStatusActive {
+		if key[0] == tenant.EffectiveID(ctx) && m.Role == RoleOwner && m.Status == MembershipStatusActive {
 			n++
 		}
 	}
 	return n, nil
 }
 
-func (r memMemberships) LockAdminChanges(context.Context) error { return nil }
+func (r memMemberships) LockOwnerChanges(context.Context) error { return nil }
 
 func (r memMemberships) Stats(context.Context) (MemberStats, error) {
 	return MemberStats{}, errFakeNotImplemented
@@ -598,6 +600,16 @@ func (r memTenants) GetBySlug(context.Context, string) (*Tenant, error) {
 }
 func (r memTenants) GetByIDForUpdate(_ context.Context, id int64) (*Tenant, error) {
 	return r.get(id, false)
+}
+func (r memTenants) ListCursor(_ context.Context, _ pagination.DBCursor) ([]Tenant, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	tenants := make([]Tenant, 0, len(r.db.tenants))
+	for _, t := range r.db.tenants {
+		tenants = append(tenants, *t)
+	}
+	sort.Slice(tenants, func(i, j int) bool { return tenants[i].ID > tenants[j].ID })
+	return tenants, nil
 }
 func (r memTenants) Create(context.Context, NewTenant) (*Tenant, error) {
 	return nil, errFakeNotImplemented

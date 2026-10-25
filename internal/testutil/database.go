@@ -18,6 +18,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
@@ -73,12 +75,27 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 		return nil, nil, err
 	}
 
+	if err := syncPermissions(ctx, pool); err != nil {
+		pool.Close()
+		_ = pgContainer.Terminate(context.Background())
+		return nil, nil, err
+	}
+
 	cleanup := func() {
 		pool.Close()
 		_ = pgContainer.Terminate(context.Background())
 	}
 
 	return pool, cleanup, nil
+}
+
+// syncPermissions mirrors the API startup: tests call services and routes
+// directly, so the code-owned catalog must reach the database before any
+// session loads its snapshot.
+func syncPermissions(ctx context.Context, pool *pgxpool.Pool) error {
+	stores := identityrepo.NewStores(pool)
+	tx := identityrepo.NewTransactor(database.NewTxManager(pool), nil, nil, nil)
+	return identityservice.SyncPermissions(ctx, tx, stores.Roles)
 }
 
 func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, func(), error) {
@@ -126,6 +143,12 @@ func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, func(), er
 	if err != nil {
 		dropSchema()
 		return nil, nil, fmt.Errorf("connect to test schema: %w", err)
+	}
+
+	if err := syncPermissions(ctx, pool); err != nil {
+		pool.Close()
+		dropSchema()
+		return nil, nil, err
 	}
 
 	cleanup := func() {

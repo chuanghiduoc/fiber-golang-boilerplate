@@ -16,7 +16,7 @@ type SessionResponse struct {
 // InviteRequest invites an address into the request tenant.
 type InviteRequest struct {
 	Email string `json:"email" validate:"required,email,max=255"`
-	Role  string `json:"role" validate:"omitempty,oneof=user admin"`
+	Role  string `json:"role" validate:"omitempty,oneof=user member admin owner"`
 }
 
 // InvitationResponse is a pending (or accepted) invitation. The token is

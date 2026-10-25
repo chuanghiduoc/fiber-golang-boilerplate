@@ -35,29 +35,40 @@ func adminCfg() config.AdminConfig {
 	return config.AdminConfig{Email: " Admin@Example.com ", Password: "Admin123!", Name: "Root"}
 }
 
-func TestAdminCreatesVerifiedAdminMembershipOnce(t *testing.T) {
+func TestAdminCreatesVerifiedOwnerMembershipOnce(t *testing.T) {
 	pool, run := setup(t)
 	ctx := context.Background()
 	require.NoError(t, run(adminCfg(), 1))
 	require.NoError(t, run(adminCfg(), 1), "the seed is idempotent")
 
 	var (
-		users, passwords, admins int
-		verified                 bool
+		users, passwords, owners, platformAdmins int
+		verified                                 bool
 	)
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*), bool_and(email_verified_at IS NOT NULL) FROM users WHERE email = $1`, adminEmail).Scan(&users, &verified))
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM user_passwords`).Scan(&passwords))
-	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM memberships WHERE tenant_id = 1 AND role = 'admin' AND status = 'active'`).Scan(&admins))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM memberships m
+		JOIN membership_roles mr ON mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+		JOIN roles r ON r.id = mr.role_id
+		WHERE m.tenant_id = 1 AND m.status = 'active'
+		  AND r.tenant_id IS NULL AND r.key = 'owner'`).Scan(&owners))
+	require.NoError(t, pool.QueryRow(ctx, `
+		SELECT count(*) FROM platform_role_assignments pra
+		JOIN roles r ON r.id = pra.role_id
+		JOIN users u ON u.id = pra.user_id
+		WHERE u.email = $1 AND r.scope = 'platform' AND r.key = 'platform_admin'`, adminEmail).Scan(&platformAdmins))
 	assert.Equal(t, 1, users)
 	assert.True(t, verified)
 	assert.Equal(t, 1, passwords)
-	assert.Equal(t, 1, admins)
+	assert.Equal(t, 1, owners)
+	assert.Equal(t, 1, platformAdmins)
 }
 
-func TestAdminRepairsUnverifiedExistingAdmin(t *testing.T) {
+func TestAdminRepairsUnverifiedExistingOwner(t *testing.T) {
 	pool, run := setup(t)
 	ctx := context.Background()
-	m := testutil.CreateMember(t, ctx, pool, 1, adminEmail, testutil.MemberOptions{Role: "admin", Unverified: true})
+	m := testutil.CreateMember(t, ctx, pool, 1, adminEmail, testutil.MemberOptions{Role: "owner", Unverified: true})
 	require.NoError(t, run(adminCfg(), 1))
 	var verified bool
 	require.NoError(t, pool.QueryRow(ctx, `SELECT email_verified_at IS NOT NULL FROM users WHERE id = $1`, m.UserID).Scan(&verified))
@@ -69,15 +80,15 @@ func TestAdminRepairsUnverifiedExistingAdmin(t *testing.T) {
 func TestAdminNeverPromotesOrJoins(t *testing.T) {
 	cases := map[string]func(t *testing.T, pool *pgxpool.Pool){
 		"demoted member": func(t *testing.T, pool *pgxpool.Pool) {
-			testutil.CreateMember(t, context.Background(), pool, 1, adminEmail, testutil.MemberOptions{Role: "user"})
+			testutil.CreateMember(t, context.Background(), pool, 1, adminEmail, testutil.MemberOptions{Role: "member"})
 		},
 		"member of another tenant only": func(t *testing.T, pool *pgxpool.Pool) {
 			acme := testutil.CreateTenant(t, context.Background(), pool, "acme")
-			testutil.CreateMember(t, context.Background(), pool, acme, adminEmail, testutil.MemberOptions{Role: "admin"})
+			testutil.CreateMember(t, context.Background(), pool, acme, adminEmail, testutil.MemberOptions{Role: "owner"})
 		},
 		"banned in the tenant": func(t *testing.T, pool *pgxpool.Pool) {
-			testutil.CreateMember(t, context.Background(), pool, 1, "keeper@example.com", testutil.MemberOptions{Role: "admin"})
-			m := testutil.CreateMember(t, context.Background(), pool, 1, adminEmail, testutil.MemberOptions{Role: "admin"})
+			testutil.CreateMember(t, context.Background(), pool, 1, "keeper@example.com", testutil.MemberOptions{Role: "owner"})
+			m := testutil.CreateMember(t, context.Background(), pool, 1, adminEmail, testutil.MemberOptions{Role: "owner"})
 			_, err := pool.Exec(context.Background(),
 				`UPDATE memberships SET status = 'suspended', banned_at = NOW() WHERE tenant_id = 1 AND user_id = $1`, m.UserID)
 			require.NoError(t, err)
@@ -92,12 +103,16 @@ func TestAdminNeverPromotesOrJoins(t *testing.T) {
 			pool, run := setup(t)
 			prepare(t, pool)
 			require.NoError(t, run(adminCfg(), 1), "an operator decision never fails startup")
-			var activeAdmin int
+			var activeOwner int
 			require.NoError(t, pool.QueryRow(context.Background(), `
-				SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id
-				WHERE m.tenant_id = 1 AND u.email = $1 AND m.role = 'admin' AND m.status = 'active' AND u.status = 'active'`,
-				adminEmail).Scan(&activeAdmin))
-			assert.Zero(t, activeAdmin)
+				SELECT count(*) FROM memberships m
+				JOIN users u ON u.id = m.user_id
+				JOIN membership_roles mr ON mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+				JOIN roles r ON r.id = mr.role_id
+				WHERE m.tenant_id = 1 AND u.email = $1 AND m.status = 'active' AND u.status = 'active'
+				  AND r.tenant_id IS NULL AND r.key = 'owner'`,
+				adminEmail).Scan(&activeOwner))
+			assert.Zero(t, activeOwner)
 		})
 	}
 }

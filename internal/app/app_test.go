@@ -123,7 +123,7 @@ type catalogModule struct {
 func (m catalogModule) Name() string                          { return m.name }
 func (m catalogModule) RegisterRoutes(fiber.Router, app.Deps) {}
 func (m catalogModule) Permissions() []authz.Grant {
-	return []authz.Grant{{Permission: m.permission, Roles: []string{authz.RoleUser}}}
+	return []authz.Grant{{Permission: m.permission, Roles: []string{authz.RoleMember}}}
 }
 func (m catalogModule) ErrorCodes() map[apperror.Code]apperror.Spec {
 	return map[apperror.Code]apperror.Spec{m.code: {Status: 409, Title: "Gadget busy", DocPath: "/errors/gadget-busy"}}
@@ -147,7 +147,7 @@ func TestRegisterCatalogsWiresEveryProvider(t *testing.T) {
 	require.NoError(t, app.RegisterCatalogs(module))
 	require.NoError(t, app.RegisterCatalogs(module), "re-registering the same module is a no-op")
 
-	assert.True(t, authz.Has(authz.RoleUser, "gadgets:read"))
+	assert.True(t, authz.Has(authz.RoleMember, "gadgets:read"))
 	assert.True(t, authz.Has(authz.RoleAdmin, "gadgets:read"), "admins receive every permission")
 	spec, ok := apperror.SpecFor("gadget.busy")
 	require.True(t, ok)

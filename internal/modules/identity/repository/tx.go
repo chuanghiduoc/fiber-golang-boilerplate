@@ -27,6 +27,7 @@ func NewStores(db identitysqlc.DBTX) identityservice.Stores {
 		Tenants:       NewTenantRepository(db),
 		MFA:           NewMFARepository(db),
 		Privacy:       NewDataExportRepository(db),
+		Roles:         NewRoleRepository(db),
 	}
 }
 

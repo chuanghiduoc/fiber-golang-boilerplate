@@ -63,9 +63,9 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: role})
 	}
 	adminA := member(tenant.DefaultID, "admin-a@example.com", identitydto.RoleAdmin)
-	member(tenant.DefaultID, "user-a@example.com", identitydto.RoleUser)
-	userBID := member(tenantB, "user-b@example.com", identitydto.RoleUser).UserID
-	bannedBID := member(tenantB, "banned-b@example.com", identitydto.RoleUser).UserID
+	member(tenant.DefaultID, "user-a@example.com", identitydto.RoleMember)
+	userBID := member(tenantB, "user-b@example.com", identitydto.RoleMember).UserID
+	bannedBID := member(tenantB, "banned-b@example.com", identitydto.RoleMember).UserID
 	_, err = pool.Exec(ctx,
 		`UPDATE memberships SET status = 'suspended', banned_at = NOW() WHERE tenant_id = $1 AND user_id = $2`,
 		tenantB, bannedBID)
@@ -142,8 +142,14 @@ func (h *tenantAdminHarness) request(t *testing.T, method, path, body string) (s
 // membership reads a user's membership role and status in tenantID.
 func (h *tenantAdminHarness) membership(t *testing.T, tenantID, userID int64) (role, status string) {
 	t.Helper()
-	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`SELECT role, status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenantID, userID,
+	require.NoError(t, h.pool.QueryRow(context.Background(), `
+		SELECT COALESCE((
+			SELECT r.key FROM membership_roles mr JOIN roles r ON r.id = mr.role_id
+			WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+			ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+			LIMIT 1
+		), 'member'), m.status
+		FROM memberships m WHERE m.tenant_id = $1 AND m.user_id = $2`, tenantID, userID,
 	).Scan(&role, &status))
 	return role, status
 }
@@ -188,11 +194,11 @@ func TestTenantAdminModule_CrossTenantOperationsAreNotFound(t *testing.T) {
 	assert.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
 
 	role, memberStatus := h.membership(t, h.tenantB, h.userBID)
-	assert.Equal(t, identitydto.RoleUser, role)
+	assert.Equal(t, identitydto.RoleMember, role)
 	assert.Equal(t, "active", memberStatus, "tenant B active member must not be banned")
 
 	role, memberStatus = h.membership(t, h.tenantB, h.bannedBID)
-	assert.Equal(t, identitydto.RoleUser, role)
+	assert.Equal(t, identitydto.RoleMember, role)
 	assert.Equal(t, "suspended", memberStatus, "tenant B banned member must stay banned")
 
 	// The tenant A admin still exists and was not affected by the attempts.

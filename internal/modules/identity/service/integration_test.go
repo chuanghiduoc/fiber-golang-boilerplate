@@ -157,33 +157,33 @@ func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM user_passwords`))
 }
 
-// The last active admin of a tenant can be neither demoted, banned, removed,
+// The last active owner of a tenant can be neither demoted, banned, removed,
 // nor deleted with their account; the trigger on memberships backs the
 // service checks.
-func TestLastAdminProtection(t *testing.T) {
+func TestLastOwnerProtection(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
-	admin := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
+	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "owner@example.com", testutil.MemberOptions{Role: "owner"})
 	// The same user is a plain member elsewhere, which must not count.
-	testutil.CreateMember(t, ctx, e.pool, acmeID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
-	testutil.CreateMember(t, ctx, e.pool, acmeID, "second@example.com", testutil.MemberOptions{Role: "admin"})
+	testutil.CreateMember(t, ctx, e.pool, acmeID, "owner@example.com", testutil.MemberOptions{Role: "member"})
+	testutil.CreateMember(t, ctx, e.pool, acmeID, "second@example.com", testutil.MemberOptions{Role: "owner"})
 
-	_, err := e.admin.UpdateRole(ctx, admin.UserID, service.RoleUser)
+	_, err := e.admin.UpdateRole(ctx, owner.UserID, service.RoleMember)
 	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(err))
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.admin.BanUser(ctx, admin.UserID)))
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.users.DeleteAccount(ctx, admin.UserID)),
-		"deleting the account would leave the default tenant without an admin")
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.admin.BanUser(ctx, owner.UserID)))
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(e.users.DeleteAccount(ctx, owner.UserID)),
+		"deleting the account would leave the default tenant without an owner")
 
-	// Removing them from acme is fine: acme has another admin.
-	require.NoError(t, e.users.RemoveMember(tenant.WithID(ctx, acmeID), admin.UserID))
+	// Removing them from acme is fine: acme has another owner.
+	require.NoError(t, e.users.RemoveMember(tenant.WithID(ctx, acmeID), owner.UserID))
 	assert.Equal(t, "removed", scalar[string](t, e.pool,
-		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, acmeID, admin.UserID))
+		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, acmeID, owner.UserID))
 
 	// The database trigger refuses a direct write too.
-	_, err = e.pool.Exec(ctx, `UPDATE memberships SET role = 'user' WHERE tenant_id = 1 AND user_id = $1`, admin.UserID)
+	_, err = e.pool.Exec(ctx, `DELETE FROM membership_roles WHERE tenant_id = 1 AND user_id = $1`, owner.UserID)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "last active admin")
+	assert.Contains(t, err.Error(), "last owner")
 }
 
 // A ban is per membership and survives the banned account deleting itself:

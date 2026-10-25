@@ -52,9 +52,10 @@ type UserResponse struct {
 	ID    int64  `json:"id"`
 	Email string `json:"email"`
 	Name  string `json:"name"`
-	// Role is the membership role in TenantID (transitional; P2b-2 replaces
-	// it with membership roles).
+	// Role is the highest system role key (owner, admin, or member).
 	Role string `json:"role"`
+	// Roles lists every role assigned in TenantID.
+	Roles []string `json:"roles"`
 	// MembershipStatus is active, suspended (banned), or removed.
 	MembershipStatus string     `json:"membershipStatus" enums:"active,suspended,removed"`
 	EmailVerified    bool       `json:"emailVerified"`

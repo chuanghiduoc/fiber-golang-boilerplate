@@ -66,7 +66,7 @@ module, and `platform`/`pkg` never import modules.
 | `cmd/api` | Infra setup, catalog registration, lifecycle, graceful shutdown |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (shared with `test/arch`) |
 | `cmd/migrate` | The only schema initializer/migrator |
-| `cmd/seed` | Admin seeder (schema must exist) |
+| `cmd/seed` | Admin seeder: tenant `owner` + `platform_admin` (schema must exist) |
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
@@ -169,14 +169,17 @@ migrations) to its owners; keep it current when adding a module.
   `password_reset_tokens`, and `email_verification_tokens` have no
   `tenant_id`; `tenants`/`tenant_settings` are the tenant rows themselves. A
   user joins a tenant through `memberships` (`UNIQUE (tenant_id, user_id)`,
-  transitional `role user|admin`, `status active|suspended|removed`); every
-  per-member row in another module references
+  `status active|suspended|removed`); roles live in `membership_roles`
+  (system `owner`/`admin`/`member` or a tenant role) and platform access in
+  `platform_role_assignments`. Every per-member row in another module references
   `(tenant_id, user_id) → memberships ON DELETE RESTRICT`, never `users`. Job
   claim/lease recovery/purge are
   global, so `jobs` has only the tenant-leading idempotency index.
 - `cmd/migrate` verifies required tables, columns, unique indexes (every
   `ON CONFLICT` target), tenant-leading indexes, and enabled triggers
-  (`trigger_protect_last_admin`, audit completion/no-delete/no-truncate); its
+  (`trigger_memberships_last_owner`, `trigger_protect_last_owner`,
+  `trigger_membership_roles_scope`, `trigger_platform_role_scope`, audit
+  completion/no-delete/no-truncate); its
   test fails when that list drifts from the baseline. `audit_events` rejects
   `DELETE`/`TRUNCATE` at the database.
 - `jobs.idempotency_key` is nullable with a partial unique
@@ -185,11 +188,13 @@ migrations) to its owners; keep it current when adding a module.
   `(schedule, scheduled_for)` ledger) are platform coordination tables with no
   tenant column and no cross-module/jobs foreign keys; do not add them.
 - The baseline seeds tenant id 1 (`default`); keep it as the compatibility
-  tenant (it can never be `pending_deletion`/`deleted`). The last-admin
-  trigger lives on `memberships` and is per tenant. Tenant status is
-  `trialing|active|suspended|pending_deletion|deleted`; only
+  tenant (it can never be `pending_deletion`/`deleted`). The last-owner
+  trigger lives on `memberships` and `membership_roles` and is per tenant:
+  removing the last active system `owner` of an operational tenant is refused.
+  The platform tenant create endpoint makes the caller its first owner.
+  Tenant status is `trialing|active|suspended|pending_deletion|deleted`; only
   `trialing`/`active` serve requests; transitions go through the audited
-  identity `TenantService` (no HTTP endpoints until P2b-2).
+  identity `TenantService`, exposed on the platform tenant routes.
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
@@ -277,12 +282,14 @@ handler/service/DTO/repository package.
   `Deprecation`/`Sunset`/`Link`. Keep Swagger's base path at `/api/v1`.
 - **Auth/session:** login is the global password plus an *active membership*
   in the request tenant (otherwise the same 401 as a wrong password). JWT
-  carries user id, `tenant_id`, `sid` (session id), `token_version`, the
-  transitional membership `role`, and optional `amr` (pwd/google/otp/rc);
-  `session.Store` loads the session and
-  requires it unrevoked, the membership and user active, the tenant
-  operational, and role/version to match (5s snapshot per session,
-  generation-keyed per-user invalidation). `JWTAuth` rejects a non-positive tenant and an
+  carries user id, `tenant_id`, `sid` (session id), `token_version`, and
+  optional `amr` (pwd/google/otp/rc); it
+  carries no role (a legacy `role` claim verifies but is ignored).
+  `session.Store` loads the session and requires it unrevoked, the membership
+  and user active, the tenant operational, and the token version to match; the
+  same snapshot carries the effective permission set (union of the membership
+  roles and platform assignments) for 5s, with generation-keyed per-user and
+  global permission invalidation. `JWTAuth` rejects a non-positive tenant and an
   explicit header that conflicts with the claim, and clears `tenant_slug` when
   the claim overrides an unresolved default. `pkg/token` pins HS256 and
   requires `exp`; tokens carry a `kid` header derived from the signing secret,
@@ -299,7 +306,9 @@ handler/service/DTO/repository package.
   Lockout/rate-limit cache keys hash the normalized email (SHA-256, 128-bit
   hex: `<prefix><hash>[:ip=…]`), never store it raw. Admin ban/unban/role
   change/removal are membership changes in the request tenant; ban, removal,
-  and an actual role change revoke the member's sessions there. A ban or
+  and an actual role change revoke the member's sessions there. The last active
+  owner cannot be demoted, banned, removed, or deleted (DB trigger + advisory
+  lock). A ban or
   removal sets
   `memberships.credentials_revoked_at` (`clock_timestamp()`, never cleared);
   API keys created at or before it are rejected, so unban never revives them.
@@ -351,15 +360,24 @@ handler/service/DTO/repository package.
   (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
   `rc`; refresh repeats the session's `amr`, tokens without it still verify,
   and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
-  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Which roles require MFA is not decided
-  here.
+  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Every `/platform` route (platform-scope roles) requires it (ADR 0010, enforced
+  by `test/arch` `TestPlatformRoutesRequireMFA`).
+  or added. A newly seeded admin becomes tenant `owner` and gets the
+  `platform_admin` assignment; `cmd/seed` does the same.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
-  via `app.PermissionProvider` (`authz.Grant{Permission, Roles}`; admins get
-  everything). Only permissions shared by several modules (`admin:users:*`,
-  `admin:files:*`, `admin:stats:read`) stay in `platform/authz`. Duplicate or
-  conflicting registrations fail startup. Protect routes with
+  via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).
+  The system tenant roles are `owner`, `admin`, and `member`; owner and admin
+  receive every tenant permission, member receives the listed grants. Platform
+  permissions (`platform:tenants:*`, `platform:features:write`) go to
+  `platform_admin` only and are the only cross-tenant access. Only permissions
+  shared by several modules (`admin:users:*`, `admin:files:*`,
+  `admin:stats:read`, the platform ones) stay in `platform/authz`. The catalog
+  is synchronized into `permissions`/system-role grants at API startup;
+  tenant roles are database rows and may only use known tenant permissions.
+  Duplicate or conflicting registrations fail startup. Protect routes with
   `authzhttp.Require(<m>catalog.PermissionX)` behind `deps.Authenticate()`
-  (API key or JWT; API-key scopes are the subject's permissions). JWT-only:
+  (API key or JWT; API-key scopes are intersected with the owner's current
+  effective permissions). JWT-only:
   `POST /auth/logout-all` and `DELETE /auth/sessions/:id` (`sessions:revoke`),
   `GET /auth/sessions` (`profile:read`), `POST /auth/invitations/accept`
   (`profile:write`). `invitations:read|write` are admin-only.

@@ -24,7 +24,7 @@ func TestUserRegisteredEvent(t *testing.T) {
 			Status: UserStatusActive, TokenVersion: 4, HasPassword: true,
 			CreatedAt: created,
 		},
-		Membership: Membership{ID: 9, TenantID: 3, UserID: 7, Role: RoleUser, Status: MembershipStatusActive},
+		Membership: Membership{ID: 9, TenantID: 3, UserID: 7, Role: RoleMember, Status: MembershipStatusActive},
 	})
 	if err != nil {
 		t.Fatalf("userRegisteredEvent: %v", err)

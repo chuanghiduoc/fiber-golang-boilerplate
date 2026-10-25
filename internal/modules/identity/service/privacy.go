@@ -272,7 +272,7 @@ func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) 
 	return s.requestErasure(ctx, userID, "admin.user.erasure_requested")
 }
 
-// requestErasure refuses to erase the last active admin of any tenant, then
+// requestErasure refuses to erase the last active owner of any tenant, then
 // commits one erase job per membership plus the global finalizer and a Tier 1
 // audit row.
 func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, action string) error {
@@ -291,11 +291,11 @@ func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, actio
 
 		for i := range memberships {
 			m := &memberships[i]
-			if m.Status != MembershipStatusActive || m.Role != RoleAdmin {
+			if m.Status != MembershipStatusActive || m.Role != RoleOwner {
 				continue
 			}
 			tctx := tenant.WithID(ctx, m.TenantID)
-			if err := ensureNotLastAdmin(tctx, tx.Memberships, "cannot erase the last active admin"); err != nil {
+			if err := ensureNotLastOwner(tctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
 				return err
 			}
 		}
@@ -538,7 +538,7 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 		return jobs.Permanent(fmt.Errorf("invalid privacy.erase payload"))
 	}
 	tenantID := tenant.EffectiveID(ctx)
-	if err := s.refuseLastAdminErasure(ctx, in.UserID); err != nil {
+	if err := s.refuseLastOwnerErasure(ctx, in.UserID); err != nil {
 		return err
 	}
 	if s.registry != nil {
@@ -551,10 +551,10 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 	return nil
 }
 
-// refuseLastAdminErasure re-checks at job time: another admin may have been
+// refuseLastOwnerErasure re-checks at job time: another admin may have been
 // demoted after the request was accepted. It runs before any eraser, so a
 // refusal leaves the tenant (and other modules) untouched.
-func (s *PrivacyService) refuseLastAdminErasure(ctx context.Context, userID int64) error {
+func (s *PrivacyService) refuseLastOwnerErasure(ctx context.Context, userID int64) error {
 	member, err := s.stores.Memberships.Get(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -562,15 +562,15 @@ func (s *PrivacyService) refuseLastAdminErasure(ctx context.Context, userID int6
 		}
 		return fmt.Errorf("load membership: %w", err)
 	}
-	if member.Membership.Status != MembershipStatusActive || member.Membership.Role != RoleAdmin {
+	if member.Membership.Status != MembershipStatusActive || member.Membership.Role != RoleOwner {
 		return nil
 	}
-	admins, err := s.stores.Memberships.CountActiveAdmins(ctx)
+	owners, err := s.stores.Memberships.CountActiveOwners(ctx)
 	if err != nil {
-		return fmt.Errorf("count admins: %w", err)
+		return fmt.Errorf("count owners: %w", err)
 	}
-	if admins <= 1 {
-		return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot erase the last active admin")
+	if owners <= 1 {
+		return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot erase the last active owner")
 	}
 	return nil
 }

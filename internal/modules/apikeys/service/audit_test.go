@@ -27,7 +27,7 @@ func (r *recordingAudit) RecordTx(_ context.Context, event audit.Event) error {
 
 func auditTestPrincipals() fakePrincipals {
 	return fakePrincipals{users: map[int64]identitycontracts.Principal{
-		10: {ID: 10, TenantID: 1, Role: authz.RoleUser, TenantStatus: identitycontracts.TenantStatusActive},
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 	}}
 }
 

@@ -138,7 +138,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 		if ownerErr != nil {
 			return nil, ownerErr
 		}
-		scopes, scopeErr := normalizeScopes(in.Scopes, principal.Role)
+		scopes, scopeErr := normalizeScopes(in.Scopes, principal)
 		if scopeErr != nil {
 			return nil, scopeErr
 		}
@@ -214,7 +214,7 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 		if err != nil {
 			return nil, err
 		}
-		scopes, err = normalizeScopes(in.Scopes, principal.Role)
+		scopes, err = normalizeScopes(in.Scopes, principal)
 		if err != nil {
 			return nil, err
 		}
@@ -434,7 +434,7 @@ func (s *service) checkPrincipal(
 	return principal, nil
 }
 
-func normalizeScopes(raw []string, role string) ([]authz.Permission, error) {
+func normalizeScopes(raw []string, principal identitycontracts.Principal) ([]authz.Permission, error) {
 	if len(raw) == 0 {
 		return nil, apperror.NewBadRequest("at least one scope is required")
 	}
@@ -452,7 +452,7 @@ func normalizeScopes(raw []string, role string) ([]authz.Permission, error) {
 		if !authz.IsKnownPermission(permission) {
 			return nil, apperror.NewBadRequest(fmt.Sprintf("unknown scope %q", value))
 		}
-		if role != "" && !authz.Has(role, permission) {
+		if !ownerHasPermission(principal, permission) {
 			return nil, apperror.NewBadRequest(fmt.Sprintf("scope %q is not granted to the key owner", value))
 		}
 		if _, ok := seen[permission]; ok {
@@ -463,6 +463,18 @@ func normalizeScopes(raw []string, role string) ([]authz.Permission, error) {
 	}
 	sort.Slice(scopes, func(i, j int) bool { return scopes[i] < scopes[j] })
 	return scopes, nil
+}
+
+func ownerHasPermission(principal identitycontracts.Principal, permission authz.Permission) bool {
+	if principal.Permissions == nil {
+		return principal.Role == "" || authz.Has(principal.Role, permission)
+	}
+	for _, granted := range principal.Permissions {
+		if granted == string(permission) {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeName(raw string) (string, error) {

@@ -67,10 +67,40 @@ WHERE tenant_id = @tenant_id AND id = @id;
 
 -- name: GetSessionState :one
 -- The access-token validator's single lookup: the session (with its tenant
--- and revocation), the membership role/status, the user's token version and
--- status, and the tenant's status.
-SELECT s.tenant_id, s.revoked_at, m.role, m.status AS membership_status,
-       u.token_version, u.status AS user_status, t.status AS tenant_status
+-- and revocation), the membership status and effective permissions (tenant
+-- roles plus platform assignments), the user's token version and status, and
+-- the tenant's status. role_keys is ordered owner, admin, member.
+SELECT s.tenant_id, s.revoked_at, m.status AS membership_status,
+       u.token_version, u.status AS user_status, t.status AS tenant_status,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY
+               CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = s.tenant_id AND mr.user_id = s.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+       ), '{}'::text[])::text[] AS role_keys,
+       COALESCE((
+           SELECT array_agg(DISTINCT p.permission_key)
+           FROM (
+               SELECT rp.permission_key
+               FROM membership_roles mr
+               JOIN roles r ON r.id = mr.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE mr.tenant_id = s.tenant_id AND mr.user_id = s.user_id AND r.scope = 'tenant'
+               UNION
+               SELECT rp.permission_key
+               FROM platform_role_assignments pra
+               JOIN roles r ON r.id = pra.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE pra.user_id = s.user_id AND r.scope = 'platform'
+           ) p
+       ), '{}'::text[])::text[] AS permission_keys,
+       EXISTS (
+           SELECT 1 FROM platform_role_assignments pra
+           JOIN roles r ON r.id = pra.role_id
+           WHERE pra.user_id = s.user_id AND r.scope = 'platform'
+       ) AS platform
 FROM sessions s
 JOIN memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
 JOIN users u ON u.id = s.user_id

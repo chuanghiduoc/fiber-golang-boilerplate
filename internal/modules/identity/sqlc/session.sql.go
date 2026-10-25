@@ -93,8 +93,37 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 }
 
 const getSessionState = `-- name: GetSessionState :one
-SELECT s.tenant_id, s.revoked_at, m.role, m.status AS membership_status,
-       u.token_version, u.status AS user_status, t.status AS tenant_status
+SELECT s.tenant_id, s.revoked_at, m.status AS membership_status,
+       u.token_version, u.status AS user_status, t.status AS tenant_status,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY
+               CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = s.tenant_id AND mr.user_id = s.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+       ), '{}'::text[])::text[] AS role_keys,
+       COALESCE((
+           SELECT array_agg(DISTINCT p.permission_key)
+           FROM (
+               SELECT rp.permission_key
+               FROM membership_roles mr
+               JOIN roles r ON r.id = mr.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE mr.tenant_id = s.tenant_id AND mr.user_id = s.user_id AND r.scope = 'tenant'
+               UNION
+               SELECT rp.permission_key
+               FROM platform_role_assignments pra
+               JOIN roles r ON r.id = pra.role_id
+               JOIN role_permissions rp ON rp.role_id = r.id
+               WHERE pra.user_id = s.user_id AND r.scope = 'platform'
+           ) p
+       ), '{}'::text[])::text[] AS permission_keys,
+       EXISTS (
+           SELECT 1 FROM platform_role_assignments pra
+           JOIN roles r ON r.id = pra.role_id
+           WHERE pra.user_id = s.user_id AND r.scope = 'platform'
+       ) AS platform
 FROM sessions s
 JOIN memberships m ON m.tenant_id = s.tenant_id AND m.user_id = s.user_id
 JOIN users u ON u.id = s.user_id
@@ -110,27 +139,32 @@ type GetSessionStateParams struct {
 type GetSessionStateRow struct {
 	TenantID         int64              `json:"tenant_id"`
 	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
-	Role             string             `json:"role"`
 	MembershipStatus string             `json:"membership_status"`
 	TokenVersion     int32              `json:"token_version"`
 	UserStatus       string             `json:"user_status"`
 	TenantStatus     string             `json:"tenant_status"`
+	RoleKeys         []string           `json:"role_keys"`
+	PermissionKeys   []string           `json:"permission_keys"`
+	Platform         bool               `json:"platform"`
 }
 
 // The access-token validator's single lookup: the session (with its tenant
-// and revocation), the membership role/status, the user's token version and
-// status, and the tenant's status.
+// and revocation), the membership status and effective permissions (tenant
+// roles plus platform assignments), the user's token version and status, and
+// the tenant's status. role_keys is ordered owner, admin, member.
 func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams) (GetSessionStateRow, error) {
 	row := q.db.QueryRow(ctx, getSessionState, arg.ID, arg.UserID)
 	var i GetSessionStateRow
 	err := row.Scan(
 		&i.TenantID,
 		&i.RevokedAt,
-		&i.Role,
 		&i.MembershipStatus,
 		&i.TokenVersion,
 		&i.UserStatus,
 		&i.TenantStatus,
+		&i.RoleKeys,
+		&i.PermissionKeys,
+		&i.Platform,
 	)
 	return i, err
 }

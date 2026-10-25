@@ -76,6 +76,7 @@ func TestNormalizeNewTenant(t *testing.T) {
 		"trial without end": {Status: TenantStatusTrialing},
 		"suspended":         {Status: TenantStatusSuspended},
 		"bad timezone":      {Status: TenantStatusActive, Timezone: "Mars/Olympus"},
+		"bad locale":        {Status: TenantStatusActive, Locale: "en_US"},
 	} {
 		assert.Error(t, normalizeNewTenant(&in), name)
 	}

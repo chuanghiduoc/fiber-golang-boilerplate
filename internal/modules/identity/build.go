@@ -127,6 +127,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	}
 	tenantSvc := identityservice.NewTenantService(stores, transactor)
 	invitationSvc := identityservice.NewInvitationService(stores, transactor, infra.Email, cfg.App.FrontendURL)
+	roleSvc := identityservice.NewRoleService(stores, transactor, sessionStore)
 
 	authHandler := identityhandler.NewAuthHandler(identityhandler.AuthDeps{
 		Users:                    userSvc,
@@ -147,6 +148,8 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	m.sessions = identityhandler.NewSessionHandler(sessionSvc)
 	m.invitations = identityhandler.NewInvitationHandler(invitationSvc)
 	m.mfa = identityhandler.NewMFAHandler(mfaSvc)
+	m.roles = identityhandler.NewRoleHandler(roleSvc)
+	m.platform = identityhandler.NewPlatformHandler(tenantSvc)
 	m.resetSvc = passwordResetSvc
 	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
 	m.privacySvc = identityservice.NewPrivacyService(identityservice.PrivacyDeps{
@@ -159,7 +162,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	})
 	m.privacy = identityhandler.NewPrivacyHandler(m.privacySvc)
 	m.startup = func(ctx context.Context) error {
-		return startup(ctx, infra.Platform, settings.Admin, stores, transactor)
+		return startup(ctx, infra.Platform, settings.Admin, stores, transactor, sessionStore)
 	}
 
 	return m, Provides{
@@ -264,7 +267,7 @@ func (m *Module) Startup(ctx context.Context) error {
 }
 
 func startup(ctx context.Context, cfg app.PlatformConfig, admin config.AdminConfig,
-	stores identityservice.Stores, tx identityservice.Transactor,
+	stores identityservice.Stores, tx identityservice.Transactor, sessions session.Store,
 ) error {
 	// The baseline seeds tenant id 1. Startup checks existence, not request
 	// eligibility: a suspended configured/default tenant must not crash the
@@ -282,6 +285,16 @@ func startup(ctx context.Context, cfg app.PlatformConfig, admin config.AdminConf
 	}
 	if cfg.App.Env == "staging" && !cfg.Tenant.RequireHeader {
 		slog.Warn("TENANT_REQUIRE_HEADER=false in staging: header-less requests use the default tenant")
+	}
+
+	// The permission catalog is code-owned; write it and the system role
+	// grants before the seed assigns roles.
+	if err := identityservice.SyncPermissions(ctx, tx, stores.Roles); err != nil {
+		return err
+	}
+	// A deploy can change role_permissions; drop snapshots cached by replicas.
+	if err := sessions.InvalidatePermissions(ctx); err != nil {
+		return fmt.Errorf("invalidate cached permissions: %w", err)
 	}
 
 	// Auto-seed admin user (idempotent) in the configured default tenant.

@@ -195,3 +195,24 @@ func TestModuleNamesAreUnique(t *testing.T) {
 		seen[m.Name()] = true
 	}
 }
+
+// TestPlatformRoutesRequireMFA enforces ADR 0010: platform-scope roles require
+// a second factor, so every cross-tenant /platform route runs
+// authzhttp.RequireMFA before its final handler.
+func TestPlatformRoutesRequireMFA(t *testing.T) {
+	endpoints, _ := moduleRoutes(t)
+	seen := 0
+	for _, mounted := range endpoints {
+		route := mounted.route
+		if !strings.HasPrefix(route.Path, "/api/v1/platform/") {
+			continue
+		}
+		seen++
+		if !handlerBeforeFinal(route, authzPackage, "RequireMFA") {
+			t.Errorf("module %s: %s %s must run authzhttp.RequireMFA before its handler", mounted.module, route.Method, route.Path)
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no /api/v1/platform routes found; update this test if the prefix moved")
+	}
+}

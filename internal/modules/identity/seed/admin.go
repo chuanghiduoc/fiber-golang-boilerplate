@@ -21,11 +21,11 @@ const adminBcryptCost = 12
 
 // Admin creates the bootstrap admin when ADMIN_EMAIL and ADMIN_PASSWORD are
 // set and no account has that address: a verified global user, its password,
-// and an admin membership in the tenant, in one transaction. It is safe to
-// call on every startup (idempotent).
+// an owner membership in the tenant, and the platform_admin assignment, in one
+// transaction. It is safe to call on every startup (idempotent).
 //
 // The seed only ever creates. When ADMIN_EMAIL already belongs to an account
-// (in any tenant) that is not an active admin member of this tenant, or the
+// (in any tenant) that is not an active owner of this tenant, or the
 // address is banned in it, that state is an operator decision: the seed logs
 // a warning and skips. It never promotes, adds memberships to, or restores an
 // existing account, and never fails startup over it.
@@ -82,8 +82,10 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		if err := tx.Users.CreatePassword(ctx, user.ID, string(hash)); err != nil {
 			return err
 		}
-		_, err = tx.Memberships.Create(ctx, user.ID, identityservice.RoleAdmin)
-		return err
+		if _, err = tx.Memberships.Create(ctx, user.ID, identityservice.RoleOwner); err != nil {
+			return err
+		}
+		return tx.Roles.AssignPlatformRole(ctx, user.ID, authz.RolePlatformAdmin)
 	})
 	if err != nil {
 		// Another replica may have won the startup race; its row decides.
@@ -112,8 +114,8 @@ func keepExisting(ctx context.Context, stores identityservice.Stores, user *iden
 	case err != nil:
 		return fmt.Errorf("look up admin membership: %w", err)
 	}
-	if !member.Active() || member.Membership.Role != identityservice.RoleAdmin {
-		slog.Warn("ADMIN_EMAIL belongs to a member that is not an active admin; skipping admin seed (accounts are never promoted or restored)",
+	if !member.Active() || member.Membership.Role != identityservice.RoleOwner {
+		slog.Warn("ADMIN_EMAIL belongs to a member that is not an active owner; skipping admin seed (accounts are never promoted or restored)",
 			slog.String("email", user.Email),
 			slog.Int64("tenant_id", tenantID),
 			slog.String("membership_status", string(member.Membership.Status)),
