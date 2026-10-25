@@ -1,6 +1,6 @@
 //go:build integration
 
-package service
+package service_test
 
 import (
 	"context"
@@ -15,8 +15,8 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
+	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -35,14 +35,14 @@ func integrationUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, address s
 	return testutil.CreateMember(t, context.Background(), pool, tenantID, address, testutil.MemberOptions{}).UserID
 }
 
-func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) NotificationService {
+func newIntegrationService(t *testing.T, pool *pgxpool.Pool, recipients identitycontracts.NotificationRecipientLookup) notificationservice.NotificationService {
 	t.Helper()
 	sender := jobs.NewQueuedSender(jobs.NewQueue(pool))
-	return NewNotificationService(
+	return notificationservice.NewNotificationService(
 		repository.NewNotificationRepository(pool),
 		recipients,
 		sender,
-		database.NewTxManager(pool),
+		repository.NewTransactor(database.NewTxManager(pool), sender),
 	)
 }
 
@@ -145,8 +145,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	svc := newIntegrationService(t, pool, recipients)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelEmail, Enabled: new(false),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelEmail, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err := svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -162,8 +162,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	).Scan(&jobsForType))
 	assert.Zero(t, jobsForType, "a disabled email channel must not enqueue a job")
 
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(false),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelInApp, Enabled: new(false),
 	})
 	require.NoError(t, err)
 	result, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
@@ -174,8 +174,8 @@ func TestCreateIntegrationHonorsPreferencesAndReadState(t *testing.T) {
 	assert.False(t, result.EmailQueued)
 
 	// Re-enable in-app and exercise unread/read/read-all against real SQL.
-	_, err = svc.SetPreference(ctx, userID, dto.UpdatePreferenceRequest{
-		Type: "marketing.promo", Channel: ChannelInApp, Enabled: new(true),
+	_, err = svc.SetPreference(ctx, userID, notificationservice.PreferenceUpdate{
+		Type: "marketing.promo", Channel: notificationservice.ChannelInApp, Enabled: new(true),
 	})
 	require.NoError(t, err)
 	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{

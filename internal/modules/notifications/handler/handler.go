@@ -53,7 +53,8 @@ func (h *Handler) List(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, items, hasMore, pagination.NextCursor(items, func(n dto.NotificationResponse) (time.Time, int64) { return n.CreatedAt, n.ID }))
+	responses := toNotificationResponses(items)
+	return response.List(c, responses, hasMore, pagination.NextCursor(responses, func(n dto.NotificationResponse) (time.Time, int64) { return n.CreatedAt, n.ID }))
 }
 
 // Get godoc
@@ -78,7 +79,7 @@ func (h *Handler) Get(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, item)
+	return response.Success(c, toNotificationResponse(item))
 }
 
 // MarkRead godoc
@@ -103,7 +104,7 @@ func (h *Handler) MarkRead(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, item)
+	return response.Success(c, toNotificationResponse(item))
 }
 
 // MarkAllRead godoc
@@ -157,7 +158,7 @@ func (h *Handler) ListPreferences(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.List(c, prefs, false)
+	return response.List(c, toPreferenceResponses(prefs), false)
 }
 
 // SetPreference godoc
@@ -179,11 +180,11 @@ func (h *Handler) SetPreference(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	pref, err := h.service.SetPreference(c.Context(), httpx.AuthUserID(c), req)
+	pref, err := h.service.SetPreference(c.Context(), httpx.AuthUserID(c), toPreferenceUpdate(req))
 	if err != nil {
 		return err
 	}
-	return response.Success(c, pref)
+	return response.Success(c, toPreferenceResponse(pref))
 }
 
 // Send godoc
@@ -232,8 +233,5 @@ func (h *Handler) Send(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Created(c, dto.SendNotificationResponse{
-		Notification: result.Notification,
-		EmailQueued:  result.EmailQueued,
-	})
+	return response.Created(c, toSendNotificationResponse(result))
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -35,7 +34,7 @@ func (s *routeService) Create(_ context.Context, input notificationcontracts.Cre
 	s.createCalls++
 	now := time.Now().UTC()
 	return service.CreateResult{
-		Notification: &dto.NotificationResponse{
+		Notification: &service.Notification{
 			ID: 1, TenantID: input.TenantID, UserID: input.UserID, Type: input.Type,
 			Title: input.Title, Body: input.Body, CreatedAt: now,
 		},
@@ -47,17 +46,17 @@ func (s *routeService) Notify(context.Context, notificationcontracts.CreateNotif
 	return nil
 }
 
-func (s *routeService) Get(context.Context, int64, int64) (*dto.NotificationResponse, error) {
-	return &dto.NotificationResponse{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body"}, nil
+func (s *routeService) Get(context.Context, int64, int64) (*service.Notification, error) {
+	return &service.Notification{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body"}, nil
 }
 
-func (s *routeService) List(ctx context.Context, _ int64, _ int, _ string, _ bool) ([]dto.NotificationResponse, bool, error) {
+func (s *routeService) List(ctx context.Context, _ int64, _ int, _ string, _ bool) ([]service.Notification, bool, error) {
 	s.lastTenantID = tenant.EffectiveID(ctx)
-	return []dto.NotificationResponse{}, false, nil
+	return []service.Notification{}, false, nil
 }
 
-func (s *routeService) MarkRead(context.Context, int64, int64) (*dto.NotificationResponse, error) {
-	return &dto.NotificationResponse{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body"}, nil
+func (s *routeService) MarkRead(context.Context, int64, int64) (*service.Notification, error) {
+	return &service.Notification{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body"}, nil
 }
 
 func (s *routeService) MarkAllRead(context.Context, int64) (int64, error) {
@@ -67,12 +66,12 @@ func (s *routeService) MarkAllRead(context.Context, int64) (int64, error) {
 
 func (s *routeService) UnreadCount(context.Context, int64) (int64, error) { return 3, nil }
 
-func (s *routeService) ListPreferences(context.Context, int64) ([]dto.PreferenceResponse, error) {
-	return []dto.PreferenceResponse{}, nil
+func (s *routeService) ListPreferences(context.Context, int64) ([]service.Preference, error) {
+	return []service.Preference{}, nil
 }
 
-func (s *routeService) SetPreference(_ context.Context, userID int64, req dto.UpdatePreferenceRequest) (*dto.PreferenceResponse, error) {
-	return &dto.PreferenceResponse{ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: *req.Enabled}, nil
+func (s *routeService) SetPreference(_ context.Context, userID int64, update service.PreferenceUpdate) (*service.Preference, error) {
+	return &service.Preference{ID: 1, TenantID: 1, UserID: userID, Type: update.Type, Channel: update.Channel, Enabled: *update.Enabled}, nil
 }
 
 func newRouteApp(t *testing.T, svc *routeService) *fiber.App {
