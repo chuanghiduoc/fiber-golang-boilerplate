@@ -23,8 +23,8 @@ import (
 )
 
 type fakeService struct {
-	items          []dto.NotificationResponse
-	prefs          []dto.PreferenceResponse
+	items          []service.Notification
+	prefs          []service.Preference
 	unread         int64
 	updated        int64
 	hasMore        bool
@@ -35,7 +35,7 @@ type fakeService struct {
 	lastLimit      int
 	lastAfter      string
 	lastUnreadOnly bool
-	lastPreference dto.UpdatePreferenceRequest
+	lastPreference service.PreferenceUpdate
 	lastInput      notificationcontracts.CreateNotificationInput
 }
 
@@ -48,7 +48,7 @@ func (f *fakeService) Notify(_ context.Context, _ notificationcontracts.CreateNo
 	return f.err
 }
 
-func (f *fakeService) Get(_ context.Context, userID, id int64) (*dto.NotificationResponse, error) {
+func (f *fakeService) Get(_ context.Context, userID, id int64) (*service.Notification, error) {
 	f.lastUserID = userID
 	if f.err != nil {
 		return nil, f.err
@@ -61,7 +61,7 @@ func (f *fakeService) Get(_ context.Context, userID, id int64) (*dto.Notificatio
 	return nil, apperror.NewNotFound("notification not found")
 }
 
-func (f *fakeService) List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]dto.NotificationResponse, bool, error) {
+func (f *fakeService) List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]service.Notification, bool, error) {
 	f.lastUserID = userID
 	f.lastTenantID = tenant.EffectiveID(ctx)
 	f.lastLimit = limit
@@ -70,7 +70,7 @@ func (f *fakeService) List(ctx context.Context, userID int64, limit int, startin
 	return f.items, f.hasMore, f.err
 }
 
-func (f *fakeService) MarkRead(_ context.Context, userID, id int64) (*dto.NotificationResponse, error) {
+func (f *fakeService) MarkRead(_ context.Context, userID, id int64) (*service.Notification, error) {
 	f.lastUserID = userID
 	if f.err != nil {
 		return nil, f.err
@@ -95,19 +95,19 @@ func (f *fakeService) UnreadCount(_ context.Context, userID int64) (int64, error
 	return f.unread, f.err
 }
 
-func (f *fakeService) ListPreferences(_ context.Context, userID int64) ([]dto.PreferenceResponse, error) {
+func (f *fakeService) ListPreferences(_ context.Context, userID int64) ([]service.Preference, error) {
 	f.lastUserID = userID
 	return f.prefs, f.err
 }
 
-func (f *fakeService) SetPreference(_ context.Context, userID int64, req dto.UpdatePreferenceRequest) (*dto.PreferenceResponse, error) {
+func (f *fakeService) SetPreference(_ context.Context, userID int64, update service.PreferenceUpdate) (*service.Preference, error) {
 	f.lastUserID = userID
-	f.lastPreference = req
+	f.lastPreference = update
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &dto.PreferenceResponse{
-		ID: 1, TenantID: 1, UserID: userID, Type: req.Type, Channel: req.Channel, Enabled: *req.Enabled,
+	return &service.Preference{
+		ID: 1, TenantID: 1, UserID: userID, Type: update.Type, Channel: update.Channel, Enabled: *update.Enabled,
 	}, nil
 }
 
@@ -156,7 +156,7 @@ func doJSON(t *testing.T, app *fiber.App, method, path string, body any) (resp *
 
 func TestListHandler(t *testing.T) {
 	now := time.Now().UTC()
-	svc := &fakeService{hasMore: true, items: []dto.NotificationResponse{
+	svc := &fakeService{hasMore: true, items: []service.Notification{
 		{ID: 2, TenantID: 1, UserID: 10, Type: "system.info", Title: "New", Body: "Body", CreatedAt: now},
 		{ID: 1, TenantID: 1, UserID: 10, Type: "system.info", Title: "Old", Body: "Body", CreatedAt: now.Add(-time.Minute)},
 	}}
@@ -189,7 +189,7 @@ func TestListHandler(t *testing.T) {
 func TestUnreadAndReadHandlers(t *testing.T) {
 	now := time.Now().UTC()
 	svc := &fakeService{
-		items:   []dto.NotificationResponse{{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body", CreatedAt: now}},
+		items:   []service.Notification{{ID: 1, TenantID: 1, UserID: 10, Title: "One", Body: "Body", CreatedAt: now}},
 		unread:  3,
 		updated: 4,
 	}
@@ -210,7 +210,7 @@ func TestUnreadAndReadHandlers(t *testing.T) {
 }
 
 func TestPreferenceHandlers(t *testing.T) {
-	svc := &fakeService{prefs: []dto.PreferenceResponse{
+	svc := &fakeService{prefs: []service.Preference{
 		{ID: 1, TenantID: 1, UserID: 10, Type: "security.alert", Channel: "email", Enabled: false},
 	}}
 	app := setupHandlerApp(New(svc))
@@ -235,7 +235,7 @@ func TestPreferenceHandlers(t *testing.T) {
 
 	// Omitting enabled is a validation error, not an implicit disable;
 	// explicit false is accepted.
-	svc.lastPreference = dto.UpdatePreferenceRequest{}
+	svc.lastPreference = service.PreferenceUpdate{}
 	resp, _ = doJSON(t, app, http.MethodPut, "/notification-preferences", map[string]any{
 		"type": "security.alert", "channel": "email",
 	})
@@ -256,7 +256,7 @@ func TestPreferenceHandlers(t *testing.T) {
 func TestSendHandler(t *testing.T) {
 	now := time.Now().UTC()
 	svc := &fakeService{createResult: service.CreateResult{
-		Notification: &dto.NotificationResponse{ID: 1, TenantID: 1, UserID: 10, Title: "Hello", Body: "Body", CreatedAt: now},
+		Notification: &service.Notification{ID: 1, TenantID: 1, UserID: 10, Title: "Hello", Body: "Body", CreatedAt: now},
 		EmailQueued:  true,
 	}}
 	app := setupHandlerApp(New(svc))

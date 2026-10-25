@@ -26,14 +26,6 @@ const (
 	retentionPurgeBudget = time.Minute
 )
 
-// RetentionRepository is the retention persistence port. It is not
-// tenant-scoped: retention is a cross-tenant maintenance pass.
-type RetentionRepository interface {
-	// PurgeRead deletes at most limit notifications read more than
-	// retentionDays ago and returns how many it deleted.
-	PurgeRead(ctx context.Context, retentionDays, limit int32) (int64, error)
-}
-
 // RetentionPurger runs the read-notification retention job.
 type RetentionPurger struct {
 	repo          RetentionRepository

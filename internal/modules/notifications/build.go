@@ -22,17 +22,14 @@ type Settings struct {
 	RetentionDays int32
 }
 
-// The repository cannot assert this itself (import cycle with the legacy
-// service), so the composition point does.
-var _ notificationsservice.RetentionRepository = (*notificationsrepo.RetentionRepository)(nil)
-
 // Build constructs the notification feed, preferences, and email channel.
 // Identity supplies the email recipient through the contract, and the queued
 // sender writes the email job into the shared outbox in the same transaction
 // as the in-app row.
 func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup, settings Settings) *Module {
 	repo := notificationsrepo.NewNotificationRepository(infra.Pool)
-	svc := notificationsservice.NewNotificationService(repo, recipients, infra.Email, infra.Tx)
+	svc := notificationsservice.NewNotificationService(
+		repo, recipients, infra.Email, notificationsrepo.NewTransactor(infra.Tx, infra.Email))
 	m := New(notificationshandler.New(svc))
 	if settings.RetentionDays > 0 {
 		m.retentionPurger = notificationsservice.NewRetentionPurger(

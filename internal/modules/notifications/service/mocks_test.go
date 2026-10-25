@@ -2,16 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
-	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
@@ -21,48 +17,49 @@ import (
 // mockRepository mirrors the repository's tenant and user predicates. It is
 // intentionally in-memory so service tests exercise scoping without Docker.
 type mockRepository struct {
-	notifications map[int64]*notificationsqlc.Notification
-	prefs         map[string]*notificationsqlc.NotificationPreference
+	notifications map[int64]*Notification
+	prefs         map[string]*Preference
 	nextNotifID   int64
 	nextPrefID    int64
 	failCreate    error
 	failList      error
 }
 
-var _ repository.NotificationRepository = (*mockRepository)(nil)
+var _ NotificationRepository = (*mockRepository)(nil)
 
 func newMockRepository() *mockRepository {
 	return &mockRepository{
-		notifications: make(map[int64]*notificationsqlc.Notification),
-		prefs:         make(map[string]*notificationsqlc.NotificationPreference),
+		notifications: make(map[int64]*Notification),
+		prefs:         make(map[string]*Preference),
 		nextNotifID:   1,
 		nextPrefID:    1,
 	}
 }
 
-func (m *mockRepository) WithTx(tx pgx.Tx) repository.NotificationRepository { return m }
-
-func (m *mockRepository) Create(ctx context.Context, params notificationsqlc.CreateNotificationParams) (*notificationsqlc.Notification, error) {
+func (m *mockRepository) Create(ctx context.Context, in NewNotification) (*Notification, error) {
 	if m.failCreate != nil {
 		return nil, m.failCreate
 	}
-	params.TenantID = tenant.EffectiveID(ctx)
-	row := &notificationsqlc.Notification{
+	data := map[string]any{}
+	if len(in.Data) > 0 {
+		_ = json.Unmarshal(in.Data, &data)
+	}
+	row := &Notification{
 		ID:        m.nextNotifID,
-		TenantID:  params.TenantID,
-		UserID:    params.UserID,
-		Type:      params.Type,
-		Title:     params.Title,
-		Body:      params.Body,
-		Data:      append([]byte(nil), params.Data...),
-		CreatedAt: pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+		TenantID:  tenant.EffectiveID(ctx),
+		UserID:    in.UserID,
+		Type:      in.Type,
+		Title:     in.Title,
+		Body:      in.Body,
+		Data:      data,
+		CreatedAt: time.Now().UTC(),
 	}
 	m.notifications[row.ID] = row
 	m.nextNotifID++
 	return row, nil
 }
 
-func (m *mockRepository) GetByID(ctx context.Context, id, userID int64) (*notificationsqlc.Notification, error) {
+func (m *mockRepository) GetByID(ctx context.Context, id, userID int64) (*Notification, error) {
 	row, ok := m.notifications[id]
 	if !ok || !m.scoped(ctx, row, userID) {
 		return nil, apperror.ErrNotFound
@@ -70,16 +67,16 @@ func (m *mockRepository) GetByID(ctx context.Context, id, userID int64) (*notifi
 	return row, nil
 }
 
-func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]notificationsqlc.Notification, error) {
+func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]Notification, error) {
 	if m.failList != nil {
 		return nil, m.failList
 	}
-	rows := make([]notificationsqlc.Notification, 0, len(m.notifications))
+	rows := make([]Notification, 0, len(m.notifications))
 	for _, row := range m.notifications {
 		if !m.scoped(ctx, row, userID) {
 			continue
 		}
-		if unreadOnly && row.ReadAt.Valid {
+		if unreadOnly && row.ReadAt != nil {
 			continue
 		}
 		if cur.HasCursor && !beforeCursor(row, cur) {
@@ -88,10 +85,10 @@ func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagin
 		rows = append(rows, *row)
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].CreatedAt.Time.Equal(rows[j].CreatedAt.Time) {
+		if rows[i].CreatedAt.Equal(rows[j].CreatedAt) {
 			return rows[i].ID > rows[j].ID
 		}
-		return rows[i].CreatedAt.Time.After(rows[j].CreatedAt.Time)
+		return rows[i].CreatedAt.After(rows[j].CreatedAt)
 	})
 	if len(rows) > int(cur.Limit) {
 		rows = rows[:cur.Limit]
@@ -102,20 +99,21 @@ func (m *mockRepository) ListCursor(ctx context.Context, userID int64, cur pagin
 func (m *mockRepository) CountUnread(ctx context.Context, userID int64) (int64, error) {
 	var count int64
 	for _, row := range m.notifications {
-		if m.scoped(ctx, row, userID) && !row.ReadAt.Valid {
+		if m.scoped(ctx, row, userID) && row.ReadAt == nil {
 			count++
 		}
 	}
 	return count, nil
 }
 
-func (m *mockRepository) MarkRead(ctx context.Context, id, userID int64) (*notificationsqlc.Notification, error) {
+func (m *mockRepository) MarkRead(ctx context.Context, id, userID int64) (*Notification, error) {
 	row, ok := m.notifications[id]
 	if !ok || !m.scoped(ctx, row, userID) {
 		return nil, apperror.ErrNotFound
 	}
-	if !row.ReadAt.Valid {
-		row.ReadAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+	if row.ReadAt == nil {
+		readAt := time.Now().UTC()
+		row.ReadAt = &readAt
 	}
 	return row, nil
 }
@@ -123,15 +121,16 @@ func (m *mockRepository) MarkRead(ctx context.Context, id, userID int64) (*notif
 func (m *mockRepository) MarkAllRead(ctx context.Context, userID int64) (int64, error) {
 	var updated int64
 	for _, row := range m.notifications {
-		if m.scoped(ctx, row, userID) && !row.ReadAt.Valid {
-			row.ReadAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+		if m.scoped(ctx, row, userID) && row.ReadAt == nil {
+			readAt := time.Now().UTC()
+			row.ReadAt = &readAt
 			updated++
 		}
 	}
 	return updated, nil
 }
 
-func (m *mockRepository) GetPreference(ctx context.Context, userID int64, notificationType, channel string) (*notificationsqlc.NotificationPreference, error) {
+func (m *mockRepository) GetPreference(ctx context.Context, userID int64, notificationType, channel string) (*Preference, error) {
 	row, ok := m.prefs[prefKey(tenant.EffectiveID(ctx), userID, notificationType, channel)]
 	if !ok {
 		return nil, apperror.ErrNotFound
@@ -139,8 +138,8 @@ func (m *mockRepository) GetPreference(ctx context.Context, userID int64, notifi
 	return row, nil
 }
 
-func (m *mockRepository) ListPreferences(ctx context.Context, userID int64) ([]notificationsqlc.NotificationPreference, error) {
-	rows := make([]notificationsqlc.NotificationPreference, 0, len(m.prefs))
+func (m *mockRepository) ListPreferences(ctx context.Context, userID int64) ([]Preference, error) {
+	rows := make([]Preference, 0, len(m.prefs))
 	for _, row := range m.prefs {
 		if row.TenantID == tenant.EffectiveID(ctx) && row.UserID == userID {
 			rows = append(rows, *row)
@@ -155,22 +154,22 @@ func (m *mockRepository) ListPreferences(ctx context.Context, userID int64) ([]n
 	return rows, nil
 }
 
-func (m *mockRepository) UpsertPreference(ctx context.Context, params notificationsqlc.UpsertNotificationPreferenceParams) (*notificationsqlc.NotificationPreference, error) {
-	params.TenantID = tenant.EffectiveID(ctx)
-	key := prefKey(params.TenantID, params.UserID, params.Type, params.Channel)
+func (m *mockRepository) UpsertPreference(ctx context.Context, in NewPreference) (*Preference, error) {
+	tenantID := tenant.EffectiveID(ctx)
+	key := prefKey(tenantID, in.UserID, in.Type, in.Channel)
 	if row, ok := m.prefs[key]; ok {
-		row.Enabled = params.Enabled
-		row.UpdatedAt = pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
+		row.Enabled = in.Enabled
+		row.UpdatedAt = time.Now().UTC()
 		return row, nil
 	}
-	now := pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true}
-	row := &notificationsqlc.NotificationPreference{
+	now := time.Now().UTC()
+	row := &Preference{
 		ID:        m.nextPrefID,
-		TenantID:  params.TenantID,
-		UserID:    params.UserID,
-		Type:      params.Type,
-		Channel:   params.Channel,
-		Enabled:   params.Enabled,
+		TenantID:  tenantID,
+		UserID:    in.UserID,
+		Type:      in.Type,
+		Channel:   in.Channel,
+		Enabled:   in.Enabled,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -179,24 +178,24 @@ func (m *mockRepository) UpsertPreference(ctx context.Context, params notificati
 	return row, nil
 }
 
-func (m *mockRepository) scoped(ctx context.Context, row *notificationsqlc.Notification, userID int64) bool {
+func (m *mockRepository) scoped(ctx context.Context, row *Notification, userID int64) bool {
 	return row.TenantID == tenant.EffectiveID(ctx) && row.UserID == userID
 }
 
-func (m *mockRepository) snapshot() (notifs map[int64]notificationsqlc.Notification, prefs map[string]notificationsqlc.NotificationPreference) {
-	notifs = make(map[int64]notificationsqlc.Notification, len(m.notifications))
+func (m *mockRepository) snapshot() (notifs map[int64]Notification, prefs map[string]Preference) {
+	notifs = make(map[int64]Notification, len(m.notifications))
 	for id, row := range m.notifications {
 		notifs[id] = *row
 	}
-	prefs = make(map[string]notificationsqlc.NotificationPreference, len(m.prefs))
+	prefs = make(map[string]Preference, len(m.prefs))
 	for key, row := range m.prefs {
 		prefs[key] = *row
 	}
 	return notifs, prefs
 }
 
-func (m *mockRepository) restore(notifs map[int64]notificationsqlc.Notification, prefs map[string]notificationsqlc.NotificationPreference) {
-	m.notifications = make(map[int64]*notificationsqlc.Notification, len(notifs))
+func (m *mockRepository) restore(notifs map[int64]Notification, prefs map[string]Preference) {
+	m.notifications = make(map[int64]*Notification, len(notifs))
 	m.nextNotifID = 1
 	for id, row := range notifs {
 		copyRow := row
@@ -205,7 +204,7 @@ func (m *mockRepository) restore(notifs map[int64]notificationsqlc.Notification,
 			m.nextNotifID = id + 1
 		}
 	}
-	m.prefs = make(map[string]*notificationsqlc.NotificationPreference, len(prefs))
+	m.prefs = make(map[string]*Preference, len(prefs))
 	m.nextPrefID = 1
 	for key, row := range prefs {
 		copyRow := row
@@ -216,29 +215,41 @@ func (m *mockRepository) restore(notifs map[int64]notificationsqlc.Notification,
 	}
 }
 
-func beforeCursor(row *notificationsqlc.Notification, cur pagination.DBCursor) bool {
-	if row.CreatedAt.Time.Before(cur.CreatedAt) {
+func beforeCursor(row *Notification, cur pagination.DBCursor) bool {
+	if row.CreatedAt.Before(cur.CreatedAt) {
 		return true
 	}
-	return row.CreatedAt.Time.Equal(cur.CreatedAt) && row.ID < cur.ID
+	return row.CreatedAt.Equal(cur.CreatedAt) && row.ID < cur.ID
 }
 
 func prefKey(tenantID, userID int64, notificationType, channel string) string {
 	return fmt.Sprintf("%d|%d|%s|%s", tenantID, userID, notificationType, channel)
 }
 
-// mockTxManager models transaction rollback without a database.
-type mockTxManager struct {
+// mockTransactor models transaction rollback without a database.
+type mockTransactor struct {
 	repo *mockRepository
+	mail *mockEmailSender
 }
 
-func (m *mockTxManager) WithTx(_ context.Context, fn func(tx pgx.Tx) error) error {
+var _ Transactor = (*mockTransactor)(nil)
+
+func (m *mockTransactor) InTx(ctx context.Context, fn func(context.Context, TxRepos) error) error {
 	notifs, prefs := m.repo.snapshot()
-	if err := fn(nil); err != nil {
+	if err := fn(ctx, TxRepos{Notifications: m.repo, Mail: txMail{sender: m.mail}}); err != nil {
 		m.repo.restore(notifs, prefs)
 		return err
 	}
 	return nil
+}
+
+type txMail struct {
+	sender *mockEmailSender
+}
+
+func (m txMail) Send(ctx context.Context, msg email.Message) error {
+	m.sender.txCalls++
+	return m.sender.Send(ctx, msg)
 }
 
 type mockEmailSender struct {
@@ -248,17 +259,10 @@ type mockEmailSender struct {
 	txCalls   int
 }
 
+var _ Mailer = (*mockEmailSender)(nil)
+
 func (m *mockEmailSender) Send(_ context.Context, msg email.Message) error {
 	m.sendCalls++
-	if m.fail != nil {
-		return m.fail
-	}
-	m.messages = append(m.messages, msg)
-	return nil
-}
-
-func (m *mockEmailSender) SendTx(_ context.Context, _ pgx.Tx, msg email.Message) error {
-	m.txCalls++
 	if m.fail != nil {
 		return m.fail
 	}

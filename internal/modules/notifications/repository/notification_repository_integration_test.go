@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
+	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -45,19 +45,18 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
-	first, err := repo.Create(ctxOne, notificationsqlc.CreateNotificationParams{
-		TenantID: 999, // must be overridden by the context tenant
-		UserID:   userOne,
-		Type:     "security.alert",
-		Title:    "Tenant one",
-		Body:     "Body one",
-		Data:     []byte(`{"source":"test"}`),
+	first, err := repo.Create(ctxOne, notificationservice.NewNotification{
+		UserID: userOne,
+		Type:   "security.alert",
+		Title:  "Tenant one",
+		Body:   "Body one",
+		Data:   []byte(`{"source":"test"}`),
 	})
 	require.NoError(t, err)
 	assert.Equal(t, tenant.DefaultID, first.TenantID)
 	assert.Equal(t, userOne, first.UserID)
 
-	second, err := repo.Create(ctxTwo, notificationsqlc.CreateNotificationParams{
+	second, err := repo.Create(ctxTwo, notificationservice.NewNotification{
 		UserID: userTwo,
 		Type:   "security.alert",
 		Title:  "Tenant two",
@@ -105,10 +104,11 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 
 	read, err := repo.MarkRead(ctxOne, first.ID, userOne)
 	require.NoError(t, err)
-	require.True(t, read.ReadAt.Valid)
+	require.NotNil(t, read.ReadAt)
 	readAgain, err := repo.MarkRead(ctxOne, first.ID, userOne)
 	require.NoError(t, err)
-	assert.Equal(t, read.ReadAt.Time, readAgain.ReadAt.Time)
+	require.NotNil(t, readAgain.ReadAt)
+	assert.Equal(t, *read.ReadAt, *readAgain.ReadAt)
 
 	count, err := repo.CountUnread(ctxOne, userOne)
 	require.NoError(t, err)
@@ -179,13 +179,13 @@ func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
-	first, err := repo.UpsertPreference(ctxOne, notificationsqlc.UpsertNotificationPreferenceParams{
+	first, err := repo.UpsertPreference(ctxOne, notificationservice.NewPreference{
 		UserID: userOne, Type: "security.alert", Channel: "email", Enabled: false,
 	})
 	require.NoError(t, err)
 	assert.False(t, first.Enabled)
 
-	same, err := repo.UpsertPreference(ctxOne, notificationsqlc.UpsertNotificationPreferenceParams{
+	same, err := repo.UpsertPreference(ctxOne, notificationservice.NewPreference{
 		UserID: userOne, Type: "security.alert", Channel: "email", Enabled: true,
 	})
 	require.NoError(t, err)

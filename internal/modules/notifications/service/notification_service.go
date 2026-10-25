@@ -14,13 +14,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
-
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
-	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
@@ -47,43 +42,24 @@ const (
 
 var notificationTypePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-// TransactionalEmailSender can enqueue an email on a caller-owned database
-// transaction. jobs.QueuedSender implements it; a plain email.Sender does not.
-type TransactionalEmailSender interface {
-	SendTx(ctx context.Context, tx pgx.Tx, msg email.Message) error
-}
-
-// TransactionManager runs fn inside a transaction. database.TxManager
-// implements it; tests substitute a fake that models rollback.
-type TransactionManager interface {
-	WithTx(ctx context.Context, fn func(tx pgx.Tx) error) error
-}
-
-// CreateResult reports which channels accepted a notification. Notification
-// is nil when the in-app channel is disabled.
-type CreateResult struct {
-	Notification *dto.NotificationResponse
-	EmailQueued  bool
-}
-
 // NotificationService is the notifications module's business surface.
 type NotificationService interface {
 	Create(ctx context.Context, input notificationcontracts.CreateNotificationInput) (CreateResult, error)
 	Notify(ctx context.Context, input notificationcontracts.CreateNotificationInput) error
-	Get(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error)
-	List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]dto.NotificationResponse, bool, error)
-	MarkRead(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error)
+	Get(ctx context.Context, userID, id int64) (*Notification, error)
+	List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error)
+	MarkRead(ctx context.Context, userID, id int64) (*Notification, error)
 	MarkAllRead(ctx context.Context, userID int64) (int64, error)
 	UnreadCount(ctx context.Context, userID int64) (int64, error)
-	ListPreferences(ctx context.Context, userID int64) ([]dto.PreferenceResponse, error)
-	SetPreference(ctx context.Context, userID int64, req dto.UpdatePreferenceRequest) (*dto.PreferenceResponse, error)
+	ListPreferences(ctx context.Context, userID int64) ([]Preference, error)
+	SetPreference(ctx context.Context, userID int64, update PreferenceUpdate) (*Preference, error)
 }
 
 type notificationService struct {
-	repo       repository.NotificationRepository
+	repo       NotificationRepository
 	recipients identitycontracts.NotificationRecipientLookup
-	sender     email.Sender
-	txManager  TransactionManager
+	sender     Mailer
+	tx         Transactor
 }
 
 // Notify implements notificationcontracts.Notifier for other modules. A notification
@@ -99,23 +75,23 @@ var (
 )
 
 func NewNotificationService(
-	repo repository.NotificationRepository,
+	repo NotificationRepository,
 	recipients identitycontracts.NotificationRecipientLookup,
-	sender email.Sender,
-	txManager TransactionManager,
+	sender Mailer,
+	tx Transactor,
 ) NotificationService {
 	return &notificationService{
 		repo:       repo,
 		recipients: recipients,
 		sender:     sender,
-		txManager:  txManager,
+		tx:         tx,
 	}
 }
 
 // Create validates the notification, applies the user's channel preferences,
-// stores the in-app row, and enqueues the email channel. When a transaction
-// manager and a transactional sender are wired, the row and job commit
-// together: an enqueue failure rolls the row back.
+// stores the in-app row, and enqueues the email channel. When a transactor is
+// wired, the row and job commit together: an enqueue failure rolls the row
+// back.
 func (s *notificationService) Create(ctx context.Context, input notificationcontracts.CreateNotificationInput) (CreateResult, error) {
 	scopedCtx, err := resolveTenantContext(ctx, input.TenantID)
 	if err != nil {
@@ -144,7 +120,7 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 		}
 	}
 
-	params := notificationsqlc.CreateNotificationParams{
+	in := NewNotification{
 		UserID: normalized.UserID,
 		Type:   normalized.Type,
 		Title:  normalized.Title,
@@ -152,25 +128,21 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 		Data:   normalized.Data,
 	}
 
-	var created *notificationsqlc.Notification
-	if s.txManager != nil && channels.email {
-		err = s.txManager.WithTx(scopedCtx, func(tx pgx.Tx) error {
+	var created *Notification
+	if s.tx != nil && channels.email {
+		err = s.tx.InTx(scopedCtx, func(ctx context.Context, tx TxRepos) error {
 			var txErr error
-			created, txErr = s.deliver(scopedCtx, s.repo.WithTx(tx), tx, channels, params, message)
+			created, txErr = s.deliver(ctx, tx.Notifications, tx.Mail, channels, in, message)
 			return txErr
 		})
 	} else {
-		created, err = s.deliver(scopedCtx, s.repo, nil, channels, params, message)
+		created, err = s.deliver(scopedCtx, s.repo, s.sender, channels, in, message)
 	}
 	if err != nil {
 		return CreateResult{}, s.createError(scopedCtx, err, normalized)
 	}
 
-	result := CreateResult{EmailQueued: channels.email}
-	if created != nil {
-		result.Notification = toNotificationResponse(created)
-	}
-	return result, nil
+	return CreateResult{Notification: created, EmailQueued: channels.email}, nil
 }
 
 // deliveryChannels are the channels a notification is delivered on after the
@@ -193,42 +165,37 @@ func (s *notificationService) enabledChannels(ctx context.Context, input notific
 }
 
 // deliver stores the in-app row and enqueues the email on the enabled
-// channels. tx is the surrounding transaction, or nil when the row and email
-// are not committed together.
+// channels. mail is the transaction-bound sender, or the plain sender when the
+// row and email are not committed together.
 func (s *notificationService) deliver(
 	ctx context.Context,
-	repo repository.NotificationRepository,
-	tx pgx.Tx,
+	repo NotificationRepository,
+	mail Mailer,
 	channels deliveryChannels,
-	params notificationsqlc.CreateNotificationParams,
+	in NewNotification,
 	message email.Message,
-) (*notificationsqlc.Notification, error) {
-	var created *notificationsqlc.Notification
+) (*Notification, error) {
+	var created *Notification
 	if channels.inApp {
-		row, err := repo.Create(ctx, params)
+		row, err := repo.Create(ctx, in)
 		if err != nil {
 			return nil, err
 		}
 		created = row
 	}
 	if channels.email {
-		if err := s.sendEmail(ctx, tx, message); err != nil {
+		if err := sendEmail(ctx, mail, message); err != nil {
 			return nil, err
 		}
 	}
 	return created, nil
 }
 
-// sendEmail enqueues inside tx when a transaction manager and a transactional
-// sender are wired, so a queue failure rolls the in-app row back.
-func (s *notificationService) sendEmail(ctx context.Context, tx pgx.Tx, message email.Message) error {
-	if txSender, ok := s.sender.(TransactionalEmailSender); ok && s.txManager != nil {
-		return txSender.SendTx(ctx, tx, message)
-	}
-	if s.sender == nil {
+func sendEmail(ctx context.Context, mail Mailer, message email.Message) error {
+	if mail == nil {
 		return errors.New("notification email sender is not configured")
 	}
-	return s.sender.Send(ctx, message)
+	return mail.Send(ctx, message)
 }
 
 // createError preserves domain errors and hides persistence/queue internals
@@ -291,7 +258,7 @@ func (s *notificationService) channelEnabled(ctx context.Context, userID int64, 
 	return pref.Enabled, nil
 }
 
-func (s *notificationService) Get(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error) {
+func (s *notificationService) Get(ctx context.Context, userID, id int64) (*Notification, error) {
 	row, err := s.repo.GetByID(ctx, id, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -299,10 +266,10 @@ func (s *notificationService) Get(ctx context.Context, userID, id int64) (*dto.N
 		}
 		return nil, apperror.NewInternal("failed to get notification")
 	}
-	return toNotificationResponse(row), nil
+	return row, nil
 }
 
-func (s *notificationService) List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]dto.NotificationResponse, bool, error) {
+func (s *notificationService) List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -317,15 +284,10 @@ func (s *notificationService) List(ctx context.Context, userID int64, limit int,
 	if hasMore {
 		rows = rows[:pageSize]
 	}
-
-	responses := make([]dto.NotificationResponse, len(rows))
-	for i := range rows {
-		responses[i] = *toNotificationResponse(&rows[i])
-	}
-	return responses, hasMore, nil
+	return rows, hasMore, nil
 }
 
-func (s *notificationService) MarkRead(ctx context.Context, userID, id int64) (*dto.NotificationResponse, error) {
+func (s *notificationService) MarkRead(ctx context.Context, userID, id int64) (*Notification, error) {
 	row, err := s.repo.MarkRead(ctx, id, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -333,7 +295,7 @@ func (s *notificationService) MarkRead(ctx context.Context, userID, id int64) (*
 		}
 		return nil, apperror.NewInternal("failed to mark notification as read")
 	}
-	return toNotificationResponse(row), nil
+	return row, nil
 }
 
 func (s *notificationService) MarkAllRead(ctx context.Context, userID int64) (int64, error) {
@@ -352,40 +314,36 @@ func (s *notificationService) UnreadCount(ctx context.Context, userID int64) (in
 	return count, nil
 }
 
-func (s *notificationService) ListPreferences(ctx context.Context, userID int64) ([]dto.PreferenceResponse, error) {
+func (s *notificationService) ListPreferences(ctx context.Context, userID int64) ([]Preference, error) {
 	rows, err := s.repo.ListPreferences(ctx, userID)
 	if err != nil {
 		return nil, apperror.NewInternal("failed to list notification preferences")
 	}
-	responses := make([]dto.PreferenceResponse, len(rows))
-	for i := range rows {
-		responses[i] = *toPreferenceResponse(&rows[i])
-	}
-	return responses, nil
+	return rows, nil
 }
 
-func (s *notificationService) SetPreference(ctx context.Context, userID int64, req dto.UpdatePreferenceRequest) (*dto.PreferenceResponse, error) {
-	notificationType := strings.TrimSpace(req.Type)
+func (s *notificationService) SetPreference(ctx context.Context, userID int64, update PreferenceUpdate) (*Preference, error) {
+	notificationType := strings.TrimSpace(update.Type)
 	if err := validateType(notificationType); err != nil {
 		return nil, err
 	}
-	if req.Channel != ChannelInApp && req.Channel != ChannelEmail {
+	if update.Channel != ChannelInApp && update.Channel != ChannelEmail {
 		return nil, apperror.NewBadRequest("channel must be in_app or email")
 	}
-	if req.Enabled == nil {
+	if update.Enabled == nil {
 		return nil, apperror.NewBadRequest("enabled is required")
 	}
 
-	row, err := s.repo.UpsertPreference(ctx, notificationsqlc.UpsertNotificationPreferenceParams{
+	row, err := s.repo.UpsertPreference(ctx, NewPreference{
 		UserID:  userID,
 		Type:    notificationType,
-		Channel: req.Channel,
-		Enabled: *req.Enabled,
+		Channel: update.Channel,
+		Enabled: *update.Enabled,
 	})
 	if err != nil {
 		return nil, apperror.NewInternal("failed to save notification preference")
 	}
-	return toPreferenceResponse(row), nil
+	return row, nil
 }
 
 func resolveTenantContext(ctx context.Context, explicit int64) (context.Context, error) {
@@ -491,41 +449,6 @@ func validateType(notificationType string) error {
 		return apperror.NewBadRequest(invalidType)
 	}
 	return nil
-}
-
-func toNotificationResponse(row *notificationsqlc.Notification) *dto.NotificationResponse {
-	data := map[string]any{}
-	if len(row.Data) > 0 {
-		_ = json.Unmarshal(row.Data, &data)
-	}
-	resp := &dto.NotificationResponse{
-		ID:        row.ID,
-		TenantID:  row.TenantID,
-		UserID:    row.UserID,
-		Type:      row.Type,
-		Title:     row.Title,
-		Body:      row.Body,
-		Data:      data,
-		CreatedAt: row.CreatedAt.Time,
-	}
-	if row.ReadAt.Valid {
-		readAt := row.ReadAt.Time
-		resp.ReadAt = &readAt
-	}
-	return resp
-}
-
-func toPreferenceResponse(row *notificationsqlc.NotificationPreference) *dto.PreferenceResponse {
-	return &dto.PreferenceResponse{
-		ID:        row.ID,
-		TenantID:  row.TenantID,
-		UserID:    row.UserID,
-		Type:      row.Type,
-		Channel:   row.Channel,
-		Enabled:   row.Enabled,
-		CreatedAt: row.CreatedAt.Time,
-		UpdatedAt: row.UpdatedAt.Time,
-	}
 }
 
 // buildCursor normalizes the page size and decodes an optional cursor.
