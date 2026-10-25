@@ -1,6 +1,5 @@
 # Ratchet for TestModuleLayering (ADR 0002). Existing violations only:
 # delete a line when its violation is fixed; never add new lines.
-admin/service/service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto
 apikeys/service/service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto
 apikeys/service/service.go -> github.com/jackc/pgx/v5
 features/service/features_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto

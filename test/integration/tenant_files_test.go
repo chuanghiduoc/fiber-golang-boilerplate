@@ -21,6 +21,7 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/repository"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
@@ -110,7 +111,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store)
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
 	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store))
-	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))
+	adminHandler := adminhandler.NewHandler(adminservice.NewService(adminrepository.NewIdentityAdmin(zeroIdentityAdmin{}), adminrepository.NewFilesAdmin(filesAdmin)))
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(

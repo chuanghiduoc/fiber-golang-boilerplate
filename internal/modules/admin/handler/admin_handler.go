@@ -39,7 +39,7 @@ func (h *Handler) GetStats(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, stats)
+	return response.Success(c, toStatsResponse(stats))
 }
 
 // ListUsers godoc
@@ -65,7 +65,8 @@ func (h *Handler) ListUsers(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, users, hasMore, pagination.NextCursor(users, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
+	resp := toUserResponses(users)
+	return response.List(c, resp, hasMore, pagination.NextCursor(resp, func(u admindto.UserResponse) (time.Time, int64) { return u.JoinedAt, u.ID }))
 }
 
 // UpdateRole godoc
@@ -103,7 +104,7 @@ func (h *Handler) UpdateRole(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(user))
 }
 
 // BanUser godoc
@@ -161,7 +162,7 @@ func (h *Handler) UnbanUser(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.Success(c, user)
+	return response.Success(c, toUserResponse(user))
 }
 
 // ListFiles godoc
@@ -187,7 +188,8 @@ func (h *Handler) ListFiles(c fiber.Ctx) error {
 		return err
 	}
 
-	return response.List(c, files, hasMore, pagination.NextCursor(files, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
+	resp := toFileResponses(files)
+	return response.List(c, resp, hasMore, pagination.NextCursor(resp, func(f admindto.FileResponse) (time.Time, int64) { return f.CreatedAt, f.ID }))
 }
 
 // DownloadFile godoc
@@ -266,5 +268,5 @@ func (h *Handler) RestoreFile(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	return response.Success(c, file)
+	return response.Success(c, toFileResponse(file))
 }

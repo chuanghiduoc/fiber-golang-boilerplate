@@ -22,6 +22,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/repository"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
@@ -84,7 +85,7 @@ func setupTenantAdminHarness(t *testing.T) *tenantAdminHarness {
 	identityAdmin := identityadapter.NewAdminIdentity(kit.admin)
 	filesRepo := filesrepo.NewFileRepository(pool)
 	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(filesRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store))
-	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
+	adminHandler := adminhandler.NewHandler(adminservice.NewService(adminrepository.NewIdentityAdmin(identityAdmin), adminrepository.NewFilesAdmin(filesAdmin)))
 
 	cfg := &config.Config{
 		App: config.AppConfig{

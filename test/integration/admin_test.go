@@ -19,6 +19,7 @@ import (
 
 	admindto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto"
 	adminhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/handler"
+	adminrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/repository"
 	adminservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/service"
 	filesadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/adapter"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
@@ -59,7 +60,8 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
 
 	identityAdmin := identityadapter.NewAdminIdentity(kit.admin)
 	filesAdmin := filesadapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesrepo.NewTransactor(txManager, auditRecorder, nil), store))
-	adminHandler := adminhandler.NewHandler(adminservice.NewService(identityAdmin, filesAdmin))
+	adminService := adminservice.NewService(adminrepository.NewIdentityAdmin(identityAdmin), adminrepository.NewFilesAdmin(filesAdmin))
+	adminHandler := adminhandler.NewHandler(adminService)
 
 	app := fiber.New(fiber.Config{
 		ErrorHandler: apperrorhttp.FiberErrorHandler,
