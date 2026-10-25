@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
+	featuresservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -20,28 +21,28 @@ import (
 )
 
 type fakeService struct {
-	flags        []featuresdto.FlagResponse
-	detail       featuresdto.FlagDetailResponse
-	targets      []featuresdto.TargetResponse
-	upsertFlag   featuresdto.FlagResponse
-	upsertTarget featuresdto.TargetResponse
+	flags        []featuresservice.Flag
+	detail       featuresservice.FlagDetail
+	targets      []featuresservice.Target
+	upsertFlag   featuresservice.Flag
+	upsertTarget featuresservice.Target
 	deleteErr    error
 	lastSubject  features.Subject
-	lastRequest  featuresdto.UpsertFlagRequest
+	lastRequest  featuresservice.UpsertFlagInput
 }
 
-func (f *fakeService) ListFlags(_ context.Context, subject features.Subject) ([]featuresdto.FlagResponse, error) {
+func (f *fakeService) ListFlags(_ context.Context, subject features.Subject) ([]featuresservice.Flag, error) {
 	f.lastSubject = subject
 	return f.flags, nil
 }
 
-func (f *fakeService) GetFlag(_ context.Context, _ string, subject features.Subject) (*featuresdto.FlagDetailResponse, error) {
+func (f *fakeService) GetFlag(_ context.Context, _ string, subject features.Subject) (*featuresservice.FlagDetail, error) {
 	f.lastSubject = subject
 	return &f.detail, nil
 }
 
-func (f *fakeService) UpsertFlag(_ context.Context, _ string, req featuresdto.UpsertFlagRequest, subject features.Subject) (*featuresdto.FlagResponse, error) {
-	f.lastRequest = req
+func (f *fakeService) UpsertFlag(_ context.Context, _ string, in featuresservice.UpsertFlagInput, subject features.Subject) (*featuresservice.Flag, error) {
+	f.lastRequest = in
 	f.lastSubject = subject
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
@@ -53,11 +54,11 @@ func (f *fakeService) DeleteFlag(context.Context, string) error {
 	return f.deleteErr
 }
 
-func (f *fakeService) ListTargets(context.Context, string) ([]featuresdto.TargetResponse, error) {
+func (f *fakeService) ListTargets(context.Context, string) ([]featuresservice.Target, error) {
 	return f.targets, nil
 }
 
-func (f *fakeService) UpsertTarget(_ context.Context, _ string, _ featuresdto.UpsertTargetRequest) (*featuresdto.TargetResponse, error) {
+func (f *fakeService) UpsertTarget(_ context.Context, _ string, _ featuresservice.UpsertTargetInput) (*featuresservice.Target, error) {
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
 	}
@@ -73,14 +74,14 @@ func int64Ptr(value int64) *int64 { return &value }
 func setupFeatureHandler(t *testing.T) (*fiber.App, *fakeService) {
 	t.Helper()
 	svc := &fakeService{
-		flags: []featuresdto.FlagResponse{{Key: "file_uploads", Enabled: true, Effective: true, Source: "compiled_default"}},
-		detail: featuresdto.FlagDetailResponse{
-			Flag:    featuresdto.FlagResponse{Key: "file_uploads", Enabled: true},
-			Targets: []featuresdto.TargetResponse{{ID: 1, FlagKey: "file_uploads", TenantID: 2, Enabled: false}},
+		flags: []featuresservice.Flag{{Key: "file_uploads", Enabled: true, Effective: true, Source: "compiled_default"}},
+		detail: featuresservice.FlagDetail{
+			Flag:    featuresservice.Flag{Key: "file_uploads", Enabled: true},
+			Targets: []featuresservice.Target{{ID: 1, FlagKey: "file_uploads", TenantID: 2, Enabled: false}},
 		},
-		targets:      []featuresdto.TargetResponse{{ID: 1, FlagKey: "file_uploads", TenantID: 2, Enabled: false}},
-		upsertFlag:   featuresdto.FlagResponse{Key: "file_uploads", Enabled: false, KillSwitch: true, Configured: true, Source: "kill_switch"},
-		upsertTarget: featuresdto.TargetResponse{ID: 5, FlagKey: "file_uploads", TenantID: 2, UserID: int64Ptr(42), Enabled: true},
+		targets:      []featuresservice.Target{{ID: 1, FlagKey: "file_uploads", TenantID: 2, Enabled: false}},
+		upsertFlag:   featuresservice.Flag{Key: "file_uploads", Enabled: false, KillSwitch: true, Configured: true, Source: "kill_switch"},
+		upsertTarget: featuresservice.Target{ID: 5, FlagKey: "file_uploads", TenantID: 2, UserID: int64Ptr(42), Enabled: true},
 	}
 	h := NewHandler(svc)
 

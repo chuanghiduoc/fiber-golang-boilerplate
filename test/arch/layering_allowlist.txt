@@ -3,9 +3,6 @@
 admin/service/service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin/dto
 apikeys/service/service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/dto
 apikeys/service/service.go -> github.com/jackc/pgx/v5
-features/service/features_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto
-features/service/features_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc
-features/service/features_service.go -> github.com/jackc/pgx/v5/pgtype
 identity/service/admin_user_service.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
 identity/service/authentication.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto
 identity/service/oauth_google.go -> github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto

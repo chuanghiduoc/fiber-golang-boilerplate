@@ -10,12 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"strconv"
-	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
-	featuresdto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/dto"
-	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -36,12 +31,12 @@ const (
 
 // Service is the feature-flag administration surface.
 type Service interface {
-	ListFlags(ctx context.Context, subject features.Subject) ([]featuresdto.FlagResponse, error)
-	GetFlag(ctx context.Context, key string, subject features.Subject) (*featuresdto.FlagDetailResponse, error)
-	UpsertFlag(ctx context.Context, key string, req featuresdto.UpsertFlagRequest, subject features.Subject) (*featuresdto.FlagResponse, error)
+	ListFlags(ctx context.Context, subject features.Subject) ([]Flag, error)
+	GetFlag(ctx context.Context, key string, subject features.Subject) (*FlagDetail, error)
+	UpsertFlag(ctx context.Context, key string, in UpsertFlagInput, subject features.Subject) (*Flag, error)
 	DeleteFlag(ctx context.Context, key string) error
-	ListTargets(ctx context.Context, key string) ([]featuresdto.TargetResponse, error)
-	UpsertTarget(ctx context.Context, key string, req featuresdto.UpsertTargetRequest) (*featuresdto.TargetResponse, error)
+	ListTargets(ctx context.Context, key string) ([]Target, error)
+	UpsertTarget(ctx context.Context, key string, in UpsertTargetInput) (*Target, error)
 	DeleteTarget(ctx context.Context, key string, id int64) error
 }
 
@@ -49,17 +44,6 @@ type service struct {
 	repository Repository
 	flags      features.Evaluator
 	audit      audit.Recorder
-}
-
-// Repository is the persistence surface the service needs.
-type Repository interface {
-	ListFlags(ctx context.Context) ([]featuressqlc.FeatureFlag, error)
-	GetFlag(ctx context.Context, key string) (featuressqlc.FeatureFlag, error)
-	UpsertFlag(ctx context.Context, params featuressqlc.UpsertFeatureFlagParams) (featuressqlc.FeatureFlag, error)
-	DeleteFlag(ctx context.Context, key string) error
-	ListTargets(ctx context.Context, key string) ([]featuressqlc.FeatureFlagTarget, error)
-	UpsertTarget(ctx context.Context, key string, userID int64, enabled bool) (featuressqlc.FeatureFlagTarget, error)
-	DeleteTarget(ctx context.Context, key string, id int64) error
 }
 
 // New returns a service. A nil evaluator falls back to compiled/environment
@@ -75,21 +59,21 @@ func New(repository Repository, flags features.Evaluator, recorder audit.Recorde
 	return &service{repository: repository, flags: flags, audit: recorder}
 }
 
-func (s *service) ListFlags(ctx context.Context, subject features.Subject) ([]featuresdto.FlagResponse, error) {
+func (s *service) ListFlags(ctx context.Context, subject features.Subject) ([]Flag, error) {
 	rows, err := s.repository.ListFlags(ctx)
 	if err != nil {
 		return nil, err
 	}
-	byKey := make(map[features.Key]featuressqlc.FeatureFlag, len(rows))
+	byKey := make(map[features.Key]Flag, len(rows))
 	for _, row := range rows {
-		byKey[features.Key(row.FlagKey)] = row
+		byKey[features.Key(row.Key)] = row
 	}
 
 	definitions := features.Catalog()
-	out := make([]featuresdto.FlagResponse, 0, len(definitions))
+	out := make([]Flag, 0, len(definitions))
 	for _, def := range definitions {
 		row, configured := byKey[def.Key]
-		var rowPtr *featuressqlc.FeatureFlag
+		var rowPtr *Flag
 		if configured {
 			rowPtr = &row
 		}
@@ -98,7 +82,7 @@ func (s *service) ListFlags(ctx context.Context, subject features.Subject) ([]fe
 	return out, nil
 }
 
-func (s *service) GetFlag(ctx context.Context, key string, subject features.Subject) (*featuresdto.FlagDetailResponse, error) {
+func (s *service) GetFlag(ctx context.Context, key string, subject features.Subject) (*FlagDetail, error) {
 	def, err := lookup(key)
 	if err != nil {
 		return nil, err
@@ -113,13 +97,13 @@ func (s *service) GetFlag(ctx context.Context, key string, subject features.Subj
 		return nil, err
 	}
 
-	return &featuresdto.FlagDetailResponse{
+	return &FlagDetail{
 		Flag:    s.flagResponse(ctx, def, row, subject),
-		Targets: toTargetResponses(targets),
+		Targets: targets,
 	}, nil
 }
 
-func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.UpsertFlagRequest, subject features.Subject) (*featuresdto.FlagResponse, error) {
+func (s *service) UpsertFlag(ctx context.Context, key string, in UpsertFlagInput, subject features.Subject) (*Flag, error) {
 	def, err := lookup(key)
 	if err != nil {
 		return nil, err
@@ -127,7 +111,7 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	if err := requirePlatformTenant(ctx); err != nil {
 		return nil, err
 	}
-	if req.KillSwitch == nil {
+	if in.KillSwitch == nil {
 		return nil, apperror.NewBadRequest("killSwitch is required")
 	}
 
@@ -139,20 +123,15 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 	if configured && existing.Description != "" {
 		description = existing.Description
 	}
-	if req.Description != nil {
-		description = *req.Description
+	if in.Description != nil {
+		description = *in.Description
 	}
 
 	// A nil Enabled stores NULL: the row keeps its kill switch and targets but
 	// has no database default, so environment/compiled defaults apply.
-	enabled := pgtype.Bool{}
-	if req.Enabled != nil {
-		enabled = pgtype.Bool{Bool: *req.Enabled, Valid: true}
-	}
-	row, err := s.repository.UpsertFlag(ctx, featuressqlc.UpsertFeatureFlagParams{
-		FlagKey:     key,
-		Enabled:     enabled,
-		KillSwitch:  *req.KillSwitch,
+	row, err := s.repository.UpsertFlag(ctx, key, FlagWrite{
+		Enabled:     in.Enabled,
+		KillSwitch:  *in.KillSwitch,
 		Description: description,
 	})
 	if err != nil {
@@ -166,8 +145,8 @@ func (s *service) UpsertFlag(ctx context.Context, key string, req featuresdto.Up
 		"killSwitch": resp.KillSwitch,
 		"source":     resp.Source,
 	}
-	if row.Enabled.Valid {
-		metadata["enabled"] = row.Enabled.Bool
+	if row.Configured {
+		metadata["enabled"] = row.Enabled
 	}
 	s.recordEvent(ctx, actionFlagUpdated, resourceFlag, key, metadata)
 	return &resp, nil
@@ -190,50 +169,45 @@ func (s *service) DeleteFlag(ctx context.Context, key string) error {
 	return nil
 }
 
-func (s *service) ListTargets(ctx context.Context, key string) ([]featuresdto.TargetResponse, error) {
+func (s *service) ListTargets(ctx context.Context, key string) ([]Target, error) {
 	if _, err := lookup(key); err != nil {
 		return nil, err
 	}
-	targets, err := s.repository.ListTargets(ctx, key)
-	if err != nil {
-		return nil, err
-	}
-	return toTargetResponses(targets), nil
+	return s.repository.ListTargets(ctx, key)
 }
 
-func (s *service) UpsertTarget(ctx context.Context, key string, req featuresdto.UpsertTargetRequest) (*featuresdto.TargetResponse, error) {
+func (s *service) UpsertTarget(ctx context.Context, key string, in UpsertTargetInput) (*Target, error) {
 	if _, err := lookup(key); err != nil {
 		return nil, err
 	}
-	if req.Enabled == nil {
+	if in.Enabled == nil {
 		return nil, apperror.NewBadRequest("enabled is required")
 	}
 
 	var userID int64
-	if req.UserID != nil {
-		userID = *req.UserID
+	if in.UserID != nil {
+		userID = *in.UserID
 		if userID < 1 {
 			return nil, apperror.NewBadRequest("userId must be positive")
 		}
 	}
 
-	target, err := s.repository.UpsertTarget(ctx, key, userID, *req.Enabled)
+	target, err := s.repository.UpsertTarget(ctx, key, userID, *in.Enabled)
 	if err != nil {
 		return nil, err
 	}
 	s.invalidate(ctx)
 
-	resp := toTargetResponse(target)
 	metadata := map[string]any{
-		"feature":  resp.FlagKey,
-		"targetId": resp.ID,
-		"enabled":  resp.Enabled,
+		"feature":  target.FlagKey,
+		"targetId": target.ID,
+		"enabled":  target.Enabled,
 	}
-	if resp.UserID != nil {
-		metadata["userId"] = *resp.UserID
+	if target.UserID != nil {
+		metadata["userId"] = *target.UserID
 	}
-	s.recordEvent(ctx, actionTargetUpdated, resourceTarget, strconv.FormatInt(resp.ID, 10), metadata)
-	return &resp, nil
+	s.recordEvent(ctx, actionTargetUpdated, resourceTarget, strconv.FormatInt(target.ID, 10), metadata)
+	return &target, nil
 }
 
 func (s *service) DeleteTarget(ctx context.Context, key string, id int64) error {
@@ -264,7 +238,7 @@ func requirePlatformTenant(ctx context.Context) error {
 	return nil
 }
 
-func (s *service) getRow(ctx context.Context, key string) (*featuressqlc.FeatureFlag, bool, error) {
+func (s *service) getRow(ctx context.Context, key string) (*Flag, bool, error) {
 	row, err := s.repository.GetFlag(ctx, key)
 	if err == nil {
 		return &row, true, nil
@@ -298,12 +272,11 @@ func (s *service) recordEvent(ctx context.Context, action, resource, resourceID 
 	}
 }
 
-func (s *service) flagResponse(ctx context.Context, def features.Definition, row *featuressqlc.FeatureFlag, subject features.Subject) featuresdto.FlagResponse {
-	resp := featuresdto.FlagResponse{
+func (s *service) flagResponse(ctx context.Context, def features.Definition, row *Flag, subject features.Subject) Flag {
+	resp := Flag{
 		Key:         string(def.Key),
 		Description: def.Description,
 		Enabled:     def.Default,
-		Configured:  false,
 	}
 	if row != nil {
 		if row.Description != "" {
@@ -312,12 +285,12 @@ func (s *service) flagResponse(ctx context.Context, def features.Definition, row
 		resp.KillSwitch = row.KillSwitch
 		// A row without a database default (created to anchor targets or a
 		// kill switch) is not "configured": the compiled default is shown.
-		if row.Enabled.Valid {
-			resp.Enabled = row.Enabled.Bool
+		if row.Configured {
+			resp.Enabled = row.Enabled
 			resp.Configured = true
 		}
-		resp.CreatedAt = timePtr(row.CreatedAt)
-		resp.UpdatedAt = timePtr(row.UpdatedAt)
+		resp.CreatedAt = row.CreatedAt
+		resp.UpdatedAt = row.UpdatedAt
 	}
 
 	result := s.flags.Evaluate(ctx, def.Key, subject)
@@ -332,36 +305,4 @@ func lookup(key string) (features.Definition, error) {
 		return features.Definition{}, apperror.NewNotFound("feature flag not found")
 	}
 	return def, nil
-}
-
-func toTargetResponses(targets []featuressqlc.FeatureFlagTarget) []featuresdto.TargetResponse {
-	out := make([]featuresdto.TargetResponse, len(targets))
-	for i := range targets {
-		out[i] = toTargetResponse(targets[i])
-	}
-	return out
-}
-
-func toTargetResponse(target featuressqlc.FeatureFlagTarget) featuresdto.TargetResponse {
-	resp := featuresdto.TargetResponse{
-		ID:        target.ID,
-		FlagKey:   target.FlagKey,
-		TenantID:  target.TenantID,
-		Enabled:   target.Enabled,
-		CreatedAt: timePtr(target.CreatedAt),
-		UpdatedAt: timePtr(target.UpdatedAt),
-	}
-	if target.UserID.Valid {
-		userID := target.UserID.Int64
-		resp.UserID = &userID
-	}
-	return resp
-}
-
-func timePtr(ts pgtype.Timestamptz) *time.Time {
-	if !ts.Valid {
-		return nil
-	}
-	t := ts.Time
-	return &t
 }
