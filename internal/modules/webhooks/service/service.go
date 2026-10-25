@@ -8,8 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -62,34 +60,34 @@ func (f TenantCheckerFunc) TenantActive(ctx context.Context, tenantID int64) (bo
 // secret rotation, delivery history/replay, inbound source CRUD, and the
 // public inbound receiver.
 type Service interface {
-	CreateEndpoint(ctx context.Context, actorID int64, req dto.CreateEndpointRequest) (*dto.EndpointSecretResponse, error)
-	UpdateEndpoint(ctx context.Context, actorID, id int64, req dto.UpdateEndpointRequest) (*dto.EndpointResponse, error)
+	CreateEndpoint(ctx context.Context, actorID int64, in CreateEndpointInput) (*Endpoint, string, error)
+	UpdateEndpoint(ctx context.Context, actorID, id int64, in UpdateEndpointInput) (*Endpoint, error)
 	DeleteEndpoint(ctx context.Context, actorID, id int64) error
-	GetEndpoint(ctx context.Context, id int64) (*dto.EndpointResponse, error)
-	ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]dto.EndpointResponse, bool, error)
-	RotateEndpointSecret(ctx context.Context, actorID, id int64) (*dto.EndpointSecretResponse, error)
+	GetEndpoint(ctx context.Context, id int64) (*Endpoint, error)
+	ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]Endpoint, bool, error)
+	RotateEndpointSecret(ctx context.Context, actorID, id int64) (*Endpoint, string, error)
 
-	ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]dto.DeliveryResponse, bool, error)
-	GetDelivery(ctx context.Context, id int64) (*dto.DeliveryResponse, error)
-	ListDeliveryAttempts(ctx context.Context, id int64) ([]dto.DeliveryAttemptResponse, error)
-	ReplayDelivery(ctx context.Context, actorID, id int64) (*dto.DeliveryResponse, error)
+	ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]Delivery, bool, error)
+	GetDelivery(ctx context.Context, id int64) (*Delivery, error)
+	ListDeliveryAttempts(ctx context.Context, id int64) ([]DeliveryAttempt, error)
+	ReplayDelivery(ctx context.Context, actorID, id int64) (*Delivery, error)
 
-	CreateInboundSource(ctx context.Context, actorID int64, req dto.CreateInboundSourceRequest) (*dto.InboundSourceSecretResponse, error)
-	UpdateInboundSource(ctx context.Context, actorID, id int64, req dto.UpdateInboundSourceRequest) (*dto.InboundSourceResponse, error)
+	CreateInboundSource(ctx context.Context, actorID int64, in CreateInboundSourceInput) (*InboundSource, string, error)
+	UpdateInboundSource(ctx context.Context, actorID, id int64, in UpdateInboundSourceInput) (*InboundSource, error)
 	DeleteInboundSource(ctx context.Context, actorID, id int64) error
-	GetInboundSource(ctx context.Context, id int64) (*dto.InboundSourceResponse, error)
-	ListInboundSources(ctx context.Context, limit int, startingAfter string) ([]dto.InboundSourceResponse, bool, error)
-	RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*dto.InboundSourceSecretResponse, error)
-	ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]dto.InboundEventResponse, bool, error)
-	ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*dto.InboundReceipt, error)
+	GetInboundSource(ctx context.Context, id int64) (*InboundSource, error)
+	ListInboundSources(ctx context.Context, limit int, startingAfter string) ([]InboundSource, bool, error)
+	RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*InboundSource, string, error)
+	ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]InboundEvent, bool, error)
+	ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*InboundReceipt, error)
 
 	PurgeRetention(ctx context.Context, retentionDays int32) (RetentionResult, error)
 }
 
 type service struct {
-	endpoints  repository.EndpointStore
-	deliveries repository.DeliveryStore
-	inbound    repository.InboundStore
+	endpoints  EndpointStore
+	deliveries DeliveryStore
+	inbound    InboundStore
 	codec      *SecretCodec
 	audit      audit.Recorder
 	opts       Options
@@ -99,9 +97,9 @@ type service struct {
 
 // New returns the webhooks service. audit may be nil (Noop semantics).
 func New(
-	endpoints repository.EndpointStore,
-	deliveries repository.DeliveryStore,
-	inbound repository.InboundStore,
+	endpoints EndpointStore,
+	deliveries DeliveryStore,
+	inbound InboundStore,
 	codec *SecretCodec,
 	recorder audit.Recorder,
 	opts Options,
@@ -161,7 +159,7 @@ func (s *service) recordAudit(ctx context.Context, actorID int64, action, resour
 }
 
 func validStatus(status string) bool {
-	return status == dto.StatusActive || status == dto.StatusDisabled
+	return status == StatusActive || status == StatusDisabled
 }
 
 func buildCursor(limit int, startingAfter string) (pagination.DBCursor, int, error) {

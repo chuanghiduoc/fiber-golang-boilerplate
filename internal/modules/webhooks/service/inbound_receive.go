@@ -8,9 +8,6 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
@@ -31,7 +28,7 @@ const (
 // The steps run in a fixed order: validate the body, resolve an active source
 // of an active tenant, validate the event id, verify the signature, validate
 // the event type, then store the event once per (source, webhook-id).
-func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*dto.InboundReceipt, error) {
+func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*InboundReceipt, error) {
 	if err := validateInboundBody(body); err != nil {
 		return nil, err
 	}
@@ -83,7 +80,7 @@ func validateInboundBody(body []byte) error {
 // activeInboundSource resolves the source across tenants. A disabled source
 // and a suspended tenant are indistinguishable from a missing source, like
 // every other request for that tenant.
-func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*webhooksqlc.WebhookInboundSource, error) {
+func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*InboundSource, error) {
 	source, err := s.inbound.GetInboundSourceByID(ctx, sourceID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -91,7 +88,7 @@ func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*web
 		}
 		return nil, apperror.NewInternal("failed to resolve inbound source")
 	}
-	if source.Status != dto.StatusActive {
+	if source.Status != StatusActive {
 		return nil, apperror.NewNotFound("inbound source not found")
 	}
 	if s.opts.Tenants == nil {
@@ -126,7 +123,7 @@ func inboundEventID(headers http.Header) (string, error) {
 // verifyInboundSignature checks the Standard Webhooks signature and timestamp
 // with the source's secret and maps each failure class to a public 401
 // detail.
-func (s *service) verifyInboundSignature(source *webhooksqlc.WebhookInboundSource, headers http.Header, body []byte) error {
+func (s *service) verifyInboundSignature(source *InboundSource, headers http.Header, body []byte) error {
 	secret, err := s.codec.Open(source.SecretCiphertext)
 	if err != nil {
 		slog.Error("webhooks: failed to open inbound source secret",
@@ -181,12 +178,12 @@ func inboundEventType(body []byte) (string, error) {
 
 // storeInboundEvent records the event once per (source, external id). A
 // duplicate returns the receipt of the event that was stored first.
-func (s *service) storeInboundEvent(ctx context.Context, source *webhooksqlc.WebhookInboundSource, externalID, eventType string, headers http.Header, body []byte) (*dto.InboundReceipt, error) {
+func (s *service) storeInboundEvent(ctx context.Context, source *InboundSource, externalID, eventType string, headers http.Header, body []byte) (*InboundReceipt, error) {
 	signature := headers.Get(webhook.HeaderSignature)
 	if len(signature) > maxStoredSignatureLen {
 		signature = signature[:maxStoredSignatureLen]
 	}
-	eventID, created, err := s.inbound.CreateInboundEvent(ctx, repository.InboundEventDraft{
+	eventID, created, err := s.inbound.CreateInboundEvent(ctx, InboundEventDraft{
 		SourceID:        source.ID,
 		ExternalEventID: externalID,
 		EventType:       eventType,
@@ -197,7 +194,7 @@ func (s *service) storeInboundEvent(ctx context.Context, source *webhooksqlc.Web
 		return nil, apperror.NewInternal("failed to store inbound event")
 	}
 
-	receipt := &dto.InboundReceipt{
+	receipt := &InboundReceipt{
 		ID:         eventID,
 		TenantID:   source.TenantID,
 		SourceID:   source.ID,
@@ -215,12 +212,12 @@ func (s *service) storeInboundEvent(ctx context.Context, source *webhooksqlc.Web
 	}
 	receipt.ID = existing.ID
 	receipt.EventType = existing.EventType
-	receipt.ReceivedAt = existing.ReceivedAt.Time.UTC()
+	receipt.ReceivedAt = existing.ReceivedAt.UTC()
 	return receipt, nil
 }
 
 // ListInboundEvents pages through the events received by one source.
-func (s *service) ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]dto.InboundEventResponse, bool, error) {
+func (s *service) ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]InboundEvent, bool, error) {
 	if _, err := s.inbound.GetInboundSource(ctx, sourceID); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, false, apperror.NewNotFound("inbound source not found")
@@ -239,11 +236,7 @@ func (s *service) ListInboundEvents(ctx context.Context, sourceID int64, limit i
 	if hasMore {
 		events = events[:pageSize]
 	}
-	out := make([]dto.InboundEventResponse, len(events))
-	for i := range events {
-		out[i] = toInboundEventResponse(&events[i])
-	}
-	return out, hasMore, nil
+	return events, hasMore, nil
 }
 
 func hasControl(value string) bool {
@@ -253,16 +246,4 @@ func hasControl(value string) bool {
 		}
 	}
 	return false
-}
-
-func toInboundEventResponse(event *webhooksqlc.WebhookInboundEvent) dto.InboundEventResponse {
-	return dto.InboundEventResponse{
-		ID:              event.ID,
-		TenantID:        event.TenantID,
-		SourceID:        event.SourceID,
-		ExternalEventID: event.ExternalEventID,
-		EventType:       event.EventType,
-		Payload:         json.RawMessage(event.Payload),
-		ReceivedAt:      event.ReceivedAt.Time.UTC(),
-	}
 }

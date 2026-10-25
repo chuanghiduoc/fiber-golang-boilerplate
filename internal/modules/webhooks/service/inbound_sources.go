@@ -3,57 +3,52 @@ package service
 import (
 	"context"
 	"errors"
-	"fmt"
 	"regexp"
 	"strings"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/dto"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/repository"
-	webhooksqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
 
-func (s *service) CreateInboundSource(ctx context.Context, actorID int64, req dto.CreateInboundSourceRequest) (*dto.InboundSourceSecretResponse, error) {
-	if err := validateSlug(req.Slug); err != nil {
-		return nil, err
+func (s *service) CreateInboundSource(ctx context.Context, actorID int64, in CreateInboundSourceInput) (*InboundSource, string, error) {
+	if err := validateSlug(in.Slug); err != nil {
+		return nil, "", err
 	}
 	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	source, err := s.inbound.CreateInboundSource(ctx, repository.InboundSourceDraft{
-		Name:             strings.TrimSpace(req.Name),
-		Slug:             req.Slug,
+	source, err := s.inbound.CreateInboundSource(ctx, InboundSourceDraft{
+		Name:             strings.TrimSpace(in.Name),
+		Slug:             in.Slug,
 		SecretCiphertext: ciphertext,
 	})
 	if err != nil {
 		if isConflict(err) {
-			return nil, err
+			return nil, "", err
 		}
-		return nil, apperror.NewInternal("failed to create inbound source")
+		return nil, "", apperror.NewInternal("failed to create inbound source")
 	}
 	s.recordAudit(ctx, actorID, "webhook.inbound_source.created", "webhook_inbound_source", source.ID, map[string]any{
 		"name": source.Name,
 		"slug": source.Slug,
 	})
-	resp := toInboundSourceResponse(source)
-	return &dto.InboundSourceSecretResponse{InboundSourceResponse: resp, Secret: secret}, nil
+	return source, secret, nil
 }
 
-func (s *service) UpdateInboundSource(ctx context.Context, actorID, id int64, req dto.UpdateInboundSourceRequest) (*dto.InboundSourceResponse, error) {
-	if err := validateSlug(req.Slug); err != nil {
+func (s *service) UpdateInboundSource(ctx context.Context, actorID, id int64, in UpdateInboundSourceInput) (*InboundSource, error) {
+	if err := validateSlug(in.Slug); err != nil {
 		return nil, err
 	}
-	if !validStatus(req.Status) {
+	if !validStatus(in.Status) {
 		return nil, apperror.NewBadRequest("status must be one of: active, disabled")
 	}
-	source, err := s.inbound.UpdateInboundSource(ctx, repository.UpdateInboundSourceDraft{
+	source, err := s.inbound.UpdateInboundSource(ctx, UpdateInboundSourceDraft{
 		ID:     id,
-		Name:   strings.TrimSpace(req.Name),
-		Slug:   req.Slug,
-		Status: req.Status,
+		Name:   strings.TrimSpace(in.Name),
+		Slug:   in.Slug,
+		Status: in.Status,
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -69,8 +64,7 @@ func (s *service) UpdateInboundSource(ctx context.Context, actorID, id int64, re
 		"slug":   source.Slug,
 		"status": source.Status,
 	})
-	resp := toInboundSourceResponse(source)
-	return &resp, nil
+	return source, nil
 }
 
 func (s *service) DeleteInboundSource(ctx context.Context, actorID, id int64) error {
@@ -84,7 +78,7 @@ func (s *service) DeleteInboundSource(ctx context.Context, actorID, id int64) er
 	return nil
 }
 
-func (s *service) GetInboundSource(ctx context.Context, id int64) (*dto.InboundSourceResponse, error) {
+func (s *service) GetInboundSource(ctx context.Context, id int64) (*InboundSource, error) {
 	source, err := s.inbound.GetInboundSource(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -92,11 +86,10 @@ func (s *service) GetInboundSource(ctx context.Context, id int64) (*dto.InboundS
 		}
 		return nil, apperror.NewInternal("failed to get inbound source")
 	}
-	resp := toInboundSourceResponse(source)
-	return &resp, nil
+	return source, nil
 }
 
-func (s *service) ListInboundSources(ctx context.Context, limit int, startingAfter string) ([]dto.InboundSourceResponse, bool, error) {
+func (s *service) ListInboundSources(ctx context.Context, limit int, startingAfter string) ([]InboundSource, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -109,11 +102,7 @@ func (s *service) ListInboundSources(ctx context.Context, limit int, startingAft
 	if hasMore {
 		sources = sources[:pageSize]
 	}
-	out := make([]dto.InboundSourceResponse, len(sources))
-	for i := range sources {
-		out[i] = toInboundSourceResponse(&sources[i])
-	}
-	return out, hasMore, nil
+	return sources, hasMore, nil
 }
 
 func validateSlug(slug string) error {
@@ -121,22 +110,4 @@ func validateSlug(slug string) error {
 		return apperror.NewBadRequest("slug must match [a-z0-9-]{1,63}")
 	}
 	return nil
-}
-
-func toInboundSourceResponse(source *webhooksqlc.WebhookInboundSource) dto.InboundSourceResponse {
-	resp := dto.InboundSourceResponse{
-		ID:          source.ID,
-		TenantID:    source.TenantID,
-		Name:        source.Name,
-		Slug:        source.Slug,
-		Status:      source.Status,
-		ReceiverURL: fmt.Sprintf("/api/v1/webhooks/inbound/%d", source.ID),
-		CreatedAt:   source.CreatedAt.Time.UTC(),
-		UpdatedAt:   source.UpdatedAt.Time.UTC(),
-	}
-	if source.DeletedAt.Valid {
-		deletedAt := source.DeletedAt.Time.UTC()
-		resp.DeletedAt = &deletedAt
-	}
-	return resp
 }

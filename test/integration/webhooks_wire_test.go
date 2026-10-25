@@ -122,7 +122,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	require.NoError(t, err)
 
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	endpoint, err := repo.CreateEndpoint(tenantCtx, webhookrepo.CreateEndpointDraft{
+	endpoint, err := repo.CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
 		URL:              server.URL + "/hook",
 		EventTypes:       []string{"file.*"},
 		Status:           "active",
@@ -152,7 +152,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	worker := webhookservice.NewDeliveryWorker(repo, codec,
 		webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second}),
 		webhookservice.WorkerOptions{RetryBase: time.Second, RetryMax: time.Minute})
-	deliveryJob, err := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: deliveryID})
+	deliveryJob, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
 	require.NoError(t, err)
 	require.NoError(t, worker.Handle(tenantCtx, deliveryJob))
 
@@ -185,7 +185,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	svc := webhookservice.New(repo, repo, repo, codec, nil, webhookservice.Options{})
 	replayed, err := svc.ReplayDelivery(tenantCtx, 0, deliveryID)
 	require.NoError(t, err)
-	replayJob, err := json.Marshal(webhookrepo.DeliveryJobPayload{DeliveryID: replayed.ID})
+	replayJob, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: replayed.ID})
 	require.NoError(t, err)
 	require.NoError(t, worker.Handle(tenantCtx, replayJob))
 	var replay capturedRequest
