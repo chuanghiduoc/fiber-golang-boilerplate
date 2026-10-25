@@ -18,6 +18,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey/apikeyhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -74,6 +75,13 @@ type JobProvider interface {
 // composition root; a nil registry is skipped.
 type ScheduleProvider interface {
 	RegisterSchedules(registry *scheduler.Registry)
+}
+
+// PrivacyProvider is an optional module capability for modules holding
+// per-user data. RegisterPrivacy runs after routes are mounted and only when
+// Deps.Privacy is non-nil.
+type PrivacyProvider interface {
+	RegisterPrivacy(registry *privacycontracts.Registry)
 }
 
 // PermissionProvider is an optional module capability declaring the
@@ -197,6 +205,9 @@ type Deps struct {
 	// Schedules receives module periodic schedules when the scheduler is
 	// enabled. Nil disables ScheduleProvider registration.
 	Schedules *scheduler.Registry
+	// Privacy is the registry privacy providers register into. Nil disables
+	// PrivacyProvider registration (tests and minimal deployments).
+	Privacy *privacycontracts.Registry
 	// APIKeyVerifier authenticates `Authorization: ApiKey` requests. A nil
 	// verifier leaves JWT authentication unchanged; API-key attempts fail 401.
 	APIKeyVerifier *apikey.Verifier
@@ -486,6 +497,9 @@ func (a *App) registerProviders(m Module) {
 	}
 	if provider, ok := m.(JobProvider); ok && a.deps.Jobs != nil {
 		provider.RegisterJobs(systemRegistrar{next: a.deps.Jobs})
+	}
+	if provider, ok := m.(PrivacyProvider); ok && a.deps.Privacy != nil {
+		provider.RegisterPrivacy(a.deps.Privacy)
 	}
 }
 

@@ -45,6 +45,8 @@ var tier1Mutations = map[string]tier1Audit{
 	"PUT /api/v1/users/me/password":        {"identity", "user.password_changed"},
 	"PUT /api/v1/users/:id":                {"identity", "user.profile_updated"},
 	"DELETE /api/v1/users/:id":             {"identity", "user.deleted"},
+	"POST /api/v1/me/erasure":              {"identity", "user.erasure_requested"},
+	"POST /api/v1/admin/users/:id/erasure": {"identity", "admin.user.erasure_requested"},
 	"PUT /api/v1/admin/users/:id/role":     {"identity", "admin.user.role_changed"},
 	"POST /api/v1/admin/users/:id/ban":     {"identity", "admin.user.banned"},
 	"POST /api/v1/admin/users/:id/unban":   {"identity", "admin.user.unbanned"},

@@ -45,6 +45,9 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides) {
 	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, tx, infra.Storage)
 
 	m := New(uploadHandler)
+	privacyRepo := filesrepo.NewPrivacyRepository(infra.Pool)
+	m.privacyExporter = filesvc.NewPrivacyExporter(privacyRepo, infra.Storage)
+	m.privacyEraser = filesvc.NewPrivacyEraser(privacyRepo, infra.Storage)
 	if settings.TrashRetentionDays > 0 {
 		m.trashPurger = filesvc.NewTrashPurger(filesrepo.NewTrashRepository(infra.Tx), infra.Storage, settings.TrashRetentionDays)
 	}

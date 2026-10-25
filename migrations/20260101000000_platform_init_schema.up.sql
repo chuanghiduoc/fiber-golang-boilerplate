@@ -284,6 +284,44 @@ CREATE TRIGGER trigger_protect_last_admin
     EXECUTE FUNCTION protect_last_admin();
 
 -- ---------------------------------------------------------------------------
+-- identity: data exports (GDPR right of access)
+--
+-- One row per requested tenant-scoped export. Active means queued/running; the
+-- partial unique index allows one in-flight request per membership. The blob
+-- key is only set when the export becomes ready; expires_at bounds retention.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS data_exports (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    user_id BIGINT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'running', 'ready', 'failed', 'expired')),
+    storage_path VARCHAR(512),
+    expires_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_data_exports_tenant_user FOREIGN KEY (tenant_id, user_id)
+        REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
+);
+
+-- The caller's export list and one in-flight export per membership.
+CREATE INDEX IF NOT EXISTS idx_data_exports_tenant_user_created_at_id
+    ON data_exports (tenant_id, user_id, created_at DESC, id DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_data_exports_active
+    ON data_exports (tenant_id, user_id)
+    WHERE status IN ('queued', 'running');
+-- The hourly retention purge scans every tenant by expiry.
+CREATE INDEX IF NOT EXISTS idx_data_exports_expires_at
+    ON data_exports (expires_at)
+    WHERE expires_at IS NOT NULL;
+
+DROP TRIGGER IF EXISTS trigger_data_exports_updated_at ON data_exports;
+CREATE TRIGGER trigger_data_exports_updated_at
+    BEFORE UPDATE ON data_exports
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+-- ---------------------------------------------------------------------------
 -- identity: invitations (hashed single-use token)
 --
 -- One pending invitation per (tenant, address); re-inviting refreshes it.

@@ -70,7 +70,7 @@ module, and `platform`/`pkg` never import modules.
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
-| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier) |
+| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
 | `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
@@ -155,13 +155,16 @@ migrations) to its owners; keep it current when adding a module.
   (1–999999) with upgrade guidance; never rewrite `schema_migrations` to skip
   DDL or edit a shipped migration.
 - Tenant-owned tables (`memberships`, `invitations`, `sessions`,
-  `refresh_tokens`, `files`, `notifications`, `notification_preferences`,
-  `api_keys`, `jobs`, `audit_events`, `feature_flag_targets`, `webhook_*`)
+  `refresh_tokens`, `data_exports`, `files`, `notifications`,
+  `notification_preferences`, `api_keys`, `jobs`, `audit_events`,
+  `feature_flag_targets`, `webhook_*`)
   have `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)`. New ones
   must too, and lead tenant-scoped
   query indexes with `tenant_id`. `feature_flags` is process-wide (deliberate
   exception); `api_key_scopes` is a pure child of `api_keys` (CASCADE) and
-  inherits its tenant through the parent key.
+  inherits its tenant through the parent key. `data_exports` is identity-owned:
+  its partial unique index allows one queued/running export per membership,
+  and `storage_path` is the authoritative export blob key.
 - Users are global (ADR 0004): `users`, `user_passwords`, `user_identities`,
   `password_reset_tokens`, and `email_verification_tokens` have no
   `tenant_id`; `tenants`/`tenant_settings` are the tenant rows themselves. A
@@ -410,9 +413,10 @@ handler/service/DTO/repository package.
     `files.trash.purge` (files soft-deleted more than
     `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
     `purge_started_at` claim that blocks restore, then blob, then row; a
-    missing blob counts as deleted; no event/webhook); and
+    missing blob counts as deleted; no event/webhook);
     `notifications.retention.purge` (notifications read more than
-    `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept). See
+    `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept); and
+    `privacy.exports.purge` (expired data-export blobs, then rows). See
     `docs/operations.md` "Data retention overview".
   - Metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
     `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures,
@@ -532,6 +536,22 @@ handler/service/DTO/repository package.
   never raw paths, payloads, SQL, headers, or error text. pgx is instrumented
   only under a recording parent. Jobs persist `trace_parent`; each attempt is a
   new-root `job.process` span linked to the enqueue span.
+- **Privacy (GDPR, ADR 0013):** `internal/contracts/privacy` is the stdlib
+  `Exporter`/`Eraser`/`Registry` contract. Every module with per-user data
+  registers through `app.PrivacyProvider` (identity, files, notifications,
+  apikeys, features, and webhooks' stored event history; endpoint config is
+  tenant-wide), and `bootstrap` returns the registry
+  in `Modules.Privacy`, installed in `app.Deps.Privacy`. Identity owns
+  `data_exports` and the routes: `POST/GET /me/data-exports`,
+  `GET /me/data-exports/:id[/download]`, `POST /me/erasure`, and
+  `POST /admin/users/:id/erasure` (`admin:users:delete`). Export jobs write one
+  JSON document per tenant/user for 7 days; erasure fans out one
+  `privacy.erase` job per membership plus a retryable finalizer that
+  anonymizes the global user only after every membership is `removed`. Self
+  erasure re-authenticates with the current password (no MFA exists yet); both
+  erasure routes are JWT-only. The last active admin is refused before enqueue
+  and re-checked at job time. Audit rows keep only IDs. The hourly purge also
+  removes failed/stale export rows after one day.
 - **Notifications:** owns the in-app feed, per-type `in_app`/`email`
   preferences, and the email channel. Queries filter `tenant_id` and
   `user_id`; missing preferences mean both channels on. `notifications.Notifier`

@@ -7,7 +7,7 @@ The fresh-install schema is one init migration (ADR 0012),
 | Section owner | Creates |
 |---|---|
 | `platform` | `update_updated_at()` trigger function |
-| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `data_exports`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `platform` | `jobs` |
 | `platform` | `scheduler_leases`, `scheduler_runs` |
 | `platform` | `audit_events` and its append-only triggers |
@@ -28,7 +28,7 @@ migration policy.
 
 | Owner | Tables |
 |---|---|
-| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
+| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `data_exports`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
 | `files` | `files` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -85,6 +85,7 @@ erDiagram
     tenants ||--o{ invitations : "RESTRICT"
     memberships ||--o{ invitations : "invited_by, accepted_by, RESTRICT"
     memberships ||--o{ sessions : "(tenant_id, user_id), CASCADE"
+    memberships ||--o{ data_exports : "(tenant_id, user_id), RESTRICT"
     sessions ||--o{ refresh_tokens : "(tenant_id, session_id), CASCADE"
     memberships ||--o{ api_keys : "(tenant_id, user_id), RESTRICT"
     api_keys ||--o{ api_key_scopes : "CASCADE"
@@ -134,6 +135,16 @@ erDiagram
         timestamptz banned_at "set iff suspended"
         timestamptz removed_at "set iff removed"
         timestamptz credentials_revoked_at "never cleared"
+    }
+    data_exports {
+        bigint id PK
+        bigint tenant_id FK
+        bigint user_id FK
+        varchar status "queued | running | ready | failed | expired"
+        varchar storage_path "ready export blob key"
+        timestamptz expires_at "ready + 7 days"
+        timestamptz created_at
+        timestamptz updated_at
     }
     invitations {
         bigint id PK
@@ -237,6 +248,12 @@ erDiagram
   `credentials_revoked_at` is set by a ban or removal and never cleared, so
   API keys created at or before it stay invalid after an unban or re-join.
   `role` is transitional; P2b-2 replaces it with `membership_roles`.
+- **Data exports** (ADR 0013) belong to one membership. A `queued`/`running`
+  row is the active request (partial unique index); `ready` rows carry the
+  document key and a 7-day `expires_at`; a failed export is retried only while
+  the job has attempts. Expired, failed, and stale (>1 day) queued/running rows
+  are removed by `privacy.exports.purge` (blob, then row); erasure removes them
+  immediately.
 - The last-admin trigger (`protect_last_admin`) lives on `memberships`: a
   tenant keeps at least one active admin membership. Counting and locking are
   scoped to the tenant; services also take a per-tenant advisory lock, and the
@@ -276,6 +293,7 @@ erDiagram
 |---|---|---|
 | `users` | partial unique `(email) WHERE status <> 'deleted'` | One live account per address, globally. |
 | `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows and for active admins | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check; last-admin count. |
+| `data_exports` | partial unique `(tenant_id, user_id) WHERE status IN ('queued','running')`; `(tenant_id, user_id, created_at DESC, id DESC)`; partial `(expires_at)` | One active export per membership; caller list cursor; hourly expiry purge. |
 | `invitations` | `token_hash` unique; partial unique `(tenant_id, email_normalized) WHERE accepted_at IS NULL`; `(tenant_id, created_at DESC, id DESC)`; partial `(expires_at)` on pending rows | Token lookup; one pending invite per address; list cursor; expiry purge. |
 | `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; "my sessions"; revoking a user's live sessions across tenants; stale-session purge. |
 | `refresh_tokens` | `token_hash` unique; `(tenant_id, session_id)`; `(expires_at)` | Rotation lookup; FK cascade and the purge's live-token check; expiry purge. |

@@ -158,7 +158,8 @@ flowchart TD
 | 403 | Authenticated but not permitted, or tenant mismatch |
 | 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-admin, idempotency key still in progress |
+| 409 | Conflict, duplicate, last-admin, idempotency key still in progress, data export not ready |
+| 410 | Expired data export |
 | 413 | Body or upload too large |
 | 415 | Unsupported media type |
 | 422 | Validation failed, or `Idempotency-Key` reused with a different body (`idempotency.key_mismatch`) |
@@ -314,6 +315,31 @@ membership state):
 
 Unknown, expired, already accepted, or misaddressed invitation tokens are
 `400 invitation.invalid`.
+
+## Privacy: data export and erasure
+
+All routes are in the request tenant; another user's or tenant's export id is
+`404` (never `403`). See [ADR 0013](adr/0013-gdpr-data-export-and-erasure.md).
+
+| Route | Auth | Behavior |
+|---|---|---|
+| `POST /me/data-exports` | `profile:read`, `Idempotency-Key`, Tier 2 audit (`data_export.requested`) | Creates one tenant-scoped export request and enqueues `privacy.data_export` in the same transaction. One `queued`/`running` export per membership; a second is `409 data_export.in_progress`. Returns `201 DataExportResponse` (`status: queued`). |
+| `GET /me/data-exports` | `profile:read` | Cursor list of the caller's exports, newest first. |
+| `GET /me/data-exports/:id` | `profile:read` | Status of one export (`queued`, `running`, `ready`, `failed`, `expired`). A ready export includes `downloadUrl`; unknown/other-owner/cross-tenant ids are `404 data_export.not_found`. |
+| `GET /me/data-exports/:id/download` | `profile:read` | Streams the ready JSON document with `Cache-Control: private, no-store`. `409 data_export.not_ready` before it is ready; `410 data_export.expired` once expired; after the hourly purge deletes the row it is `404`. Other users/tenants get `404`. |
+| `POST /me/erasure` | JWT only, `profile:write`, current password, Tier 1 (`user.erasure_requested`) | Re-authenticates with `currentPassword`, then queues one `privacy.erase` job per membership plus `privacy.erase.finalize`. `202 {status: accepted}`. API keys are refused; refused with `409 user.last_admin` when the caller is the last active admin of any tenant; passwordless accounts cannot self-erase this way. |
+| `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Same global erasure for a member of the request tenant; no password re-auth (the admin is already authenticated). `404` for a non-member, `409 user.last_admin` for the last active admin. API keys are refused because this ends global access. |
+
+The export document is `{userId, tenantId, generatedAt, sections: {identity,
+files, notifications, apikeys, features, webhooks}}`. Files include metadata
+plus base64 content; apikeys include metadata and scopes, never a hash;
+features include only user targets; webhooks include user-attributed event
+payloads and delivery summaries. The document is deleted at expiry (7 days),
+and failed/stuck builds are cleaned by the same hourly
+`privacy.exports.purge` job (blob, then row). Erasure anonymizes the global
+user (`erased+<id>@invalid`, empty name, `status: deleted`) only after every
+membership is `removed`, and deletes credentials, identities, sessions, and
+tokens. Audit rows keep only ids and outcomes.
 
 ## Headers
 

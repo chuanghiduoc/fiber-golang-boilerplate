@@ -6,8 +6,11 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
+	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
 	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
@@ -17,11 +20,14 @@ import (
 type Module struct {
 	handler         *notificationshandler.Handler
 	retentionPurger *notificationsservice.RetentionPurger
+	notifier        notificationcontracts.Notifier
+	privacy         *notificationsprivacy.Provider
 }
 
 var (
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
+	_ app.PrivacyProvider  = (*Module)(nil)
 )
 
 func New(handler *notificationshandler.Handler) *Module {
@@ -29,6 +35,18 @@ func New(handler *notificationshandler.Handler) *Module {
 }
 
 func (m *Module) Name() string { return notificationscatalog.Owner }
+
+// Notifier exposes the cross-module create API (used by identity's export job
+// and wired in bootstrap after both modules are built).
+func (m *Module) Notifier() notificationcontracts.Notifier { return m.notifier }
+
+// RegisterPrivacy implements app.PrivacyProvider.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacy == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "notifications", Exporter: m.privacy, Eraser: m.privacy})
+}
 
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters

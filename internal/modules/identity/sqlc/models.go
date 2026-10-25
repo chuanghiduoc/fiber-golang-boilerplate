@@ -10,6 +10,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+type DataExport struct {
+	ID          int64              `json:"id"`
+	TenantID    int64              `json:"tenant_id"`
+	UserID      int64              `json:"user_id"`
+	Status      string             `json:"status"`
+	StoragePath pgtype.Text        `json:"storage_path"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
 type EmailVerificationToken struct {
 	ID        int64              `json:"id"`
 	UserID    int64              `json:"user_id"`

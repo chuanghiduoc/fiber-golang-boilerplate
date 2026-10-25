@@ -41,6 +41,7 @@ DROP TABLE IF EXISTS jobs;
 -- owner: identity
 DROP TABLE IF EXISTS mfa_recovery_codes;
 DROP TABLE IF EXISTS mfa_factors;
+DROP TABLE IF EXISTS data_exports;
 DROP TABLE IF EXISTS email_verification_tokens;
 DROP TABLE IF EXISTS password_reset_tokens;
 DROP TABLE IF EXISTS refresh_tokens;

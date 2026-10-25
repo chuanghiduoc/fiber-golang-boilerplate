@@ -9,5 +9,9 @@
   "errors.user.email_taken.title": "Email đã được sử dụng",
   "errors.user.not_found.title": "Không tìm thấy người dùng",
   "errors.invitation.invalid.title": "Lời mời không hợp lệ",
-  "errors.membership.exists.title": "Đã là thành viên"
+  "errors.membership.exists.title": "Đã là thành viên",
+  "errors.data_export.in_progress.title": "Đang có một yêu cầu xuất dữ liệu",
+  "errors.data_export.not_found.title": "Không tìm thấy bản xuất dữ liệu",
+  "errors.data_export.not_ready.title": "Bản xuất dữ liệu chưa sẵn sàng",
+  "errors.data_export.expired.title": "Bản xuất dữ liệu đã hết hạn"
 }

@@ -8,8 +8,10 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	featurescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/catalog"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
+	featuresprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 )
@@ -17,7 +19,10 @@ import (
 // Module wires the feature-flag admin HTTP surface into the application.
 type Module struct {
 	handler *featureshandler.Handler
+	privacy *featuresprivacy.Provider
 }
+
+var _ app.PrivacyProvider = (*Module)(nil)
 
 // New builds the module from its handler.
 func New(handler *featureshandler.Handler) *Module {
@@ -26,6 +31,14 @@ func New(handler *featureshandler.Handler) *Module {
 
 // Name identifies the module in the registry.
 func (m *Module) Name() string { return featurescatalog.Owner }
+
+// RegisterPrivacy implements app.PrivacyProvider.
+func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
+	if m.privacy == nil {
+		return
+	}
+	registry.Register(privacycontracts.Provider{Name: "features", Exporter: m.privacy, Eraser: m.privacy})
+}
 
 // RegisterRoutes mounts the admin feature-flag routes below /api/v1.
 func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {

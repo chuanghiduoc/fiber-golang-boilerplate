@@ -34,6 +34,7 @@ var tableOwners = map[string]string{
 	"email_verification_tokens":      "identity",
 	"mfa_factors":                    "identity",
 	"mfa_recovery_codes":             "identity",
+	"data_exports":                   "identity",
 	"files":                          "files",
 	"feature_flags":                  "features",
 	"feature_flag_targets":           "features",

@@ -1310,6 +1310,76 @@
                 }
             }
         },
+        "/admin/users/{id}/erasure": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Queue erasure of every tenant membership's data and the global account for a member of the request tenant. The last active admin cannot be erased.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin"
+                ],
+                "summary": "Erase a member and their global account",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Idempotency key",
+                        "name": "Idempotency-Key",
+                        "in": "header"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErasureAccepted"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "user.last_admin",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/users/{id}/role": {
             "put": {
                 "security": [
@@ -3140,6 +3210,295 @@
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/me/data-exports": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "List the caller's export requests in the request tenant, newest first.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Privacy"
+                ],
+                "summary": "List data exports",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "default": 20,
+                        "description": "Max items to return",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Cursor from the last item of the previous page",
+                        "name": "startingAfter",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/response.ListResponse"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/definitions/dto.DataExportResponse"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Queue a JSON export of the caller's data in the request tenant. At most one queued or running export exists per membership.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Privacy"
+                ],
+                "summary": "Request a data export",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Idempotency key",
+                        "name": "Idempotency-Key",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/dto.DataExportResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "data_export.in_progress",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/me/data-exports/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Status of one of the caller's exports. Another user's or tenant's id is not found.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Privacy"
+                ],
+                "summary": "Get a data export",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Export ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.DataExportResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/me/data-exports/{id}/download": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Stream the caller's ready JSON export. Other users and tenants get 404; an expired export is 410.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Privacy"
+                ],
+                "summary": "Download a data export",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Export ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "file"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "data_export.not_ready",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "410": {
+                        "description": "data_export.expired",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
+        "/me/erasure": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Re-authenticate with the current password, then queue erasure of every tenant membership's data and the global account. Refused while the caller is the last active admin of a tenant.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Privacy"
+                ],
+                "summary": "Erase the caller's account data",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Idempotency key",
+                        "name": "Idempotency-Key",
+                        "in": "header"
+                    },
+                    {
+                        "description": "Current password",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErasureRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "$ref": "#/definitions/dto.ErasureAccepted"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "user.last_admin",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -5636,6 +5995,42 @@
                 }
             }
         },
+        "dto.DataExportResponse": {
+            "type": "object",
+            "properties": {
+                "createdAt": {
+                    "type": "string"
+                },
+                "downloadUrl": {
+                    "type": "string"
+                },
+                "expiresAt": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "queued",
+                        "running",
+                        "ready",
+                        "failed",
+                        "expired"
+                    ]
+                },
+                "tenantId": {
+                    "type": "integer"
+                },
+                "updatedAt": {
+                    "type": "string"
+                },
+                "userId": {
+                    "type": "integer"
+                }
+            }
+        },
         "dto.DeliveryAttemptResponse": {
             "type": "object",
             "properties": {
@@ -5796,6 +6191,25 @@
                     "type": "string"
                 },
                 "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.ErasureAccepted": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "dto.ErasureRequest": {
+            "type": "object",
+            "required": [
+                "currentPassword"
+            ],
+            "properties": {
+                "currentPassword": {
                     "type": "string"
                 }
             }

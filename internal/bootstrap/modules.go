@@ -12,6 +12,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
@@ -34,6 +35,8 @@ type Modules struct {
 	Sessions       session.Store
 	TenantResolver tenant.Resolver
 	APIKeyVerifier *apikey.Verifier
+	// Privacy is the registry modules register their exporters/erasers into.
+	Privacy *privacycontracts.Registry
 
 	// Startup runs one-time checks that need the database (tenant
 	// existence, admin seed) inside the caller's startup deadline.
@@ -51,10 +54,11 @@ type Modules struct {
 // add a module: build it here (passing only contracts from earlier modules
 // and its own settings) and append it to List.
 func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
+	privacyRegistry := privacycontracts.NewRegistry()
 	identityModule, identityProvides, err := identity.Build(infra, identity.Settings{
 		OAuth: cfg.OAuth,
 		Admin: cfg.Admin,
-	})
+	}, privacyRegistry)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +87,11 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	// two gen: markers below; keep both lines.
 	// gen:module-build
 
+	notificationsModule := notifications.Build(infra, identityProvides.Recipients, notifications.Settings{
+		RetentionDays: cfg.Retention.NotificationsRetentionDays(),
+	})
+	identityModule.SetNotifier(notificationsModule.Notifier())
+
 	return &Modules{
 		List: []app.Module{
 			identityModule,
@@ -91,14 +100,13 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 			features.Build(infra),
 			webhooksModule,
 			apikeysModule,
-			notifications.Build(infra, identityProvides.Recipients, notifications.Settings{
-				RetentionDays: cfg.Retention.NotificationsRetentionDays(),
-			}),
+			notificationsModule,
 			// gen:module-list
 		},
 		Sessions:       identityProvides.Sessions,
 		TenantResolver: identityProvides.TenantResolver,
 		APIKeyVerifier: apikeysProvides.Verifier,
+		Privacy:        privacyRegistry,
 		Startup:        identityModule.Startup,
 		Background:     []func(context.Context){webhooksModule.RunRetention},
 		Close:          []func(){webhooksModule.Close},

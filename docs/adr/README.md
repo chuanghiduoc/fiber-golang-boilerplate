@@ -33,3 +33,4 @@ flowchart LR
 | [0010](0010-mfa-totp-first.md) | MFA: TOTP and recovery codes first, WebAuthn later | Accepted |
 | [0011](0011-versioned-event-envelope.md) | Versioned event envelope; webhooks subscribe to domain events | Accepted |
 | [0012](0012-single-init-migration.md) | Single init migration with `-- owner:` sections; later migrations are UTC-timestamped | Accepted |
+| [0013](0013-gdpr-data-export-and-erasure.md) | GDPR data export and erasure through per-module privacy contracts | Accepted |

@@ -7,6 +7,7 @@ import (
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
+	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
 	notificationsrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/repository"
 	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -31,6 +32,8 @@ func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLo
 	svc := notificationsservice.NewNotificationService(
 		repo, recipients, infra.Email, notificationsrepo.NewTransactor(infra.Tx, infra.Email))
 	m := New(notificationshandler.New(svc))
+	m.notifier = svc
+	m.privacy = notificationsprivacy.New(notificationsrepo.NewPrivacyStore(infra.Pool))
 	if settings.RetentionDays > 0 {
 		m.retentionPurger = notificationsservice.NewRetentionPurger(
 			notificationsrepo.NewRetentionRepository(infra.Pool), settings.RetentionDays)
