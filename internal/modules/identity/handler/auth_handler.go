@@ -99,12 +99,15 @@ type GoogleOAuthProvider interface {
 	AuthURL(state string) string
 	Exchange(ctx context.Context, code string) (*oauth.GoogleUserInfo, error)
 	BuildCallbackURL(accessToken, refreshToken string) string
+	// BuildMFACallbackURL redirects a first-factor Google sign-in to the
+	// frontend with only a two-step login challenge, never tokens.
+	BuildMFACallbackURL(challenge string) string
 }
 
 // SessionIssuer is the session service surface the auth handlers use.
 // *service.SessionService implements it.
 type SessionIssuer interface {
-	Issue(ctx context.Context, userID int64, tokenVersion int32) (service.TokenPair, error)
+	Issue(ctx context.Context, userID int64, tokenVersion int32, amr []string) (service.TokenPair, error)
 	Refresh(ctx context.Context, refreshToken string, admit service.Admission) (*service.RefreshResult, error)
 	Logout(ctx context.Context, refreshToken string) error
 	List(ctx context.Context, userID int64, limit int, startingAfter string) ([]service.Session, bool, error)
@@ -128,6 +131,9 @@ type AuthDeps struct {
 	OAuthStateSecret         string
 	RequireEmailVerification bool
 	GoogleOAuth              GoogleOAuthProvider
+	// MFA is nil only in deployments and tests that do not wire MFA; login
+	// then issues tokens directly.
+	MFA service.MFAService
 	// Tenants validates the tenant carried through the OAuth state. Without
 	// it the Google flow fails closed with 500.
 	Tenants TenantLookup
@@ -141,6 +147,7 @@ type AuthHandler struct {
 	requireEmailVerification bool
 	googleOAuth              GoogleOAuthProvider
 	tenants                  TenantLookup
+	mfa                      service.MFAService
 	// oauthStateKey signs the OAuth state (see encodeOAuthState).
 	oauthStateKey []byte
 	// flags gates registration, Google OAuth, and the email-verification
@@ -181,6 +188,7 @@ func NewAuthHandler(deps AuthDeps) *AuthHandler {
 		requireEmailVerification: deps.RequireEmailVerification,
 		googleOAuth:              deps.GoogleOAuth,
 		tenants:                  deps.Tenants,
+		mfa:                      deps.MFA,
 		oauthStateKey:            oauthStateKey(deps.OAuthStateSecret),
 	}
 }
@@ -279,15 +287,35 @@ func (h *AuthHandler) Login(c fiber.Ctx) error {
 		return apperror.NewCode(identitycatalog.CodeAuthEmailNotVerified, "email not verified")
 	}
 
+	// Attribute the audit event to the authenticated user.
+	fiber.Locals(c, "user_id", user.ID)
+
+	// A confirmed factor makes the password only the first step: issue a
+	// short-lived challenge instead of a session.
+	if h.mfa != nil {
+		required, err := h.mfa.Required(c.Context(), user.ID)
+		if err != nil {
+			return err
+		}
+		if required {
+			challenge, err := h.mfa.BeginChallenge(ctx, user.ID, service.AMRPassword)
+			if err != nil {
+				return err
+			}
+			return response.Success(c, dto.LoginResponse{
+				User:              *user,
+				MFARequired:       true,
+				MFAChallengeToken: challenge,
+			})
+		}
+	}
+
 	// Issue re-checks the membership and the token version the password was
 	// verified at, so a credential change committed in between fails closed.
-	pair, err := h.sessions.Issue(ctx, user.ID, user.TokenVersion)
+	pair, err := h.sessions.Issue(ctx, user.ID, user.TokenVersion, []string{service.AMRPassword})
 	if err != nil {
 		return err
 	}
-
-	// Attribute the audit event to the authenticated user.
-	fiber.Locals(c, "user_id", user.ID)
 
 	return response.Success(c, dto.LoginResponse{
 		AccessToken:  pair.AccessToken,
@@ -610,9 +638,22 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		Complete: func(ctx context.Context, user *dto.UserResponse) error {
 			return h.admitGoogleUser(ctx, c, tenantID, user)
 		},
+		MFARequired: func(ctx context.Context, member *service.Member) (bool, error) {
+			if h.mfa == nil {
+				return false, nil
+			}
+			return h.mfa.Required(ctx, member.User.ID)
+		},
 	})
 	if err != nil {
 		return err
+	}
+	if result.MFARequired {
+		challenge, err := h.mfa.BeginChallenge(ctx, result.User.ID, service.AMRGoogle)
+		if err != nil {
+			return err
+		}
+		return c.Redirect().To(h.googleOAuth.BuildMFACallbackURL(challenge))
 	}
 	return c.Redirect().To(h.googleOAuth.BuildCallbackURL(result.Tokens.AccessToken, result.Tokens.RefreshToken))
 }

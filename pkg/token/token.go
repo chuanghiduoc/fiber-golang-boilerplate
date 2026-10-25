@@ -19,6 +19,9 @@ type Claims struct {
 	Email        string `json:"email"`
 	Role         string `json:"role"`
 	TokenVersion int32  `json:"token_version"`
+	// AMR is the Authentication Methods References set (RFC 8176): pwd,
+	// google, otp, rc. Tokens issued before MFA have no amr and still verify.
+	AMR []string `json:"amr,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -68,6 +71,7 @@ type SessionClaims struct {
 	Email        string
 	Role         string
 	TokenVersion int32
+	AMR          []string
 }
 
 // GenerateForSession creates a signed JWT bound to a user, tenant, and
@@ -88,6 +92,7 @@ func GenerateForSession(c SessionClaims, secret string, expireHour int) (string,
 		Email:        c.Email,
 		Role:         c.Role,
 		TokenVersion: c.TokenVersion,
+		AMR:          c.AMR,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Duration(expireHour) * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),

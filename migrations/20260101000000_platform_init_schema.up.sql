@@ -349,11 +349,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     token_version INTEGER NOT NULL,
     user_agent VARCHAR(512),
     ip INET,
+    -- Authentication methods used to establish the session (RFC 8176). A
+    -- refreshed access token repeats them; recovery codes record 'rc'.
+    amr TEXT[] NOT NULL DEFAULT ARRAY['pwd']::TEXT[],
     last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     revoked_at TIMESTAMP WITH TIME ZONE,
     revoked_reason VARCHAR(30)
         CHECK (revoked_reason IN ('logout', 'logout_all', 'revoked', 'refresh_reuse',
-                                  'credentials_changed', 'membership_changed', 'account_deleted')),
+                                  'credentials_changed', 'membership_changed', 'account_deleted',
+                                  'mfa_changed')),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_sessions_revoked CHECK ((revoked_at IS NULL) = (revoked_reason IS NULL)),
@@ -433,6 +437,60 @@ CREATE TABLE IF NOT EXISTS email_verification_tokens (
     expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
+
+-- ---------------------------------------------------------------------------
+-- identity: MFA factors (ADR 0010)
+--
+-- MFA is per global user, not per tenant. The TOTP secret is sealed with the
+-- data encryption keyring (DATA_ENCRYPTION_KEY) and never returned again after
+-- enrollment. last_used_step is the RFC 6238 step of the last accepted code;
+-- the verifier updates it with last_used_step < step so one code cannot be
+-- replayed, including by concurrent requests.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mfa_factors (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('totp')),
+    secret_ciphertext TEXT NOT NULL,
+    confirmed_at TIMESTAMP WITH TIME ZONE,
+    last_used_step BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+-- At most one confirmed factor of each type per user, and one pending
+-- enrollment (upsert target for re-enrollment).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mfa_factors_user_confirmed_totp
+    ON mfa_factors (user_id)
+    WHERE type = 'totp' AND confirmed_at IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mfa_factors_user_unconfirmed_totp
+    ON mfa_factors (user_id)
+    WHERE type = 'totp' AND confirmed_at IS NULL;
+
+DROP TRIGGER IF EXISTS trigger_mfa_factors_updated_at ON mfa_factors;
+CREATE TRIGGER trigger_mfa_factors_updated_at
+    BEFORE UPDATE ON mfa_factors
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- identity: single-use recovery codes (SHA-256 hashes, never plaintext)
+--
+-- Ten codes are issued on confirmation and on regenerate; used_at marks the
+-- one that was consumed, so a code can never authenticate twice.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash VARCHAR(64) NOT NULL,
+    used_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_mfa_recovery_codes_user_hash UNIQUE (user_id, code_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_user_unused
+    ON mfa_recovery_codes (user_id)
+    WHERE used_at IS NULL;
 
 -- owner: platform
 -- ---------------------------------------------------------------------------

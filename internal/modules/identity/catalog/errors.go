@@ -12,6 +12,17 @@ const (
 	CodeAuthInvalidCredentials apperror.Code = "auth.invalid_credentials"
 	CodeAuthEmailNotVerified   apperror.Code = "auth.email_not_verified"
 	CodeAuthRefreshInvalid     apperror.Code = "auth.refresh_invalid"
+	// CodeAuthMFARequired: the access token lacks an otp/rc amr entry.
+	CodeAuthMFARequired apperror.Code = "auth.mfa_required"
+	// CodeAuthMFAChallengeInvalid: the challenge expired, was already used,
+	// or belongs to another tenant.
+	CodeAuthMFAChallengeInvalid apperror.Code = "auth.mfa_challenge_invalid"
+	// CodeAuthMFAInvalidCode: a TOTP or recovery code did not match.
+	CodeAuthMFAInvalidCode apperror.Code = "auth.mfa_invalid_code"
+	// CodeAuthMFAAlreadyEnabled: a confirmed factor already exists.
+	CodeAuthMFAAlreadyEnabled apperror.Code = "auth.mfa_already_enabled"
+	// CodeAuthMFANotEnabled: no confirmed factor exists.
+	CodeAuthMFANotEnabled apperror.Code = "auth.mfa_not_enabled"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
@@ -40,6 +51,31 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid refresh token",
 			DocPath: "/errors/auth-refresh-invalid",
+		},
+		CodeAuthMFARequired: {
+			Status:  http.StatusForbidden,
+			Title:   "Multi-factor authentication required",
+			DocPath: "/errors/auth-mfa-required",
+		},
+		CodeAuthMFAChallengeInvalid: {
+			Status:  http.StatusUnauthorized,
+			Title:   "Invalid MFA challenge",
+			DocPath: "/errors/auth-mfa-challenge-invalid",
+		},
+		CodeAuthMFAInvalidCode: {
+			Status:  http.StatusUnauthorized,
+			Title:   "Invalid MFA code",
+			DocPath: "/errors/auth-mfa-invalid-code",
+		},
+		CodeAuthMFAAlreadyEnabled: {
+			Status:  http.StatusConflict,
+			Title:   "MFA is already enabled",
+			DocPath: "/errors/auth-mfa-already-enabled",
+		},
+		CodeAuthMFANotEnabled: {
+			Status:  http.StatusConflict,
+			Title:   "MFA is not enabled",
+			DocPath: "/errors/auth-mfa-not-enabled",
 		},
 		CodeUserEmailTaken: {
 			Status:  http.StatusConflict,

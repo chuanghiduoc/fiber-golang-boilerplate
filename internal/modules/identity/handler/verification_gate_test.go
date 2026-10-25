@@ -51,6 +51,10 @@ func (s *stubGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) str
 	return "https://frontend.example.test/cb#a=" + accessToken + "&r=" + refreshToken
 }
 
+func (s *stubGoogleOAuth) BuildMFACallbackURL(challenge string) string {
+	return "https://frontend.example.test/cb#mfa_required=true&mfa_challenge=" + challenge
+}
+
 func TestGoogleCallback_RequiresVerifiedEmailWhenConfigured(t *testing.T) {
 	provider := &stubGoogleOAuth{info: &oauth.GoogleUserInfo{ID: "g-1", Email: "g@example.com", Name: "G", VerifiedEmail: true}}
 	tenants := &fakeTenantRepository{tenant: service.Tenant{ID: 1, Slug: "default", Status: "active"}}

@@ -26,6 +26,7 @@ type Module struct {
 	// WithInvitations); their routes are mounted only when present.
 	sessions    *identityhandler.SessionHandler
 	invitations *identityhandler.InvitationHandler
+	mfa         *identityhandler.MFAHandler
 
 	// The job, schedule, and startup collaborators are set by Build; a module
 	// built with New (tests) has none.
@@ -102,6 +103,19 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	}
 	if m.invitations != nil {
 		m.registerInvitationRoutes(v1, auth, jwtOnly, deps)
+	}
+	if m.mfa != nil {
+		// MFA management is JWT-only: an API key has no session to keep and
+		// must not change the owner's second factor. Enroll/confirm/regenerate
+		// return one-time secrets, so they never take Idempotency-Key.
+		auth.Get("/mfa/status", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionMFARead), m.mfa.Status)
+		auth.Post("/mfa/totp/enroll", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Enroll)
+		auth.Post("/mfa/totp/confirm", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Confirm)
+		auth.Post("/mfa/disable", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Disable)
+		auth.Post("/mfa/recovery-codes/regenerate", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Regenerate)
+		// The two-step login verification is public: the sealed, single-use
+		// challenge plus the second factor are the credentials.
+		auth.Post("/mfa/verify", rl.Strict, m.mfa.Verify)
 	}
 
 	users := v1.Group("/users", deps.Authenticate())

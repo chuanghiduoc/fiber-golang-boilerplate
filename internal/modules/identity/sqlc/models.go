@@ -46,6 +46,17 @@ type Membership struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 }
 
+type MfaFactor struct {
+	ID               int64              `json:"id"`
+	UserID           int64              `json:"user_id"`
+	Type             string             `json:"type"`
+	SecretCiphertext string             `json:"secret_ciphertext"`
+	ConfirmedAt      pgtype.Timestamptz `json:"confirmed_at"`
+	LastUsedStep     int64              `json:"last_used_step"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type PasswordResetToken struct {
 	ID        int64              `json:"id"`
 	UserID    int64              `json:"user_id"`
@@ -71,6 +82,7 @@ type Session struct {
 	TokenVersion  int32              `json:"token_version"`
 	UserAgent     pgtype.Text        `json:"user_agent"`
 	Ip            *netip.Addr        `json:"ip"`
+	Amr           []string           `json:"amr"`
 	LastUsedAt    pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
 	RevokedReason pgtype.Text        `json:"revoked_reason"`

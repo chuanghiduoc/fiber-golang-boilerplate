@@ -74,4 +74,10 @@ type LoginResponse struct {
 	AccessToken  string       `json:"accessToken"`
 	RefreshToken string       `json:"refreshToken"`
 	User         UserResponse `json:"user"`
+	// MFARequired is true when the password or Google sign-in succeeded but a
+	// second factor is needed. Tokens are empty in that case; the caller
+	// completes the sign-in with MFAChallengeToken at /auth/mfa/verify.
+	MFARequired bool `json:"mfaRequired,omitempty"`
+	// MFAChallengeToken is a five-minute, single-use, tenant-bound challenge.
+	MFAChallengeToken string `json:"mfaChallengeToken,omitempty"`
 }

@@ -274,8 +274,9 @@ handler/service/DTO/repository package.
   `Deprecation`/`Sunset`/`Link`. Keep Swagger's base path at `/api/v1`.
 - **Auth/session:** login is the global password plus an *active membership*
   in the request tenant (otherwise the same 401 as a wrong password). JWT
-  carries user id, `tenant_id`, `sid` (session id), `token_version`, and the
-  transitional membership `role`; `session.Store` loads the session and
+  carries user id, `tenant_id`, `sid` (session id), `token_version`, the
+  transitional membership `role`, and optional `amr` (pwd/google/otp/rc);
+  `session.Store` loads the session and
   requires it unrevoked, the membership and user active, the tenant
   operational, and role/version to match (5s snapshot per session,
   generation-keyed per-user invalidation). `JWTAuth` rejects a non-positive tenant and an
@@ -324,6 +325,28 @@ handler/service/DTO/repository package.
   the send). The admin seed only creates a missing admin; an existing
   demoted/banned/deleted or non-member account is skipped, never re-promoted
   or added.
+- **MFA (ADR 0010):** TOTP only (RFC 6238, SHA-1/6 digits/30s, ±1 step),
+  per global user, not per tenant. `mfa_factors` keeps at most one confirmed
+  factor and one pending enrollment; the secret is sealed with
+  `infra.PayloadCodec` (`DATA_ENCRYPTION_KEY`, previous keys decrypt) and is
+  returned only inside the enrollment `otpauth://` URI. Confirmation and
+  disable require a current TOTP/recovery code; confirmation issues ten
+  single-use recovery codes (SHA-256 hashes, shown once). `mfa_recovery_codes.used_at`
+  and `mfa_factors.last_used_step` are claimed with conditional UPDATEs, so
+  concurrent uses cannot both pass. Routes: `GET /auth/mfa/status`,
+  `POST /auth/mfa/totp/{enroll,confirm}`, `POST /auth/mfa/disable`,
+  `POST /auth/mfa/recovery-codes/regenerate` (JWT-only, `mfa:read|write`,
+  Tier 1; no Idempotency-Key on secret-returning endpoints). With a confirmed
+  factor, password login and Google sign-in return `mfaRequired` plus a
+  five-minute, single-use, tenant-bound challenge sealed with the same codec
+  (no tokens); `POST /auth/mfa/verify` (challenge + TOTP/recovery code)
+  issues the normal pair. Failed verifications count toward the login
+  lockout, and confirming/disabling revokes the user's other sessions
+  (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
+  `rc`; refresh repeats the session's `amr`, tokens without it still verify,
+  and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
+  `otp`/`rc` (403 `auth.mfa_required`). Which roles require MFA is not decided
+  here.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles}`; admins get
   everything). Only permissions shared by several modules (`admin:users:*`,

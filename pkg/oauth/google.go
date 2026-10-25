@@ -75,6 +75,22 @@ func (g *GoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string 
 	return u.String()
 }
 
+// BuildMFACallbackURL constructs the redirect URL for a first-factor Google
+// sign-in that still needs a TOTP or recovery code. Only the challenge travels
+// in the URL fragment, never a token.
+func (g *GoogleOAuth) BuildMFACallbackURL(challenge string) string {
+	params := url.Values{}
+	params.Set("mfa_required", "true")
+	params.Set("mfa_challenge", challenge)
+
+	u, err := url.Parse(g.frontendURL)
+	if err != nil {
+		return g.frontendURL
+	}
+	u.Fragment = params.Encode()
+	return u.String()
+}
+
 func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInfo, error) {
 	token, err := g.cfg.Exchange(ctx, code)
 	if err != nil {

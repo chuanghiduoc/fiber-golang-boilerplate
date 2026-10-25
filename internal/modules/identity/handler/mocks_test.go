@@ -32,7 +32,7 @@ func mockMember(userID int64) *service.Member {
 	}
 }
 
-func (m *mockSessions) Issue(_ context.Context, _ int64, _ int32) (service.TokenPair, error) {
+func (m *mockSessions) Issue(_ context.Context, _ int64, _ int32, _ []string) (service.TokenPair, error) {
 	return service.TokenPair{AccessToken: "mock-access-token", RefreshToken: "mock-refresh-token", SessionID: 1}, nil
 }
 

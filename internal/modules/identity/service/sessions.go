@@ -20,6 +20,7 @@ type AccessClaims struct {
 	Email        string
 	Role         string
 	TokenVersion int32
+	AMR          []string
 }
 
 // AccessTokenSigner mints a signed access token (the composition root binds
@@ -74,10 +75,10 @@ func accountNotActive() error {
 // Issue opens a session in the request tenant for an authenticated user.
 // tokenVersion is the version the caller authenticated at: a credential
 // change committed since then makes the issue fail with 401.
-func (s *SessionService) Issue(ctx context.Context, userID int64, tokenVersion int32) (TokenPair, error) {
+func (s *SessionService) Issue(ctx context.Context, userID int64, tokenVersion int32, amr []string) (TokenPair, error) {
 	var pair TokenPair
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		issued, err := s.issueTx(ctx, tx.Stores, userID, tokenVersion)
+		issued, err := s.issueTx(ctx, tx.Stores, userID, tokenVersion, amr)
 		pair = issued
 		return err
 	})
@@ -85,7 +86,10 @@ func (s *SessionService) Issue(ctx context.Context, userID int64, tokenVersion i
 }
 
 // issueTx opens a session through st (normally a transaction's stores).
-func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, tokenVersion int32) (TokenPair, error) {
+func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, tokenVersion int32, amr []string) (TokenPair, error) {
+	if len(amr) == 0 {
+		amr = []string{AMRPassword}
+	}
 	member, err := st.Memberships.GetActive(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -98,6 +102,7 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 		TokenVersion: tokenVersion,
 		UserAgent:    userAgentFromContext(ctx),
 		IP:           clientIPFromContext(ctx),
+		AMR:          amr,
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -109,7 +114,7 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 	if err != nil {
 		return TokenPair{}, err
 	}
-	access, err := s.signFor(member, sess.ID)
+	access, err := s.signFor(member, sess.ID, amr)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -127,7 +132,7 @@ func (s *SessionService) newRefreshToken(ctx context.Context, tokens RefreshToke
 	return plain, nil
 }
 
-func (s *SessionService) signFor(member *Member, sessionID int64) (string, error) {
+func (s *SessionService) signFor(member *Member, sessionID int64, amr []string) (string, error) {
 	access, err := s.sign(AccessClaims{
 		UserID:       member.User.ID,
 		TenantID:     member.Membership.TenantID,
@@ -135,6 +140,7 @@ func (s *SessionService) signFor(member *Member, sessionID int64) (string, error
 		Email:        member.User.Email,
 		Role:         member.Membership.Role,
 		TokenVersion: member.User.TokenVersion,
+		AMR:          amr,
 	})
 	if err != nil {
 		return "", apperror.NewInternal("failed to generate access token")
@@ -195,7 +201,7 @@ func (s *SessionService) Refresh(ctx context.Context, plain string, admit Admiss
 	if err != nil {
 		return nil, err
 	}
-	access, err := s.signFor(member, sess.session.ID)
+	access, err := s.signFor(member, sess.session.ID, sess.session.AMR)
 	if err != nil {
 		return nil, err
 	}

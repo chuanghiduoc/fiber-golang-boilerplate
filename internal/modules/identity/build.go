@@ -63,6 +63,18 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	}
 
 	stores := identityrepository.NewStores(infra.Pool)
+	// cmd/api always supplies the DATA_ENCRYPTION_KEY codec. Builds without one
+	// (unit/arch tests, an app built with New) fall back to the JWT secret the
+	// same way local job payload encryption does.
+	payloadCodec := infra.PayloadCodec
+	if payloadCodec == nil {
+		var err error
+		payloadCodec, err = jobs.NewPayloadCodec(cfg.JWT.Secret)
+		if err != nil {
+			return nil, Provides{}, fmt.Errorf("MFA secret encryption: %w", err)
+		}
+	}
+	sealer := identityadapter.NewPayloadSealer(payloadCodec)
 	var mail identityrepository.TxEmailSender
 	if infra.Email != nil {
 		mail = infra.Email
@@ -82,6 +94,9 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), infra.Cache)
 	sessionSvc := identityservice.NewSessionService(stores, transactor, accessTokenSigner(cfg.JWT),
 		time.Duration(cfg.JWT.RefreshExpireDays)*24*time.Hour, sessionStore)
+	mfaSvc := identityservice.NewMFAService(identityservice.MFADeps{
+		Stores: stores, Tx: transactor, Cache: infra.Cache, Sealer: sealer, Sessions: sessionSvc,
+	})
 
 	emailVerifSvc := identityservice.NewEmailVerificationService(identityservice.VerificationDeps{
 		Stores: stores, Tx: transactor, Sender: infra.Email, Cache: infra.Cache, FrontendURL: cfg.App.FrontendURL,
@@ -121,6 +136,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 		RequireEmailVerification: cfg.App.RequireEmailVerification,
 		GoogleOAuth:              googleOAuthProvider(googleOAuth),
 		Tenants:                  tenantSvc,
+		MFA:                      mfaSvc,
 	})
 	userHandler := identityhandler.NewUserHandler(userSvc, emailVerifSvc)
 
@@ -129,6 +145,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	m := New(authHandler, userHandler)
 	m.sessions = identityhandler.NewSessionHandler(sessionSvc)
 	m.invitations = identityhandler.NewInvitationHandler(invitationSvc)
+	m.mfa = identityhandler.NewMFAHandler(mfaSvc)
 	m.resetSvc = passwordResetSvc
 	m.tokenPurger = identityservice.NewTokenPurger(identityrepository.NewTokenPurgeRepository(infra.Pool))
 	m.startup = func(ctx context.Context) error {
@@ -172,6 +189,7 @@ func accessTokenSigner(jwt config.JWTConfig) identityservice.AccessTokenSigner {
 			Email:        c.Email,
 			Role:         c.Role,
 			TokenVersion: c.TokenVersion,
+			AMR:          c.AMR,
 		}, jwt.Secret, jwt.ExpireHour)
 	}
 }

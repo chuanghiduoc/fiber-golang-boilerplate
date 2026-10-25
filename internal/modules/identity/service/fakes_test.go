@@ -29,6 +29,8 @@ type memDB struct {
 	sessions    map[int64]*Session
 	refresh     map[string]*RefreshToken // hash -> token
 	tenants     map[int64]*Tenant
+	factors     map[int64]*MFAFactor
+	recovery    map[int64]map[string]bool // user -> code hash -> used
 	audits      []audit.Event
 	published   []events.Event
 }
@@ -44,6 +46,8 @@ func newMemDB() *memDB {
 		sessions:    map[int64]*Session{},
 		refresh:     map[string]*RefreshToken{},
 		tenants:     map[int64]*Tenant{},
+		factors:     map[int64]*MFAFactor{},
+		recovery:    map[int64]map[string]bool{},
 	}
 	db.tenants[1] = &Tenant{ID: 1, Slug: "default", Name: "Default", Status: TenantStatusActive}
 	db.tenants[2] = &Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: TenantStatusActive}
@@ -62,6 +66,7 @@ func (db *memDB) stores() Stores {
 		Verifications: memVerifications{},
 		Invitations:   memInvitations{},
 		Tenants:       memTenants{db},
+		MFA:           memMFA{db},
 	}
 }
 
@@ -407,7 +412,7 @@ func (r memSessions) Create(ctx context.Context, in NewSession) (*Session, error
 	}
 	now := time.Now()
 	s := &Session{ID: r.db.id(), TenantID: tid, UserID: in.UserID, TokenVersion: in.TokenVersion,
-		UserAgent: in.UserAgent, IP: in.IP, CreatedAt: now, LastUsedAt: now}
+		UserAgent: in.UserAgent, IP: in.IP, AMR: in.AMR, CreatedAt: now, LastUsedAt: now}
 	r.db.sessions[s.ID] = s
 	c := *s
 	return &c, nil
@@ -460,6 +465,13 @@ func (r memSessions) RevokeAllForUser(_ context.Context, userID int64, why Revok
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	r.revoke(func(s *Session) bool { return s.UserID == userID }, why)
+	return nil
+}
+
+func (r memSessions) RevokeOtherUserSessions(_ context.Context, userID, keepID int64, why RevokeReason) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	r.revoke(func(s *Session) bool { return s.UserID == userID && s.ID != keepID }, why)
 	return nil
 }
 
@@ -595,4 +607,122 @@ func (r memTenants) UpdateStatus(_ context.Context, id int64, status TenantStatu
 }
 func (r memTenants) Settings(context.Context, int64) (*TenantSettings, error) {
 	return nil, errFakeNotImplemented
+}
+
+type memMFA struct{ db *memDB }
+
+func (r memMFA) GetTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	f, ok := r.db.factors[userID]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	c := *f
+	return &c, nil
+}
+
+func (r memMFA) GetConfirmedTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	f, ok := r.db.factors[userID]
+	if !ok || f.ConfirmedAt == nil {
+		return nil, apperror.ErrNotFound
+	}
+	c := *f
+	return &c, nil
+}
+
+func (r memMFA) UpsertUnconfirmedTOTP(_ context.Context, userID int64, sealed string) (*MFAFactor, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	now := time.Now()
+	f, ok := r.db.factors[userID]
+	if !ok {
+		f = &MFAFactor{ID: r.db.id(), UserID: userID, Type: MFAFactorTOTP, CreatedAt: now}
+		r.db.factors[userID] = f
+	}
+	if f.ConfirmedAt != nil {
+		return nil, errors.New("fake: factor already confirmed")
+	}
+	f.SecretCiphertext = sealed
+	f.UpdatedAt = now
+	c := *f
+	return &c, nil
+}
+
+func (r memMFA) ConfirmTOTP(_ context.Context, id, userID, step int64) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	f, ok := r.db.factors[userID]
+	if !ok || f.ID != id || f.ConfirmedAt != nil {
+		return false, nil
+	}
+	now := time.Now()
+	f.ConfirmedAt = &now
+	f.LastUsedStep = step
+	return true, nil
+}
+
+func (r memMFA) ConsumeTOTPStep(_ context.Context, userID, step int64) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	f, ok := r.db.factors[userID]
+	if !ok || f.ConfirmedAt == nil || f.LastUsedStep >= step {
+		return false, nil
+	}
+	f.LastUsedStep = step
+	return true, nil
+}
+
+func (r memMFA) DeleteTOTP(_ context.Context, userID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	delete(r.db.factors, userID)
+	return nil
+}
+
+func (r memMFA) DeleteRecoveryCodes(_ context.Context, userID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	delete(r.db.recovery, userID)
+	return nil
+}
+
+func (r memMFA) CreateRecoveryCodes(_ context.Context, userID int64, hashes []string) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	codes := r.db.recovery[userID]
+	if codes == nil {
+		codes = map[string]bool{}
+		r.db.recovery[userID] = codes
+	}
+	for _, hash := range hashes {
+		codes[hash] = false
+	}
+	return nil
+}
+
+func (r memMFA) UseRecoveryCode(_ context.Context, userID int64, hash string) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	codes := r.db.recovery[userID]
+	used, ok := codes[hash]
+	if !ok || used {
+		return false, nil
+	}
+	codes[hash] = true
+	return true, nil
+}
+
+func (r memMFA) CountUnusedRecoveryCodes(_ context.Context, userID int64) (int64, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	var n int64
+	for _, used := range r.db.recovery[userID] {
+		if !used {
+			n++
+		}
+	}
+	return n, nil
 }

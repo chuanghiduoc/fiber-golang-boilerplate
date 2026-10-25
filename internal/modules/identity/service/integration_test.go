@@ -74,6 +74,7 @@ type env struct {
 	users    service.UserService
 	admin    service.AdminUserService
 	sessions *service.SessionService
+	mfa      service.MFAService
 	resets   service.PasswordResetService
 	verify   service.EmailVerificationService
 	mail     *mailbox
@@ -108,6 +109,9 @@ func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 		}),
 		admin:    service.NewAdminUserService(stores, tx, nil),
 		sessions: sessions,
+		mfa: service.NewMFAService(service.MFADeps{
+			Stores: stores, Tx: tx, Cache: appCache, Sealer: testSealer{}, Sessions: sessions,
+		}),
 		resets: service.NewPasswordResetService(service.ResetDeps{
 			Stores: stores, Tx: tx, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",
 		}),
@@ -217,7 +221,7 @@ func TestRefresh_ConcurrentRotationRevokesFamily(t *testing.T) {
 	ctx := context.Background()
 	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "race@example.com", Password: "Password1!", Name: "Race"})
 	require.NoError(t, err)
-	pair, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion)
+	pair, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
@@ -256,9 +260,9 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 	user, err := e.users.Register(ctx, dto.RegisterRequest{Email: "reset@example.com", Password: "Password1!", Name: "Reset"})
 	require.NoError(t, err)
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "reset@example.com", testutil.MemberOptions{})
-	inDefault, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion)
+	inDefault, err := e.sessions.Issue(ctx, user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
-	inAcme, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.ID, user.TokenVersion)
+	inAcme, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.ID, user.TokenVersion, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, e.resets.ForgotPassword(tenant.WithIdentity(ctx, acmeID, "acme"), dto.ForgotPasswordRequest{Email: "Reset@Example.com"}))

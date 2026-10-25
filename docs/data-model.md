@@ -7,7 +7,7 @@ The fresh-install schema is one init migration (ADR 0012),
 | Section owner | Creates |
 |---|---|
 | `platform` | `update_updated_at()` trigger function |
-| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants` (seeds id 1 `default`), `tenant_settings`, `users`, `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `platform` | `jobs` |
 | `platform` | `scheduler_leases`, `scheduler_runs` |
 | `platform` | `audit_events` and its append-only triggers |
@@ -28,7 +28,7 @@ migration policy.
 
 | Owner | Tables |
 |---|---|
-| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens` |
+| `identity` | `tenants`, `tenant_settings`, `users` (global), `user_passwords`, `user_identities`, `memberships`, `invitations`, `sessions`, `refresh_tokens`, `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, `mfa_recovery_codes` |
 | `apikeys` | `api_keys`, `api_key_scopes` |
 | `files` | `files` |
 | `notifications` | `notifications`, `notification_preferences` |
@@ -45,8 +45,8 @@ Conventions that apply to every diagram below:
   baseline. Exceptions: `api_key_scopes`, a child fully owned by its key, has
   no `tenant_id` of its own (the key id is global; the parent row holds the
   tenant); `users` and the per-user rows `user_passwords`, `user_identities`,
-  `password_reset_tokens`, and `email_verification_tokens` are global (ADR
-  0004) and have no `tenant_id`.
+  `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, and
+  `mfa_recovery_codes` are global (ADR 0004) and have no `tenant_id`.
 - Child rows reference their parent through a **composite** foreign key, so a
   row can never point at a parent in another tenant. Every per-member row in
   another module references `(tenant_id, user_id) → memberships(tenant_id,
@@ -80,6 +80,8 @@ erDiagram
     users ||--o{ user_identities : "one per provider, CASCADE"
     users ||--o| password_reset_tokens : "one per user, CASCADE"
     users ||--o| email_verification_tokens : "one per user, CASCADE"
+    users ||--o{ mfa_factors : "one confirmed TOTP, CASCADE"
+    users ||--o{ mfa_recovery_codes : "ten per set, CASCADE"
     tenants ||--o{ invitations : "RESTRICT"
     memberships ||--o{ invitations : "invited_by, accepted_by, RESTRICT"
     memberships ||--o{ sessions : "(tenant_id, user_id), CASCADE"
@@ -151,9 +153,10 @@ erDiagram
         int token_version "user version at sign-in"
         varchar user_agent
         inet ip
+        text amr "pwd | google | otp | rc"
         timestamptz last_used_at
         timestamptz revoked_at "set together with revoked_reason"
-        varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | ..."
+        varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | mfa_changed | ..."
     }
     refresh_tokens {
         bigint id PK
@@ -175,6 +178,20 @@ erDiagram
         varchar email "target address"
         varchar token_hash UK
         timestamptz expires_at
+    }
+    mfa_factors {
+        bigint id PK
+        bigint user_id FK "unique when confirmed; unique when pending"
+        varchar type "totp"
+        text secret_ciphertext "sealed with DATA_ENCRYPTION_KEY"
+        timestamptz confirmed_at
+        bigint last_used_step "RFC 6238 replay guard"
+    }
+    mfa_recovery_codes {
+        bigint id PK
+        bigint user_id FK
+        varchar code_hash "SHA-256, unique per user"
+        timestamptz used_at "single use"
     }
     api_keys {
         bigint id PK
@@ -237,6 +254,12 @@ erDiagram
   used tokens are kept until they expire so a replay is recognized as reuse.
 - Password-reset and email-verification tokens are **per user**
   (`user_id UNIQUE`), not per tenant: the password is a global credential.
+- **MFA is per user** (ADR 0010): `mfa_factors` holds at most one confirmed
+  TOTP factor (partial unique `WHERE confirmed_at IS NOT NULL`) and one pending
+  enrollment (`WHERE confirmed_at IS NULL`). The secret is sealed with
+  `DATA_ENCRYPTION_KEY`; `last_used_step` makes one RFC 6238 step usable once.
+  `mfa_recovery_codes` stores SHA-256 hashes; `used_at` makes each code single
+  use.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request
   tenant cannot be trusted until the key is verified. A key's owner is a
   membership (`(tenant_id, user_id) → memberships`).
@@ -256,6 +279,8 @@ erDiagram
 | `invitations` | `token_hash` unique; partial unique `(tenant_id, email_normalized) WHERE accepted_at IS NULL`; `(tenant_id, created_at DESC, id DESC)`; partial `(expires_at)` on pending rows | Token lookup; one pending invite per address; list cursor; expiry purge. |
 | `sessions` | unique `(tenant_id, id)`; `(tenant_id, user_id, created_at DESC)`; partial `(user_id) WHERE revoked_at IS NULL`; `(last_used_at)` | Refresh-token FK parent; "my sessions"; revoking a user's live sessions across tenants; stale-session purge. |
 | `refresh_tokens` | `token_hash` unique; `(tenant_id, session_id)`; `(expires_at)` | Rotation lookup; FK cascade and the purge's live-token check; expiry purge. |
+| `mfa_factors` | partial unique `(user_id) WHERE type = 'totp' AND confirmed_at IS NOT NULL`; partial unique `(user_id) WHERE type = 'totp' AND confirmed_at IS NULL` | One confirmed factor and one pending enrollment per user. |
+| `mfa_recovery_codes` | unique `(user_id, code_hash)`; partial `(user_id) WHERE used_at IS NULL` | Code lookup; unused-code count. |
 
 ## Files, notifications, and feature flags
 
