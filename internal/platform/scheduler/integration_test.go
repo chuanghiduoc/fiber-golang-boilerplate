@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
@@ -286,7 +285,7 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 		_, _ = admin.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE")
 	})
 
-	migration, err := integrationSchema(t)
+	migrations, err := integrationSchema(t)
 	require.NoError(t, err)
 
 	conn, err := admin.Acquire(ctx)
@@ -295,8 +294,12 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 
 	_, err = conn.Exec(ctx, "SET search_path TO "+schemaIdent)
 	require.NoError(t, err)
-	if _, err := conn.Conn().PgConn().Exec(ctx, migration).ReadAll(); err != nil {
-		t.Fatalf("apply migrations/*.up.sql: %v", err)
+	// One Exec per file, like golang-migrate: a multi-statement string runs in
+	// an implicit transaction, which CREATE INDEX CONCURRENTLY rejects.
+	for _, migration := range migrations {
+		if _, err := conn.Conn().PgConn().Exec(ctx, migration.sql).ReadAll(); err != nil {
+			t.Fatalf("apply %s: %v", migration.name, err)
+		}
 	}
 
 	poolCfg, err := pgxpool.ParseConfig(dsn)
@@ -310,27 +313,32 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// integrationSchema returns every up migration concatenated in version
-// order, which is what golang-migrate applies to a fresh database.
-func integrationSchema(t *testing.T) (string, error) {
+// integrationMigration is one up migration file.
+type integrationMigration struct {
+	name string
+	sql  string
+}
+
+// integrationSchema returns every up migration in version order, which is
+// what golang-migrate applies to a fresh database (one file at a time).
+func integrationSchema(t *testing.T) ([]integrationMigration, error) {
 	t.Helper()
 
 	_, filename, _, ok := runtime.Caller(0)
 	require.True(t, ok, "resolve test file path")
 	paths, err := filepath.Glob(filepath.Join(filepath.Dir(filename), "..", "..", "..", "migrations", "*.up.sql"))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	require.NotEmpty(t, paths, "no up migrations found")
 	sort.Strings(paths)
-	var schema strings.Builder
+	migrations := make([]integrationMigration, 0, len(paths))
 	for _, path := range paths {
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
-		schema.Write(raw)
-		schema.WriteString("\n")
+		migrations = append(migrations, integrationMigration{name: filepath.Base(path), sql: string(raw)})
 	}
-	return schema.String(), nil
+	return migrations, nil
 }

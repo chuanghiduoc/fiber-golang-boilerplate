@@ -73,6 +73,55 @@ jobs:
           git add -N internal/modules/*/sqlc/
           git diff --exit-code internal/modules/*/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
 
+  # ADR 0006: swag emits Swagger 2.0; cmd/openapi3 converts both the base
+  # branch's and this PR's docs/swagger.json to OpenAPI 3 and oasdiff fails on
+  # ERR-level breaking changes. An intentional break is acknowledged by
+  # editing docs/api-breaking-changes.md in the same PR; the report is then
+  # printed but does not fail. The Lint job already proves the PR's spec
+  # matches the annotations.
+  api-compat:
+    name: API compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install oasdiff
+        run: go install github.com/oasdiff/oasdiff@v1.33.0
+
+      - name: Detect breaking API changes
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          base="origin/${BASE_REF}"
+          if ! git cat-file -e "${base}:docs/swagger.json" 2>/dev/null; then
+            echo "::notice::${base} has no docs/swagger.json; nothing to compare"
+            exit 0
+          fi
+          git show "${base}:docs/swagger.json" > /tmp/base-swagger.json
+          go run ./cmd/openapi3 -in /tmp/base-swagger.json -out /tmp/base-openapi3.json
+          go run ./cmd/openapi3 -in docs/swagger.json -out /tmp/pr-openapi3.json
+
+          if git diff --name-only "${base}...HEAD" | grep -qx 'docs/api-breaking-changes.md'; then
+            echo "::warning::docs/api-breaking-changes.md changed: breaking changes are reported, not enforced"
+            oasdiff breaking /tmp/base-openapi3.json /tmp/pr-openapi3.json --format githubactions
+            oasdiff breaking /tmp/base-openapi3.json /tmp/pr-openapi3.json
+            exit 0
+          fi
+          oasdiff breaking /tmp/base-openapi3.json /tmp/pr-openapi3.json --format githubactions
+          oasdiff breaking /tmp/base-openapi3.json /tmp/pr-openapi3.json --fail-on ERR || {
+            echo "::error::Breaking API change against ${base}. If intentional, record it in docs/api-breaking-changes.md in this PR."
+            exit 1
+          }
+
   build:
     name: Build
     runs-on: ubuntu-latest

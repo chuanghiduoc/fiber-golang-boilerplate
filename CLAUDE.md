@@ -31,7 +31,11 @@ perl (needs go + perl).
 
 CI builds both binaries; its `Migrations` job applies the baseline up/down on a
 fresh PostgreSQL service and runs `cmd/migrate` twice, and its `Manifests` job
-runs actionlint, kustomize, and kubeconform. Reproduce the fresh-DB check
+runs actionlint, kustomize, and kubeconform. On pull requests the
+`API compatibility` job converts the base and PR `docs/swagger.json` to
+OpenAPI 3 (`go run ./cmd/openapi3`) and fails on `oasdiff breaking` ERR
+findings (oasdiff v1.33.0); an intentional break is acknowledged by editing
+`docs/api-breaking-changes.md` in the same PR. Reproduce the fresh-DB check
 against a disposable database before merging. Kubernetes: follow
 `deploy/k8s/README.md` (migration Job first, then the app kustomization);
 `.github/workflows/release.yml` builds multi-arch GHCR images on `v*` tags.
@@ -175,9 +179,13 @@ migrations) to its owners; keep it current when adding a module.
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
   every new query keeps a `tenant_id` predicate. Cross-tenant ids behave as
-  not found (`404`), never forbidden. Deliberate exception: the identity
-  `PurgeExpired*Tokens` maintenance queries delete expired tokens across all
-  tenants (job `identity.tokens.purge_expired`).
+  not found (`404`), never forbidden. Deliberate exceptions are the
+  cross-tenant retention queries: identity `PurgeExpired*Tokens`
+  (`identity.tokens.purge_expired`), files `ClaimTrashedFiles`/
+  `HardDeleteTrashedFiles` (`files.trash.purge`), and notifications
+  `PurgeReadNotifications` (`notifications.retention.purge`); their indexes
+  lead with the age column (`idx_files_deleted_at`,
+  `idx_notifications_read_at`), not `tenant_id`.
 - Startup checks tenant *existence* (`StartupTenants`, ignoring status)
   separately from request resolution: a suspended configured/default tenant
   must not crash `cmd/api`/`cmd/seed`; its requests return 404.
@@ -329,6 +337,15 @@ handler/service/DTO/repository package.
     from worker start (`WithRetention`, non-positive disables;
     `WithPurgeInterval`, non-positive ignored), 5s per pass, ≤1,000-row
     batches.
+  - Module retention jobs are hourly `ScheduleProvider` schedules, so they run
+    only with `SCHEDULER_ENABLED=true`: `identity.tokens.purge_expired`;
+    `files.trash.purge` (files soft-deleted more than
+    `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
+    `purge_started_at` claim that blocks restore, then blob, then row; a
+    missing blob counts as deleted; no event/webhook); and
+    `notifications.retention.purge` (notifications read more than
+    `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept). See
+    `docs/operations.md` "Data retention overview".
   - Metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
     `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures,
     permanent ones included; not lease-expiry dead letters), `jobs_claim_errors_total`,

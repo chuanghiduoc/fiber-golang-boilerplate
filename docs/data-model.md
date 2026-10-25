@@ -156,6 +156,7 @@ erDiagram
         varchar mime_type
         bigint size "CHECK >= 0"
         timestamptz deleted_at "soft delete / trash"
+        timestamptz purge_started_at "purge claim; blocks restore"
     }
     notifications {
         bigint id PK

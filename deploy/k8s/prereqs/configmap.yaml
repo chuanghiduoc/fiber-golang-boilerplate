@@ -108,6 +108,18 @@ data:
   STORAGE_S3_USE_SSL: "true"
 
   # ---------------------------------------------------------------------------
+  # Data retention (days, 1..3650). The purge jobs are scheduled only when
+  # SCHEDULER_ENABLED=true (not set here, so the default false applies);
+  # without the scheduler nothing below is ever purged.
+  # ---------------------------------------------------------------------------
+  # Soft-deleted files stay restorable this long, then files.trash.purge
+  # deletes the blob and the metadata row.
+  FILES_TRASH_RETENTION_DAYS: "30"
+  # Read notifications are deleted this long after being read; unread ones are
+  # kept at any age.
+  NOTIFICATIONS_RETENTION_DAYS: "180"
+
+  # ---------------------------------------------------------------------------
   # Cache (Redis is required for multi-replica session invalidation)
   # ---------------------------------------------------------------------------
   CACHE_DRIVER: "redis"
