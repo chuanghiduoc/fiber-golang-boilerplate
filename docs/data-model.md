@@ -371,6 +371,8 @@ erDiagram
         bigint size "CHECK >= 0"
         timestamptz deleted_at "soft delete / trash"
         timestamptz purge_started_at "purge claim; blocks restore"
+        int purge_attempts "failed blob deletes"
+        timestamptz purge_retry_after "per-row backoff; claim skips until due"
     }
     notifications {
         bigint id PK

@@ -364,11 +364,14 @@ optional `deploy/k8s/base/worker/` component.
 
 Notifications use the same queue and `email.send`/`email.send.encrypted` kinds
 as identity email. The service resolves the recipient through identity's
-`contracts.NotificationRecipientLookup` and never reads `users` directly. When
-the `email` channel is enabled, the in-app row and the email job commit in one
-transaction, so a queue outage returns `500` and rolls the row back.
-Preferences apply before any write: an explicit `enabled=false` row skips that
-channel; a missing row means enabled.
+`contracts.NotificationRecipientLookup` and never reads `users` directly. The
+lookup runs for every notification, including an in-app-only one: only an
+active member of the request tenant is a recipient, and anything else is a
+`404` before a row is written (a membership FK violation is mapped to the same
+not-found). When the `email` channel is enabled, the in-app row and the email
+job commit in one transaction, so a queue outage returns `500` and rolls the
+row back. Preferences apply before any write: an explicit `enabled=false` row
+skips that channel; a missing row means enabled.
 
 ```sql
 -- Unread backlog per tenant/user
@@ -467,7 +470,7 @@ loops run in every worker process regardless.
 | `scheduler_runs` | Older than `SCHEDULER_RETENTION_DAYS` (30); newest row per schedule kept | Scheduler leader, hourly | See [Scheduler](#scheduler) | — |
 | Identity tokens | Expired | `identity.tokens.purge_expired`, hourly (scheduler) | 1,000-row batches, 1 min per table | `idx_refresh_tokens_expires_at` |
 | Webhook deliveries/events | Terminal, older than `WEBHOOK_RETENTION_DAYS` (30) | Webhooks background loop, hourly | 1,000-row batches, 30s per pass | See [Webhooks](webhooks.md) |
-| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
+| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
 
@@ -476,8 +479,9 @@ indefinitely, notifications are never deleted, and expired export documents
 stay in storage until the scheduler is enabled. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
 every tenant; they are partial, so live files, unread notifications, and active
-exports are not indexed. These indexes and the purge claim column
-`files.purge_started_at` are part of the init migration.
+exports are not indexed. These indexes and the purge claim/retry columns
+`files.purge_started_at`, `files.purge_attempts`, and `files.purge_retry_after`
+are part of the init migration.
 
 #### Privacy exports and erasure
 
@@ -518,16 +522,17 @@ sequenceDiagram
     participant W as files.trash.purge job
     participant DB as PostgreSQL (files)
     participant S as Object storage
-    loop until a short batch, a blob failure, or the 1 min budget
-        W->>DB: UPDATE files SET purge_started_at = now() WHERE id IN<br/>(oldest 100 trashed > N days, FOR UPDATE SKIP LOCKED); COMMIT
+    loop until a short batch or the 1 min budget
+        W->>DB: UPDATE files SET purge_started_at = now() WHERE id IN<br/>(oldest 100 trashed > N days and retry due, FOR UPDATE SKIP LOCKED); COMMIT
         loop each claimed row
             W->>S: Delete(storage_path)
             alt deleted or already missing
                 S-->>W: ok (row queued for hard delete)
             else storage error
-                S-->>W: error (row kept, logged)
+                S-->>W: error (row queued for deferred retry, logged)
             end
         end
+        W->>DB: UPDATE failed rows SET purge_started_at = NULL,<br/>purge_attempts = purge_attempts + 1, purge_retry_after = ...; COMMIT
         W->>DB: DELETE FROM files WHERE id = ANY(ids) AND purge_started_at IS NOT NULL
     end
 ```
@@ -535,8 +540,8 @@ sequenceDiagram
 | Rule | Behavior |
 | --- | --- |
 | Order | Claim, blob, then row. A crash or failed hard delete after the blob delete leaves a claimed row with no blob; the next run deletes it (a missing blob counts as deleted). |
-| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` even if the purge later fails. A row whose blob delete failed stays claimed: it is past retention and only waits for the next run. |
-| Failures | A blob that cannot be deleted keeps its (claimed) row, is logged at error level with `file_id`/`tenant_id`, and fails the job after the rest of the batch commits (normal retry/dead-letter path); the next scheduled run tries again. |
+| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` while the blob operation runs. A failed blob releases the claim; the row is restorable again and can be retried later. |
+| Failures | A blob that cannot be deleted is logged at error level with `file_id`/`tenant_id`, counted, and deferred on its own row: the claim is released, `purge_attempts` increments, and `purge_retry_after` moves out with a capped exponential backoff. The rest of the batch is still hard-deleted, the job succeeds, and claiming skips rows whose retry time is in the future, so one permanently failing blob cannot block newer rows. |
 | Events | None. The purge publishes no domain event, so no webhook fires; the user-visible deletion already emitted `file.deleted`. No audit row is written (system retention, like the token purge). |
 
 ```sql
@@ -544,6 +549,12 @@ sequenceDiagram
 SELECT tenant_id, count(*), min(deleted_at)
 FROM files
 WHERE deleted_at IS NOT NULL
+GROUP BY tenant_id;
+
+-- Blob failures deferred for a later run
+SELECT tenant_id, count(*), max(purge_attempts), max(purge_retry_after)
+FROM files
+WHERE purge_retry_after IS NOT NULL
 GROUP BY tenant_id;
 
 -- Read notifications past retention (should stay near zero)
@@ -956,7 +967,9 @@ the handler, so a retry that races the owner's completion still replays.
 - Memory cache is per process and unsuitable for multiple replicas or for
   guarantees across restarts. Production rejects `CACHE_DRIVER=memory` unless
   `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true` (a deliberate single-replica
-  deployment only).
+  deployment only). It is bounded by `CACHE_MEMORY_MAX_ENTRIES` (default
+  100000): once full, expired entries are dropped first and then the least
+  recently used ones, so stored responses cannot grow the heap without limit.
 
 ### Rate limits
 
@@ -981,6 +994,7 @@ second per request:
 | `REDIS_READ_TIMEOUT_MS` / `REDIS_WRITE_TIMEOUT_MS` | 500 / 500 |
 | `REDIS_POOL_TIMEOUT_MS` | 1000 |
 | `REDIS_MAX_RETRIES` | 1 |
+| `CACHE_MEMORY_MAX_ENTRIES` | 100000 (memory driver bound; must be > 0) |
 
 The `REDIS_*` values override timeout/retry parameters in `REDIS_URL`
 (instead of go-redis's 5s dial, 3s read, and 3 retries). The client sets

@@ -59,6 +59,21 @@ func insertFile(t *testing.T, pool *pgxpool.Pool, store storage.Storage, tenantI
 	return id, path
 }
 
+// failingBlobStore fails Delete for one path and delegates everything else.
+type failingBlobStore struct {
+	storage.Storage
+	failPath string
+	fails    int
+}
+
+func (s *failingBlobStore) Delete(ctx context.Context, path string) error {
+	if path == s.failPath {
+		s.fails++
+		return errors.New("s3 unavailable")
+	}
+	return s.Storage.Delete(ctx, path)
+}
+
 func blobExists(t *testing.T, root, path string) bool {
 	t.Helper()
 	_, err := os.Stat(filepath.Join(root, filepath.FromSlash(path)))
@@ -132,12 +147,12 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	files := filesrepo.NewFileRepository(testutil.Scoped(pool))
 	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
 	failure := errors.New("hard delete never ran")
-	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
+	_, err = repo.PurgeBatch(ctx, trashRetentionDays, 10, func(ctx context.Context, batch []filesvc.TrashedFile) ([]int64, []int64, error) {
 		require.Len(t, batch, 1)
 		_, restoreErr := files.Restore(tenantCtx, id)
 		assert.ErrorIs(t, restoreErr, apperror.ErrNotFound, "a claimed row is not restorable")
 		require.NoError(t, store.Delete(ctx, path))
-		return nil, failure
+		return nil, nil, failure
 	})
 	require.ErrorIs(t, err, failure)
 
@@ -146,12 +161,58 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 	_, err = files.Restore(tenantCtx, id)
 	assert.ErrorIs(t, err, apperror.ErrNotFound, "the claim survives the failed purge")
 
-	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(_ context.Context, batch []filesvc.TrashedFile) ([]int64, error) {
-		return []int64{batch[0].ID}, nil
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(_ context.Context, batch []filesvc.TrashedFile) ([]int64, []int64, error) {
+		return []int64{batch[0].ID}, nil, nil
 	})
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), deleted, "the next run reclaims and finishes the row")
 	assert.Empty(t, fileIDs(t, pool))
+}
+
+// TestTrashPurgeFailedBlobDoesNotBlockNewerRows proves a permanently failing
+// blob is deferred on its own row instead of stalling every newer row: the
+// claim is released (restore stays possible), the attempt is counted, and the
+// next run continues with rows outside the backoff.
+func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
+	pool := setupTrashDB(t)
+	root := t.TempDir()
+	base, err := storage.NewLocalStorage(root)
+	require.NoError(t, err)
+	store := &failingBlobStore{Storage: base}
+
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "trash-retry@example.com", testutil.MemberOptions{}).UserID
+	const old = 40 * 24 * time.Hour
+	stuckID, stuckPath := insertFile(t, pool, store, tenant.DefaultID, userA, "stuck", old, true)
+	insertFile(t, pool, store, tenant.DefaultID, userA, "ok", old, true)
+	store.failPath = stuckPath
+
+	ctx := context.Background()
+	purger := filesvc.NewTrashPurger(filesrepo.NewTrashRepository(testutil.NewTxManager(pool)), store, trashRetentionDays)
+	require.NoError(t, purger.HandleJob(ctx, nil), "a blob failure is recorded, not returned as a job error")
+	assert.Equal(t, []int64{stuckID}, fileIDs(t, pool), "the rest of the batch is purged")
+	assert.True(t, blobExists(t, root, stuckPath), "the failed delete leaves the blob for the retry")
+
+	var attempts int
+	var retryAfter *time.Time
+	var claimedAt *time.Time
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT purge_attempts, purge_retry_after, purge_started_at FROM files WHERE id = $1`, stuckID,
+	).Scan(&attempts, &retryAfter, &claimedAt))
+	assert.Equal(t, 1, attempts)
+	require.NotNil(t, retryAfter)
+	assert.True(t, retryAfter.After(time.Now()), "the failed row is deferred into the future")
+	assert.Nil(t, claimedAt, "the claim is released so the row can be restored")
+
+	// A newer expired row is purged on the next run while the failed row waits.
+	_, newerPath := insertFile(t, pool, store, tenant.DefaultID, userA, "newer", old, true)
+	require.NoError(t, purger.HandleJob(ctx, nil))
+	assert.Equal(t, []int64{stuckID}, fileIDs(t, pool), "the backoff row does not block newer rows")
+	assert.False(t, blobExists(t, root, newerPath))
+	assert.Equal(t, 1, store.fails, "the row in backoff is skipped, not retried immediately")
+
+	// Releasing the claim means the user can still restore the row.
+	_, err = filesrepo.NewFileRepository(testutil.Scoped(pool)).Restore(tenant.WithID(ctx, tenant.DefaultID), stuckID)
+	require.NoError(t, err, "a failed purge must not make the row unrestorable")
 }
 
 // TestTrashPurgeSkipsRowsLockedByRestore proves the claim does not wait on a
@@ -171,9 +232,9 @@ func TestTrashPurgeSkipsRowsLockedByRestore(t *testing.T) {
 	require.NoError(t, err)
 
 	repo := filesrepo.NewTrashRepository(testutil.NewTxManager(pool))
-	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, error) {
+	deleted, err := repo.PurgeBatch(ctx, trashRetentionDays, 10, func(context.Context, []filesvc.TrashedFile) ([]int64, []int64, error) {
 		t.Fatal("a row locked by a restore must be skipped")
-		return nil, nil
+		return nil, nil, nil
 	})
 	require.NoError(t, err)
 	assert.Zero(t, deleted)

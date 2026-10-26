@@ -291,7 +291,7 @@ func baseValidConfig() Config {
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
 		CORS:      CORSConfig{AllowOrigins: "*"},
-		Cache:     CacheConfig{Driver: "memory"},
+		Cache:     CacheConfig{Driver: "memory", MemoryMaxEntries: DefaultMemoryMaxEntries},
 		Email:     EmailConfig{Driver: "console"},
 		Tenant:    TenantConfig{DefaultSlug: "default"},
 		Webhook: WebhookConfig{
@@ -506,7 +506,7 @@ func TestValidate_MinConnsExceedsMax(t *testing.T) {
 
 func TestValidate_RedisDriver_MissingURL(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Cache = CacheConfig{Driver: "redis"}
+	cfg.Cache = CacheConfig{Driver: "redis", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for redis driver without REDIS_URL")
 	}
@@ -725,13 +725,13 @@ func productionValidConfig() Config {
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "require"
 	cfg.Tenant.RequireHeader = true
-	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0"}
+	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	return cfg
 }
 
 func TestValidate_MemoryCacheInProduction(t *testing.T) {
 	cfg := productionValidConfig()
-	cfg.Cache = CacheConfig{Driver: "memory"}
+	cfg.Cache = CacheConfig{Driver: "memory", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("production must reject CACHE_DRIVER=memory without the single-replica opt-in")
 	}
@@ -859,8 +859,26 @@ func TestLoad_CacheRedisDefaults(t *testing.T) {
 		c.RedisWriteTimeout() != 500*time.Millisecond || c.RedisPoolTimeout() != time.Second || c.RedisMaxRetries != 1 {
 		t.Fatalf("unexpected Redis defaults: %+v", c)
 	}
+	if c.MemoryMaxEntries != DefaultMemoryMaxEntries {
+		t.Fatalf("MemoryMaxEntries = %d, want %d", c.MemoryMaxEntries, DefaultMemoryMaxEntries)
+	}
 	if (CacheConfig{}).RedisReadTimeout() != DefaultRedisReadTimeout {
 		t.Fatal("a zero Redis timeout must fall back to the package default")
+	}
+}
+
+func TestValidate_CacheMemoryMaxEntries(t *testing.T) {
+	for _, value := range []int{0, -1} {
+		cfg := baseValidConfig()
+		cfg.Cache.MemoryMaxEntries = value
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("CACHE_MEMORY_MAX_ENTRIES=%d must be rejected", value)
+		}
+	}
+	cfg := baseValidConfig()
+	cfg.Cache.MemoryMaxEntries = 1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("CACHE_MEMORY_MAX_ENTRIES=1 should be valid: %v", err)
 	}
 }
 

@@ -340,6 +340,32 @@ func TestEvaluatorServesStaleSnapshotWithinMaxStaleness(t *testing.T) {
 	}
 }
 
+func TestEvaluatorHonoursKillSwitchAfterMaxStaleness(t *testing.T) {
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	store := &fakeStore{snapshot: killSwitchSnapshot()}
+	evaluator := NewEvaluator(Options{
+		Store:        store,
+		CacheTTL:     10 * time.Second,
+		MaxStaleness: 60 * time.Second,
+		Env:          map[Key]bool{KeyEmailVerification: true},
+		Now:          func() time.Time { return now },
+	})
+
+	if got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1}); got.Source != SourceKillSwitch {
+		t.Fatalf("initial evaluation = %+v, want kill switch", got)
+	}
+
+	// Past MaxStaleness the snapshot may no longer supply targets or database
+	// defaults, but a kill switch must fail closed instead of reverting to the
+	// compiled/environment default.
+	now = now.Add(61 * time.Second)
+	store.err = errors.New("database down")
+	got := evaluator.Evaluate(context.Background(), KeyEmailVerification, Subject{TenantID: 1})
+	if got.Enabled || got.Source != SourceKillSwitch {
+		t.Fatalf("evaluation after max staleness = %+v, want the last snapshot's kill switch", got)
+	}
+}
+
 func TestEvaluatorFallsBackWithoutStore(t *testing.T) {
 	evaluator := NewEvaluator(Options{Env: map[Key]bool{KeyUserRegistration: false}})
 	got := evaluator.Evaluate(context.Background(), KeyUserRegistration, Subject{})

@@ -16,6 +16,7 @@ WHERE id IN (
     SELECT id FROM files
     WHERE deleted_at IS NOT NULL
       AND deleted_at < now() - make_interval(days => $1::int)
+      AND (purge_retry_after IS NULL OR purge_retry_after <= now())
     ORDER BY deleted_at
     LIMIT $2::int
     FOR UPDATE SKIP LOCKED
@@ -37,7 +38,9 @@ type ClaimTrashedFilesRow struct {
 // Trash retention (files.trash.purge). These are the only files queries
 // without a tenant_id predicate: the purge is a deliberate cross-tenant
 // maintenance pass, and each row carries its own tenant and storage path.
-// Committed before any blob delete; RestoreFile skips claimed rows.
+// Committed before any blob delete; RestoreFile skips claimed rows. Rows whose
+// retry time is still in the future are skipped so a permanently failing blob
+// cannot block newer rows.
 // Served by idx_files_deleted_at.
 func (q *Queries) ClaimTrashedFiles(ctx context.Context, arg ClaimTrashedFilesParams) ([]ClaimTrashedFilesRow, error) {
 	rows, err := q.db.Query(ctx, claimTrashedFiles, arg.RetentionDays, arg.BatchSize)
@@ -57,6 +60,25 @@ func (q *Queries) ClaimTrashedFiles(ctx context.Context, arg ClaimTrashedFilesPa
 		return nil, err
 	}
 	return items, nil
+}
+
+const failTrashedFiles = `-- name: FailTrashedFiles :execrows
+UPDATE files
+SET purge_started_at = NULL,
+    purge_attempts = purge_attempts + 1,
+    purge_retry_after = now() + make_interval(hours => LEAST(24, 1 << LEAST(purge_attempts, 5)))
+WHERE id = ANY($1::bigint[])
+  AND purge_started_at IS NOT NULL
+`
+
+// A blob delete failed: release the claim so the row stays restorable, count
+// the attempt, and defer the next try with a capped exponential backoff.
+func (q *Queries) FailTrashedFiles(ctx context.Context, ids []int64) (int64, error) {
+	result, err := q.db.Exec(ctx, failTrashedFiles, ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const hardDeleteTrashedFiles = `-- name: HardDeleteTrashedFiles :execrows

@@ -12,6 +12,7 @@ import (
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -212,10 +213,15 @@ func toPreferences(rows []notificationsqlc.NotificationPreference) []notificatio
 	return out
 }
 
-// wrapErr translates pgx "no rows" into the shared sentinel so services do
-// not depend on database-driver details.
+// wrapErr translates pgx "no rows" and membership foreign-key failures into
+// the shared not-found sentinel so services do not depend on database-driver
+// details. A notification or preference can only reference a membership in the
+// same tenant, so a violation means the recipient is not an active member.
 func wrapErr(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
+		return apperror.ErrNotFound
+	}
+	if _, ok := database.ForeignKeyViolation(err); ok {
 		return apperror.ErrNotFound
 	}
 	return err
