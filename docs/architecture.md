@@ -57,7 +57,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | The deleted shared `internal/{handler,service,dto,repository}` and `internal/sqlc` packages cannot return. | legacy-package checks |
 | Module SQL touches only owned tables (or platform tables). | `test/arch/table_ownership_test.go` |
 | Core packages (`pkg/apperror`, `pkg/storage`, `platform/authz`, `tenant`, `audit`, `apikey`, `features`) and every module `service`/`repository` never import Fiber/fasthttp, even transitively; `pkg/storage` and `files/service` never import the AWS SDK. | `test/arch/framework_free_test.go` |
-| Inside a module, `service/` never imports sqlc, pgx, Fiber, or its own `dto/`/`handler/`; `handler/` never imports `repository/`, sqlc, or pgx ([ADR 0002](adr/0002-module-layering.md)). Existing violations are frozen in `layering_allowlist.txt`, which only shrinks. | `test/arch/layering_test.go` |
+| Inside a module, `service/` never imports sqlc, pgx, Fiber, or its own `dto/`/`handler/`; `handler/` never imports `repository/`, sqlc, or pgx. Existing violations are frozen in `layering_allowlist.txt`, which only shrinks. | `test/arch/layering_test.go` |
 
 ### Packages
 
@@ -188,7 +188,7 @@ flowchart LR
 
 ### Event backbone
 
-Domain events (ADR 0011) are the only way a producer triggers work in another
+Domain events are the only way a producer triggers work in another
 module asynchronously. Every event is one versioned envelope
 (`events.Event`: `id` UUIDv7, `type`, `dataVersion`, `occurredAt`,
 `tenantId`, `actor`, `data`), with the payload struct and version owned by the
@@ -251,7 +251,7 @@ export/erase jobs call the registered exporters/erasers.
 
 ## Multi-tenant model
 
-Users are global identities that join tenants through memberships (ADR 0004):
+Users are global identities that join tenants through memberships:
 one account (one email, one password, linked Google identity) can be a member
 of several tenants, each membership with its own roles and status. Tenant `1` (`default`) is seeded by
 the baseline and keeps header-less local/test requests and pre-tenancy rows
@@ -282,9 +282,8 @@ forced row-level security: `database.TxManager` and `database.Scoped` set the
 transaction-local `app.tenant_id`/`app.rls_bypass` settings, so a query that
 forgot its predicate still cannot read or write another tenant's rows. The
 deliberate cross-tenant paths (global job work, retention, feature snapshots,
-webhook inbound lookup, global-user operations) set `database.WithRLSBypass`;
-see [ADR 0007](adr/0007-row-level-security-after-schema.md). Per-tenant limits
-remain future work.
+webhook inbound lookup, global-user operations) set `database.WithRLSBypass`.
+Per-tenant limits remain future work.
 
 ## Authorization
 
@@ -359,7 +358,7 @@ keeps the repository's tenant scoping.
 - Only `cmd/migrate` applies DDL. The API and seed assume the schema exists;
   `cmd/migrate` also verifies required tenant tables/columns/indexes and that
   the `default` tenant exists with id 1.
-- Fresh installs apply the single init (ADR 0012):
+- Fresh installs apply the single init:
   `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:`
   section per owner, shared functions first, then identity, platform tables,
   and modules in FK order.
@@ -369,7 +368,7 @@ keeps the repository's tenant scoping.
 - `feature_flags` is global configuration; `scheduler_leases` and
   `scheduler_runs` are tenant-independent with no foreign keys; identity's
   `users`, `user_passwords`, `user_identities`, and reset/verification tokens
-  are global per-user rows (ADR 0004). Everything else is tenant-owned with
+  are global per-user rows. Everything else is tenant-owned with
   tenant-leading indexes. `data_exports` (identity) is tenant-owned and
   references `(tenant_id, user_id) → memberships`.
 - `api_keys.key_hash` is globally unique; it is the only lookup made before a
@@ -384,7 +383,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Concern | Convention |
 |---|---|
 | Authorization | Module permissions live in `catalog/permissions.go` and register through `app.PermissionProvider`; only shared back-office permissions stay in `internal/platform/authz`. Notification routes use `notifications:read`/`notifications:write`; sending to another user needs admin-only `notifications:send`. Legacy exceptions: [Module Template](module-template.md#legacy-exceptions-do-not-copy). |
-| Privacy | `internal/contracts/privacy` exporters/erasers are registered by every module with per-user data; identity owns `data_exports` and orchestrates export/erasure jobs (ADR 0013). Export documents live 7 days; erasure anonymizes the global user after every membership is removed. |
+| Privacy | `internal/contracts/privacy` exporters/erasers are registered by every module with per-user data; identity owns `data_exports` and orchestrates export/erasure jobs. Export documents live 7 days; erasure anonymizes the global user after every membership is removed. |
 | Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, invitations create/revoke/accept/sign-up, tenant lifecycle, role definitions/member roles, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |
@@ -447,7 +446,7 @@ Use the generator [`cmd/gen`](../cmd/gen/main.go) and the
 [Module Template](module-template.md). Short form:
 
 1. `make gen module=<name>`: module.go/build.go (`Build` + providers),
-   catalog (permissions, error codes, en/vi strings), ADR 0002 layers with
+   catalog (permissions, error codes, en/vi strings), the layered packages with
    `service/ports.go`, `queries/` + the module's `sqlc.yaml`, tests, README,
    an init migration pair, and the `internal/bootstrap/modules.go` entry (the
    only central edit).

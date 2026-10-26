@@ -196,7 +196,7 @@ func TestModuleNamesAreUnique(t *testing.T) {
 	}
 }
 
-// TestPlatformRoutesRequireMFA enforces ADR 0010: platform-scope roles require
+// TestPlatformRoutesRequireMFA enforces platform-scope roles require
 // a second factor, so every cross-tenant /platform route runs
 // authzhttp.RequireMFA before its final handler.
 func TestPlatformRoutesRequireMFA(t *testing.T) {

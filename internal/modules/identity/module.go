@@ -165,7 +165,7 @@ func (m *Module) registerRoleRoutes(v1 fiber.Router, deps app.Deps) {
 // grants.
 func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters
-	// Platform-scope access requires a second factor (ADR 0010).
+	// Platform-scope access requires a second factor.
 	mfa := authzhttp.RequireMFA()
 	tenants := v1.Group("/platform/tenants", deps.Authenticate())
 	tenants.Get("/", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.ListTenants)

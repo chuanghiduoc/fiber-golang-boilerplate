@@ -86,7 +86,7 @@ flowchart LR
 | `internal/contracts/<provider>` | Stdlib-only cross-module interfaces, one package per providing module |
 | `internal/platform` | `authz`, `audit`, `events`, `features`, `i18n`, `jobs`, `requestctx`, `scheduler`, `session`, `tenant`, `tracing`, `versioning`, `middleware` (JWT, rate limit, logger, recovery, security headers, metrics, idempotency) |
 | `pkg` | `apperror` (RFC 9457 + catalog), `response`, `database` (pool, TxManager, migrations), `webhook` (HMAC + SSRF-safe client), `validator`, `token`, `cache`, `storage`, `email`, `pagination`, `logger`, `health`, `oauth`, `metrics`, `async` |
-| `migrations` | One init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later migrations are `<UTC ts>_<owner>_<purpose>` |
+| `migrations` | One init pair `20260101000000_platform_init_schema` with `-- owner:` sections; later migrations are `<UTC ts>_<owner>_<purpose>` |
 | `deploy/k8s` | Kubernetes production manifests |
 
 Every module follows the same layered slice (`handler → service → repository →
@@ -94,7 +94,7 @@ sqlc → PostgreSQL`) and owns its own `queries/` and generated `sqlc/` package.
 Core packages and module services/repositories are Fiber-free; Fiber adapters
 live in `<pkg>http` subpackages (`apperrorhttp`, `authzhttp`, `tenanthttp`,
 `audithttp`, `featureshttp`, `apikeyhttp`), and `test/arch` enforces both that
-split and the [ADR 0002](docs/adr/0002-module-layering.md) layering ratchet.
+split and the  layering ratchet.
 
 ### Documentation map
 
@@ -109,7 +109,7 @@ split and the [ADR 0002](docs/adr/0002-module-layering.md) layering ratchet.
 | [docs/feature-flags.md](docs/feature-flags.md) | Flag catalog, precedence, cache, admin API |
 | [docs/tracing.md](docs/tracing.md) | OpenTelemetry configuration, privacy rules, collector |
 | [deploy/k8s/README.md](deploy/k8s/README.md) | Kubernetes deployment flow |
-| [docs/adr/README.md](docs/adr/README.md) | Architecture Decision Records |
+|  | Architecture Decision Records |
 
 **Schema ownership:** only `cmd/migrate` applies DDL. The API and seed commands
 assume the schema exists, so replicas never race on migrations. Fresh installs
@@ -180,7 +180,7 @@ on startup.
 
 The schema, request pipeline, and every module are tenant-scoped. Users are
 global identities (one email, one password, an optional linked Google
-identity) that join tenants through **memberships** (ADR 0004); each
+identity) that join tenants through **memberships**; each
 membership has its own role and status, and every tenant-scoped row of other
 modules references the membership, not the user. A user joins another tenant
 only by accepting an invitation.
@@ -286,7 +286,7 @@ actionable error on a legacy partial schema.
 
 ### Upgrading an existing database
 
-The init migration (`20260101000000`, ADR 0012; see
+The init migration (`20260101000000`; see
 [Data Model](docs/data-model.md)) is a **fresh-install baseline**. It replaces
 the old shipped migrations `000001`–`000003` and the former consolidated
 `000001_init_schema`. A database that applied any of those (recorded at a
@@ -321,7 +321,7 @@ flowchart LR
 source files are missing. Later migrations are ordinary timestamped files
 (`make migrate-create`), always above the legacy versions.
 
-> **Identity model change (ADR 0004).** The baseline identity schema stores
+> **Identity model change.** The baseline identity schema stores
 > global `users` plus `memberships`, `user_passwords`, `user_identities`,
 > `sessions`, and per-user reset/verification tokens, while legacy databases
 > have per-tenant `users` rows with `tenant_id`, `role`, and the password on
@@ -514,7 +514,7 @@ characters, `[A-Za-z0-9._:-]`). The decision flowchart lives in
 | First request | Runs and holds an owner-token lock for 2 minutes (above the 60-second HTTP write timeout); only the owner releases it |
 | Concurrent duplicate while the lock is held | `409 Conflict` |
 | Retry after a 2xx | Replays the cached status, body, and `Content-Type`/`Location`/`ETag` for 24 hours with `Idempotent-Replayed: true`, without running the handler |
-| Same key, different body | `422 Unprocessable Entity`, code `idempotency.key_mismatch` (ADR 0008) — non-multipart bodies up to 1 MiB are bound to a SHA-256 of the body; multipart and larger bodies are not |
+| Same key, different body | `422 Unprocessable Entity`, code `idempotency.key_mismatch` — non-multipart bodies up to 1 MiB are bound to a SHA-256 of the body; multipart and larger bodies are not |
 | Non-2xx response | Not cached |
 | Cache error | Fails open: the request runs normally |
 
@@ -796,7 +796,7 @@ migration entrypoint, and tenant foundation exist.
 
 | Area | Status |
 |------|--------|
-| Tenant isolation | Implemented for identity, files, webhooks, apikeys, and notifications (scoped SQL/indexes, tenant-bound OAuth state, tenant-aware sessions, tenant-prefixed storage keys, source-resolved inbound webhooks). Row-level security is enforced on every tenant-owned table (ADR 0007); per-tenant limits are future work. |
+| Tenant isolation | Implemented for identity, files, webhooks, apikeys, and notifications (scoped SQL/indexes, tenant-bound OAuth state, tenant-aware sessions, tenant-prefixed storage keys, source-resolved inbound webhooks). Row-level security is enforced on every tenant-owned table; per-tenant limits are future work. |
 | Notifications | In-app feed, per-type channel preferences, durable email channel committed with the in-app row; at-least-once delivery. |
 | Tracing | HTTP, sanitized pgx queries, and durable jobs; disabled by default (`OTEL_ENABLED=true` plus a collector to enable). |
 | Delivery | Metrics, Kubernetes manifests, GHCR release workflow, and an optional gated CD workflow exist; full promotion/rollout automation does not. |

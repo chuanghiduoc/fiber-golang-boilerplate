@@ -73,7 +73,7 @@ jobs:
           git add -N internal/modules/*/sqlc/
           git diff --exit-code internal/modules/*/sqlc/ || (echo "sqlc code is outdated. Run 'make sqlc-generate' and commit." && exit 1)
 
-  # ADR 0006: swag emits Swagger 2.0; cmd/openapi3 converts both the base
+  # swag emits Swagger 2.0; cmd/openapi3 converts both the base
   # branch's and this PR's docs/swagger.json to OpenAPI 3 and oasdiff fails on
   # ERR-level breaking changes. An intentional break is acknowledged by
   # editing docs/api-breaking-changes.md in the same PR; the report is then
@@ -270,7 +270,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Apply every up file in version order (the init, ADR 0012, then later
+      # Apply every up file in version order (the init, then later
       # migrations), every down file in reverse, then up again, so each down
       # drops exactly what its up created.
       - name: Apply migrations up, down, and up again with psql

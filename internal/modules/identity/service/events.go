@@ -28,7 +28,7 @@ func publishRegisteredTx(ctx context.Context, publisher EventPublisher, member *
 }
 
 // userRegisteredEvent builds the user.registered envelope. The user is
-// global (ADR 0004): the payload carries only global identity fields, and the
+// global: the payload carries only global identity fields, and the
 // tenant the account registered into is the envelope's tenantId (the new
 // membership's tenant). The new user is the actor, matching the
 // auth.registered audit row.

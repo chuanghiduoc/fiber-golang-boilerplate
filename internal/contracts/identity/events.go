@@ -2,7 +2,7 @@ package identity
 
 import "time"
 
-// Domain events published by the identity module (ADR 0011). The envelope
+// Domain events published by the identity module. The envelope
 // (id, type, dataVersion, occurredAt, tenantId, actor) is
 // internal/platform/events.Event; these structs are its data. They are public
 // webhook contracts, deliberately separate from the REST DTOs: evolve them

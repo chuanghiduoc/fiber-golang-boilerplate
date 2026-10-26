@@ -6,7 +6,7 @@ import (
 )
 
 // SubscribedEvents are the domain event types webhooks subscribes to durably
-// and fans out to matching endpoints (ADR 0011). Each type's data struct and
+// and fans out to matching endpoints. Each type's data struct and
 // version live with its producer in internal/contracts/<producer>. Adding a
 // type here makes it deliverable; endpoints still choose it by pattern.
 func SubscribedEvents() []string {

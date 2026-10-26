@@ -238,7 +238,7 @@ flowchart TD
   subject, only an `authz.SystemContext` (trusted background caller) is
   allowed; any other subject-less call is `403` (fail closed).
 
-## MFA (ADR 0010)
+## MFA
 
 TOTP (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step) and single-use recovery codes
 are available per global user, not per tenant.
@@ -276,7 +276,7 @@ Token-minting endpoints never take `Idempotency-Key`.
 | Browser fallback | Validated `?tenant=<slug>` is accepted on `GET /auth/google` and the reset/verify endpoints; an explicit header wins. Reset, verification, and invitation links include `?tenant=<slug>` so the frontend knows where to sign in. |
 | Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership, effective permissions, and tenant status are re-read on every authentication, so bans, removals, deletions, role/permission changes, and suspensions apply immediately (`401`/`403`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
-| Scoping | Users are global (ADR 0004): an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
+| Scoping | Users are global: an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
 | OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
 | Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
@@ -285,8 +285,7 @@ Token-minting endpoints never take `Idempotency-Key`.
 
 ## Users, memberships, sessions, and invitations
 
-Users are global identities; a user joins tenants through memberships
-(ADR 0004). Everything below runs in the request tenant unless stated.
+Users are global identities; a user joins tenants through memberships. Everything below runs in the request tenant unless stated.
 
 | Flow | Behavior |
 |---|---|
@@ -319,7 +318,7 @@ Unknown, expired, already accepted, or misaddressed invitation tokens are
 ## Privacy: data export and erasure
 
 All routes are in the request tenant; another user's or tenant's export id is
-`404` (never `403`). See [ADR 0013](adr/0013-gdpr-data-export-and-erasure.md).
+`404` (never `403`).
 
 | Route | Auth | Behavior |
 |---|---|---|
@@ -344,7 +343,7 @@ membership is `removed`, and deletes credentials, identities, sessions, and
 tokens. Audit rows keep only ids and outcomes.
 ## Roles and platform administration
 
-Tenant roles are rows (ADR 0003); the permission catalog stays in code and is
+Tenant roles are rows; the permission catalog stays in code and is
 synchronized into `permissions` at API startup. System roles (`owner`,
 `admin`, `member`) are seeded, immutable, and visible to every tenant.
 
@@ -362,7 +361,7 @@ as an alias for `member` in request bodies.
 
 Platform administration is the only cross-tenant surface. It requires a
 `platform_admin` role assignment (not a tenant role) and the `platform:*`
-permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, otherwise `403 auth.mfa_required`, ADR 0010); a tenant admin without the assignment gets `403`.
+permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, otherwise `403 auth.mfa_required`); a tenant admin without the assignment gets `403`.
 
 | Route | Auth | Behavior |
 |---|---|---|
@@ -413,7 +412,7 @@ targets remain `admin:features:write`.
 | First request with a key | Runs normally; a 2xx is cached for 24h |
 | Same key, same body, after success | Replayed response with `Idempotent-Replayed: true` (not re-audited) |
 | Same key while the first is in progress | `409` |
-| Same key, different body (non-multipart, up to 1 MiB, SHA-256 bound) | `422` `idempotency.key_mismatch` (ADR 0008; was `409` before) |
+| Same key, different body (non-multipart, up to 1 MiB, SHA-256 bound) | `422` `idempotency.key_mismatch` (was `409` before) |
 | Lock claim reply lost | The lock key is re-read: own token runs, another token gets `409`, missing key or read error fails open |
 | Cache unavailable | Fails open (request runs without idempotency) |
 

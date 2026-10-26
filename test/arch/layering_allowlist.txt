@@ -1,2 +1,2 @@
-# Ratchet for TestModuleLayering (ADR 0002). Existing violations only:
+# Ratchet for TestModuleLayering. Existing violations only:
 # delete a line when its violation is fixed; never add new lines.

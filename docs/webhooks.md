@@ -2,8 +2,8 @@
 
 Tenant-scoped outbound webhooks with durable delivery, plus a public inbound
 receiver. Both follow the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)
-specification (ADR 0009), and outbound payloads are the versioned domain event
-envelope (ADR 0011).
+specification, and outbound payloads are the versioned domain event
+envelope.
 
 | Concern | Lives in |
 |---|---|

@@ -122,7 +122,7 @@ type GetUserByIDRow struct {
 	HasPassword bool `json:"has_password"`
 }
 
-// Global user identities (ADR 0004). These queries are deliberately not
+// Global user identities. These queries are deliberately not
 // tenant-scoped: a user exists once across tenants. Tenant-facing reads go
 // through membership.sql, which always filters by tenant_id.
 func (q *Queries) GetUserByID(ctx context.Context, id int64) (GetUserByIDRow, error) {

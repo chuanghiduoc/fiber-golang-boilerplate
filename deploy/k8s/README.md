@@ -203,8 +203,7 @@ Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
 | `DB_PASSWORD` | Password of the runtime `app` role (`DB_USERNAME`). It must not be a superuser or have `BYPASSRLS`; production startup refuses one |
 | `DB_MIGRATE_PASSWORD` | Password of the schema owner (`DB_MIGRATE_USERNAME`), read only by the migration Job |
 
-Create the runtime role once as the owner before the first migration
-(ADR 0007); the same script is in the repository:
+Create the runtime role once as the owner before the first migration; the same script is in the repository:
 
 ```bash
 psql -v app_user=app -v app_password='<DB_PASSWORD>' -v owner=postgres -v schema=public \

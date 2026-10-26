@@ -72,7 +72,7 @@ const (
 // executes the handler, and stores any 2xx response for 24 hours. Retries with
 // the same key replay that response; concurrent retries while the first is
 // still running get 409; reusing a key with a different body gets 422
-// idempotency.key_mismatch (ADR 0008). The scope includes the resolved tenant so identical
+// idempotency.key_mismatch. The scope includes the resolved tenant so identical
 // keys from two tenants never share a replay. Requests without the header, and
 // GET/HEAD/OPTIONS requests, are untouched.
 //

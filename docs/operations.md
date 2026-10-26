@@ -477,7 +477,7 @@ every tenant; they are partial, so live files, unread notifications, and active
 exports are not indexed. These indexes and the purge claim column
 `files.purge_started_at` are part of the init migration.
 
-#### Privacy exports and erasure (ADR 0013)
+#### Privacy exports and erasure
 
 `POST /me/data-exports` commits a `data_exports` row and a
 `privacy.data_export` job in one transaction. The job runs every registered
@@ -1050,7 +1050,7 @@ flowchart TD
 
 ### Database roles and row-level security
 
-Every tenant-owned table has forced row-level security (ADR 0007). The API,
+Every tenant-owned table has forced row-level security. The API,
 worker, and `cmd/seed` must connect as a dedicated non-superuser role without
 `BYPASSRLS`; a superuser or a `BYPASSRLS` role ignores every policy. `cmd/api`
 logs an error when it detects one and refuses to start when
@@ -1097,7 +1097,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 
 ### Fresh installs vs deployed databases
 
-- A fresh install applies the single init (ADR 0012):
+- A fresh install applies the single init:
   `migrations/20260101000000_platform_init_schema.up.sql` (see
   [Data Model](data-model.md)).
 - Once a database is deployed, never edit a migration it applied. Add one with
@@ -1152,7 +1152,7 @@ those objects from the baseline. The upgrade DDL must:
    columns, the feed/unread indexes, and the unique preference index.
 
 The steps above describe the earlier per-tenant `users` foundation. The
-current baseline goes further (ADR 0004): `users` are global, tenant access is
+current baseline goes further: `users` are global, tenant access is
 a `memberships` row, and every cross-module `(tenant_id, user_id)` FK
 references `memberships`. Moving a per-tenant `users` database onto it is a
 data migration (merge accounts sharing an email, create memberships, move
@@ -1165,7 +1165,7 @@ defaults and backfill every row. Existing rows default to tenant 1, and their
 old `<userID>/<uuid>.<ext>` storage keys stay valid because downloads read
 `files.storage_path`. New uploads use `<tenantID>/<userID>/<uuid>.<ext>`; if you
 migrate existing blobs, copy first and update `files.storage_path` in the same
-operation. Row-level security (ADR 0007) is enforced on every tenant-owned
+operation. Row-level security is enforced on every tenant-owned
 table; per-tenant limits are future work (see the README scope note).
 
 | Setting | Behavior |

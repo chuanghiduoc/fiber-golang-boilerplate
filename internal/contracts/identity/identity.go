@@ -10,7 +10,7 @@ import (
 )
 
 // User is the identity module's cross-module view of a global user as a
-// member of the context tenant (ADR 0004). Role, MembershipStatus, JoinedAt,
+// member of the context tenant. Role, MembershipStatus, JoinedAt,
 // BannedAt, and DeletedAt (membership removal or account deletion) describe
 // the membership; the rest is the global identity. It deliberately omits
 // credentials, token versions, and other internal fields.

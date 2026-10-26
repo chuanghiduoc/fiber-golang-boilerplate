@@ -7,7 +7,7 @@ rules) and [Operations](operations.md) (runtime behavior).
 ## Quick start
 
 `cmd/gen` (Go stdlib `text/template` + `embed`) generates code in the
-[ADR 0002](adr/0002-module-layering.md) layout, so `test/arch` (including the
+ layout, so `test/arch` (including the
 layering ratchet) passes for generated code with no allowlist entries.
 
 ```bash
@@ -142,8 +142,8 @@ the worker (`events.RegisterJobs`).
 | `repository` | SQL, sqlc rows, persistence errors, mapping rows to service types | own `sqlc`, own service/domain types (existing code also uses `dto`), `pkg/database`, pgx | own `handler`, Fiber, another module's `sqlc` |
 | `dto` | transport structs, validation tags | stdlib (or `pkg/pagination`) | repository, sqlc, Fiber |
 
-`test/arch/layering_test.go` enforces the `service`/`handler` bans
-([ADR 0002](adr/0002-module-layering.md)); violations that predate the rule
+`test/arch/layering_test.go` enforces the `service`/`handler` bans;
+violations that predate the rule
 are frozen in `test/arch/layering_allowlist.txt`. New code must not add to
 it, and fixing one means deleting its line. `test/arch/framework_free_test.go`
 walks the transitive imports of every `service`/`repository` and of the core
@@ -153,9 +153,8 @@ platform packages and fails on Fiber or fasthttp. Fiber code goes in
 
 ### Reference module: `files`
 
-`internal/modules/files` is the reference implementation of ADR 0002 and has
-no allowlist entries. Copy its shape, not identity's (identity still has the
-most allowlisted violations).
+`internal/modules/files` is the reference implementation of the layering
+rules. Copy its shape.
 
 | Path | Role |
 | --- | --- |
@@ -351,7 +350,7 @@ permission and keep the module's routes together.
 | Public routes | The `publicRoutes` allowlist in `test/arch/routes_test.go` (anonymous/token-possession auth flows and the HMAC-authenticated webhook receiver) is the complete list of `/api/v1` routes without `authzhttp.Require`. Every other route, including all `files` routes and `POST /auth/logout-all` (`sessions:revoke`), requires a permission. | Adding to the list is a reviewed product decision. |
 | Fallback-audited mutations | Only the public webhook receiver and the caller's own notification state (`read-all`, `:id/read`, preferences) are neither Tier 1 nor `audithttp.Guard`ed; the best-effort global middleware records them (`fallbackAudited` in `test/arch/audit_routes_test.go`). Webhook administration and `POST /notifications/send` are guarded. | Never extend the list with privileged mutations. |
 | `identity` user reads/updates | `GET/DELETE /users/:id` require `profile:read`/`profile:write`, then allow another user's id only if the caller also holds the matching `admin:users:*` permission (`httpx.Can` in the handler; `DELETE` on another id removes the membership). `PUT /users/:id` accepts only the caller's own id (the global profile has one owner). | Keep the route permission; move row-level ownership into the service. |
-| Membership references from other modules | `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` keep `(tenant_id, user_id) REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT` (ADR 0004: users are global; the membership is the tenant-scoped principal). Memberships are never hard-deleted (removal is a status), so the key only guarantees the user is or was a member of that tenant and never cascades across the module boundary. | No new cross-module foreign keys; core identity references need explicit owner approval. |
+| Membership references from other modules | `files`, `notifications`, `notification_preferences`, `api_keys`, and `feature_flag_targets` keep `(tenant_id, user_id) REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT` (users are global; the membership is the tenant-scoped principal). Memberships are never hard-deleted (removal is a status), so the key only guarantees the user is or was a member of that tenant and never cascades across the module boundary. | No new cross-module foreign keys; core identity references need explicit owner approval. |
 
 ## 4. Permissions and catalog
 
@@ -552,7 +551,7 @@ flowchart TD
 
 - Only `cmd/migrate` applies DDL; the API and seed commands assume the schema
   exists.
-- The fresh-install schema is one init migration (ADR 0012, listed in
+- The fresh-install schema is one init migration (listed in
   [Data Model](data-model.md)) with one `-- owner: <module>` section per owner:
   shared functions, identity, platform tables, then modules in FK order. A
   new module's section goes after every table it references.

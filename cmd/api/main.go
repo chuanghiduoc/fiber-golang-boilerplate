@@ -273,7 +273,7 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	// Feature flags: database defaults/targets are optional. The evaluator
 	// serves environment/compiled defaults when the store is unavailable and
 	// bounds stale snapshots with FEATURE_FLAGS_MAX_STALENESS_SECONDS. The
-	// snapshot covers every tenant, so its reads bypass RLS (ADR 0007).
+	// snapshot covers every tenant, so its reads bypass RLS.
 	flagStoreDB := database.NewScoped(pool, database.WithResolver(func(context.Context) database.Scope {
 		return database.Scope{Bypass: true}
 	}))

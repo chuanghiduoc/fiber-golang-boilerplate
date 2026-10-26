@@ -187,7 +187,7 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	).Scan(&verified))
 	assert.True(t, verified, "verification should have happened")
 
-	// Passwords are global (ADR 0004): a reset token belongs to the user, not
+	// Passwords are global: a reset token belongs to the user, not
 	// to a tenant, so it completes from any tenant's link. Use a second
 	// account so the per-email reset rate limit does not suppress this email.
 	status, _ = h.postJSONWithTenant(t, "/api/v1/auth/forgot-password",

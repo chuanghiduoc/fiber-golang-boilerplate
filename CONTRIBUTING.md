@@ -17,15 +17,6 @@ Integration, Security, and Docker. [`.github/CODEOWNERS`](.github/CODEOWNERS)
 assigns reviewers per platform area and per module (code, contracts, and
 migrations); add your module's paths there when you create one.
 
-## Architecture decisions
-
-Decisions that change a boundary (layering, tenancy, authorization,
-migrations, API or event contracts) are recorded as ADRs in
-[`docs/adr/`](docs/adr/README.md). Copy
-[`docs/adr/template.md`](docs/adr/template.md), take the next number, and
-link the ADR from the PR. Accepted ADRs are not rewritten; supersede them with
-a new one.
-
 ## Commit Convention
 
 Follow [Conventional Commits](https://www.conventionalcommits.org/):
@@ -95,16 +86,16 @@ When releasing, move `[Unreleased]` entries under a version header such as
 |------|--------|
 | One DDL entrypoint | Only `cmd/migrate` applies DDL. `make migrate-run` runs it, `make run`/`make seed` migrate first, Compose runs `migrate` before `app`. `cmd/api`/`cmd/seed` assume the schema exists, so replicas never race. |
 | Migrate config | `config.LoadDatabase` needs only `DB_*`; `DB_SSLMODE=disable\|allow\|prefer` is rejected in production. It verifies required tables, indexes, and triggers after migrating. |
-| Fresh installs | The single init (ADR 0012): `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:` section per owner (see `docs/data-model.md`). |
+| Fresh installs | The single init: `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:` section per owner (see `docs/data-model.md`). |
 | Deployed databases | Never edit a shipped migration. Add one with `make migrate-create module=<owner> name=<purpose>` → `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp versions, and tables created outside their owner. |
 | Ownership | One module owns each table; cross-module access goes through a contract or read model, never another module's repository. |
-| Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Users are global (ADR 0004): emails and Google subjects are unique across tenants, and a user joins a tenant through `memberships`. |
+| Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Users are global: emails and Google subjects are unique across tenants, and a user joins a tenant through `memberships`. |
 | Last admin | The `memberships` last-admin trigger is per tenant; application checks must use the same scope. |
 | Scoped queries | Repositories derive the tenant from `tenant.EffectiveID(ctx)` (tenant-1 fallback is for jobs/internal/tests only, never a substitute for HTTP resolution). Public auth flows resolve the tenant, Google `state` carries it, reset/verify links carry `?tenant=<slug>`, uploads use `<tenantID>/<userID>/<uuid>.<ext>`, idempotency keys include the tenant, and logout revokes by possession. RLS and per-tenant limits are future work; do not describe the application as fully isolated. |
 
 ### Upgrading an existing database
 
-The init migration (`20260101000000`, ADR 0012) is a
+The init migration (`20260101000000`) is a
 fresh-install baseline that replaces the old `000001`–`000003` files and the
 former consolidated `000001`. Never run it against a database recorded at one
 of those sequential versions, and never reset `schema_migrations` to force it.
@@ -145,7 +136,7 @@ covered by [`docs/operations.md`](docs/operations.md).
 
 1. The generator creates `module.go`, `build.go` (`Build(infra, Settings)
    (*Module, Provides, error)`), `catalog/` (permissions, error codes, en/vi
-   strings), the ADR 0002 layers with `service/ports.go`, `queries/`, the
+   strings), the service/repository/handler layers with `service/ports.go`, `queries/`, the
    module's own `sqlc.yaml`, tests, a `<UTC ts>_<name>_init` migration pair,
    and the `internal/bootstrap/modules.go` entry, then builds, vets, and tests
    (rolling everything back on failure). Keep everything in that directory.
@@ -163,7 +154,7 @@ covered by [`docs/operations.md`](docs/operations.md).
    `internal/bootstrap/modules.go`.
 6. Add unit tests plus an integration test; `test/arch` rejects cross-module
    imports, Fiber in `service`/`repository` packages, and new
-   [ADR 0002](docs/adr/0002-module-layering.md) layering violations (never add
+    layering violations (never add
    lines to `test/arch/layering_allowlist.txt`; delete the ones you fix).
 7. Run `make swagger`, `make check`, and `go test -race ./...`.
 8. Update `CHANGELOG.md`.

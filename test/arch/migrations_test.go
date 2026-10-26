@@ -32,7 +32,7 @@ func createdTables(sql string) []string {
 }
 
 // ownerMarker starts a section owned by another owner inside one migration
-// file; the single init migration (ADR 0012) has one per owner.
+// file; the single init migration has one per owner.
 var ownerMarker = regexp.MustCompile(`(?m)^-- owner: ([a-z0-9_]+)$`)
 
 // ownerSections splits a migration into owner -> SQL. Text before the first

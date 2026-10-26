@@ -12,14 +12,14 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-// Persistence ports of the identity module (ADR 0002). The repository package
+// Persistence ports of the identity module. The repository package
 // implements them over sqlc and maps rows to these types; services never see
 // generated SQL types or pgx.
 //
 // Tenant scoping: methods of tenant-owned stores (memberships, sessions,
 // refresh tokens, invitations) take the tenant from the context
 // (tenant.EffectiveID). Users, passwords, external identities, and reset /
-// verification tokens are global (ADR 0004) and take no tenant. The few
+// verification tokens are global and take no tenant. The few
 // deliberately cross-tenant methods say so in their doc comment.
 
 // Sentinel errors returned by the repositories for unique violations the

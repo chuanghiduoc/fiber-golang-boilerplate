@@ -1,5 +1,5 @@
 #!/bin/sh
-# PostgreSQL entrypoint hook: create the non-superuser app role (ADR 0007).
+# PostgreSQL entrypoint hook: create the non-superuser app role.
 # Runs once, when the data volume is first initialized, as POSTGRES_USER.
 set -eu
 

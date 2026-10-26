@@ -79,7 +79,7 @@ func verifyStandardWebhook(secret string, header http.Header, body []byte, now t
 }
 
 // wireGoldenBody is the exact Standard Webhooks request body the worker must
-// send for the fixed event below: the versioned envelope (ADR 0011) with the
+// send for the fixed event below: the versioned envelope with the
 // data stored as JSONB (keys normalized by PostgreSQL, numbers kept verbatim,
 // "<", "&", ">" HTML-escaped by encoding/json).
 const wireGoldenBody = `{"id":"evt_wire_golden_1","type":"file.uploaded","dataVersion":1,` +
