@@ -175,7 +175,8 @@ func (s *service) verifyInboundSignature(source *InboundSource, headers http.Hea
 	if errors.Is(verifyErr, webhook.ErrInvalidSignature) && source.previousSecretValid(s.now()) {
 		previousKey, err := s.openInboundKey(binding, source.PreviousSecretCiphertext, source.ID)
 		if err != nil {
-			return verifyErr
+			slog.Error("failed to open an inbound source's previous secret", slog.Int64("source_id", source.ID), slog.Any("error", err))
+			return inboundVerifyError(verifyErr)
 		}
 		if previousErr := webhook.VerifyRequest(previousKey, headers, body, s.opts.TimestampTolerance, s.now()); previousErr == nil {
 			return nil

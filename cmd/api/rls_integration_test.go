@@ -134,7 +134,7 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 	if plainErr == nil || !strings.Contains(plainErr.Error(), "does not have BYPASSRLS") {
 		t.Fatalf("plain checkBypassRLSRole = %v, want a BYPASSRLS refusal", plainErr)
 	}
-	if err := checkRLSRole(ctx, ownerPool, schema, "production"); err == nil {
+	if err := checkBypassRLSRole(ctx, ownerPool, appPool, schema, "production"); err == nil {
 		t.Fatal("the schema owner must not be accepted as the bypass role")
 	}
 }

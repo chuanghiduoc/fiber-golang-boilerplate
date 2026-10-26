@@ -3,8 +3,10 @@
 //
 // A credential is `<prefix>_<43 base62 chars of 32 random bytes><6 base62 chars
 // of the CRC32 checksum of the random part>`. The checksum lets a verifier
-// reject a mistyped or invented key before any database lookup, following
-// GitHub's token format and secret-scanning practice. Only the SHA-256 hash of
+// reject a mistyped or corrupted key before any database lookup, and lets
+// secret scanners recognize real keys, following GitHub's token format. It is
+// not a secret: a deliberately invented key with a valid checksum still
+// reaches the hash lookup and fails there. Only the SHA-256 hash of
 // the complete credential is stored; the plaintext is returned exactly once
 // when a key is created or rotated.
 //

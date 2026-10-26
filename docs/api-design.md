@@ -501,8 +501,9 @@ Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
   known permissions within the caller's own role or key.
 - Key format is `fgb_<43 base62 chars of 32 random bytes><6 base62 chars of a
   CRC32 checksum>`. The checksum is verified before the key hash lookup, so a
-  mistyped or invented key is `401 invalid API key` without touching the
-  database. Keys issued before the checksum (`fgb_<32-byte base64url secret>`)
+  mistyped or corrupted key is `401 invalid API key` without touching the
+  database. The checksum is not secret: an invented key with a valid
+  checksum reaches the hash lookup and fails there with the same 401. Keys issued before the checksum (`fgb_<32-byte base64url secret>`)
   still verify but are deprecated; rotate them to get the current format.
   Prefix and SHA-256 hash storage are unchanged.
 - `APIKEYS_MAX_LIFETIME` (Go duration, default `8760h`) caps every issued key.
