@@ -9,6 +9,7 @@ import (
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -194,7 +195,87 @@ func newTestService(repo *fakeRepo, principals fakePrincipals) Service {
 }
 
 func newAuditedTestService(repo *fakeRepo, principals fakePrincipals, recorder AuditWriter) Service {
-	return NewService(repo, principals, fakeTx{keys: repo, audit: recorder, principals: principals})
+	return NewService(repo, principals, fakeTx{keys: repo, audit: recorder, principals: principals}, 8760*time.Hour)
+}
+
+func TestService_CreateAppliesMaxLifetime(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
+	const maxLifetime = 2 * time.Hour
+	svc := NewService(repo, principals, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+	svc.(*service).now = func() time.Time { return now }
+	ctx := testContext(1)
+
+	created, err := svc.Create(ctx, 10, CreateInput{Name: "defaulted", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.ExpiresAt == nil || !created.ExpiresAt.Equal(now.Add(maxLifetime)) {
+		t.Fatalf("expiresAt = %v, want now + max (%v)", created.ExpiresAt, now.Add(maxLifetime))
+	}
+
+	explicit := now.Add(time.Hour)
+	created, err = svc.Create(ctx, 10, CreateInput{Name: "explicit", Scopes: []string{"files:read"}, ExpiresAt: &explicit})
+	if err != nil {
+		t.Fatalf("create explicit: %v", err)
+	}
+	if created.ExpiresAt == nil || !created.ExpiresAt.Equal(explicit) {
+		t.Fatalf("expiresAt = %v, want %v", created.ExpiresAt, explicit)
+	}
+
+	tooLate := now.Add(maxLifetime + time.Second)
+	_, err = svc.Create(ctx, 10, CreateInput{Name: "too-late", Scopes: []string{"files:read"}, ExpiresAt: &tooLate})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("late expiry error = %v, want 400", err)
+	}
+	if appErr.Code != string(apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime) {
+		t.Fatalf("late expiry code = %q, want %q", appErr.Code, apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime)
+	}
+}
+
+func TestService_RotateInheritsBoundedExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
+	const maxLifetime = 24 * time.Hour
+
+	tests := []struct {
+		name     string
+		original *time.Time
+		want     time.Time
+	}{
+		{name: "legacy NULL expiry gets the maximum", original: nil, want: now.Add(maxLifetime)},
+		{name: "earlier expiry is preserved", original: ptrTime(now.Add(6 * time.Hour)), want: now.Add(6 * time.Hour)},
+		{name: "later legacy expiry is capped", original: ptrTime(now.Add(240 * time.Hour)), want: now.Add(maxLifetime)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFakeRepo()
+			principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+				10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+			}}
+			svc := NewService(repo, principals, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+			svc.(*service).now = func() time.Time { return now }
+			ctx := testContext(1)
+
+			created, err := svc.Create(ctx, 10, CreateInput{Name: "legacy", Scopes: []string{"files:read"}})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			// Simulate a row issued before APIKEYS_MAX_LIFETIME existed.
+			repo.keys[created.ID].ExpiresAt = tc.original
+
+			rotated, err := svc.Rotate(ctx, 10, created.ID)
+			if err != nil {
+				t.Fatalf("rotate: %v", err)
+			}
+			if rotated.ExpiresAt == nil || !rotated.ExpiresAt.Equal(tc.want) {
+				t.Fatalf("successor expiresAt = %v, want %v", rotated.ExpiresAt, tc.want)
+			}
+		})
+	}
 }
 
 func TestService_CreateReturnsSecretOnceAndStoresOnlyHash(t *testing.T) {

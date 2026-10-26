@@ -2,6 +2,7 @@ package apikey
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strings"
@@ -17,11 +18,13 @@ import (
 type fakeStore struct {
 	key            Key
 	findErr        error
+	findCalls      int
 	touched        []time.Time
 	touchedTenants []int64
 }
 
 func (s *fakeStore) FindByHash(_ context.Context, hash string) (Key, error) {
+	s.findCalls++
 	if s.findErr != nil {
 		return Key{}, s.findErr
 	}
@@ -96,6 +99,73 @@ func TestGenerate_FormatAndHash(t *testing.T) {
 	}
 	if other.Key == credentials.Key {
 		t.Fatal("two generated keys must differ")
+	}
+}
+
+func TestGenerate_UsesChecksummedBase62Format(t *testing.T) {
+	credentials, err := Generate()
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	prefix, secret, ok := strings.Cut(credentials.Key, "_")
+	if !ok || prefix != DefaultPrefix {
+		t.Fatalf("key = %q, want prefix %q", credentials.Key, DefaultPrefix)
+	}
+	if len(secret) != newSecretLen {
+		t.Fatalf("secret length = %d, want %d (43 base62 random + 6 checksum)", len(secret), newSecretLen)
+	}
+	if _, err := ParsePrefix(credentials.Key); err != nil {
+		t.Fatalf("parse generated key: %v", err)
+	}
+}
+
+func TestVerifier_RejectsBadChecksumBeforeLookup(t *testing.T) {
+	credentials, key := newTestKey(t)
+	if len(credentials.Key) < 2 {
+		t.Fatal("generated key is too short")
+	}
+	// Flip the last checksum character to another base62 digit. The key stays
+	// structurally valid but fails its CRC32 check.
+	last := credentials.Key[len(credentials.Key)-1]
+	replacement := byte('0')
+	if last == '0' {
+		replacement = '1'
+	}
+	corrupted := credentials.Key[:len(credentials.Key)-1] + string(replacement)
+	if Valid(corrupted) {
+		t.Fatalf("corrupted key %q must not be valid", corrupted)
+	}
+
+	store := &fakeStore{key: key}
+	verifier := NewVerifier(store, nil)
+	_, err := verifier.Verify(context.Background(), corrupted, 0)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != http.StatusUnauthorized {
+		t.Fatalf("error = %v, want 401", err)
+	}
+	if appErr.Detail != "invalid API key" {
+		t.Fatalf("detail = %q, want the generic invalid API key message", appErr.Detail)
+	}
+	if store.findCalls != 0 {
+		t.Fatalf("FindByHash calls = %d, want 0: a bad checksum must not reach the database", store.findCalls)
+	}
+}
+
+// TestParsePrefix_AcceptsLegacyFormat covers keys issued before the checksum
+// existed: a 32-byte base64url secret with no checksum must keep verifying.
+func TestParsePrefix_AcceptsLegacyFormat(t *testing.T) {
+	legacy := DefaultPrefix + "_" + base64.RawURLEncoding.EncodeToString([]byte(
+		"0123456789abcdef0123456789abcdef", // exactly 32 bytes
+	))
+	if len(strings.SplitN(legacy, "_", 2)[1]) != legacySecretLen {
+		t.Fatalf("legacy fixture length = %d", len(strings.SplitN(legacy, "_", 2)[1]))
+	}
+	if !Valid(legacy) {
+		t.Fatal("legacy key must stay valid for verification")
+	}
+	prefix, err := ParsePrefix(legacy)
+	if err != nil || prefix != DefaultPrefix {
+		t.Fatalf("parse legacy = %q, %v", prefix, err)
 	}
 }
 

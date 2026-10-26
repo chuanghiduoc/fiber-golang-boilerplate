@@ -24,6 +24,29 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
 
 ## Entries
 
+### 2026-10-26 — Webhook port policy, inbound enumeration, and API-key lifetime
+
+- `POST /api/v1/webhooks/inbound/{id}`: an unknown, disabled, or soft-deleted
+  source (or a suspended tenant) now returns `401 webhook signature is invalid`
+  instead of `404`. All signature failures use that same problem, so clients
+  cannot tell whether an id exists. Senders must keep using a valid source id
+  and secret; there is no v2 route.
+- `POST /api/v1/webhooks/endpoints` and `PUT /api/v1/webhooks/endpoints/{id}`:
+  a URL whose port is not 443/80 (or an operator-allowed
+  `WEBHOOK_ALLOWED_PORTS` entry) now returns `400 webhook.port_not_allowed`.
+  Delivery also enforces the same policy at dial time. Clients using a
+  receiver on another port must have the operator add it to
+  `WEBHOOK_ALLOWED_PORTS`; there is no client-side override.
+- `POST /api/v1/admin/api-keys`: an omitted `expiresAt` is now recorded as
+  now + `APIKEYS_MAX_LIFETIME` (default `8760h`), and an `expiresAt` later than
+  that maximum returns `400 api_key.expiry_exceeds_max_lifetime`. Clients that
+  relied on non-expiring keys must omit the field (bounded default) or send an
+  earlier expiry. Existing rows with NULL expiry keep working until rotated or
+  revoked.
+- New API keys use `fgb_<base62 random><base62 CRC32 checksum>`; keys issued in
+  the old base64url format still verify but are deprecated. Rotate them to get
+  the current format.
+
 ### 2026-10-26 — API keys are owner-bound on create and rotate
 
 - `POST /api/v1/admin/api-keys`: the `userId` request field is removed. A key is

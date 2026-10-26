@@ -1,0 +1,3 @@
+{
+  "errors.api_key.expiry_exceeds_max_lifetime.title": "API key expiry exceeds the maximum lifetime"
+}

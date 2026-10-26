@@ -252,6 +252,74 @@ func TestLoad_WebhookDefaults(t *testing.T) {
 	}
 }
 
+func TestValidate_APIKeyMaxLifetime(t *testing.T) {
+	for _, lifetime := range []time.Duration{0, -time.Hour} {
+		cfg := baseValidConfig()
+		cfg.APIKeys.MaxLifetime = lifetime
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should reject APIKEYS_MAX_LIFETIME %s", lifetime)
+		}
+	}
+}
+
+func TestLoad_APIKeyDefaults(t *testing.T) {
+	t.Setenv("APIKEYS_MAX_LIFETIME", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.APIKeys.MaxLifetime != 8760*time.Hour {
+		t.Errorf("APIKEYS_MAX_LIFETIME = %s, want 8760h", cfg.APIKeys.MaxLifetime)
+	}
+}
+
+func TestValidate_WebhookAllowedPorts(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Webhook.AllowedPortsCSV = "8443, 9443"
+	ports, err := cfg.Webhook.AllowedPorts()
+	if err != nil {
+		t.Fatalf("AllowedPorts: %v", err)
+	}
+	if !containsInt(ports, 80) || !containsInt(ports, 443) || !containsInt(ports, 8443) || !containsInt(ports, 9443) {
+		t.Fatalf("ports = %v, want defaults plus configured entries", ports)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected valid ports: %v", err)
+	}
+
+	for _, value := range []string{"0", "65536", "-1", "abc", "80,not-a-port"} {
+		cfg := baseValidConfig()
+		cfg.Webhook.AllowedPortsCSV = value
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should reject WEBHOOK_ALLOWED_PORTS=%q", value)
+		}
+	}
+}
+
+func TestLoad_WebhookAllowedPortDefaults(t *testing.T) {
+	t.Setenv("WEBHOOK_ALLOWED_PORTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	ports, err := cfg.Webhook.AllowedPorts()
+	if err != nil {
+		t.Fatalf("AllowedPorts: %v", err)
+	}
+	if len(ports) != 2 || !containsInt(ports, 80) || !containsInt(ports, 443) {
+		t.Fatalf("default ports = %v, want 80 and 443", ports)
+	}
+}
+
+func containsInt(values []int, target int) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestAppConfig_TrustedProxiesList(t *testing.T) {
 	a := AppConfig{TrustedProxies: "10.0.0.1, 192.168.0.0/16 ,"}
 	got := a.TrustedProxiesList()
@@ -327,6 +395,7 @@ func baseValidConfig() Config {
 			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
 			RetentionDays: 30, TimestampToleranceSeconds: 300,
 		},
+		APIKeys: APIKeysConfig{MaxLifetime: 8760 * time.Hour},
 	}
 }
 

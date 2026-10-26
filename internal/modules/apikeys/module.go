@@ -1,6 +1,8 @@
 package apikeys
 
 import (
+	"io/fs"
+
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
@@ -9,6 +11,7 @@ import (
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
 	apikeysprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // Module owns tenant-scoped API-key administration. Keys authenticate through
@@ -26,6 +29,12 @@ func New(handler *apikeyhandler.Handler) *Module {
 }
 
 func (m *Module) Name() string { return apikeyscatalog.Owner }
+
+// ErrorCodes implements app.ErrorProvider.
+func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return apikeyscatalog.ErrorCodes() }
+
+// Locales implements app.LocaleProvider.
+func (m *Module) Locales() fs.FS { return apikeyscatalog.Locales() }
 
 // RegisterPrivacy implements app.PrivacyProvider.
 func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {

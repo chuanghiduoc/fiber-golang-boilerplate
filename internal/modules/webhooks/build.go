@@ -51,7 +51,11 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize webhook secret encryption: %w", err)
 	}
-	guard, err := webhook.NewGuard(cfg.SSRFAllowlistEntries())
+	ports, err := cfg.AllowedPorts()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize webhook port policy: %w", err)
+	}
+	guard, err := webhook.NewGuardWithPorts(cfg.SSRFAllowlistEntries(), ports)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize webhook SSRF guard: %w", err)
 	}
@@ -70,6 +74,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 		DefaultTimeoutMS:   int32(cfg.RequestTimeoutSeconds * 1000), // #nosec G115 -- validated 1..120 seconds
 		TimestampTolerance: cfg.TimestampTolerance(),
 		Tenants:            tenants,
+		URLGuard:           guard,
 	})
 	dispatcher := webhookservice.NewDispatcher(repo)
 

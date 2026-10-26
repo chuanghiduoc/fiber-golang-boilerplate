@@ -81,7 +81,9 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 		TrashRetentionDays: cfg.Retention.FilesTrashRetentionDays(),
 	})
 
-	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
+	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals, apikeys.Settings{
+		MaxLifetime: cfg.APIKeys.MaxLifetime,
+	})
 
 	// cmd/gen (make gen module=<name>) inserts generated modules above the
 	// two gen: markers below; keep both lines.

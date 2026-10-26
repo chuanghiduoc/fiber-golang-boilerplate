@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
@@ -42,20 +43,43 @@ func toInboundEvent(row webhooksqlc.WebhookInboundEvent) webhooksvc.InboundEvent
 }
 
 func (r *Postgres) CreateInboundSource(ctx context.Context, draft webhooksvc.InboundSourceDraft) (*webhooksvc.InboundSource, error) {
-	if r == nil || r.q == nil {
+	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
-	row, err := r.q.CreateWebhookInboundSource(ctx, webhooksqlc.CreateWebhookInboundSourceParams{
-		TenantID:         tenantID(ctx),
-		Name:             draft.Name,
-		Slug:             draft.Slug,
-		SecretCiphertext: draft.SecretCiphertext,
+	if draft.SealSecret == nil {
+		return nil, fmt.Errorf("webhooks: create inbound source: secret sealer is required")
+	}
+	tid := tenantID(ctx)
+	var source *webhooksvc.InboundSource
+	err := r.withTx(ctx, func(_ pgx.Tx, q *webhooksqlc.Queries) error {
+		created, err := q.CreateWebhookInboundSource(ctx, webhooksqlc.CreateWebhookInboundSourceParams{
+			TenantID: tid,
+			Name:     draft.Name,
+			Slug:     draft.Slug,
+		})
+		if err != nil {
+			return mapInboundConflict(err)
+		}
+		ciphertext, err := draft.SealSecret(created.ID)
+		if err != nil {
+			return err
+		}
+		sealed, err := q.SetWebhookInboundSourceSecret(ctx, webhooksqlc.SetWebhookInboundSourceSecretParams{
+			SecretCiphertext: ciphertext,
+			ID:               created.ID,
+			TenantID:         tid,
+		})
+		if err != nil {
+			return mapNotFound(err)
+		}
+		mapped := toInboundSource(sealed)
+		source = &mapped
+		return nil
 	})
 	if err != nil {
-		return nil, mapInboundConflict(err)
+		return nil, err
 	}
-	source := toInboundSource(row)
-	return &source, nil
+	return source, nil
 }
 
 func (r *Postgres) GetInboundSource(ctx context.Context, id int64) (*webhooksvc.InboundSource, error) {

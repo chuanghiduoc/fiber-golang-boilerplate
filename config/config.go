@@ -28,6 +28,8 @@ type Config struct {
 	FeatureFlags FeatureFlagsConfig
 	Scheduler    SchedulerConfig
 	Webhook      WebhookConfig
+	// APIKeys bounds API-key credential lifetime.
+	APIKeys APIKeysConfig
 	// Retention holds module purge windows (files trash, read notifications).
 	Retention RetentionConfig
 	// DataEncryption seals job payloads at rest.
@@ -100,6 +102,7 @@ func (cfg *Config) Validate() error {
 		cfg.Tenant.validate,
 		cfg.FeatureFlags.validate,
 		func() error { return cfg.Webhook.validate(cfg.App.Env, cfg.JWT.Secret) },
+		cfg.APIKeys.validate,
 		func() error { return cfg.DataEncryption.validate(cfg.App.Env, cfg.JWT.Secret) },
 		cfg.Jobs.validate,
 		cfg.App.validateBodyLimits,

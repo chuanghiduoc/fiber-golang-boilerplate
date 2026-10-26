@@ -152,7 +152,7 @@ func (w *DeliveryWorker) checkConfigured() error {
 // retrying cannot help: the delivery is dead-lettered without sending
 // anything.
 func (w *DeliveryWorker) prepare(delivery *Delivery) (key, body []byte, unsendable string) {
-	key, err := w.signingKey(delivery.SecretCiphertext)
+	key, err := w.signingKey(EndpointSecretBinding(delivery.TenantID, delivery.EndpointID), delivery.SecretCiphertext)
 	if err != nil {
 		slog.Error("webhooks: delivery secret is unusable",
 			slog.Int64("delivery_id", delivery.ID),
@@ -171,8 +171,8 @@ func (w *DeliveryWorker) prepare(delivery *Delivery) (key, body []byte, unsendab
 }
 
 // signingKey opens a sealed "whsec_" secret and decodes its HMAC key.
-func (w *DeliveryWorker) signingKey(ciphertext string) ([]byte, error) {
-	secret, err := w.codec.Open(ciphertext)
+func (w *DeliveryWorker) signingKey(binding SecretBinding, ciphertext string) ([]byte, error) {
+	secret, err := w.codec.Open(binding, ciphertext)
 	if err != nil {
 		return nil, err
 	}
@@ -387,9 +387,10 @@ func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery
 		)
 		return sign(snapshot)
 	}
+	binding := EndpointSecretBinding(delivery.TenantID, delivery.EndpointID)
 	currentKey := snapshot
 	if secrets.CurrentCiphertext != delivery.SecretCiphertext {
-		currentKey, err = w.signingKey(secrets.CurrentCiphertext)
+		currentKey, err = w.signingKey(binding, secrets.CurrentCiphertext)
 		if err != nil {
 			slog.Error("webhooks: current endpoint secret is unusable; signing with the snapshot only",
 				slog.Int64("delivery_id", delivery.ID),
@@ -401,7 +402,7 @@ func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery
 	}
 	signatures := []string{sign(currentKey)}
 	if secrets.PreviousCiphertext != "" && secrets.PreviousCiphertext != secrets.CurrentCiphertext {
-		previousKey, err := w.signingKey(secrets.PreviousCiphertext)
+		previousKey, err := w.signingKey(binding, secrets.PreviousCiphertext)
 		if err != nil {
 			slog.Error("webhooks: previous endpoint secret is unusable; co-signing without it",
 				slog.Int64("delivery_id", delivery.ID),

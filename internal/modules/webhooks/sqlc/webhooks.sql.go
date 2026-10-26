@@ -368,26 +368,20 @@ INSERT INTO webhook_inbound_sources (
     tenant_id, name, slug, secret_ciphertext, status
 )
 VALUES (
-    $1, $2, $3, $4, 'active'
+    $1, $2, $3, '', 'active'
 )
 RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
 `
 
 type CreateWebhookInboundSourceParams struct {
-	TenantID         int64  `json:"tenant_id"`
-	Name             string `json:"name"`
-	Slug             string `json:"slug"`
-	SecretCiphertext string `json:"secret_ciphertext"`
+	TenantID int64  `json:"tenant_id"`
+	Name     string `json:"name"`
+	Slug     string `json:"slug"`
 }
 
 // Inbound sources and events ------------------------------------------------
 func (q *Queries) CreateWebhookInboundSource(ctx context.Context, arg CreateWebhookInboundSourceParams) (WebhookInboundSource, error) {
-	row := q.db.QueryRow(ctx, createWebhookInboundSource,
-		arg.TenantID,
-		arg.Name,
-		arg.Slug,
-		arg.SecretCiphertext,
-	)
+	row := q.db.QueryRow(ctx, createWebhookInboundSource, arg.TenantID, arg.Name, arg.Slug)
 	var i WebhookInboundSource
 	err := row.Scan(
 		&i.ID,
@@ -1427,6 +1421,41 @@ func (q *Queries) RotateWebhookInboundSourceSecret(ctx context.Context, arg Rota
 		arg.ID,
 		arg.TenantID,
 	)
+	var i WebhookInboundSource
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Slug,
+		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const setWebhookInboundSourceSecret = `-- name: SetWebhookInboundSourceSecret :one
+UPDATE webhook_inbound_sources
+SET secret_ciphertext = $1
+WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
+`
+
+type SetWebhookInboundSourceSecretParams struct {
+	SecretCiphertext string `json:"secret_ciphertext"`
+	ID               int64  `json:"id"`
+	TenantID         int64  `json:"tenant_id"`
+}
+
+// A new source is inserted with an empty placeholder and sealed immediately
+// in the same transaction, once the generated id is known (the secret's AAD
+// binds that id).
+func (q *Queries) SetWebhookInboundSourceSecret(ctx context.Context, arg SetWebhookInboundSourceSecretParams) (WebhookInboundSource, error) {
+	row := q.db.QueryRow(ctx, setWebhookInboundSourceSecret, arg.SecretCiphertext, arg.ID, arg.TenantID)
 	var i WebhookInboundSource
 	err := row.Scan(
 		&i.ID,
