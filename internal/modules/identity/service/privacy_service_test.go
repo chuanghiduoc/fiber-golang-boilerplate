@@ -17,6 +17,7 @@ import (
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -206,6 +207,19 @@ func privacyTestStores(repo *fakePrivacyRepo) (Stores, *memDB) {
 	return stores, db
 }
 
+// adminCallerCtx adds an active admin (user 1) to the request tenant and
+// returns a context carrying that admin as the subject: admin erasure follows
+// the role hierarchy, so the caller must outrank the target.
+func adminCallerCtx(db *memDB) context.Context {
+	db.users[1] = &User{ID: 1, Email: "admin@example.com", Name: "Admin", Status: UserStatusActive}
+	db.memberships[[2]int64{tenant.DefaultID, 1}] = &Membership{
+		ID: 1, TenantID: tenant.DefaultID, UserID: 1, Role: RoleAdmin, Roles: []string{RoleAdmin},
+		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	return authz.WithSubject(ctx, authz.NewSubject(1, tenant.DefaultID, RoleAdmin))
+}
+
 func newPrivacyTestService(t *testing.T, repo *fakePrivacyRepo, registry *privacycontracts.Registry) (*PrivacyService, *fakeJobs, *fakeNotifier, storage.Storage, Stores) {
 	t.Helper()
 	stores, _ := privacyTestStores(repo)
@@ -344,7 +358,7 @@ func TestRequestAdminErasureStaysInTheRequestTenant(t *testing.T) {
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: store, Registry: registry})
 	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
 	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: fakeExporter{}})
-	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	ctx := adminCallerCtx(db)
 
 	require.NoError(t, svc.RequestAdminErasure(ctx, 10))
 	require.Len(t, jobsQueue.jobs, 1, "exactly one tenant erase job")
@@ -372,7 +386,7 @@ func TestRequestAdminErasureRejectsACrossTenantID(t *testing.T) {
 	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
 
-	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	err := svc.RequestAdminErasure(adminCallerCtx(db), 10)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
 	assert.Equal(t, 404, appErr.Status)
@@ -387,10 +401,27 @@ func TestRequestAdminErasureRejectsARemovedMember(t *testing.T) {
 	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
 
-	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	err := svc.RequestAdminErasure(adminCallerCtx(db), 10)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
 	assert.Equal(t, 404, appErr.Status)
+	assert.Empty(t, jobsQueue.jobs)
+}
+
+// Admin erasure follows the role hierarchy: an admin cannot erase an owner.
+func TestRequestAdminErasureRequiresAHigherRank(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Roles = []string{RoleOwner}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+
+	err := svc.RequestAdminErasure(adminCallerCtx(db), 10)
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, string(identitycatalog.CodeRoleInsufficientRank), appErr.Code)
 	assert.Empty(t, jobsQueue.jobs)
 }
 
@@ -398,11 +429,16 @@ func TestRequestAdminErasureRefusesTheLastOwner(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
 	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Roles = []string{RoleOwner}
 	jobsQueue := &fakeJobs{}
 	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
 
-	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	// The sole owner targets themselves through the admin route: an owner may
+	// manage an owner, so only the last-owner rule can refuse it.
+	ownerCtx := authz.WithSubject(tenant.WithID(context.Background(), tenant.DefaultID),
+		authz.NewSubject(10, tenant.DefaultID, RoleOwner))
+	err := svc.RequestAdminErasure(ownerCtx, 10)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
 	assert.Equal(t, string(apperror.CodeUserLastAdmin), appErr.Code)

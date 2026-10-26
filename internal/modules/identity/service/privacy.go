@@ -275,6 +275,9 @@ func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) 
 		if tx.Privacy == nil || tx.Jobs == nil {
 			return apperror.NewInternal("privacy services are not configured")
 		}
+		if err := EnsureCanManageMember(ctx, tx.Stores, userID); err != nil {
+			return err
+		}
 		member, err := tx.Memberships.Get(ctx, userID)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
