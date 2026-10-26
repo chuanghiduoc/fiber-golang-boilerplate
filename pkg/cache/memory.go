@@ -6,6 +6,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -191,28 +192,76 @@ func (m *MemoryCache) Increment(_ context.Context, key string, ttl time.Duration
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if el, ok := m.items[key]; ok {
+	value, _, err := m.incrementLocked(key, ttl, math.MaxInt64)
+	return value, err
+}
+
+// IncrementBelow increments only while the resulting value stays at or below
+// maxValue, leaving the counter untouched (and ok false) once the cap is reached.
+func (m *MemoryCache) IncrementBelow(_ context.Context, key string, ttl time.Duration, maxValue int64) (value int64, ok bool, err error) {
+	if maxValue < 1 {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		value, _, err = m.currentLocked(key)
+		return value, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.incrementLocked(key, ttl, maxValue)
+}
+
+// incrementLocked applies the shared Increment/IncrementBelow semantics. It
+// returns ok=false without writing when the counter is already at maxValue. The
+// caller holds m.mu.
+func (m *MemoryCache) incrementLocked(key string, ttl time.Duration, maxValue int64) (value int64, ok bool, err error) {
+	if el, exists := m.items[key]; exists {
 		e := el.Value.(*entry)
 		if !e.expired() {
-			n, err := strconv.ParseInt(string(e.data), 10, 64)
-			if err != nil {
+			n, parseErr := strconv.ParseInt(string(e.data), 10, 64)
+			if parseErr != nil {
 				// Match Redis INCR: a non-integer value is not a counter.
-				return 0, fmt.Errorf("cache: increment non-integer value at %q", key)
+				return 0, false, fmt.Errorf("cache: increment non-integer value at %q", key)
+			}
+			if n >= maxValue {
+				m.lru.MoveToFront(el)
+				return n, false, nil
 			}
 			n++
 			// Preserve the original expiry and version: a new expiry record
 			// would make the existing heap entry stale.
 			e.data = []byte(strconv.FormatInt(n, 10))
 			m.lru.MoveToFront(el)
-			return n, nil
+			return n, true, nil
 		}
 		m.removeLocked(el)
 	}
 
+	if maxValue < 1 {
+		return 0, false, nil
+	}
 	now := time.Now()
 	m.storeLocked(key, []byte("1"), expiryAt(now, ttl))
 	m.evictLocked(now)
-	return 1, nil
+	return 1, true, nil
+}
+
+// currentLocked returns a live counter's value without writing it.
+func (m *MemoryCache) currentLocked(key string) (value int64, ok bool, err error) {
+	el, exists := m.items[key]
+	if !exists {
+		return 0, false, nil
+	}
+	e := el.Value.(*entry)
+	if e.expired() {
+		m.removeLocked(el)
+		return 0, false, nil
+	}
+	n, err := strconv.ParseInt(string(e.data), 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("cache: increment non-integer value at %q", key)
+	}
+	m.lru.MoveToFront(el)
+	return n, true, nil
 }
 
 // storeLocked writes key as the most recently used entry and records its

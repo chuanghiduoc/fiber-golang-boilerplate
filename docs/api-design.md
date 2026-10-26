@@ -420,6 +420,13 @@ targets remain `admin:features:write`.
 
 - Configured via `RATE_LIMIT_*`; tiers are strict/normal/relaxed with separate
   keyspaces. Cache-backed (Redis in production; memory is single-replica only).
+- The window is a sliding approximation (current window plus the previous one
+  weighted by overlap, floored), so a client cannot double its allowance at a
+  boundary. Rejected retries do not advance the counter. Responses carry
+  `RateLimit-Policy` and `RateLimit` (IETF
+  draft-ietf-httpapi-ratelimit-headers) plus the legacy `X-RateLimit-*` headers;
+  `429` also carries `Retry-After`, pointing at the first second the caller fits
+  again.
 - Keyed per API key when authenticated with `ApiKey`, otherwise per user, then
   per IP. `429` is retryable. Rotating a key moves later requests to a new
   bucket.
@@ -470,6 +477,16 @@ targets remain `admin:features:write`.
 
 - `POST /files/upload` accepts multipart `file`, enforces size and a MIME
   allowlist, and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+- Uploads enforce optional byte quotas (`FILES_TENANT_QUOTA_BYTES`,
+  `FILES_USER_QUOTA_BYTES`; 0 = unlimited) over live plus trashed files. The
+  check runs inside the metadata transaction under a per-tenant advisory lock,
+  so two concurrent uploads cannot both pass; an upload over quota is `413
+  file.quota_exceeded` and its stored blob is removed.
+- With `FILES_SCAN_DRIVER=clamav`, each stored blob is streamed to clamd before
+  the metadata row is committed. A signature match is `422 file.infected`; a
+  scanner failure is fail-closed `503 file.scan_unavailable`. The blob is
+  removed in both cases. `none` (the default) skips scanning and logs a
+  production startup warning.
 - Downloads are authenticated and tenant/ownership checked; there is no public
   `/uploads` tree. Cross-tenant or other-owner ids return `404`, never `403`
   (`authz.TenantPolicy` + `authz.OwnerPolicy`; admin services use the tenant

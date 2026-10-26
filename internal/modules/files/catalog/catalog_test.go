@@ -20,6 +20,9 @@ func TestPublicValuesAreStable(t *testing.T) {
 		string(CodeFileTooLarge):        "file.too_large",
 		string(CodeFileUnsupportedType): "file.unsupported_type",
 		string(CodeFileNotDeleted):      "file.not_deleted",
+		string(CodeFileQuotaExceeded):   "file.quota_exceeded",
+		string(CodeFileInfected):        "file.infected",
+		string(CodeFileScanUnavailable): "file.scan_unavailable",
 		string(KeyFileUploads):          "file_uploads",
 	}
 	for got, want := range pins {

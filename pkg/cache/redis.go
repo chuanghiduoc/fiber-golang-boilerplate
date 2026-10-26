@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
@@ -101,6 +102,41 @@ return v
 
 func (r *RedisCache) Increment(ctx context.Context, key string, ttl time.Duration) (int64, error) {
 	return incrExpireScript.Run(ctx, r.client, []string{key}, ttl.Milliseconds()).Int64()
+}
+
+// incrBelowExpireScript increments only while the result stays at or below
+// ARGV[2], returning {value, allowed}. Rejected increments do not create a key
+// or extend its TTL, so a throttled client's retries cannot extend its block.
+var incrBelowExpireScript = redis.NewScript(`
+local raw = redis.call('GET', KEYS[1])
+local v = 0
+if raw then
+	v = tonumber(raw)
+	if not v then
+		return redis.error_reply('cache: increment non-integer value')
+	end
+end
+local maxValue = tonumber(ARGV[2])
+if v >= maxValue then
+	return {v, 0}
+end
+v = v + 1
+redis.call('SET', KEYS[1], v)
+if v == 1 and tonumber(ARGV[1]) > 0 then
+	redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return {v, 1}
+`)
+
+func (r *RedisCache) IncrementBelow(ctx context.Context, key string, ttl time.Duration, maxValue int64) (value int64, ok bool, err error) {
+	values, err := incrBelowExpireScript.Run(ctx, r.client, []string{key}, ttl.Milliseconds(), maxValue).Int64Slice()
+	if err != nil {
+		return 0, false, err
+	}
+	if len(values) != 2 {
+		return 0, false, fmt.Errorf("cache: increment-below script returned %d values, want 2", len(values))
+	}
+	return values[0], values[1] == 1, nil
 }
 
 // compareAndDeleteScript deletes the key only when its value still matches the

@@ -50,7 +50,7 @@ func TestUploadService_ABACOwnerAndTenantPolicies(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store)
+	svc := NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
 
 	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleMember))
 
@@ -95,7 +95,7 @@ func TestUploadService_ABACPermissionPreCheck(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store)
+	svc := NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
 
 	// A JWT-equivalent subject whose role grants files:read.
 	ctx := abacCtx(1, authz.NewSubject(10, 1, authz.RoleMember))
@@ -185,7 +185,7 @@ func TestFileServices_NoSubjectNoSystemMarkerIsDenied(t *testing.T) {
 	repo := newMockFileRepo()
 	store := newMockStorage()
 	seedABACFiles(repo, store)
-	svc := NewUploadService(repo, newFakeTx(repo), store)
+	svc := NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
 	ctx := tenant.WithID(context.Background(), 1)
 
 	_, err := svc.Upload(ctx, 10, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")

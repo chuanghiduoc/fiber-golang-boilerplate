@@ -86,6 +86,12 @@ func TestNewLimiter_HeadersAndProblem(t *testing.T) {
 		if reset, err := strconv.Atoi(resp.Header.Get("X-RateLimit-Reset")); err != nil || reset < 1 || reset > 60 {
 			t.Errorf("X-RateLimit-Reset = %q, want 1..60", resp.Header.Get("X-RateLimit-Reset"))
 		}
+		if got := resp.Header.Get("RateLimit-Policy"); got != `"normal";q=2;w=60` {
+			t.Errorf("RateLimit-Policy = %q, want %q", got, `"normal";q=2;w=60`)
+		}
+		if got := resp.Header.Get("RateLimit"); got != `"normal";r=`+strconv.Itoa(want)+`;t=`+resp.Header.Get("X-RateLimit-Reset") {
+			t.Errorf("RateLimit = %q, want remaining %d and the reset delta", got, want)
+		}
 	}
 
 	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/", http.NoBody))
@@ -96,8 +102,17 @@ func TestNewLimiter_HeadersAndProblem(t *testing.T) {
 	if resp.StatusCode != fiber.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
-	if retry, err := strconv.Atoi(resp.Header.Get(fiber.HeaderRetryAfter)); err != nil || retry < 1 || retry > 60 {
-		t.Errorf("Retry-After = %q, want 1..60", resp.Header.Get(fiber.HeaderRetryAfter))
+	if retry, err := strconv.Atoi(resp.Header.Get(fiber.HeaderRetryAfter)); err != nil || retry < 1 || retry > 61 {
+		t.Errorf("Retry-After = %q, want 1..61 (a full current window may need one second of decay)", resp.Header.Get(fiber.HeaderRetryAfter))
+	}
+	if got := resp.Header.Get("X-RateLimit-Remaining"); got != "0" {
+		t.Errorf("X-RateLimit-Remaining on 429 = %q, want 0", got)
+	}
+	if got := resp.Header.Get("RateLimit-Policy"); got != `"normal";q=2;w=60` {
+		t.Errorf("RateLimit-Policy on 429 = %q, want %q", got, `"normal";q=2;w=60`)
+	}
+	if got := resp.Header.Get("RateLimit"); !strings.HasPrefix(got, `"normal";r=0;t=`) {
+		t.Errorf("RateLimit on 429 = %q, want a zero-remaining entry", got)
 	}
 	var problem struct {
 		Code   string `json:"code"`
@@ -162,8 +177,16 @@ func TestNewLimiter_ConcurrentRequestsNeverExceedLimit(t *testing.T) {
 
 type failingCounter struct{ cache.Cache }
 
+func (failingCounter) Get(context.Context, string) ([]byte, error) {
+	return nil, errors.New("redis: connection refused")
+}
+
 func (failingCounter) Increment(context.Context, string, time.Duration) (int64, error) {
 	return 0, errors.New("redis: connection refused")
+}
+
+func (failingCounter) IncrementBelow(context.Context, string, time.Duration, int64) (value int64, ok bool, err error) {
+	return 0, false, errors.New("redis: connection refused")
 }
 
 // blackholeCache models an unreachable cache whose calls hang: every
@@ -196,6 +219,9 @@ func (b *blackholeCache) Exists(ctx context.Context, _ string) (bool, error) {
 }
 func (b *blackholeCache) Increment(ctx context.Context, _ string, _ time.Duration) (int64, error) {
 	return 0, b.wait(ctx)
+}
+func (b *blackholeCache) IncrementBelow(ctx context.Context, _ string, _ time.Duration, _ int64) (value int64, ok bool, err error) {
+	return 0, false, b.wait(ctx)
 }
 func (b *blackholeCache) Close() error                   { return nil }
 func (b *blackholeCache) Ping(ctx context.Context) error { return b.wait(ctx) }

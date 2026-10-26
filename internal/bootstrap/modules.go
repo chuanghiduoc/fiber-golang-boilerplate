@@ -9,6 +9,7 @@ package bootstrap
 
 import (
 	"context"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
@@ -75,11 +76,19 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	// Identity and files publish domain events on infra.Events inside their
 	// transactions; webhooks subscribes to them (app.EventProvider), so no
 	// producer is wired to the webhooks module.
-	filesModule, filesProvides := files.Build(infra, files.Settings{
+	filesModule, filesProvides, err := files.Build(infra, files.Settings{
 		MaxFileSize:        cfg.Storage.MaxFileSize,
 		AllowedTypes:       cfg.Storage.AllowedTypes(),
+		TenantQuotaBytes:   cfg.Files.TenantQuotaBytes,
+		UserQuotaBytes:     cfg.Files.UserQuotaBytes,
+		ScanDriver:         cfg.Files.EnabledScanDriver(),
+		ClamAVAddr:         cfg.Files.ClamAVAddr,
+		ClamAVTimeout:      time.Duration(cfg.Files.ClamAVTimeoutSecs) * time.Second,
 		TrashRetentionDays: cfg.Retention.FilesTrashRetentionDays(),
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals)
 

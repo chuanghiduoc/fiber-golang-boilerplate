@@ -41,6 +41,9 @@ func (failingCache) Exists(context.Context, string) (bool, error) { return false
 func (failingCache) Increment(context.Context, string, time.Duration) (int64, error) {
 	return 0, errStubCache
 }
+func (failingCache) IncrementBelow(context.Context, string, time.Duration, int64) (value int64, ok bool, err error) {
+	return 0, false, errStubCache
+}
 func (failingCache) Close() error               { return nil }
 func (failingCache) Ping(context.Context) error { return errStubCache }
 

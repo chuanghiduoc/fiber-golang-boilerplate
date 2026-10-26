@@ -30,6 +30,13 @@ type Cache interface {
 	// at 1 and ttl is applied. Atomicity prevents concurrent requests from racing
 	// a read-modify-write (e.g. bypassing brute-force lockout in parallel).
 	Increment(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	// IncrementBelow atomically increments the integer counter at key and
+	// returns the new value only while the result is at most maxValue. When the
+	// counter has already reached maxValue it is left unchanged and ok is false;
+	// the current value is returned so callers can report headroom. Rejected
+	// operations therefore never create or advance a counter, which keeps a
+	// sliding-window limiter's rejected retries from extending a block.
+	IncrementBelow(ctx context.Context, key string, ttl time.Duration, maxValue int64) (value int64, ok bool, err error)
 	Close() error
 	Ping(ctx context.Context) error
 }

@@ -12,6 +12,9 @@ const (
 	CodeFileTooLarge        apperror.Code = "file.too_large"
 	CodeFileUnsupportedType apperror.Code = "file.unsupported_type"
 	CodeFileNotDeleted      apperror.Code = "file.not_deleted"
+	CodeFileQuotaExceeded   apperror.Code = "file.quota_exceeded"
+	CodeFileInfected        apperror.Code = "file.infected"
+	CodeFileScanUnavailable apperror.Code = "file.scan_unavailable"
 )
 
 // ErrorCodes returns the files error catalog for app.ErrorProvider.
@@ -36,6 +39,21 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusConflict,
 			Title:   "File was not deleted",
 			DocPath: "/errors/file-not-deleted",
+		},
+		CodeFileQuotaExceeded: {
+			Status:  http.StatusRequestEntityTooLarge,
+			Title:   "Storage quota exceeded",
+			DocPath: "/errors/file-quota-exceeded",
+		},
+		CodeFileInfected: {
+			Status:  http.StatusUnprocessableEntity,
+			Title:   "File failed the malware scan",
+			DocPath: "/errors/file-infected",
+		},
+		CodeFileScanUnavailable: {
+			Status:  http.StatusServiceUnavailable,
+			Title:   "File scanning is unavailable",
+			DocPath: "/errors/file-scan-unavailable",
 		},
 	}
 }

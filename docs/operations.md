@@ -1014,9 +1014,9 @@ the handler, so a retry that races the owner's completion still replays.
 
 | Rule | Behavior |
 | --- | --- |
-| Algorithm | Fixed windows aligned to epoch multiples of the tier window. One atomic `INCR` (+`PEXPIRE` on first hit) per request on `ratelimit:<tier>:<apikey\|user\|ip>:<id>:<windowStart>`, so replicas sharing Redis cannot race. A client can send up to twice the limit across a window boundary. |
-| Headers | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429`. |
-| `auth` tier | Protected routes pass a per-client-IP tier (`RATE_LIMIT_AUTH_MAX`, default 300 per `RATE_LIMIT_AUTH_WINDOW_SECS`, default 60) inside `Deps.Authenticate()`, **before** the token or API key is checked; otherwise a flood of bogus `Authorization: ApiKey ...` headers would cost one database lookup each. Clients behind a shared NAT share it; raise it rather than remove it. It sets only `Retry-After` on `429`. |
+| Algorithm | Sliding-window approximation: `floor(previous * (1 - elapsed/window)) + current`, where each window is aligned to an epoch multiple of the tier window. The current counter is advanced atomically only while the result stays within the limit (`INCR` only when below the cap, `PEXPIRE` on first admission), so a rejected retry never consumes a slot or extends the block. The key is `ratelimit:<tier>:<apikey\|user\|ip>:<id>:<windowStart>`, so replicas sharing Redis cannot race. Filling one window no longer doubles the allowance at the next boundary; capacity returns gradually as the previous window ages out. |
+| Headers | IETF draft `RateLimit-Policy: "<tier>";q=<limit>;w=<window>` and `RateLimit: "<tier>";r=<remaining>;t=<seconds to window reset>`, plus the legacy `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429` (all set on allowed and rejected responses). `Retry-After` is the first second at which the caller fits again, so it may be one second past the window boundary when the current window is full. |
+| `auth` tier | Protected routes pass a per-client-IP sliding window (`RATE_LIMIT_AUTH_MAX`, default 300 per `RATE_LIMIT_AUTH_WINDOW_SECS`, default 60) inside `Deps.Authenticate()`, **before** the token or API key is checked; otherwise a flood of bogus `Authorization: ApiKey ...` headers would cost one database lookup each. Clients behind a shared NAT share it; raise it rather than remove it. It sets only `Retry-After` on `429`. |
 | Cache errors | Fail open: the request is allowed, a warning is logged, and `rate_limit_errors_total{tier}` increments. Login lockouts are separate and fail closed. |
 
 ### Fail-fast bounds
@@ -1026,7 +1026,7 @@ second per request:
 
 | Operation | Bound |
 | --- | --- |
-| Rate-limit increment | 250ms |
+| Rate-limit counter operations | 250ms (previous-window read and bounded increment share one budget) |
 | Idempotency lookup / lock claim | 250ms |
 | Idempotency response write and lock release | 500ms |
 | `REDIS_DIAL_TIMEOUT_MS` | 2000 |
@@ -1670,6 +1670,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
 | `SCHEDULER_RETENTION_DAYS` | `scheduler_runs` retention (default 30) |
 | `FILES_TRASH_RETENTION_DAYS` / `NOTIFICATIONS_RETENTION_DAYS` | Days a soft-deleted file stays restorable before its blob and row are purged (default 30), and days a read notification is kept after being read (default 180; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
+| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; the per-tenant advisory lock makes concurrent uploads serializable |
+| `FILES_SCAN_DRIVER` / `FILES_CLAMAV_ADDR` / `FILES_CLAMAV_TIMEOUT_SECS` | Upload malware scanner: `none` (default) or `clamav` (clamd INSTREAM over TCP; address required, timeout default 10s). A configured scanner fails closed: infected is `422 file.infected`, scanner errors are `503 file.scan_unavailable`, and the blob is removed either way. Production warns at startup when scanning is off |
 | `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
 | `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
 | `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |
@@ -1690,7 +1692,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Tenant claim | A conflicting explicit `X-Tenant-Slug` returns `403`; a missing/zero/negative claim `401`. Unknown or suspended tenants are rejected with `404` before authentication; a cached suspended snapshot returns `401` until the 5-second TTL expires. |
 | Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
 | Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
-| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
+| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. Upload quotas are enforced transactionally per tenant, and an optional clamd scan runs before metadata commits (infected/unknown fails closed and removes the blob). |
 | Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
 | Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |

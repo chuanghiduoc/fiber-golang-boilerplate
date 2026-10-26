@@ -19,6 +19,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/scan"
 )
 
 const maxOriginalNameRunes = 255
@@ -44,12 +45,13 @@ type uploadService struct {
 	repo    FileRepository
 	tx      Transactor
 	storage storage.Storage
+	opts    UploadOptions
 }
 
 // NewUploadService builds the user file service. Mutations run through tx, so
 // a metadata change and its domain event commit atomically.
-func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage) UploadService {
-	return &uploadService{repo: repo, tx: tx, storage: store}
+func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage, opts UploadOptions) UploadService {
+	return &uploadService{repo: repo, tx: tx, storage: store, opts: opts}
 }
 
 func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error) {
@@ -75,6 +77,16 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		return nil, apperror.NewInternal("failed to store file")
 	}
 
+	// Scan the stored blob before any metadata is committed. A configured
+	// scanner fails closed: an infected file is 422 and a scanner problem is
+	// 503, and neither leaves the blob behind.
+	if s.opts.Scanner != nil {
+		if err := s.scanStored(ctx, storagePath, size); err != nil {
+			s.removeBlob(ctx, storagePath, "failed to cleanup storage after a rejected scan")
+			return nil, err
+		}
+	}
+
 	input := NewFile{
 		UserID:       userID,
 		OriginalName: originalName,
@@ -86,6 +98,9 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	// The metadata row and the file.uploaded event commit together; a publish
 	// failure rolls the row back and cleans up the blob below.
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := s.checkQuota(ctx, tx.Files, userID, size); err != nil {
+			return err
+		}
 		created, createErr := tx.Files.Create(ctx, input)
 		if createErr != nil {
 			return createErr
@@ -99,18 +114,83 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	if err != nil {
 		// Cleanup storage on DB failure. The request context may already be
 		// canceled; storage cleanup must still run.
-		if delErr := s.storage.Delete(context.WithoutCancel(ctx), storagePath); delErr != nil {
-			slog.Error("failed to cleanup storage after DB failure",
-				slog.String("path", storagePath),
-				slog.Any("error", delErr),
-			)
-		}
+		s.removeBlob(ctx, storagePath, "failed to cleanup storage after DB failure")
 		if errors.Is(err, ErrStoragePathTaken) {
 			return nil, apperror.NewConflict("a file with this storage path already exists")
 		}
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) {
+			return nil, appErr
+		}
+		slog.Error("failed to save file metadata", slog.Any("error", err))
 		return nil, apperror.NewInternal("failed to save file metadata")
 	}
 	return file, nil
+}
+
+// scanStored streams the stored blob through the configured scanner. The rows
+// are not committed yet, so a bad verdict just removes the blob.
+func (s *uploadService) scanStored(ctx context.Context, storagePath string, size int64) error {
+	reader, err := s.storage.Get(ctx, storagePath)
+	if err != nil {
+		slog.Error("failed to read a stored upload for scanning",
+			slog.String("path", storagePath),
+			slog.Any("error", err),
+		)
+		return apperror.NewCode(filescatalog.CodeFileScanUnavailable, "file scanning is temporarily unavailable")
+	}
+	verdict, scanErr := s.opts.Scanner.Scan(ctx, reader, size)
+	closeErr := reader.Close()
+	if closeErr != nil {
+		slog.Warn("failed to close scanned upload", slog.String("path", storagePath), slog.Any("error", closeErr))
+	}
+	if scanErr != nil {
+		slog.Error("upload scan failed",
+			slog.String("path", storagePath),
+			slog.Any("error", scanErr),
+		)
+		return apperror.NewCode(filescatalog.CodeFileScanUnavailable, "file scanning is temporarily unavailable")
+	}
+	if verdict == scan.VerdictInfected {
+		return apperror.NewCode(filescatalog.CodeFileInfected, "file failed the malware scan")
+	}
+	if verdict != scan.VerdictClean {
+		slog.Error("upload scanner returned an unknown verdict", slog.String("verdict", verdict.String()))
+		return apperror.NewCode(filescatalog.CodeFileScanUnavailable, "file scanning is temporarily unavailable")
+	}
+	return nil
+}
+
+// removeBlob deletes a stored blob whose upload was rejected. The request
+// context may already be canceled, so cleanup uses a detached context.
+func (s *uploadService) removeBlob(ctx context.Context, storagePath, reason string) {
+	if err := s.storage.Delete(context.WithoutCancel(ctx), storagePath); err != nil {
+		slog.Error(reason, slog.String("path", storagePath), slog.Any("error", err))
+	}
+}
+
+// checkQuota refuses an upload that would push the tenant or the user over
+// its configured byte quota. The per-tenant advisory lock is taken first and
+// held until the transaction ends, so concurrent uploads serialize: the second
+// one sees the first one's row and cannot also pass. Trashed rows count
+// because their blobs are still stored.
+func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, userID, size int64) error {
+	if s.opts.TenantQuotaBytes <= 0 && s.opts.UserQuotaBytes <= 0 {
+		return nil
+	}
+	if err := repo.LockQuota(ctx); err != nil {
+		return err
+	}
+	tenantBytes, userBytes, err := repo.StorageUsage(ctx, userID)
+	if err != nil {
+		return err
+	}
+	tenantExceeded := s.opts.TenantQuotaBytes > 0 && tenantBytes+size > s.opts.TenantQuotaBytes
+	userExceeded := s.opts.UserQuotaBytes > 0 && userBytes+size > s.opts.UserQuotaBytes
+	if !tenantExceeded && !userExceeded {
+		return nil
+	}
+	return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")
 }
 
 // cleanOriginalName makes the client filename safe to store and display: valid

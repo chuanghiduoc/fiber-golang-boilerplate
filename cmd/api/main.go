@@ -183,6 +183,9 @@ func warnRiskySettings(cfg *config.Config) {
 				slog.String("app_role", cfg.App.EffectiveRole()),
 			)
 		}
+		if cfg.App.ServesAPI() && cfg.Files.EnabledScanDriver() == "none" {
+			slog.Warn("FILES_SCAN_DRIVER=none in production: uploaded files are not scanned for malware")
+		}
 	}
 
 	if cfg.App.Env != "production" && cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {

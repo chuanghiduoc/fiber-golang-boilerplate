@@ -47,7 +47,9 @@ func NewUploadHandler(svc filesvc.UploadService, maxFileSize int64, allowedTypes
 // @Failure 404 {object} apperror.ProblemDetails "feature.disabled when file_uploads is off"
 // @Failure 413 {object} apperror.ProblemDetails
 // @Failure 415 {object} apperror.ProblemDetails
+// @Failure 422 {object} apperror.ProblemDetails "file.infected when the malware scan matched"
 // @Failure 500 {object} apperror.ProblemDetails
+// @Failure 503 {object} apperror.ProblemDetails "file.scan_unavailable when a configured scanner failed"
 // @Router /files/upload [post]
 func (h *UploadHandler) Upload(c fiber.Ctx) error {
 	fileHeader, err := c.FormFile("file")

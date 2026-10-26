@@ -105,7 +105,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
 	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(testutil.Scoped(pool)),
-		filesrepo.NewTransactor(testutil.NewTxManager(pool), recorder, bus), store)
+		filesrepo.NewTransactor(testutil.NewTxManager(pool), recorder, bus), store, filesvc.UploadOptions{})
 	userCtx := requestctx.WithActorID(authz.WithSubject(tenantCtx, authz.NewSubject(userID, tenant.DefaultID, "user")), userID)
 	file, err := uploads.Upload(userCtx, userID, "report.pdf", strings.NewReader("%PDF-1"), 6, "application/pdf")
 	require.NoError(t, err)

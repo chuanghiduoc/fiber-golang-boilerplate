@@ -271,7 +271,7 @@ func TestFilesEvents_AdminAndRestorePublishInTx(t *testing.T) {
 	}
 	tx := filesrepo.NewTransactor(h.tx, h.recorder, bus)
 	adminSvc := filesvc.NewAdminFileService(h.files, tx, h.store)
-	uploadSvc := filesvc.NewUploadService(h.files, tx, h.store)
+	uploadSvc := filesvc.NewUploadService(h.files, tx, h.store, filesvc.UploadOptions{})
 
 	adminCtx := h.actorCtx(tenant.DefaultID, adminID, "admin")
 	ownerCtx := h.actorCtx(tenant.DefaultID, ownerID, "user")
