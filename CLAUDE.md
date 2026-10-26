@@ -128,7 +128,14 @@ migrations) to its owners; keep it current when adding a module.
   `internal/platform/**` (detected only with UPPERCASE keywords). Platform
   tables belong to `platform/<pkg>`; the one reviewed exception is
   `platform/features` reading `feature_flags`/`feature_flag_targets`. A CTE
-  must not be named like another owner's table.
+  must not be named like another owner's table. The scan also covers `pkg/`
+  and `cmd/`, and `test/arch/sql_literals_test.go` requires every
+  `Exec`/`Query`/`QueryRow`/batch SQL argument outside generated code to be a
+  compile-time constant; the reviewed dynamic-SQL allowlist there (with
+  `maxDynamicSQLSites`) only shrinks.
+- The Tier 1 audit check is per function (`go/ast`): the action literal and
+  `RecordTx`/`RecordInTx` must sit in one function or in functions linked by
+  same-package calls.
 - Migrations: every version is a 14-digit UTC timestamp, owners are real
   modules or `platform`, two spellings of one version are duplicates, and an
   owner's file or `-- owner:` section may only create that owner's tables
@@ -174,7 +181,10 @@ migrations) to its owners; keep it current when adding a module.
   claim/lease recovery/purge are
   global, so `jobs` has only the tenant-leading idempotency index.
 - `cmd/migrate` verifies required tables, columns, unique indexes (every
-  `ON CONFLICT` target), tenant-leading indexes, and enabled triggers
+  `ON CONFLICT` target), tenant-leading indexes, row-level security on every
+  table with a `tenant_id` column (found dynamically: `ENABLE`+`FORCE`, one
+  `tenant_isolation` policy calling `app_tenant_visible`, no other policy),
+  and enabled triggers
   (`trigger_memberships_last_owner`, `trigger_protect_last_owner`,
   `trigger_membership_roles_scope`, `trigger_platform_role_scope`, audit
   completion/no-delete/no-truncate); its
@@ -453,7 +463,9 @@ handler/service/DTO/repository package.
     only when `lease_expires_at < now()`, so workers with different lease
     durations (dedicated slow-kind workers) are safe together.
     Bookkeeping writes are fenced by owner and attempts, so a reclaimed worker
-    cannot finish the job, though it may still be running the old handler.
+    cannot finish the job; a worker whose heartbeat finds the lease gone (or
+    whose heartbeats keep failing for a full lease duration) cancels its
+    handler and records neither success nor failure.
   - Shutdown: one 20s budget; HTTP, scheduler/worker, and async work drain in
     parallel within a 15s window, the rest is reserved for tracing flush and
     closing cache/DB. A request keeps working up to 3s after its handler
@@ -470,14 +482,19 @@ handler/service/DTO/repository package.
     `files.trash.purge` (files soft-deleted more than
     `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
     `purge_started_at` claim that blocks restore, then blob, then row; a
-    missing blob counts as deleted; no event/webhook);
+    missing blob counts as deleted; a failed blob delete releases the claim
+    and backs the row off via `purge_attempts`/`purge_retry_after`, up to
+    24h; no event/webhook);
     `notifications.retention.purge` (notifications read more than
     `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept); and
     `privacy.exports.purge` (expired data-export blobs, then rows). See
-    `docs/operations.md` "Data retention overview".
+    `docs/operations.md` "Data retention overview". The k8s configmap enables
+    the scheduler, and `cmd/api` warns in production when a job-running role
+    has it off.
   - Metrics: `jobs_claimed_total{kind}`, `jobs_succeeded_total{kind}`,
     `jobs_retried_total{kind}`, `jobs_dead_total{kind}` (handler failures,
-    permanent ones included; not lease-expiry dead letters), `jobs_claim_errors_total`,
+    permanent ones included), `jobs_lease_dead_total{kind}` (dead-lettered by
+    lease expiry, also logged), `jobs_lease_lost_total{kind}`, `jobs_claim_errors_total`,
     `jobs_purged_total`, `audit_write_failures_total`, and the
     `jobs_queue_lag_seconds{kind}` histogram (from the claim query, no extra
     query; a stalled queue shows as missing observations).
@@ -523,7 +540,13 @@ handler/service/DTO/repository package.
   schema owner) when set: golang-migrate holds a session advisory lock,
   so it must bypass a transaction-mode pooler. The API/worker/seed role is a
   non-superuser without `BYPASSRLS`; create it with
-  `deploy/postgres/database-roles.sql`. `search_path` stays a startup
+  `deploy/postgres/database-roles.sql` (no `TRUNCATE`: it ignores RLS).
+  Production refuses a role that is a superuser, has `BYPASSRLS`, owns a
+  table in `DB_SCHEMA` (it could turn `FORCE` off), or is a member of such a
+  role (`cmd/api/rls.go`), and requires `DB_SSLMODE=verify-full` (optional
+  `DB_SSLROOTCERT`). In Kubernetes the migrate credentials live only in
+  `fiber-boilerplate-migrate-secrets`, mounted by the migration Job alone.
+  `search_path` stays a startup
   parameter: with PgBouncer either `track_extra_parameters = search_path` or
   `ignore_startup_parameters = search_path` plus
   `ALTER ROLE ... SET search_path`.
@@ -536,8 +559,13 @@ handler/service/DTO/repository package.
   and `webhook.delivery` job per matching endpoint in one transaction. The
   worker sends Standard Webhooks requests: `webhook-id` (event id; receivers
   deduplicate on it), `webhook-timestamp`, `webhook-signature: v1,<base64
-  HMAC-SHA256 of id.timestamp.body>` (space-separated co-signatures during
-  the 24h rotation grace); the envelope body carries `type`/`dataVersion`. It
+  HMAC-SHA256 of id.timestamp.body>` (for 24h after a rotation every delivery
+  is co-signed with the previous secret, space-separated; a second rotation
+  keeps only the immediately previous one); the envelope body carries
+  `type`/`dataVersion`. A replay is a new delivery row (`is_replay`) that
+  keeps the original `webhook-id`; pending deliveries follow an endpoint URL
+  change in the same transaction; audit metadata and `last_error` never hold
+  the endpoint URL path/query. It
   sends via `pkg/webhook.Client` (private/loopback/link-local blocked unless
   allowlisted, no redirects, no proxy, DNS pinned), records every attempt, and
   retries 408/425/429/5xx with backoff or `Retry-After`; other 3xx/4xx are
@@ -545,8 +573,9 @@ handler/service/DTO/repository package.
   pre-Standard secrets must be rotated), sealed with
   `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key in
   production) and returned only on create/rotate. `POST /webhooks/inbound/:id`
-  verifies the same scheme with the source secret, takes the type from the
-  body, and deduplicates `(source, webhook-id)`.
+  verifies the same scheme with the source secret (or, for 24h after a
+  rotation, the previous one), takes the type from the body, and deduplicates
+  `(source, webhook-id)`.
 - **Events**: typed bus over one versioned envelope `events.Event`
   {`id` UUIDv7, `type`, `dataVersion`, `occurredAt`, `tenantId`, `actor`
   {type user|service|system, id}, `data`} (1:1 with CloudEvents attributes;
@@ -557,7 +586,9 @@ handler/service/DTO/repository package.
   `SubscribeDurable` enqueues one job per event and handler (kind
   `events.<type>.<handler>`, key `event:<type>:<id>:<handler>:<tenantId>`);
   `PublishTx` keeps it atomic with the business transaction (files via its
-  tx-bound `EventPublisher` port; `app.Infra.Events`). Invalid durable
+  tx-bound `EventPublisher` port; `app.Infra.Events`) and enqueues durable
+  deliveries only: local `Subscribe` handlers are not called inside the
+  transaction (use `Publish` after commit). Invalid durable
   payloads dead-letter (`jobs.Permanent`). Panics are recovered per handler,
   errors joined; durable handlers must be idempotent.
 - **Scheduler:** optional (`SCHEDULER_ENABLED`, default false), global. One
@@ -626,7 +657,8 @@ handler/service/DTO/repository package.
   `user_id`; missing preferences mean both channels on. `notifications.Notifier`
   is the cross-module create API; identity implements
   `NotificationRecipientLookup` (only an active member of the context tenant
-  is a recipient), so notifications never reads `users`. With
+  is a recipient; the lookup runs for every send, in-app only included, and
+  an unknown recipient is 404), so notifications never reads `users`. With
   email on, the row and `email.send` job commit together (queue failure rolls
   back); both channels off is a successful no-op. Writes use
   `Idempotency-Key`; admin sends need `notifications:send`.
@@ -635,14 +667,24 @@ handler/service/DTO/repository package.
   `FEATURE_FLAGS` syntax only and `cmd/api` rejects unknown keys after
   `app.RegisterCatalogs`. `deps.Flags` is never nil after `app.New`.
   Precedence: force-off > kill switch > user > tenant > database default >
-  environment > compiled default. The `features` module scopes targets to
+  environment > compiled default. Kill switches fail closed: when the snapshot
+  is older than the max staleness, the last loaded snapshot's kill switches
+  still apply while everything else falls back. The `features` module scopes targets to
   `tenant.EffectiveID(ctx)` and invalidates the local snapshot after writes.
 - **Transactions:** `database.TxManager.WithTx` scopes one module/aggregate
   and installs the context's RLS scope right after `BEGIN`; never span modules
   (use jobs/events).
 - **Drivers:** storage `local|s3|seaweedfs` (`pkg/storage/drivers.New`; S3 via
-  aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis`, email
+  aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis` (memory is
+  bounded by `CACHE_MEMORY_MAX_ENTRIES`, default 100000, expired-then-LRU
+  eviction), email
   `console|smtp`, chosen by config factories.
+- **Request bodies:** Fiber streams request bodies (`StreamRequestBody`,
+  lazy multipart). `middleware.BodyLimit` caps every body at
+  `APP_JSON_BODY_LIMIT` before auth (declared `Content-Length` rejected
+  unread; chunked bodies read through a limited reader). Only multipart on
+  `POST /api/v1/files/upload` (`filesUploadPath` in `internal/app`, keep it in
+  sync with the files route) may use `APP_BODY_LIMIT`.
 - **Rate limits:** tiered, cache-backed; authenticated requests keyed per user,
   unauthenticated per IP.
 - **Idempotency** (`docs/operations.md` flowchart): opt-in `Idempotency-Key`

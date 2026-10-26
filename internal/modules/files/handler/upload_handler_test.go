@@ -251,6 +251,33 @@ func TestUploadHandler_Upload_DisallowedMIME(t *testing.T) {
 	assert.Equal(t, fiber.StatusUnsupportedMediaType, resp.StatusCode)
 }
 
+func TestUploadHandler_RejectsBodyOverFiberLimit(t *testing.T) {
+	app := fiber.New(fiber.Config{
+		ErrorHandler:                 apperrorhttp.FiberErrorHandler,
+		BodyLimit:                    128,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+	})
+	uploadHandler := NewUploadHandler(newMockUploadService(), 10*1024*1024, []string{"text/plain; charset=utf-8"})
+	app.Post("/upload", middleware.JWTAuth("test-secret"), uploadHandler.Upload)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "large.txt")
+	require.NoError(t, err)
+	_, err = part.Write(bytes.Repeat([]byte("x"), 256))
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	req, _ := http.NewRequest("POST", "/upload", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+userToken())
+
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusRequestEntityTooLarge, resp.StatusCode)
+}
+
 func TestUploadHandler_RejectsOversizedFile(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	uploadHandler := NewUploadHandler(newMockUploadService(), 10, []string{"text/plain; charset=utf-8"})

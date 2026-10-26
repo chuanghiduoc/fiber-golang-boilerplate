@@ -80,6 +80,7 @@ func (r *Postgres) CreateDeliveryWithJob(ctx context.Context, draft webhooksvc.D
 			MaxAttempts:      draft.MaxAttempts,
 			TimeoutMs:        draft.TimeoutMS,
 			ReplayedFromID:   nullableInt8(draft.ReplayedFromID),
+			IsReplay:         draft.IsReplay,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The event was already dispatched to this endpoint. Nothing was

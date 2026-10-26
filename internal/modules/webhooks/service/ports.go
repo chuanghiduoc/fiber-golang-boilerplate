@@ -24,6 +24,12 @@ const (
 
 	// DeliveryJobKind is the durable job kind for one delivery attempt.
 	DeliveryJobKind = "webhook.delivery"
+
+	// SecretRotationGrace is how long a retired endpoint secret keeps
+	// co-signing deliveries after a rotation, and how long the inbound
+	// receiver accepts a source's previous secret. Receivers and senders get
+	// 24 hours to switch to the new secret.
+	SecretRotationGrace = 24 * time.Hour
 )
 
 var (
@@ -92,17 +98,21 @@ type DeliveryAttempt struct {
 	CreatedAt  time.Time
 }
 
-// InboundSource is a tenant-owned HMAC-authenticated receiver.
+// InboundSource is a tenant-owned HMAC-authenticated receiver. The previous
+// sealed secret is kept, with an explicit expiry, for the rotation grace
+// window so a sender that has not switched yet still verifies.
 type InboundSource struct {
-	ID               int64
-	TenantID         int64
-	Name             string
-	Slug             string
-	SecretCiphertext string
-	Status           string
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	DeletedAt        *time.Time
+	ID                       int64
+	TenantID                 int64
+	Name                     string
+	Slug                     string
+	SecretCiphertext         string
+	PreviousSecretCiphertext string
+	PreviousSecretExpiresAt  *time.Time
+	Status                   string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	DeletedAt                *time.Time
 }
 
 // InboundEvent is one authenticated, deduplicated inbound event.
@@ -138,11 +148,12 @@ type ActiveEndpoint struct {
 	SecretCiphertext string
 }
 
-// SigningSecret is an endpoint's current active sealed secret and when it
-// became active (its rotation time).
-type SigningSecret struct {
-	Ciphertext string
-	CreatedAt  time.Time
+// SigningSecrets is an endpoint's active sealed secret plus the immediately
+// previous sealed secret while its explicit rotation grace window is open.
+// PreviousCiphertext is empty once the grace expires.
+type SigningSecrets struct {
+	CurrentCiphertext  string
+	PreviousCiphertext string
 }
 
 // CreateEndpointInput is the endpoint configuration a caller may set.
@@ -206,6 +217,9 @@ type DeliveryDraft struct {
 	TimeoutMS        int32
 	RunAt            time.Time
 	ReplayedFromID   int64
+	// IsReplay inserts a new delivery for an existing event instead of taking
+	// part in the per-endpoint dispatch deduplication.
+	IsReplay bool
 }
 
 // ListDeliveriesParams filters the tenant's delivery history.
@@ -287,7 +301,7 @@ type EndpointStore interface {
 	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*Endpoint, error)
 	ActiveEndpoints(ctx context.Context, tenantID int64) ([]ActiveEndpoint, error)
 	ActiveEndpointSecret(ctx context.Context, endpointID int64) (string, error)
-	ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error)
+	SigningSecrets(ctx context.Context, endpointID int64) (*SigningSecrets, error)
 }
 
 // DeliveryStore covers the outbox, attempts, claims, and retention.

@@ -52,14 +52,38 @@ SET url = @url,
 WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
 RETURNING *;
 
+-- name: UpdateWebhookDeliveryEndpointSnapshot :exec
+-- Runs in the endpoint update transaction: a queued delivery must follow the
+-- endpoint's new URL/timeout instead of retrying the old receiver. Terminal
+-- (succeeded/dead) rows keep the snapshot they were sent with.
+UPDATE webhook_deliveries
+SET url = @url,
+    timeout_ms = @timeout_ms
+WHERE tenant_id = @tenant_id
+  AND endpoint_id = @endpoint_id
+  AND status = 'pending';
+
 -- name: DeleteWebhookEndpoint :execrows
 UPDATE webhook_endpoints
 SET status = 'disabled', deleted_at = NOW()
 WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL;
 
--- name: DeactivateWebhookEndpointSecrets :exec
+-- name: ExpireOlderWebhookEndpointSecrets :exec
+-- A second rotation inside the grace window drops the older retired secret:
+-- only the immediately previous secret may co-sign deliveries.
 UPDATE webhook_endpoint_secrets
-SET active = FALSE
+SET grace_expires_at = NOW()
+WHERE tenant_id = @tenant_id
+  AND endpoint_id = @endpoint_id
+  AND NOT active
+  AND grace_expires_at > NOW();
+
+-- name: DeactivateWebhookEndpointSecrets :exec
+-- Retires the active secret but keeps it usable for dual-signing until its
+-- explicit grace expiry.
+UPDATE webhook_endpoint_secrets
+SET active = FALSE,
+    grace_expires_at = NOW() + make_interval(secs => @grace_seconds::double precision)
 WHERE tenant_id = @tenant_id AND endpoint_id = @endpoint_id AND active;
 
 -- name: CreateWebhookEndpointSecret :one
@@ -75,6 +99,18 @@ RETURNING *;
 SELECT * FROM webhook_endpoint_secrets
 WHERE tenant_id = @tenant_id AND endpoint_id = @endpoint_id AND active
 LIMIT 1;
+
+-- name: GetWebhookEndpointSigningSecrets :one
+-- The delivery worker signs with the current secret first and, while its
+-- explicit grace expiry is still open, the immediately previous one too.
+SELECT
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_endpoint_secrets s
+      WHERE s.tenant_id = @tenant_id AND s.endpoint_id = @endpoint_id AND s.active
+      ORDER BY s.version DESC LIMIT 1), '')::text AS current_ciphertext,
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_endpoint_secrets s
+      WHERE s.tenant_id = @tenant_id AND s.endpoint_id = @endpoint_id
+        AND NOT s.active AND s.grace_expires_at > NOW()
+      ORDER BY s.version DESC LIMIT 1), '')::text AS previous_ciphertext;
 
 -- name: LockWebhookEndpoint :one
 -- Serializes concurrent secret rotations: the row lock is held until the
@@ -132,14 +168,14 @@ ON CONFLICT (tenant_id, event_id) DO NOTHING;
 INSERT INTO webhook_deliveries (
     tenant_id, endpoint_id, event_id,
     url, secret_ciphertext, status, max_attempts, timeout_ms,
-    next_attempt_at, replayed_from_id
+    next_attempt_at, replayed_from_id, is_replay
 )
 VALUES (
     @tenant_id, @endpoint_id, @event_id,
     @url, @secret_ciphertext, 'pending', @max_attempts, @timeout_ms,
-    NOW(), @replayed_from_id
+    NOW(), @replayed_from_id, @is_replay
 )
-ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
+ON CONFLICT (tenant_id, endpoint_id, event_id) WHERE NOT is_replay DO NOTHING
 RETURNING id;
 
 -- name: GetWebhookDelivery :one
@@ -351,8 +387,12 @@ WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
 RETURNING *;
 
 -- name: RotateWebhookInboundSourceSecret :one
+-- The replaced secret stays valid for the grace window. A second rotation
+-- overwrites it, so only the immediately previous secret is accepted.
 UPDATE webhook_inbound_sources
-SET secret_ciphertext = @secret_ciphertext
+SET previous_secret_ciphertext = secret_ciphertext,
+    previous_secret_expires_at = NOW() + make_interval(secs => @grace_seconds::double precision),
+    secret_ciphertext = @secret_ciphertext
 WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
 RETURNING *;
 

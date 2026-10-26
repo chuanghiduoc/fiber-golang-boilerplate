@@ -54,12 +54,29 @@ var _ Registrar = (*Worker)(nil)
 type store interface {
 	// Claim and Heartbeat set the job's lease deadline to now() + lease, the
 	// calling worker's own lease, so workers with different leases coexist.
-	Claim(ctx context.Context, workerID string, limit int, lease time.Duration) ([]claimedJob, error)
+	// Claim also reports jobs that lease expiry dead-lettered on their final
+	// attempt; they are not dispatched.
+	Claim(ctx context.Context, workerID string, limit int, lease time.Duration) (claimResult, error)
 	Succeed(ctx context.Context, id int64, workerID string, attempts int) error
 	Fail(ctx context.Context, id int64, workerID string, attempts int, reason string, retryAt *time.Time) error
 	Heartbeat(ctx context.Context, id int64, workerID string, attempts int, lease time.Duration) error
 	Release(ctx context.Context, id int64, workerID string, attempts int, reason string) error
 	PurgeTerminal(ctx context.Context, olderThan time.Duration) (int64, error)
+}
+
+// claimResult is one Claim call: jobs this worker now owns and, separately,
+// jobs that lease expiry dead-lettered while reclaiming expired leases.
+type claimResult struct {
+	Jobs      []claimedJob
+	LeaseDead []leaseExpiredJob
+}
+
+// leaseExpiredJob identifies a job dead-lettered by the claim query because
+// its worker's lease expired on the job's final attempt.
+type leaseExpiredJob struct {
+	ID       int64
+	TenantID int64
+	Kind     string
 }
 
 type claimedJob struct {
@@ -344,11 +361,14 @@ func (w *Worker) Run(ctx context.Context) error {
 		}
 		claimBackoff = cappedClaimBackoff(w.pollInterval)
 
-		if len(claimed) == 0 {
+		for _, dead := range claimed.LeaseDead {
+			w.recordLeaseDead(dead)
+		}
+		if len(claimed.Jobs) == 0 {
 			waitFor(ctx, w.pollInterval)
 			continue
 		}
-		for _, job := range claimed {
+		for _, job := range claimed.Jobs {
 			w.dispatch(ctx, job, slots, finished, &wg)
 		}
 	}
@@ -430,7 +450,13 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 	processCtx, span := w.startJobSpan(ctx, job)
 	defer span.End()
 
-	interrupted, handlerErr := w.runHandler(ctx, processCtx, job)
+	interrupted, leaseLost, handlerErr := w.runHandler(ctx, processCtx, job)
+	if leaseLost {
+		// The job may already belong to another worker. Its fenced outcome
+		// write would affect no row, so there is nothing to record: report the
+		// loss instead of counting the canceled handler as a failure.
+		return w.recordLeaseLost(span, job)
+	}
 
 	// The job has already been claimed in the database, so bookkeeping must
 	// still run when the caller's context was canceled during shutdown.
@@ -453,11 +479,13 @@ func (w *Worker) processJob(ctx context.Context, job claimedJob) error {
 // by a background heartbeat on the worker context that is stopped and joined
 // before returning, so no heartbeat can race the outcome write. interrupted
 // reports a failure while the worker itself was stopping, which is most likely
-// the shutdown cancellation rather than a verdict on the job.
-func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJob) (interrupted bool, err error) {
+// the shutdown cancellation rather than a verdict on the job. leaseLost reports
+// that the heartbeat canceled the handler because the worker no longer owns
+// the lease.
+func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJob) (interrupted, leaseLost bool, err error) {
 	handler, ok := w.handler(job.Kind)
 	if !ok {
-		return false, fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
+		return false, false, fmt.Errorf("%w for kind %q", ErrNoHandler, job.Kind)
 	}
 
 	// Restore the tenant that owns the job so handlers (email, audit, and
@@ -465,20 +493,29 @@ func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJo
 	// written before multi-tenancy, and test doubles, may omit the column;
 	// those jobs run under the compatibility tenant.
 	handlerCtx := tenant.WithID(processCtx, jobTenantID(job))
-	cancel := context.CancelFunc(func() {})
+	timeoutCancel := context.CancelFunc(func() {})
 	if w.jobTimeout > 0 {
-		handlerCtx, cancel = context.WithTimeout(handlerCtx, w.jobTimeout)
+		handlerCtx, timeoutCancel = context.WithTimeout(handlerCtx, w.jobTimeout)
 	}
+	// The heartbeat needs a cancelable context with a cause of its own, so a
+	// lease loss can be told apart from a job timeout or worker shutdown. A
+	// lost lease cancels the handler exactly like any other deadline: the
+	// handler must stop doing work now that another worker may own the job.
+	handlerCtx, cancelCause := context.WithCancelCause(handlerCtx)
+	defer timeoutCancel()
+	defer cancelCause(nil)
 
-	stopHeartbeat := w.startHeartbeat(processCtx, job.ID, job.Attempts)
+	stopHeartbeat := w.startHeartbeat(processCtx, cancelCause, job)
 	err = callHandler(handlerCtx, handler, job.Payload)
 	// Capture both classifications immediately: stopHeartbeat can take time.
 	// A disabled timeout must never classify a parent cancellation as a job
 	// timeout, and an already-expired parent deadline is not a job timeout.
 	timedOut := w.jobTimeout > 0 && workerCtx.Err() == nil && errors.Is(handlerCtx.Err(), context.DeadlineExceeded)
 	interrupted = err != nil && workerCtx.Err() != nil
-	cancel()
 	stopHeartbeat()
+	// stopHeartbeat joined the heartbeat goroutine, so no later cancellation
+	// can change the cause.
+	leaseLost = errors.Is(context.Cause(handlerCtx), ErrLeaseLost)
 
 	if err == nil && timedOut {
 		// The handler ignored cancellation and returned after its deadline,
@@ -492,7 +529,7 @@ func (w *Worker) runHandler(workerCtx, processCtx context.Context, job claimedJo
 			"timeout", w.jobTimeout.String(),
 		)
 	}
-	return interrupted, err
+	return interrupted, leaseLost, err
 }
 
 func (w *Worker) recordSuccess(ctx context.Context, span trace.Span, job claimedJob) error {
@@ -547,6 +584,37 @@ func (w *Worker) recordFailure(ctx context.Context, span trace.Span, job claimed
 	tracing.MarkError(span, handlerErr)
 	span.SetAttributes(jobOutcomeAttributes(outcome, retryAt)...)
 	return nil
+}
+
+// recordLeaseLost reports a handler canceled because this worker lost the job
+// lease. It writes no job outcome on purpose: the job may already belong to
+// another worker, whose fenced write is authoritative, so recording a failure
+// here would double-count the attempt (and could dead-letter work a reclaimer
+// is still running).
+func (w *Worker) recordLeaseLost(span trace.Span, job claimedJob) error {
+	metrics.JobsLeaseLostTotal.WithLabelValues(job.Kind).Inc()
+	slog.Warn("jobs: lease lost; canceled handler without recording an outcome",
+		"job_id", job.ID,
+		"kind", job.Kind,
+		"worker_id", w.id,
+	)
+	tracing.MarkError(span, ErrLeaseLost)
+	span.SetAttributes(jobOutcomeAttributes("lease_lost", nil)...)
+	return nil
+}
+
+// recordLeaseDead reports a job the claim query dead-lettered because its
+// lease expired on the final attempt. The claim query already cleared the
+// payload and set last_error, so this only makes the loss visible in metrics
+// and logs.
+func (w *Worker) recordLeaseDead(job leaseExpiredJob) {
+	metrics.JobsLeaseDeadTotal.WithLabelValues(job.Kind).Inc()
+	slog.Error("jobs: job dead-lettered after worker lease expired at max attempts",
+		"job_id", job.ID,
+		"kind", job.Kind,
+		"tenant_id", job.TenantID,
+		"worker_id", w.id,
+	)
 }
 
 // jobTenantID returns the tenant that owns job, falling back to the
@@ -626,14 +694,21 @@ func (w *Worker) purgeTerminal(ctx context.Context) {
 // called. Heartbeats use a context detached from cancellation so a handler
 // that is still unwinding during shutdown keeps ownership until it finishes.
 // stop waits for the goroutine, which guarantees no heartbeat runs after the
-// worker writes the final outcome. attempts is the worker's claim fence: a job
-// reclaimed at a higher attempt no longer matches and reports ErrLeaseLost.
-func (w *Worker) startHeartbeat(ctx context.Context, id int64, attempts int) func() {
+// worker writes the final outcome. job.Attempts is the worker's claim fence: a
+// job reclaimed at a higher attempt no longer matches and reports ErrLeaseLost.
+//
+// The heartbeat also owns lease-loss cancellation. A fenced heartbeat that
+// affects no row reports ErrLeaseLost, so the handler is canceled at once
+// instead of continuing to produce side effects another worker will duplicate.
+// A transient heartbeat failure is tolerated until the lease duration has
+// elapsed since the last successful heartbeat (or the claim), because only then
+// may another worker reclaim the job.
+func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, job claimedJob) func() {
 	if w.store == nil || w.heartbeatInterval <= 0 {
 		return func() {}
 	}
 
-	hbCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	hbCtx, hbCancel := context.WithCancel(context.WithoutCancel(ctx))
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -641,6 +716,9 @@ func (w *Worker) startHeartbeat(ctx context.Context, id int64, attempts int) fun
 		ticker := time.NewTicker(w.heartbeatInterval)
 		defer ticker.Stop()
 
+		// The claim established the lease; treat it as the last success until
+		// a heartbeat proves the lease was renewed.
+		lastRenewed := time.Now()
 		for {
 			select {
 			case <-hbCtx.Done():
@@ -651,24 +729,38 @@ func (w *Worker) startHeartbeat(ctx context.Context, id int64, attempts int) fun
 					timeout = bookkeepingTimeout
 				}
 				callCtx, callCancel := context.WithTimeout(hbCtx, timeout)
-				err := w.store.Heartbeat(callCtx, id, w.id, attempts, w.leaseDuration)
+				err := w.store.Heartbeat(callCtx, job.ID, w.id, job.Attempts, w.leaseDuration)
 				callCancel()
-				if err != nil {
-					// A missed heartbeat is not fatal here: either the lease is
-					// still valid or the job has already been reclaimed, in
-					// which case the final Succeed/Fail write is authoritative.
-					slog.Warn("jobs: heartbeat failed",
-						"job_id", id,
-						"worker_id", w.id,
-						"error", err,
-					)
+				if err == nil {
+					lastRenewed = time.Now()
+					continue
+				}
+				if errors.Is(err, ErrLeaseLost) {
+					// Another worker owns the job now. A final outcome write
+					// with this attempt fence cannot match, so stop the handler
+					// before it duplicates the new owner's work.
+					cancel(fmt.Errorf("%w: job %d kind %q: %w", ErrLeaseLost, job.ID, job.Kind, err))
+					return
+				}
+				slog.Warn("jobs: heartbeat failed",
+					"job_id", job.ID,
+					"kind", job.Kind,
+					"worker_id", w.id,
+					"error", err,
+				)
+				if time.Since(lastRenewed) >= w.leaseDuration {
+					// The lease can no longer be proven alive: another worker
+					// may reclaim the job from now on. Cancel instead of
+					// running on with a handler whose outcome can be fenced out.
+					cancel(fmt.Errorf("%w: job %d kind %q: heartbeat deadline exceeded", ErrLeaseLost, job.ID, job.Kind))
+					return
 				}
 			}
 		}
 	}()
 
 	return func() {
-		cancel()
+		hbCancel()
 		<-done
 	}
 }

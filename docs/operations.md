@@ -117,7 +117,9 @@ authorization:
 | `jobs_claimed_total` | `kind` | Jobs claimed by workers. |
 | `jobs_succeeded_total` | `kind` | Successful outcomes recorded in the database. |
 | `jobs_retried_total` | `kind` | Failed jobs requeued for another attempt. |
-| `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
+| `jobs_dead_total` | `kind` | Jobs dead-lettered by a handler failure after exhausting attempts (permanent failures included). Lease-expiry dead letters are counted by `jobs_lease_dead_total` instead. |
+| `jobs_lease_lost_total` | `kind` | Running handlers canceled because their worker lost the lease (a fenced heartbeat matched no row, or heartbeats failed for the whole lease). No outcome is recorded for them, so this is a duplicate-execution risk signal. |
+| `jobs_lease_dead_total` | `kind` | Jobs dead-lettered by the claim query because their lease expired on the final attempt. |
 | `jobs_queue_lag_seconds` | `kind` | Histogram of seconds between a job becoming due (`run_at`) and its claim, computed by the claim query (database clock). Only claimed jobs are observed, so a fully stalled queue shows up as missing observations; alert on `jobs_claimed_total` too. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
@@ -155,6 +157,12 @@ histogram_quantile(0.95,
 
 # New dead letters
 increase(jobs_dead_total[15m]) > 0
+
+# Lost leases (possible duplicate execution)
+increase(jobs_lease_lost_total[15m]) > 0
+
+# Jobs dead-lettered because their worker lease expired on the final attempt
+increase(jobs_lease_dead_total[15m]) > 0
 
 # Sustained claim failures
 rate(jobs_claim_errors_total[5m]) > 0
@@ -326,7 +334,7 @@ stateDiagram-v2
 | Permanent failure | A handler error wrapped with `jobs.Permanent(err)` dead-letters on that attempt; `last_error` starts with `permanent failure (not retried): ` and `jobs_dead_total{kind}` counts it. Used for undecodable or invalid payloads (email, password-reset request, webhook dispatch/delivery). Decryption failures are **not** permanent: a replica missing a key another one already seals with retries until the rollout completes. |
 | Unknown kind | Follows the same retry path, so a rollout can register the handler before pending work dies; a permanently missing handler eventually dead-letters. |
 | Handler timeout | 10m by default. A timeout is a normal failure that consumes the attempt. Cancellation is cooperative: a handler that ignores its context keeps running and heartbeating, and one that still returns success after its deadline is recorded as succeeded with a warning. |
-| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt). The crashed attempt counts. The previous owner may still be executing, so concurrent duplicate execution is possible. |
+| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt); a lease-expiry dead letter is logged at error level and counted by `jobs_lease_dead_total{kind}`, never by `jobs_dead_total`. The crashed attempt counts. A live worker that loses the lease (a fenced heartbeat matches no row, or heartbeats fail for the whole lease duration) cancels its handler at once with `jobs.ErrLeaseLost`, records no success or failure (the reclaimer's fenced write is authoritative), and counts `jobs_lease_lost_total{kind}`. A handler that ignores cancellation can still overrun, so delivery remains at-least-once. |
 | Fencing | Every outcome write is fenced by `attempts`, so a reclaimed worker's late result is discarded. |
 | Shutdown release | On SIGINT/SIGTERM the worker stops claiming and cancels running handlers inside the shared shutdown budget (see [Graceful shutdown](#graceful-shutdown)). A handler that fails while the worker is stopping is requeued immediately **without consuming its attempt** (`last_error` starts with `jobs: interrupted by worker shutdown`, span outcome `released`), so a drain on the final attempt never dead-letters. A handler that still succeeds is recorded normally. A non-cooperative handler can exceed the window. |
 | Claim errors | Retried in-process with exponential backoff capped at 30s. |
@@ -364,11 +372,14 @@ optional `deploy/k8s/base/worker/` component.
 
 Notifications use the same queue and `email.send`/`email.send.encrypted` kinds
 as identity email. The service resolves the recipient through identity's
-`contracts.NotificationRecipientLookup` and never reads `users` directly. When
-the `email` channel is enabled, the in-app row and the email job commit in one
-transaction, so a queue outage returns `500` and rolls the row back.
-Preferences apply before any write: an explicit `enabled=false` row skips that
-channel; a missing row means enabled.
+`contracts.NotificationRecipientLookup` and never reads `users` directly. The
+lookup runs for every notification, including an in-app-only one: only an
+active member of the request tenant is a recipient, and anything else is a
+`404` before a row is written (a membership FK violation is mapped to the same
+not-found). When the `email` channel is enabled, the in-app row and the email
+job commit in one transaction, so a queue outage returns `500` and rolls the
+row back. Preferences apply before any write: an explicit `enabled=false` row
+skips that channel; a missing row means enabled.
 
 ```sql
 -- Unread backlog per tenant/user
@@ -472,18 +483,22 @@ loops run in every worker process regardless.
 | `scheduler_runs` | Older than `SCHEDULER_RETENTION_DAYS` (30); newest row per schedule kept | Scheduler leader, hourly | See [Scheduler](#scheduler) | — |
 | Identity tokens | Expired | `identity.tokens.purge_expired`, hourly (scheduler) | 1,000-row batches, 1 min per table | `idx_refresh_tokens_expires_at` |
 | Webhook deliveries/events | Terminal, older than `WEBHOOK_RETENTION_DAYS` (30) | Webhooks background loop, hourly | 1,000-row batches, 30s per pass | See [Webhooks](webhooks.md) |
-| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
+| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
-indefinitely, notifications are never deleted, and expired export documents
-stay in storage until the scheduler is enabled. The retention indexes
+indefinitely, notifications are never deleted, expired export documents stay in
+storage, and expired tokens and scheduler ledger rows accumulate. The Kubernetes
+ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
+(`APP_ROLE=all` or `worker`); `cmd/api` logs a production warning when a
+worker-capable process starts with it off. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
 every tenant; they are partial, so live files, unread notifications, and active
-exports are not indexed. These indexes and the purge claim column
-`files.purge_started_at` are part of the init migration.
+exports are not indexed. These indexes and the purge claim/retry columns
+`files.purge_started_at`, `files.purge_attempts`, and `files.purge_retry_after`
+are part of the init migration.
 
 #### Privacy exports and erasure
 
@@ -541,16 +556,17 @@ sequenceDiagram
     participant W as files.trash.purge job
     participant DB as PostgreSQL (files)
     participant S as Object storage
-    loop until a short batch, a blob failure, or the 1 min budget
-        W->>DB: UPDATE files SET purge_started_at = now() WHERE id IN<br/>(oldest 100 trashed > N days, FOR UPDATE SKIP LOCKED); COMMIT
+    loop until a short batch or the 1 min budget
+        W->>DB: UPDATE files SET purge_started_at = now() WHERE id IN<br/>(oldest 100 trashed > N days and retry due, FOR UPDATE SKIP LOCKED); COMMIT
         loop each claimed row
             W->>S: Delete(storage_path)
             alt deleted or already missing
                 S-->>W: ok (row queued for hard delete)
             else storage error
-                S-->>W: error (row kept, logged)
+                S-->>W: error (row queued for deferred retry, logged)
             end
         end
+        W->>DB: UPDATE failed rows SET purge_started_at = NULL,<br/>purge_attempts = purge_attempts + 1, purge_retry_after = ...; COMMIT
         W->>DB: DELETE FROM files WHERE id = ANY(ids) AND purge_started_at IS NOT NULL
     end
 ```
@@ -558,8 +574,8 @@ sequenceDiagram
 | Rule | Behavior |
 | --- | --- |
 | Order | Claim, blob, then row. A crash or failed hard delete after the blob delete leaves a claimed row with no blob; the next run deletes it (a missing blob counts as deleted). |
-| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` even if the purge later fails. A row whose blob delete failed stays claimed: it is past retention and only waits for the next run. |
-| Failures | A blob that cannot be deleted keeps its (claimed) row, is logged at error level with `file_id`/`tenant_id`, and fails the job after the rest of the batch commits (normal retry/dead-letter path); the next scheduled run tries again. |
+| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` while the blob operation runs. A failed blob releases the claim; the row is restorable again and can be retried later. |
+| Failures | A blob that cannot be deleted is logged at error level with `file_id`/`tenant_id`, counted, and deferred on its own row: the claim is released, `purge_attempts` increments, and `purge_retry_after` moves out with a capped exponential backoff. The rest of the batch is still hard-deleted, the job succeeds, and claiming skips rows whose retry time is in the future, so one permanently failing blob cannot block newer rows. |
 | Events | None. The purge publishes no domain event, so no webhook fires; the user-visible deletion already emitted `file.deleted`. No audit row is written (system retention, like the token purge). |
 
 ```sql
@@ -567,6 +583,12 @@ sequenceDiagram
 SELECT tenant_id, count(*), min(deleted_at)
 FROM files
 WHERE deleted_at IS NOT NULL
+GROUP BY tenant_id;
+
+-- Blob failures deferred for a later run
+SELECT tenant_id, count(*), max(purge_attempts), max(purge_retry_after)
+FROM files
+WHERE purge_retry_after IS NOT NULL
 GROUP BY tenant_id;
 
 -- Read notifications past retention (should stay near zero)
@@ -671,7 +693,12 @@ Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
 ### Durable events
 
 `internal/platform/events` publishes metadata-rich events locally and/or as
-jobs. A durable subscription adds one job per event and handler with
+jobs. `PublishTx` only enqueues the durable jobs on the caller's transaction;
+local subscribers are **not** notified inside it, because a `pgx.Tx` has no
+after-commit hook. Use `Publish` or `PublishLocal` after the transaction when
+local delivery is needed. That keeps a rollback from leaving a ghost local
+event and keeps a local handler error from rolling back the business work. A
+durable subscription adds one job per event and handler with
 `jobs.idempotency_key = event:<eventName>:<eventId>:<handler>:<tenantId>`; the
 job payload is the event JSON. Delivery is at-least-once, so handlers must be
 idempotent. Local handler panics are recovered and combined with
@@ -979,7 +1006,9 @@ the handler, so a retry that races the owner's completion still replays.
 - Memory cache is per process and unsuitable for multiple replicas or for
   guarantees across restarts. Production rejects `CACHE_DRIVER=memory` unless
   `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true` (a deliberate single-replica
-  deployment only).
+  deployment only). It is bounded by `CACHE_MEMORY_MAX_ENTRIES` (default
+  100000): once full, expired entries are dropped first and then the least
+  recently used ones, so stored responses cannot grow the heap without limit.
 
 ### Rate limits
 
@@ -1004,6 +1033,7 @@ second per request:
 | `REDIS_READ_TIMEOUT_MS` / `REDIS_WRITE_TIMEOUT_MS` | 500 / 500 |
 | `REDIS_POOL_TIMEOUT_MS` | 1000 |
 | `REDIS_MAX_RETRIES` | 1 |
+| `CACHE_MEMORY_MAX_ENTRIES` | 100000 (memory driver bound; must be > 0) |
 
 The `REDIS_*` values override timeout/retry parameters in `REDIS_URL`
 (instead of go-redis's 5s dial, 3s read, and 3 retries). The client sets
@@ -1047,8 +1077,8 @@ During a Redis outage:
 Only `cmd/migrate` applies DDL; `cmd/api` and `cmd/seed` assume the schema
 exists, so replicas do not race. `cmd/migrate` loads only `DB_*` plus
 `APP_ENV`/`LOG_LEVEL`; it needs no JWT, admin, SMTP, storage, or other
-application secrets, and it rejects plaintext `DB_SSLMODE` values in
-production.
+application secrets, and it requires `DB_SSLMODE=verify-full` in production
+(the API and the migration Job share the rule).
 
 ```bash
 go run ./cmd/migrate   # apply pending migrations
@@ -1076,9 +1106,12 @@ flowchart TD
 ### Database roles and row-level security
 
 Every tenant-owned table has forced row-level security. The API,
-worker, and `cmd/seed` must connect as a dedicated non-superuser role without
-`BYPASSRLS`; a superuser or a `BYPASSRLS` role ignores every policy. `cmd/api`
-logs an error when it detects one and refuses to start when
+worker, and `cmd/seed` must connect as a dedicated non-superuser role that
+`BYPASSRLS` does not exempt and that owns no table in the configured schema;
+a superuser or a `BYPASSRLS` role ignores every policy, and a table owner can
+run `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`. A member of a
+superuser/`BYPASSRLS` role is unsafe too, because it can `SET ROLE`. `cmd/api`
+logs an error when it detects any of these and refuses to start when
 `APP_ENV=production`. `cmd/migrate` needs the schema owner instead
 (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
 `DB_USERNAME`/`DB_PASSWORD`).
@@ -1091,8 +1124,10 @@ psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
 ```
 
 The script grants schema access, table/sequence/function privileges, and
-`ALTER DEFAULT PRIVILEGES` for tables later migrations create. Docker Compose
-runs it automatically on a fresh volume (`deploy/postgres/init-app-role.sh`).
+`ALTER DEFAULT PRIVILEGES` for tables later migrations create. It deliberately
+does not grant `TRUNCATE`: truncation ignores RLS, so only the schema owner may
+do it. Docker Compose runs it automatically on a fresh volume
+(`deploy/postgres/init-app-role.sh`).
 
 Scoping is per transaction and never session-level:
 `database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
@@ -1279,7 +1314,7 @@ and topology diagram. The ordering invariant:
 
 ```mermaid
 flowchart LR
-    pre["1. Apply prereqs overlay<br/>Namespace + ConfigMap"] --> sec["2. Secret created<br/>out of band"]
+    pre["1. Apply prereqs overlay<br/>Namespace + ConfigMap"] --> sec["2. Secrets created<br/>out of band"]
     sec --> chk{"3. Old migration Job<br/>Complete or Failed?"}
     chk -- still running --> waitj[Wait; never interrupt]
     waitj --> chk
@@ -1289,9 +1324,10 @@ flowchart LR
 
 1. `kubectl apply -k deploy/k8s/overlays/<env>/prereqs` applies the Namespace
    and environment ConfigMap before the migration Job.
-2. Create `fiber-boilerplate-secrets` in that namespace out of band (or through
-   External Secrets / Sealed Secrets / SOPS). It is never part of a
-   kustomization.
+2. Create `fiber-boilerplate-secrets` (runtime) and
+   `fiber-boilerplate-migrate-secrets` (schema owner, mounted only by the Job)
+   in that namespace out of band (or through External Secrets / Sealed Secrets
+   / SOPS). Neither is part of a kustomization.
 3. Delete an existing migration Job only once it is `Complete` or `Failed`.
    Apply `kubectl apply -k deploy/k8s/overlays/<env>/migration`, wait for
    `condition=complete`, and read its logs. The deploy workflow refuses to
@@ -1350,16 +1386,20 @@ scheme), region, bucket, access key, and secret key.
 
 | Limit | Behavior |
 | --- | --- |
-| `APP_BODY_LIMIT` (12 MiB) | Fiber's ceiling and the multipart upload limit. Fiber-generated 413s above it are rejected before any middleware, so they use `payload_too_large` but carry no CORS, request-ID, or locale headers. |
-| `APP_JSON_BODY_LIMIT` (default 1 MiB, must not exceed `APP_BODY_LIMIT`) | Caps every non-multipart body with `413 payload_too_large` before auth, rate limiting, or decoding. |
+| `APP_BODY_LIMIT` (12 MiB) | Fiber's configured body ceiling, and the multipart ceiling on `POST /api/v1/files/upload` only. The body-limit middleware rejects a larger declared `Content-Length` before the body is read; the upload handler parses the form lazily under this limit after authentication, and a chunked body over it is a `413`. |
+| `APP_JSON_BODY_LIMIT` (default 1 MiB, must not exceed `APP_BODY_LIMIT`) | Caps every other body (JSON, form, raw, and multipart on non-upload routes) with `413 payload_too_large` before auth, rate limiting, or decoding. |
 | `Content-Encoding` other than `identity` | `415 unsupported_media_type`: Fiber transparently decompresses gzip/br/deflate/zstd, so a small compressed body would otherwise expand past the limit after the check. |
 
-Residual risk: Fiber buffers the whole body before middleware runs, so a
-non-multipart request (including a chunked body without `Content-Length`) can
-still make a pod read up to `APP_BODY_LIMIT` before rejection, and a client can
-label a non-upload body `multipart/form-data` to reach the larger limit on any
-route (the check runs before routing, and body binding decodes multipart
-fields). Keep an ingress body limit in front of the API.
+Fiber streams request bodies (`StreamRequestBody`), so a declared
+`Content-Length` over the applicable limit is rejected without reading the
+body. A chunked body has no declared length: the middleware reads it through a
+limited reader (limit+1 bytes), rejects the over-limit body as soon as the extra
+byte arrives, and hands a body at or under the limit to the handler unchanged.
+The upload route is the only exception; its multipart parser enforces
+`APP_BODY_LIMIT` for chunked bodies too. Keep an ingress body limit in front of
+the API as the outer bound; a rejected request can still make a pod read up to
+the JSON limit (chunked) or 256 KiB of an unread upload body while the server
+drains or closes the connection.
 
 ### Graceful shutdown
 
@@ -1425,7 +1465,8 @@ environment with `cancel-in-progress: false`.
 | Secret `KUBE_CONFIG` (per environment) | Raw or base64-encoded kubeconfig for that cluster; base64 is recommended. |
 | Variable `GHCR_IMAGE` (optional; a secret with the same name also works) | Bare lowercase GHCR repository equal to the Release image `ghcr.io/<owner>/<repo>`. Schemes, tags, digests, ports, and colons are rejected. Defaults to `ghcr.io/${{ github.repository }}`. |
 
-The workflow applies the prereqs, verifies the pre-created Secret exists,
+The workflow applies the prereqs, verifies both pre-created Secrets
+(`fiber-boilerplate-secrets` and `fiber-boilerplate-migrate-secrets`) exist,
 refuses to delete an unfinished migration Job, runs and awaits the migration
 Job (failing immediately on `Failed=True`), applies the app overlay, waits for
 the rollout, and smoke-checks `/healthz` and `/readyz` through a port-forward.
@@ -1459,7 +1500,7 @@ When enabled:
 - sanitized pgx client spans for queries under a recording parent, with
   SQLSTATE on failure and no SQL text, arguments, or error messages;
 - one `job.process` consumer span per attempt, as a new root linked to the
-  enqueue trace, with `job.outcome` (`succeeded`/`retried`/`dead`/`released`);
+  enqueue trace, with `job.outcome` (`succeeded`/`retried`/`dead`/`released`/`lease_lost`);
 - `trace_id`/`span_id` on request logs.
 
 | Rule | Behavior |
@@ -1611,7 +1652,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` | Comma-separated job kinds this process claims / skips (bulkhead workers); every kind must be claimed by some worker, and a kind in both lists fails startup |
 | `APP_BODY_LIMIT` | Must exceed `STORAGE_MAX_FILE_SIZE` (multipart overhead) |
 | `DB_CONNECT_TIMEOUT` | Database connect timeout in seconds (default 10) |
-| `DB_SSLMODE` | `disable`, `allow`, `prefer` rejected in production; use `require` or `verify-full` |
+| `DB_SSLMODE` | Production requires `verify-full`; `require` and `verify-ca` accept any server certificate and are rejected there, as are `disable`, `allow`, and `prefer` |
+| `DB_SSLROOTCERT` | Optional CA bundle path for `verify-full` (passed as `sslrootcert`); empty uses the system trust store |
 | `DB_QUERY_EXEC_MODE` | pgx execution mode: `cache_statement` (default; behind a transaction-mode PgBouncer needs 1.21+ with `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; `exec`/`simple_protocol` are rejected (json parameters break) |
 | `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | `cmd/migrate` only: connect here instead of `DB_HOST`/`DB_PORT`, so migrations (which hold a session advisory lock) bypass a transaction-mode pooler. See [docs/operations.md](#connection-poolers-pgbouncer) |
 | `JWT_SECRET` / `JWT_PREVIOUS_SECRETS` | Active signing key (32+ chars outside local/test; tokens carry its derived `kid`) and comma-separated verify-only retired keys |
@@ -1654,4 +1696,4 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
 | Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |
-| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |
+| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, any `DB_SSLMODE` other than `verify-full`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |

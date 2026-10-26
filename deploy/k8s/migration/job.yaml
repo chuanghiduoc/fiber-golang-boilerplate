@@ -56,8 +56,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
+            # Only the migration Job may read the schema-owner credentials.
+            # The app Secret deliberately does not contain them.
             - secretRef:
-                name: fiber-boilerplate-secrets
+                name: fiber-boilerplate-migrate-secrets
           resources:
             requests:
               cpu: 100m

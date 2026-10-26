@@ -103,6 +103,15 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 		return CreateResult{}, err
 	}
 
+	// Resolve the recipient on every path, not only when email is on: the
+	// in-app row has the same (tenant_id, user_id) membership foreign key, so a
+	// removed or suspended member must be a 404 before any write instead of an
+	// FK violation surfacing as a 500.
+	recipient, err := s.resolveRecipient(scopedCtx, normalized.UserID)
+	if err != nil {
+		return CreateResult{}, err
+	}
+
 	channels, err := s.enabledChannels(scopedCtx, normalized)
 	if err != nil {
 		return CreateResult{}, err
@@ -114,7 +123,7 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 
 	var message email.Message
 	if channels.email {
-		message, err = s.buildEmailMessage(scopedCtx, normalized)
+		message, err = s.buildEmailMessage(normalized, recipient)
 		if err != nil {
 			return CreateResult{}, err
 		}
@@ -217,20 +226,25 @@ func (s *notificationService) createError(ctx context.Context, err error, input 
 	return apperror.NewInternal("failed to create notification")
 }
 
-func (s *notificationService) buildEmailMessage(ctx context.Context, input notificationcontracts.CreateNotificationInput) (email.Message, error) {
+// resolveRecipient resolves the recipient through the identity contract, which
+// only returns an active member of the context tenant.
+func (s *notificationService) resolveRecipient(ctx context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
 	if s.recipients == nil {
-		return email.Message{}, apperror.NewInternal("notification recipient lookup is not configured")
+		return identitycontracts.NotificationRecipient{}, apperror.NewInternal("notification recipient lookup is not configured")
 	}
-	if s.sender == nil {
-		return email.Message{}, apperror.NewInternal("notification email sender is not configured")
-	}
-
-	recipient, err := s.recipients.NotificationRecipient(ctx, input.UserID)
+	recipient, err := s.recipients.NotificationRecipient(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return email.Message{}, apperror.NewNotFound("notification recipient not found")
+			return identitycontracts.NotificationRecipient{}, apperror.NewNotFound("notification recipient not found")
 		}
-		return email.Message{}, apperror.NewInternal("failed to resolve notification recipient")
+		return identitycontracts.NotificationRecipient{}, apperror.NewInternal("failed to resolve notification recipient")
+	}
+	return recipient, nil
+}
+
+func (s *notificationService) buildEmailMessage(input notificationcontracts.CreateNotificationInput, recipient identitycontracts.NotificationRecipient) (email.Message, error) {
+	if s.sender == nil {
+		return email.Message{}, apperror.NewInternal("notification email sender is not configured")
 	}
 	if strings.TrimSpace(recipient.Email) == "" {
 		return email.Message{}, apperror.NewInternal("notification recipient has no email address")

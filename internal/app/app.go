@@ -271,9 +271,15 @@ func New(cfg *config.Config, deps Deps) *App {
 		AppName:      "fiber-golang-boilerplate",
 		ErrorHandler: apperrorhttp.FiberErrorHandlerWithLocalizer(deps.I18n),
 		BodyLimit:    cfg.App.BodyLimit,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		// Stream the request body so a middleware can reject an oversized
+		// Content-Length without buffering it, and so the JSON cap is enforced
+		// before a handler reads. Multipart parsing stays lazy: only the upload
+		// handler parses a form, with APP_BODY_LIMIT as its ceiling.
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+		ReadTimeout:                  60 * time.Second,
+		WriteTimeout:                 60 * time.Second,
+		IdleTimeout:                  120 * time.Second,
 		// Reject malformed/forwarded IP values so X-Forwarded-For cannot
 		// create arbitrary rate-limit/idempotency buckets.
 		EnableIPValidation: true,
@@ -334,9 +340,14 @@ func (a *App) setupGlobalMiddleware() {
 	a.fiber.Use(middleware.Metrics())
 	a.fiber.Use(middleware.Logger())
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
-	// Fiber's BodyLimit is the multipart upload ceiling; every other body is
-	// capped here before auth, rate limiting, or decoding run.
-	a.fiber.Use(middleware.BodyLimit(a.cfg.App.EffectiveJSONBodyLimit()))
+	// Fiber's BodyLimit is the multipart upload ceiling. Every non-multipart
+	// body, and multipart bodies on routes outside the upload path, are capped
+	// here before auth, rate limiting, or decoding run. The upload route parses
+	// its own form lazily under APP_BODY_LIMIT.
+	a.fiber.Use(middleware.BodyLimit(
+		a.cfg.App.EffectiveJSONBodyLimit(),
+		middleware.WithUploadLimit(a.cfg.App.BodyLimit, filesUploadPath),
+	))
 	a.fiber.Use(audithttp.Middleware(a.deps.Audit))
 	requestTimeout := time.Duration(a.cfg.App.RequestTimeout) * time.Second
 	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
@@ -357,6 +368,11 @@ func (a *App) setupGlobalMiddleware() {
 // must fit the shutdown drain window (config.ShutdownBudget -
 // config.ShutdownReserve).
 const PostHandlerBudget = audit.WriteTimeout + middleware.IdempotencyPostHandlerBudget
+
+// filesUploadPath is the one route allowed to parse a multipart body larger
+// than APP_JSON_BODY_LIMIT, up to APP_BODY_LIMIT. Keep it in sync with the
+// files module's POST /files/upload registration.
+const filesUploadPath = "/api/v1/files/upload"
 
 func (a *App) setupInfrastructureRoutes() {
 	a.fiber.Get("/healthz", func(c fiber.Ctx) error {

@@ -596,16 +596,52 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		).Scan(&storedType))
 		assert.Equal(t, "invoice.paid", storedType, "the type comes from the signed body")
 
-		// Rotation invalidates the old secret immediately.
+		// Rotation keeps the previous secret valid for the grace window, so
+		// senders that have not switched yet keep working.
 		key := "rotate-source-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		rotated := decodeJSON[sourceDTO](t, body)
 		require.NotEmpty(t, rotated.Secret)
 
+		var previousExpiry *time.Time
+		var previousCiphertext *string
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT previous_secret_ciphertext, previous_secret_expires_at
+			 FROM webhook_inbound_sources WHERE id = $1 AND tenant_id = $2`,
+			sourceA.ID, h.tenantA,
+		).Scan(&previousCiphertext, &previousExpiry))
+		require.NotNil(t, previousCiphertext, "the rotated-away secret must be kept for the grace window")
+		require.NotNil(t, previousExpiry)
+		assert.WithinDuration(t, time.Now().Add(24*time.Hour), *previousExpiry, time.Minute)
+
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(sourceA.Secret, "evt_in_old"))
-		assert.Equal(t, fiber.StatusUnauthorized, status)
+		assert.Equal(t, fiber.StatusAccepted, status, "the previous secret must verify during the grace window")
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(rotated.Secret, "evt_in_new"))
+		assert.Equal(t, fiber.StatusAccepted, status)
+
+		// A second rotation inside the grace window keeps only the immediately
+		// previous secret: the first one stops verifying.
+		previousRotated := rotated
+		key = "rotate-source-again-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+		rotatedAgain := decodeJSON[sourceDTO](t, body)
+		require.NotEmpty(t, rotatedAgain.Secret)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(rotated.Secret, "evt_in_previous"))
+		assert.Equal(t, fiber.StatusAccepted, status, "the immediately previous secret must still verify")
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(sourceA.Secret, "evt_in_old_old"))
+		assert.Equal(t, fiber.StatusUnauthorized, status, "an older secret must not survive a second rotation")
+		rotated = rotatedAgain
+
+		// After the explicit expiry only the current secret verifies.
+		_, execErr := h.pool.Exec(ctx,
+			`UPDATE webhook_inbound_sources SET previous_secret_expires_at = now() - interval '1 second' WHERE id = $1 AND tenant_id = $2`,
+			sourceA.ID, h.tenantA)
+		require.NoError(t, execErr)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(previousRotated.Secret, "evt_in_expired"))
+		assert.Equal(t, fiber.StatusUnauthorized, status)
+		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(rotatedAgain.Secret, "evt_in_current"))
 		assert.Equal(t, fiber.StatusAccepted, status)
 
 		// A source in tenant B is reachable publicly but stores/audits under B.
@@ -946,6 +982,169 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	got, err = h.repo.GetDelivery(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, "succeeded", got.Status)
+}
+
+// TestWebhooks_EndpointSecretRotationGraceRows proves rotation keeps exactly
+// one previous secret with an explicit 24h expiry: a second rotation inside
+// the window expires the older one instead of letting three secrets verify.
+func TestWebhooks_EndpointSecretRotationGraceRows(t *testing.T) {
+	h := setupWebhookHarness(t)
+	ctx := context.Background()
+	endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/grace", "*")
+
+	rotate := func() {
+		t.Helper()
+		key := "rotate-grace-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		status, body, _ := h.do(t, http.MethodPost,
+			fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpoint.ID), h.tokenA, nil,
+			map[string]string{"Idempotency-Key": key})
+		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	}
+	rotate()
+	rotate()
+
+	type secretRow struct {
+		version   int32
+		active    bool
+		expiresAt *time.Time
+	}
+	rows, err := h.pool.Query(ctx,
+		`SELECT version, active, grace_expires_at FROM webhook_endpoint_secrets
+		 WHERE tenant_id = $1 AND endpoint_id = $2 ORDER BY version`,
+		h.tenantA, endpoint.ID)
+	require.NoError(t, err)
+	defer rows.Close()
+	var secrets []secretRow
+	for rows.Next() {
+		var row secretRow
+		require.NoError(t, rows.Scan(&row.version, &row.active, &row.expiresAt))
+		secrets = append(secrets, row)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, secrets, 3)
+
+	assert.False(t, secrets[0].active)
+	require.NotNil(t, secrets[0].expiresAt)
+	assert.False(t, secrets[0].expiresAt.After(time.Now()),
+		"a second rotation must expire the secret retired by the first one")
+
+	assert.False(t, secrets[1].active)
+	require.NotNil(t, secrets[1].expiresAt)
+	assert.WithinDuration(t, time.Now().Add(24*time.Hour), *secrets[1].expiresAt, time.Minute,
+		"the immediately previous secret keeps the 24h grace window")
+
+	assert.True(t, secrets[2].active)
+	assert.Nil(t, secrets[2].expiresAt, "the active secret has no expiry")
+
+	var activeCount, previousCount int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FILTER (WHERE active)::int,
+		        count(*) FILTER (WHERE NOT active AND grace_expires_at > NOW())::int
+		 FROM webhook_endpoint_secrets WHERE tenant_id = $1 AND endpoint_id = $2`,
+		h.tenantA, endpoint.ID,
+	).Scan(&activeCount, &previousCount))
+	assert.Equal(t, 1, activeCount)
+	assert.Equal(t, 1, previousCount, "at most one previous secret is valid at a time")
+}
+
+// TestWebhooks_EndpointUpdateRepointsPendingDeliveries proves an endpoint URL
+// or timeout change applies to the endpoint's not-yet-terminal deliveries in
+// the same transaction, so a retry cannot keep hitting the old receiver.
+func TestWebhooks_EndpointUpdateRepointsPendingDeliveries(t *testing.T) {
+	h := setupWebhookHarness(t)
+	ctx := tenant.WithID(context.Background(), h.tenantA)
+	oldURL := "https://receiver.example/old-hook"
+	endpoint := h.createEndpoint(t, h.tokenA, oldURL, "move.event")
+
+	pendingEvent := testEnvelope("evt_move_pending", "move.event", h.tenantA)
+	doneEvent := testEnvelope("evt_move_done", "move.event", h.tenantA)
+	for _, event := range []events.Event{pendingEvent, doneEvent} {
+		created, err := h.dispatcher.Dispatch(ctx, event)
+		require.NoError(t, err)
+		require.Equal(t, 1, created)
+	}
+	pendingID := h.deliveryID(t, pendingEvent.ID)
+	doneID := h.deliveryID(t, doneEvent.ID)
+	_, err := h.pool.Exec(ctx,
+		`UPDATE webhook_deliveries SET status = 'succeeded', delivered_at = now() WHERE id = $1`, doneID)
+	require.NoError(t, err)
+
+	newURL := "https://receiver.example/new-hook"
+	status, body, _ := h.do(t, http.MethodPut,
+		fmt.Sprintf("/api/v1/webhooks/endpoints/%d", endpoint.ID), h.tokenA, map[string]any{
+			"url": newURL, "status": "active", "eventTypes": []string{"move.event"}, "timeoutMs": 5000,
+		}, nil)
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+
+	var pendingURL, doneURL string
+	var pendingTimeout, doneTimeout int32
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT url, timeout_ms FROM webhook_deliveries WHERE id = $1`, pendingID,
+	).Scan(&pendingURL, &pendingTimeout))
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT url, timeout_ms FROM webhook_deliveries WHERE id = $1`, doneID,
+	).Scan(&doneURL, &doneTimeout))
+	assert.Equal(t, newURL, pendingURL, "a pending delivery follows the endpoint URL change")
+	assert.Equal(t, int32(5000), pendingTimeout, "a pending delivery follows the endpoint timeout change")
+	assert.Equal(t, oldURL, doneURL, "terminal deliveries keep the snapshot they were sent with")
+	assert.Equal(t, int32(2000), doneTimeout)
+}
+
+// TestWebhooks_ReplayKeepsOriginalWebhookID proves a replay is a new delivery
+// of the original message: the receiver sees the original event id in
+// webhook-id (and the body), so it can deduplicate it.
+func TestWebhooks_ReplayKeepsOriginalWebhookID(t *testing.T) {
+	h := setupWebhookHarness(t)
+	ctx := tenant.WithID(context.Background(), h.tenantA)
+
+	type received struct {
+		id   string
+		body map[string]any
+	}
+	var mu sync.Mutex
+	var deliveries []received
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		var parsed map[string]any
+		_ = json.Unmarshal(body, &parsed)
+		deliveries = append(deliveries, received{id: r.Header.Get(webhook.HeaderID), body: parsed})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	h.createEndpoint(t, h.tokenA, server.URL, "replay.event")
+	event := testEnvelope("evt_replay_original", "replay.event", h.tenantA)
+	created, err := h.dispatcher.Dispatch(ctx, event)
+	require.NoError(t, err)
+	require.Equal(t, 1, created)
+	originalID := h.deliveryID(t, event.ID)
+
+	run := func(deliveryID int64) {
+		t.Helper()
+		payload, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
+		require.NoError(t, err)
+		require.NoError(t, h.worker.Handle(ctx, payload))
+	}
+	run(originalID)
+
+	status, body, _ := h.do(t, http.MethodPost,
+		fmt.Sprintf("/api/v1/webhooks/deliveries/%d/replay", originalID), h.tokenA, nil, nil)
+	require.Equal(t, fiber.StatusCreated, status, "body: %s", body)
+	replayed := decodeJSON[deliveryDTO](t, body)
+	assert.NotEqual(t, originalID, replayed.ID)
+	assert.Equal(t, "evt_replay_original", replayed.EventID,
+		"a replay references the original event so webhook-id stays stable")
+	run(replayed.ID)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, deliveries, 2)
+	for i, delivery := range deliveries {
+		assert.Equal(t, "evt_replay_original", delivery.id, "delivery %d webhook-id", i)
+		assert.Equal(t, "evt_replay_original", delivery.body["id"], "delivery %d body id", i)
+	}
 }
 
 // testEnvelope is a minimal valid event envelope for dispatcher tests. An

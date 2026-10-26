@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1278,8 +1279,134 @@ func TestProcessJobHeartbeatFailureDoesNotFailJob(t *testing.T) {
 	}))
 
 	assert.GreaterOrEqual(t, fake.heartbeatCount(), 1)
-	assert.Equal(t, []int64{15}, fake.succeededIDs(), "heartbeat errors must not change the job outcome")
+	assert.Equal(t, []int64{15}, fake.succeededIDs(), "a transient heartbeat error before lease expiry must not change the outcome")
 	assert.Empty(t, fake.failures)
+}
+
+// TestProcessJobLeaseLostCancelsHandler proves the heartbeat stops a handler as
+// soon as the fenced renewal reports that another worker owns the job, and
+// that this worker records no outcome for it.
+func TestProcessJobLeaseLostCancelsHandler(t *testing.T) {
+	t.Parallel()
+
+	const kind = "lease.lost"
+	fake := &fakeStore{heartbeatErr: fmt.Errorf("%w: job was reclaimed", ErrLeaseLost)}
+	worker := NewWorker(nil, "lease-worker",
+		WithHeartbeatInterval(5*time.Millisecond),
+		WithLeaseDuration(250*time.Millisecond),
+	)
+	worker.store = fake
+
+	before := metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind))
+	cause := make(chan error, 1)
+	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
+		<-ctx.Done()
+		cause <- context.Cause(ctx)
+		return ctx.Err()
+	})
+
+	require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
+		ID:          21,
+		Kind:        kind,
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    1,
+		MaxAttempts: 3,
+	}))
+
+	select {
+	case got := <-cause:
+		assert.ErrorIs(t, got, ErrLeaseLost, "handler must see the lease-loss cause")
+	case <-time.After(time.Second):
+		t.Fatal("handler was not canceled after losing the lease")
+	}
+	assert.Empty(t, fake.succeededIDs(), "a lost lease must not record success")
+	assert.Empty(t, fake.failures, "a lost lease must not record a handler failure")
+	assert.Empty(t, fake.releases, "a lost lease must not release the new owner's job")
+	assert.Equal(t, before+1, metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind)))
+}
+
+// TestProcessJobHeartbeatDeadlineCancelsHandler proves repeated transient
+// heartbeat failures cancel the handler only once the lease duration has
+// elapsed since the claim or the last successful renewal.
+func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
+	t.Parallel()
+
+	const kind = "lease.expired"
+	fake := &fakeStore{heartbeatErr: errors.New("database unavailable")}
+	worker := NewWorker(nil, "expired-worker",
+		WithHeartbeatInterval(5*time.Millisecond),
+		WithLeaseDuration(60*time.Millisecond),
+	)
+	worker.store = fake
+
+	before := metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind))
+	cause := make(chan error, 1)
+	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
+		<-ctx.Done()
+		cause <- context.Cause(ctx)
+		return ctx.Err()
+	})
+
+	require.NoError(t, processJobWithWatchdog(t, worker, context.Background(), claimedJob{
+		ID:          22,
+		Kind:        kind,
+		Payload:     json.RawMessage(`{}`),
+		Attempts:    1,
+		MaxAttempts: 3,
+	}))
+
+	select {
+	case got := <-cause:
+		assert.ErrorIs(t, got, ErrLeaseLost)
+		assert.ErrorContains(t, got, "heartbeat deadline exceeded")
+	case <-time.After(time.Second):
+		t.Fatal("handler was not canceled after the heartbeat deadline")
+	}
+	assert.GreaterOrEqual(t, fake.heartbeatCount(), 2, "transient failures alone must not cancel at once")
+	assert.Empty(t, fake.succeededIDs())
+	assert.Empty(t, fake.failures)
+	assert.Empty(t, fake.releases)
+	assert.Equal(t, before+1, metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind)))
+}
+
+// TestWorkerCountsLeaseExpiredDeadLetters proves the claim path reports jobs
+// dead-lettered by lease expiry instead of leaving them invisible.
+func TestWorkerCountsLeaseExpiredDeadLetters(t *testing.T) {
+	t.Parallel()
+
+	const kind = "lease.dead"
+	fake := &fakeStore{leaseDead: []leaseExpiredJob{{ID: 31, TenantID: 2, Kind: kind}}}
+	worker := NewWorker(nil, "dead-letter-worker", WithPollInterval(time.Millisecond))
+	worker.store = fake
+
+	handlerCalls := make(chan struct{}, 1)
+	worker.Register(kind, func(context.Context, json.RawMessage) error {
+		handlerCalls <- struct{}{}
+		return nil
+	})
+
+	before := metricValue(t, metrics.JobsLeaseDeadTotal.WithLabelValues(kind))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- worker.Run(ctx) }()
+
+	require.Eventually(t, func() bool {
+		return metricValue(t, metrics.JobsLeaseDeadTotal.WithLabelValues(kind)) == before+1
+	}, time.Second, time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not stop")
+	}
+
+	select {
+	case <-handlerCalls:
+		t.Fatal("a lease-expired dead letter must not be dispatched")
+	default:
+	}
 }
 
 func TestPGStoreHeartbeatRequiresPool(t *testing.T) {
@@ -1403,27 +1530,28 @@ type streamingStore struct {
 	pending []claimedJob
 }
 
-func (s *streamingStore) Claim(_ context.Context, _ string, limit int, staleAfter time.Duration) ([]claimedJob, error) {
+func (s *streamingStore) Claim(_ context.Context, _ string, limit int, staleAfter time.Duration) (claimResult, error) {
 	s.mu.Lock()
 	s.claimCalls++
 	s.lastStaleAfter = staleAfter
 	s.mu.Unlock()
 
 	if limit <= 0 || len(s.pending) == 0 {
-		return nil, nil
+		return claimResult{}, nil
 	}
 	if limit > len(s.pending) {
 		limit = len(s.pending)
 	}
 	batch := append([]claimedJob(nil), s.pending[:limit]...)
 	s.pending = s.pending[limit:]
-	return batch, nil
+	return claimResult{Jobs: batch}, nil
 }
 
 // fakeStore records worker outcomes without a database.
 type fakeStore struct {
 	mu             sync.Mutex
 	claimed        []claimedJob
+	leaseDead      []leaseExpiredJob
 	claimErr       error
 	claimErrs      []error
 	claimCalls     int
@@ -1435,6 +1563,7 @@ type fakeStore struct {
 	releases       []fakeFailure
 	heartbeats     []fakeHeartbeat
 	heartbeatErr   error
+	heartbeatErrs  []error
 	purgeCalls     int
 	purgeRows      int64
 	purgeErr       error
@@ -1461,7 +1590,7 @@ type fakeHeartbeat struct {
 	attempts int
 }
 
-func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Duration) ([]claimedJob, error) {
+func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Duration) (claimResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -1470,14 +1599,15 @@ func (f *fakeStore) Claim(_ context.Context, _ string, _ int, staleAfter time.Du
 	if len(f.claimErrs) > 0 {
 		err := f.claimErrs[0]
 		f.claimErrs = f.claimErrs[1:]
-		return nil, err
+		return claimResult{}, err
 	}
 	if f.claimErr != nil {
-		return nil, f.claimErr
+		return claimResult{}, f.claimErr
 	}
-	jobs := f.claimed
+	batch := claimResult{Jobs: f.claimed, LeaseDead: f.leaseDead}
 	f.claimed = nil
-	return jobs, nil
+	f.leaseDead = nil
+	return batch, nil
 }
 
 func (f *fakeStore) Succeed(_ context.Context, id int64, workerID string, attempts int) error {
@@ -1504,6 +1634,11 @@ func (f *fakeStore) Heartbeat(_ context.Context, id int64, workerID string, atte
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.heartbeats = append(f.heartbeats, fakeHeartbeat{id: id, workerID: workerID, attempts: attempts})
+	if len(f.heartbeatErrs) > 0 {
+		err := f.heartbeatErrs[0]
+		f.heartbeatErrs = f.heartbeatErrs[1:]
+		return err
+	}
 	return f.heartbeatErr
 }
 

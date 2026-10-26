@@ -534,11 +534,13 @@ authenticated user and request tenant; other users' or tenants' ids return
 | `PUT /notification-preferences/` | Upsert `{type, channel, enabled}`; `type` matches `^[a-z0-9][a-z0-9._-]*$` (max 100); channels `in_app`, `email` |
 
 Writes accept `Idempotency-Key`. The caller's own state changes are audited by
-the best-effort generic middleware. With email enabled, the in-app row and the
-durable `email.send` job commit together; an enqueue failure returns `500` and
-leaves no row. Both channels disabled suppresses the notification (create is a
-successful no-op; admin send returns `notification: null`,
-`emailQueued: false`). Email delivery is at-least-once.
+the best-effort generic middleware. The recipient must be an active member of
+the request tenant on every channel, including in-app-only sends; otherwise
+`POST /notifications/send` returns `404` before writing. With email enabled,
+the in-app row and the durable `email.send` job commit together; an enqueue
+failure returns `500` and leaves no row. Both channels disabled suppresses the
+notification (create is a successful no-op; admin send returns `notification:
+null`, `emailQueued: false`). Email delivery is at-least-once.
 
 ## Jobs and asynchronous work
 

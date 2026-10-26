@@ -199,9 +199,23 @@ func (e *CachedEvaluator) Evaluate(ctx context.Context, key Key, subject Subject
 
 	subject = normalizeSubject(ctx, subject)
 	snapshot := e.snapshotFor(ctx)
-	enabled, source := e.resolve(key, subject, snapshot)
+	// Kill switches are fail-closed: the last loaded snapshot remains the
+	// authority for them even after MaxStaleness, when its targets and database
+	// defaults may no longer be used.
+	killSnapshot := snapshot
+	if killSnapshot == nil {
+		killSnapshot = e.lastSnapshot()
+	}
+	enabled, source := e.resolve(key, subject, snapshot, killSnapshot)
 	e.record(key, source, enabled)
 	return Result{Enabled: enabled, Source: source}
+}
+
+// lastSnapshot returns the most recently loaded snapshot regardless of its age.
+func (e *CachedEvaluator) lastSnapshot() *Snapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.snapshot
 }
 
 func normalizeSubject(ctx context.Context, subject Subject) Subject {
@@ -214,12 +228,16 @@ func normalizeSubject(ctx context.Context, subject Subject) Subject {
 	return subject
 }
 
-func (e *CachedEvaluator) resolve(key Key, subject Subject, snapshot *Snapshot) (bool, Source) {
-	if snapshot != nil {
-		flag, hasRow := snapshot.Flags[key]
-		if hasRow && flag.KillSwitch {
+func (e *CachedEvaluator) resolve(key Key, subject Subject, snapshot, killSnapshot *Snapshot) (bool, Source) {
+	// The kill switch is checked against the last loaded snapshot even when
+	// snapshot is nil because it is too stale (fail closed).
+	if killSnapshot != nil {
+		if flag, hasRow := killSnapshot.Flags[key]; hasRow && flag.KillSwitch {
 			return false, SourceKillSwitch
 		}
+	}
+	if snapshot != nil {
+		flag, hasRow := snapshot.Flags[key]
 		if subject.UserID != 0 {
 			if targets := snapshot.UserTargets[key]; targets != nil {
 				if enabled, ok := targets[UserTargetKey(subject)]; ok {

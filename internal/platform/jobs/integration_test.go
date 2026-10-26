@@ -35,14 +35,18 @@ func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{Kind: "jobs.integration.release", MaxAttempts: 1})
+	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
+		Kind:        "jobs.integration.release",
+		MaxAttempts: 1,
+		RunAt:       time.Now().Add(-time.Minute),
+	})
 	require.NoError(t, err)
 
 	store := newPGStore(pgtest.Scoped(pool))
-	claimed, err := store.Claim(ctx, "release-worker", 1, time.Minute)
+	batch, err := store.Claim(ctx, "release-worker", 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	require.Equal(t, 1, claimed[0].Attempts)
+	require.Len(t, batch.Jobs, 1)
+	require.Equal(t, 1, batch.Jobs[0].Attempts)
 
 	require.NoError(t, store.Release(ctx, id, "release-worker", 1, "jobs: interrupted by worker shutdown"))
 	var (
@@ -61,10 +65,10 @@ func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
 		"a released job is no longer owned")
 
 	// The job is claimable again with its full budget.
-	claimed, err = store.Claim(ctx, "release-worker", 1, time.Minute)
+	batch, err = store.Claim(ctx, "release-worker", 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, 1, claimed[0].Attempts)
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, 1, batch.Jobs[0].Attempts)
 }
 
 // TestWorkerIntegrationProcessesJob exercises Enqueue and Worker against a real
@@ -244,18 +248,25 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 	require.NoError(t, err)
 
 	store := newPGStore(pgtest.Scoped(pool))
-	claimed, err := store.Claim(ctx, "recovering-worker", 1, time.Minute)
+	batch, err := store.Claim(ctx, "recovering-worker", 1, time.Minute)
 	require.NoError(t, err)
-	require.Empty(t, claimed, "terminal expired job must not be claimable")
+	require.Empty(t, batch.Jobs, "terminal expired job must not be claimable")
+	require.Len(t, batch.LeaseDead, 1, "lease-expiry dead letters must be reported")
+	assert.Equal(t, id, batch.LeaseDead[0].ID)
+	assert.Equal(t, "jobs.integration.poison", batch.LeaseDead[0].Kind)
+	assert.Equal(t, tenant.DefaultID, batch.LeaseDead[0].TenantID)
 
 	var (
-		status  string
-		payload []byte
+		status    string
+		payload   []byte
+		lastError *string
 	)
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT status, payload FROM jobs WHERE id = $1`, id).Scan(&status, &payload))
+		`SELECT status, payload, last_error FROM jobs WHERE id = $1`, id).Scan(&status, &payload, &lastError))
 	assert.Equal(t, "dead", status)
 	assert.JSONEq(t, `{}`, string(payload))
+	require.NotNil(t, lastError)
+	assert.Contains(t, *lastError, "lease expired after max attempts")
 }
 
 // TestWorkerIntegrationReclaimsExpiredLease simulates a worker that claimed a
@@ -359,6 +370,7 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 		Kind:        kind,
 		Payload:     payload,
 		MaxAttempts: 5,
+		RunAt:       time.Now().Add(-time.Minute),
 	})
 	require.NoError(t, err)
 
@@ -366,9 +378,9 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 
 	first, err := store.Claim(ctx, workerID, 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, first, 1)
-	require.Equal(t, id, first[0].ID)
-	require.Equal(t, 1, first[0].Attempts)
+	require.Len(t, first.Jobs, 1)
+	require.Equal(t, id, first.Jobs[0].ID)
+	require.Equal(t, 1, first.Jobs[0].Attempts)
 
 	// Simulate the expired lease being requeued and reclaimed by the same
 	// worker ID. The replacement claim increments attempts, which invalidates
@@ -385,12 +397,12 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 
 	second, err := store.Claim(ctx, workerID, 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, second, 1)
-	require.Equal(t, id, second[0].ID)
-	require.Equal(t, 2, second[0].Attempts)
+	require.Len(t, second.Jobs, 1)
+	require.Equal(t, id, second.Jobs[0].ID)
+	require.Equal(t, 2, second.Jobs[0].Attempts)
 
-	currentAttempt := second[0].Attempts
-	staleAttempt := first[0].Attempts
+	currentAttempt := second.Jobs[0].Attempts
+	staleAttempt := first.Jobs[0].Attempts
 
 	// The current owner can heartbeat with its attempt. This also exercises
 	// heartbeatJobSQL's $3 parameter order against the database.
@@ -461,14 +473,14 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 	_, err = tx.Exec(ctx, `UPDATE jobs SET locked_at = now(), lease_expires_at = now() + interval '1 minute' WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	type claimResult struct {
-		jobs []claimedJob
-		err  error
+	type claimOutcome struct {
+		batch claimResult
+		err   error
 	}
-	claimDone := make(chan claimResult, 1)
+	claimDone := make(chan claimOutcome, 1)
 	go func() {
-		jobs, err := newPGStore(pgtest.Scoped(pool)).Claim(ctx, "claiming-worker", 1, time.Minute)
-		claimDone <- claimResult{jobs: jobs, err: err}
+		batch, err := newPGStore(pgtest.Scoped(pool)).Claim(ctx, "claiming-worker", 1, time.Minute)
+		claimDone <- claimOutcome{batch: batch, err: err}
 	}()
 
 	// Give Claim time to reach the row lock; committing first would exercise
@@ -479,7 +491,7 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 	select {
 	case result := <-claimDone:
 		require.NoError(t, result.err)
-		assert.Empty(t, result.jobs, "a job heartbeated during claim must not be reclaimed")
+		assert.Empty(t, result.batch.Jobs, "a job heartbeated during claim must not be reclaimed")
 	case <-ctx.Done():
 		t.Fatal("claim did not finish")
 	}
@@ -667,7 +679,10 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	// Transactional enqueue inherits the context tenant.
 	tx, err := pool.Begin(tenantCtx)
 	require.NoError(t, err)
-	txID, err := queue.EnqueueTx(tenantCtx, tx, Job{Kind: "jobs.integration.tenant.tx"})
+	txID, err := queue.EnqueueTx(tenantCtx, tx, Job{
+		Kind:  "jobs.integration.tenant.tx",
+		RunAt: time.Now().Add(-time.Minute),
+	})
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(tenantCtx))
 
@@ -677,26 +692,31 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	assert.Equal(t, tenantTwo, storedTenant)
 
 	// Claim returns the tenant so the worker can restore it.
-	claimed, err := store.Claim(tenantCtx, "tenant-claim-worker", 1, time.Minute)
+	batch, err := store.Claim(tenantCtx, "tenant-claim-worker", 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, txID, claimed[0].ID)
-	assert.Equal(t, tenantTwo, claimed[0].TenantID)
-	require.NoError(t, store.Succeed(tenantCtx, txID, "tenant-claim-worker", claimed[0].Attempts))
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, txID, batch.Jobs[0].ID)
+	assert.Equal(t, tenantTwo, batch.Jobs[0].TenantID)
+	require.NoError(t, store.Succeed(tenantCtx, txID, "tenant-claim-worker", batch.Jobs[0].Attempts))
 
-	// An empty context falls back to the compatibility tenant.
-	defaultID, err := queue.Enqueue(ctx, Job{Kind: "jobs.integration.tenant.default"})
+	// An empty context falls back to the compatibility tenant. RunAt is in the
+	// past so the immediate claim below does not race a small host/container
+	// clock skew on run_at <= now().
+	defaultID, err := queue.Enqueue(ctx, Job{
+		Kind:  "jobs.integration.tenant.default",
+		RunAt: time.Now().Add(-time.Minute),
+	})
 	require.NoError(t, err)
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT tenant_id FROM jobs WHERE id = $1`, defaultID).Scan(&storedTenant))
 	assert.Equal(t, tenant.DefaultID, storedTenant)
 
-	claimed, err = store.Claim(ctx, "default-claim-worker", 1, time.Minute)
+	batch, err = store.Claim(ctx, "default-claim-worker", 1, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, defaultID, claimed[0].ID)
-	assert.Equal(t, tenant.DefaultID, claimed[0].TenantID)
-	require.NoError(t, store.Succeed(ctx, defaultID, "default-claim-worker", claimed[0].Attempts))
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, defaultID, batch.Jobs[0].ID)
+	assert.Equal(t, tenant.DefaultID, batch.Jobs[0].TenantID)
+	require.NoError(t, store.Succeed(ctx, defaultID, "default-claim-worker", batch.Jobs[0].Attempts))
 
 	// The worker runs the handler with the job's tenant in context.
 	const kind = "jobs.integration.tenant.handler"

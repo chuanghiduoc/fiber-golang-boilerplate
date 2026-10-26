@@ -1144,6 +1144,11 @@ CREATE TABLE IF NOT EXISTS files (
     deleted_at TIMESTAMP WITH TIME ZONE,
     -- files.trash.purge claim: set before the blob is deleted; restore requires NULL.
     purge_started_at TIMESTAMP WITH TIME ZONE,
+    -- A blob delete failure releases the claim (restore stays possible) and
+    -- records the attempt; rows are skipped until purge_retry_after so a
+    -- permanently failing blob cannot block newer rows.
+    purge_attempts INTEGER NOT NULL DEFAULT 0 CHECK (purge_attempts >= 0),
+    purge_retry_after TIMESTAMP WITH TIME ZONE,
     CONSTRAINT fk_files_tenant_user FOREIGN KEY (tenant_id, user_id)
         REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );
@@ -1328,8 +1333,10 @@ CREATE POLICY tenant_isolation ON notification_preferences
 --
 -- Secrets are sealed with AES-256-GCM by the webhooks module and only the
 -- ciphertext is stored. Rotating a secret deactivates the old row and inserts a
--- new version; queued deliveries keep the ciphertext snapshot they were
--- created with, so rotation never breaks in-flight work.
+-- new version; the retired row keeps an explicit 24h grace expiry so deliveries
+-- can be signed with both the previous and the current secret while receivers
+-- switch over. A second rotation expires the older retired row: only the
+-- immediately previous secret is ever valid.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_endpoints (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1386,6 +1393,10 @@ CREATE TABLE IF NOT EXISTS webhook_endpoint_secrets (
     version INTEGER NOT NULL CHECK (version > 0),
     secret_ciphertext TEXT NOT NULL,
     active BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Set when the row is retired: the secret keeps co-signing deliveries
+    -- until then. NULL on the active row and on rows whose grace has been
+    -- superseded by a later rotation.
+    grace_expires_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     -- Secrets are fully owned by their endpoint (same module), so CASCADE.
     CONSTRAINT fk_webhook_endpoint_secrets_tenant_endpoint FOREIGN KEY (tenant_id, endpoint_id)
@@ -1463,6 +1474,10 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     -- Single-column on purpose: a composite FK with ON DELETE SET NULL would
     -- also null tenant_id when the original delivery is purged.
     replayed_from_id BIGINT REFERENCES webhook_deliveries(id) ON DELETE SET NULL,
+    -- is_replay is immutable and keeps replay rows out of the dispatch
+    -- deduplication index, so a replay can target the same event and endpoint
+    -- again while webhook-id stays the original message id.
+    is_replay BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT fk_webhook_deliveries_tenant_endpoint FOREIGN KEY (tenant_id, endpoint_id)
@@ -1474,8 +1489,12 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 -- Parent key for the tenant-composite FK from webhook_delivery_attempts.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_id_id
     ON webhook_deliveries (tenant_id, id);
+-- Dispatch deduplication only: replays are new delivery rows for the same
+-- message, so they are excluded by the immutable is_replay flag (replayed_from_id
+-- is mutable through ON DELETE SET NULL and cannot carry the predicate).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint_event
-    ON webhook_deliveries (tenant_id, endpoint_id, event_id);
+    ON webhook_deliveries (tenant_id, endpoint_id, event_id)
+    WHERE NOT is_replay;
 -- Serves the fk_webhook_deliveries_tenant_event check when an event is
 -- deleted and the NOT EXISTS probe of PurgeOrphanWebhookEvents.
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_tenant_event
@@ -1532,6 +1551,9 @@ CREATE INDEX IF NOT EXISTS idx_webhook_delivery_attempts_tenant_delivery
 --
 -- The public receiver authenticates HMAC over the raw body and timestamp. The
 -- source secret is sealed at rest but must be decryptable for verification.
+-- Rotating keeps the replaced ciphertext in previous_secret_* for 24h so
+-- senders that have not switched yet keep verifying; a second rotation
+-- overwrites it, so only the immediately previous secret is accepted.
 -- Inbound events deduplicate on (tenant, source, external_event_id).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS webhook_inbound_sources (
@@ -1540,11 +1562,15 @@ CREATE TABLE IF NOT EXISTS webhook_inbound_sources (
     name VARCHAR(255) NOT NULL,
     slug VARCHAR(63) NOT NULL,
     secret_ciphertext TEXT NOT NULL,
+    previous_secret_ciphertext TEXT,
+    previous_secret_expires_at TIMESTAMP WITH TIME ZONE,
     status VARCHAR(20) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'disabled')),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
-    deleted_at TIMESTAMP WITH TIME ZONE
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT chk_webhook_inbound_sources_previous_secret
+        CHECK ((previous_secret_ciphertext IS NULL) = (previous_secret_expires_at IS NULL))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_inbound_sources_tenant_slug_active

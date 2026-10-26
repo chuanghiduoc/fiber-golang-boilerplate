@@ -50,7 +50,27 @@ var (
 	JobsDeadTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "jobs_dead_total",
-			Help: "Total number of jobs dead-lettered after exhausting their attempts, partitioned by job kind.",
+			Help: "Total number of jobs dead-lettered by a handler failure after exhausting their attempts, partitioned by job kind.",
+		},
+		[]string{"kind"},
+	)
+
+	// JobsLeaseLostTotal counts running handlers that were canceled because
+	// their worker lost the job lease; no outcome is recorded for them.
+	JobsLeaseLostTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jobs_lease_lost_total",
+			Help: "Total number of running jobs whose handler was canceled because the worker lost the lease, partitioned by job kind.",
+		},
+		[]string{"kind"},
+	)
+
+	// JobsLeaseDeadTotal counts jobs the claim query dead-lettered because
+	// their worker lease expired on the final attempt.
+	JobsLeaseDeadTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "jobs_lease_dead_total",
+			Help: "Total number of jobs dead-lettered by lease expiry on their final attempt, partitioned by job kind.",
 		},
 		[]string{"kind"},
 	)

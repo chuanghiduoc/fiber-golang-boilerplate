@@ -278,6 +278,34 @@ func TestDBConfig_DSN(t *testing.T) {
 	}
 }
 
+func TestDBConfig_DSN_SSLROOTCERT(t *testing.T) {
+	db := DBConfig{
+		Host:        "localhost",
+		Port:        5432,
+		Database:    "testdb",
+		Username:    "user",
+		Password:    "pass",
+		SSLMode:     "verify-full",
+		Schema:      "public",
+		SSLRootCert: "/etc/ssl/certs/db-ca.pem",
+	}
+
+	dsn := db.DSN()
+	if !strings.Contains(dsn, "sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fdb-ca.pem") {
+		t.Errorf("DSN() = %q, want it to contain the URL-escaped sslrootcert", dsn)
+	}
+
+	db.SSLRootCert = "  "
+	if strings.Contains(db.DSN(), "sslrootcert") {
+		t.Errorf("DSN() = %q, want no sslrootcert for a blank DB_SSLROOTCERT", db.DSN())
+	}
+
+	db.SSLMode = "VERIFY-FULL"
+	if !strings.Contains(db.DSN(), "sslmode=verify-full") {
+		t.Errorf("DSN() = %q, want a lowercased sslmode for pgx", db.DSN())
+	}
+}
+
 // baseValidConfig returns a fully valid config. Each Validate test starts from
 // this baseline and mutates exactly one field so failures isolate one rule.
 func baseValidConfig() Config {
@@ -291,7 +319,7 @@ func baseValidConfig() Config {
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
 		CORS:      CORSConfig{AllowOrigins: "*"},
-		Cache:     CacheConfig{Driver: "memory"},
+		Cache:     CacheConfig{Driver: "memory", MemoryMaxEntries: DefaultMemoryMaxEntries},
 		Email:     EmailConfig{Driver: "console"},
 		Tenant:    TenantConfig{DefaultSlug: "default"},
 		Webhook: WebhookConfig{
@@ -516,7 +544,7 @@ func TestValidate_MinConnsExceedsMax(t *testing.T) {
 
 func TestValidate_RedisDriver_MissingURL(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Cache = CacheConfig{Driver: "redis"}
+	cfg.Cache = CacheConfig{Driver: "redis", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for redis driver without REDIS_URL")
 	}
@@ -657,7 +685,7 @@ func TestLoadDatabase_IgnoresApplicationSecrets(t *testing.T) {
 	t.Setenv("DB_DATABASE", "app")
 	t.Setenv("DB_USERNAME", "migrator")
 	t.Setenv("DB_PASSWORD", "secret")
-	t.Setenv("DB_SSLMODE", "require")
+	t.Setenv("DB_SSLMODE", "verify-full")
 	t.Setenv("DB_CONNECT_TIMEOUT", "10")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
@@ -666,7 +694,7 @@ func TestLoadDatabase_IgnoresApplicationSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadDatabase() returned error: %v", err)
 	}
-	if db.Host != "db.internal" || db.Database != "app" || db.SSLMode != "require" {
+	if db.Host != "db.internal" || db.Database != "app" || db.SSLMode != "verify-full" {
 		t.Fatalf("unexpected database config: %+v", db)
 	}
 }
@@ -678,8 +706,8 @@ func TestLoadDatabase_RejectsInvalidPoolSettings(t *testing.T) {
 	}
 }
 
-func TestLoadDatabase_RejectsPlaintextProductionTransport(t *testing.T) {
-	for _, mode := range []string{"disable", "allow", "prefer"} {
+func TestLoadDatabase_RejectsUnverifiedProductionTransport(t *testing.T) {
+	for _, mode := range []string{"disable", "allow", "prefer", "require", "verify-ca"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("APP_ENV", "Production")
 			t.Setenv("DB_SSLMODE", mode)
@@ -733,15 +761,15 @@ func productionValidConfig() Config {
 	cfg.CORS.AllowOrigins = "https://app.example.com"
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
-	cfg.DB.SSLMode = "require"
+	cfg.DB.SSLMode = "verify-full"
 	cfg.Tenant.RequireHeader = true
-	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0"}
+	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	return cfg
 }
 
 func TestValidate_MemoryCacheInProduction(t *testing.T) {
 	cfg := productionValidConfig()
-	cfg.Cache = CacheConfig{Driver: "memory"}
+	cfg.Cache = CacheConfig{Driver: "memory", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("production must reject CACHE_DRIVER=memory without the single-replica opt-in")
 	}
@@ -795,6 +823,8 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"known default JWT secret", func(c *Config) {
 			c.JWT.Secret = "your-super-secret-key-change-in-production"
 		}},
+		{"db ssl require", func(c *Config) { c.DB.SSLMode = "require" }},
+		{"db ssl verify-ca", func(c *Config) { c.DB.SSLMode = "verify-ca" }},
 		{"db ssl disabled", func(c *Config) { c.DB.SSLMode = "disable" }},
 		{"db ssl disabled uppercase", func(c *Config) { c.DB.SSLMode = "DISABLE" }},
 		{"db ssl allow", func(c *Config) { c.DB.SSLMode = "allow" }},
@@ -822,11 +852,19 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 }
 
 func TestValidate_ProductionTLSAccepted(t *testing.T) {
-	for _, mode := range []string{"require", "verify-ca", "verify-full", "VERIFY-FULL"} {
+	for _, mode := range []string{"verify-full", "VERIFY-FULL"} {
 		cfg := productionValidConfig()
 		cfg.DB.SSLMode = mode
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("DB_SSLMODE=%s should be accepted in production: %v", mode, err)
+		}
+	}
+
+	for _, mode := range []string{"require", "verify-ca"} {
+		cfg := productionValidConfig()
+		cfg.DB.SSLMode = mode
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("DB_SSLMODE=%s does not verify the server certificate and must be rejected in production", mode)
 		}
 	}
 
@@ -870,8 +908,26 @@ func TestLoad_CacheRedisDefaults(t *testing.T) {
 		c.RedisWriteTimeout() != 500*time.Millisecond || c.RedisPoolTimeout() != time.Second || c.RedisMaxRetries != 1 {
 		t.Fatalf("unexpected Redis defaults: %+v", c)
 	}
+	if c.MemoryMaxEntries != DefaultMemoryMaxEntries {
+		t.Fatalf("MemoryMaxEntries = %d, want %d", c.MemoryMaxEntries, DefaultMemoryMaxEntries)
+	}
 	if (CacheConfig{}).RedisReadTimeout() != DefaultRedisReadTimeout {
 		t.Fatal("a zero Redis timeout must fall back to the package default")
+	}
+}
+
+func TestValidate_CacheMemoryMaxEntries(t *testing.T) {
+	for _, value := range []int{0, -1} {
+		cfg := baseValidConfig()
+		cfg.Cache.MemoryMaxEntries = value
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("CACHE_MEMORY_MAX_ENTRIES=%d must be rejected", value)
+		}
+	}
+	cfg := baseValidConfig()
+	cfg.Cache.MemoryMaxEntries = 1
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("CACHE_MEMORY_MAX_ENTRIES=1 should be valid: %v", err)
 	}
 }
 

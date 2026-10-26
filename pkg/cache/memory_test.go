@@ -276,3 +276,114 @@ func TestPing(t *testing.T) {
 		t.Errorf("Ping returned error: %v", err)
 	}
 }
+
+func TestMemoryCacheEvictsLeastRecentlyUsed(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(2)
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "a", []byte("a"), time.Minute); err != nil {
+		t.Fatalf("Set(a): %v", err)
+	}
+	if err := mc.Set(ctx, "b", []byte("b"), time.Minute); err != nil {
+		t.Fatalf("Set(b): %v", err)
+	}
+	// Reading a makes b the least recently used entry.
+	if got, _ := mc.Get(ctx, "a"); string(got) != "a" {
+		t.Fatalf("Get(a) = %q, want a", got)
+	}
+	if err := mc.Set(ctx, "c", []byte("c"), time.Minute); err != nil {
+		t.Fatalf("Set(c): %v", err)
+	}
+
+	if got, _ := mc.Get(ctx, "b"); got != nil {
+		t.Fatalf("b = %q, want it evicted as the least recently used entry", got)
+	}
+	if exists, _ := mc.Exists(ctx, "a"); !exists {
+		t.Fatal("a was evicted but was recently used")
+	}
+	if exists, _ := mc.Exists(ctx, "c"); !exists {
+		t.Fatal("the newly written entry was evicted")
+	}
+}
+
+func TestMemoryCacheDropsExpiredEntriesBeforeLRU(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(2)
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "live", []byte("live"), time.Minute); err != nil {
+		t.Fatalf("Set(live): %v", err)
+	}
+	if err := mc.Set(ctx, "expired", []byte("old"), time.Millisecond); err != nil {
+		t.Fatalf("Set(expired): %v", err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	// The expired entry is the most recently used one, so eviction must reclaim
+	// expiry before falling back to the LRU tail (which is the live entry).
+	if err := mc.Set(ctx, "new", []byte("new"), time.Minute); err != nil {
+		t.Fatalf("Set(new): %v", err)
+	}
+	if exists, _ := mc.Exists(ctx, "expired"); exists {
+		t.Fatal("the expired entry survived eviction")
+	}
+	if exists, _ := mc.Exists(ctx, "live"); !exists {
+		t.Fatal("a live entry was evicted before an expired one")
+	}
+}
+
+func TestMemoryCacheEvictionKeepsSetNXExact(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(1)
+	defer mc.Close()
+	ctx := context.Background()
+
+	stored, err := mc.SetNX(ctx, "lock", []byte("owner-1"), time.Minute)
+	if err != nil || !stored {
+		t.Fatalf("SetNX(lock) = %v, %v; want true, nil", stored, err)
+	}
+	// A held lock cannot be taken, and the rejected attempt must not evict the
+	// holder (which would silently release the lock).
+	stored, err = mc.SetNX(ctx, "lock", []byte("owner-2"), time.Minute)
+	if err != nil || stored {
+		t.Fatalf("SetNX(held) = %v, %v; want false, nil", stored, err)
+	}
+	if got, _ := mc.Get(ctx, "lock"); string(got) != "owner-1" {
+		t.Fatalf("lock = %q, want owner-1", got)
+	}
+
+	// Filling the cache with another key evicts the lock as the LRU entry.
+	if stored, err := mc.SetNX(ctx, "other", []byte("other"), time.Minute); err != nil || !stored {
+		t.Fatalf("SetNX(other) = %v, %v; want true, nil", stored, err)
+	}
+	if deleted, err := mc.CompareAndDelete(ctx, "lock", []byte("owner-1")); err != nil || deleted {
+		t.Fatalf("CompareAndDelete(evicted lock) = %v, %v; want false, nil", deleted, err)
+	}
+}
+
+func TestMemoryCacheConcurrentSetNXHasOneWinner(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(16)
+	defer mc.Close()
+	ctx := context.Background()
+
+	const contenders = 32
+	results := make(chan bool, contenders)
+	for range contenders {
+		go func() {
+			stored, err := mc.SetNX(ctx, "lock", []byte("owner"), time.Minute)
+			if err != nil {
+				t.Errorf("SetNX: %v", err)
+			}
+			results <- stored
+		}()
+	}
+	winners := 0
+	for range contenders {
+		if <-results {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("SetNX winners = %d, want exactly 1", winners)
+	}
+}

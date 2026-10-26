@@ -55,7 +55,8 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `internal/contracts` is stdlib-only (no repositories, DTOs, sqlc, storage, database, or session). | stdlib-only check |
 | `admin` never imports identity/files, sqlc, `pkg/storage`, `pkg/database`, or the session store. | admin check |
 | The deleted shared `internal/{handler,service,dto,repository}` and `internal/sqlc` packages cannot return. | legacy-package checks |
-| Module SQL touches only owned tables (or platform tables). | `test/arch/table_ownership_test.go` |
+| SQL queries touch only owned tables; `pkg/**` and `cmd/**` may not read module tables; dynamic `Exec`/`Query`/`QueryRow`/`Batch.Queue` SQL is rejected. | `test/arch/table_ownership_test.go`, `test/arch/sql_literals_test.go` |
+| A Tier 1 route's audit action is recorded by `RecordInTx`/`RecordTx` in the mutation transaction, tied to the action literal through the same function or a local call chain. | `test/arch/audit_routes_test.go` |
 | Core packages (`pkg/apperror`, `pkg/storage`, `platform/authz`, `tenant`, `audit`, `apikey`, `features`) and every module `service`/`repository` never import Fiber/fasthttp, even transitively; `pkg/storage` and `files/service` never import the AWS SDK. | `test/arch/framework_free_test.go` |
 | Inside a module, `service/` never imports sqlc, pgx, Fiber, or its own `dto/`/`handler/`; `handler/` never imports `repository/`, sqlc, or pgx. Existing violations are frozen in `layering_allowlist.txt`, which only shrinks. | `test/arch/layering_test.go` |
 
@@ -116,7 +117,7 @@ sequenceDiagram
     participant DB as Repository / sqlc / PostgreSQL
 
     C->>G: HTTP request
-    Note over G: Recovery, CORS, security headers,<br/>RequestID, i18n, tracing, metrics, logger,<br/>Recovery, JSON body limit, audit fallback, timeout
+    Note over G: Recovery, CORS, security headers,<br/>RequestID, i18n, tracing, metrics, logger,<br/>Recovery, body limit (JSON cap; multipart only on the upload route), audit fallback, timeout
     G->>V: versioning.Guard on /api (unknown vN: 406)
     Note over V: group versioning.Middleware:<br/>Accept-Version must match path (406)
     V->>T: resolve X-Tenant-Slug, ?tenant= (browser auth paths) or default
@@ -194,7 +195,10 @@ module asynchronously. Every event is one versioned envelope
 `tenantId`, `actor`, `data`), with the payload struct and version owned by the
 producer in `internal/contracts/<producer>`. Producers publish with
 `PublishTx` in their own transaction; subscribers register through
-`app.EventProvider` and run on the shared jobs worker.
+`app.EventProvider` and run on the shared jobs worker. `PublishTx` enqueues
+durable subscriptions only: local `Subscribe` handlers are notified by
+`Publish`/`PublishLocal` after the transaction, never inside it (a `pgx.Tx`
+has no after-commit hook).
 
 ```mermaid
 flowchart LR
@@ -223,7 +227,7 @@ flowchart LR
 | **Privacy contract** (`internal/contracts/privacy`) | A GDPR export or erasure must reach every module holding per-user data. | Modules register an exporter/eraser through `app.PrivacyProvider`; identity orchestrates through the registry, so no module imports another. |
 | **Outbox** (`jobs` table) | A side effect must exist if and only if the business change commits. | Job row commits with the business row (`EnqueueTx`/`EnqueueOnceTx`); delivery is at-least-once, so handlers are idempotent. |
 | **Durable event** (`events.PublishTx` + `SubscribeDurable`) | Several independent reactions to one fact. | One job per subscription, key `event:<type>:<id>:<handler>:<tenantId>`; at-least-once. |
-| **Local event** (`Subscribe`) | In-process reactions that may fail with the request. | Runs synchronously before commit; panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
+| **Local event** (`Subscribe` via `Publish`/`PublishLocal`) | In-process reactions that may fail with the request. | Runs synchronously in the publisher's call, not inside a business transaction (`PublishTx` skips local handlers and only enqueues durable work); panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
 
 Contract wiring performed by `internal/bootstrap`:
 

@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -180,11 +179,13 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	assert.Equal(t, wireGoldenHeaders, headers)
 	require.NoError(t, verifyStandardWebhook(wireSecret, got.header, got.body, time.Now()))
 
-	// A replay is a new event (fresh UUIDv7 id and occurredAt) that carries
-	// the original type, dataVersion, actor, and byte-identical data.
+	// A replay is a new delivery row and attempt counter for the SAME message:
+	// webhook-id, body id, and occurredAt stay the original ones so the
+	// receiver can deduplicate it, and the envelope bytes are unchanged.
 	svc := webhookservice.New(repo, repo, repo, codec, nil, webhookservice.Options{})
 	replayed, err := svc.ReplayDelivery(tenantCtx, 0, deliveryID)
 	require.NoError(t, err)
+	require.NotEqual(t, deliveryID, replayed.ID, "a replay gets its own delivery row")
 	replayJob, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: replayed.ID})
 	require.NoError(t, err)
 	require.NoError(t, worker.Handle(tenantCtx, replayJob))
@@ -194,19 +195,8 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("receiver got no replay request")
 	}
-	var envelope struct {
-		ID         string `json:"id"`
-		OccurredAt string `json:"occurredAt"`
-	}
-	require.NoError(t, json.Unmarshal(replay.body, &envelope))
-	replayID, err := uuid.Parse(envelope.ID)
-	require.NoError(t, err, "replay id %q", envelope.ID)
-	assert.Equal(t, uuid.Version(7), replayID.Version())
-	_, goldenTail, found := strings.Cut(wireGoldenBody, `,"tenantId":`)
-	require.True(t, found, "golden body has a tenantId member")
-	wantReplay := `{"id":"` + envelope.ID + `","type":"file.uploaded","dataVersion":1,"occurredAt":"` +
-		envelope.OccurredAt + `","tenantId":` + goldenTail
-	assert.Equal(t, wantReplay, string(replay.body), "replay must resend the original envelope and data bytes")
-	assert.Equal(t, envelope.ID, replay.header.Get(webhook.HeaderID))
+	assert.Equal(t, wireGoldenBody, string(replay.body), "replay must resend the original envelope bytes")
+	assert.Equal(t, "evt_wire_golden_1", replay.header.Get(webhook.HeaderID),
+		"the message id is stable across replays")
 	require.NoError(t, verifyStandardWebhook(wireSecret, replay.header, replay.body, time.Now()))
 }

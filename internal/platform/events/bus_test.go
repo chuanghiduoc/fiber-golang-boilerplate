@@ -255,6 +255,35 @@ func TestPublishTxUsesTransaction(t *testing.T) {
 	assert.Len(t, queue.jobs, 1)
 }
 
+// TestPublishTxSkipsLocalHandlersUntilCommit pins the transaction boundary:
+// durable work is enqueued on the caller's transaction, while local handlers
+// are not run at all (there is no pgx.Tx commit hook), so a rollback cannot
+// leave a ghost event and a local handler error cannot roll back the business
+// transaction.
+func TestPublishTxSkipsLocalHandlersUntilCommit(t *testing.T) {
+	queue := &fakeQueue{}
+	bus := New(queue)
+	require.NoError(t, bus.SubscribeDurable("tenant.created", "provision", func(context.Context, Event) error { return nil }))
+
+	localErr := errors.New("local handler failed")
+	localCalls := 0
+	require.NoError(t, bus.Subscribe("tenant.created", func(context.Context, Event) error {
+		localCalls++
+		return localErr
+	}))
+
+	event, err := NewEvent("tenant.created", 1, nil)
+	require.NoError(t, err)
+	require.NoError(t, bus.PublishTx(context.Background(), &fakeTx{}, event),
+		"a local handler error must not escape a transactional publish")
+	assert.Zero(t, localCalls, "local handlers must not run inside the business transaction")
+
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	assert.Equal(t, 1, queue.txCalls)
+	assert.Len(t, queue.jobs, 1)
+}
+
 func TestPublishTxRejectsNilTransaction(t *testing.T) {
 	bus := New(&fakeQueue{})
 	event, err := NewEvent("tenant.created", 1, nil)
