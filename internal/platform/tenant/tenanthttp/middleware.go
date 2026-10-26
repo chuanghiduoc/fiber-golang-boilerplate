@@ -111,9 +111,13 @@ func allowsTenantQuery(path string) bool {
 	return ok
 }
 
+// canonicalPath normalizes a request path for the exemption and tenant-query
+// maps. Fiber routes case-insensitively and non-strictly, so the maps must
+// compare the lowercase, slash-trimmed form; otherwise a mixed-case callback
+// URL would miss its exemption and be rejected in require-header mode.
 func canonicalPath(path string) string {
 	if len(path) > 1 {
-		return strings.TrimRight(path, "/")
+		path = strings.TrimRight(path, "/")
 	}
-	return path
+	return strings.ToLower(path)
 }

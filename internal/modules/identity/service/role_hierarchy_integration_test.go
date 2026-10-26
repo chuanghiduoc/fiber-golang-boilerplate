@@ -24,7 +24,7 @@ func memberContext(userID int64, role string) context.Context {
 
 func TestRoleHierarchy_AdminCannotGrantOwnerOrManageOwner(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "hierarchy-owner@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	otherOwner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "hierarchy-owner-2@example.com",
@@ -79,7 +79,7 @@ func TestRoleHierarchy_AdminCannotGrantOwnerOrManageOwner(t *testing.T) {
 
 func TestRoleHierarchy_CustomRoleCannotDemoteOwner(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := authz.SystemContext(context.Background())
+	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "custom-owner@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	custom := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "custom-demoter@example.com",
@@ -101,7 +101,7 @@ func TestRoleHierarchy_CustomRoleCannotDemoteOwner(t *testing.T) {
 
 func TestInvitations_AdminCannotInviteOwner(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	admin := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "invite-admin@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleAdmin})
 	invitations := identityservice.NewInvitationService(e.stores, e.tx, e.mail, "https://app.example.test")
@@ -120,7 +120,7 @@ func TestInvitations_AdminCannotInviteOwner(t *testing.T) {
 
 func TestInvitations_AcceptRechecksInviterAuthority(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviter := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "recheck-inviter@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	coOwner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "recheck-coowner@example.com",
@@ -150,7 +150,7 @@ func TestInvitations_AcceptRechecksInviterAuthority(t *testing.T) {
 
 func TestInvitations_SignUpRechecksInviterAuthority(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviter := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "signup-inviter@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	coOwner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "signup-coowner@example.com",
@@ -167,7 +167,7 @@ func TestInvitations_SignUpRechecksInviterAuthority(t *testing.T) {
 	_, err = e.admin.UpdateRole(coOwnerCtx, inviter.UserID, identityservice.RoleAdmin)
 	require.NoError(t, err, "a co-owner may demote the inviter")
 
-	_, err = invitations.SignUp(context.Background(), identityservice.InvitationSignUp{
+	_, err = invitations.SignUp(ctx, identityservice.InvitationSignUp{
 		Token: token, Name: "Invitee", Password: "Password1!2026",
 	})
 	assert.Equal(t, string(identitycatalog.CodeInvitationInviterIneligible), appCode(err))
@@ -179,7 +179,7 @@ func TestInvitations_SignUpRechecksInviterAuthority(t *testing.T) {
 
 func TestInvitations_BanOrRemovalRevokesPendingInvitations(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviter := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "revoke-inviter@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleAdmin})
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "revoke-owner@example.com",

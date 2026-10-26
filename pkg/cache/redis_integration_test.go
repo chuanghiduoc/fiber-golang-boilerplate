@@ -107,6 +107,76 @@ func TestRedisCacheIncrementBelow(t *testing.T) {
 	}
 }
 
+// TestRedisCacheIncrementBelowKeepsTTL is the regression test for the
+// SET-without-KEEPTTL script bug: only the first increment used to leave a
+// TTL, so a rate-limit key hit a second time lived forever. PTTL must stay
+// positive after every admission.
+func TestRedisCacheIncrementBelowKeepsTTL(t *testing.T) {
+	rc, err := NewRedisCache(config.CacheConfig{RedisURL: redisURL(t)})
+	if err != nil {
+		t.Fatalf("NewRedisCache: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.Close() })
+	ctx := context.Background()
+	key := "it:increment-below-ttl"
+	const ttl = time.Minute
+	if err := rc.Delete(ctx, key); err != nil {
+		t.Fatalf("Delete(%s): %v", key, err)
+	}
+
+	for want := int64(1); want <= 5; want++ {
+		got, ok, err := rc.IncrementBelow(ctx, key, ttl, 10)
+		if err != nil || !ok || got != want {
+			t.Fatalf("IncrementBelow #%d = %d, %v, %v; want %d, true, nil", want, got, ok, err, want)
+		}
+		pttl, err := rc.client.PTTL(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("PTTL after increment #%d: %v", want, err)
+		}
+		if pttl <= 0 {
+			t.Fatalf("PTTL after increment #%d = %v, want > 0 (key must not become immortal)", want, pttl)
+		}
+		if pttl > ttl {
+			t.Fatalf("PTTL after increment #%d = %v, want <= %v", want, pttl, ttl)
+		}
+	}
+}
+
+// TestRedisCacheIncrementRepairsImmortalKey covers the audit of Increment:
+// INCR preserves a TTL but cannot add one, so a key that already exists
+// without an expiry (for example one written by the old IncrementBelow script)
+// must gain the requested TTL instead of staying immortal.
+func TestRedisCacheIncrementRepairsImmortalKey(t *testing.T) {
+	rc, err := NewRedisCache(config.CacheConfig{RedisURL: redisURL(t)})
+	if err != nil {
+		t.Fatalf("NewRedisCache: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.Close() })
+	ctx := context.Background()
+
+	for _, key := range []string{"it:increment-immortal", "it:increment-below-immortal"} {
+		if err := rc.client.Set(ctx, key, 5, 0).Err(); err != nil {
+			t.Fatalf("seed %s without TTL: %v", key, err)
+		}
+		var got int64
+		if key == "it:increment-immortal" {
+			got, err = rc.Increment(ctx, key, time.Minute)
+		} else {
+			got, _, err = rc.IncrementBelow(ctx, key, time.Minute, 10)
+		}
+		if err != nil || got != 6 {
+			t.Fatalf("%s increment = %d, %v; want 6, nil", key, got, err)
+		}
+		pttl, err := rc.client.PTTL(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("PTTL(%s): %v", key, err)
+		}
+		if pttl <= 0 {
+			t.Fatalf("PTTL(%s) = %v, want the requested TTL to be applied", key, pttl)
+		}
+	}
+}
+
 // TestRedisCacheHonoursContextDeadline stalls the server with CLIENT PAUSE and
 // proves an operation returns at its context deadline, not the (deliberately
 // long) socket read timeout.

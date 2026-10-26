@@ -31,9 +31,12 @@ const DefaultID int64 = 1
 
 // WithID stores the tenant ID in a context so services and repositories can
 // scope queries without threading a parameter through every signature. A zero
-// ID means "unset" and falls back to DefaultID. Negative IDs are preserved so
-// validation boundaries can reject them instead of silently writing to the
-// default tenant; tenant resolution never produces one.
+// ID means "unset": EffectiveID applies the compatibility fallback for row
+// parameters, while the row-level-security resolver
+// (app.RLSResolver/tenant.IDFromContext) fails closed and sees no tenant rows.
+// Negative IDs are preserved so validation boundaries can reject them instead
+// of silently writing to the default tenant; tenant resolution never produces
+// one.
 func WithID(ctx context.Context, id int64) context.Context {
 	return context.WithValue(ctx, contextKey{}, id)
 }

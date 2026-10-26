@@ -19,7 +19,9 @@
 --     superuser and owns nothing.
 --
 -- TRUNCATE is deliberately not granted to either role because it ignores
--- row-level security.
+-- row-level security. TEMP is revoked on the database as well: a runtime role
+-- that can create temp tables could shadow the schema's real table inside a
+-- trigger function, so the runtime roles must not be able to create them.
 
 SELECT format('CREATE ROLE %I LOGIN', :'app_user')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = :'app_user')\gexec
@@ -40,6 +42,29 @@ GRANT USAGE ON SCHEMA :"schema" TO :"app_user", :"bypass_user";
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA :"schema" TO :"app_user", :"bypass_user";
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA :"schema" TO :"app_user", :"bypass_user";
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA :"schema" TO :"app_user", :"bypass_user";
+
+-- TEMP is a search_path shadowing primitive: a runtime role that can create
+-- temp tables could shadow an unqualified table name inside a trigger
+-- function for one statement. The functions pin search_path as well; removing
+-- the primitive is the second half of the fix.
+--
+-- New databases grant TEMP to PUBLIC by default, so revoking it from the two
+-- runtime roles alone would leave them with the PUBLIC grant. Revoke it from
+-- PUBLIC on this dedicated application database (the owner keeps its explicit
+-- grant; a superuser ignores ACLs anyway).
+SELECT format('REVOKE TEMP ON DATABASE %I FROM PUBLIC', current_database())\gexec
+SELECT format('REVOKE TEMP ON DATABASE %I FROM %I, %I',
+              current_database(), :'app_user', :'bypass_user')\gexec
+SELECT format('GRANT TEMP ON DATABASE %I TO %I', current_database(), :'owner')\gexec
+
+-- golang-migrate owns schema_migrations. The default privileges below would
+-- otherwise let a runtime role rewrite the recorded version (skipping or
+-- replaying DDL). This script normally runs before the first migration, so
+-- the table may not exist yet: the guarded REVOKE is a no-op then, and
+-- cmd/migrate revokes the same privileges after every migration run.
+SELECT format('REVOKE ALL ON TABLE %I.schema_migrations FROM %I, %I',
+              :'schema', :'app_user', :'bypass_user')
+WHERE to_regclass(format('%I.schema_migrations', :'schema')) IS NOT NULL\gexec
 
 -- Tables created by later migrations inherit the same grants.
 ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA :"schema"

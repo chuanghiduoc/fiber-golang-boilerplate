@@ -10,15 +10,19 @@ import (
 )
 
 // Scoped returns the DBTX the application uses: every statement carries the
-// RLS scope resolved from its context. The pool is the normal app role, except
-// for a WithRLSBypass context, which uses the dedicated bypass pool.
+// RLS scope resolved from its context. The resolver is fail-closed exactly like
+// app.RLSResolver: only a tenant stored with tenant.WithID is in scope, so a
+// test that forgets one sees no rows instead of the compatibility tenant. The
+// pool is the normal app role, except for a WithRLSBypass context, which uses
+// the dedicated bypass pool.
 func Scoped(pool *pgxpool.Pool) *database.Scoped {
-	return database.NewScopedPools(poolsFor(pool), database.WithResolver(database.Resolver(tenant.EffectiveID)))
+	return database.NewScopedPools(poolsFor(pool), database.WithResolver(database.Resolver(tenant.IDFromContext)))
 }
 
-// NewTxManager returns a transaction manager with the application's resolver.
+// NewTxManager returns a transaction manager with the application's resolver
+// (fail-closed, like app.RLSResolver).
 func NewTxManager(pool *pgxpool.Pool) *database.TxManager {
-	return database.NewTxManagerPools(poolsFor(pool), database.WithResolver(database.Resolver(tenant.EffectiveID)))
+	return database.NewTxManagerPools(poolsFor(pool), database.WithResolver(database.Resolver(tenant.IDFromContext)))
 }
 
 // BypassScoped returns a DBTX for a deliberately cross-tenant store (the

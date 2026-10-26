@@ -28,8 +28,12 @@ func main() {
 	}
 }
 
+// run seeds the bootstrap admin from the ADMIN_* settings. It is the only
+// entry point that creates accounts: cmd/api never seeds at startup, so the
+// admin credentials live in the seed Job's own secret instead of every API and
+// worker pod.
 func run() error {
-	cfg, err := config.Load()
+	cfg, err := config.LoadSeed()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}

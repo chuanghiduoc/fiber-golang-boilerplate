@@ -47,7 +47,8 @@ spec:
         - name: migrate
           # The app overlay's images transformer does not update this raw Job;
           # overlays/<env>/migration/kustomization.yaml does. The deploy
-          # workflow injects the same tag into both before applying either.
+          # workflow injects the same verified image reference (digest) into
+          # the app, migration, and seed overlays before applying any.
           image: ghcr.io/OWNER/REPO:latest
           # Mutable placeholder tag: always pull. Switch to IfNotPresent after
           # pinning an immutable release tag.

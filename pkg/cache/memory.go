@@ -22,6 +22,11 @@ type entry struct {
 	// version they were created for, so an overwritten key's old record is
 	// recognised and ignored instead of deleting the fresh entry.
 	version uint64
+	// elem is the entry's node in the evictable LRU list. It is nil for locks
+	// and counters (SetNX/Increment/IncrementBelow): those are never evicted
+	// while live, because evicting them would silently release a lock, reset a
+	// lockout, or admit a request past its rate limit.
+	elem *list.Element
 }
 
 func (e *entry) expired() bool {
@@ -58,12 +63,14 @@ func (q *expiryQueue) Pop() any {
 	return item
 }
 
-// MemoryCache is a bounded process-local cache. The LRU list orders entries by
-// recent use and the expiry heap reclaims expired ones first, so a client
-// cannot grow the heap without bound.
+// MemoryCache is a bounded process-local cache. The LRU list orders evictable
+// cached values by recent use and the expiry heap reclaims expired entries
+// first, so a client cannot grow the heap without bound. Locks and counters
+// are stored outside the LRU and are only removed by Delete/CompareAndDelete or
+// expiry; when they fill the cache, a new write fails with ErrFull.
 type MemoryCache struct {
 	mu          sync.Mutex
-	items       map[string]*list.Element
+	items       map[string]*entry
 	lru         *list.List
 	expirations expiryQueue
 	maxEntries  int
@@ -85,7 +92,7 @@ func NewMemoryCacheWithLimit(maxEntries int) *MemoryCache {
 		maxEntries = config.DefaultMemoryMaxEntries
 	}
 	mc := &MemoryCache{
-		items:      make(map[string]*list.Element),
+		items:      make(map[string]*entry),
 		lru:        list.New(),
 		maxEntries: maxEntries,
 		done:       make(chan struct{}),
@@ -99,16 +106,15 @@ func (m *MemoryCache) Get(_ context.Context, key string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	el, ok := m.items[key]
+	e, ok := m.items[key]
 	if !ok {
 		return nil, nil
 	}
-	e := el.Value.(*entry)
 	if e.expired() {
-		m.removeLocked(el)
+		m.removeLocked(e)
 		return nil, nil
 	}
-	m.lru.MoveToFront(el)
+	m.touchLocked(e)
 	return e.data, nil
 }
 
@@ -117,8 +123,10 @@ func (m *MemoryCache) Set(_ context.Context, key string, value []byte, ttl time.
 	defer m.mu.Unlock()
 
 	now := time.Now()
-	m.storeLocked(key, value, expiryAt(now, ttl))
-	m.evictLocked(now)
+	if _, exists := m.items[key]; !exists && !m.makeRoomLocked(now) {
+		return ErrFull
+	}
+	m.storeLocked(key, value, expiryAt(now, ttl), true)
 	return nil
 }
 
@@ -126,16 +134,18 @@ func (m *MemoryCache) SetNX(_ context.Context, key string, value []byte, ttl tim
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if el, ok := m.items[key]; ok {
-		if !el.Value.(*entry).expired() {
+	if e, ok := m.items[key]; ok {
+		if !e.expired() {
 			return false, nil
 		}
-		m.removeLocked(el)
+		m.removeLocked(e)
 	}
 
 	now := time.Now()
-	m.storeLocked(key, value, expiryAt(now, ttl))
-	m.evictLocked(now)
+	if !m.makeRoomLocked(now) {
+		return false, ErrFull
+	}
+	m.storeLocked(key, value, expiryAt(now, ttl), false)
 	return true, nil
 }
 
@@ -143,8 +153,8 @@ func (m *MemoryCache) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if el, ok := m.items[key]; ok {
-		m.removeLocked(el)
+	if e, ok := m.items[key]; ok {
+		m.removeLocked(e)
 	}
 	return nil
 }
@@ -156,19 +166,18 @@ func (m *MemoryCache) CompareAndDelete(_ context.Context, key string, value []by
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	el, ok := m.items[key]
+	e, ok := m.items[key]
 	if !ok {
 		return false, nil
 	}
-	e := el.Value.(*entry)
 	if e.expired() {
-		m.removeLocked(el)
+		m.removeLocked(e)
 		return false, nil
 	}
 	if !bytes.Equal(e.data, value) {
 		return false, nil
 	}
-	m.removeLocked(el)
+	m.removeLocked(e)
 	return true, nil
 }
 
@@ -176,15 +185,15 @@ func (m *MemoryCache) Exists(_ context.Context, key string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	el, ok := m.items[key]
+	e, ok := m.items[key]
 	if !ok {
 		return false, nil
 	}
-	if el.Value.(*entry).expired() {
-		m.removeLocked(el)
+	if e.expired() {
+		m.removeLocked(e)
 		return false, nil
 	}
-	m.lru.MoveToFront(el)
+	m.touchLocked(e)
 	return true, nil
 }
 
@@ -214,69 +223,94 @@ func (m *MemoryCache) IncrementBelow(_ context.Context, key string, ttl time.Dur
 // returns ok=false without writing when the counter is already at maxValue. The
 // caller holds m.mu.
 func (m *MemoryCache) incrementLocked(key string, ttl time.Duration, maxValue int64) (value int64, ok bool, err error) {
-	if el, exists := m.items[key]; exists {
-		e := el.Value.(*entry)
+	if e, exists := m.items[key]; exists {
 		if !e.expired() {
 			n, parseErr := strconv.ParseInt(string(e.data), 10, 64)
 			if parseErr != nil {
 				// Match Redis INCR: a non-integer value is not a counter.
 				return 0, false, fmt.Errorf("cache: increment non-integer value at %q", key)
 			}
+			// A counter is never evictable while live, even if the key was
+			// first written as a cached value.
+			m.markNonEvictableLocked(e)
 			if n >= maxValue {
-				m.lru.MoveToFront(el)
 				return n, false, nil
 			}
 			n++
 			// Preserve the original expiry and version: a new expiry record
 			// would make the existing heap entry stale.
 			e.data = []byte(strconv.FormatInt(n, 10))
-			m.lru.MoveToFront(el)
 			return n, true, nil
 		}
-		m.removeLocked(el)
+		m.removeLocked(e)
 	}
 
 	if maxValue < 1 {
 		return 0, false, nil
 	}
 	now := time.Now()
-	m.storeLocked(key, []byte("1"), expiryAt(now, ttl))
-	m.evictLocked(now)
+	if !m.makeRoomLocked(now) {
+		return 0, false, ErrFull
+	}
+	m.storeLocked(key, []byte("1"), expiryAt(now, ttl), false)
 	return 1, true, nil
 }
 
 // currentLocked returns a live counter's value without writing it.
 func (m *MemoryCache) currentLocked(key string) (value int64, ok bool, err error) {
-	el, exists := m.items[key]
+	e, exists := m.items[key]
 	if !exists {
 		return 0, false, nil
 	}
-	e := el.Value.(*entry)
 	if e.expired() {
-		m.removeLocked(el)
+		m.removeLocked(e)
 		return 0, false, nil
 	}
 	n, err := strconv.ParseInt(string(e.data), 10, 64)
 	if err != nil {
 		return 0, false, fmt.Errorf("cache: increment non-integer value at %q", key)
 	}
-	m.lru.MoveToFront(el)
+	m.touchLocked(e)
 	return n, true, nil
 }
 
-// storeLocked writes key as the most recently used entry and records its
-// expiry. The caller holds m.mu.
-func (m *MemoryCache) storeLocked(key string, value []byte, expiresAt time.Time) {
+// touchLocked marks an evictable entry as recently used. Locks and counters
+// have no LRU node and need no ordering. The caller holds m.mu.
+func (m *MemoryCache) touchLocked(e *entry) {
+	if e.elem != nil {
+		m.lru.MoveToFront(e.elem)
+	}
+}
+
+// markNonEvictableLocked removes an entry from the LRU, so it is never chosen
+// for capacity eviction while live. The caller holds m.mu.
+func (m *MemoryCache) markNonEvictableLocked(e *entry) {
+	if e.elem != nil {
+		m.lru.Remove(e.elem)
+		e.elem = nil
+	}
+}
+
+// storeLocked writes key and records its expiry, placing evictable entries at
+// the front of the LRU. The caller holds m.mu.
+func (m *MemoryCache) storeLocked(key string, value []byte, expiresAt time.Time, evictable bool) {
 	m.nextVersion++
-	if el, ok := m.items[key]; ok {
-		e := el.Value.(*entry)
-		e.data = value
-		e.expiresAt = expiresAt
-		e.version = m.nextVersion
-		m.lru.MoveToFront(el)
+	e, ok := m.items[key]
+	if !ok {
+		e = &entry{key: key}
+		m.items[key] = e
+	}
+	e.data = value
+	e.expiresAt = expiresAt
+	e.version = m.nextVersion
+	if evictable {
+		if e.elem == nil {
+			e.elem = m.lru.PushFront(e)
+		} else {
+			m.lru.MoveToFront(e.elem)
+		}
 	} else {
-		el := m.lru.PushFront(&entry{key: key, data: value, expiresAt: expiresAt, version: m.nextVersion})
-		m.items[key] = el
+		m.markNonEvictableLocked(e)
 	}
 	if !expiresAt.IsZero() {
 		heap.Push(&m.expirations, expiry{key: key, at: expiresAt, version: m.nextVersion})
@@ -284,19 +318,22 @@ func (m *MemoryCache) storeLocked(key string, value []byte, expiresAt time.Time)
 	m.compactExpirationsLocked()
 }
 
-// evictLocked restores the size bound: expired entries first, then the least
-// recently used entries. The caller holds m.mu.
-func (m *MemoryCache) evictLocked(now time.Time) {
-	for len(m.items) > m.maxEntries {
+// makeRoomLocked evicts expired entries first and then the least recently used
+// cached value until one slot is free. It reports false when every live entry
+// is non-evictable (a lock or counter): the caller must then fail the write
+// with ErrFull instead of dropping live state. The caller holds m.mu.
+func (m *MemoryCache) makeRoomLocked(now time.Time) bool {
+	for len(m.items) >= m.maxEntries {
 		if m.dropExpiredLocked(now) {
 			continue
 		}
 		el := m.lru.Back()
 		if el == nil {
-			return
+			return false
 		}
-		m.removeLocked(el)
+		m.removeLocked(el.Value.(*entry))
 	}
+	return true
 }
 
 // dropExpiredLocked removes every entry whose expiry record is due and reports
@@ -310,24 +347,25 @@ func (m *MemoryCache) dropExpiredLocked(now time.Time) bool {
 			break
 		}
 		heap.Pop(&m.expirations)
-		el, ok := m.items[next.key]
+		e, ok := m.items[next.key]
 		if !ok {
 			continue
 		}
-		e := el.Value.(*entry)
 		if e.version != next.version {
 			continue
 		}
-		m.removeLocked(el)
+		m.removeLocked(e)
 		removed = true
 	}
 	return removed
 }
 
-func (m *MemoryCache) removeLocked(el *list.Element) {
-	e := el.Value.(*entry)
+func (m *MemoryCache) removeLocked(e *entry) {
 	delete(m.items, e.key)
-	m.lru.Remove(el)
+	if e.elem != nil {
+		m.lru.Remove(e.elem)
+		e.elem = nil
+	}
 }
 
 // compactExpirationsLocked bounds the expiry heap when keys are overwritten
@@ -338,8 +376,7 @@ func (m *MemoryCache) compactExpirationsLocked() {
 		return
 	}
 	compact := make(expiryQueue, 0, len(m.items))
-	for _, el := range m.items {
-		e := el.Value.(*entry)
+	for _, e := range m.items {
 		if !e.expiresAt.IsZero() {
 			compact = append(compact, expiry{key: e.key, at: e.expiresAt, version: e.version})
 		}

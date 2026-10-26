@@ -15,7 +15,6 @@ import (
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
@@ -47,12 +46,11 @@ type Provides struct {
 // root passes them explicitly; shared settings come from infra.Platform.
 type Settings struct {
 	OAuth config.OAuthConfig
-	// Admin is the optional seed admin created at startup.
-	Admin config.AdminConfig
 }
 
 // Build constructs identity's repositories, services, and handlers from infra.
-// It performs no I/O; call Module.Startup for the tenant/admin-seed checks.
+// It performs no I/O; call Module.Startup for the tenant and permission-catalog
+// checks. The admin user is created only by cmd/seed, never at startup.
 func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts.Registry, tenancyRegistry *tenancycontracts.Registry) (*Module, Provides, error) {
 	cfg := infra.Platform
 
@@ -181,7 +179,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		Storage:  infra.Storage,
 	})
 	m.startup = func(ctx context.Context) error {
-		return startup(ctx, infra.Platform, settings.Admin, stores, transactor, sessionStore)
+		return startup(ctx, infra.Platform, stores, transactor, sessionStore)
 	}
 
 	return m, Provides{
@@ -301,7 +299,8 @@ func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
 }
 
 // Startup runs identity's one-time startup checks: the baseline/default
-// tenant must exist, and the admin user is seeded idempotently. A module
+// tenant must exist and the permission catalog is synchronized. It never
+// creates or promotes accounts; the admin user comes from cmd/seed. A module
 // built with New (tests) has no startup work.
 func (m *Module) Startup(ctx context.Context) error {
 	if m.startup == nil {
@@ -310,7 +309,7 @@ func (m *Module) Startup(ctx context.Context) error {
 	return m.startup(ctx)
 }
 
-func startup(ctx context.Context, cfg app.PlatformConfig, admin config.AdminConfig,
+func startup(ctx context.Context, cfg app.PlatformConfig,
 	stores identityservice.Stores, tx identityservice.Transactor, sessions session.Store,
 ) error {
 	// The baseline seeds tenant id 1. Startup checks existence, not request
@@ -332,18 +331,13 @@ func startup(ctx context.Context, cfg app.PlatformConfig, admin config.AdminConf
 	}
 
 	// The permission catalog is code-owned; write it and the system role
-	// grants before the seed assigns roles.
+	// grants here so cmd/seed can assign roles against a known catalog.
 	if err := identityservice.SyncPermissions(ctx, tx, stores.Roles); err != nil {
 		return err
 	}
 	// A deploy can change role_permissions; drop snapshots cached by replicas.
 	if err := sessions.InvalidatePermissions(ctx); err != nil {
 		return fmt.Errorf("invalidate cached permissions: %w", err)
-	}
-
-	// Auto-seed admin user (idempotent) in the configured default tenant.
-	if err := seed.Admin(ctx, admin, stores, tx, defaultTenant.ID); err != nil {
-		return fmt.Errorf("failed to seed admin user: %w", err)
 	}
 	return nil
 }

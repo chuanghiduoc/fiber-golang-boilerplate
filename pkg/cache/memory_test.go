@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -406,12 +407,109 @@ func TestMemoryCacheEvictionKeepsSetNXExact(t *testing.T) {
 		t.Fatalf("lock = %q, want owner-1", got)
 	}
 
-	// Filling the cache with another key evicts the lock as the LRU entry.
-	if stored, err := mc.SetNX(ctx, "other", []byte("other"), time.Minute); err != nil || !stored {
-		t.Fatalf("SetNX(other) = %v, %v; want true, nil", stored, err)
+	// A live lock is never evicted to make room: the write fails loudly.
+	stored, err = mc.SetNX(ctx, "other", []byte("other"), time.Minute)
+	if !errors.Is(err, ErrFull) || stored {
+		t.Fatalf("SetNX(full of locks) = %v, %v; want false, ErrFull", stored, err)
 	}
-	if deleted, err := mc.CompareAndDelete(ctx, "lock", []byte("owner-1")); err != nil || deleted {
-		t.Fatalf("CompareAndDelete(evicted lock) = %v, %v; want false, nil", deleted, err)
+	if exists, _ := mc.Exists(ctx, "other"); exists {
+		t.Fatal("a rejected SetNX must not store the key")
+	}
+	if got, _ := mc.Get(ctx, "lock"); string(got) != "owner-1" {
+		t.Fatalf("lock = %q, want it kept while live", got)
+	}
+
+	// The owner can still release it, and then the cache accepts writes again.
+	if deleted, err := mc.CompareAndDelete(ctx, "lock", []byte("owner-1")); err != nil || !deleted {
+		t.Fatalf("CompareAndDelete(lock) = %v, %v; want true, nil", deleted, err)
+	}
+	if stored, err := mc.SetNX(ctx, "other", []byte("other"), time.Minute); err != nil || !stored {
+		t.Fatalf("SetNX(after release) = %v, %v; want true, nil", stored, err)
+	}
+}
+
+// TestMemoryCacheEvictsOnlySetEntries pins which entries the LRU may reclaim:
+// cached values (Set) are evictable, while locks (SetNX) and counters
+// (Increment/IncrementBelow) are not, because evicting them would silently
+// release a lock, reset a lockout, or admit a request past its rate limit.
+func TestMemoryCacheEvictsOnlySetEntries(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(2)
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "a", []byte("a"), time.Minute); err != nil {
+		t.Fatalf("Set(a): %v", err)
+	}
+	if err := mc.Set(ctx, "b", []byte("b"), time.Minute); err != nil {
+		t.Fatalf("Set(b): %v", err)
+	}
+	// A new counter makes room by evicting the least recently used value (a).
+	if n, err := mc.Increment(ctx, "counter", time.Minute); err != nil || n != 1 {
+		t.Fatalf("Increment(counter) = %d, %v; want 1, nil", n, err)
+	}
+	if exists, _ := mc.Exists(ctx, "a"); exists {
+		t.Fatal("the least recently used value was not evicted to make room")
+	}
+	// A new lock evicts the remaining value (b), never the counter.
+	if stored, err := mc.SetNX(ctx, "lock", []byte("owner"), time.Minute); err != nil || !stored {
+		t.Fatalf("SetNX(lock) = %v, %v; want true, nil", stored, err)
+	}
+	if exists, _ := mc.Exists(ctx, "b"); exists {
+		t.Fatal("the least recently used value was not evicted to make room")
+	}
+	if exists, _ := mc.Exists(ctx, "counter"); !exists {
+		t.Fatal("a live counter was evicted")
+	}
+
+	// Now every live entry is non-evictable: new keys fail loudly instead of
+	// silently dropping a lock or counter.
+	if err := mc.Set(ctx, "value", []byte("value"), time.Minute); !errors.Is(err, ErrFull) {
+		t.Fatalf("Set(full of non-evictable entries) = %v, want ErrFull", err)
+	}
+	if _, _, err := mc.IncrementBelow(ctx, "bounded", time.Minute, 5); !errors.Is(err, ErrFull) {
+		t.Fatalf("IncrementBelow(full) = %v, want ErrFull", err)
+	}
+	if exists, _ := mc.Exists(ctx, "value"); exists {
+		t.Fatal("a Set rejected with ErrFull must not store the value")
+	}
+	if exists, _ := mc.Exists(ctx, "bounded"); exists {
+		t.Fatal("an IncrementBelow rejected with ErrFull must not create the counter")
+	}
+	if got, _ := mc.Get(ctx, "lock"); string(got) != "owner" {
+		t.Fatalf("lock = %q, want it kept while live", got)
+	}
+
+	// An existing counter can still advance: it needs no new capacity.
+	if n, err := mc.Increment(ctx, "counter", time.Minute); err != nil || n != 2 {
+		t.Fatalf("Increment(existing counter) = %d, %v; want 2, nil", n, err)
+	}
+
+	// Freeing one slot lets cached values in again.
+	if err := mc.Delete(ctx, "lock"); err != nil {
+		t.Fatalf("Delete(lock): %v", err)
+	}
+	if err := mc.Set(ctx, "value", []byte("value"), time.Minute); err != nil {
+		t.Fatalf("Set(after freeing a slot): %v", err)
+	}
+}
+
+// TestMemoryCacheReclaimsExpiredNonEvictableEntries proves "never evicted while
+// live": an expired lock or counter is still reclaimed to make room.
+func TestMemoryCacheReclaimsExpiredNonEvictableEntries(t *testing.T) {
+	mc := NewMemoryCacheWithLimit(1)
+	defer mc.Close()
+	ctx := context.Background()
+
+	if stored, err := mc.SetNX(ctx, "lock", []byte("owner"), time.Millisecond); err != nil || !stored {
+		t.Fatalf("SetNX(lock) = %v, %v; want true, nil", stored, err)
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	if err := mc.Set(ctx, "value", []byte("value"), time.Minute); err != nil {
+		t.Fatalf("Set after the lock expired: %v", err)
+	}
+	if exists, _ := mc.Exists(ctx, "lock"); exists {
+		t.Fatal("an expired lock was not reclaimed")
 	}
 }
 

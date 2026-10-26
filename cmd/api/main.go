@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -123,6 +124,9 @@ type background struct {
 	schedulerDone   <-chan struct{}
 	workerCancel    context.CancelFunc // nil for APP_ROLE=api
 	workerDone      <-chan struct{}
+	// loopsDone is closed when every module background loop returned. It is
+	// nil for APP_ROLE=api, which starts none.
+	loopsDone <-chan struct{}
 }
 
 // startupError carries the log message for the startup step that failed.
@@ -413,8 +417,9 @@ func (rt *runtime) buildModules(ctx context.Context) error {
 		return startupFailed("failed to initialize i18n", err)
 	}
 
-	// Module startup checks (tenant existence, idempotent admin seed) share
-	// the startup deadline.
+	// Module startup checks (tenant existence, permission catalog sync) share
+	// the startup deadline. Account creation is not part of startup: the admin
+	// comes from the one-shot cmd/seed Job.
 	if err := modules.Startup(ctx); err != nil {
 		return startupFailed("module startup failed", err)
 	}
@@ -491,12 +496,32 @@ func (rt *runtime) startBackground() (background, error) {
 		}
 		close(workerDone)
 	}()
-	// Module background loops are best-effort.
-	for _, run := range rt.modules.Background {
-		go run(workerCtx)
-	}
+	// Module background loops are best-effort, but they hold the pools and
+	// must be joined before closeResources releases them.
+	bg.loopsDone = startModuleLoops(workerCtx, rt.modules.Background)
 	bg.workerCancel, bg.workerDone = workerCancel, workerDone
 	return bg, nil
+}
+
+// startModuleLoops runs the module background loops under ctx and returns a
+// channel that is closed once every loop has returned. The owner waits for it
+// in the drain window: a loop still using the database when the pools close
+// would fail every write it attempted during shutdown.
+func startModuleLoops(ctx context.Context, loops []func(context.Context)) <-chan struct{} {
+	var running sync.WaitGroup
+	running.Add(len(loops))
+	for _, run := range loops {
+		go func() {
+			defer running.Done()
+			run(ctx)
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		running.Wait()
+		close(done)
+	}()
+	return done
 }
 
 // startScheduler runs the scheduler. It is global (not tenant-scoped);
@@ -591,6 +616,11 @@ func (rt *runtime) drain(ctx context.Context, bg background) bool {
 	if bg.workerCancel != nil {
 		bg.workerCancel()
 		waitForShutdown(ctx, bg.workerDone, "job worker")
+	}
+	// The loops share the worker context, so they are already canceled. Join
+	// them before the caller closes the pools they use.
+	if bg.loopsDone != nil {
+		waitForShutdown(ctx, bg.loopsDone, "module background loops")
 	}
 
 	clean := true

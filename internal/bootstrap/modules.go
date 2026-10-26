@@ -23,6 +23,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
@@ -42,8 +43,8 @@ type Modules struct {
 	// Tenancy is the registry modules register their tenant-wide purgers into.
 	Tenancy *tenancycontracts.Registry
 
-	// Startup runs one-time checks that need the database (tenant
-	// existence, admin seed) inside the caller's startup deadline.
+	// Startup runs one-time checks that need the database (tenant existence,
+	// permission catalog sync) inside the caller's startup deadline.
 	Startup func(ctx context.Context) error
 	// Background runs best-effort loops that share the job worker lifecycle
 	// (canceled with the worker context during shutdown).
@@ -62,7 +63,6 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	tenancyRegistry := tenancycontracts.NewRegistry()
 	identityModule, identityProvides, err := identity.Build(infra, identity.Settings{
 		OAuth: cfg.OAuth,
-		Admin: cfg.Admin,
 	}, privacyRegistry, tenancyRegistry)
 	if err != nil {
 		return nil, err
@@ -117,6 +117,11 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	webhooksModule.RegisterTenantPurge(tenancyRegistry)
 	notificationsModule.RegisterTenantPurge(tenancyRegistry)
 	identityModule.RegisterTenantPurge(tenancyRegistry)
+	// The durable jobs table is platform-owned rather than part of a module,
+	// so its purger is registered here, after every module: queued encrypted
+	// email payloads must not survive the tenant that produced them, and
+	// running jobs are left to finish.
+	tenancyRegistry.Register(tenancycontracts.Provider{Name: "jobs", Purger: jobs.NewTenantPurger(infra.DB)})
 
 	return &Modules{
 		List: []app.Module{

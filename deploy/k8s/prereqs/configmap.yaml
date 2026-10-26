@@ -22,8 +22,10 @@ data:
   APP_BODY_LIMIT: "12582912"
   # Every non-multipart body (JSON, forms) is capped at this smaller limit.
   APP_JSON_BODY_LIMIT: "1048576"
-  # Seconds; at most 15 so in-flight requests finish inside the 20s shutdown
-  # budget (terminationGracePeriodSeconds 30 = 5s preStop + 20s + 5s margin).
+  # Seconds; at most 12 so in-flight requests finish inside the 20s shutdown
+  # budget (terminationGracePeriodSeconds 30 = 5s preStop + 20s + 5s margin),
+  # together with the 3s post-handler reserve. config.MaxRequestTimeoutSeconds
+  # is the code-side ceiling.
   APP_REQUEST_TIMEOUT: "12"
   LOG_LEVEL: "info"
   # Replace with the public frontend origin (https is enforced in production).
@@ -51,7 +53,7 @@ data:
   CORS_ALLOW_ORIGINS: "https://app.example.com"
   CORS_ALLOW_METHODS: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
   CORS_ALLOW_HEADERS: "Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"
-  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link"
+  CORS_EXPOSE_HEADERS: "Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"
   CORS_ALLOW_CREDENTIALS: "false"
 
   # ---------------------------------------------------------------------------

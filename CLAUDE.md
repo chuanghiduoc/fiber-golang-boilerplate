@@ -38,8 +38,14 @@ findings (oasdiff v1.33.0); an intentional break is acknowledged by editing
 `docs/api-breaking-changes.md` in the same PR. Reproduce the fresh-DB check
 against a disposable database before merging. Kubernetes: follow
 `deploy/k8s/README.md` (migration Job first, then the app kustomization);
-`.github/workflows/release.yml` builds multi-arch GHCR images on `v*` tags,
-after a Trivy scan (CRITICAL/HIGH with fixes fail) of the image it builds.
+`.github/workflows/release.yml` publishes only from `v*` semver tags: it pushes
+the multi-arch image unsigned, Trivy-scans that pushed digest per platform
+(CRITICAL/HIGH with fixes fail), and only then cosign-signs and attests the
+digest. `deploy.yml` always verifies the signature (identity: `release.yml` on
+`refs/tags/v*`) and rolls out by digest; a `workflow_run` deploy checks out the
+release's `head_sha`, and pre-release tags never auto-deploy to production.
+The CI `Migrations` job derives the expected forced-RLS table count from the
+schema, and every downloaded CI tool is checksum-verified.
 
 ## Architecture
 
@@ -67,7 +73,7 @@ module, and `platform`/`pkg` never import modules.
 | `cmd/api` | Infra setup, catalog registration, lifecycle, graceful shutdown |
 | `internal/bootstrap` | The single ordered module list + contract cross-wiring (shared with `test/arch`) |
 | `cmd/migrate` | The only schema initializer/migrator |
-| `cmd/seed` | Admin seeder: tenant `owner` + `platform_admin` (schema must exist) |
+| `cmd/seed` | Admin seeder: tenant `owner` + `platform_admin` (schema must exist); the only seeder: `cmd/api` never seeds, and Kubernetes runs it as the one-shot `deploy/k8s/seed` Job with its own `ADMIN_*` Secret |
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
@@ -190,7 +196,13 @@ migrations) to its owners; keep it current when adding a module.
   `trigger_membership_roles_scope`, `trigger_platform_role_scope`, audit
   completion/no-delete/no-truncate); its
   test fails when that list drifts from the baseline. `audit_events` rejects
-  `DELETE`/`TRUNCATE` at the database.
+  `DELETE`/`TRUNCATE` at the database, and its completion trigger freezes the
+  actor columns (`actor_id`/`actor_type`/`actor_role`) and lets
+  `status_code`/`error_code` go only from NULL to a value. Trigger functions pin
+  `search_path` (TEMP tables cannot shadow them; the runtime roles have no
+  `TEMP` and no rights on `schema_migrations`), and `validate_role_permission`
+  raises when the role row is not visible instead of treating it as a system
+  role.
 - `jobs.idempotency_key` is nullable with a partial unique
   `(tenant_id, idempotency_key)` index used by `EnqueueOnce`/`EnqueueOnceTx`.
 - `scheduler_leases` (one leader row) and `scheduler_runs` (unique
@@ -209,7 +221,9 @@ migrations) to its owners; keep it current when adding a module.
   schedule erases a deleted tenant's per-member data through the privacy
   erasers, then every module's tenant-wide data through the
   `internal/contracts/tenancy` `Purger` registry (batched, idempotent; audit
-  rows and the `tenants` row stay, `tenants.purged_at` records completion).
+  rows and the `tenants` row stay, `tenants.purged_at` records completion);
+  the platform `jobs` purger, registered after every module, deletes the
+  tenant's non-running job rows.
   `identity.tenants.expire_trials` suspends `trialing` tenants past
   `trial_ends_at`, which also stop serving requests at once.
 
@@ -237,7 +251,10 @@ migrations) to its owners; keep it current when adding a module.
   `state`.
 - Tokens without a positive `tenant_id` or `sid` claim are rejected
   fail-closed; rotate legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
-  is for jobs/internal/tests only, never HTTP handling.
+  is for jobs/internal/tests only, never HTTP handling, and never the RLS
+  scope: `app.RLSResolver` uses `tenant.IDFromContext` only, so a context
+  without a tenant sees no tenant-owned rows (background work sets the tenant
+  explicitly; the job worker restores each job's `tenant_id`).
 - **Row-level security:** every table with a `tenant_id` has
   `ENABLE`+`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy calling
   `app_tenant_visible(tenant_id)` (`roles` also exposes the shared system roles,
@@ -399,7 +416,7 @@ handler/service/DTO/repository package.
   the transactional outbox in the change's transaction.
   Password reset and email verification are per user. The password-reset
   token insert re-checks the current email (an email change in between skips
-  the send). The admin seed only creates a missing admin; an existing
+  the send). The admin seed (only `cmd/seed`) only creates a missing admin; an existing
   demoted/banned/deleted or non-member account is skipped, never re-promoted
   or added. A newly seeded admin becomes tenant `owner` and gets the
   `platform_admin` assignment.
@@ -509,9 +526,12 @@ handler/service/DTO/repository package.
     durations (dedicated slow-kind workers) are safe together.
     Bookkeeping writes are fenced by owner and attempts, so a reclaimed worker
     cannot finish the job; a worker whose heartbeat finds the lease gone (or
-    whose heartbeats keep failing for a full lease duration) cancels its
-    handler and records neither success nor failure.
-  - Shutdown: one 20s budget; HTTP, scheduler/worker, and async work drain in
+    whose heartbeats keep failing until a safety margin before the lease
+    expires — lease − heartbeat interval − bookkeeping timeout, measured from
+    before the last successful heartbeat was sent) cancels its handler and
+    records neither success nor failure.
+  - Shutdown: one 20s budget; HTTP, scheduler/worker, module background loops
+    (joined before the pools close), and async work drain in
     parallel within a 15s window, the rest is reserved for tracing flush and
     closing cache/DB. A request keeps working up to 3s after its handler
     (audit write 2s + idempotency store/release 1s =
@@ -571,7 +591,7 @@ handler/service/DTO/repository package.
   previous fails startup. OAuth `state` is still derived from the active
   `JWT_SECRET` only, so in-flight Google sign-ins fail across a JWT swap.
   Secret settings also accept `<NAME>_FILE` (`config/secretfile.go`:
-  `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DATA_ENCRYPTION_KEY`,
+  `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`,
   `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`,
   `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`,
   `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`,
@@ -588,8 +608,9 @@ handler/service/DTO/repository package.
   non-superuser without `BYPASSRLS`; create it with
   `deploy/postgres/database-roles.sql` (no `TRUNCATE`: it ignores RLS).
   Production refuses a role that is a superuser, has `BYPASSRLS`, owns a
-  table in `DB_SCHEMA` (it could turn `FORCE` off), or is a member of such a
-  role (`cmd/api/rls.go`), and requires `DB_SSLMODE=verify-full` (optional
+  table in `DB_SCHEMA` (it could turn `FORCE` off), or is a member of a
+  superuser, `BYPASSRLS`, or table-owner role (`pg_has_role`, so `SET ROLE`
+  cannot reach the owner; `cmd/api/rls.go`), and requires `DB_SSLMODE=verify-full` (optional
   `DB_SSLROOTCERT`). In Kubernetes the migrate credentials live only in
   `fiber-boilerplate-migrate-secrets`, mounted by the migration Job alone.
   `search_path` stays a startup
@@ -727,8 +748,10 @@ handler/service/DTO/repository package.
   (use jobs/events).
 - **Drivers:** storage `local|s3|seaweedfs` (`pkg/storage/drivers.New`; S3 via
   aws-sdk-go-v2 in `pkg/storage/s3store`), cache `memory|redis` (memory is
-  bounded by `CACHE_MEMORY_MAX_ENTRIES`, default 100000, expired-then-LRU
-  eviction), email
+  bounded by `CACHE_MEMORY_MAX_ENTRIES`, default 100000: expired entries go
+  first, then least-recently-used `Set` values; live locks and counters from
+  `SetNX`/`Increment*` are never evicted, and a cache full of them fails the
+  write with `cache.ErrFull`; the Redis scripts keep TTLs with `KEEPTTL`), email
   `console|smtp`, chosen by config factories.
 - **Request bodies:** Fiber streams request bodies (`StreamRequestBody`,
   lazy multipart). `middleware.BodyLimit` caps every body at
@@ -752,7 +775,9 @@ handler/service/DTO/repository package.
   after failing open. The Redis client sets `ContextTimeoutEnabled`, so the
   250ms/500ms per-operation bounds (rate limit, idempotency) are real.
   Replays set `Idempotent-Replayed: true` and `idempotency_replayed=true` so
-  audit skips them. Keep `Idempotency-Key` in `CORS_ALLOW_HEADERS`. Never add
+  audit skips them. Keep `Idempotency-Key` in `CORS_ALLOW_HEADERS`; the
+  default `CORS_EXPOSE_HEADERS` lists the rate-limit headers and
+  `X-Request-Id` so browsers can read them. Never add
   it to token-minting or secret-returning endpoints (API-key create/rotate,
   webhook create and `rotate-secret`) or GET/HEAD/OPTIONS.
 

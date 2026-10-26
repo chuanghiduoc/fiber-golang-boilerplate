@@ -14,8 +14,9 @@ import (
 // these exempts or lets the role exempt itself from row-level security:
 //
 //   - a superuser or BYPASSRLS role ignores every policy;
-//   - a table owner may ALTER TABLE ... NO FORCE ROW LEVEL SECURITY, which
-//     removes the last guard FORCE adds;
+//   - a table owner (or a member of the owner role, which can SET ROLE to it)
+//     may ALTER TABLE ... NO FORCE ROW LEVEL SECURITY, which removes the last
+//     guard FORCE adds;
 //   - a member of a superuser/BYPASSRLS role can SET ROLE to it.
 type rlsRoleState struct {
 	Superuser      bool
@@ -40,7 +41,7 @@ func (s rlsRoleState) reasons() []string {
 		reasons = append(reasons, "has BYPASSRLS")
 	}
 	if s.OwnsTables {
-		reasons = append(reasons, "owns tables in the configured schema")
+		reasons = append(reasons, "owns tables in the configured schema (directly or as a member of their owner)")
 	}
 	if s.MemberOfExempt {
 		reasons = append(reasons, "is a member of a superuser or BYPASSRLS role")
@@ -66,7 +67,7 @@ SELECT
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = $1
-          AND c.relowner = me.oid
+          AND pg_has_role(current_user, c.relowner, 'MEMBER')
           AND c.relkind IN ('r', 'p')
     ),
     EXISTS (
@@ -140,7 +141,7 @@ func (s bypassRoleState) reasons() []string {
 		reasons = append(reasons, "is a superuser")
 	}
 	if s.OwnsTables {
-		reasons = append(reasons, "owns tables in the configured schema")
+		reasons = append(reasons, "owns tables in the configured schema (directly or as a member of their owner)")
 	}
 	if s.NormalIsMember {
 		reasons = append(reasons, "is reachable with SET ROLE from the normal role")
@@ -165,7 +166,7 @@ SELECT
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = $1
-          AND c.relowner = me.oid
+          AND pg_has_role(current_user, c.relowner, 'MEMBER')
           AND c.relkind IN ('r', 'p')
     )
 FROM me`

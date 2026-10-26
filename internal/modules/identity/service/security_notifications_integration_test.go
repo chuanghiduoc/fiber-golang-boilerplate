@@ -24,7 +24,7 @@ import (
 // (the audit row) fails and the transaction rolls back.
 func TestChangePassword_NotificationJobRollsBackWithChange(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	member := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "job-notify@example.com",
 		testutil.MemberOptions{Password: "Password1!", Role: identityservice.RoleMember})
 

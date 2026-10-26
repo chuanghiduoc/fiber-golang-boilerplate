@@ -44,7 +44,7 @@ func setupAuditTestDBWithOwner(t *testing.T) (*pgxpool.Pool, *pgxpool.Pool) {
 // TestPostgresRecorderIntegration inserts an event and reads it back.
 func TestPostgresRecorderIntegration(t *testing.T) {
 	pool := setupAuditTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-test-%d", time.Now().UnixNano())
@@ -112,7 +112,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 // which would 503 guarded routes and drop fallback audit rows.
 func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
 	pool := setupAuditTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-hostile-%d", time.Now().UnixNano())
@@ -142,7 +142,7 @@ func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
 // that the recorder resolves a missing Event.TenantID from the context.
 func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 	pool := setupAuditTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	slug := fmt.Sprintf("audit-tenant-%d", time.Now().UnixNano())
@@ -186,7 +186,7 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 // default metadata/created_at handling against a real database.
 func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 	pool := setupAuditTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-test-defaults-%d", time.Now().UnixNano())
@@ -226,7 +226,7 @@ func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 // disappears with the mutation when the transaction rolls back.
 func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 	pool := setupAuditTestDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-tx-rollback-%d", time.Now().UnixNano())
@@ -256,7 +256,7 @@ func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 // one-shot semantics, and the completion-only trigger.
 func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	pool, owner := setupAuditTestDBWithOwner(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
@@ -285,9 +285,6 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	assert.Nil(t, completedAt)
 
 	require.NoError(t, recorder.Complete(ctx, id, Completion{
-		ActorID:    42,
-		ActorType:  ActorTypeUser,
-		ActorRole:  "admin",
 		Outcome:    OutcomeSucceeded,
 		StatusCode: 200,
 	}))
@@ -304,11 +301,9 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		Scan(&outcome, &completedAt, &actorID, &actorType, &actorRole, &statusCode))
 	assert.Equal(t, OutcomeSucceeded, outcome)
 	require.NotNil(t, completedAt)
-	require.NotNil(t, actorID)
-	assert.Equal(t, int64(42), *actorID)
-	assert.Equal(t, ActorTypeUser, actorType)
-	require.NotNil(t, actorRole)
-	assert.Equal(t, "admin", *actorRole)
+	assert.Nil(t, actorID, "completion must not invent an actor")
+	assert.Equal(t, ActorTypeAnonymous, actorType, "completion must not change the intent actor")
+	assert.Nil(t, actorRole)
 	require.NotNil(t, statusCode)
 	assert.Equal(t, int16(200), *statusCode)
 
@@ -318,6 +313,57 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	_, err = pool.Exec(ctx,
 		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, id)
 	require.Error(t, err, "completed rows must reject non-completion updates")
+
+	// A guarded request that was already authenticated records the same actor
+	// on the intent and the completion; completing it as another actor is
+	// refused by the trigger.
+	sameActorID, err := recorder.RecordID(ctx, Event{
+		ActorID:   42,
+		ActorType: ActorTypeUser,
+		ActorRole: "admin",
+		Action:    "user.updated",
+		Resource:  "user",
+		RequestID: requestID + "-same-actor",
+		Source:    SourceHTTP,
+		Outcome:   OutcomeStarted,
+	})
+	require.NoError(t, err)
+	require.NoError(t, recorder.Complete(ctx, sameActorID, Completion{
+		ActorID:    42,
+		ActorType:  ActorTypeUser,
+		ActorRole:  "admin",
+		Outcome:    OutcomeSucceeded,
+		StatusCode: 200,
+	}))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT actor_id, actor_type, actor_role FROM audit_events WHERE id = $1`, sameActorID).
+		Scan(&actorID, &actorType, &actorRole))
+	require.NotNil(t, actorID)
+	assert.Equal(t, int64(42), *actorID)
+	assert.Equal(t, ActorTypeUser, actorType)
+	require.NotNil(t, actorRole)
+	assert.Equal(t, "admin", *actorRole)
+
+	swappedID, err := recorder.RecordID(ctx, Event{
+		ActorID:   42,
+		ActorType: ActorTypeUser,
+		ActorRole: "admin",
+		Action:    "user.updated",
+		Resource:  "user",
+		RequestID: requestID + "-swapped-actor",
+		Source:    SourceHTTP,
+		Outcome:   OutcomeStarted,
+	})
+	require.NoError(t, err)
+	err = recorder.Complete(ctx, swappedID, Completion{
+		ActorID:    43,
+		ActorType:  ActorTypeUser,
+		ActorRole:  "admin",
+		Outcome:    OutcomeSucceeded,
+		StatusCode: 200,
+	})
+	require.Error(t, err, "a started row must not be completed with a different actor")
+	assert.Contains(t, err.Error(), "audit completion may only change completion fields")
 
 	// A terminal service row is not a completable HTTP intent.
 	require.NoError(t, recorder.Record(ctx, Event{
@@ -359,7 +405,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 // TRUNCATE ignores row-level security, so the API/worker role must not have it.
 func TestAppRoleCannotTruncate(t *testing.T) {
 	pool := pgtest.AppPool(setupAuditTestDB(t))
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	tx, err := pool.Begin(ctx)

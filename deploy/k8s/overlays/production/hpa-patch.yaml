@@ -1,7 +1,8 @@
 # Production keeps at least three replicas and scales to 10. DB_MAX_CONNS in the
-# production ConfigMap is 10, so 10 replicas stay within the 100-connection
-# budget documented in the README. The HPA owns the replica count; the
-# Deployment intentionally has no spec.replicas.
+# production ConfigMap is 10 and each pod opens two pools (normal + bypass), so
+# 10 replicas can hold up to 200 connections; keep that below the managed
+# database's connection limit. The HPA owns the replica count; the Deployment
+# intentionally has no spec.replicas.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

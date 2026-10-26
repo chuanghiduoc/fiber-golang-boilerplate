@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
@@ -37,7 +38,7 @@ func TestKindFilterDefaultsToNoFilter(t *testing.T) {
 // the due set and that the claim returns a non-negative database-clock lag.
 func TestClaimIntegrationKindFilters(t *testing.T) {
 	pool := setupIntegrationDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	queue := NewQueue(pgtest.Scoped(pool))

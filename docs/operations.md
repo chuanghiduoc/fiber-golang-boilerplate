@@ -118,7 +118,7 @@ authorization:
 | `jobs_succeeded_total` | `kind` | Successful outcomes recorded in the database. |
 | `jobs_retried_total` | `kind` | Failed jobs requeued for another attempt. |
 | `jobs_dead_total` | `kind` | Jobs dead-lettered by a handler failure after exhausting attempts (permanent failures included). Lease-expiry dead letters are counted by `jobs_lease_dead_total` instead. |
-| `jobs_lease_lost_total` | `kind` | Running handlers canceled because their worker lost the lease (a fenced heartbeat matched no row, or heartbeats failed for the whole lease). No outcome is recorded for them, so this is a duplicate-execution risk signal. |
+| `jobs_lease_lost_total` | `kind` | Running handlers canceled because their worker lost the lease (a fenced heartbeat matched no row, or heartbeats failed for the whole cancel margin). No outcome is recorded for them, so this is a duplicate-execution risk signal. |
 | `jobs_lease_dead_total` | `kind` | Jobs dead-lettered by the claim query because their lease expired on the final attempt. |
 | `jobs_queue_lag_seconds` | `kind` | Histogram of seconds between a job becoming due (`run_at`) and its claim, computed by the claim query (database clock). Only claimed jobs are observed, so a fully stalled queue shows up as missing observations; alert on `jobs_claimed_total` too. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
@@ -135,7 +135,7 @@ authorization:
 | `feature_flag_snapshot_fallback_total` | — | Evaluations that used env/compiled defaults because no snapshot was usable. |
 | `feature_flag_snapshot_age_seconds` | — | Age of the snapshot currently used. |
 | `feature_flag_invalidations_total` | — | Local snapshot invalidations after admin writes. |
-| `events_published_total` | `event`, `mode` | Events published locally or durably. |
+| `events_published_total` | `event`, `mode` | Events published locally or durably. A transactional publish (`PublishTx`) counts only after its durable enqueue succeeds; a later rollback of the business transaction can still over-count, because the counter cannot be rolled back. |
 | `events_handled_total` | `event`, `outcome` | Event handler calls (`success`, `error`, `panic`). |
 | `events_enqueue_errors_total` | `event` | Durable event jobs that could not be enqueued. |
 | `scheduler_runs_total` | `schedule`, `outcome` | Scheduler slots processed (`enqueued`, `skipped`, `duplicate`). |
@@ -334,7 +334,7 @@ stateDiagram-v2
 | Permanent failure | A handler error wrapped with `jobs.Permanent(err)` dead-letters on that attempt; `last_error` starts with `permanent failure (not retried): ` and `jobs_dead_total{kind}` counts it. Used for undecodable or invalid payloads (email, password-reset request, webhook dispatch/delivery). Decryption failures are **not** permanent: a replica missing a key another one already seals with retries until the rollout completes. |
 | Unknown kind | Follows the same retry path, so a rollout can register the handler before pending work dies; a permanently missing handler eventually dead-letters. |
 | Handler timeout | 10m by default. A timeout is a normal failure that consumes the attempt. Cancellation is cooperative: a handler that ignores its context keeps running and heartbeating, and one that still returns success after its deadline is recorded as succeeded with a warning. |
-| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt); a lease-expiry dead letter is logged at error level and counted by `jobs_lease_dead_total{kind}`, never by `jobs_dead_total`. The crashed attempt counts. A live worker that loses the lease (a fenced heartbeat matches no row, or heartbeats fail for the whole lease duration) cancels its handler at once with `jobs.ErrLeaseLost`, records no success or failure (the reclaimer's fenced write is authoritative), and counts `jobs_lease_lost_total{kind}`. A handler that ignores cancellation can still overrun, so delivery remains at-least-once. |
+| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt); a lease-expiry dead letter is logged at error level and counted by `jobs_lease_dead_total{kind}`, never by `jobs_dead_total`. The crashed attempt counts. A live worker that loses the lease (a fenced heartbeat matches no row) cancels its handler at once with `jobs.ErrLeaseLost`, records no success or failure (the reclaimer's fenced write is authoritative), and counts `jobs_lease_lost_total{kind}`. Heartbeats that keep failing transiently cancel the handler near the end rather than at expiry: the worker stops at `leaseDuration - heartbeatInterval - bookkeepingTimeout` (clamped to at least one heartbeat interval) measured from before the last heartbeat RPC was sent, so another worker cannot reclaim the job before the handler has stopped and its outcome write was possible. A handler that ignores cancellation can still overrun, so delivery remains at-least-once. |
 | Fencing | Every outcome write is fenced by `attempts`, so a reclaimed worker's late result is discarded. |
 | Shutdown release | On SIGINT/SIGTERM the worker stops claiming and cancels running handlers inside the shared shutdown budget (see [Graceful shutdown](#graceful-shutdown)). A handler that fails while the worker is stopping is requeued immediately **without consuming its attempt** (`last_error` starts with `jobs: interrupted by worker shutdown`, span outcome `released`), so a drain on the final attempt never dead-letters. A handler that still succeeds is recorded normally. A non-cooperative handler can exceed the window. |
 | Claim errors | Retried in-process with exponential backoff capped at 30s. |
@@ -580,12 +580,16 @@ erase job for every membership (including removed ones; no global finalizer),
 then asks every module's `tenancy.Purger` to remove its tenant-wide rows
 (webhook endpoints/events/deliveries/inbound sources, tenant roles,
 `feature_flag_targets`, invitations, API keys, files and blobs, notifications,
-data exports). Identity's purger runs last: it deletes the memberships (and
+data exports) and the platform `jobs` purger, which is registered after every
+module. Identity's purger runs last overall: it deletes the memberships (and
 their sessions, refresh tokens, and role assignments), the tenant's custom
-roles, and `tenant_settings`. Every table is drained in bounded 500-row pages
-(and every files/export page deletes its blobs before its rows), so a large
-tenant never loads its whole table or blob list into memory. Only after every
-phase succeeds does it write `tenants.purged_at` and a
+roles, and `tenant_settings`. The jobs purger deletes the tenant's non-running
+rows (queued encrypted email payloads included); a `running` row is left to its
+lease owner so an in-flight handler is not stranded, and the retention purge
+removes it later. Every table is drained in bounded pages (500 rows for module
+purgers, 1,000 for jobs; every files/export page deletes its blobs before its
+rows), so a large tenant never loads its whole table or blob list into memory.
+Only after every phase succeeds does it write `tenants.purged_at` and a
 `tenant.purged` audit row in one transaction. Each phase is idempotent, so a
 failure or worker restart retries the same tenant; no phase accepts a tenant
 id other than the job's explicit tenant scope, and RLS backs that.
@@ -1061,7 +1065,13 @@ the handler, so a retry that races the owner's completion still replays.
   `CACHE_ALLOW_MEMORY_IN_PRODUCTION=true` (a deliberate single-replica
   deployment only). It is bounded by `CACHE_MEMORY_MAX_ENTRIES` (default
   100000): once full, expired entries are dropped first and then the least
-  recently used ones, so stored responses cannot grow the heap without limit.
+  recently used cached values (`Set`), so stored responses cannot grow the heap
+  without limit. Locks (`SetNX`) and counters (`Increment`/`IncrementBelow`)
+  are never evicted while live, because eviction would silently release an
+  idempotency lock, reset a login lockout, or admit a request past its rate
+  limit; if every live entry is one of those, the write fails with
+  `cache.ErrFull` (lockout fails closed, rate limiting and idempotency fail
+  open like any other cache error).
 
 ### Rate limits
 
@@ -1156,6 +1166,27 @@ flowchart TD
     newer --> run
 ```
 
+### Admin seeding
+
+Account creation is a one-shot command, never part of API startup:
+
+```bash
+make seed   # migrate-run, then cmd/seed
+```
+
+`cmd/seed` loads the database, app-environment, and `ADMIN_*` settings only
+(`config.LoadSeed`), so it needs no JWT, SMTP, storage, or metrics secrets. It
+also connects with both runtime pools, so `DB_PASSWORD`/`DB_BYPASS_PASSWORD`
+still apply. It creates the admin as tenant `owner` plus the `platform_admin`
+assignment only when the account is missing; an existing account that is
+demoted, banned, removed, or not a member of the tenant is skipped, never
+promoted or re-added, so the command is safe to re-run.
+
+Because the API no longer seeds, `ADMIN_PASSWORD` is not part of the API
+deployment: Compose runs it in the one-shot `seed` service, and Kubernetes runs
+it in `seed/job.yaml` with its own `fiber-boilerplate-seed-secrets` Secret.
+`deploy.yml` runs that Job only when its `seed` input is true (default false).
+
 ### Database roles and row-level security
 
 Every tenant-owned table has forced row-level security. The API,
@@ -1163,17 +1194,21 @@ worker, and `cmd/seed` connect as two dedicated non-superuser roles:
 
 - the normal role (`DB_USERNAME`/`DB_PASSWORD`) has no `BYPASSRLS`, owns no
   table in the configured schema, and is not a member of a
-  superuser/`BYPASSRLS` role, so it cannot `SET ROLE` into one;
+  superuser/`BYPASSRLS` role or of the owner of a table in that schema (either
+  would let it `SET ROLE` and turn `FORCE` off);
 - the bypass role (`DB_BYPASS_USERNAME`/`DB_BYPASS_PASSWORD`, e.g.
-  `app_bypass`) has `BYPASSRLS`, is not a superuser, owns nothing, and the
-  normal role is not a member of it. It serves only deliberate cross-tenant
-  work.
+  `app_bypass`) has `BYPASSRLS`, is not a superuser, owns nothing, is not a
+  member of a table owner, and the normal role is not a member of it. It serves
+  only deliberate cross-tenant work.
 
 `cmd/api` logs an error when either role is misconfigured and refuses to start
-when `APP_ENV=production`. Production also requires both bypass settings and a
-username different from `DB_USERNAME`. `cmd/migrate` needs the schema owner
-instead (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
-`DB_USERNAME`/`DB_PASSWORD`).
+when `APP_ENV=production`. The ownership check uses
+`pg_has_role(current_user, c.relowner, 'MEMBER')` for both the normal and the
+bypass role, so a grant of the owner role is refused just like direct ownership
+(the member could `SET ROLE` to it). Production also requires both bypass
+settings and a username different from `DB_USERNAME`. `cmd/migrate` needs the
+schema owner instead (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back
+to `DB_USERNAME`/`DB_PASSWORD`).
 
 Create both runtime roles once, before the first migration:
 
@@ -1188,15 +1223,40 @@ The script grants both roles the same schema access, table/sequence/function
 privileges, and `ALTER DEFAULT PRIVILEGES` for tables later migrations create,
 and revokes any membership of the bypass role from the app role. It
 deliberately does not grant `TRUNCATE`: truncation ignores RLS, so only the
-schema owner may do it. Docker Compose runs it automatically on a fresh volume
-(`deploy/postgres/init-app-role.sh`).
+schema owner may do it. It also revokes `TEMP` on the database: PostgreSQL
+grants it to `PUBLIC` by default, so removing it from both runtime roles alone
+would not help. A temp table could otherwise shadow an unqualified table name
+inside a trigger function for one statement. Docker Compose runs it
+automatically on a fresh volume (`deploy/postgres/init-app-role.sh`).
+
+`golang-migrate` creates and owns `schema_migrations`. The role script's
+default privileges would give the runtime roles DML on it, which would let a
+compromised app role rewrite the recorded version; the script revokes all on
+the table when it already exists, and `cmd/migrate` revokes every non-owner
+grant after each migration run, which also covers a fresh volume where the
+script ran before the table existed.
+
+Trigger functions that read tables (`validate_membership_role`,
+`protect_last_owner`, `validate_role_permission`, `validate_platform_role`,
+plus the audit guards and `update_updated_at`) pin
+`search_path = pg_catalog, <DB_SCHEMA>` at creation time, so neither the
+caller's search path nor a temp table can redirect them. `app_tenant_visible`
+deliberately stays a plain `LANGUAGE sql` function with no `SET` clause: it
+reads no table and must stay inlinable into every policy; `cmd/migrate`
+verifies that it has no pinned search path. `validate_role_permission` also
+raises when the role row is not visible (another tenant's role), instead of
+reading a NULL `tenant_id` and mistaking it for a system role.
 
 Scoping is per transaction and never session-level:
 `database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true)` right
 after `BEGIN`; a statement outside a transaction (`database.Scoped`) runs
 `BEGIN; set_config(...); <statement>; COMMIT` as one pgx Batch. This keeps
 transaction-mode PgBouncer working. A connection with no setting sees no
-tenant-owned rows.
+tenant-owned rows. `app.RLSResolver` is fail-closed in the same way: it uses
+only the tenant stored in the context (`tenant.IDFromContext`) and never the
+tenant-1 compatibility fallback, so an internal path that forgot to install a
+tenant sees nothing. The job worker installs each job's `tenant_id`; global
+work marks the context with `database.WithRLSBypass` instead.
 
 `app_tenant_visible(tenant_id)` reads only that transaction-local setting, so
 no SQL the normal role can run can switch isolation off. Setting the old
@@ -1398,7 +1458,10 @@ flowchart LR
     chk -- still running --> waitj[Wait; never interrupt]
     waitj --> chk
     chk -- finished or absent --> mig["Apply migration overlay,<br/>wait for condition=complete"]
-    mig --> app["4. Apply app overlay,<br/>rollout status"]
+    mig --> seed{"4. Bootstrap admin<br/>wanted?"}
+    seed -- yes --> seedjob["Apply seed overlay<br/>(ADMIN_* Secret), wait"]
+    seed -- no --> app
+    seedjob --> app["5. Apply app overlay,<br/>rollout status"]
 ```
 
 1. `kubectl apply -k deploy/k8s/overlays/<env>/prereqs` applies the Namespace
@@ -1406,20 +1469,26 @@ flowchart LR
 2. Create `fiber-boilerplate-secrets` (runtime) and
    `fiber-boilerplate-migrate-secrets` (schema owner, mounted only by the Job)
    in that namespace out of band (or through External Secrets / Sealed Secrets
-   / SOPS). Neither is part of a kustomization.
+   / SOPS). Neither is part of a kustomization. If the seed Job will run, also
+   create `fiber-boilerplate-seed-secrets` with `ADMIN_*` only.
 3. Delete an existing migration Job only once it is `Complete` or `Failed`.
    Apply `kubectl apply -k deploy/k8s/overlays/<env>/migration`, wait for
    `condition=complete`, and read its logs. The deploy workflow refuses to
    delete an unfinished Job and fails immediately on `Failed=True` rather than
    waiting for its 15-minute deadline.
-4. Only then apply `kubectl apply -k deploy/k8s/overlays/<env>` and
+4. Optionally apply `kubectl apply -k deploy/k8s/overlays/<env>/seed` and wait
+   for it. It creates a missing admin only; API startup never does. The deploy
+   workflow runs it only when the `seed` input is true (default false).
+5. Only then apply `kubectl apply -k deploy/k8s/overlays/<env>` and
    `kubectl -n <namespace> rollout status deployment/fiber-boilerplate`.
    `kubectl apply -k` has no cross-resource ordering guarantee, so the
-   migration Job is deliberately excluded from every app overlay.
-5. The app and `prereqs` overlays share the environment ConfigMap component.
-   The migration Job's image is set by
-   `overlays/<env>/migration/kustomization.yaml`; keep it and `overlays/<env>`
-   on the same image tag.
+   migration and seed Jobs are deliberately excluded from every app overlay.
+6. The app and `prereqs` overlays share the environment ConfigMap component.
+   The migration and seed Jobs' images are set by
+   `overlays/<env>/migration/kustomization.yaml` and
+   `overlays/<env>/seed/kustomization.yaml`; keep them and `overlays/<env>` on
+   the same verified digest. `deploy.yml` resolves the tag once, verifies its
+   cosign signature, and pins all three.
 
 | Topic | Caveat |
 | --- | --- |
@@ -1427,7 +1496,7 @@ flowchart LR
 | PDB | `minAvailable: 1`. Every environment runs at least two replicas, so a node drain proceeds one pod at a time. Do not lower an HPA minimum below 2 without changing the PDB. |
 | NetworkPolicy probes | CNI-dependent: some CNIs allow kubelet probes regardless of policy, others drop them. If probes fail, use the commented node/node-pod CIDR rule, never `0.0.0.0/0`. A Prometheus scrape also needs the commented monitoring-namespace ingress rule. |
 | Config reload | None. `envFrom` is read at container start; after editing the ConfigMap component or Secret, run `kubectl rollout restart deployment/<name>`. |
-| Database connections | `DB_MAX_CONNS` (default 25) is per pod. Keep `DB_MAX_CONNS * maxReplicas` below the database limit: production uses 10 with HPA max 10 (at most 100 connections); staging uses 5 with max 4. |
+| Database connections | `DB_MAX_CONNS` (default 25) is per pool, and each process opens two pools (normal + bypass), so one pod can hold `2 * DB_MAX_CONNS` connections. Keep `2 * DB_MAX_CONNS * maxReplicas` below the database limit: production uses 10 with HPA max 10 (at most 200 connections); staging uses 5 with max 4 (at most 40). Migration and seed Jobs each add one short-lived connection while they run. |
 | Secrets | Never commit a rendered Secret. Use External Secrets, Sealed Secrets, SOPS, or the platform secret manager. Secret settings also accept `<NAME>_FILE` pointing at a mounted file (setting both forms fails startup); the list is in [`config/secretfile.go`](../config/secretfile.go). |
 | Worker split | Every pod runs `APP_ROLE=all` by default. The optional `base/worker` component (not enabled by any overlay) adds a `fiber-boilerplate-worker` Deployment with `APP_ROLE=worker` and sets `APP_ROLE=api` on the API Deployment; worker pods are not selected by the API Service, HPA, or PDB. See [deploy/k8s/README.md](../deploy/k8s/README.md#job-workers). |
 | SMTP | STARTTLS, normally port 587; implicit TLS on 465 is not supported. Set `EMAIL_DRIVER=smtp`, `SMTP_HOST`, `SMTP_PORT`, credentials, and `EMAIL_FROM_ADDRESS`. Production requires `SMTP_REQUIRE_TLS=true` and rejects `EMAIL_DRIVER=console`. A relay that does not advertise STARTTLS fails sends. |
@@ -1502,6 +1571,7 @@ gantt
     section Drain window (15s)
     HTTP stop accepting and drain       :http, 5, 15s
     Scheduler then job worker drain     :work, 5, 15s
+    Join module background loops        :loops, 5, 15s
     Wait for async goroutines           :async, 5, 15s
     section Reserve (5s)
     Flush spans (min 1s)                :trace, 20, 3s
@@ -1513,11 +1583,14 @@ After SIGTERM the process:
 1. stops accepting HTTP and drains in-flight requests, **in parallel with**
    cancelling the scheduler and then the job worker (they only need the pool
    and cache, which stay open);
-2. once HTTP has stopped, so no new ones appear, waits for `pkg/async`
+2. joins the module background loops (for example the webhook retention loop)
+   that share the worker context, so none is still using the database when the
+   pools close;
+3. once HTTP has stopped, so no new ones appear, waits for `pkg/async`
    goroutines (post-commit emails started by handlers);
-3. flushes spans, bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` (default 10) and the
+4. flushes spans, bounded by `OTEL_SHUTDOWN_TIMEOUT_SECS` (default 10) and the
    budget left after a 2s close reserve, but always given at least 1s;
-4. closes modules, the cache, and the database pool. Pool close waits for every
+5. closes modules, the cache, and the database pool. Pool close waits for every
    checked-out connection, so it is bounded by the rest of the budget (at least
    1s); if a job or handler that ignored cancellation still holds a connection,
    the process logs `database pool did not close before the shutdown deadline`
@@ -1534,9 +1607,10 @@ and `config.ShutdownBudget` together.
 `.github/workflows/deploy.yml` is optional and deploys nothing until
 configured. It supports manual `workflow_dispatch` for staging or production,
 automatic production deploys after a **successful** Release workflow run
-triggered by a `v*` tag, and a `dry_run` mode that only renders/uploads
-manifests. Failed releases never deploy. Deploys are serialized per
-environment with `cancel-in-progress: false`.
+triggered by a stable `v<semver>` tag, and a `dry_run` mode that only
+renders/uploads manifests. Failed releases and pre-release tags never
+auto-deploy. Deploys are serialized per environment with
+`cancel-in-progress: false`.
 
 | GitHub configuration | Requirement |
 | --- | --- |
@@ -1544,16 +1618,28 @@ environment with `cancel-in-progress: false`.
 | Secret `KUBE_CONFIG` (per environment) | Raw or base64-encoded kubeconfig for that cluster; base64 is recommended. |
 | Variable `GHCR_IMAGE` (optional; a secret with the same name also works) | Bare lowercase GHCR repository equal to the Release image `ghcr.io/<owner>/<repo>`. Schemes, tags, digests, ports, and colons are rejected. Defaults to `ghcr.io/${{ github.repository }}`. |
 
-The workflow applies the prereqs, verifies both pre-created Secrets
-(`fiber-boilerplate-secrets` and `fiber-boilerplate-migrate-secrets`) exist,
-refuses to delete an unfinished migration Job, runs and awaits the migration
-Job (failing immediately on `Failed=True`), applies the app overlay, waits for
-the rollout, and smoke-checks `/healthz` and `/readyz` through a port-forward.
-The optional `image_preflight` input checks GHCR for the exact image first
-(`packages: read`). Production requires a full semver tag or `sha-<40 hex>`;
-`latest`, branch names, and placeholders are rejected. Staging accepts branch
-tags and always pulls. Promotion deploys the same image tag to staging and then
+Every non-dry-run deployment resolves the tag to its digest, verifies the
+cosign signature of `image@sha256:...` against
+`release.yml@refs/tags/v<semver>`, and renders and rolls out that digest, so a
+tag rewritten after verification cannot change what runs. A deploy triggered by
+`workflow_run` checks out `github.event.workflow_run.head_sha`, so the manifests
+match the commit that produced the image.
+
+The workflow applies the prereqs, verifies the pre-created Secrets exist
+(`fiber-boilerplate-secrets`, `fiber-boilerplate-migrate-secrets`, and
+`fiber-boilerplate-seed-secrets` when seeding), refuses to delete an unfinished
+migration Job, runs and awaits the migration Job (failing immediately on
+`Failed=True`), optionally runs and awaits the one-shot seed Job (`seed` input,
+default `false`), applies the app overlay, waits for the rollout, and
+smoke-checks `/healthz` and `/readyz` through a port-forward. Production
+requires a stable full semver tag or `sha-<40 hex>`; `latest`, branch names,
+pre-release tags, and placeholders are rejected. Staging also accepts
+pre-release tags. Promotion deploys the same image tag to staging and then
 production; the workflow never rebuilds the image.
+
+The admin is created only by `cmd/seed` (the Kubernetes seed Job, the Compose
+`seed` service, or `make seed`), never by API startup, so `ADMIN_*` never
+reaches API or worker pods.
 
 ```bash
 kubectl -n <namespace> rollout history deployment/fiber-boilerplate
@@ -1674,7 +1760,7 @@ increasing, slow requests.
    means a replica lacks a `DATA_ENCRYPTION_*` key (see
    [Key rotation](#key-rotation)).
 4. Scale worker-running replicas within the DB connection budget; do not
-   exceed `DB_MAX_CONNS * replicas`.
+   exceed `2 * DB_MAX_CONNS * replicas` (normal + bypass pools per process).
 5. Let lease expiry reclaim crashed work. Manual lock clearing is a last resort
    and accepts duplicate execution.
 6. Do not bulk-requeue `dead` rows: payloads are cleared. Fix the handler and
@@ -1756,7 +1842,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |
 | `METRICS_AUTH_TOKEN` | Required in production; sent as `Authorization: Bearer <token>` |
 | `OTEL_ENABLED` | Enable tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`; `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317` |
-| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Admin seeded on API startup (also `make seed`); password 12+ chars in production |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Used only by `cmd/seed` (`make seed`, the Compose `seed` service, or the Kubernetes seed Job); API startup never seeds. Password 12+ chars in production |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (required in production; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
 | `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |

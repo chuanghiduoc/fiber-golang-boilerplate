@@ -26,6 +26,14 @@ func TestRLSPredicateGaps(t *testing.T) {
 	if !containsGap(gaps, "must compare the row tenant with app.tenant_id") {
 		t.Fatalf("gaps = %v, want an app.tenant_id refusal", gaps)
 	}
+
+	withSearchPath := strings.Replace(safe,
+		"LANGUAGE sql STABLE",
+		"LANGUAGE sql STABLE SET search_path = pg_catalog, public", 1)
+	gaps = rlsPredicateGaps(withSearchPath)
+	if !containsGap(gaps, "must not SET search_path") {
+		t.Fatalf("gaps = %v, want an inlinability refusal", gaps)
+	}
 }
 
 func containsGap(gaps []string, want string) bool {

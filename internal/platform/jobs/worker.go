@@ -251,6 +251,10 @@ type Worker struct {
 
 	tracer trace.Tracer
 
+	// now reads the worker clock. Tests replace it to drive the heartbeat
+	// deadline without waiting for real lease durations.
+	now func() time.Time
+
 	store store
 }
 
@@ -275,6 +279,7 @@ func NewWorker(db database.DBTX, workerID string, opts ...Option) *Worker {
 		purgeInterval:     defaultPurgeInterval,
 		handlers:          make(map[string]Handler),
 		tracer:            noop.NewTracerProvider().Tracer(jobsInstrumentationName),
+		now:               time.Now,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -690,6 +695,22 @@ func (w *Worker) purgeTerminal(ctx context.Context) {
 	}
 }
 
+// leaseCancelMargin is how long the heartbeat may keep failing before the
+// handler is canceled: one heartbeat interval (the next renewal still had a
+// chance to arrive) plus the bookkeeping timeout (the longest a heartbeat call
+// or the final outcome write may take). Cancelling one interval and one
+// bookkeeping timeout before the lease expires stops work before another worker
+// may reclaim the job. A lease that is not comfortably longer than that (a
+// degenerate configuration) still gets one heartbeat interval, which
+// normalizeLease guarantees is positive.
+func (w *Worker) leaseCancelMargin() time.Duration {
+	margin := w.leaseDuration - w.heartbeatInterval - bookkeepingTimeout
+	if margin <= 0 {
+		return w.heartbeatInterval
+	}
+	return margin
+}
+
 // startHeartbeat renews the job's lease until the returned stop function is
 // called. Heartbeats use a context detached from cancellation so a handler
 // that is still unwinding during shutdown keeps ownership until it finishes.
@@ -700,9 +721,10 @@ func (w *Worker) purgeTerminal(ctx context.Context) {
 // The heartbeat also owns lease-loss cancellation. A fenced heartbeat that
 // affects no row reports ErrLeaseLost, so the handler is canceled at once
 // instead of continuing to produce side effects another worker will duplicate.
-// A transient heartbeat failure is tolerated until the lease duration has
-// elapsed since the last successful heartbeat (or the claim), because only then
-// may another worker reclaim the job.
+// A transient heartbeat failure is tolerated until the lease is
+// leaseCancelMargin away from expiring (measured from the moment the last
+// heartbeat was sent, or the claim), because from then on another worker may
+// reclaim the job before this worker can renew or finish it.
 func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, job claimedJob) func() {
 	if w.store == nil || w.heartbeatInterval <= 0 {
 		return func() {}
@@ -718,7 +740,8 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelCauseF
 
 		// The claim established the lease; treat it as the last success until
 		// a heartbeat proves the lease was renewed.
-		lastRenewed := time.Now()
+		lastRenewed := w.now()
+		margin := w.leaseCancelMargin()
 		for {
 			select {
 			case <-hbCtx.Done():
@@ -728,11 +751,15 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelCauseF
 				if timeout > bookkeepingTimeout {
 					timeout = bookkeepingTimeout
 				}
+				// Measure from before the RPC: the server-side renewal may
+				// complete later than this, and a deadline that is too early is
+				// safe while one that is too late is not.
+				sentAt := w.now()
 				callCtx, callCancel := context.WithTimeout(hbCtx, timeout)
 				err := w.store.Heartbeat(callCtx, job.ID, w.id, job.Attempts, w.leaseDuration)
 				callCancel()
 				if err == nil {
-					lastRenewed = time.Now()
+					lastRenewed = sentAt
 					continue
 				}
 				if errors.Is(err, ErrLeaseLost) {
@@ -748,10 +775,12 @@ func (w *Worker) startHeartbeat(ctx context.Context, cancel context.CancelCauseF
 					"worker_id", w.id,
 					"error", err,
 				)
-				if time.Since(lastRenewed) >= w.leaseDuration {
-					// The lease can no longer be proven alive: another worker
-					// may reclaim the job from now on. Cancel instead of
-					// running on with a handler whose outcome can be fenced out.
+				if w.now().Sub(lastRenewed) >= margin {
+					// The lease can no longer be proven alive for the rest of
+					// this handler: another worker may reclaim the job before
+					// the outcome write is fenced out. Cancel now, one
+					// heartbeat interval and one bookkeeping timeout before
+					// the lease can actually expire.
 					cancel(fmt.Errorf("%w: job %d kind %q: heartbeat deadline exceeded", ErrLeaseLost, job.ID, job.Kind))
 					return
 				}

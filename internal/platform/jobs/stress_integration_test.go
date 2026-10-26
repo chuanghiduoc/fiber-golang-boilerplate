@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 )
 
@@ -51,7 +52,7 @@ func startStressWorker(t *testing.T, worker *Worker) func() {
 func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
 
 	const (
@@ -180,7 +181,7 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
 
 	const (
@@ -317,7 +318,7 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
 
 	const (

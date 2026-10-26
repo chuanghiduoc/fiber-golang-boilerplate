@@ -38,7 +38,7 @@ func memberContextIn(tenantID, userID int64, role string) context.Context {
 // the audit row does.
 func TestInvitationAccept_RollsBackWhenAuditFails(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviter := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rollback-inviter@example.com",
 		testutil.MemberOptions{Role: identityservice.RoleOwner})
 	otherTenant := testutil.CreateTenant(t, ctx, e.pool, "rollback-other")
@@ -63,7 +63,7 @@ func TestInvitationAccept_RollsBackWhenAuditFails(t *testing.T) {
 // use the tenant-1 fallback.
 func TestInvitationAccept_JoinsTheInvitingTenant(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviteTenant := testutil.CreateTenant(t, ctx, e.pool, "join-target")
 	otherTenant := testutil.CreateTenant(t, ctx, e.pool, "join-other")
 	inviter := testutil.CreateMember(t, ctx, e.pool, inviteTenant, "join-inviter@example.com",
@@ -85,7 +85,7 @@ func TestInvitationAccept_JoinsTheInvitingTenant(t *testing.T) {
 // foreign tenant reads it as not found even without the bypass.
 func TestInvitationLookup_IsTenantScoped(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	inviteTenant := testutil.CreateTenant(t, ctx, e.pool, "scope-target")
 	otherTenant := testutil.CreateTenant(t, ctx, e.pool, "scope-other")
 	inviter := testutil.CreateMember(t, ctx, e.pool, inviteTenant, "scope-inviter@example.com",

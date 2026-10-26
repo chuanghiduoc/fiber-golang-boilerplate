@@ -353,12 +353,19 @@ CREATE INDEX IF NOT EXISTS idx_role_permissions_permission
 
 -- Tenant roles may only hold tenant-scoped permissions. Every platform
 -- permission uses the reserved `platform:` prefix (authz.Grant.Platform).
+--
+-- The lookup runs under the caller's RLS: a role owned by another tenant is
+-- invisible, so it must raise instead of reading a NULL tenant_id (which would
+-- otherwise look like a shared system role and allow platform permissions).
 CREATE OR REPLACE FUNCTION validate_role_permission()
 RETURNS TRIGGER AS $$
 DECLARE
     owner_tenant BIGINT;
 BEGIN
     SELECT tenant_id INTO owner_tenant FROM roles WHERE id = NEW.role_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'role does not exist or is not visible to the caller';
+    END IF;
     IF owner_tenant IS NOT NULL AND NEW.permission_key LIKE 'platform:%' THEN
         RAISE EXCEPTION 'tenant roles cannot hold platform permissions';
     END IF;
@@ -1000,6 +1007,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_events_started
 -- Audit rows are append-only. Only a pre-write intent row (source http,
 -- outcome started) may transition to a terminal outcome, and only completion
 -- fields may change. This makes a successful mutation's audit row immutable.
+-- The actor is part of the intent: a completion may not swap in a different
+-- actor, and status_code/error_code may only be filled once (NULL -> value),
+-- never changed afterwards.
 CREATE OR REPLACE FUNCTION audit_events_completion_guard() RETURNS trigger AS $$
 BEGIN
     IF OLD.source <> 'http' OR OLD.outcome <> 'started' THEN
@@ -1017,6 +1027,9 @@ BEGIN
     IF NEW.id IS DISTINCT FROM OLD.id
         OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
         OR NEW.parent_id IS DISTINCT FROM OLD.parent_id
+        OR NEW.actor_id IS DISTINCT FROM OLD.actor_id
+        OR NEW.actor_type IS DISTINCT FROM OLD.actor_type
+        OR NEW.actor_role IS DISTINCT FROM OLD.actor_role
         OR NEW.action IS DISTINCT FROM OLD.action
         OR NEW.resource IS DISTINCT FROM OLD.resource
         OR NEW.resource_id IS DISTINCT FROM OLD.resource_id
@@ -1027,6 +1040,14 @@ BEGIN
         OR NEW.idempotency_key_hash IS DISTINCT FROM OLD.idempotency_key_hash
         OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'audit completion may only change completion fields';
+    END IF;
+    -- status_code and error_code are completion fields, not intent fields:
+    -- the first non-NULL value is set once and can never change.
+    IF OLD.status_code IS NOT NULL AND NEW.status_code IS DISTINCT FROM OLD.status_code THEN
+        RAISE EXCEPTION 'audit completion cannot change status_code';
+    END IF;
+    IF OLD.error_code IS NOT NULL AND NEW.error_code IS DISTINCT FROM OLD.error_code THEN
+        RAISE EXCEPTION 'audit completion cannot change error_code';
     END IF;
     RETURN NEW;
 END;
@@ -1045,6 +1066,48 @@ BEGIN
     RAISE EXCEPTION 'audit_events rows are append-only (% is not allowed)', TG_OP;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Trigger functions resolve their unqualified table names through the
+-- caller's search_path. An attacker who can create a TEMP table in a session
+-- could otherwise shadow `roles`, `memberships`, or `tenants` for the
+-- duration of one statement and subvert the checks above. Pin pg_catalog plus
+-- the schema this migration targets (DB_SCHEMA; the migration runs with
+-- search_path set to it, so current_schema() is that schema).
+--
+-- app_tenant_visible deliberately stays a plain SQL function with no SET
+-- clause: it reads no table and must remain inlinable into every tenant
+-- policy. database-roles.sql also revokes TEMP on the database from the
+-- runtime roles, which removes the shadowing primitive itself.
+DO $$
+DECLARE
+    target_schema TEXT := current_schema();
+BEGIN
+    IF target_schema IS NULL THEN
+        RAISE EXCEPTION 'cannot pin function search_path: current_schema() is NULL';
+    END IF;
+    EXECUTE format(
+        'ALTER FUNCTION %I.update_updated_at() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.validate_role_permission() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.validate_membership_role() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.validate_platform_role() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.protect_last_owner() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.audit_events_completion_guard() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+    EXECUTE format(
+        'ALTER FUNCTION %I.audit_events_append_only() SET search_path = pg_catalog, %I',
+        target_schema, target_schema);
+END;
+$$;
 
 DROP TRIGGER IF EXISTS trigger_audit_events_no_delete ON audit_events;
 CREATE TRIGGER trigger_audit_events_no_delete

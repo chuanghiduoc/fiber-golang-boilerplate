@@ -289,6 +289,71 @@ func TestMiddleware_OAuthCallbackSkipsResolution(t *testing.T) {
 	}
 }
 
+// TestMiddleware_ExemptionsAreCaseInsensitive pins the exemption checks to
+// Fiber's routing: it matches paths case-insensitively, so a mixed-case
+// callback URL must still bypass tenant resolution instead of 404ing in
+// require-header mode.
+func TestMiddleware_ExemptionsAreCaseInsensitive(t *testing.T) {
+	resolver := &countingResolver{}
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	app.Use(Middleware(resolver, ""))
+	app.Get("/api/v1/auth/google/callback", func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"id": ID(c), "slug": Slug(c)})
+	})
+	app.Post("/api/v1/webhooks/inbound/:id", func(c fiber.Ctx) error {
+		return c.SendStatus(http.StatusAccepted)
+	})
+
+	for _, path := range []string{
+		"/api/v1/auth/google/callback?state=x&code=y",
+		"/API/V1/Auth/Google/Callback?state=x&code=y",
+		"/api/v1/Auth/Google/Callback/?state=x&code=y",
+	} {
+		resp, err := app.Test(mustRequest(t, path))
+		if err != nil {
+			t.Fatalf("app.Test(%q): %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200 (callback must bypass require-header)", path, resp.StatusCode)
+		}
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0 for a mixed-case OAuth callback", resolver.calls)
+	}
+
+	for _, path := range []string{"/api/v1/webhooks/inbound/42", "/API/V1/Webhooks/Inbound/42"} {
+		req, err := http.NewRequest(http.MethodPost, path, http.NoBody)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatalf("app.Test(%q): %v", path, err)
+		}
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("%s: status = %d, want 202 (receiver must bypass require-header)", path, resp.StatusCode)
+		}
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("resolver calls = %d, want 0 for a mixed-case webhook receiver", resolver.calls)
+	}
+}
+
+// TestMiddleware_TenantQueryFallbackIsCaseInsensitive covers the same
+// canonicalization for the browser-auth query fallback.
+func TestMiddleware_TenantQueryFallbackIsCaseInsensitive(t *testing.T) {
+	const path = "/api/v1/auth/reset-password"
+	app := newPathTestApp(tenantQueryTestResolver, "", path)
+
+	resp, body := doPathRequest(t, app, "/API/V1/Auth/Reset-Password?tenant=acme", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if body["id"] != float64(2) || body["slug"] != "acme" {
+		t.Fatalf("locals = %v, want tenant 2/acme", body)
+	}
+}
+
 func TestMiddleware_WebhookInboundSkipsResolution(t *testing.T) {
 	resolver := &countingResolver{}
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})

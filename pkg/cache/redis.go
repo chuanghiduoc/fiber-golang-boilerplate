@@ -89,12 +89,14 @@ func (r *RedisCache) Exists(ctx context.Context, key string) (bool, error) {
 	return n > 0, nil
 }
 
-// incrExpireScript increments a key and, on first creation, sets its expiry —
-// atomically, so a crash between INCR and EXPIRE cannot leave a key without a
-// TTL (which would lock the account out permanently).
+// incrExpireScript increments a key and applies the expiry atomically, so a
+// crash between INCR and EXPIRE cannot leave a key without a TTL (which would
+// lock the account out permanently). INCR preserves an existing TTL, but a key
+// that already exists without one (for example a counter written by an older
+// client) gets the requested TTL too.
 var incrExpireScript = redis.NewScript(`
 local v = redis.call('INCR', KEYS[1])
-if v == 1 and tonumber(ARGV[1]) > 0 then
+if tonumber(ARGV[1]) > 0 and (v == 1 or redis.call('PTTL', KEYS[1]) < 0) then
 	redis.call('PEXPIRE', KEYS[1], ARGV[1])
 end
 return v
@@ -107,6 +109,9 @@ func (r *RedisCache) Increment(ctx context.Context, key string, ttl time.Duratio
 // incrBelowExpireScript increments only while the result stays at or below
 // ARGV[2], returning {value, allowed}. Rejected increments do not create a key
 // or extend its TTL, so a throttled client's retries cannot extend its block.
+// SET keeps the existing TTL (KEEPTTL) and a key that is new or has none gets
+// the requested one; a plain SET would drop the expiry on every increment after
+// the first and leave the key alive forever.
 var incrBelowExpireScript = redis.NewScript(`
 local raw = redis.call('GET', KEYS[1])
 local v = 0
@@ -121,8 +126,8 @@ if v >= maxValue then
 	return {v, 0}
 end
 v = v + 1
-redis.call('SET', KEYS[1], v)
-if v == 1 and tonumber(ARGV[1]) > 0 then
+redis.call('SET', KEYS[1], v, 'KEEPTTL')
+if tonumber(ARGV[1]) > 0 and redis.call('PTTL', KEYS[1]) < 0 then
 	redis.call('PEXPIRE', KEYS[1], ARGV[1])
 end
 return {v, 1}

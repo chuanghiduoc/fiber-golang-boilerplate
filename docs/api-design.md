@@ -445,7 +445,10 @@ targets remain `admin:features:write`.
 | `Accept-Version` | in | Asserts the path version. |
 | `API-Version`, `Vary: Accept-Version`, `Deprecation`, `Sunset`, `Link` | out | Version metadata. |
 
-`Location`, `ETag`, locale, and version metadata are exposed through CORS.
+`Location`, `ETag`, `Idempotent-Replayed`, locale and version metadata, the
+rate-limit headers (`RateLimit`, `RateLimit-Policy`, `X-RateLimit-Limit`,
+`X-RateLimit-Remaining`, `X-RateLimit-Reset`, `Retry-After`), and
+`X-Request-Id` are exposed through CORS.
 
 ## Rate limits and quotas
 

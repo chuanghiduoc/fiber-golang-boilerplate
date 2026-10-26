@@ -88,6 +88,41 @@ func LoadDatabase() (DBConfig, error) {
 	return parsed.DB, nil
 }
 
+// LoadSeed loads the app environment, database, and one-shot admin settings.
+// It deliberately skips the application-wide validation Load performs: the seed
+// Job mounts the database credentials from the app Secret and ADMIN_* from its
+// own Secret, so it must run without JWT, SMTP, metrics, or storage secrets. It
+// still validates the database transport and the admin credentials the seed
+// command applies.
+func LoadSeed() (*Config, error) {
+	environment, err := loadEnvironmentFor(seedSecretFileVars)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load seed config: %w", err)
+	}
+	cfg := &Config{}
+	if err := env.ParseWithOptions(cfg, env.Options{Environment: environment}); err != nil {
+		return nil, fmt.Errorf("failed to parse seed config: %w", err)
+	}
+	appEnv := strings.ToLower(strings.TrimSpace(cfg.App.Env))
+	if err := validateAppEnv(appEnv, cfg.App.Env); err != nil {
+		return nil, err
+	}
+	if err := cfg.DB.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid database config: %w", err)
+	}
+	// Seeding skips application validation, but must not silently downgrade
+	// the database transport security relative to the API.
+	if appEnv == envProduction {
+		if err := validateProductionSSLMode(cfg.DB.SSLMode); err != nil {
+			return nil, err
+		}
+	}
+	if err := cfg.Admin.validate(cfg.App.Env); err != nil {
+		return nil, fmt.Errorf("invalid admin config: %w", err)
+	}
+	return cfg, nil
+}
+
 // Validate checks every section and returns the first violation. The order is
 // part of the contract: when several settings are wrong, operators see the
 // same first error as before, so the steps below are listed in the order they

@@ -274,14 +274,17 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 	// Resolve the invitation's tenant by possession, then require the request
 	// tenant to match before the tenant-scoped transaction starts. Only the
 	// resolution is cross-tenant; the account, membership, and audit row are
-	// written under the invitation's RLS scope.
+	// written under the invitation's RLS scope. A request without a tenant is
+	// refused: the RLS resolver is fail-closed and would not admit any row.
 	invitationTenant, err := s.resolveInvitationTenant(ctx, tokenHash)
 	if err != nil {
 		return nil, err
 	}
-	if invitationTenant != tenant.EffectiveID(ctx) {
+	requestTenant := tenant.IDFromContext(ctx)
+	if requestTenant == 0 || invitationTenant != requestTenant {
 		return nil, invitationInvalid("invalid or expired invitation")
 	}
+	ctx = tenant.WithID(ctx, invitationTenant)
 	var member *Member
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		inv, ictx, err := s.pendingInvitation(ctx, tx.Stores, invitationTenant, tokenHash)
