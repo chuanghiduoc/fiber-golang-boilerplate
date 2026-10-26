@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 
-	"github.com/google/uuid"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -89,21 +87,18 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*Deliv
 		return nil, apperror.NewInternal("failed to get webhook secret")
 	}
 
-	// A replay is a new event (new webhook-id, so receivers do not drop it as
-	// a duplicate) carrying the original type, dataVersion, actor, and data.
-	eventID, err := uuid.NewV7()
-	if err != nil {
-		return nil, apperror.NewInternal("failed to replay webhook delivery")
-	}
+	// A replay is a new delivery (and attempt counter) of the SAME message:
+	// the original event id stays the webhook-id, so a receiver deduplicates
+	// it per the Standard Webhooks contract. The original rows are untouched.
 	newID, created, err := s.deliveries.CreateDeliveryWithJob(ctx, DeliveryDraft{
 		TenantID:         tenant.EffectiveID(ctx),
 		EndpointID:       endpoint.ID,
-		EventID:          eventID.String(),
+		EventID:          original.EventID,
 		EventType:        original.EventType,
 		DataVersion:      original.DataVersion,
 		ActorType:        original.ActorType,
 		ActorID:          original.ActorID,
-		EventCreatedAt:   s.now(),
+		EventCreatedAt:   original.OccurredAt,
 		URL:              endpoint.URL,
 		Payload:          original.Payload,
 		SecretCiphertext: ciphertext,
@@ -111,6 +106,7 @@ func (s *service) ReplayDelivery(ctx context.Context, actorID, id int64) (*Deliv
 		TimeoutMS:        endpoint.TimeoutMS,
 		RunAt:            s.now(),
 		ReplayedFromID:   original.ID,
+		IsReplay:         true,
 	})
 	if err != nil {
 		return nil, apperror.NewInternal("failed to replay webhook delivery")

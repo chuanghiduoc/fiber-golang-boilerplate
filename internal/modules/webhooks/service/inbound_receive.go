@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -121,31 +122,64 @@ func inboundEventID(headers http.Header) (string, error) {
 }
 
 // verifyInboundSignature checks the Standard Webhooks signature and timestamp
-// with the source's secret and maps each failure class to a public 401
-// detail.
+// with the source's current secret and, while its explicit grace window is
+// open, the immediately previous secret. A sender that has not switched yet
+// therefore keeps working for 24h after a rotation. Each failure class maps to
+// a public 401 detail.
 func (s *service) verifyInboundSignature(source *InboundSource, headers http.Header, body []byte) error {
-	secret, err := s.codec.Open(source.SecretCiphertext)
+	key, err := s.openInboundKey(source.SecretCiphertext, source.ID)
+	if err != nil {
+		return err
+	}
+	verifyErr := webhook.VerifyRequest(key, headers, body, s.opts.TimestampTolerance, s.now())
+	if verifyErr == nil {
+		return nil
+	}
+	// Only a signature mismatch can be rescued by the previous secret; a
+	// missing or stale timestamp is the sender's mistake either way.
+	if errors.Is(verifyErr, webhook.ErrInvalidSignature) && source.previousSecretValid(s.now()) {
+		previousKey, err := s.openInboundKey(source.PreviousSecretCiphertext, source.ID)
+		if err != nil {
+			return verifyErr
+		}
+		if previousErr := webhook.VerifyRequest(previousKey, headers, body, s.opts.TimestampTolerance, s.now()); previousErr == nil {
+			return nil
+		}
+	}
+	return inboundVerifyError(verifyErr)
+}
+
+// openInboundKey opens and decodes one sealed source secret. A source created
+// before Standard Webhooks has a secret no standard sender can sign with; the
+// sender only learns the signature failed.
+func (s *service) openInboundKey(ciphertext string, sourceID int64) ([]byte, error) {
+	secret, err := s.codec.Open(ciphertext)
 	if err != nil {
 		slog.Error("webhooks: failed to open inbound source secret",
-			slog.Int64("source_id", source.ID),
+			slog.Int64("source_id", sourceID),
 			slog.Any("error", err),
 		)
-		return apperror.NewInternal("failed to verify inbound signature")
+		return nil, apperror.NewInternal("failed to verify inbound signature")
 	}
 	key, err := webhook.DecodeSecret(string(secret))
 	if err != nil {
-		// A source created before Standard Webhooks has a secret no standard
-		// sender can sign with. The sender only learns the signature failed.
 		slog.Error("webhooks: inbound source secret predates Standard Webhooks; rotate it",
-			slog.Int64("source_id", source.ID),
+			slog.Int64("source_id", sourceID),
 			slog.Any("error", err),
 		)
-		return apperror.NewUnauthorized("webhook signature is invalid")
+		return nil, apperror.NewUnauthorized("webhook signature is invalid")
 	}
-	err = webhook.VerifyRequest(key, headers, body, s.opts.TimestampTolerance, s.now())
+	return key, nil
+}
+
+func (s *InboundSource) previousSecretValid(now time.Time) bool {
+	return s.PreviousSecretCiphertext != "" &&
+		s.PreviousSecretExpiresAt != nil &&
+		now.Before(*s.PreviousSecretExpiresAt)
+}
+
+func inboundVerifyError(err error) error {
 	switch {
-	case err == nil:
-		return nil
 	case errors.Is(err, webhook.ErrMissingSignature), errors.Is(err, webhook.ErrMissingTimestamp), errors.Is(err, webhook.ErrMissingID):
 		return apperror.NewUnauthorized("webhook signature is required")
 	case errors.Is(err, webhook.ErrTimestampOutOfRange), errors.Is(err, webhook.ErrInvalidTimestamp):

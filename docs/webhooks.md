@@ -199,9 +199,9 @@ stateDiagram-v2
 
 | Header | Value |
 |---|---|
-| `webhook-id` | The event id (UUIDv7), stable across delivery retries. **Deduplicate on this value**; delivery is at-least-once. |
+| `webhook-id` | The event id (UUIDv7), stable across delivery retries **and replays**. **Deduplicate on this value**; delivery is at-least-once. |
 | `webhook-timestamp` | Unix seconds used in the signature. |
-| `webhook-signature` | `v1,<base64 HMAC-SHA256>`; two space-separated signatures during a rotation grace period. |
+| `webhook-signature` | `v1,<base64 HMAC-SHA256>`; the current secret signs first, and the immediately previous secret co-signs (second space-separated value) while its 24h grace window is open. |
 | `Content-Type` | `application/json`. |
 | `User-Agent` | `fiber-golang-boilerplate-webhooks/2.0`. |
 
@@ -288,20 +288,28 @@ specification's published test vector.
 
 ### Signing during secret rotation
 
+Rotation keeps the retired secret row with an explicit 24h
+`grace_expires_at`; it is not only a retry snapshot. Every attempt sent while
+that row is unexpired — including a delivery dispatched *after* the rotation —
+carries both signatures, current first. After the expiry (or after a second
+rotation, which expires the older retired row) only the current secret signs.
+
 ```mermaid
 flowchart TD
-    A[Attempt ready to sign] --> B{Load current active secret}
+    A[Attempt ready to sign] --> B{Load active + unexpired<br/>previous secret}
     B -->|lookup fails| S[Sign with snapshot only<br/>+ log error]
-    B -->|same ciphertext as snapshot| S2[Sign with snapshot]
-    B -->|rotated since snapshot| C{Current secret decrypts<br/>and decodes?}
+    B -->|loaded| C{Active secret decrypts?}
     C -->|no| S
-    C -->|yes| D{Within 24h of rotation?}
-    D -->|yes| E["v1,&lt;snapshot&gt; v1,&lt;current&gt;"]
-    D -->|no| F[Sign with current only]
+    C -->|yes| D[Sign with current first]
+    D --> E{Previous secret unexpired<br/>and decrypts?}
+    E -->|yes| F["v1,&lt;current&gt; v1,&lt;previous&gt;"]
+    E -->|no| G[Current only]
 ```
 
-Only the snapshot and the current secret co-sign: after two rotations inside
-the window, a receiver still on the intermediate secret rejects the request.
+A second rotation inside the window sets the older retired row's expiry to
+now, so only the immediately previous secret is ever accepted. A delivery
+whose snapshot is older than that previous secret is signed with the current
+(and previous) secret only; a receiver still on the older secret must switch.
 
 ### Retry classification
 
@@ -323,17 +331,18 @@ the window, a receiver still on the intermediate secret rejects the request.
   immediate retry), and is capped at the same maximum.
 - Every attempt is recorded in `webhook_delivery_attempts` with status code,
   duration, and a truncated error (never the response body).
-- Replay (`POST /webhooks/deliveries/:id/replay`) creates a **new** event (new
-  UUIDv7 `id`, so receivers do not drop it as a duplicate, and a new
-  `occurredAt`) with the original type, `dataVersion`, actor, and data,
+- Replay (`POST /webhooks/deliveries/:id/replay`) creates a **new delivery row
+  and attempt counter for the original message**: `webhook-id`, the body
+  `id`, and `occurredAt` stay the original ones, so a Standard Webhooks
+  receiver deduplicates the replay instead of processing it twice. It is
   delivered to the endpoint's current URL with its active secret. The original
-  rows are untouched.
+  delivery rows are untouched.
 
 ### Endpoint model
 
 | Field | Meaning |
 |---|---|
-| `url` | Absolute `http(s)` URL, snapshotted per delivery. |
+| `url` | Absolute `http(s)` URL, snapshotted per delivery. Updating it (or `timeoutMs`) also repoints that endpoint's `pending` deliveries in the same transaction, so a retry follows the move; `succeeded`/`dead` rows keep their snapshot. |
 | `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. Stored as a set and returned sorted. |
 | `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried. |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
@@ -399,9 +408,9 @@ sequenceDiagram
     Note over SV: missing / disabled source -> 404
     SV->>SV: source tenant active? (suspended -> 404)
     SV->>SV: webhook-id present and well-formed (else 400)
-    SV->>SV: open sealed source secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
+    SV->>SV: open sealed current secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
     SV->>SV: headers present, timestamp parses,<br/>inside tolerance window (else 401)
-    SV->>SV: constant-time HMAC over id.timestamp.body (else 401)
+    SV->>SV: constant-time HMAC over id.timestamp.body<br/>(current, else unexpired previous; else 401)
     SV->>SV: body "type" valid if present (else 400)
     SV->>DB: INSERT inbound event, unique (source, webhook-id)
     alt new event
@@ -453,8 +462,8 @@ once on create or rotate. The stored envelope (v2) records the sealing key's
 
 | Rotation | Behavior |
 |---|---|
-| Endpoint | Locks the endpoint row, deactivates the old secret, inserts the next version (concurrent rotations serialize). Queued deliveries keep their ciphertext snapshot and are co-signed for 24 hours (see [Signing during secret rotation](#signing-during-secret-rotation)). If the current secret cannot be loaded, decrypted, or decoded, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
-| Inbound source | Replaces the verification secret immediately; old signatures fail on the next request. |
+| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. If the current secret cannot be loaded, decrypted, or decoded, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
+| Inbound source | Keeps the replaced sealed secret as `previous_secret_ciphertext` with `previous_secret_expires_at = now() + 24h`. Verification accepts the current secret or, while unexpired, the immediately previous one; a second rotation within the window replaces it, so only that one survives. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
 | Variable | Default | Purpose |
@@ -485,8 +494,10 @@ Administration routes accept a JWT or an API key scoped to these permissions
 Domain events: `webhook.endpoint.created|updated|deleted|secret_rotated`,
 `webhook.delivery.replayed`,
 `webhook.inbound_source.created|updated|deleted|secret_rotated`. Metadata holds
-IDs, URL/filter/status, event type, and the duplicate flag; never secrets or
-payloads.
+IDs, the endpoint URL's `scheme://host[:port]` only (paths and queries may
+carry receiver tokens), filter/status, event type, and the duplicate flag;
+never secrets, full URLs, or payloads. A transport failure in `last_error` (and
+the logs) unwraps `*url.Error` to its inner cause for the same reason.
 
 ## HTTP API
 
@@ -523,12 +534,12 @@ Idempotency:
 
 | Table | Role |
 |---|---|
-| `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active). |
+| `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active, plus at most one retired with an unexpired grace window). |
 | `webhook_endpoint_subscriptions` | One row per `eventTypes` pattern of an endpoint. |
 | `webhook_events` | Each dispatched event envelope once: id, type, `data_version`, `actor_type`/`actor_id`, `occurred_at`, and `payload` (the envelope data). The worker rebuilds the signed body from it. |
 | `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret ciphertext, timeout, max attempts) + state. |
 | `webhook_delivery_attempts` | One row per attempt. |
-| `webhook_inbound_sources` | Inbound receivers and sealed secrets. |
+| `webhook_inbound_sources` | Inbound receivers and sealed current/previous secrets. |
 | `webhook_inbound_events` | Received events, unique per source and external event ID. |
 
 - All tables carry `tenant_id` with tenant-leading indexes; there are no

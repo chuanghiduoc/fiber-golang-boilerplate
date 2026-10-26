@@ -128,6 +128,17 @@ func (r *Postgres) UpdateEndpoint(ctx context.Context, draft webhooksvc.UpdateEn
 		if err != nil {
 			return mapNotFound(err)
 		}
+		// Queued deliveries snapshotted the old URL/timeout. Repoint them in
+		// the same transaction so a retry after an endpoint move cannot keep
+		// hitting the previous receiver.
+		if err := q.UpdateWebhookDeliveryEndpointSnapshot(ctx, webhooksqlc.UpdateWebhookDeliveryEndpointSnapshotParams{
+			Url:        draft.URL,
+			TimeoutMs:  draft.TimeoutMS,
+			TenantID:   tid,
+			EndpointID: draft.ID,
+		}); err != nil {
+			return err
+		}
 		if err := q.DeleteWebhookEndpointSubscriptions(ctx, webhooksqlc.DeleteWebhookEndpointSubscriptionsParams{
 			TenantID:   tid,
 			EndpointID: draft.ID,
@@ -187,9 +198,16 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 		if err != nil {
 			return err
 		}
-		if err := q.DeactivateWebhookEndpointSecrets(ctx, webhooksqlc.DeactivateWebhookEndpointSecretsParams{
+		if err := q.ExpireOlderWebhookEndpointSecrets(ctx, webhooksqlc.ExpireOlderWebhookEndpointSecretsParams{
 			TenantID:   tid,
 			EndpointID: id,
+		}); err != nil {
+			return err
+		}
+		if err := q.DeactivateWebhookEndpointSecrets(ctx, webhooksqlc.DeactivateWebhookEndpointSecretsParams{
+			TenantID:     tid,
+			EndpointID:   id,
+			GraceSeconds: webhooksvc.SecretRotationGrace.Seconds(),
 		}); err != nil {
 			return err
 		}
@@ -248,19 +266,26 @@ func (r *Postgres) ActiveEndpointSecret(ctx context.Context, endpointID int64) (
 	return secret.SecretCiphertext, nil
 }
 
-// ActiveSigningSecret returns the endpoint's active sealed secret and its
-// rotation time, so the delivery worker can co-sign retries during the
-// rotation grace period.
-func (r *Postgres) ActiveSigningSecret(ctx context.Context, endpointID int64) (*webhooksvc.SigningSecret, error) {
+// SigningSecrets returns the endpoint's active sealed secret and, while its
+// explicit grace window is open, its immediately previous sealed secret. The
+// delivery worker co-signs with both so receivers can switch at any time
+// during the window.
+func (r *Postgres) SigningSecrets(ctx context.Context, endpointID int64) (*webhooksvc.SigningSecrets, error) {
 	if r == nil || r.q == nil {
 		return nil, ErrNoPool
 	}
-	secret, err := r.q.GetActiveWebhookEndpointSecret(ctx, webhooksqlc.GetActiveWebhookEndpointSecretParams{
+	secrets, err := r.q.GetWebhookEndpointSigningSecrets(ctx, webhooksqlc.GetWebhookEndpointSigningSecretsParams{
 		TenantID:   tenantID(ctx),
 		EndpointID: endpointID,
 	})
 	if err != nil {
-		return nil, mapNotFound(err)
+		return nil, err
 	}
-	return &webhooksvc.SigningSecret{Ciphertext: secret.SecretCiphertext, CreatedAt: secret.CreatedAt.Time}, nil
+	if secrets.CurrentCiphertext == "" {
+		return nil, apperror.ErrNotFound
+	}
+	return &webhooksvc.SigningSecrets{
+		CurrentCiphertext:  secrets.CurrentCiphertext,
+		PreviousCiphertext: secrets.PreviousCiphertext,
+	}, nil
 }

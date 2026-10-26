@@ -24,6 +24,7 @@ type WebhookDelivery struct {
 	LastError        pgtype.Text        `json:"last_error"`
 	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
 	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
+	IsReplay         bool               `json:"is_replay"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 }
@@ -59,6 +60,7 @@ type WebhookEndpointSecret struct {
 	Version          int32              `json:"version"`
 	SecretCiphertext string             `json:"secret_ciphertext"`
 	Active           bool               `json:"active"`
+	GraceExpiresAt   pgtype.Timestamptz `json:"grace_expires_at"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
@@ -86,13 +88,15 @@ type WebhookInboundEvent struct {
 }
 
 type WebhookInboundSource struct {
-	ID               int64              `json:"id"`
-	TenantID         int64              `json:"tenant_id"`
-	Name             string             `json:"name"`
-	Slug             string             `json:"slug"`
-	SecretCiphertext string             `json:"secret_ciphertext"`
-	Status           string             `json:"status"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
+	ID                       int64              `json:"id"`
+	TenantID                 int64              `json:"tenant_id"`
+	Name                     string             `json:"name"`
+	Slug                     string             `json:"slug"`
+	SecretCiphertext         string             `json:"secret_ciphertext"`
+	PreviousSecretCiphertext pgtype.Text        `json:"previous_secret_ciphertext"`
+	PreviousSecretExpiresAt  pgtype.Timestamptz `json:"previous_secret_expires_at"`
+	Status                   string             `json:"status"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                pgtype.Timestamptz `json:"updated_at"`
+	DeletedAt                pgtype.Timestamptz `json:"deleted_at"`
 }

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,9 +47,9 @@ type fakeWorkerStore struct {
 	// rejectCanceled makes bookkeeping writes fail on a canceled context,
 	// like a real database call would.
 	rejectCanceled bool
-	// activeSecret is the endpoint's current secret; nil means the snapshot
-	// is still active.
-	activeSecret *SigningSecret
+	// signingSecrets is the endpoint's current secret plus its unexpired
+	// previous secret; nil means the snapshot is still the only active one.
+	signingSecrets *SigningSecrets
 	// leaseLost makes every fenced outcome write match no row.
 	leaseLost bool
 	// fencedAttempts records the attempt each fenced write was fenced on.
@@ -58,14 +59,14 @@ type fakeWorkerStore struct {
 	beforeAttempt func()
 }
 
-func (f *fakeWorkerStore) ActiveSigningSecret(context.Context, int64) (*SigningSecret, error) {
-	if f.activeSecret != nil {
-		return f.activeSecret, nil
+func (f *fakeWorkerStore) SigningSecrets(context.Context, int64) (*SigningSecrets, error) {
+	if f.signingSecrets != nil {
+		return f.signingSecrets, nil
 	}
 	if f.delivery == nil {
 		return nil, errors.New("not found")
 	}
-	return &SigningSecret{Ciphertext: f.delivery.SecretCiphertext}, nil
+	return &SigningSecrets{CurrentCiphertext: f.delivery.SecretCiphertext}, nil
 }
 
 func (f *fakeWorkerStore) ReleaseDeliveryClaim(ctx context.Context, _ int64, attempt int32) error {
@@ -149,14 +150,14 @@ func (f *fakeWorkerStore) CreateDeliveryAttempt(ctx context.Context, draft Attem
 	return nil
 }
 
-func fixedDelivery(url, ciphertext string, attempts, maxAttempts int32) *Delivery {
+func fixedDelivery(rawURL, ciphertext string, attempts, maxAttempts int32) *Delivery {
 	created := time.Date(2026, 10, 24, 11, 59, 0, 0, time.UTC)
 	return &Delivery{
 		ID:               7,
 		TenantID:         1,
 		EndpointID:       2,
 		EventID:          "evt_1",
-		URL:              url,
+		URL:              rawURL,
 		SecretCiphertext: ciphertext,
 		Status:           "pending",
 		Attempts:         attempts,
@@ -558,9 +559,11 @@ func TestDeliveryWorker_StaleOutcomeIsDiscarded(t *testing.T) {
 	}
 }
 
-// TestDeliveryWorker_RotationGraceCoSigns proves a retry whose snapshot
-// predates a secret rotation is signed with both secrets inside the grace
-// period and with the current secret alone after it.
+// TestDeliveryWorker_RotationGraceCoSigns proves every delivery sent while the
+// previous endpoint secret is unexpired carries both signatures, current
+// first, whether it is a new delivery (snapshot is the current secret) or a
+// retry whose snapshot predates the rotation. After the grace only the current
+// secret signs.
 func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 	codec, oldCiphertext := testCodec(t)
 	newCiphertext, err := codec.Seal([]byte(rotatedSecret))
@@ -570,21 +573,39 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 
 	cases := []struct {
-		name      string
-		rotatedAt time.Time
-		oldValid  bool
+		name     string
+		snapshot string
+		secrets  *SigningSecrets
+		oldValid bool
 	}{
-		{"inside grace", now.Add(-time.Hour), true},
-		{"after grace", now.Add(-secretRotationGrace - time.Minute), false},
+		{
+			name:     "new delivery inside grace",
+			snapshot: newCiphertext,
+			secrets:  &SigningSecrets{CurrentCiphertext: newCiphertext, PreviousCiphertext: oldCiphertext},
+			oldValid: true,
+		},
+		{
+			name:     "retry snapshot inside grace",
+			snapshot: oldCiphertext,
+			secrets:  &SigningSecrets{CurrentCiphertext: newCiphertext, PreviousCiphertext: oldCiphertext},
+			oldValid: true,
+		},
+		{
+			name:     "retry snapshot after grace",
+			snapshot: oldCiphertext,
+			secrets:  &SigningSecrets{CurrentCiphertext: newCiphertext},
+			oldValid: false,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var newErr, oldErr error
+			var header string
+			var sentBody []byte
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, _ := io.ReadAll(r.Body)
-				if strings.Count(r.Header.Get("webhook-signature"), "v1,") > 1 && !strings.Contains(r.Header.Get("webhook-signature"), " ") {
-					t.Errorf("co-signatures must be space-separated: %q", r.Header.Get("webhook-signature"))
-				}
+				sentBody = body
+				header = r.Header.Get("webhook-signature")
 				newErr = verifyWith(rotatedSecret, r.Header, body, now)
 				oldErr = verifyWith(testSecret, r.Header, body, now)
 				w.WriteHeader(http.StatusNoContent)
@@ -592,8 +613,8 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 			defer server.Close()
 
 			store := &fakeWorkerStore{
-				delivery:     fixedDelivery(server.URL, oldCiphertext, 0, 3),
-				activeSecret: &SigningSecret{Ciphertext: newCiphertext, CreatedAt: tc.rotatedAt},
+				delivery:       fixedDelivery(server.URL, tc.snapshot, 0, 3),
+				signingSecrets: tc.secrets,
 			}
 			worker, _ := testWorker(store, loopbackWebhookClient(t))
 			worker.codec = codec
@@ -602,15 +623,57 @@ func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 				t.Fatalf("Handle(): %v", err)
 			}
 			if newErr != nil {
-				t.Fatalf("a receiver on the rotated secret must verify: %v", newErr)
+				t.Fatalf("a receiver on the current secret must verify: %v", newErr)
 			}
-			if tc.oldValid && oldErr != nil {
-				t.Fatalf("a receiver still on the snapshot secret must verify inside the grace: %v", oldErr)
-			}
-			if !tc.oldValid && !errors.Is(oldErr, webhook.ErrInvalidSignature) {
-				t.Fatalf("snapshot secret must stop signing after the grace, got %v", oldErr)
+			if tc.oldValid {
+				if oldErr != nil {
+					t.Fatalf("a receiver still on the previous secret must verify inside the grace: %v", oldErr)
+				}
+				parts := strings.Fields(header)
+				if len(parts) != 2 {
+					t.Fatalf("co-signatures must be two space-separated v1 values: %q", header)
+				}
+				currentKey, err := webhook.DecodeSecret(rotatedSecret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				previousKey, err := webhook.DecodeSecret(testSecret)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := webhook.Sign(currentKey, "evt_1", now, sentBody); parts[0] != want {
+					t.Fatalf("the current secret must sign first: got %q want %q", parts[0], want)
+				}
+				if want := webhook.Sign(previousKey, "evt_1", now, sentBody); parts[1] != want {
+					t.Fatalf("the previous secret must sign second: got %q want %q", parts[1], want)
+				}
+			} else {
+				if !errors.Is(oldErr, webhook.ErrInvalidSignature) {
+					t.Fatalf("previous secret must stop signing after the grace, got %v", oldErr)
+				}
+				if strings.Count(header, "v1,") != 1 {
+					t.Fatalf("only the current signature must be sent after the grace: %q", header)
+				}
 			}
 		})
+	}
+}
+
+// TestClassifyAttempt_TransportErrorOmitsURL proves a transport failure is
+// recorded without the endpoint URL: *url.Error embeds the full request URL,
+// which may carry receiver tokens in its path or query.
+func TestClassifyAttempt_TransportErrorOmitsURL(t *testing.T) {
+	transportErr := &url.Error{
+		Op:  "Post",
+		URL: "https://hooks.example/services/T000/B000/secret-token?key=abc",
+		Err: errors.New("dial tcp: connection refused"),
+	}
+	attempt := classifyAttempt(sentRequest{err: transportErr, elapsed: time.Second})
+	if strings.Contains(attempt.reason, "secret-token") || strings.Contains(attempt.reason, "hooks.example") {
+		t.Fatalf("transport error leaked the endpoint URL: %q", attempt.reason)
+	}
+	if !strings.Contains(attempt.reason, "connection refused") {
+		t.Fatalf("transport error lost its inner cause: %q", attempt.reason)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -23,12 +24,6 @@ const (
 	// bookkeepingTimeout bounds the detached writes that record an attempt
 	// after the HTTP request was sent.
 	bookkeepingTimeout = 5 * time.Second
-	// secretRotationGrace is how long after an endpoint secret rotation a
-	// delivery whose snapshot predates the rotation is signed with both the
-	// snapshot and the current secret. Receivers can switch to the new secret
-	// at any time inside the window without failing pending retries; after it
-	// only the current secret signs.
-	secretRotationGrace = 24 * time.Hour
 )
 
 // WorkerOptions configures retry and claim behavior.
@@ -45,7 +40,7 @@ type WorkerStore interface {
 	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
 	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
 	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
-	ActiveSigningSecret(ctx context.Context, endpointID int64) (*SigningSecret, error)
+	SigningSecrets(ctx context.Context, endpointID int64) (*SigningSecrets, error)
 	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error
@@ -274,7 +269,7 @@ func classifyAttempt(sent sentRequest) attemptResult {
 	if sent.err != nil {
 		return attemptResult{
 			outcome: webhook.ClassifyError(sent.err),
-			reason:  truncateError(fmt.Sprintf("request failed: %v", sent.err)),
+			reason:  transportErrorReason(sent.err),
 			elapsed: sent.elapsed,
 		}
 	}
@@ -289,6 +284,17 @@ func classifyAttempt(sent sentRequest) attemptResult {
 		attempt.reason = webhook.StatusError(result.StatusCode)
 	}
 	return attempt
+}
+
+// transportErrorReason builds the recorded error text for a failed request.
+// *url.Error embeds the full request URL (which may carry receiver tokens in
+// its path or query), so only its inner cause is kept.
+func transportErrorReason(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
+	return truncateError(fmt.Sprintf("request failed: %v", err))
 }
 
 // recordAttempt appends the attempt to the delivery log before the delivery
@@ -359,43 +365,54 @@ func (w *DeliveryWorker) fenced(delivery *Delivery, action string, err error) er
 	return nil
 }
 
-// signatureHeader signs with the delivery's snapshot key. When the endpoint
-// secret was rotated after the snapshot, it also signs with the current key
-// during secretRotationGrace (two space-separated "v1," signatures; receivers
-// accept either), and with the current key alone after it. A failed lookup
-// falls back to the snapshot signature, which is what the delivery was
-// created with.
+// signatureHeader signs with the endpoint's current secret first and, while
+// the immediately previous secret's explicit grace window is still open, with
+// that one too as a second space-separated "v1," signature. Receivers accept
+// either, so they can switch secrets at any point inside the 24h window; a
+// delivery sent after it (or after a second rotation) carries only the
+// current signature. A failed lookup falls back to the snapshot signature,
+// which is what the delivery was created with. Each rotation seals a fresh
+// secret with a random nonce, so an identical ciphertext means the snapshot
+// is still the active secret.
 func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery, snapshot []byte, timestamp time.Time, body []byte) string {
 	sign := func(key []byte) string {
 		return webhook.Sign(key, delivery.EventID, timestamp, body)
 	}
-	current, err := w.store.ActiveSigningSecret(ctx, delivery.EndpointID)
+	secrets, err := w.store.SigningSecrets(ctx, delivery.EndpointID)
 	if err != nil {
-		slog.Error("webhooks: load current endpoint secret; signing with the snapshot only",
+		slog.Error("webhooks: load endpoint signing secrets; signing with the snapshot only",
 			slog.Int64("delivery_id", delivery.ID),
 			slog.Int64("endpoint_id", delivery.EndpointID),
 			slog.Any("error", err),
 		)
 		return sign(snapshot)
 	}
-	// Each rotation seals a fresh secret with a random nonce, so an identical
-	// ciphertext means the snapshot is still the active secret.
-	if current.Ciphertext == delivery.SecretCiphertext {
-		return sign(snapshot)
+	currentKey := snapshot
+	if secrets.CurrentCiphertext != delivery.SecretCiphertext {
+		currentKey, err = w.signingKey(secrets.CurrentCiphertext)
+		if err != nil {
+			slog.Error("webhooks: current endpoint secret is unusable; signing with the snapshot only",
+				slog.Int64("delivery_id", delivery.ID),
+				slog.Int64("endpoint_id", delivery.EndpointID),
+				slog.Any("error", err),
+			)
+			return sign(snapshot)
+		}
 	}
-	currentKey, err := w.signingKey(current.Ciphertext)
-	if err != nil {
-		slog.Error("webhooks: current endpoint secret is unusable; signing with the snapshot only",
-			slog.Int64("delivery_id", delivery.ID),
-			slog.Int64("endpoint_id", delivery.EndpointID),
-			slog.Any("error", err),
-		)
-		return sign(snapshot)
+	signatures := []string{sign(currentKey)}
+	if secrets.PreviousCiphertext != "" && secrets.PreviousCiphertext != secrets.CurrentCiphertext {
+		previousKey, err := w.signingKey(secrets.PreviousCiphertext)
+		if err != nil {
+			slog.Error("webhooks: previous endpoint secret is unusable; co-signing without it",
+				slog.Int64("delivery_id", delivery.ID),
+				slog.Int64("endpoint_id", delivery.EndpointID),
+				slog.Any("error", err),
+			)
+		} else {
+			signatures = append(signatures, sign(previousKey))
+		}
 	}
-	if w.now().Before(current.CreatedAt.Add(secretRotationGrace)) {
-		return webhook.SignatureHeader(sign(snapshot), sign(currentKey))
-	}
-	return sign(currentKey)
+	return webhook.SignatureHeader(signatures...)
 }
 
 // handleNotClaimable distinguishes an already-terminal delivery (nothing to
