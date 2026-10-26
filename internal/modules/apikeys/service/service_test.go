@@ -195,7 +195,20 @@ func newTestService(repo *fakeRepo, principals fakePrincipals) Service {
 }
 
 func newAuditedTestService(repo *fakeRepo, principals fakePrincipals, recorder AuditWriter) Service {
-	return NewService(repo, principals, fakeTx{keys: repo, audit: recorder, principals: principals}, 8760*time.Hour)
+	return NewService(repo, principals, nil, fakeTx{keys: repo, audit: recorder, principals: principals}, 8760*time.Hour)
+}
+
+// fakeRanks records the rank checks the service asks identity for. err is
+// returned for every target, modelling an admin/owner that does not outrank
+// the key's owner.
+type fakeRanks struct {
+	err   error
+	calls []int64
+}
+
+func (r *fakeRanks) CanManageMember(_ context.Context, targetUserID int64) error {
+	r.calls = append(r.calls, targetUserID)
+	return r.err
 }
 
 func TestService_CreateAppliesMaxLifetime(t *testing.T) {
@@ -205,7 +218,7 @@ func TestService_CreateAppliesMaxLifetime(t *testing.T) {
 	}}
 	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
 	const maxLifetime = 2 * time.Hour
-	svc := NewService(repo, principals, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+	svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
 	svc.(*service).now = func() time.Time { return now }
 	ctx := testContext(1)
 
@@ -256,7 +269,7 @@ func TestService_RotateInheritsBoundedExpiry(t *testing.T) {
 			principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
 				10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
 			}}
-			svc := NewService(repo, principals, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
+			svc := NewService(repo, principals, nil, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, maxLifetime)
 			svc.(*service).now = func() time.Time { return now }
 			ctx := testContext(1)
 
@@ -568,6 +581,107 @@ func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	}
 	if _, err := verifier.Verify(ctx, created.Secret, 2); !isForbidden(err) {
 		t.Fatalf("tenant mismatch error = %v, want 403", err)
+	}
+}
+
+func TestService_AnotherMembersKeyRequiresHigherRank(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	ranks := &fakeRanks{}
+	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, 8760*time.Hour)
+
+	created, err := svc.Create(testContext(1), 10, CreateInput{Name: "owner-key", Scopes: []string{"files:read", "files:write"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	adminCtx := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
+		20, 1, authz.RoleAdmin, authz.Permission("files:read"), authz.Permission("files:write"),
+	))
+	ranks.err = apperror.NewCode(apperror.CodePermissionDenied, "cannot manage a member with an equal or higher role")
+	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Name: ptrString("hijack")}); !hasStatus(err, 403) {
+		t.Fatalf("equal-rank update error = %v, want 403", err)
+	}
+	if err := svc.Revoke(adminCtx, created.ID); !hasStatus(err, 403) {
+		t.Fatalf("equal-rank revoke error = %v, want 403", err)
+	}
+	if repo.keys[created.ID].RevokedAt != nil || repo.keys[created.ID].Name != "owner-key" {
+		t.Fatal("a refused manager changed the key")
+	}
+
+	// Outranking the owner allows managing the key, but only narrowing scopes.
+	ranks.err = nil
+	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Name: ptrString("managed")}); err != nil {
+		t.Fatalf("outranking update: %v", err)
+	}
+	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Scopes: []string{"files:read", "files:write"}}); err != nil {
+		t.Fatalf("same scopes are a narrowing no-op: %v", err)
+	}
+	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Scopes: []string{"files:write"}}); err != nil {
+		t.Fatalf("narrowing update: %v", err)
+	}
+	if _, err := svc.Update(adminCtx, created.ID, UpdateInput{Scopes: []string{"files:read", "files:write"}}); !hasStatus(err, 403) {
+		t.Fatalf("widening by another member error = %v, want 403", err)
+	}
+	if got := repo.keys[created.ID].Scopes; len(got) != 1 || got[0] != "files:write" {
+		t.Fatalf("scopes = %v, want the narrowed files:write", got)
+	}
+	if err := svc.Revoke(adminCtx, created.ID); err != nil {
+		t.Fatalf("outranking revoke: %v", err)
+	}
+}
+
+func TestService_OwnerMayWidenOwnKeyScopes(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, Permissions: []string{"files:read", "files:write"}, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	ranks := &fakeRanks{}
+	svc := NewService(repo, principals, ranks, fakeTx{keys: repo, audit: auditWriterFunc(func(context.Context, audit.Event) error { return nil }), principals: principals}, 8760*time.Hour)
+	created, err := svc.Create(testContext(1), 10, CreateInput{Name: "own-key", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	ownerCtx := authz.WithSubject(testContext(1), authz.NewSubjectWithPermissions(
+		10, 1, authz.RoleMember, authz.Permission("files:read"), authz.Permission("files:write"),
+	))
+	updated, err := svc.Update(ownerCtx, created.ID, UpdateInput{Scopes: []string{"files:read", "files:write"}})
+	if err != nil {
+		t.Fatalf("owner widening: %v", err)
+	}
+	if len(updated.Scopes) != 2 {
+		t.Fatalf("scopes = %v, want both", updated.Scopes)
+	}
+	if len(ranks.calls) != 0 {
+		t.Fatalf("the owner's own key must not need a rank check: %v", ranks.calls)
+	}
+}
+
+func TestService_RotateExpiredKeyIsConflict(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	svc := newTestService(repo, principals)
+	now := time.Date(2026, 10, 26, 9, 0, 0, 0, time.UTC)
+	svc.(*service).now = func() time.Time { return now }
+	ctx := testContext(1)
+
+	created, err := svc.Create(ctx, 10, CreateInput{Name: "short-lived", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	svc.(*service).now = func() time.Time { return now.Add(25 * time.Hour) }
+	repo.keys[created.ID].ExpiresAt = ptrTime(now.Add(time.Hour))
+	if _, err := svc.Rotate(ctx, 10, created.ID); !isConflict(err) {
+		t.Fatalf("expired rotate error = %v, want 409", err)
+	}
+	if len(repo.keys) != 1 {
+		t.Fatalf("keys = %d, want no successor for an expired key", len(repo.keys))
+	}
+	if repo.keys[created.ID].RotatedAt != nil {
+		t.Fatal("a refused rotation must not mark the key rotated")
 	}
 }
 

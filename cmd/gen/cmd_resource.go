@@ -40,6 +40,7 @@ func (g *generator) planResource(module, name, pluralOverride string) (*plan, te
 		{"resource/service.go.tmpl", "service/" + name + ".go"},
 		{"resource/service_test.go.tmpl", "service/" + name + "_test.go"},
 		{"resource/repository.go.tmpl", "repository/" + name + ".go"},
+		{"resource/tenant_purge.go.tmpl", "repository/" + name + "_purge.go"},
 		{"resource/handler.go.tmpl", "handler/" + name + ".go"},
 		{"resource/handler_test.go.tmpl", "handler/" + name + "_test.go"},
 		{"resource/dto.go.tmpl", "dto/" + name + ".go"},
@@ -104,9 +105,18 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 			return insertAtMarker("module.go", out, markerRoutes, fmt.Sprintf("m.register%sRoutes(group, deps)", r.Pascal))
 		}},
 		{"build.go", func(src string) (string, error) {
-			return insertAtMarker("build.go", src, markerBuild, fmt.Sprintf(
-				"%s: %shandler.New%sHandler(%sservice.New%sService(%srepository.New%sRepository(infra.Pool))),",
+			out, err := insertAtMarker("build.go", src, markerBuild, fmt.Sprintf(
+				"%s: %shandler.New%sHandler(%sservice.New%sService(%srepository.New%sRepository(infra.DB))),",
 				r.PluralPascal, m.Ident, r.Pascal, m.Ident, r.Pascal, m.Ident, r.Pascal))
+			if err != nil {
+				return "", err
+			}
+			// Every resource table is tenant-owned, so it needs a purge path.
+			// Repositories take infra.DB (the RLS-scoped handle), never the raw
+			// bypass pool.
+			return insertAtMarker("build.go", out, markerPurge, fmt.Sprintf(
+				"m.tenantPurgers = append(m.tenantPurgers, %srepository.New%sTenantPurger(infra.DB))",
+				m.Ident, r.Pascal))
 		}},
 		{"catalog/permissions.go", func(src string) (string, error) {
 			perm := "Permission" + r.PluralPascal
@@ -138,7 +148,7 @@ func (g *generator) wireResource(p *plan, data templateData) error {
 		{"catalog/locales/vi.json", localeEdit("catalog/locales/vi.json", notFoundCode(m, r), "Không tìm thấy "+r.Human)},
 		{"README.md", func(src string) (string, error) {
 			return insertAtMarker("README.md", src, markerReadme, fmt.Sprintf(
-				"- Resource %#q: table %#q; routes `/api/v1/%s/%s[/:id]` (GET, POST, PUT, DELETE); "+
+				"- Resource %#q: table %#q; routes `/api/v1/%s/%s[/:id]` (GET, POST, PATCH, DELETE); "+
 					"permissions `%s:%s:{read,write,delete}`; error %#q.",
 				r.Name, r.Table, m.Route, r.PluralRoute, m.Name, r.Plural, notFoundCode(m, r)))
 		}},

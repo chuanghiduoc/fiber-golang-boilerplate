@@ -187,6 +187,63 @@ func (s *SessionService) signFor(member *Member, sessionID int64, amr []string) 
 	return access, nil
 }
 
+// reissueTx keeps the session that performed an MFA change alive across the
+// change's token-version bump. It restamps the same session row with the user's
+// new token version and the proven method added to amr, replaces the session's
+// refresh-token family (a token minted before the change must not refresh into
+// the stronger amr), and returns a fresh pair for it. The caller's previous
+// access token carries the old version and stops verifying. A missing session,
+// or one that belongs to another user, is not an error: standalone callers
+// (tests, internal jobs) have no session to keep and simply get no pair.
+func (s *SessionService) reissueTx(ctx context.Context, st Stores, userID, sessionID int64, method string) (TokenPair, error) {
+	current, err := st.Sessions.Get(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return TokenPair{}, nil
+		}
+		return TokenPair{}, apperror.NewInternal("failed to load session")
+	}
+	if current.UserID != userID {
+		return TokenPair{}, nil
+	}
+	member, err := st.Memberships.GetActive(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return TokenPair{}, accountNotActive()
+		}
+		return TokenPair{}, apperror.NewInternal("failed to load membership")
+	}
+	restamped, err := st.Sessions.Restamp(ctx, userID, sessionID, member.User.TokenVersion, withAMR(current.AMR, method))
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return TokenPair{}, nil
+		}
+		return TokenPair{}, apperror.NewInternal("failed to re-issue session")
+	}
+	if err := st.Sessions.DeleteRefreshTokens(ctx, restamped.ID); err != nil {
+		return TokenPair{}, apperror.NewInternal("failed to replace session refresh tokens")
+	}
+	refresh, err := s.newRefreshToken(ctx, st.RefreshTokens, restamped.ID, restamped.ExpiresAt)
+	if err != nil {
+		return TokenPair{}, err
+	}
+	access, err := s.signFor(member, restamped.ID, restamped.AMR)
+	if err != nil {
+		return TokenPair{}, err
+	}
+	return TokenPair{AccessToken: access, RefreshToken: refresh, SessionID: restamped.ID}, nil
+}
+
+// withAMR returns amr plus method, without duplicating one already present.
+func withAMR(amr []string, method string) []string {
+	for _, value := range amr {
+		if value == method {
+			return append([]string(nil), amr...)
+		}
+	}
+	return append(append([]string(nil), amr...), method)
+}
+
 // Refresh rotates a refresh token. The token must belong to the request
 // tenant, be unused and unexpired, and its session live with an active
 // member whose token version still matches. A token that was already used

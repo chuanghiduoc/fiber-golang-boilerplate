@@ -603,7 +603,7 @@ components:
 | Selection | worker pods use their own `app.kubernetes.io/instance` label, so the API Service, HPA, and PDB never select them |
 | Scaling | replicas are safe: claims use `FOR UPDATE SKIP LOCKED` and the scheduler elects one leader through `scheduler_leases`. Count worker pods in the `2 × DB_MAX_CONNS × replicas` budget (normal + bypass pools) |
 | Bulkheads | copy the Deployment under another name with `JOBS_WORKER_KINDS=<kinds>` and set `JOBS_WORKER_EXCLUDE_KINDS=<kinds>` on the general worker, so every kind is claimed by exactly one group |
-| Retention | `SCHEDULER_ENABLED=true` in the ConfigMap enables the hourly purge schedules (`identity.tokens.purge_expired`, `files.trash.purge`, `notifications.retention.purge`, `privacy.exports.purge`) on the worker-capable process. `cmd/api` logs a production warning when the scheduler is off |
+| Retention | `SCHEDULER_ENABLED=true` in the ConfigMap enables the hourly purge schedules (`identity.tokens.purge_expired`, `files.trash.purge`, `files.orphans.sweep`, `notifications.retention.purge`, `privacy.exports.purge`) on the worker-capable process. `cmd/api` logs a production warning when the scheduler is off |
 
 Apply it after the migration Job like the rest of the app overlay. No overlay
 enables it today, so the CI-rendered manifests keep the single-Deployment

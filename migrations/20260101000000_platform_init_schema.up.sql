@@ -83,12 +83,21 @@ CREATE TABLE IF NOT EXISTS tenants (
     -- data and every module's tenant-wide rows are gone. The tenants row and
     -- its audit trail stay forever; this marker keeps the job idempotent.
     purged_at TIMESTAMP WITH TIME ZONE,
+    -- Purge progress survives a run (and a worker restart): the highest
+    -- membership user id whose erasers succeeded. purge_progress_at orders
+    -- unfinished tenants by least recent progress, so one large tenant cannot
+    -- starve the rest.
+    purge_cursor BIGINT NOT NULL DEFAULT 0,
+    purge_progress_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_tenants_trial_ends CHECK (status <> 'trialing' OR trial_ends_at IS NOT NULL),
     CONSTRAINT chk_tenants_deletion_scheduled
         CHECK ((status IN ('pending_deletion', 'deleted')) = (deletion_scheduled_at IS NOT NULL)),
     CONSTRAINT chk_tenants_purged CHECK (status = 'deleted' OR purged_at IS NULL),
+    -- Progress is only meaningful while a deleted tenant is being purged.
+    CONSTRAINT chk_tenants_purge_progress
+        CHECK (status = 'deleted' OR (purge_cursor = 0 AND purge_progress_at IS NULL)),
     -- The compatibility tenant backs every tenant_id DEFAULT 1 column.
     CONSTRAINT chk_tenants_default_not_deleted
         CHECK (id <> 1 OR status NOT IN ('pending_deletion', 'deleted'))
@@ -104,10 +113,16 @@ SELECT setval(pg_get_serial_sequence('tenants', 'id'), (SELECT max(id) FROM tena
 -- Platform tenant listing (cursor pagination by creation time).
 CREATE INDEX IF NOT EXISTS idx_tenants_created_at_id
     ON tenants (created_at DESC, id DESC);
--- The deleted-tenant purge scans only unfinished deletions.
+-- The deleted-tenant purge scans only unfinished deletions, least recently
+-- advanced first so every tenant gets a turn. NULLS FIRST matches the query's
+-- order for tenants that have not made any progress yet.
 CREATE INDEX IF NOT EXISTS idx_tenants_deleted_unpurged
-    ON tenants (id)
+    ON tenants (purge_progress_at ASC NULLS FIRST, id)
     WHERE status = 'deleted' AND purged_at IS NULL;
+-- Pending deletions whose grace has ended (the hourly finalize job).
+CREATE INDEX IF NOT EXISTS idx_tenants_deletion_due
+    ON tenants (deletion_scheduled_at, id)
+    WHERE status = 'pending_deletion';
 
 DROP TRIGGER IF EXISTS trigger_tenants_updated_at ON tenants;
 CREATE TRIGGER trigger_tenants_updated_at
@@ -242,15 +257,24 @@ CREATE TABLE IF NOT EXISTS memberships (
         CHECK (status IN ('active', 'suspended', 'removed')),
     banned_at TIMESTAMP WITH TIME ZONE,
     banned_email_hash VARCHAR(64) CHECK (banned_email_hash ~ '^[0-9a-f]{64}$'),
+    -- Set when an erasure request suspends this membership. It reserves the
+    -- membership (and its sessions/API keys stop working) until privacy.erase
+    -- removes it; unlike banned_at it carries no ban semantics, so erasure
+    -- never blocks the address from re-registering later.
+    erasure_requested_at TIMESTAMP WITH TIME ZONE,
     removed_at TIMESTAMP WITH TIME ZONE,
     credentials_revoked_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     -- Parent key for every cross-module (tenant_id, user_id) foreign key.
     CONSTRAINT uq_memberships_tenant_user UNIQUE (tenant_id, user_id),
+    -- An active membership carries neither marker. A suspended one is either
+    -- banned, pending erasure, or both (erasing a banned member keeps the ban).
+    -- A removed membership may keep either marker for its provenance.
     CONSTRAINT chk_memberships_banned CHECK (
-        (status = 'suspended') = (banned_at IS NOT NULL)
-        OR (status = 'removed' AND banned_at IS NOT NULL)
+        (status = 'active' AND banned_at IS NULL AND erasure_requested_at IS NULL)
+        OR (status = 'suspended' AND (banned_at IS NOT NULL OR erasure_requested_at IS NOT NULL))
+        OR (status = 'removed')
     ),
     CONSTRAINT chk_memberships_removed CHECK ((status = 'removed') = (removed_at IS NOT NULL))
 );

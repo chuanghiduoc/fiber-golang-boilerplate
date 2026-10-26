@@ -77,7 +77,7 @@ module, and `platform`/`pkg` never import modules.
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
-| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests), tenancy (tenant-wide `Purger` registry for deleted tenants) |
+| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, member rank checker, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests), tenancy (tenant-wide `Purger` registry for deleted tenants) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
 | `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections; later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
@@ -139,7 +139,12 @@ migrations) to its owners; keep it current when adding a module.
   and `cmd/`, and `test/arch/sql_literals_test.go` requires every
   `Exec`/`Query`/`QueryRow`/batch SQL argument outside generated code to be a
   compile-time constant; the reviewed dynamic-SQL allowlist there (with
-  `maxDynamicSQLSites`) only shrinks.
+  `maxDynamicSQLSites`) only shrinks. SQL constants reaching those calls are
+  folded with `go/types` and scanned case-insensitively. The layering
+  allowlist has a hard maximum that only decreases, every module owning a
+  `tenant_id` table must register a tenancy `Purger` (platform tables register
+  under their table name, e.g. `jobs`), and an `audithttp.Guard` in
+  `ModeBestEffort` needs a reviewed allowlist entry.
 - The Tier 1 audit check is per function (`go/ast`): the action literal and
   `RecordTx`/`RecordInTx` must sit in one function or in functions linked by
   same-package calls.
@@ -225,7 +230,13 @@ migrations) to its owners; keep it current when adding a module.
   the platform `jobs` purger, registered after every module, deletes the
   tenant's non-running job rows.
   `identity.tenants.expire_trials` suspends `trialing` tenants past
-  `trial_ends_at`, which also stop serving requests at once.
+  `trial_ends_at`, which also stop serving requests at once;
+  `identity.tenants.finalize_deletions` moves due `pending_deletion` tenants
+  to `deleted`, and restoring a `pending_deletion` tenant returns it to
+  `suspended` (a platform admin then activates it). The purge persists
+  `tenants.purge_cursor`, deletes each member's membership as soon as that
+  member's erasers succeed, and gives each tenant a 2-minute budget per run
+  (least recently advanced first).
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
@@ -281,8 +292,15 @@ migrations) to its owners; keep it current when adding a module.
   for that one statement; refresh rotation stays tenant-scoped) and must
   never appear on an HTTP path serving one tenant otherwise. Invitation
   accept/sign-up bypass only the possession lookup of the invitation's
-  tenant; credential/MFA changes that revoke every tenant's sessions keep one
-  bypass transaction for atomicity (each site comments why). The
+  tenant. Credential and MFA changes (password change/reset, email change,
+  logout-all, MFA confirm/disable, platform MFA reset) run in a normal
+  tenant-scoped transaction: bumping the global `users.token_version` ends
+  every session everywhere at once, and the per-tenant `sessions.revoked_at`
+  bookkeeping runs as one bypass statement after commit (MFA confirm
+  re-issues the caller's session on the new version and returns fresh
+  tokens; MFA disable keeps the caller's session). `CreateSession` also
+  refuses, in SQL, a session without `otp`/`rc` for a user with a confirmed
+  factor. Only deleting a global account keeps one bypass transaction. The
   API/worker/seed connect as a non-superuser role without `BYPASSRLS`, and
   `cmd/api` refuses production startup unless the bypass role has
   `BYPASSRLS`, is not superuser, owns no tables, and the normal role is not a
@@ -467,13 +485,17 @@ handler/service/DTO/repository package.
   login/Google+MFA, carried in the session snapshot) must be within
   `MFA_MAX_AGE` (default 12h); a stale session refreshes it with
   `POST /auth/mfa/step-up` (JWT, current TOTP/recovery code, shared guess
-  budget, Tier 1). Every `/platform` route (platform-scope roles) requires it (enforced
-  by `test/arch` `TestPlatformRoutesRequireMFA`).
+  budget, Tier 1). Every route that accepts any platform permission requires
+  it, wherever it is mounted (the feature-flag writes on `/admin/features`
+  included); `test/arch` `TestPlatformRoutesRequireMFA` checks the
+  permissions passed to `Require`/`RequireAny`, not the path.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).
   The system tenant roles are `owner`, `admin`, and `member`; owner and admin
   receive every tenant permission, member receives the listed grants. A rank
-  (`service/role_hierarchy.go`: owner 3 > admin 2 > member/tenant roles 1)
+  (`service/role_hierarchy.go`: owner 3 > admin 2 > member/tenant roles 1; a
+  tenant role holding any member-management permission (`admin:users:*`) has
+  the admin rank, so it manages members but not admins or owners)
   gates member management: granting or inviting a role needs a rank ≥ that
   role plus all its permissions; changing, demoting, banning, unbanning,
   removing, or erasing a member needs a strictly higher rank (owners may
@@ -504,8 +526,10 @@ handler/service/DTO/repository package.
   does the admin seed; never derive a system context from an HTTP request.
   apikeys `ensureCallerCanGrant` and identity `authorizeGrant` follow the
   same rule. API keys are created and rotated only by their owner (no
-  `userId` field; another member's key rotates as 404); admins may still
-  list and revoke them. Keys are `fgb_<base62 random><base62 CRC32>`; a bad
+  `userId` field; another member's key rotates as 404, an expired key as
+  409); updating or revoking another member's key requires outranking its
+  owner (identity's `MemberRankChecker` contract), and only the owner may
+  widen a key's scopes. Keys are `fgb_<base62 random><base62 CRC32>`; a bad
   checksum is rejected before any lookup (legacy base64url keys still
   verify). Every key expires: an omitted `expiresAt` defaults to now +
   `APIKEYS_MAX_LIFETIME` (default 8760h) and a later one is 400.
@@ -514,7 +538,10 @@ handler/service/DTO/repository package.
   invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`. Optional
   quotas (`FILES_TENANT_QUOTA_BYTES`, `FILES_USER_QUOTA_BYTES`, 0 =
   unlimited; trashed files count) are checked in the metadata transaction
-  under a per-tenant advisory lock (`file.quota_exceeded`). `FILES_SCAN_DRIVER`
+  under a per-tenant advisory lock (`file.quota_exceeded`), after a cheap
+  unlocked pre-check before the blob is written. The hourly
+  `files.orphans.sweep` deletes storage objects older than an hour with no
+  `files` row (`storage.Storage.List`). `FILES_SCAN_DRIVER`
   `none|clamav` (`FILES_CLAMAV_ADDR`) scans the stored blob before commit and
   fails closed (`file.infected` 422, `file.scan_unavailable` 503).
 - **Jobs** (`internal/platform/jobs`, details in `docs/operations.md`):
@@ -562,8 +589,9 @@ handler/service/DTO/repository package.
     `files.trash.purge` (files soft-deleted more than
     `FILES_TRASH_RETENTION_DAYS`, default 30, ago, in 100-row batches: commit a
     `purge_started_at` claim that blocks restore, then blob, then row; a
-    missing blob counts as deleted; a failed blob delete releases the claim
-    and backs the row off via `purge_attempts`/`purge_retry_after`, up to
+    missing blob counts as deleted; a failed blob delete keeps the row
+    non-restorable (the blob may already be gone) and backs only the delete
+    retry off via `purge_attempts`/`purge_retry_after`, up to
     24h; no event/webhook);
     `notifications.retention.purge` (notifications read more than
     `NOTIFICATIONS_RETENTION_DAYS`, default 180, ago; unread are kept); and
@@ -650,17 +678,23 @@ handler/service/DTO/repository package.
   the endpoint URL path/query. It
   sends via `pkg/webhook.Client` (private/loopback/link-local blocked unless
   allowlisted, no redirects, no proxy, DNS pinned, ports 443/80 plus
-  `WEBHOOK_ALLOWED_PORTS` at validation and dial time), records every attempt, and
+  `WEBHOOK_ALLOWED_PORTS`; endpoint URLs are also DNS-resolved and range-checked
+  at create/update, and `WEBHOOK_REQUIRE_HTTPS` (default on in production)
+  rejects `http://`), records every attempt, and
   retries 408/425/429/5xx with backoff or `Retry-After`; other 3xx/4xx are
-  dead. Secrets are `whsec_<base64 32 bytes>` (HMAC key = decoded bytes;
-  pre-Standard secrets must be rotated), sealed with
-  `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key in
-  production; the AAD binds purpose, tenant, and endpoint/source id, legacy
-  seals still open) and returned only on create/rotate.
+  dead. A secret that cannot be decrypted or looked up is retryable (never a
+  dead letter, never a fallback to the old snapshot). Secrets are
+  `whsec_<base64 32 bytes>` (HMAC key = decoded bytes; pre-Standard secrets
+  must be rotated), sealed with `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback
+  locally; dedicated key in production) in the v3 envelope only, whose AAD
+  binds purpose, tenant, and endpoint/source id, and returned only on
+  create/rotate; `rotate-secret` with `{"expirePrevious": true}` ends the
+  co-signing grace at once.
   `POST /webhooks/inbound/:id` verifies the same scheme with the source
   secret (or, for 24h after a rotation, the previous one), answers unknown,
-  disabled, or deleted sources with the same 401 as a bad signature, takes
-  the type from the body, and deduplicates `(source, webhook-id)`.
+  disabled, or deleted sources and tenant-check failures with the same 401 as
+  a bad signature (doing equivalent dummy work), takes the type from the
+  body, and deduplicates `(source, webhook-id)`.
 - **Events**: typed bus over one versioned envelope `events.Event`
   {`id` UUIDv7, `type`, `dataVersion`, `occurredAt`, `tenantId`, `actor`
   {type user|service|system, id}, `data`} (1:1 with CloudEvents attributes;
@@ -726,7 +760,13 @@ handler/service/DTO/repository package.
   identities, MFA status, invitations, and the user's own audit events, never
   secrets or hashes); self erasure fans out one
   `privacy.erase` job per membership plus a retryable finalizer that
-  anonymizes the global user only after every membership is `removed`. Admin
+  anonymizes the global user only after every membership is `removed`. At
+  request time, under the owner advisory lock, the memberships being erased
+  are suspended (`erasure_requested_at`, ban fields untouched) and their
+  sessions revoked, so the user cannot act while erasure is pending and a
+  second owner's request sees one active owner and gets 409; a job-time
+  refusal is `jobs.Permanent` and logged. Erasure also anonymizes the user's
+  email on invitations they received. Admin
   erasure is tenant-scoped: one erase job for the request tenant, no
   finalizer, other memberships and the account untouched, and the role
   hierarchy applies. An erase job runs identity's eraser last, so a removed
@@ -812,8 +852,11 @@ Use the Go generator `cmd/gen` (stdlib `text/template` + `embed`) and follow
 - `make gen resource=<r> module=<m>`: tenant-scoped CRUD (`<m>_<plural>`
   table, sqlc queries, repository mapping rows to service types, service over
   ports, handler/dto, routes `rate limit → authzhttp.Require → idempotency →
-  audithttp.Guard → handler`, permissions, error code, en/vi keys, fake-based
-  unit tests, a PostgreSQL integration test).
+  audithttp.Guard → handler` with `PATCH` partial updates, permissions, error
+  code, en/vi keys, fake-based unit tests, a PostgreSQL integration test run
+  through the RLS app role). The table gets `ENABLE`+`FORCE` RLS and the
+  `tenant_isolation` policy, the repository is wired with `infra.DB`, and a
+  tenancy `Purger` for the table is generated and registered.
 - `make gen command=<Name> module=<m>` / `query=<Name>`:
   `service/{command,query}_<name>.go` with Input/Result (501 until written)
   plus an HTTP stub (`no_http=1` skips it).
@@ -827,7 +870,8 @@ Use the Go generator `cmd/gen` (stdlib `text/template` + `embed`) and follow
    `bootstrap.Build(cfg, infra)` from its own `config` section (as identity,
    files, and webhooks do); `app.Infra.Platform` carries only App, JWT, and
    Tenant. Contracts from earlier modules follow `settings` in `Build`. The
-   bootstrap entry is the only central edit: catalogs self-register through
+   bootstrap entry (with its generated purger registration) and
+   `.github/CODEOWNERS` are the only central edits: catalogs self-register through
    the catalog providers, and jobs/events/schedules through
    `JobProvider`/`EventProvider`/`ScheduleProvider`. Add `RegisterV2Routes`
    only for a breaking v2 surface.

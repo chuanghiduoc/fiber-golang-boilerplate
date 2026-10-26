@@ -19,12 +19,24 @@ WHERE tenant_id = @tenant_id::bigint
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
--- name: Update{{.R.Pascal}} :one
+-- name: Patch{{.R.Pascal}} :one
+-- Partial update: set_name is false when the caller omitted the field, so a
+-- concurrent write to an omitted column is never clobbered.
 UPDATE {{.R.Table}}
-SET name = @name::text
+SET name = CASE WHEN @set_name::boolean THEN @name::text ELSE name END
 WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint
 RETURNING *;
 
 -- name: Delete{{.R.Pascal}} :execrows
 DELETE FROM {{.R.Table}}
 WHERE tenant_id = @tenant_id::bigint AND id = @id::bigint;
+
+-- name: DeleteTenant{{.R.Pascal}}Batch :execrows
+-- Tenant purge: one bounded page per statement so a large tenant never holds
+-- a long lock. The purger loops until this returns zero.
+DELETE FROM {{.R.Table}}
+WHERE id IN (
+    SELECT id FROM {{.R.Table}}
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);

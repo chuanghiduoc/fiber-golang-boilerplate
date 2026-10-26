@@ -1420,3 +1420,42 @@ func TestValidate_FeatureFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestWebhook_RequiresHTTPS(t *testing.T) {
+	cases := []struct {
+		name   string
+		env    string
+		value  string
+		want   bool
+		reject bool
+	}{
+		{name: "production default", env: "production", want: true},
+		{name: "local default", env: "local", want: false},
+		{name: "explicit true", env: "local", value: "true", want: true},
+		{name: "explicit false in production", env: "production", value: "false", want: false},
+		{name: "invalid", env: "local", value: "sometimes", reject: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidConfig()
+			cfg.App.Env = tc.env
+			cfg.Webhook.RequireHTTPS = tc.value
+			got, err := cfg.Webhook.RequiresHTTPS(cfg.App.Env)
+			if tc.reject {
+				if err == nil {
+					t.Fatal("RequiresHTTPS should reject an invalid value")
+				}
+				if validateErr := cfg.Validate(); validateErr == nil {
+					t.Fatal("Validate should reject an invalid WEBHOOK_REQUIRE_HTTPS")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RequiresHTTPS: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("RequiresHTTPS = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

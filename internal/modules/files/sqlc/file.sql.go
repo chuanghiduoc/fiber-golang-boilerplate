@@ -324,6 +324,39 @@ func (q *Queries) GetFileByIDIncludingDeleted(ctx context.Context, arg GetFileBy
 	return i, err
 }
 
+const listFileStoragePaths = `-- name: ListFileStoragePaths :many
+SELECT storage_path FROM files
+WHERE tenant_id = $1::bigint
+  AND storage_path = ANY($2::text[])
+`
+
+type ListFileStoragePathsParams struct {
+	TenantID int64    `json:"tenant_id"`
+	Paths    []string `json:"paths"`
+}
+
+// The orphan sweep checks candidate storage keys against the owning tenant's
+// rows; a key with no row is an orphan.
+func (q *Queries) ListFileStoragePaths(ctx context.Context, arg ListFileStoragePathsParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, listFileStoragePaths, arg.TenantID, arg.Paths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var storage_path string
+		if err := rows.Scan(&storage_path); err != nil {
+			return nil, err
+		}
+		items = append(items, storage_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFilesByUserCursor = `-- name: ListFilesByUserCursor :many
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
 WHERE tenant_id = $1::bigint

@@ -193,6 +193,30 @@ func (r *DataExportRepository) AnonymizeUser(ctx context.Context, userID int64, 
 	return toUser(row, false), nil
 }
 
+func (r *DataExportRepository) AnonymizeErasedUserInvitations(ctx context.Context, userID int64, replacement string) (int64, error) {
+	rows, err := r.q.AnonymizeErasedUserInvitations(ctx, identitysqlc.AnonymizeErasedUserInvitationsParams{
+		Replacement: replacement, TenantID: tenantID(ctx), UserID: userID,
+	})
+	if err != nil {
+		return 0, wrapErr(err)
+	}
+	return rows, nil
+}
+
+// AnonymizeErasedUserInvitationsAllTenants sweeps every tenant; only the
+// global finalizer calls it, under the RLS bypass, so an address invited to a
+// tenant the user never joined is erased too.
+func (r *DataExportRepository) AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, userID int64, replacement string) (int64, error) {
+	rows, err := r.q.AnonymizeErasedUserInvitationsAllTenants(ctx,
+		identitysqlc.AnonymizeErasedUserInvitationsAllTenantsParams{
+			Replacement: replacement, UserID: userID,
+		})
+	if err != nil {
+		return 0, wrapErr(err)
+	}
+	return rows, nil
+}
+
 func (r *DataExportRepository) DeleteCredentialsAndIdentities(ctx context.Context, userID int64) error {
 	if err := r.q.DeleteUserPasswords(ctx, userID); err != nil {
 		return wrapErr(err)

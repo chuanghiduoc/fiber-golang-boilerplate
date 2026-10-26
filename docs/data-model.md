@@ -112,6 +112,8 @@ erDiagram
         timestamptz trial_ends_at "required while trialing"
         timestamptz deletion_scheduled_at "set iff pending_deletion or deleted"
         timestamptz purged_at "set once the deleted-tenant purge completes"
+        bigint purge_cursor "highest membership user id whose erasers succeeded"
+        timestamptz purge_progress_at "orders unfinished purges by least recent progress"
     }
     tenant_settings {
         bigint tenant_id PK, FK
@@ -145,7 +147,8 @@ erDiagram
         bigint tenant_id FK "unique with user_id"
         bigint user_id FK
         varchar status "active | suspended | removed"
-        timestamptz banned_at "set iff suspended"
+        timestamptz banned_at "ban marker, kept through removal"
+        timestamptz erasure_requested_at "reserves a suspended member for erasure"
         timestamptz removed_at "set iff removed"
         timestamptz credentials_revoked_at "never cleared"
     }
@@ -264,19 +267,22 @@ erDiagram
 - **Tenant lifecycle** (enforced by `identity/service/tenants.go`; the
   timestamps each state needs are pinned by `CHECK`s): `trialing → active |
   suspended | pending_deletion`, `active → suspended | pending_deletion`,
-  `suspended → active | pending_deletion`, `pending_deletion → active
-  (cancelled) | deleted`; `deleted` is terminal. A `pending_deletion` tenant
+  `suspended → active | pending_deletion`, `pending_deletion → suspended
+  (cancelled) | deleted`; `deleted` is terminal. Cancelling a deletion lands on
+  `suspended`, never directly on `active`. A `pending_deletion` tenant
   cannot become `deleted` before `deletion_scheduled_at` (`409
-  tenant.deletion_not_due`, a 30-day grace period). Only `trialing` and
-  `active` tenants serve requests, and a `trialing` tenant stops serving the
-  moment `trial_ends_at` passes (its status is then moved to `suspended` by
-  the hourly audited trial-expiry job). Tenant 1 can never enter
-  `pending_deletion` or `deleted`. Tenants are never hard-deleted, so every
-  `tenants` reference is `RESTRICT`/`NO ACTION`. A `deleted` tenant keeps its
-  row and `audit_events`; the hourly purge erases the memberships' per-user
-  data and every module's tenant-wide rows in bounded 500-row pages (deleting
-  file/export blobs before their rows), then stamps `purged_at` (a
-  `CHECK` allows it only on `deleted`).
+  tenant.deletion_not_due`, a 30-day grace period); the hourly audited
+  `identity.tenants.finalize_deletions` job performs the due transition as a
+  system actor. Only `trialing` and `active` tenants serve requests, and a
+  `trialing` tenant stops serving the moment `trial_ends_at` passes (its status
+  is then moved to `suspended` by the hourly audited trial-expiry job). Tenant 1
+  can never enter `pending_deletion` or `deleted`. Tenants are never
+  hard-deleted, so every `tenants` reference is `RESTRICT`/`NO ACTION`. A
+  `deleted` tenant keeps its row and `audit_events`; the hourly purge erases
+  each member's data, then every module's tenant-wide rows in bounded 500-row
+  pages (deleting file/export blobs before their rows), persists
+  `purge_cursor` after each member so a run resumes where it stopped, and
+  stamps `purged_at` (a `CHECK` allows it only on `deleted`).
 - **Users** are global. `email` is stored normalized (`CHECK (email =
   lower(btrim(email)))`) and the partial unique index `idx_users_email_live`
   allows one live account per address; deleting an account (`status =
@@ -285,16 +291,23 @@ erDiagram
   `user_identities`, roles in `membership_roles`, and bans on `memberships`.
   `token_version` is bumped
   by every global credential event (password change or reset, email change,
-  logout-all, account deletion) and invalidates every token and session of
-  the user in every tenant.
+  logout-all, account deletion) and by enabling a second factor (TOTP
+  confirmation and the platform MFA reset), which invalidates every token and
+  session of the user in every tenant. Disabling a factor does not bump it;
+  it revokes the user's other sessions instead.
 - **Memberships** are the user ↔ tenant N:N join and the parent key
   (`uq_memberships_tenant_user`) of every cross-module per-member row, which
-  is why both parents are `RESTRICT` and rows are never hard-deleted. A ban is
-  `status = 'suspended'` + `banned_at`; leaving or being removed is
-  `status = 'removed'` + `removed_at`. There is no `invited` state: a pending
+  is why both parents are `RESTRICT` and rows are never hard-deleted (the
+  tenant purge is the one exception: it deletes one membership after that
+  member's erasers and invitations are gone). A ban is
+  `status = 'suspended'` + `banned_at`; an erasure request reserves the
+  membership with `status = 'suspended'` + `erasure_requested_at` and no ban
+  marker; leaving or being removed is `status = 'removed'` + `removed_at`.
+  There is no `invited` state: a pending
   invite is an `invitations` row (it can target an address with no account).
-  `credentials_revoked_at` is set by a ban or removal and never cleared, so
-  API keys created at or before it stay invalid after an unban or re-join.
+  `credentials_revoked_at` is set by a ban, an erasure reservation, or removal
+  and never cleared, so API keys created at or before it stay invalid after an
+  unban or re-join.
   `banned_email_hash` is the lowercase hex SHA-256 of the normalized address,
   written by a ban. A removed membership keeps `banned_at` and the hash, so a
   ban survives removal and erasure (the user's email may since have been
@@ -325,9 +338,13 @@ erDiagram
   platform roles). `platform_role_assignments` is the only cross-tenant grant
   and accepts only `scope = 'platform'` roles. `api_key_scopes.permission_key`
   references the catalog (`RESTRICT`). Tenant role rank is `owner` 3 > `admin`
-  2 > `member` and tenant-defined roles 1: a caller may grant a role only at
-  or below its rank (owner alone grants owner) and may manage a member only
-  with a strictly higher rank (owners may manage co-owners).
+  2 > `member` 1; a tenant-defined role that grants `admin:users:role`,
+  `admin:users:ban`, or `admin:users:delete` has the admin rank 2 (a delegated
+  administrator: it manages members but not admins or owners), and any other
+  tenant role stays at 1. A caller may grant a role only at
+  or below its effective rank and only while holding every permission the role
+  grants (owner alone grants owner), and may manage a member only
+  with a strictly higher effective rank (owners may manage co-owners).
 - The last-owner trigger (`protect_last_owner`) lives on `memberships` and
   `membership_roles`: removing the last active system `owner` of an
   operational tenant is refused. Counting and locking are scoped to the
@@ -343,7 +360,11 @@ erDiagram
   `audit_events`); accepting stamps `accepted_at`/`accepted_by` in the
   transaction that creates or reactivates the membership. A ban or removal
   deletes the member's pending invitations in the same transaction, and
-  acceptance re-checks the inviter's current rank and permissions.
+  acceptance re-checks the inviter's current rank and permissions. Erasure
+  replaces `email_normalized` with the user's erased address on invitations
+  they accepted or that were addressed to them; `accepted_by` stays the
+  membership id. The global finalizer sweeps every tenant (also one the user
+  never joined); the tenant-scoped admin path only the request tenant.
 - **Sessions** are the RFC 9700 refresh-token family, so there is no separate
   family id: every rotated refresh token references its session. Presenting a
   token that a rotation consumed less than 10 seconds ago in a still-live

@@ -138,6 +138,32 @@ func TestSeaweedFSStorageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSeaweedFSStorageList(t *testing.T) {
+	endpoint := seaweedEndpoint(t)
+	ctx := context.Background()
+	store := newSeaweedStorage(t, endpoint, "uploads-list-it")
+	bucketPrefix := "list-" + strings.ReplaceAll(time.Now().UTC().Format("150405.000000000"), ".", "-") + "/"
+	for _, key := range []string{bucketPrefix + "1/2/a.txt", bucketPrefix + "1/2/nested/b.txt", bucketPrefix + "12/3/c.txt"} {
+		if err := store.Put(ctx, key, bytes.NewReader([]byte(key)), int64(len(key)), "text/plain"); err != nil {
+			t.Fatalf("Put(%s): %v", key, err)
+		}
+	}
+	objects, err := store.List(ctx, bucketPrefix+"1/")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := make(map[string]bool, len(objects))
+	for _, object := range objects {
+		got[object.Path] = true
+		if object.ModifiedAt.IsZero() {
+			t.Errorf("object %q has no last-modified time", object.Path)
+		}
+	}
+	if len(got) != 2 || !got[bucketPrefix+"1/2/a.txt"] || !got[bucketPrefix+"1/2/nested/b.txt"] {
+		t.Fatalf("List = %v, want the two objects under the prefix", got)
+	}
+}
+
 func TestSeaweedFSStorageRejectsBadCredentials(t *testing.T) {
 	endpoint := seaweedEndpoint(t)
 	_, err := New(config.StorageConfig{

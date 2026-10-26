@@ -106,14 +106,14 @@ func (h *mfaHarness) enrollAndConfirm(t *testing.T) (secret string, codes []stri
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	codes, err = h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, code)
+	result, err := h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, code)
 	if err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
-	if len(codes) != 10 {
-		t.Fatalf("recovery codes = %d, want 10", len(codes))
+	if len(result.RecoveryCodes) != 10 {
+		t.Fatalf("recovery codes = %d, want 10", len(result.RecoveryCodes))
 	}
-	return secret, codes
+	return secret, result.RecoveryCodes
 }
 
 func secretFromURI(t *testing.T, uri string) string {
@@ -479,11 +479,11 @@ func TestMFADisableRevokesOtherSessions(t *testing.T) {
 	secret, _ := h.enrollAndConfirm(t)
 	h.clock.at = h.clock.at.Add(totp.Period)
 
-	current, err := h.sessions.Issue(ctx, 100, 0, []string{AMRPassword})
+	current, err := h.sessions.Issue(ctx, 100, h.db.users[100].TokenVersion, []string{AMRPassword})
 	if err != nil {
 		t.Fatalf("Issue current: %v", err)
 	}
-	other, err := h.sessions.Issue(ctx, 100, 0, []string{AMRPassword})
+	other, err := h.sessions.Issue(ctx, 100, h.db.users[100].TokenVersion, []string{AMRPassword})
 	if err != nil {
 		t.Fatalf("Issue other: %v", err)
 	}
@@ -678,6 +678,61 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 	}
 	if h.db.sessions[current.SessionID].RevokedAt != nil {
 		t.Fatal("current session must stay live")
+	}
+}
+
+// Confirming a factor bumps the global token version, so a password-only
+// session created by a login that read MFARequired=false before the
+// confirmation can never be used, and re-issues the session that confirmed
+// the factor under the new version so that caller stays signed in.
+func TestMFAConfirmBumpsVersionAndKeepsCurrentSession(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	version := h.db.users[100].TokenVersion
+	current, err := h.sessions.Issue(ctx, 100, version, []string{AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue current: %v", err)
+	}
+	other, err := h.sessions.Issue(ctx, 100, version, []string{AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue other: %v", err)
+	}
+
+	enrollment, err := h.svc.EnrollTOTP(ctx, 100, current.SessionID, testMFAPassword)
+	if err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	secret := secretFromURI(t, enrollment.OtpauthURI)
+	code, err := totp.Code(secret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	result, err := h.svc.ConfirmTOTP(ctx, 100, current.SessionID, testMFAPassword, code)
+	if err != nil {
+		t.Fatalf("ConfirmTOTP: %v", err)
+	}
+
+	if got := h.db.users[100].TokenVersion; got != version+1 {
+		t.Fatalf("token version = %d, want %d (confirmation must invalidate every older session)", got, version+1)
+	}
+	kept := h.db.sessions[current.SessionID]
+	if kept.RevokedAt != nil {
+		t.Fatal("current session must stay live")
+	}
+	if kept.TokenVersion != h.db.users[100].TokenVersion {
+		t.Fatalf("current session token version = %d, want %d", kept.TokenVersion, h.db.users[100].TokenVersion)
+	}
+	if !containsAll(kept.AMR, AMROTP) {
+		t.Fatalf("current session amr = %v, want otp", kept.AMR)
+	}
+	if h.db.sessions[other.SessionID].RevokedAt == nil {
+		t.Fatal("other session was not revoked")
+	}
+	if result.Tokens.SessionID != current.SessionID || result.Tokens.AccessToken == "" || result.Tokens.RefreshToken == "" {
+		t.Fatalf("re-issued pair = %+v, want a fresh pair for session %d", result.Tokens, current.SessionID)
+	}
+	if len(result.RecoveryCodes) != 10 {
+		t.Fatalf("recovery codes = %d, want 10", len(result.RecoveryCodes))
 	}
 }
 

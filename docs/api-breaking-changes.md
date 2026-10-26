@@ -24,6 +24,75 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
 
 ## Entries
 
+### 2026-10-26 — MFA confirmation re-issues the caller's tokens
+
+- `POST /api/v1/auth/mfa/totp/confirm`: the response keeps
+  `recoveryCodes` and now also carries `accessToken` and `refreshToken`.
+  Confirmation bumps the user's token version so every session that existed
+  before the factor was confirmed is invalid in every tenant (this closes the
+  login race where a password-only sign-in slipped past an MFA enable). The
+  session that confirmed the factor is re-issued and stays signed in, but its
+  previous access and refresh tokens no longer work. Clients must replace
+  their stored tokens with the pair in this response; ignoring it logs the
+  caller out on the next request. There is no v2 route: keeping the old token
+  pair valid would also keep a password-only login that raced the confirmation
+  usable.
+
+### 2026-10-26 — Webhook SSRF checks at configuration, HTTPS default, and API-key rank management
+
+- `POST /api/v1/webhooks/endpoints` and `PUT /api/v1/webhooks/endpoints/{id}`:
+  the URL hostname is now resolved during validation (3s timeout). A host that
+  resolves only to a blocked/private address returns `400` instead of being
+  accepted and failing every delivery. In production `WEBHOOK_REQUIRE_HTTPS`
+  defaults to `true` and `http://` URLs are `400`; an operator can set it to
+  `false` for a deliberate plaintext receiver. Clients using a public HTTPS
+  receiver need no change.
+- `POST /api/v1/webhooks/endpoints/{id}/rotate-secret` accepts an optional body
+  `{"expirePrevious": true}` (default false). When true the previous secret
+  stops co-signing new deliveries immediately instead of after the 24h grace.
+  Requests without a body keep the previous behavior.
+- `PUT /api/v1/admin/api-keys/{id}` and `DELETE /api/v1/admin/api-keys/{id}`
+  (and its `POST .../revoke` alias): managing another member's key now requires
+  the caller to outrank the key owner under the identity role hierarchy, so an
+  admin can no longer change or revoke an owner's key (`403
+  role.insufficient_rank`), and a member can no longer manage a peer's key.
+  Only the key owner may widen its scopes; another manager may only narrow or
+  revoke (`403 permission.denied`). Clients should use an owner/outranking
+  admin account for these operations.
+- `POST /api/v1/admin/api-keys/{id}/rotate` on an expired key now returns `409`
+  instead of issuing an already-expired successor.
+- Stored webhook secrets from the pre-v3 envelope formats are rejected rather
+  than opened without tenant/entity binding. No database has been deployed, so
+  there is no client or data migration; a pre-v3 ciphertext must be re-sealed
+  (rotate the endpoint/source secret) if one exists.
+
+### 2026-10-26 — Feature-flag writes require a second factor
+
+- `PUT`/`DELETE /api/v1/admin/features/flags/{key}` now run
+  `authzhttp.RequireMFA()` before the permission check because the route also
+  accepts `platform:features:write`. A caller presenting only
+  `admin:features:write` (a tenant admin) and a session without `otp`/`rc` in
+  `amr` now receives `403 auth.mfa_required` instead of applying the change.
+  Clients must complete MFA for the admin session, or use the platform
+  permission (which already required a second factor). The target routes
+  (`/flags/{key}/targets`) are tenant-only and unchanged. There is no v2 route.
+
+### 2026-10-26 — Tenant deletion restore and erasure reservation
+
+- `PATCH /api/v1/platform/tenants/{id}/status` no longer accepts `active` for a
+  `pending_deletion` tenant; it returns `409` because the tenant may have been
+  `suspended` before the deletion was requested. Clients must cancel a deletion
+  with `suspended` and then activate the tenant explicitly with a second
+  `active` transition. There is no v2 replacement: restoring straight to
+  `active` could silently lift a suspension.
+- `POST /api/v1/me/erasure` now suspends the caller's memberships and revokes
+  their sessions in the request transaction. A second owner's request, whether
+  sequential or concurrent, now returns `409 user.last_admin` instead of
+  accepting and failing later; clients should surface that as "another owner
+  must remain". The same reservation applies to
+  `POST /api/v1/admin/users/{id}/erasure` for the request tenant only. The
+  response shape is unchanged.
+
 ### 2026-10-26 — Padded common passwords, Google refusals, and AAL2 freshness
 
 - `POST /api/v1/auth/register`, `POST /api/v1/auth/reset-password`,

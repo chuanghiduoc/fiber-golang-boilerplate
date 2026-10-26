@@ -36,11 +36,11 @@ func handlerName(handler fiber.Handler) string {
 	return fn.Name()
 }
 
-// productionModules builds every module from the same ordered list cmd/api
-// uses (internal/bootstrap). Construction performs no I/O, so nil
-// infrastructure is enough to mount and inspect the route tables. A module
-// added to bootstrap is covered by every route test automatically.
-func productionModules(t *testing.T) ([]app.Module, app.Deps) {
+// productionBootstrap builds the same ordered module set cmd/api uses
+// (internal/bootstrap). Tests that inspect composition-root wiring (the
+// tenancy registry) use this directly; productionModules keeps the route-test
+// signature.
+func productionBootstrap(t *testing.T) *bootstrap.Modules {
 	t.Helper()
 	cfg := &config.Config{
 		JWT: config.JWTConfig{Secret: archTestSecret, ExpireHour: 1, RefreshExpireDays: 1},
@@ -51,6 +51,19 @@ func productionModules(t *testing.T) ([]app.Module, app.Deps) {
 	}
 	if err := app.RegisterCatalogs(modules.List...); err != nil {
 		t.Fatalf("RegisterCatalogs: %v", err)
+	}
+	return modules
+}
+
+// productionModules builds every module from the same ordered list cmd/api
+// uses (internal/bootstrap). Construction performs no I/O, so nil
+// infrastructure is enough to mount and inspect the route tables. A module
+// added to bootstrap is covered by every route test automatically.
+func productionModules(t *testing.T) ([]app.Module, app.Deps) {
+	t.Helper()
+	modules := productionBootstrap(t)
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: archTestSecret, ExpireHour: 1, RefreshExpireDays: 1},
 	}
 	deps := app.Deps{
 		Config: cfg,

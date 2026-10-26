@@ -692,6 +692,17 @@ definitions:
     required:
     - code
     type: object
+  dto.MFAConfirmResponse:
+    properties:
+      accessToken:
+        type: string
+      recoveryCodes:
+        items:
+          type: string
+        type: array
+      refreshToken:
+        type: string
+    type: object
   dto.MFADisableRequest:
     properties:
       code:
@@ -885,6 +896,11 @@ definitions:
         type: boolean
       updatedAt:
         type: string
+    type: object
+  dto.RotateEndpointSecretRequest:
+    properties:
+      expirePrevious:
+        type: boolean
     type: object
   dto.SendNotificationRequest:
     properties:
@@ -2858,7 +2874,9 @@ paths:
       description: Verify the first TOTP code, enable the factor, and return ten single-use
         recovery codes. Requires re-authentication with the current password (or a
         recent sign-in for Google-only accounts). This is the only time the recovery
-        codes are shown.
+        codes are shown. Confirmation invalidates every older session everywhere,
+        so the response also carries a re-issued access and refresh token pair for
+        the session that confirmed the factor.
       parameters:
       - description: TOTP code and re-authentication proof
         in: body
@@ -2872,7 +2890,7 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+            $ref: '#/definitions/dto.MFAConfirmResponse'
         "400":
           description: current password is incorrect
           schema:
@@ -4941,6 +4959,11 @@ paths:
         name: id
         required: true
         type: integer
+      - description: Rotation options
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/dto.RotateEndpointSecretRequest'
       produces:
       - application/json
       responses:

@@ -161,6 +161,54 @@ func (s *LocalStorage) Delete(_ context.Context, path string) error {
 	return nil
 }
 
+// List walks prefix recursively and returns every regular file below it. Paths
+// are returned relative to the storage root with forward slashes, matching the
+// keys used by Put/Get.
+func (s *LocalStorage) List(ctx context.Context, prefix string) ([]Object, error) {
+	fullPath, err := s.safePath(prefix)
+	if err != nil {
+		return nil, err
+	}
+	var objects []Object
+	err = filepath.WalkDir(fullPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if errors.Is(walkErr, fs.ErrNotExist) {
+				// Like the S3 driver, a prefix with no objects is empty, not an
+				// error.
+				return fs.SkipAll
+			}
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		relative, err := filepath.Rel(s.basePath, path)
+		if err != nil {
+			return err
+		}
+		objects = append(objects, Object{
+			Path:       filepath.ToSlash(relative),
+			Size:       info.Size(),
+			ModifiedAt: info.ModTime().UTC(),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list storage: %w", err)
+	}
+	return objects, nil
+}
+
 func (s *LocalStorage) URL(path string) string {
 	cleaned := filepath.ToSlash(filepath.Clean(path))
 	if cleaned == "." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {

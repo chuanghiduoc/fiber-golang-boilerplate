@@ -42,6 +42,12 @@ type EndpointResponse struct {
 	DeletedAt   *time.Time `json:"deletedAt,omitempty"`
 }
 
+// RotateEndpointSecretRequest optionally ends the previous secret's rotation
+// grace immediately. The body itself may be omitted (default false).
+type RotateEndpointSecretRequest struct {
+	ExpirePrevious bool `json:"expirePrevious"`
+}
+
 // EndpointSecretResponse is returned exactly once when a secret is created or
 // rotated.
 type EndpointSecretResponse struct {

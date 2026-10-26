@@ -2565,7 +2565,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown.",
+                "description": "Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown. Confirmation invalidates every older session everywhere, so the response also carries a re-issued access and refresh token pair for the session that confirmed the factor.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2591,7 +2591,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/dto.MFARecoveryCodesResponse"
+                            "$ref": "#/definitions/dto.MFAConfirmResponse"
                         }
                     },
                     "400": {
@@ -5815,6 +5815,14 @@ const docTemplate = `{
                         "name": "id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "description": "Rotation options",
+                        "name": "request",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/dto.RotateEndpointSecretRequest"
+                        }
                     }
                 ],
                 "responses": {
@@ -7421,6 +7429,23 @@ const docTemplate = `{
                 }
             }
         },
+        "dto.MFAConfirmResponse": {
+            "type": "object",
+            "properties": {
+                "accessToken": {
+                    "type": "string"
+                },
+                "recoveryCodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "refreshToken": {
+                    "type": "string"
+                }
+            }
+        },
         "dto.MFADisableRequest": {
             "type": "object",
             "required": [
@@ -7709,6 +7734,14 @@ const docTemplate = `{
                 },
                 "updatedAt": {
                     "type": "string"
+                }
+            }
+        },
+        "dto.RotateEndpointSecretRequest": {
+            "type": "object",
+            "properties": {
+                "expirePrevious": {
+                    "type": "boolean"
                 }
             }
         },

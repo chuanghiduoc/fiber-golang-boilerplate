@@ -3,12 +3,19 @@ package service
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
+
+// publicLookup resolves every test hostname to a public address unless the
+// caller installs a different mock.
+func publicLookup(context.Context, string) ([]net.IPAddr, error) {
+	return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+}
 
 type recordingEndpointStore struct {
 	EndpointStore
@@ -45,6 +52,7 @@ func TestService_EndpointURLPortPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewGuardWithPorts: %v", err)
 	}
+	guard = guard.WithLookupIP(publicLookup)
 	store := &recordingEndpointStore{}
 	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard})
 	ctx := context.Background()
@@ -84,5 +92,81 @@ func TestService_EndpointURLPortPolicy(t *testing.T) {
 	}
 	if store.updated != 0 {
 		t.Fatal("a rejected update reached the store")
+	}
+}
+
+// TestService_EndpointURLDNSValidated proves create/update resolve the hostname
+// before accepting it, so an internal address is refused at configuration time
+// instead of failing every delivery later.
+func TestService_EndpointURLDNSValidated(t *testing.T) {
+	codec, err := NewSecretCodec("dns-policy-test-encryption-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	guard, err := webhook.NewGuard(nil)
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	guard = guard.WithLookupIP(func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host == "internal.example" {
+			return []net.IPAddr{{IP: net.ParseIP("10.0.0.5")}}, nil
+		}
+		return publicLookup(context.Background(), host)
+	})
+	store := &recordingEndpointStore{}
+	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard})
+	ctx := context.Background()
+
+	_, _, err = svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://internal.example/hook"})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("internal target error = %v, want 400", err)
+	}
+	if store.created != 0 {
+		t.Fatal("a blocked target must not reach the store")
+	}
+	_, err = svc.UpdateEndpoint(ctx, 1, 9, UpdateEndpointInput{
+		URL: "https://internal.example/hook", EventTypes: []string{"*"}, Status: StatusActive,
+	})
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("internal update error = %v, want 400", err)
+	}
+	if store.updated != 0 {
+		t.Fatal("a blocked update must not reach the store")
+	}
+
+	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
+		t.Fatalf("public target rejected: %v", err)
+	}
+}
+
+func TestService_RequireHTTPSSetting(t *testing.T) {
+	codec, err := NewSecretCodec("https-policy-test-encryption-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	guard, err := webhook.NewGuard(nil)
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	guard = guard.WithLookupIP(publicLookup)
+	store := &recordingEndpointStore{}
+	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard, RequireHTTPS: true})
+	ctx := context.Background()
+
+	_, _, err = svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "http://receiver.example/hook"})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Status != 400 {
+		t.Fatalf("http target error = %v, want 400", err)
+	}
+	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
+		t.Fatalf("https target rejected: %v", err)
+	}
+
+	// The default keeps http available outside production.
+	store = &recordingEndpointStore{}
+	svc = New(store, nil, nil, codec, nil, Options{URLGuard: guard})
+	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "http://receiver.example/hook"}); err != nil {
+		t.Fatalf("default policy rejected http: %v", err)
 	}
 }

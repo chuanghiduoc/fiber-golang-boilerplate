@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,24 +30,74 @@ type fakeTenantPurgeRepo struct {
 	marked      bool
 	listErr     error
 	deleteErr   error
+	// Cursor tracking for the resumable purge.
+	cursors       map[int64]int64
+	deletedMember []int64
+	dueDeletions  []int64
+	// membersByTenant overrides members for a multi-tenant run.
+	membersByTenant map[int64][]int64
 }
 
 func (r *fakeTenantPurgeRepo) ListDeletedTenants(context.Context, int32) ([]PurgeTenant, error) {
 	return r.tenants, r.listErr
 }
 
+func (r *fakeTenantPurgeRepo) ListDueDeletionTenantIDs(context.Context, int32) ([]int64, error) {
+	return r.dueDeletions, nil
+}
+
 func (r *fakeTenantPurgeRepo) ListExpiredTrialTenantIDs(context.Context, int32) ([]int64, error) {
 	return nil, nil
 }
 
-func (r *fakeTenantPurgeRepo) ListMembershipUserIDs(_ context.Context, _, after int64, _ int32) ([]int64, error) {
+func (r *fakeTenantPurgeRepo) ListMembershipUserIDs(_ context.Context, tenantID, after int64, _ int32) ([]int64, error) {
+	members := r.members
+	if r.membersByTenant != nil {
+		members = r.membersByTenant[tenantID]
+	}
 	var out []int64
-	for _, id := range r.members {
+	for _, id := range members {
 		if id > after {
 			out = append(out, id)
 		}
 	}
 	return out, nil
+}
+
+func (r *fakeTenantPurgeRepo) DeleteMemberInvitations(context.Context, int64, int64) (int64, error) {
+	return 0, nil
+}
+
+func (r *fakeTenantPurgeRepo) DeleteMembership(_ context.Context, tenantID, userID int64) error {
+	if r.deleteErr != nil {
+		return r.deleteErr
+	}
+	if r.membersByTenant != nil {
+		members := r.membersByTenant[tenantID]
+		for i, id := range members {
+			if id == userID {
+				r.membersByTenant[tenantID] = append(members[:i], members[i+1:]...)
+				break
+			}
+		}
+	} else {
+		for i, id := range r.members {
+			if id == userID {
+				r.members = append(r.members[:i], r.members[i+1:]...)
+				break
+			}
+		}
+	}
+	r.deletedMember = append(r.deletedMember, userID)
+	return nil
+}
+
+func (r *fakeTenantPurgeRepo) AdvancePurgeCursor(_ context.Context, tenantID, cursor int64) error {
+	if r.cursors == nil {
+		r.cursors = map[int64]int64{}
+	}
+	r.cursors[tenantID] = cursor
+	return nil
 }
 
 func (r *fakeTenantPurgeRepo) ListDataExports(_ context.Context, _ int64, limit int32) ([]DataExport, error) {
@@ -221,6 +272,101 @@ type purgeBlobStore struct {
 func (s *purgeBlobStore) Delete(_ context.Context, path string) error {
 	s.deleted = append(s.deleted, path)
 	return nil
+}
+
+// fakeClock makes the purge budgets deterministic without sleeping.
+type fakeClock struct {
+	now time.Time
+}
+
+func (c *fakeClock) Now() time.Time          { return c.now }
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// budgetEraser advances the fake clock while erasing one tenant, so that
+// tenant exceeds its per-tenant budget and the next one still gets a turn.
+type budgetEraser struct {
+	clock    *fakeClock
+	by       time.Duration
+	tenantID int64
+}
+
+func (e *budgetEraser) Export(context.Context, int64, int64) (privacycontracts.Section, error) {
+	return privacycontracts.Section{}, nil
+}
+
+func (e *budgetEraser) Erase(_ context.Context, tenantID, _ int64) error {
+	if tenantID == e.tenantID {
+		e.clock.Advance(e.by)
+	}
+	return nil
+}
+
+func TestTenantPurgeResumesFromThePersistedCursor(t *testing.T) {
+	privacyRegistry := privacycontracts.NewRegistry()
+	files := &fakeEraser{name: "files"}
+	privacyRegistry.Register(privacycontracts.Provider{Name: "files", Exporter: files, Eraser: files})
+	privacyRegistry.Register(privacycontracts.Provider{Name: "identity", Exporter: &fakeEraser{name: "identity"}, Eraser: &fakeEraser{name: "identity"}})
+	tenancyRegistry := tenancycontracts.NewRegistry()
+	tenancyRegistry.Register(tenancycontracts.Provider{Name: "files", Purger: &fakePurger{name: "files"}})
+	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: &fakePurger{name: "identity"}})
+	repo := &fakeTenantPurgeRepo{
+		tenants: []PurgeTenant{{ID: 7, Slug: "gone", Cursor: 5}},
+		members: []int64{4, 6, 7},
+	}
+	svc := NewTenantPurgeService(TenantPurgeDeps{
+		Repo: repo, Privacy: &PrivacyService{registry: privacyRegistry}, Registry: tenancyRegistry,
+	})
+
+	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
+
+	assert.Equal(t, []int64{6, 7}, repo.deletedMember, "users at or below the cursor are not revisited")
+	assert.Equal(t, int64(7), repo.cursors[7])
+	assert.Equal(t, []int64{7}, repo.purged)
+}
+
+func TestTenantPurgeTenantBudgetLetsTheNextTenantRun(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	privacyRegistry := privacycontracts.NewRegistry()
+	slow := &budgetEraser{clock: clock, by: 3 * time.Minute, tenantID: 1}
+	privacyRegistry.Register(privacycontracts.Provider{Name: "files", Exporter: slow, Eraser: slow})
+	privacyRegistry.Register(privacycontracts.Provider{Name: "identity", Exporter: &fakeEraser{name: "identity"}, Eraser: &fakeEraser{name: "identity"}})
+	tenancyRegistry := tenancycontracts.NewRegistry()
+	tenancyRegistry.Register(tenancycontracts.Provider{Name: "files", Purger: &fakePurger{name: "files"}})
+	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: &fakePurger{name: "identity"}})
+	repo := &fakeTenantPurgeRepo{
+		tenants:         []PurgeTenant{{ID: 1, Slug: "slow"}, {ID: 2, Slug: "fast"}},
+		membersByTenant: map[int64][]int64{1: {10}, 2: {20}},
+	}
+	svc := NewTenantPurgeService(TenantPurgeDeps{
+		Repo: repo, Privacy: &PrivacyService{registry: privacyRegistry}, Registry: tenancyRegistry,
+	})
+	svc.now = clock.Now
+
+	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
+
+	assert.Equal(t, []int64{2}, repo.purged, "the fast tenant is not starved by the slow one")
+	assert.Equal(t, int64(10), repo.cursors[1], "the slow tenant keeps the progress it made")
+	assert.Equal(t, int64(20), repo.cursors[2])
+	assert.Equal(t, []int64{10, 20}, repo.deletedMember)
+}
+
+func TestTenantDeletionJobFinalizesDueTenantsThroughTheService(t *testing.T) {
+	db := newMemDB()
+	past := time.Now().Add(-time.Minute)
+	db.tenants[2].Status = TenantStatusPendingDeletion
+	db.tenants[2].DeletionScheduledAt = &past
+	repo := &fakeTenantPurgeRepo{dueDeletions: []int64{2}}
+	svc := NewTenantPurgeService(TenantPurgeDeps{
+		Repo:    repo,
+		Tenants: NewTenantService(db.stores(), memTx{db}),
+	})
+
+	require.NoError(t, svc.HandleDeletionJob(context.Background(), nil))
+	assert.Equal(t, TenantStatusDeleted, db.tenants[2].Status)
+	require.Len(t, db.audits, 1)
+	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
+	assert.Equal(t, audit.ActorTypeSystem, db.audits[0].ActorType)
+	assert.Equal(t, "deletion_due", db.audits[0].Metadata["reason"])
 }
 
 func TestTenantPurgeFailureLeavesTheTenantUnmarkedAndRetries(t *testing.T) {

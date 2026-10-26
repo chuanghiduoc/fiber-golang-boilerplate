@@ -109,6 +109,31 @@ DELETE FROM user_passwords WHERE user_id = @user_id::bigint;
 -- name: DeleteUserIdentities :exec
 DELETE FROM user_identities WHERE user_id = @user_id::bigint;
 
+-- name: AnonymizeErasedUserInvitations :execrows
+-- Erasure leaves no address in invitations the user accepted or that were
+-- addressed to them; accepted_by stays the membership id. The users subselect
+-- also covers an account an older path already marked deleted. A pending row
+-- is unique per (tenant, address), so replacing the address cannot collide.
+UPDATE invitations
+SET email_normalized = @replacement::varchar,
+    updated_at = NOW()
+WHERE tenant_id = @tenant_id::bigint
+  AND (accepted_by = @user_id::bigint
+       OR email_normalized = (SELECT email FROM users WHERE id = @user_id::bigint))
+  AND email_normalized <> @replacement::varchar;
+
+-- name: AnonymizeErasedUserInvitationsAllTenants :execrows
+-- The global finalizer runs under the RLS bypass after every membership is
+-- removed. It also anonymizes invitations addressed to the erased address in a
+-- tenant the user never joined, so no tenant keeps the address after a global
+-- erasure.
+UPDATE invitations
+SET email_normalized = @replacement::varchar,
+    updated_at = NOW()
+WHERE (accepted_by = @user_id::bigint
+       OR email_normalized = (SELECT email FROM users WHERE id = @user_id::bigint))
+  AND email_normalized <> @replacement::varchar;
+
 -- name: ListTenantDataExportsForPurge :many
 -- Tenant purge: one bounded page of the tenant's exports (including rows of
 -- memberships already erased) so their blobs can be deleted before the rows.

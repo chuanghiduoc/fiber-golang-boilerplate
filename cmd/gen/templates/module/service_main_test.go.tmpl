@@ -32,7 +32,7 @@ func adminContext(tenantID int64) context.Context {
 // userContext is a request context for a plain user of tenantID.
 func userContext(tenantID int64) context.Context {
 	ctx := tenant.WithID(context.Background(), tenantID)
-	return authz.WithSubject(ctx, authz.NewSubject(2, tenantID, authz.RoleUser))
+	return authz.WithSubject(ctx, authz.NewSubject(2, tenantID, authz.RoleMember))
 }
 
 // requireCode fails unless err is an *apperror.AppError with code want.

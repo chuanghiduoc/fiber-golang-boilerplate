@@ -20,8 +20,9 @@ func TestGuard_BlocksNonPublicAddresses(t *testing.T) {
 		"169.254.169.254", "169.254.1.1", "0.0.0.0", "0.1.2.3",
 		"100.64.0.1", "192.0.0.10", "198.18.0.1", "198.51.100.1",
 		"203.0.113.1", "224.0.0.1", "255.255.255.255", "240.0.0.1",
+		"192.88.99.1",
 		"::1", "fc00::1", "fd12:3456::1", "fe80::1", "ff02::1",
-		"2001:db8::1", "::ffff:127.0.0.1",
+		"2001:db8::1", "::ffff:127.0.0.1", "100::1", "2001:2::1",
 	}
 	for _, raw := range blocked {
 		t.Run(raw, func(t *testing.T) {
@@ -118,6 +119,27 @@ func TestGuard_InvalidAllowlist(t *testing.T) {
 		if _, err := NewGuard([]string{entry}); err == nil {
 			t.Errorf("NewGuard(%q) should fail", entry)
 		}
+	}
+}
+
+func TestGuard_CheckHostWithInjectedLookup(t *testing.T) {
+	guard, err := NewGuard(nil)
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+	guard = guard.WithLookupIP(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	})
+	ips, err := guard.CheckHost(context.Background(), "receiver.example")
+	if err != nil || len(ips) != 1 || !ips[0].Equal(net.ParseIP("93.184.216.34")) {
+		t.Fatalf("public lookup = %v, %v", ips, err)
+	}
+
+	guard = guard.WithLookupIP(func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.0.0.5")}}, nil
+	})
+	if _, err := guard.CheckHost(context.Background(), "internal.example"); !errors.Is(err, ErrBlockedTarget) {
+		t.Fatalf("blocked lookup error = %v, want ErrBlockedTarget", err)
 	}
 }
 

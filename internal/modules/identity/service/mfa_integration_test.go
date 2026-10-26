@@ -130,9 +130,9 @@ func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 	require.NoError(t, err)
 	codes, err := e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
 	require.NoError(t, err)
-	require.Len(t, codes, 10)
+	require.Len(t, codes.RecoveryCodes, 10)
 
-	hash := recoveryHash(codes[0])
+	hash := recoveryHash(codes.RecoveryCodes[0])
 	var wg sync.WaitGroup
 	results := make([]bool, 2)
 	for i := range results {

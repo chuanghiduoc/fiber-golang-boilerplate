@@ -15,7 +15,7 @@ const (
 
 // Permissions returns the module's grants for app.PermissionProvider. Admins
 // hold every registered permission implicitly; grant other roles
-// deliberately, for example Roles: []string{authz.RoleUser}.
+// deliberately, for example Roles: []string{authz.RoleMember}.
 func Permissions() []authz.Grant {
 	return []authz.Grant{
 		{Permission: PermissionRead},

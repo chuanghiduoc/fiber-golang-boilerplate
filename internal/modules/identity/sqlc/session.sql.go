@@ -59,6 +59,14 @@ JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = $6 AND m.user_id = $7
   AND m.status = 'active' AND u.status = 'active'
   AND u.token_version = $8
+  AND (
+      'otp' = ANY($4::text[])
+      OR 'rc' = ANY($4::text[])
+      OR NOT EXISTS (
+          SELECT 1 FROM mfa_factors f
+          WHERE f.user_id = u.id AND f.confirmed_at IS NOT NULL
+      )
+  )
 RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at
 `
 
@@ -75,9 +83,14 @@ type CreateSessionParams struct {
 
 // A session is only created for an active member whose token version still
 // equals the one the caller authenticated at. This closes the bcrypt-length
-// window where a password change commits after the password check.
-// mfa_verified_at is set only when the session already carries an otp/rc
-// method (MFA verify or Google + MFA); a first-factor session leaves it NULL.
+// window where a password change commits after the password check, and the
+// MFA window where a login read "MFA not required" before a factor was
+// confirmed: bumping users.token_version on every credential/MFA change makes
+// the stale version check fail. The factor guard is the second line: once a
+// confirmed factor exists, a session whose amr has no otp/rc can never be
+// created, whatever the caller decided earlier. mfa_verified_at is set only
+// when the session already carries an otp/rc method (MFA verify or Google +
+// MFA); a first-factor session leaves it NULL.
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, createSession,
 		arg.ExpiresAt,
@@ -107,6 +120,25 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const deleteSessionRefreshTokens = `-- name: DeleteSessionRefreshTokens :exec
+DELETE FROM refresh_tokens
+WHERE tenant_id = $1 AND session_id = $2
+`
+
+type DeleteSessionRefreshTokensParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	SessionID int64 `json:"session_id"`
+}
+
+// A re-issued session replaces its refresh-token family. A token minted before
+// the MFA change must not survive the re-issue: refreshing with it would mint
+// an access token carrying the restamped session's stronger amr without a
+// second factor.
+func (q *Queries) DeleteSessionRefreshTokens(ctx context.Context, arg DeleteSessionRefreshTokensParams) error {
+	_, err := q.db.Exec(ctx, deleteSessionRefreshTokens, arg.TenantID, arg.SessionID)
+	return err
 }
 
 const getSession = `-- name: GetSession :one
@@ -346,6 +378,56 @@ func (q *Queries) PurgeStaleSessions(ctx context.Context, arg PurgeStaleSessions
 	return result.RowsAffected(), nil
 }
 
+const restampSession = `-- name: RestampSession :one
+UPDATE sessions
+SET token_version = $1, amr = $2, last_used_at = NOW()
+WHERE tenant_id = $3 AND user_id = $4 AND id = $5
+  AND revoked_at IS NULL
+RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at
+`
+
+type RestampSessionParams struct {
+	TokenVersion int32    `json:"token_version"`
+	Amr          []string `json:"amr"`
+	TenantID     int64    `json:"tenant_id"`
+	UserID       int64    `json:"user_id"`
+	ID           int64    `json:"id"`
+}
+
+// Re-issues the session that performed an MFA change under the user's new
+// token version and adds the second factor to its amr. Tenant-scoped: only a
+// live session of the request tenant can be restamped. The caller's previous
+// access token still carries the old version and stops verifying; the re-issue
+// replaces the session's refresh-token family (DeleteSessionRefreshTokens) and
+// mints a new pair.
+func (q *Queries) RestampSession(ctx context.Context, arg RestampSessionParams) (Session, error) {
+	row := q.db.QueryRow(ctx, restampSession,
+		arg.TokenVersion,
+		arg.Amr,
+		arg.TenantID,
+		arg.UserID,
+		arg.ID,
+	)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.UserID,
+		&i.TokenVersion,
+		&i.ExpiresAt,
+		&i.UserAgent,
+		&i.Ip,
+		&i.Amr,
+		&i.MfaVerifiedAt,
+		&i.LastUsedAt,
+		&i.RevokedAt,
+		&i.RevokedReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const revokeAllUserSessions = `-- name: RevokeAllUserSessions :exec
 UPDATE sessions
 SET revoked_at = NOW(), revoked_reason = $1
@@ -433,6 +515,31 @@ func (q *Queries) RevokeSessionByRefreshToken(ctx context.Context, arg RevokeSes
 	var user_id int64
 	err := row.Scan(&user_id)
 	return user_id, err
+}
+
+const revokeStaleUserSessions = `-- name: RevokeStaleUserSessions :exec
+UPDATE sessions AS s
+SET revoked_at = NOW(), revoked_reason = $1
+FROM users u
+WHERE s.user_id = $2 AND u.id = s.user_id
+  AND s.token_version <> u.token_version
+  AND s.revoked_at IS NULL
+`
+
+type RevokeStaleUserSessionsParams struct {
+	Reason pgtype.Text `json:"reason"`
+	UserID int64       `json:"user_id"`
+}
+
+// The after-commit cleanup of a token-version bump: every session of the user
+// whose version no longer matches the current one is already rejected by the
+// session validator and refresh check, so this only records the revocation
+// (revoked_at/reason) in every tenant. It runs as one bypass statement after
+// the change commits, never inside the business transaction, and is idempotent
+// (already-revoked rows are skipped).
+func (q *Queries) RevokeStaleUserSessions(ctx context.Context, arg RevokeStaleUserSessionsParams) error {
+	_, err := q.db.Exec(ctx, revokeStaleUserSessions, arg.Reason, arg.UserID)
+	return err
 }
 
 const revokeTenantUserSessions = `-- name: RevokeTenantUserSessions :exec

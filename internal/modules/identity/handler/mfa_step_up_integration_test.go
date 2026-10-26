@@ -62,8 +62,9 @@ func TestIntegration_MFAStepUpRefreshesTheSessionColumn(t *testing.T) {
 	secret := secretFromOtpURI(t, enrollment.OtpauthURI)
 	enrollCode, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	recoveryCodes, err := h.mfa.ConfirmTOTP(ctx, userID, passwordSessionID, pw, enrollCode)
+	confirmed, err := h.mfa.ConfirmTOTP(ctx, userID, passwordSessionID, pw, enrollCode)
 	require.NoError(t, err)
+	recoveryCodes := confirmed.RecoveryCodes
 	require.Len(t, recoveryCodes, 10)
 
 	status, body = do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/login",

@@ -44,6 +44,9 @@ type Options struct {
 	// and SSRF policy. Nil keeps the safe defaults (443/80, no private
 	// targets).
 	URLGuard *webhook.Guard
+	// RequireHTTPS rejects plaintext http:// delivery URLs. Production sets
+	// it from WEBHOOK_REQUIRE_HTTPS (default true there, false elsewhere).
+	RequireHTTPS bool
 }
 
 // TenantChecker reports whether a tenant is active. The composition root
@@ -69,7 +72,7 @@ type Service interface {
 	DeleteEndpoint(ctx context.Context, actorID, id int64) error
 	GetEndpoint(ctx context.Context, id int64) (*Endpoint, error)
 	ListEndpoints(ctx context.Context, limit int, startingAfter string) ([]Endpoint, bool, error)
-	RotateEndpointSecret(ctx context.Context, actorID, id int64) (*Endpoint, string, error)
+	RotateEndpointSecret(ctx context.Context, actorID, id int64, expirePrevious bool) (*Endpoint, string, error)
 
 	ListDeliveries(ctx context.Context, endpointID int64, status string, limit int, startingAfter string) ([]Delivery, bool, error)
 	GetDelivery(ctx context.Context, id int64) (*Delivery, error)
@@ -97,6 +100,9 @@ type service struct {
 	opts       Options
 	now        func() time.Time
 	urlGuard   *webhook.Guard
+	// dummyInboundCiphertext is a valid sealed envelope used to spend the same
+	// AES-GCM work on an unknown inbound source as on a real one.
+	dummyInboundCiphertext string
 }
 
 // New returns the webhooks service. audit may be nil (Noop semantics).
@@ -122,15 +128,31 @@ func New(
 		guard, _ = webhook.NewGuard(nil)
 	}
 	return &service{
-		endpoints:  endpoints,
-		deliveries: deliveries,
-		inbound:    inbound,
-		codec:      codec,
-		audit:      recorder,
-		opts:       opts,
-		now:        func() time.Time { return time.Now().UTC() },
-		urlGuard:   guard,
+		endpoints:              endpoints,
+		deliveries:             deliveries,
+		inbound:                inbound,
+		codec:                  codec,
+		audit:                  recorder,
+		opts:                   opts,
+		now:                    func() time.Time { return time.Now().UTC() },
+		urlGuard:               guard,
+		dummyInboundCiphertext: dummyInboundEnvelope(codec),
 	}
+}
+
+// dummyInboundEnvelope seals a throwaway value so an unknown inbound source can
+// still pay for one AES-GCM open (the dummy key is authenticated with an
+// arbitrary binding, so the open fails as expected).
+func dummyInboundEnvelope(codec *SecretCodec) string {
+	if codec == nil {
+		return ""
+	}
+	sealed, err := codec.Seal(InboundSourceSecretBinding(1, 1), []byte(webhook.SecretPrefix+"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
+	if err != nil {
+		slog.Error("webhooks: failed to prepare the dummy inbound envelope", slog.Any("error", err))
+		return ""
+	}
+	return sealed
 }
 
 func (s *service) recordAudit(ctx context.Context, actorID int64, action, resource string, resourceID int64, metadata map[string]any) {

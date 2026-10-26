@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -152,6 +153,15 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	// delivery behavior, not the port policy (covered by pkg/webhook).
 	guard, err := webhook.NewGuardWithPorts([]string{"127.0.0.1"}, allDynamicPorts())
 	require.NoError(t, err)
+	// Endpoint create/update resolves the host. The receiver hostnames in this
+	// harness are RFC 2606 placeholders with no DNS record, so resolve them to
+	// a public address (the worker dials the httptest servers by IP).
+	guard = guard.WithLookupIP(func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		if host == "receiver.example" {
+			return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+		}
+		return net.DefaultResolver.LookupIPAddr(ctx, host)
+	})
 	svc := webhookservice.New(repo, repo, repo, codec, recorder, webhookservice.Options{
 		DefaultMaxAttempts: 3,
 		DefaultTimeoutMS:   2000,
@@ -800,6 +810,23 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Zero(t, disabledAttempts, "a disabled endpoint must not be called")
 	})
 
+	t.Run("expirePrevious ends co-signing at once", func(t *testing.T) {
+		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/expire-previous", "*")
+		tenantCtx := tenant.WithID(ctx, h.tenantA)
+		_, err := h.repo.RotateEndpointSecret(tenantCtx, endpoint.ID, "first", false)
+		require.NoError(t, err)
+		secrets, err := h.repo.SigningSecrets(tenantCtx, endpoint.ID)
+		require.NoError(t, err)
+		require.NotEmpty(t, secrets.PreviousCiphertext, "a default rotation keeps the previous secret in grace")
+
+		_, err = h.repo.RotateEndpointSecret(tenantCtx, endpoint.ID, "second", true)
+		require.NoError(t, err)
+		secrets, err = h.repo.SigningSecrets(tenantCtx, endpoint.ID)
+		require.NoError(t, err)
+		assert.Empty(t, secrets.PreviousCiphertext, "expirePrevious ends the previous secret's grace immediately")
+		assert.Equal(t, "second", secrets.CurrentCiphertext)
+	})
+
 	t.Run("concurrent secret rotations serialize", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/rotate", "*")
 		tenantCtx := tenant.WithID(ctx, h.tenantA)
@@ -810,7 +837,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				_, err := h.repo.RotateEndpointSecret(tenantCtx, endpoint.ID, fmt.Sprintf("sealed-%d", i))
+				_, err := h.repo.RotateEndpointSecret(tenantCtx, endpoint.ID, fmt.Sprintf("sealed-%d", i), false)
 				errs <- err
 			}(i)
 		}

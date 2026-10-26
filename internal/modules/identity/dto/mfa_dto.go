@@ -28,6 +28,19 @@ type MFARecoveryCodesResponse struct {
 	RecoveryCodes []string `json:"recoveryCodes"`
 }
 
+// MFAConfirmResponse returns the recovery codes plus the re-issued token pair
+// for the session that confirmed the factor. Confirmation bumps the token
+// version, which invalidates every older session everywhere (including the
+// previous access token of this one), so the caller must switch to the new
+// pair to stay signed in. The pair is absent only when the confirming session
+// stopped being live before the change committed; the caller is then logged
+// out and must sign in again (with the second factor).
+type MFAConfirmResponse struct {
+	RecoveryCodes []string `json:"recoveryCodes"`
+	AccessToken   string   `json:"accessToken,omitempty"`
+	RefreshToken  string   `json:"refreshToken,omitempty"`
+}
+
 type MFADisableRequest struct {
 	Code string `json:"code" validate:"required,max=64"`
 }

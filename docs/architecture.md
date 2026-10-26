@@ -304,9 +304,19 @@ transaction that began on the normal pool does not change its connection, so
 those statements stay tenant-scoped (mark the context before `WithTx`). The
 scope is narrowed to what needs it: invitation accept/sign-up bypass only the
 possession-based tenant read, then lock the invitation and do the
-membership/audit work under that tenant; credential and MFA changes that must
-revoke every tenant's sessions keep one bypass transaction for atomicity and
-give every tenant-owned statement an explicit tenant predicate. Per-tenant
+membership/audit work under that tenant.
+Credential and MFA changes do not bypass RLS at all. Password change/reset, email change,
+logout-all, MFA confirmation, and a platform MFA reset bump
+`users.token_version` inside the request tenant's normal transaction, which
+ends every session in every tenant (the validator and refresh path compare
+the version); the per-tenant `sessions.revoked_at`/reason bookkeeping then
+runs as one bypass statement after commit. MFA confirmation re-issues the
+session that confirmed the factor under the new version so that caller stays
+signed in, and MFA disable — which removes the factor and so cannot weaken
+the caller's already-passed second factor — keeps the caller's session and
+records only the other sessions' revocation in that same follow-up statement.
+Only a genuinely cross-tenant mutation, deleting a global account and its
+memberships in every tenant, still keeps one bypass transaction. Per-tenant
 limits remain future work.
 
 ## Authorization

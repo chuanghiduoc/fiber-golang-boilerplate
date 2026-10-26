@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -13,10 +14,14 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
+// urlValidationTimeout bounds the DNS lookup done when an endpoint URL is
+// created or updated. The dialer resolves and validates again before sending.
+const urlValidationTimeout = 3 * time.Second
+
 // CreateEndpoint validates configuration, seals a fresh signing secret, and
 // returns the plaintext secret exactly once.
 func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEndpointInput) (*Endpoint, string, error) {
-	if err := s.validateURL(in.URL); err != nil {
+	if err := s.validateURL(ctx, in.URL); err != nil {
 		return nil, "", err
 	}
 	eventTypes, err := normalizeEventTypes(in.EventTypes)
@@ -48,7 +53,7 @@ func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEn
 }
 
 func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, in UpdateEndpointInput) (*Endpoint, error) {
-	if err := s.validateURL(in.URL); err != nil {
+	if err := s.validateURL(ctx, in.URL); err != nil {
 		return nil, err
 	}
 	eventTypes, err := normalizeEventTypes(in.EventTypes)
@@ -115,20 +120,35 @@ func (s *service) ListEndpoints(ctx context.Context, limit int, startingAfter st
 	return endpoints, hasMore, nil
 }
 
-func (s *service) validateURL(raw string) error {
+func (s *service) validateURL(ctx context.Context, raw string) error {
 	if len(raw) > 2048 {
 		return apperror.NewBadRequest("url must be at most 2048 characters")
 	}
-	if _, err := s.urlGuard.ValidateURL(raw); err != nil {
+	parsed, err := s.urlGuard.ValidateURL(raw)
+	if err != nil {
 		if errors.Is(err, webhook.ErrPortNotAllowed) {
 			return apperror.NewCode(webhookscatalog.CodeWebhookPortNotAllowed,
 				"url port is not allowed for webhook delivery")
 		}
 		return apperror.NewBadRequest("url must be an absolute http(s) URL")
 	}
-	parsed, _ := url.Parse(raw)
 	if parsed.Hostname() == "" {
 		return apperror.NewBadRequest("url must include a host")
+	}
+	if s.opts.RequireHTTPS && parsed.Scheme != "https" {
+		return apperror.NewBadRequest("url must use https")
+	}
+	// Resolve now so a hostname pointing at a private/loopback address is
+	// refused while the endpoint is configured, not after every delivery
+	// fails. The guarded dialer still resolves and checks again (DNS
+	// rebinding), so this is an early rejection, not the only check.
+	resolveCtx, cancel := context.WithTimeout(ctx, urlValidationTimeout)
+	defer cancel()
+	if _, err := s.urlGuard.CheckHost(resolveCtx, parsed.Hostname()); err != nil {
+		if errors.Is(err, webhook.ErrBlockedTarget) {
+			return apperror.NewBadRequest("url host resolves to a blocked address")
+		}
+		return apperror.NewBadRequest("url host could not be resolved")
 	}
 	return nil
 }

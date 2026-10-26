@@ -80,16 +80,20 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	if settings.TrashRetentionDays > 0 {
 		m.trashPurger = filesvc.NewTrashPurger(filesrepo.NewTrashRepository(infra.Tx), infra.Storage, settings.TrashRetentionDays)
 	}
+	m.orphanSweeper = filesvc.NewOrphanSweeper(fileRepo, infra.Storage)
 	m.tenantPurger = filesrepo.NewTenantPurger(infra.DB, infra.Storage)
 	return m, Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}, nil
 }
 
-// RegisterJobs implements app.JobProvider: the worker runs the trash purge
-// (under authz.SystemContext, via the app's system registrar). A module built
-// with New (tests) registers nothing.
+// RegisterJobs implements app.JobProvider: the worker runs the trash purge and
+// the orphan blob sweep (under authz.SystemContext, via the app's system
+// registrar). A module built with New (tests) registers nothing.
 func (m *Module) RegisterJobs(registrar jobs.Registrar) {
 	if m.trashPurger != nil {
 		registrar.Register(filesvc.TrashPurgeJobKind, m.trashPurger.HandleJob)
+	}
+	if m.orphanSweeper != nil {
+		registrar.Register(filesvc.OrphanSweepJobKind, m.orphanSweeper.HandleJob)
 	}
 }
 
@@ -102,13 +106,26 @@ var trashPurgeSchedule = scheduler.Spec{
 	Kind:     filesvc.TrashPurgeJobKind,
 }
 
-// RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
+// orphanSweepSchedule deletes storage blobs with no files row. An upload is
+// normally Put before its metadata commits, so the sweeper only considers
+// objects older than an hour.
+var orphanSweepSchedule = scheduler.Spec{
+	Name:     "files.orphans.sweep",
+	Interval: filesvc.OrphanSweepInterval,
+	Kind:     filesvc.OrphanSweepJobKind,
+}
+
+// RegisterSchedules implements app.ScheduleProvider. The specs are constants,
 // so a registration error is a programming error and fails startup loudly.
 func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
-	if m.trashPurger == nil {
-		return
+	if m.trashPurger != nil {
+		if err := registry.Register(trashPurgeSchedule); err != nil {
+			panic(fmt.Sprintf("files: register %s schedule: %v", trashPurgeSchedule.Name, err))
+		}
 	}
-	if err := registry.Register(trashPurgeSchedule); err != nil {
-		panic(fmt.Sprintf("files: register %s schedule: %v", trashPurgeSchedule.Name, err))
+	if m.orphanSweeper != nil {
+		if err := registry.Register(orphanSweepSchedule); err != nil {
+			panic(fmt.Sprintf("files: register %s schedule: %v", orphanSweepSchedule.Name, err))
+		}
 	}
 }

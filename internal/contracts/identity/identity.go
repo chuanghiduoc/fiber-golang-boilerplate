@@ -1,7 +1,7 @@
 // Package identity holds the stdlib-only contracts the identity module
 // provides to other modules: the admin back-office surface, API-key
-// principals, and notification recipient lookup. Implementations live in
-// internal/modules/identity/adapter.
+// principals, notification recipient lookup, and the member role hierarchy.
+// Implementations live in internal/modules/identity/adapter.
 package identity
 
 import (
@@ -78,6 +78,15 @@ const TenantStatusActive = "active"
 // wrapped error) when the account is not active.
 type PrincipalReader interface {
 	GetPrincipal(ctx context.Context, tenantID, userID int64) (Principal, error)
+}
+
+// MemberRankChecker applies identity's tenant role hierarchy to a caller acting
+// on another member. It returns a permission/rank error when the caller does
+// not outrank targetUserID in the request tenant, and apperror.ErrNotFound when
+// the target is not an active member of that tenant. A caller without a
+// subject is allowed only under authz.SystemContext.
+type MemberRankChecker interface {
+	CanManageMember(ctx context.Context, targetUserID int64) error
 }
 
 // IdentityAdmin is the back-office surface identity exposes to admin.

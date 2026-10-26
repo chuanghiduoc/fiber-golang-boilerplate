@@ -205,7 +205,13 @@ All routes require a JWT and are mounted under `/api/v1/admin/features`.
 `admin:features:read` guards reads; `admin:features:write` guards mutations.
 Mutating routes accept `Idempotency-Key` through the normal middleware and then
 run behind a required `audithttp.Guard` (fail-closed: an unavailable audit store
-returns `503 system.audit_unavailable` before the write).
+returns `503 system.audit_unavailable` before the write). `PUT`/`DELETE
+/flags/{key}` also accept the platform permission `platform:features:write`, so
+the whole route requires an MFA session (`amr` with `otp` or `rc`, otherwise
+`403 auth.mfa_required`) before the permission check: `test/arch` requires that
+every route accepting a platform permission run `authzhttp.RequireMFA()`. The
+tenant-only target routes do not accept a platform permission and need no
+second factor.
 
 | Method | Path | Description |
 | --- | --- | --- |

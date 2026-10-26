@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -35,6 +36,67 @@ func TestHighestRoleRank(t *testing.T) {
 	} {
 		assert.Equal(t, tc.want, highestRoleRank(tc.roles), name)
 	}
+}
+
+// stubRoleRepo resolves the role definitions a rank check needs; unused
+// methods panic if called.
+type stubRoleRepo struct {
+	RoleRepository
+	roles map[string]*Role
+}
+
+func (s stubRoleRepo) GetByKey(_ context.Context, key string) (*Role, error) {
+	if role, ok := s.roles[key]; ok {
+		return role, nil
+	}
+	return nil, apperror.ErrNotFound
+}
+
+func TestHighestEffectiveRank(t *testing.T) {
+	repo := stubRoleRepo{roles: map[string]*Role{
+		RoleOwner:  {Key: RoleOwner},
+		RoleAdmin:  {Key: RoleAdmin},
+		RoleMember: {Key: RoleMember, Permissions: []string{"profile:read"}},
+		"delegated_role": {
+			Key: "delegated_role", Permissions: []string{string(authz.PermissionAdminUsersRole)},
+		},
+		"delegated_ban": {
+			Key: "delegated_ban", Permissions: []string{string(authz.PermissionAdminUsersBan)},
+		},
+		"delegated_delete": {
+			Key: "delegated_delete", Permissions: []string{string(authz.PermissionAdminUsersDelete)},
+		},
+		"auditor": {Key: "auditor", Permissions: []string{string(authz.PermissionAdminUsersRead)}},
+		"reader":  {Key: "reader", Permissions: []string{"profile:read"}},
+	}}
+	for name, tc := range map[string]struct {
+		roles []string
+		want  int
+	}{
+		"owner":                 {roles: []string{RoleOwner}, want: 3},
+		"admin":                 {roles: []string{RoleAdmin}, want: 2},
+		"member":                {roles: []string{RoleMember}, want: 1},
+		"empty is member":       {roles: nil, want: 1},
+		"custom role is member": {roles: []string{"reader"}, want: 1},
+		"read-only admin perm":  {roles: []string{"auditor"}, want: 1},
+		"role-manager":          {roles: []string{"delegated_role"}, want: 2},
+		"banner":                {roles: []string{"delegated_ban"}, want: 2},
+		"remover":               {roles: []string{"delegated_delete"}, want: 2},
+		"highest wins":          {roles: []string{"reader", "delegated_role"}, want: 2},
+		"unknown key":           {roles: []string{"gone-role"}, want: 1},
+	} {
+		got, err := highestEffectiveRank(context.Background(), repo, tc.roles)
+		require.NoError(t, err, name)
+		assert.Equal(t, tc.want, got, name)
+	}
+}
+
+func TestEffectiveRoleRank(t *testing.T) {
+	assert.Equal(t, 3, effectiveRoleRank(&Role{Key: RoleOwner}))
+	assert.Equal(t, 2, effectiveRoleRank(&Role{Key: RoleAdmin}))
+	assert.Equal(t, 2, effectiveRoleRank(&Role{Key: "custom", Permissions: []string{"admin:users:delete"}}))
+	assert.Equal(t, 1, effectiveRoleRank(&Role{Key: "custom", Permissions: []string{"admin:users:read"}}))
+	assert.Equal(t, 1, effectiveRoleRank(&Role{Key: "custom"}))
 }
 
 func TestCanManageRank(t *testing.T) {

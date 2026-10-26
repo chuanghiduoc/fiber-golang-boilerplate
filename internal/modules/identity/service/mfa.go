@@ -19,7 +19,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
 )
 
@@ -51,8 +50,10 @@ type MFAService interface {
 	EnrollTOTP(ctx context.Context, userID, sessionID int64, currentPassword string) (*MFAEnrollment, error)
 	// ConfirmTOTP verifies the first code, confirms the factor, replaces the
 	// recovery codes, and returns them once. Like enrollment it requires
-	// re-authentication.
-	ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) ([]string, error)
+	// re-authentication. It bumps the user's token version (every session that
+	// predates the factor is invalid) and re-issues the session that confirmed
+	// it under the new version.
+	ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) (*MFAConfirmResult, error)
 	// Disable removes the factor and recovery codes after a TOTP or recovery
 	// code proof.
 	Disable(ctx context.Context, userID, sessionID int64, code string) error
@@ -202,7 +203,7 @@ func (s *mfaService) EnrollTOTP(ctx context.Context, userID, sessionID int64, cu
 	return &MFAEnrollment{OtpauthURI: totp.URI(s.Issuer, user.Email, secret)}, nil
 }
 
-func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) ([]string, error) {
+func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) (*MFAConfirmResult, error) {
 	if err := s.reauthenticate(ctx, userID, sessionID, currentPassword); err != nil {
 		return nil, err
 	}
@@ -217,42 +218,19 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 		}
 		return nil, apperror.NewInternal("failed to load user")
 	}
-	// Confirming the factor, replacing the recovery codes, and ending the
-	// user's other sessions in every tenant must not half-apply, so they share
-	// one bypass transaction. Every tenant-owned statement still carries its
-	// explicit scope: the revocation is cross-tenant by design and the audit
-	// event names the request tenant explicitly.
-	ctx = database.WithRLSBypass(ctx)
+	result := &MFAConfirmResult{RecoveryCodes: plain}
+	// The factor, recovery codes, and token version are global rows, so this is
+	// a normal tenant-scoped transaction. Bumping users.token_version
+	// invalidates every session of the user in every tenant at once — including
+	// a password-only login that read "MFA not required" just before this
+	// commits, which is the login race the factor guard in CreateSession also
+	// closes. Confirmation revokes only the user's OTHER sessions, so the
+	// session that confirmed the factor is re-issued under the new version and
+	// keeps working. The per-tenant session-row revocation is recorded by the
+	// follow-up bypass statement after this commits.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		factor, err := tx.MFA.GetTOTPForUpdate(ctx, userID)
-		if err != nil {
-			if errors.Is(err, apperror.ErrNotFound) {
-				return mfaNotEnabled()
-			}
-			return apperror.NewInternal("failed to load MFA factor")
-		}
-		if factor.Confirmed() {
-			return mfaAlreadyEnabled()
-		}
-		if s.now().After(factor.UpdatedAt.Add(mfaEnrollmentTTL)) {
-			return mfaEnrollmentExpired()
-		}
-		// The row is locked: this is the secret a concurrent enroll cannot
-		// replace between verification and the confirm update.
-		secret, err := s.Sealer.Open([]byte(factor.SecretCiphertext))
-		if err != nil {
-			return apperror.NewInternal("failed to open MFA secret")
-		}
-		step, ok := totp.Validate(string(secret), code, s.now())
-		if !ok {
-			return mfaInvalidCode()
-		}
-		confirmed, err := tx.MFA.ConfirmTOTP(ctx, factor.ID, userID, step)
-		if err != nil {
-			return apperror.NewInternal("failed to confirm MFA factor")
-		}
-		if !confirmed {
-			return mfaAlreadyEnabled()
+		if err := s.confirmFactor(ctx, tx, userID, code); err != nil {
+			return err
 		}
 		if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to replace recovery codes")
@@ -260,8 +238,15 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 		if err := tx.MFA.CreateRecoveryCodes(ctx, userID, hashes); err != nil {
 			return apperror.NewInternal("failed to store recovery codes")
 		}
-		if err := tx.Sessions.RevokeOtherUserSessions(ctx, userID, sessionID, RevokeMFAChanged); err != nil {
-			return apperror.NewInternal("failed to revoke other sessions")
+		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to bump token version")
+		}
+		if s.Sessions != nil && sessionID > 0 {
+			tokens, err := s.Sessions.reissueTx(ctx, tx.Stores, userID, sessionID, AMROTP)
+			if err != nil {
+				return err
+			}
+			result.Tokens = tokens
 		}
 		return s.recordMFAChange(ctx, tx, SecurityEventMFAEnabled, user, "auth.mfa_enabled", map[string]any{
 			"type":           MFAFactorTOTP,
@@ -271,10 +256,46 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 	if err != nil {
 		return nil, err
 	}
+	cleanupStaleSessions(ctx, s.Stores.Sessions, userID, RevokeMFAChanged)
 	if s.Sessions != nil {
 		s.Sessions.invalidate(ctx, userID)
 	}
-	return plain, nil
+	return result, nil
+}
+
+// confirmFactor locks the pending factor, verifies the first code, and marks
+// the factor confirmed. The row lock keeps a concurrent enroll from replacing
+// the secret between verification and the confirm update.
+func (s *mfaService) confirmFactor(ctx context.Context, tx TxRepos, userID int64, code string) error {
+	factor, err := tx.MFA.GetTOTPForUpdate(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return mfaNotEnabled()
+		}
+		return apperror.NewInternal("failed to load MFA factor")
+	}
+	if factor.Confirmed() {
+		return mfaAlreadyEnabled()
+	}
+	if s.now().After(factor.UpdatedAt.Add(mfaEnrollmentTTL)) {
+		return mfaEnrollmentExpired()
+	}
+	secret, err := s.Sealer.Open([]byte(factor.SecretCiphertext))
+	if err != nil {
+		return apperror.NewInternal("failed to open MFA secret")
+	}
+	step, ok := totp.Validate(string(secret), code, s.now())
+	if !ok {
+		return mfaInvalidCode()
+	}
+	confirmed, err := tx.MFA.ConfirmTOTP(ctx, factor.ID, userID, step)
+	if err != nil {
+		return apperror.NewInternal("failed to confirm MFA factor")
+	}
+	if !confirmed {
+		return mfaAlreadyEnabled()
+	}
+	return nil
 }
 
 // reauthenticate proves the caller may change the account's second factor.
@@ -339,13 +360,11 @@ func (s *mfaService) reauthenticateSession(ctx context.Context, userID, sessionI
 // sessions. The platform route calls it when a user lost both the
 // authenticator and the recovery codes.
 func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
-	// A platform reset removes the global factor/codes, bumps the global token
-	// version, and ends the target user's sessions in every tenant: those
-	// steps must not half-apply, so one bypass transaction owns them. The
-	// factor and user rows are global; the revocation is deliberately
-	// cross-tenant by user id; the audit event names the administrator's
-	// request tenant explicitly.
-	ctx = database.WithRLSBypass(ctx)
+	// The factor, recovery codes, and token version are global rows, so this is
+	// a normal tenant-scoped transaction; the version bump ends the target
+	// user's sessions in every tenant at once. The per-tenant session-row
+	// revocation is recorded by the follow-up bypass statement after commit.
+	// The audit event names the administrator's request tenant explicitly.
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, err := tx.Users.GetByID(ctx, userID)
 		if err != nil {
@@ -363,9 +382,6 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
 		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to bump token version")
 		}
-		if err := tx.Sessions.RevokeAllForUser(ctx, userID, RevokeMFAChanged); err != nil {
-			return apperror.NewInternal("failed to revoke sessions")
-		}
 		return s.recordMFAChange(ctx, tx, SecurityEventMFAReset, user, "admin.user.mfa_reset", map[string]any{
 			"scope": "platform",
 		})
@@ -373,6 +389,7 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
 	if err != nil {
 		return err
 	}
+	cleanupStaleSessions(ctx, s.Stores.Sessions, userID, RevokeMFAChanged)
 	if s.Sessions != nil {
 		s.Sessions.invalidate(ctx, userID)
 	}
@@ -392,12 +409,13 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 		}
 		return apperror.NewInternal("failed to load user")
 	}
-	// Disabling the factor and ending the user's other sessions in every
-	// tenant must not half-apply: a deleted factor with a still-live
-	// MFA-authenticated session would keep that session usable. The factor
-	// rows are global and the revocation is cross-tenant by user id; the
-	// audit event names the request tenant explicitly.
-	ctx = database.WithRLSBypass(ctx)
+	// Disabling the factor and ending the user's other sessions in every tenant
+	// must not half-apply with the factor deletion. The factor rows are global,
+	// so the transaction is tenant-scoped; disabling a factor does not
+	// invalidate an older session (there is no second factor left to bypass),
+	// so the caller's own session stays live and the cross-tenant revocation of
+	// the others is the follow-up bypass statement after commit. The audit
+	// event names the request tenant explicitly.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := s.consumeCode(ctx, tx.Stores, userID, matched); err != nil {
 			return err
@@ -408,9 +426,6 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 		if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to delete recovery codes")
 		}
-		if err := tx.Sessions.RevokeOtherUserSessions(ctx, userID, sessionID, RevokeMFAChanged); err != nil {
-			return apperror.NewInternal("failed to revoke other sessions")
-		}
 		return s.recordMFAChange(ctx, tx, SecurityEventMFADisabled, user, "auth.mfa_disabled", map[string]any{
 			"method": matched.auditMethod(),
 		})
@@ -419,6 +434,7 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 		s.auditSecondFactorFailure(ctx, userID, 0, err)
 		return err
 	}
+	cleanupOtherSessions(ctx, s.Stores.Sessions, userID, sessionID, RevokeMFAChanged)
 	clearMFAAttempts(ctx, s.Cache, userID)
 	if s.Sessions != nil {
 		s.Sessions.invalidate(ctx, userID)

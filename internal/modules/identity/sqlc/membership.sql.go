@@ -27,7 +27,7 @@ SET status = 'suspended', banned_at = NOW(),
 FROM users AS u
 WHERE u.id = m.user_id
   AND m.tenant_id = $1 AND m.user_id = $2 AND m.status = 'active'
-RETURNING m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at
+RETURNING m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at
 `
 
 type BanMembershipParams struct {
@@ -45,6 +45,7 @@ func (q *Queries) BanMembership(ctx context.Context, arg BanMembershipParams) (M
 		&i.Status,
 		&i.BannedAt,
 		&i.BannedEmailHash,
+		&i.ErasureRequestedAt,
 		&i.RemovedAt,
 		&i.CredentialsRevokedAt,
 		&i.CreatedAt,
@@ -73,7 +74,7 @@ func (q *Queries) CountActiveOwners(ctx context.Context, tenantID int64) (int64,
 const createMembership = `-- name: CreateMembership :one
 INSERT INTO memberships (tenant_id, user_id)
 VALUES ($1, $2)
-RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, erasure_requested_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type CreateMembershipParams struct {
@@ -91,12 +92,34 @@ func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipPara
 		&i.Status,
 		&i.BannedAt,
 		&i.BannedEmailHash,
+		&i.ErasureRequestedAt,
 		&i.RemovedAt,
 		&i.CredentialsRevokedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const deleteTenantMembership = `-- name: DeleteTenantMembership :execrows
+DELETE FROM memberships
+WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+`
+
+type DeleteTenantMembershipParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+// Tenant purge: removes one membership right after that member's erasers
+// succeeded. Its sessions, refresh tokens, and role assignments cascade; the
+// per-member invitations are deleted first to release the RESTRICT FKs.
+func (q *Queries) DeleteTenantMembership(ctx context.Context, arg DeleteTenantMembershipParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantMembership, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteTenantMembershipsBatch = `-- name: DeleteTenantMembershipsBatch :execrows
@@ -113,10 +136,9 @@ type DeleteTenantMembershipsBatchParams struct {
 	BatchSize int32 `json:"batch_size"`
 }
 
-// Runs after every module purger and invitation delete: those rows carry
-// RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
-// membership_roles cascade. A deleted tenant is not operational, so the
-// last-owner trigger permits the delete. One bounded page per statement.
+// Final sweep after every module purger and invitation delete. A deleted
+// tenant is not operational, so the last-owner trigger permits the delete.
+// One bounded page per statement.
 func (q *Queries) DeleteTenantMembershipsBatch(ctx context.Context, arg DeleteTenantMembershipsBatchParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteTenantMembershipsBatch, arg.TenantID, arg.BatchSize)
 	if err != nil {
@@ -158,7 +180,7 @@ func (q *Queries) EmailBannedInTenant(ctx context.Context, arg EmailBannedInTena
 }
 
 const getActiveMember = `-- name: GetActiveMember :one
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
            SELECT r.key FROM membership_roles mr
            JOIN roles r ON r.id = mr.role_id
@@ -213,6 +235,7 @@ func (q *Queries) GetActiveMember(ctx context.Context, arg GetActiveMemberParams
 		&i.Membership.Status,
 		&i.Membership.BannedAt,
 		&i.Membership.BannedEmailHash,
+		&i.Membership.ErasureRequestedAt,
 		&i.Membership.RemovedAt,
 		&i.Membership.CredentialsRevokedAt,
 		&i.Membership.CreatedAt,
@@ -226,7 +249,7 @@ func (q *Queries) GetActiveMember(ctx context.Context, arg GetActiveMemberParams
 
 const getMember = `-- name: GetMember :one
 
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
            SELECT r.key FROM membership_roles mr
            JOIN roles r ON r.id = mr.role_id
@@ -284,6 +307,7 @@ func (q *Queries) GetMember(ctx context.Context, arg GetMemberParams) (GetMember
 		&i.Membership.Status,
 		&i.Membership.BannedAt,
 		&i.Membership.BannedEmailHash,
+		&i.Membership.ErasureRequestedAt,
 		&i.Membership.RemovedAt,
 		&i.Membership.CredentialsRevokedAt,
 		&i.Membership.CreatedAt,
@@ -379,7 +403,7 @@ func (q *Queries) GetMemberPrincipal(ctx context.Context, arg GetMemberPrincipal
 }
 
 const listActiveMembersCursor = `-- name: ListActiveMembersCursor :many
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
            SELECT r.key FROM membership_roles mr
            JOIN roles r ON r.id = mr.role_id
@@ -450,6 +474,7 @@ func (q *Queries) ListActiveMembersCursor(ctx context.Context, arg ListActiveMem
 			&i.Membership.Status,
 			&i.Membership.BannedAt,
 			&i.Membership.BannedEmailHash,
+			&i.Membership.ErasureRequestedAt,
 			&i.Membership.RemovedAt,
 			&i.Membership.CredentialsRevokedAt,
 			&i.Membership.CreatedAt,
@@ -469,7 +494,7 @@ func (q *Queries) ListActiveMembersCursor(ctx context.Context, arg ListActiveMem
 }
 
 const listMembersCursor = `-- name: ListMembersCursor :many
-SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT u.id, u.email, u.name, u.email_verified_at, u.status, u.token_version, u.credentials_changed_at, u.created_at, u.updated_at, u.deleted_at, m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
            SELECT r.key FROM membership_roles mr
            JOIN roles r ON r.id = mr.role_id
@@ -540,6 +565,7 @@ func (q *Queries) ListMembersCursor(ctx context.Context, arg ListMembersCursorPa
 			&i.Membership.Status,
 			&i.Membership.BannedAt,
 			&i.Membership.BannedEmailHash,
+			&i.Membership.ErasureRequestedAt,
 			&i.Membership.RemovedAt,
 			&i.Membership.CredentialsRevokedAt,
 			&i.Membership.CreatedAt,
@@ -596,7 +622,7 @@ func (q *Queries) ListTenantMembershipUserIDs(ctx context.Context, arg ListTenan
 }
 
 const listUserMemberships = `-- name: ListUserMemberships :many
-SELECT m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
+SELECT m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
            SELECT r.key FROM membership_roles mr
            JOIN roles r ON r.id = mr.role_id
@@ -638,6 +664,7 @@ func (q *Queries) ListUserMemberships(ctx context.Context, userID int64) ([]List
 			&i.Membership.Status,
 			&i.Membership.BannedAt,
 			&i.Membership.BannedEmailHash,
+			&i.Membership.ErasureRequestedAt,
 			&i.Membership.RemovedAt,
 			&i.Membership.CredentialsRevokedAt,
 			&i.Membership.CreatedAt,
@@ -797,10 +824,10 @@ func (q *Queries) MembershipStats(ctx context.Context, tenantID int64) (Membersh
 
 const reactivateMembership = `-- name: ReactivateMembership :one
 UPDATE memberships
-SET status = 'active', removed_at = NULL
+SET status = 'active', removed_at = NULL, erasure_requested_at = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'removed'
   AND banned_at IS NULL
-RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, removed_at, credentials_revoked_at, created_at, updated_at
+RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, erasure_requested_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type ReactivateMembershipParams struct {
@@ -810,7 +837,8 @@ type ReactivateMembershipParams struct {
 
 // Re-joining after removal (invitation acceptance). A ban is never lifted
 // here: a suspended membership matches no row, and neither does a removed
-// membership that kept its ban timestamp.
+// membership that kept its ban timestamp. An erasure reservation is cleared:
+// a re-invited member starts a fresh membership in the tenant.
 func (q *Queries) ReactivateMembership(ctx context.Context, arg ReactivateMembershipParams) (Membership, error) {
 	row := q.db.QueryRow(ctx, reactivateMembership, arg.TenantID, arg.UserID)
 	var i Membership
@@ -821,6 +849,7 @@ func (q *Queries) ReactivateMembership(ctx context.Context, arg ReactivateMember
 		&i.Status,
 		&i.BannedAt,
 		&i.BannedEmailHash,
+		&i.ErasureRequestedAt,
 		&i.RemovedAt,
 		&i.CredentialsRevokedAt,
 		&i.CreatedAt,
@@ -834,18 +863,19 @@ UPDATE memberships AS m
 SET status = 'removed', removed_at = NOW(),
     -- A ban (and its pseudonymous email marker) survives removal and erasure,
     -- so the address cannot re-register in this tenant. A ban recorded before
-    -- the hash existed derives it here from the still-intact users.email.
-    banned_at = CASE WHEN m.status = 'suspended' THEN m.banned_at ELSE NULL END,
+    -- the hash existed derives it here from the still-intact users.email; an
+    -- erasure reservation (no banned_at) must not create one.
+    banned_at = m.banned_at,
     banned_email_hash = CASE
-        WHEN m.status <> 'suspended' THEN NULL
         WHEN m.banned_email_hash IS NOT NULL THEN m.banned_email_hash
-        ELSE encode(sha256(convert_to(u.email, 'UTF8')), 'hex')
+        WHEN m.banned_at IS NOT NULL THEN encode(sha256(convert_to(u.email, 'UTF8')), 'hex')
+        ELSE NULL
     END,
     credentials_revoked_at = clock_timestamp()
 FROM users AS u
 WHERE u.id = m.user_id
   AND m.tenant_id = $1 AND m.user_id = $2 AND m.status <> 'removed'
-RETURNING m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at
+RETURNING m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.erasure_requested_at, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at
 `
 
 type RemoveMembershipParams struct {
@@ -863,6 +893,7 @@ func (q *Queries) RemoveMembership(ctx context.Context, arg RemoveMembershipPara
 		&i.Status,
 		&i.BannedAt,
 		&i.BannedEmailHash,
+		&i.ErasureRequestedAt,
 		&i.RemovedAt,
 		&i.CredentialsRevokedAt,
 		&i.CreatedAt,
@@ -871,11 +902,39 @@ func (q *Queries) RemoveMembership(ctx context.Context, arg RemoveMembershipPara
 	return i, err
 }
 
+const suspendMembershipForErasure = `-- name: SuspendMembershipForErasure :execrows
+UPDATE memberships
+SET status = 'suspended',
+    erasure_requested_at = NOW(),
+    removed_at = NULL,
+    credentials_revoked_at = clock_timestamp()
+WHERE tenant_id = $1 AND user_id = $2
+  AND status <> 'removed'
+`
+
+type SuspendMembershipForErasureParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+// Reserves a membership for erasure inside the request transaction: the
+// member can no longer act in the tenant and a concurrent last-owner check
+// sees one fewer active owner. banned_at/banned_email_hash are deliberately
+// untouched: this is not a ban.
+func (q *Queries) SuspendMembershipForErasure(ctx context.Context, arg SuspendMembershipForErasureParams) (int64, error) {
+	result, err := q.db.Exec(ctx, suspendMembershipForErasure, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const unbanMembership = `-- name: UnbanMembership :one
 UPDATE memberships
 SET status = 'active', banned_at = NULL, banned_email_hash = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'suspended'
-RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, removed_at, credentials_revoked_at, created_at, updated_at
+  AND banned_at IS NOT NULL AND erasure_requested_at IS NULL
+RETURNING id, tenant_id, user_id, status, banned_at, banned_email_hash, erasure_requested_at, removed_at, credentials_revoked_at, created_at, updated_at
 `
 
 type UnbanMembershipParams struct {
@@ -883,6 +942,8 @@ type UnbanMembershipParams struct {
 	UserID   int64 `json:"user_id"`
 }
 
+// Only a real ban is lifted. A membership suspended for a pending erasure
+// matches no row, so an unban can never resurrect it.
 func (q *Queries) UnbanMembership(ctx context.Context, arg UnbanMembershipParams) (Membership, error) {
 	row := q.db.QueryRow(ctx, unbanMembership, arg.TenantID, arg.UserID)
 	var i Membership
@@ -893,6 +954,7 @@ func (q *Queries) UnbanMembership(ctx context.Context, arg UnbanMembershipParams
 		&i.Status,
 		&i.BannedAt,
 		&i.BannedEmailHash,
+		&i.ErasureRequestedAt,
 		&i.RemovedAt,
 		&i.CredentialsRevokedAt,
 		&i.CreatedAt,

@@ -297,7 +297,7 @@ rotation, which expires the older retired row) only the current secret signs.
 ```mermaid
 flowchart TD
     A[Attempt ready to sign] --> B{Load active + unexpired<br/>previous secret}
-    B -->|lookup fails| S[Sign with snapshot only<br/>+ log error]
+    B -->|lookup fails| S[Retry the attempt with backoff<br/>+ log error]
     B -->|loaded| C{Active secret decrypts?}
     C -->|no| S
     C -->|yes| D[Sign with current first]
@@ -342,7 +342,7 @@ whose snapshot is older than that previous secret is signed with the current
 
 | Field | Meaning |
 |---|---|
-| `url` | Absolute `http(s)` URL, snapshotted per delivery. Only ports 443 and 80 are allowed by default; `WEBHOOK_ALLOWED_PORTS` extends the list. Updating it (or `timeoutMs`) also repoints that endpoint's `pending` deliveries in the same transaction, so a retry follows the move; `succeeded`/`dead` rows keep their snapshot. |
+| `url` | Absolute `http(s)` URL, snapshotted per delivery. Create/update resolve the hostname once and reject an internal address, and production (`WEBHOOK_REQUIRE_HTTPS`, default true) rejects plaintext `http://`. Only ports 443 and 80 are allowed by default; `WEBHOOK_ALLOWED_PORTS` extends the list. Updating it (or `timeoutMs`) also repoints that endpoint's `pending` deliveries in the same transaction, so a retry follows the move; `succeeded`/`dead` rows keep their snapshot. |
 | `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. Stored as a set and returned sorted. |
 | `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried. |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
@@ -358,9 +358,9 @@ matching and returns `404` for reads.
 
 | Control | Behavior |
 |---|---|
-| URL shape | Absolute `http(s)` only, no userinfo. |
+| URL shape | Absolute `http(s)` only, no userinfo. In production `WEBHOOK_REQUIRE_HTTPS=true` (the default) rejects `http://` at create/update; set it to `false` only for a deliberate plaintext receiver. |
 | Destination port | Only 443 and 80 by default; `WEBHOOK_ALLOWED_PORTS` extends the set. Endpoint create/update returns `400 webhook.port_not_allowed`, and the dialer enforces the same policy again (so a direct caller cannot bypass it). An implicit port uses the scheme default (80/443) and is allowed. |
-| Address checks | Resolves the hostname itself; rejects private, loopback, link-local, multicast, unspecified, CGNAT, and reserved/documentation ranges. |
+| Address checks | Endpoint create/update resolves the hostname with a 3s timeout and rejects a blocked address immediately; the delivery client resolves and checks again at dial time (DNS rebinding), so the early check is not the only one. Rejects private, loopback, link-local, multicast, unspecified, CGNAT, 6to4-relay anycast `192.88.99.0/24`, discard-only `100::/64`, benchmarking `2001:2::/48`, and reserved/documentation ranges. |
 | IPv6 transition | NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, IPv4-compatible `::/96`, and IPv4-translated `::ffff:0:0:0/96` are re-checked against the embedded IPv4; local-use NAT64 `64:ff9b:1::/48`, Teredo `2001::/32`, and site-local `fec0::/10` are blocked outright. |
 | DNS rebinding | Dials the vetted IP while keeping the hostname for `Host`/TLS SNI. |
 | Proxy | `Proxy: nil`, so `HTTP_PROXY` cannot bypass validation. |
@@ -407,7 +407,7 @@ sequenceDiagram
     SV->>SV: body non-empty, <= 1 MiB, valid JSON (else 400)
     SV->>SV: webhook-id present and well-formed (else 400)
     SV->>DB: load source (not soft-deleted)
-    Note over SV: missing / disabled / suspended source<br/>-> dummy HMAC, then 401
+    Note over SV: missing / disabled / suspended source, or a tenant-check DB error<br/>-> dummy tenant lookup + AES-GCM open + HMAC, then 401 (DB error logged)
     SV->>SV: open sealed current secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
     SV->>SV: headers present, timestamp parses,<br/>inside tolerance window (else 401)
     SV->>SV: constant-time HMAC over id.timestamp.body<br/>(current, else unexpired previous; else 401)
@@ -461,12 +461,13 @@ once on create or rotate. The current envelope (v3) records the sealing key's
 `kid` and authenticates the secret's purpose, tenant, and owning endpoint or
 source id as AAD, so a ciphertext copied to another row by someone with
 database write access fails to open. Delivery snapshots are copies of the
-endpoint secret and use the endpoint binding. Legacy v2 envelopes (key id only)
-and v1 envelopes (no key id) still open; newly sealed rows always use v3.
+endpoint secret and use the endpoint binding. Only v3 envelopes are accepted:
+unbound v1/v2 envelopes are rejected as invalid (no database predates v3, so
+there is nothing to migrate).
 
 | Rotation | Behavior |
 |---|---|
-| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. If the current secret cannot be loaded, decrypted, or decoded, the attempt is signed with the snapshot only and the failure is logged. Replays use the current active secret. |
+| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. `POST /webhooks/endpoints/:id/rotate-secret` accepts `{"expirePrevious": true}` to close the grace immediately, so the previous secret stops co-signing at once. A failed signing-secret lookup or an unreadable current secret is a retryable attempt failure; the worker never falls back to the delivery snapshot (it may be past its grace), and a structurally invalid envelope or pre-Standard secret is dead. Replays use the current active secret. |
 | Inbound source | Keeps the replaced sealed secret as `previous_secret_ciphertext` with `previous_secret_expires_at = now() + 24h`. Verification accepts the current secret or, while unexpired, the immediately previous one; a second rotation within the window replaces it, so only that one survives. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
@@ -483,6 +484,7 @@ and v1 envelopes (no key id) still open; newly sealed rows always use v3.
 | `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | `300` | Inbound signature clock skew. |
 | `WEBHOOK_SSRF_ALLOWLIST` | empty | Trusted private IPs/CIDRs/hosts. |
 | `WEBHOOK_ALLOWED_PORTS` | `443,80` | Additional outbound destination ports (comma-separated, 1-65535); 443 and 80 always stay allowed. |
+| `WEBHOOK_REQUIRE_HTTPS` | production: `true`; otherwise `false` | Reject `http://` endpoint URLs at create/update. Set explicitly to override the environment default. |
 
 ## Permissions and audit
 
@@ -513,7 +515,7 @@ the logs) unwraps `*url.Error` to its inner cause for the same reason.
 | GET | `/api/v1/webhooks/endpoints/:id` | `webhooks:read` |
 | PUT | `/api/v1/webhooks/endpoints/:id` | `webhooks:write` |
 | DELETE | `/api/v1/webhooks/endpoints/:id` | `webhooks:write` |
-| POST | `/api/v1/webhooks/endpoints/:id/rotate-secret` | `webhooks:write` |
+| POST | `/api/v1/webhooks/endpoints/:id/rotate-secret` | `webhooks:write`; body `{"expirePrevious": true}` (optional, default false) ends the previous secret's co-signing grace immediately |
 | GET | `/api/v1/webhooks/deliveries` | `webhooks:read` |
 | GET | `/api/v1/webhooks/deliveries/:id` | `webhooks:read` |
 | GET | `/api/v1/webhooks/deliveries/:id/attempts` | `webhooks:read` |

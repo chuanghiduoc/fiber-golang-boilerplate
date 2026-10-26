@@ -15,6 +15,7 @@ var moduleFiles = []struct{ template, path string }{
 	{"module/module.go.tmpl", "module.go"},
 	{"module/build.go.tmpl", "build.go"},
 	{"module/generate.go.tmpl", "generate.go"},
+	{"module/tenant_purge.go.tmpl", "tenant_purge.go"},
 	{"module/module_test.go.tmpl", "module_test.go"},
 	{"module/README.md.tmpl", "README.md"},
 	{"module/sqlc.yaml.tmpl", "sqlc.yaml"},
@@ -102,9 +103,9 @@ func (g *generator) planModule(name string) (*plan, error) {
 	return p, nil
 }
 
-// registerInBootstrap adds the module's import, Build call, and List entry to
-// internal/bootstrap/modules.go. It is idempotent: a module whose import is
-// already present is left untouched.
+// registerInBootstrap adds the module's import, Build call, List entry, and
+// tenant-purger registration to internal/bootstrap/modules.go. It is
+// idempotent: a module whose import is already present is left untouched.
 func registerInBootstrap(src, modulePath, name string) (string, error) {
 	importPath := modulePath + "/internal/modules/" + name
 	if strings.Contains(src, strconv.Quote(importPath)) {
@@ -117,6 +118,9 @@ func registerInBootstrap(src, modulePath, name string) (string, error) {
 	variable := camel(name) + "Module"
 	build := fmt.Sprintf("%s, _, err := %s.Build(infra, %s.Settings{})\nif err != nil {\n\treturn nil, err\n}", variable, name, name)
 	if out, err = insertAtMarker(bootstrapFile, out, markerBootstrapBuild, build); err != nil {
+		return "", err
+	}
+	if out, err = insertAtMarker(bootstrapFile, out, markerBootstrapPurge, variable+".RegisterTenantPurge(tenancyRegistry)"); err != nil {
 		return "", err
 	}
 	return insertAtMarker(bootstrapFile, out, markerBootstrapList, variable+",")

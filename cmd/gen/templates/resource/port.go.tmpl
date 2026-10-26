@@ -6,6 +6,6 @@ type {{.R.Pascal}}Repository interface {
 	Create{{.R.Pascal}}(ctx context.Context, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error)
 	Get{{.R.Pascal}}(ctx context.Context, id int64) ({{.R.Pascal}}, error)
 	List{{.R.PluralPascal}}(ctx context.Context, cursor pagination.DBCursor) ([]{{.R.Pascal}}, error)
-	Update{{.R.Pascal}}(ctx context.Context, id int64, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error)
+	Patch{{.R.Pascal}}(ctx context.Context, id int64, in {{.R.Pascal}}Patch) ({{.R.Pascal}}, error)
 	Delete{{.R.Pascal}}(ctx context.Context, id int64) error
 }

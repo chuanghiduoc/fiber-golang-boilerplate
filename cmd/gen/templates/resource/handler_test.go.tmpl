@@ -15,10 +15,11 @@ import (
 // fake{{.R.Pascal}}UseCases records the input it received and answers with
 // fixed values; id 404 is "not found".
 type fake{{.R.Pascal}}UseCases struct {
-	lastInput   {{.M.Ident}}service.{{.R.Pascal}}Input
-	lastLimit   int
-	lastCursor  string
-	deletedID   int64
+	lastInput  {{.M.Ident}}service.{{.R.Pascal}}Input
+	lastPatch  {{.M.Ident}}service.{{.R.Pascal}}Patch
+	lastLimit  int
+	lastCursor string
+	deletedID  int64
 }
 
 var fake{{.R.Pascal}} = {{.M.Ident}}service.{{.R.Pascal}}{
@@ -44,8 +45,8 @@ func (f *fake{{.R.Pascal}}UseCases) List(_ context.Context, limit int, startingA
 	return {{.M.Ident}}service.{{.R.Pascal}}Page{Items: []{{.M.Ident}}service.{{.R.Pascal}}{fake{{.R.Pascal}}}, HasMore: true, NextCursor: "next"}, nil
 }
 
-func (f *fake{{.R.Pascal}}UseCases) Update(_ context.Context, _ int64, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
-	f.lastInput = in
+func (f *fake{{.R.Pascal}}UseCases) Patch(_ context.Context, _ int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	f.lastPatch = in
 	return fake{{.R.Pascal}}, nil
 }
 
@@ -61,7 +62,7 @@ func Test{{.R.Pascal}}Handler(t *testing.T) {
 	app.Post("/{{.R.PluralRoute}}", h.Create)
 	app.Get("/{{.R.PluralRoute}}", h.List)
 	app.Get("/{{.R.PluralRoute}}/:id", h.Get)
-	app.Put("/{{.R.PluralRoute}}/:id", h.Update)
+	app.Patch("/{{.R.PluralRoute}}/:id", h.Patch)
 	app.Delete("/{{.R.PluralRoute}}/:id", h.Delete)
 
 	if status, body := do(t, app, http.MethodPost, "/{{.R.PluralRoute}}", `{"name":"fixture"}`); status != http.StatusCreated || !strings.Contains(body, `"id":7`) {
@@ -83,8 +84,9 @@ func Test{{.R.Pascal}}Handler(t *testing.T) {
 	if status, body := do(t, app, http.MethodGet, "/{{.R.PluralRoute}}/404", ""); status != http.StatusNotFound || !strings.Contains(body, string({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)) {
 		t.Fatalf("GET missing = %d %s, want 404 %s", status, body, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
 	}
-	if status, body := do(t, app, http.MethodPut, "/{{.R.PluralRoute}}/7", `{"name":"renamed"}`); status != http.StatusOK || fake.lastInput.Name != "renamed" {
-		t.Fatalf("PUT = %d %s", status, body)
+	if status, body := do(t, app, http.MethodPatch, "/{{.R.PluralRoute}}/7", `{"name":"renamed"}`); status != http.StatusOK ||
+		fake.lastPatch.Name == nil || *fake.lastPatch.Name != "renamed" {
+		t.Fatalf("PATCH = %d %s", status, body)
 	}
 	if status, body := do(t, app, http.MethodDelete, "/{{.R.PluralRoute}}/7", ""); status != http.StatusNoContent || fake.deletedID != 7 {
 		t.Fatalf("DELETE = %d %s", status, body)

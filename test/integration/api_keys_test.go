@@ -28,6 +28,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
 
@@ -72,7 +73,9 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(testutil.Scoped(pool))
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(testutil.NewTxManager(pool), audit.Noop{}, principalReader), 8760*time.Hour)
+	txManager := testutil.NewTxManager(pool)
+	ranks := identityadapter.NewMemberRank(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil))
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, ranks, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principalReader), 8760*time.Hour)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
@@ -202,4 +205,60 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	// An explicit default-tenant header conflicts with the key binding.
 	resp, _ = h.request(t, keyB.Secret, tenant.DefaultSlug)
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+}
+
+// memberSubjectCtx is a request context for a member of tenantID with the given
+// role and permissions, as the authenticate middleware would build it.
+func memberSubjectCtx(tenantID, userID int64, role string, permissions ...authz.Permission) context.Context {
+	return authz.WithSubject(
+		tenant.WithID(context.Background(), tenantID),
+		authz.NewSubjectWithPermissions(userID, tenantID, role, permissions...),
+	)
+}
+
+func requireAPIKeyStatus(t *testing.T, err error, status int) {
+	t.Helper()
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	require.Equal(t, status, appErr.Status, "error: %v", err)
+}
+
+// TestIntegration_APIKeyManagementRespectsMemberRank proves the apikeys to
+// identity rank wiring against PostgreSQL: managing another member's key
+// requires outranking its owner, and only the owner may widen the scopes.
+func TestIntegration_APIKeyManagementRespectsMemberRank(t *testing.T) {
+	h := setupAPIKeyHarness(t)
+	ctx := context.Background()
+	owner := testutil.CreateMember(t, ctx, h.pool, h.tenant, "apikey-rank-owner@test.com", testutil.MemberOptions{Role: "owner"}).UserID
+	admin := testutil.CreateMember(t, ctx, h.pool, h.tenant, "apikey-rank-admin@test.com", testutil.MemberOptions{Role: "admin"}).UserID
+	member := testutil.CreateMember(t, ctx, h.pool, h.tenant, "apikey-rank-member@test.com", testutil.MemberOptions{Role: "member"}).UserID
+
+	ownerKey, err := h.svc.Create(systemTenantCtx(h.tenant), owner, apikeyservice.CreateInput{
+		Name: "owner-key", Scopes: []string{"files:read"},
+	})
+	require.NoError(t, err)
+	memberKey, err := h.svc.Create(systemTenantCtx(h.tenant), member, apikeyservice.CreateInput{
+		Name: "member-key", Scopes: []string{"files:read", "files:write"},
+	})
+	require.NoError(t, err)
+
+	// An admin does not outrank an owner: neither update nor revoke succeeds.
+	adminCtx := memberSubjectCtx(h.tenant, admin, authz.RoleAdmin, "files:read", "files:write")
+	name := "hijacked"
+	_, err = h.svc.Update(adminCtx, ownerKey.ID, apikeyservice.UpdateInput{Name: &name})
+	requireAPIKeyStatus(t, err, fiber.StatusForbidden)
+	requireAPIKeyStatus(t, h.svc.Revoke(adminCtx, ownerKey.ID), fiber.StatusForbidden)
+
+	// The admin outranks a member: it may narrow that member's key, not widen it.
+	_, err = h.svc.Update(adminCtx, memberKey.ID, apikeyservice.UpdateInput{Scopes: []string{"files:read"}})
+	require.NoError(t, err)
+	_, err = h.svc.Update(adminCtx, memberKey.ID, apikeyservice.UpdateInput{Scopes: []string{"files:read", "files:write"}})
+	requireAPIKeyStatus(t, err, fiber.StatusForbidden)
+	require.NoError(t, h.svc.Revoke(adminCtx, memberKey.ID))
+
+	// The owner may still widen its own key.
+	ownerCtx := memberSubjectCtx(h.tenant, owner, authz.RoleOwner, "files:read", "files:write")
+	updated, err := h.svc.Update(ownerCtx, ownerKey.ID, apikeyservice.UpdateInput{Scopes: []string{"files:read", "files:write"}})
+	require.NoError(t, err)
+	assert.Len(t, updated.Scopes, 2)
 }

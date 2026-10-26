@@ -62,6 +62,15 @@ DELETE FROM invitations AS t
 USING batch
 WHERE t.id = batch.id;
 
+-- name: DeleteMemberInvitations :execrows
+-- Tenant purge releases the RESTRICT foreign keys before deleting one
+-- membership: invitations this member created or accepted. The tenant-wide
+-- DeleteTenantInvitationsBatch removes the remaining rows later; the tenant is
+-- already deleted, so its provenance has no reader left.
+DELETE FROM invitations
+WHERE tenant_id = @tenant_id::bigint
+  AND (invited_by = @user_id::bigint OR accepted_by = @user_id::bigint);
+
 -- name: DeleteTenantInvitationsBatch :execrows
 -- Tenant purge: invitations reference memberships through invited_by and
 -- accepted_by (RESTRICT), so they must go before the memberships. One bounded

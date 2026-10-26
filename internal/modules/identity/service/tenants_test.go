@@ -19,7 +19,7 @@ func TestTenantStatusTransitions(t *testing.T) {
 		TenantStatusTrialing:        {TenantStatusActive, TenantStatusSuspended, TenantStatusPendingDeletion},
 		TenantStatusActive:          {TenantStatusSuspended, TenantStatusPendingDeletion},
 		TenantStatusSuspended:       {TenantStatusActive, TenantStatusPendingDeletion},
-		TenantStatusPendingDeletion: {TenantStatusActive, TenantStatusDeleted},
+		TenantStatusPendingDeletion: {TenantStatusSuspended, TenantStatusDeleted},
 		TenantStatusDeleted:         nil,
 	}
 	for _, from := range all {
@@ -53,9 +53,13 @@ func TestTenantTransition_SchedulesAndAudits(t *testing.T) {
 	require.NotNil(t, pending.DeletionScheduledAt)
 	assert.WithinDuration(t, time.Now().Add(TenantDeletionGrace), *pending.DeletionScheduledAt, time.Minute)
 
-	restored, err := svc.Transition(ctx, 2, TenantStatusActive)
-	require.NoError(t, err)
+	restored, err := svc.Transition(ctx, 2, TenantStatusSuspended)
+	require.NoError(t, err, "cancelling a deletion suspends the tenant")
 	assert.Nil(t, restored.DeletionScheduledAt, "cancelling deletion clears the schedule")
+
+	activated, err := svc.Transition(ctx, 2, TenantStatusActive)
+	require.NoError(t, err, "a platform admin activates the restored tenant explicitly")
+	assert.Equal(t, TenantStatusActive, activated.Status)
 
 	_, err = svc.Transition(ctx, 2, TenantStatusDeleted)
 	assert.Equal(t, http.StatusConflict, statusOf(err), "active -> deleted skips the grace period")
@@ -63,7 +67,7 @@ func TestTenantTransition_SchedulesAndAudits(t *testing.T) {
 	_, err = svc.Transition(ctx, 1, TenantStatusPendingDeletion)
 	assert.Equal(t, http.StatusConflict, statusOf(err), "the default tenant cannot be deleted")
 
-	require.Len(t, db.audits, 2)
+	require.Len(t, db.audits, 3)
 	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
 	assert.Equal(t, int64(2), db.audits[0].TenantID)
 }
@@ -115,6 +119,38 @@ func TestTenantExpireTrialSuspendsOnlyPastDue(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, changed, "a live trial stays trialing")
 	assert.Equal(t, TenantStatusTrialing, db.tenants[3].Status)
+}
+
+func TestTenantFinalizeDeletionTransitionsOnlyDueTenants(t *testing.T) {
+	db := newMemDB()
+	svc := NewTenantService(db.stores(), memTx{db})
+	ctx := context.Background()
+	past := time.Now().Add(-time.Minute)
+	future := time.Now().Add(time.Hour)
+	db.tenants[2].Status = TenantStatusPendingDeletion
+	db.tenants[2].DeletionScheduledAt = &past
+	db.tenants[3] = &Tenant{
+		ID: 3, Slug: "not-due", Name: "Not Due", Status: TenantStatusPendingDeletion, DeletionScheduledAt: &future,
+	}
+
+	changed, err := svc.FinalizeDeletion(ctx, 2)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, TenantStatusDeleted, db.tenants[2].Status)
+	require.Len(t, db.audits, 1)
+	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
+	assert.Equal(t, audit.ActorTypeSystem, db.audits[0].ActorType)
+	assert.Equal(t, "deletion_due", db.audits[0].Metadata["reason"])
+
+	changed, err = svc.FinalizeDeletion(ctx, 2)
+	require.NoError(t, err)
+	assert.False(t, changed, "a retry after deletion is a no-op")
+
+	changed, err = svc.FinalizeDeletion(ctx, 3)
+	require.NoError(t, err)
+	assert.False(t, changed, "a tenant before its grace end stays pending")
+	assert.Equal(t, TenantStatusPendingDeletion, db.tenants[3].Status)
+	assert.Len(t, db.audits, 1, "a no-op writes no audit row")
 }
 
 func TestNormalizeNewTenant(t *testing.T) {

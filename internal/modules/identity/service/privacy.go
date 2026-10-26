@@ -50,7 +50,16 @@ const (
 	identityProviderName = "identity"
 )
 
-var errErasurePending = errors.New("private erasure is waiting for tenant memberships")
+var (
+	errErasurePending = errors.New("private erasure is waiting for tenant memberships")
+	// errErasureNotRequested refuses a privacy.erase job whose membership was
+	// never reserved by a request transaction. A job-time refusal is
+	// permanent: retrying cannot make a request that never happened.
+	errErasureNotRequested = errors.New("erasure was not requested for this membership")
+	// errErasureLastOwner refuses a job whose member became the last active
+	// owner after the request reserved it.
+	errErasureLastOwner = errors.New("erasing this member would remove the last active owner")
+)
 
 type exportJob struct {
 	ExportID int64 `json:"exportId"`
@@ -362,6 +371,9 @@ func (s *PrivacyService) DownloadExport(ctx context.Context, userID, id int64) (
 }
 
 // RequestSelfErasure re-authenticates the caller and starts global erasure.
+// The request transaction reserves every membership (suspends it under the
+// tenant owner lock and revokes its sessions), so the account cannot act while
+// the erase jobs are pending.
 func (s *PrivacyService) RequestSelfErasure(ctx context.Context, userID int64, password string) error {
 	if s.verifier == nil {
 		return apperror.NewInternal("password verification is not configured")
@@ -369,15 +381,21 @@ func (s *PrivacyService) RequestSelfErasure(ctx context.Context, userID int64, p
 	if err := s.verifier.VerifyPassword(ctx, userID, password); err != nil {
 		return err
 	}
-	return s.requestErasure(ctx, userID, "user.erasure_requested")
+	if err := s.requestErasure(ctx, userID, "user.erasure_requested"); err != nil {
+		return err
+	}
+	invalidateSessions(ctx, s.sessionCache, userID)
+	return nil
 }
 
 // RequestAdminErasure starts erasure for a member of the request tenant. It
 // is deliberately tenant-scoped: the request tenant's membership is removed
 // and only that tenant's data is erased, while the global account and the
-// user's memberships in other tenants stay intact.
+// user's memberships in other tenants stay intact. The membership is
+// suspended inside the request transaction, so a second request (including a
+// concurrent one) sees the reservation and acts on the remaining owners.
 func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) error {
-	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if tx.Privacy == nil || tx.Jobs == nil {
 			return apperror.NewInternal("privacy services are not configured")
 		}
@@ -400,6 +418,15 @@ func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) 
 				return err
 			}
 		}
+		if err := tx.Memberships.SuspendForErasure(ctx, userID); err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found")
+			}
+			return apperror.NewInternal("failed to reserve the member for erasure")
+		}
+		if err := tx.Sessions.RevokeAllInTenant(ctx, userID, RevokeMembershipChanged); err != nil {
+			return apperror.NewInternal("failed to revoke sessions")
+		}
 		if _, err := tx.Privacy.ExpireForUser(ctx, userID); err != nil {
 			return apperror.NewInternal("failed to expire data exports")
 		}
@@ -412,11 +439,19 @@ func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) 
 		event := userEvent(ctx, "admin.user.erasure_requested", userID, map[string]any{"scope": "tenant"})
 		return checkAudit(tx.Audit.RecordTx(ctx, event))
 	})
+	if err != nil {
+		return err
+	}
+	invalidateSessions(ctx, s.sessionCache, userID)
+	return nil
 }
 
 // requestErasure refuses to erase the last active owner of any tenant, then
-// commits one erase job per membership plus the global finalizer and a Tier 1
-// audit row.
+// reserves every membership (suspended, sessions revoked) and commits one
+// erase job per membership plus the global finalizer and a Tier 1 audit row.
+// Reserving inside the request transaction is what makes a second owner's
+// request see one active owner and fail up front; the job then only proceeds
+// for a membership marked for erasure.
 func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, action string) error {
 	ctx = database.WithRLSBypass(ctx) // Erasure reads and writes every tenant the user belongs to.
 	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
@@ -432,21 +467,17 @@ func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, actio
 		}
 		sort.Slice(memberships, func(i, j int) bool { return memberships[i].TenantID < memberships[j].TenantID })
 
-		for i := range memberships {
-			m := &memberships[i]
-			if m.Status != MembershipStatusActive || m.Role != RoleOwner {
-				continue
-			}
-			tctx := tenant.WithID(ctx, m.TenantID)
-			if err := ensureNotLastOwner(tctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
-				return err
-			}
-		}
-
 		erasePayload, _ := json.Marshal(eraseJob{UserID: userID})
 		for i := range memberships {
 			m := &memberships[i]
 			tctx := tenant.WithID(ctx, m.TenantID)
+			queue, err := reserveMembershipForErasure(tctx, tx, userID)
+			if err != nil {
+				return err
+			}
+			if !queue {
+				continue
+			}
 			if _, err := tx.Privacy.ExpireForUser(tctx, userID); err != nil {
 				return apperror.NewInternal("failed to expire data exports")
 			}
@@ -467,6 +498,47 @@ func (s *PrivacyService) requestErasure(ctx context.Context, userID int64, actio
 		event := userEvent(ctx, action, userID, map[string]any{"memberships": len(memberships)})
 		return checkAudit(tx.Audit.RecordTx(ctx, event))
 	})
+}
+
+// reserveMembershipForErasure suspends one membership inside the request
+// transaction, without ban markers, and revokes its sessions. It reports
+// queue=false when the membership is already reserved by an earlier request
+// (its job exists) and true when the caller must enqueue one. An already
+// removed membership has no row to reserve but still needs its erasers run.
+// Lock order matches every membership mutation: the target row first, then the
+// per-tenant owner-change lock inside ensureNotLastOwner.
+func reserveMembershipForErasure(ctx context.Context, tx TxRepos, userID int64) (bool, error) {
+	if err := tx.Memberships.LockMembership(ctx, userID); err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return false, nil
+		}
+		return false, apperror.NewInternal("failed to lock membership")
+	}
+	current, err := tx.Memberships.Get(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return false, nil
+		}
+		return false, apperror.NewInternal("failed to load membership")
+	}
+	if current.Membership.Status == MembershipStatusRemoved {
+		return true, nil
+	}
+	if current.Membership.ErasureRequestedAt != nil {
+		return false, nil
+	}
+	if current.Membership.Status == MembershipStatusActive && current.Membership.Role == RoleOwner {
+		if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Memberships.SuspendForErasure(ctx, userID); err != nil {
+		return false, apperror.NewInternal("failed to reserve the member for erasure")
+	}
+	if err := tx.Sessions.RevokeAllInTenant(ctx, userID, RevokeMembershipChanged); err != nil {
+		return false, apperror.NewInternal("failed to revoke sessions")
+	}
+	return true, nil
 }
 
 // Export implements privacy.Exporter for identity's own data.
@@ -625,11 +697,14 @@ func toInvitationExports(invitations []InvitationExport) []invitationExport {
 }
 
 // Erase implements privacy.Eraser for identity's own data: export documents,
-// sessions, and the tenant membership.
+// invitation addresses, sessions, and the tenant membership.
 func (s *PrivacyService) Erase(ctx context.Context, tenantID, userID int64) error {
 	tctx := tenant.WithID(ctx, tenantID)
 	if err := s.eraseExports(tctx, userID); err != nil {
 		return err
+	}
+	if _, err := s.stores.Privacy.AnonymizeErasedUserInvitations(tctx, userID, erasedEmail(userID)); err != nil {
+		return fmt.Errorf("anonymize invitations: %w", err)
 	}
 	if err := s.stores.Privacy.DeleteSessionsInTenant(tctx, userID); err != nil {
 		return fmt.Errorf("delete sessions: %w", err)
@@ -785,14 +860,21 @@ func (s *PrivacyService) buildExportDocument(ctx context.Context, export *DataEx
 // HandleEraseJob runs every tenant Eraser, identity's own eraser last: it
 // removes the membership, and the finalizer treats a removed membership as
 // proof that every other module's data is gone. Each implementation is
-// idempotent, so a retry is safe.
+// idempotent, so a retry is safe. The request transaction already reserved the
+// membership (suspended, sessions revoked); a job for a live membership
+// without that reservation is refused permanently and logged with both ids.
 func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMessage) error {
 	var in eraseJob
 	if err := json.Unmarshal(payload, &in); err != nil || in.UserID <= 0 {
 		return jobs.Permanent(fmt.Errorf("invalid privacy.erase payload"))
 	}
 	tenantID := tenant.EffectiveID(ctx)
-	if err := s.refuseLastOwnerErasure(ctx, in.UserID); err != nil {
+	if err := s.checkErasureRequest(ctx, in.UserID); err != nil {
+		if errors.Is(err, errErasureNotRequested) || errors.Is(err, errErasureLastOwner) {
+			slog.Error("privacy.erase job refused",
+				slog.Int64("tenant_id", tenantID), slog.Int64("user_id", in.UserID), slog.Any("error", err))
+			return jobs.Permanent(fmt.Errorf("refusing to erase user %d in tenant %d: %w", in.UserID, tenantID, err))
+		}
 		return err
 	}
 	return s.eraseUserInTenant(ctx, tenantID, in.UserID)
@@ -832,16 +914,12 @@ func (s *PrivacyService) eraseUserInTenant(ctx context.Context, tenantID, userID
 	return nil
 }
 
-// refuseLastOwnerErasure re-checks at job time: another admin may have been
-// demoted after the request was accepted. It takes the same per-tenant owner
-// advisory lock the service uses inside the check transaction, so a
-// concurrent owner change serializes with it. It runs before any eraser, so a
-// refusal leaves the tenant (and other modules) untouched.
-func (s *PrivacyService) refuseLastOwnerErasure(ctx context.Context, userID int64) error {
+// checkErasureRequest gates a job on the request-time reservation. A removed
+// membership (or one already hard-deleted) is a completed no-op; a live one
+// without erasure_requested_at was never requested. The last-owner check
+// remains a defense in case the membership was reactivated after reserving.
+func (s *PrivacyService) checkErasureRequest(ctx context.Context, userID int64) error {
 	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if err := tx.Memberships.LockOwnerChanges(ctx); err != nil {
-			return apperror.NewInternal("failed to lock owner changes")
-		}
 		member, err := tx.Memberships.Get(ctx, userID)
 		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
@@ -849,15 +927,20 @@ func (s *PrivacyService) refuseLastOwnerErasure(ctx context.Context, userID int6
 			}
 			return fmt.Errorf("load membership: %w", err)
 		}
-		if member.Membership.Status != MembershipStatusActive || member.Membership.Role != RoleOwner {
+		if member.Membership.Status == MembershipStatusRemoved {
 			return nil
 		}
-		owners, err := tx.Memberships.CountActiveOwners(ctx)
-		if err != nil {
-			return fmt.Errorf("count owners: %w", err)
+		if member.Membership.ErasureRequestedAt == nil {
+			return errErasureNotRequested
 		}
-		if owners <= 1 {
-			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot erase the last active owner")
+		if member.Membership.Status == MembershipStatusActive && member.Membership.Role == RoleOwner {
+			if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
+				var appErr *apperror.AppError
+				if errors.As(err, &appErr) && appErr.Code == string(apperror.CodeUserLastAdmin) {
+					return errErasureLastOwner
+				}
+				return err
+			}
 		}
 		return nil
 	})
@@ -889,14 +972,19 @@ func (s *PrivacyService) finalizeUser(ctx context.Context, userID int64) (bool, 
 	if !allMembershipsRemoved(memberships) {
 		return false, errErasurePending
 	}
-	// Sweep exports created just before the last membership was removed. The
-	// request path holds the membership FOR SHARE, so no new export can appear
-	// after this point.
+	// Sweep exports created just before the last membership was removed, and
+	// every invitation address in every tenant (including one the user never
+	// joined). The request path holds the membership FOR SHARE, so no new
+	// export can appear after this point.
+	replacement := erasedEmail(userID)
 	for i := range memberships {
 		tctx := tenant.WithID(ctx, memberships[i].TenantID)
 		if err := s.eraseExports(tctx, userID); err != nil {
 			return false, err
 		}
+	}
+	if _, err := s.stores.Privacy.AnonymizeErasedUserInvitationsAllTenants(ctx, userID, replacement); err != nil {
+		return false, fmt.Errorf("anonymize invitations: %w", err)
 	}
 
 	var anonymized bool

@@ -36,8 +36,8 @@ flowchart LR
 
 | Command | Creates | Edits (at `gen:` markers) |
 | --- | --- | --- |
-| `module=<name>` | `module.go`, `build.go`, `generate.go`, `sqlc.yaml`, `README.md`, `module_test.go`, `catalog/` (permissions, errors, en/vi), `service/{ports,authorize,health}.go`, `repository/health.go`, `handler/health.go`, `dto/dto.go`, `queries/health.sql`, unit tests, `migrations/<UTC ts>_<name>_init.{up,down}.sql` | `internal/bootstrap/modules.go` (import, `Build`, `List`; idempotent) |
-| `resource=<r> module=<m>` | `migrations/<UTC ts>_<m>_create_<plural>.{up,down}.sql`, `queries/<r>.sql`, `service/<r>.go`, `repository/<r>.go` (+ shared `repository/errors.go`), `handler/<r>.go`, `dto/<r>.go`, `routes_<r>.go`, service/handler tests with hand-written fakes, `<r>_integration_test.go` | `service/ports.go`, `module.go`, `build.go`, `catalog/{permissions,errors}.go`, `catalog/locales/{en,vi}.json`, `README.md` |
+| `module=<name>` | `module.go`, `build.go`, `generate.go`, `tenant_purge.go`, `sqlc.yaml`, `README.md`, `module_test.go`, `catalog/` (permissions, errors, en/vi), `service/{ports,authorize,health}.go`, `repository/health.go`, `handler/health.go`, `dto/dto.go`, `queries/health.sql`, unit tests, `migrations/<UTC ts>_<name>_init.{up,down}.sql` | `internal/bootstrap/modules.go` (import, `Build`, `List`, tenant-purger registration; idempotent) |
+| `resource=<r> module=<m>` | `migrations/<UTC ts>_<m>_create_<plural>.{up,down}.sql`, `queries/<r>.sql`, `service/<r>.go`, `repository/<r>.go` (+ shared `repository/errors.go`), `repository/<r>_purge.go`, `handler/<r>.go`, `dto/<r>.go`, `routes_<r>.go`, service/handler tests with hand-written fakes, `<r>_integration_test.go` | `service/ports.go`, `module.go`, `build.go`, `catalog/{permissions,errors}.go`, `catalog/locales/{en,vi}.json`, `README.md` |
 | `command=<Name>` / `query=<Name>` | `service/{command,query}_<name>.go` (+ test); unless `no_http=1`: `handler/`, `dto/`, `routes_*.go` (+ handler test) | `module.go`, `build.go`, `README.md` |
 
 Rules the generator enforces:
@@ -51,7 +51,10 @@ Rules the generator enforces:
 - A migration version is a UTC timestamp newer than every existing migration,
   so `module` then `resource` in the same second never collide.
 - The resource table is `<module>_<plural>` (`--plural` for irregular
-  nouns); sqlc's model is the singularized table name.
+  nouns); sqlc's model is the singularized table name. It is tenant-owned, so
+  the generator also emits `ENABLE`/`FORCE ROW LEVEL SECURITY`, the
+  `tenant_isolation` policy, a `PATCH` partial-update path, and a tenant
+  `Purger` registered through the module's `tenant_purge.go`.
 
 Generated code is owner/admin-only until you grant roles in `catalog/permissions.go`,
 and commands/queries return `501 <module>.not_implemented` until their
@@ -258,7 +261,7 @@ type InvoiceRepository interface {
 	CreateInvoice(ctx context.Context, in InvoiceInput) (Invoice, error)
 	GetInvoice(ctx context.Context, id int64) (Invoice, error)
 	ListInvoices(ctx context.Context, cursor pagination.DBCursor) ([]Invoice, error)
-	UpdateInvoice(ctx context.Context, id int64, in InvoiceInput) (Invoice, error)
+	PatchInvoice(ctx context.Context, id int64, in InvoicePatch) (Invoice, error)
 	DeleteInvoice(ctx context.Context, id int64) error
 }
 ```
@@ -269,14 +272,15 @@ type InvoiceRepository interface {
 
 | Layer | Generated behavior |
 | --- | --- |
-| Migration | `billing_invoices`: `BIGINT GENERATED ALWAYS AS IDENTITY` PK, `tenant_id ... REFERENCES tenants (id) ON DELETE RESTRICT`, `name VARCHAR(255)` with a non-blank `CHECK`, `created_at`/`updated_at` (`update_updated_at()` trigger), index `(tenant_id, created_at DESC, id DESC)`; the down file drops the table |
-| Queries | `Create`/`Get`/`List`/`Update`/`Delete` with a `tenant_id` predicate each; `List` uses `(created_at, id) < (@cursor_created_at, @cursor_id)` |
-| Repository | binds `tenant.EffectiveID(ctx)`, maps `pgx.ErrNoRows`/zero deleted rows to `apperror.ErrNotFound`, maps sqlc rows to `service.Invoice` |
-| Service | `authz.Authorize` first (fail closed), input normalization (422), a row from another tenant is `404 billing.invoice_not_found`, a row escaping the tenant filter in a list fails loudly; imports no sqlc, pgx, Fiber, or `dto` |
-| Handler/DTO | `httpx.BindAndValidate`, `httpx.ParamID`, `httpx.CursorQuery`, `pkg/response`, `Location` on create, Swagger annotations |
-| Routes | `rl.Relaxed → authzhttp.Require(read)` for reads; `rl.Normal → authzhttp.Require(write/delete) → deps.Idempotency → audithttp.Guard(ModeRequired)` for writes |
+| Migration | `billing_invoices`: `BIGINT GENERATED ALWAYS AS IDENTITY` PK, `tenant_id ... REFERENCES tenants (id) ON DELETE RESTRICT`, `name VARCHAR(255)` with a non-blank `CHECK`, `created_at`/`updated_at` (`update_updated_at()` trigger), index `(tenant_id, created_at DESC, id DESC)`, `ENABLE`/`FORCE ROW LEVEL SECURITY` and the reviewed `tenant_isolation` policy calling `app_tenant_visible(tenant_id)`; the down file drops the table |
+| Queries | `Create`/`Get`/`List`/`Patch`/`Delete` with a `tenant_id` predicate each, plus a bounded `DeleteTenant<Resource>Batch` purge query; `List` uses `(created_at, id) < (@cursor_created_at, @cursor_id)`; `Patch` uses `CASE WHEN @set_<field>` so an omitted field is never clobbered |
+| Repository | takes `infra.DB` (the RLS-scoped handle, never `infra.Pool`), binds `tenant.EffectiveID(ctx)`, maps `pgx.ErrNoRows`/zero deleted rows to `apperror.ErrNotFound`, maps sqlc rows to `service.Invoice`; `<r>_purge.go` implements the tenancy `Purger` in `PurgeBatchSize` pages |
+| Service | `authz.Authorize` first (fail closed), input normalization (422), a pointer-field `InvoicePatch` rejects an empty patch, a row from another tenant is `404 billing.invoice_not_found`, a row escaping the tenant filter in a list fails loudly; imports no sqlc, pgx, Fiber, or `dto` |
+| Handler/DTO | `httpx.BindAndValidate`, `httpx.ParamID`, `httpx.CursorQuery`, `pkg/response`, `Location` on create, Swagger annotations; `PATCH` takes `InvoicePatchRequest` pointer fields |
+| Routes | `rl.Relaxed → authzhttp.Require(read)` for reads; `rl.Normal → authzhttp.Require(write/delete) → deps.Idempotency → audithttp.Guard(ModeRequired)` for writes; update is `PATCH /invoices/:id` with partial semantics |
 | Catalog | `billing:invoices:{read,write,delete}` (owner/admin-only), `billing.invoice_not_found` with en/vi titles |
-| Tests | service test over a fake repository (CRUD, validation, tenant isolation, pagination, fail-closed), handler test over a fake service, `invoice_integration_test.go` (`-tags=integration`) running the routes through `app.New` on PostgreSQL: CRUD, cross-tenant id → 404, three succeeded audit rows |
+| Tenancy | `Build` appends `repository.NewInvoiceTenantPurger(infra.DB)`; the module's `tenant_purge.go` exposes it through `RegisterTenantPurge`, and bootstrap calls that at the `gen:module-purge` marker so a deleted tenant's rows are erased with no manual wiring |
+| Tests | service test over a fake repository (CRUD, validation, tenant isolation, pagination, fail-closed), handler test over a fake service, `invoice_integration_test.go` (`-tags=integration`) running the routes through `app.New` on PostgreSQL with `testutil.Scoped`/`NewTxManager` (the RLS app role, not the BYPASS fixture pool): CRUD, empty patch 422, cross-tenant id → 404, three succeeded audit rows, and a tenant purge that leaves another tenant's rows intact |
 
 Commands and queries (`make gen command=IssueInvoice module=billing`) get
 `IssueInvoiceInput`/`IssueInvoiceResult` and an `IssueInvoiceHandler` in
@@ -333,7 +337,7 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	group.Get("/", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.List)
 	group.Get("/:id", deps.Limiters.Relaxed, authzhttp.Require(widgetscatalog.PermissionRead), m.handler.Get)
 	group.Post("/", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Create)
-	group.Put("/:id", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Update)
+	group.Patch("/:id", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionWrite), deps.Idempotency, m.handler.Patch)
 	group.Delete("/:id", deps.Limiters.Normal, authzhttp.Require(widgetscatalog.PermissionDelete), deps.Idempotency, m.handler.Delete)
 }
 ```

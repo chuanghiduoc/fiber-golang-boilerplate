@@ -171,8 +171,8 @@ func TestTrashPurgeClaimBlocksRestore(t *testing.T) {
 
 // TestTrashPurgeFailedBlobDoesNotBlockNewerRows proves a permanently failing
 // blob is deferred on its own row instead of stalling every newer row: the
-// claim is released (restore stays possible), the attempt is counted, and the
-// next run continues with rows outside the backoff.
+// claim is kept (the row is never restorable again), the attempt is counted,
+// and the next run continues with rows outside the backoff.
 func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
 	pool := setupTrashDB(t)
 	root := t.TempDir()
@@ -201,7 +201,7 @@ func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
 	assert.Equal(t, 1, attempts)
 	require.NotNil(t, retryAfter)
 	assert.True(t, retryAfter.After(time.Now()), "the failed row is deferred into the future")
-	assert.Nil(t, claimedAt, "the claim is released so the row can be restored")
+	require.NotNil(t, claimedAt, "the first delete attempt makes the row permanently non-restorable")
 
 	// A newer expired row is purged on the next run while the failed row waits.
 	_, newerPath := insertFile(t, pool, store, tenant.DefaultID, userA, "newer", old, true)
@@ -210,9 +210,10 @@ func TestTrashPurgeFailedBlobDoesNotBlockNewerRows(t *testing.T) {
 	assert.False(t, blobExists(t, root, newerPath))
 	assert.Equal(t, 1, store.fails, "the row in backoff is skipped, not retried immediately")
 
-	// Releasing the claim means the user can still restore the row.
+	// Keeping the claim means the user can never restore a row whose blob
+	// delete was already attempted.
 	_, err = filesrepo.NewFileRepository(testutil.Scoped(pool)).Restore(tenant.WithID(ctx, tenant.DefaultID), stuckID)
-	require.NoError(t, err, "a failed purge must not make the row unrestorable")
+	assert.ErrorIs(t, err, apperror.ErrNotFound, "a failed purge stays non-restorable")
 }
 
 // TestTrashPurgeSkipsRowsLockedByRestore proves the claim does not wait on a
@@ -274,4 +275,25 @@ func TestTrashPurgeQueryUsesPartialIndex(t *testing.T) {
 	plan := strings.Join(lines, "\n")
 	t.Log("\n" + plan)
 	assert.Contains(t, plan, "idx_files_deleted_at")
+}
+
+// TestExistingStoragePathsScopesToTenant proves the orphan sweep lookup only
+// sees the tenant in its context, so a path owned by another tenant is never
+// treated as live.
+func TestExistingStoragePathsScopesToTenant(t *testing.T) {
+	pool := setupTrashDB(t)
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	tenantB := testutil.CreateTenant(t, context.Background(), pool, "orphan-b")
+	userA := testutil.CreateMember(t, context.Background(), pool, tenant.DefaultID, "orphan-a@example.com", testutil.MemberOptions{}).UserID
+	userB := testutil.CreateMember(t, context.Background(), pool, tenantB, "orphan-b@example.com", testutil.MemberOptions{}).UserID
+	_, pathA := insertFile(t, pool, store, tenant.DefaultID, userA, "live-a", 0, true)
+	_, pathB := insertFile(t, pool, store, tenantB, userB, "live-b", 0, true)
+
+	repo := filesrepo.NewFileRepository(testutil.Scoped(pool))
+	existing, err := repo.ExistingStoragePaths(tenant.WithID(context.Background(), tenant.DefaultID), []string{pathA, pathB, "1/999/orphan.png"})
+	require.NoError(t, err)
+	assert.Contains(t, existing, pathA)
+	assert.NotContains(t, existing, pathB, "another tenant's row must not make a path live")
+	assert.NotContains(t, existing, "1/999/orphan.png")
 }

@@ -193,6 +193,49 @@ func TestTenantPurge_DeletedTenantIsErasedAndIsIdempotent(t *testing.T) {
 	assert.Equal(t, auditAfter, countForTenant(t, h, "audit_events", tenantA))
 }
 
+func TestTenantDeletion_DueTenantsFinalizeHourlyThroughTheService(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	due := testutil.CreateTenant(t, ctx, h.pool, "deletion-due")
+	notDue := testutil.CreateTenant(t, ctx, h.pool, "deletion-not-due")
+	_, err := h.pool.Exec(ctx,
+		`UPDATE tenants SET status = 'pending_deletion', deletion_scheduled_at = NOW() - INTERVAL '1 minute'
+		 WHERE id = $1`, due)
+	require.NoError(t, err)
+	_, err = h.pool.Exec(ctx,
+		`UPDATE tenants SET status = 'pending_deletion', deletion_scheduled_at = NOW() + INTERVAL '1 day'
+		 WHERE id = $1`, notDue)
+	require.NoError(t, err)
+
+	handler := h.jobs.handler(t, "identity.tenants.finalize_deletions")
+	require.NoError(t, handler(ctx, nil))
+
+	var dueStatus, notDueStatus string
+	require.NoError(t, h.pool.QueryRow(ctx, `SELECT status FROM tenants WHERE id = $1`, due).Scan(&dueStatus))
+	require.NoError(t, h.pool.QueryRow(ctx, `SELECT status FROM tenants WHERE id = $1`, notDue).Scan(&notDueStatus))
+	assert.Equal(t, "deleted", dueStatus, "a tenant past its grace period is finalized")
+	assert.Equal(t, "pending_deletion", notDueStatus, "a tenant inside its grace period stays pending")
+
+	var actorType, reason string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT actor_type, metadata->>'reason' FROM audit_events
+		 WHERE tenant_id = $1 AND action = 'tenant.status_changed' ORDER BY id DESC LIMIT 1`,
+		due).Scan(&actorType, &reason))
+	assert.Equal(t, "system", actorType, "the due transition is a system action")
+	assert.Equal(t, "deletion_due", reason)
+
+	var audits int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.status_changed'`, due).Scan(&audits))
+	assert.Equal(t, 1, audits)
+
+	// Re-running the hourly job after the transition is a no-op.
+	require.NoError(t, handler(ctx, nil))
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE tenant_id = $1 AND action = 'tenant.status_changed'`, due).Scan(&audits))
+	assert.Equal(t, 1, audits)
+}
+
 func TestTrialExpiry_StopsServingAndSuspendsHourly(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()

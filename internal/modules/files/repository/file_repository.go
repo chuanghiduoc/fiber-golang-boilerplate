@@ -132,6 +132,23 @@ func (r *FileRepository) StorageUsage(ctx context.Context, userID int64) (tenant
 	return usage.TenantBytes, usage.UserBytes, nil
 }
 
+// ExistingStoragePaths returns which of paths have a metadata row in the
+// request tenant. The orphan sweep calls it once per tenant batch.
+func (r *FileRepository) ExistingStoragePaths(ctx context.Context, paths []string) (map[string]struct{}, error) {
+	rows, err := r.q.ListFileStoragePaths(ctx, filesqlc.ListFileStoragePathsParams{
+		TenantID: tenantID(ctx),
+		Paths:    paths,
+	})
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]struct{}, len(rows))
+	for _, path := range rows {
+		existing[path] = struct{}{}
+	}
+	return existing, nil
+}
+
 // oneFile maps a single-row query result.
 func oneFile(row filesqlc.File, err error) (*filesvc.File, error) {
 	if err != nil {
