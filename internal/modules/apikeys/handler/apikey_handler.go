@@ -25,7 +25,7 @@ func NewHandler(service apikeysvc.Service) *Handler {
 
 // Create godoc
 // @Summary Create an API key
-// @Description Create a tenant-scoped API key. The plaintext key is returned once and never stored.
+// @Description Create an API key owned by the authenticated caller. The plaintext key is returned once and never stored.
 // @Tags Admin API Keys
 // @Accept json
 // @Produce json
@@ -63,7 +63,7 @@ func (h *Handler) Create(c fiber.Ctx) error {
 
 // List godoc
 // @Summary List API keys
-// @Description List the request tenant's API keys, including revoked and rotated keys. Secrets are never returned.
+// @Description List the request tenant's API keys, including other members', revoked and rotated keys. Secrets are never returned.
 // @Tags Admin API Keys
 // @Produce json
 // @Security BearerAuth
@@ -198,7 +198,7 @@ func (h *Handler) RevokeByPost(c fiber.Ctx) error {
 
 // Rotate godoc
 // @Summary Rotate an API key
-// @Description Issue a replacement key. The previous key remains valid for the rotation grace window unless revoked.
+// @Description Issue a replacement key for an API key owned by the authenticated caller. Another member's key id returns 404. The previous key remains valid for the rotation grace window unless revoked.
 // @Tags Admin API Keys
 // @Produce json
 // @Security BearerAuth
@@ -216,7 +216,7 @@ func (h *Handler) Rotate(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	result, err := h.service.Rotate(c.Context(), id)
+	result, err := h.service.Rotate(c.Context(), httpx.AuthUserID(c), id)
 	if err != nil {
 		return err
 	}

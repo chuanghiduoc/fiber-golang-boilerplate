@@ -304,9 +304,43 @@ func TestService_CreateRejectsInvalidRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create broad key: %v", err)
 	}
-	_, err = svc.Rotate(scopedCaller, broad.ID)
+	_, err = svc.Rotate(scopedCaller, 10, broad.ID)
 	if !errors.As(err, &appErr) || appErr.Status != 400 {
 		t.Fatalf("rotate escalation error = %v, want 400", err)
+	}
+}
+
+func TestService_RotateOnlyIssuesSecretsToTheOwner(t *testing.T) {
+	repo := newFakeRepo()
+	principals := fakePrincipals{users: map[int64]identitycontracts.Principal{
+		10: {ID: 10, TenantID: 1, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
+		20: {ID: 20, TenantID: 1, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive},
+	}}
+	svc := newTestService(repo, principals)
+	ctx := testContext(1)
+
+	created, err := svc.Create(ctx, 10, CreateInput{Name: "owner-key", Scopes: []string{"files:read"}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Another admin in the same tenant cannot obtain a secret for this key.
+	if _, err := svc.Rotate(ctx, 20, created.ID); !isNotFound(err) {
+		t.Fatalf("cross-owner rotate error = %v, want 404", err)
+	}
+	if repo.keys[created.ID].RotatedAt != nil {
+		t.Fatal("a refused cross-owner rotation must not mark the key rotated")
+	}
+	if len(repo.keys) != 1 {
+		t.Fatalf("keys = %d, want no successor key", len(repo.keys))
+	}
+
+	rotated, err := svc.Rotate(ctx, 10, created.ID)
+	if err != nil {
+		t.Fatalf("owner rotate: %v", err)
+	}
+	if rotated.UserID != 10 {
+		t.Fatalf("successor owner = %d, want the caller 10", rotated.UserID)
 	}
 }
 
@@ -336,7 +370,7 @@ func TestService_TenantIsolation(t *testing.T) {
 	if err := svc.Revoke(testContext(1), keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant revoke error = %v, want 404", err)
 	}
-	if _, err := svc.Rotate(testContext(1), keyB.ID); !isNotFound(err) {
+	if _, err := svc.Rotate(testContext(1), 10, keyB.ID); !isNotFound(err) {
 		t.Fatalf("cross-tenant rotate error = %v, want 404", err)
 	}
 
@@ -386,7 +420,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 		t.Fatalf("scope escalation update error = %v, want 400", err)
 	}
 
-	rotated, err := svc.Rotate(ctx, created.ID)
+	rotated, err := svc.Rotate(ctx, 10, created.ID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -410,7 +444,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 		t.Fatal("rotation grace must be in the future")
 	}
 
-	if _, err := svc.Rotate(ctx, created.ID); !isConflict(err) {
+	if _, err := svc.Rotate(ctx, 10, created.ID); !isConflict(err) {
 		t.Fatalf("second rotate error = %v, want 409", err)
 	}
 	if err := svc.Revoke(ctx, rotated.ID); err != nil {
@@ -422,7 +456,7 @@ func TestService_UpdateRevokeAndRotation(t *testing.T) {
 	if _, err := svc.Update(ctx, rotated.ID, UpdateInput{Name: ptrString("x")}); !isConflict(err) {
 		t.Fatalf("update revoked error = %v, want 409", err)
 	}
-	if _, err := svc.Rotate(ctx, rotated.ID); !isConflict(err) {
+	if _, err := svc.Rotate(ctx, 10, rotated.ID); !isConflict(err) {
 		t.Fatalf("rotate revoked error = %v, want 409", err)
 	}
 }
@@ -439,7 +473,7 @@ func TestService_RotationGraceIsAcceptedByVerifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	rotated, err := svc.Rotate(ctx, created.ID)
+	rotated, err := svc.Rotate(ctx, 10, created.ID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}

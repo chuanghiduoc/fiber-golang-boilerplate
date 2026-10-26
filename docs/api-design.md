@@ -469,18 +469,21 @@ Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
 ## API keys
 
 - `POST /admin/api-keys` returns the plaintext key once; list/get never do.
-  Name, owner (`userId`, defaults to the caller), scopes, and optional
-  `expiresAt` are recorded. Scopes must be known permissions within the owner's
-  role.
+  The owner is always the authenticated caller (the request has no `userId`
+  field); name, scopes, and optional `expiresAt` are recorded. Scopes must be
+  known permissions within the caller's own role or key.
 - `PUT /admin/api-keys/:id` updates name/scopes; `DELETE /admin/api-keys/:id`
   or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent);
   `POST /admin/api-keys/:id/rotate` issues a new secret while the old one stays
-  valid for 24 hours unless revoked. Create, update, and rotate reject (`400`)
-  any scope the caller does not hold, so an API-key caller cannot mint a
-  broader key.
+  valid for 24 hours unless revoked. Rotation is owner-only: an administrator
+  rotating another member's key gets `404`. Create, update, and rotate reject
+  (`400`) any scope the caller does not hold, so an API-key caller cannot mint
+  a broader key.
 - Routes require `admin:api_keys:read|create|update|revoke|rotate`, are
-  tenant-scoped, and return `404` for another tenant's key id. Mutations accept
-  `Idempotency-Key` except create and rotate.
+  tenant-scoped, and return `404` for another tenant's key id. Listing and
+  revoking other members' keys in the request tenant stays allowed (revocation
+  is safe); only create and rotate are bound to the caller as owner. Mutations
+  accept `Idempotency-Key` except create and rotate.
 - Every lifecycle mutation is Tier 1 audited (`api_key.created|updated|revoked|rotated`
   in the mutation transaction): an audit failure rolls back and returns
   `503 system.audit_unavailable` with no secret. Re-revoking writes no second

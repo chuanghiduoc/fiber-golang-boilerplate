@@ -8,7 +8,6 @@ import (
 func toCreateInput(req apikeydto.CreateRequest) apikeysvc.CreateInput {
 	return apikeysvc.CreateInput{
 		Name:      req.Name,
-		UserID:    req.UserID,
 		Scopes:    req.Scopes,
 		ExpiresAt: req.ExpiresAt,
 	}

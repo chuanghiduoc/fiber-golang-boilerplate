@@ -372,7 +372,10 @@ keeps the repository's tenant scoping.
   tenant-leading indexes. `data_exports` (identity) is tenant-owned and
   references `(tenant_id, user_id) → memberships`.
 - `api_keys.key_hash` is globally unique; it is the only lookup made before a
-  request tenant can be trusted.
+  request tenant can be trusted, so that single statement deliberately runs
+  with the RLS bypass. The verifier still compares the key's tenant with an
+  explicit `X-Tenant-Slug` and scopes the last-used write to the key's own
+  tenant.
 - `files.storage_path` is the authoritative blob key; moving a blob without
   updating it (or vice versa) breaks the file.
 

@@ -161,7 +161,7 @@ func TestAPIKeyRotateRefusesKeyRevokedByBan(t *testing.T) {
 	_, err = h.admin.UnbanUser(ctx, h.owner)
 	require.NoError(t, err)
 
-	_, err = h.keys.Rotate(ctx, created.ID)
+	_, err = h.keys.Rotate(ctx, h.owner, created.ID)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
 	require.Equal(t, http.StatusConflict, appErr.Status)
@@ -169,6 +169,6 @@ func TestAPIKeyRotateRefusesKeyRevokedByBan(t *testing.T) {
 	// A key created after the unban is unaffected.
 	fresh, err := h.createKey(ctx)
 	require.NoError(t, err)
-	_, err = h.keys.Rotate(ctx, fresh.ID)
+	_, err = h.keys.Rotate(ctx, h.owner, fresh.ID)
 	require.NoError(t, err)
 }

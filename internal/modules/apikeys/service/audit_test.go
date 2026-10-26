@@ -44,7 +44,7 @@ func TestService_LifecycleMutationsAreAudited(t *testing.T) {
 	if _, err := svc.Update(ctx, created.ID, UpdateInput{Name: &name}); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	rotated, err := svc.Rotate(ctx, created.ID)
+	rotated, err := svc.Rotate(ctx, 10, created.ID)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}

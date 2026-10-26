@@ -327,8 +327,9 @@ erDiagram
   `mfa_recovery_codes` stores SHA-256 hashes; `used_at` makes each code single
   use.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request
-  tenant cannot be trusted until the key is verified. A key's owner is a
-  membership (`(tenant_id, user_id) → memberships`).
+  tenant cannot be trusted until the key is verified, so that statement runs
+  with the RLS bypass while the request's last-used write stays under the key's
+  tenant. A key's owner is a membership (`(tenant_id, user_id) → memberships`).
 - `api_key_scopes` holds one row per granted permission. Every API-key query
   returns the scopes as one array sorted in byte order, so the API still
   returns a `scopes` array exactly as before. Create and update change the key

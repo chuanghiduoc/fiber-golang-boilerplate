@@ -40,10 +40,10 @@ type NewKey struct {
 	ExpiresAt *time.Time
 }
 
-// CreateInput asks for a new key. UserID defaults to the authenticated caller.
+// CreateInput asks for a new key. The owner is always the authenticated
+// caller, so it is not part of the input.
 type CreateInput struct {
 	Name      string
-	UserID    int64
 	Scopes    []string
 	ExpiresAt *time.Time
 }
@@ -70,7 +70,8 @@ type RotatedKey struct {
 
 // APIKeyRepository is the key persistence port. Implementations scope every
 // tenant-facing query to the request tenant (tenant.EffectiveID(ctx)) and
-// return apperror.ErrNotFound when no row matches.
+// return apperror.ErrNotFound when no row matches. GetByHash is the deliberate
+// exception: it is the pre-tenant possession lookup.
 type APIKeyRepository interface {
 	Create(ctx context.Context, key NewKey) (*APIKey, error)
 	GetByID(ctx context.Context, id int64) (*APIKey, error)

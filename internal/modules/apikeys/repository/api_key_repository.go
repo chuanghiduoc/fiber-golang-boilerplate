@@ -62,7 +62,13 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id int64) (*apikeysvc.AP
 }
 
 func (r *APIKeyRepository) GetByHash(ctx context.Context, hash string) (*apikeysvc.APIKey, error) {
-	row, err := r.q.GetAPIKeyByHash(ctx, hash)
+	// Possession of the hash authenticates the caller before a request tenant
+	// can be trusted: the key's tenant is learned from this row. This single
+	// statement is therefore a deliberate cross-tenant read; the verifier
+	// still compares the key's tenant with an explicit X-Tenant-Slug and
+	// otherwise authorizes the key's own tenant. Nothing else inherits the
+	// bypass.
+	row, err := r.q.GetAPIKeyByHash(database.WithRLSBypass(ctx), hash)
 	if err != nil {
 		return nil, wrapErr(err)
 	}

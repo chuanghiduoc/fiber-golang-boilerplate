@@ -67,7 +67,9 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	userB := insertUser(tenantB, "apikey-b@test.com")
 
 	stores := identityrepo.NewStores(testutil.Scoped(pool))
-	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(pool)
+	// Production wires every repository to the Scoped handle, so the verifier's
+	// hash lookup and last-used update run under RLS exactly as in the API.
+	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(testutil.Scoped(pool))
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
 	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(testutil.NewTxManager(pool), audit.Noop{}, principalReader))
@@ -157,7 +159,7 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode, "tenant mismatch")
 
 	// Rotation keeps the old key valid during grace and issues a working new key.
-	rotated, err := h.svc.Rotate(systemTenantCtx(h.tenant), created.ID)
+	rotated, err := h.svc.Rotate(systemTenantCtx(h.tenant), h.user, created.ID)
 	require.NoError(t, err)
 	resp, _ = h.request(t, created.Secret, "")
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode, "old key within rotation grace")
@@ -180,6 +182,8 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	require.NoError(t, err)
 
 	// No header: the key's tenant is authoritative, so a non-default key works.
+	// The hash lookup bypasses RLS (possession proof), while the request's
+	// default tenant must not leak into the last-used write.
 	resp, body := h.request(t, keyB.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 	var payload struct {
@@ -187,6 +191,13 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(body, &payload))
 	assert.Equal(t, h.other, payload.TenantID)
+
+	var lastUsed *time.Time
+	require.NoError(t, h.pool.QueryRow(context.Background(),
+		`SELECT last_used_at FROM api_keys WHERE id = $1 AND tenant_id = $2`,
+		keyB.ID, h.other,
+	).Scan(&lastUsed))
+	assert.NotNil(t, lastUsed, "last use must be recorded under the key's own tenant")
 
 	// An explicit default-tenant header conflicts with the key binding.
 	resp, _ = h.request(t, keyB.Secret, tenant.DefaultSlug)

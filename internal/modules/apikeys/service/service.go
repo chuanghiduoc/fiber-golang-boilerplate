@@ -36,7 +36,7 @@ type Service interface {
 	Get(ctx context.Context, id int64) (*APIKey, error)
 	Update(ctx context.Context, id int64, in UpdateInput) (*APIKey, error)
 	Revoke(ctx context.Context, id int64) error
-	Rotate(ctx context.Context, id int64) (*RotatedKey, error)
+	Rotate(ctx context.Context, callerUserID, id int64) (*RotatedKey, error)
 }
 
 type service struct {
@@ -113,12 +113,13 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 		return nil, err
 	}
 
-	ownerID := in.UserID
-	if ownerID == 0 {
-		ownerID = callerUserID
-	}
+	// The owner is always the authenticated caller. An administrator may list
+	// and revoke another member's keys, but a secret is only ever issued to the
+	// user who will act with it, so audience routes (/me/*) and the audit actor
+	// cannot be borrowed by creating a key for someone else.
+	ownerID := callerUserID
 	if ownerID <= 0 {
-		return nil, apperror.NewBadRequest("userId is required")
+		return nil, apperror.NewBadRequest("authenticated user is required")
 	}
 
 	expiresAt, err := validateExpiry(in.ExpiresAt, s.now())
@@ -268,12 +269,12 @@ func (s *service) Revoke(ctx context.Context, id int64) error {
 	})
 }
 
-func (s *service) Rotate(ctx context.Context, id int64) (*RotatedKey, error) {
+func (s *service) Rotate(ctx context.Context, callerUserID, id int64) (*RotatedKey, error) {
 	graceSeconds := int32(RotationGrace / time.Second)
 
 	var result *RotatedKey
 	err := s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
-		rotated, rotateErr := s.rotate(ctx, tx, id, graceSeconds)
+		rotated, rotateErr := s.rotate(ctx, tx, callerUserID, id, graceSeconds)
 		if rotateErr != nil {
 			return nil, rotateErr
 		}
@@ -293,13 +294,20 @@ func (s *service) Rotate(ctx context.Context, id int64) (*RotatedKey, error) {
 	return result, nil
 }
 
-func (s *service) rotate(ctx context.Context, tx TxRepos, id int64, graceSeconds int32) (*RotatedKey, error) {
+func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64, graceSeconds int32) (*RotatedKey, error) {
 	existing, err := tx.Keys.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("API key not found")
 		}
 		return nil, apperror.NewInternal("failed to rotate API key")
+	}
+	// Rotation returns a fresh secret, so it is owner-only. Another member's
+	// key is concealed as not found (the list/revoke admin surface stays
+	// available) and its state is checked after this so a revoked key does not
+	// reveal its existence either.
+	if existing.UserID != callerUserID {
+		return nil, apperror.NewNotFound("API key not found")
 	}
 	if existing.RevokedAt != nil {
 		return nil, apperror.NewConflict("API key has been revoked")

@@ -24,4 +24,19 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
 
 ## Entries
 
-None yet.
+### 2026-10-26 — API keys are owner-bound on create and rotate
+
+- `POST /api/v1/admin/api-keys`: the `userId` request field is removed. A key is
+  always owned by the authenticated caller. Requests that still send `userId`
+  now fail with `400 bad_request` (the binder rejects unknown fields). Clients
+  must change to: the member creates the key with their own session, or an
+  administrator keeps using list/revoke to manage it.
+- `POST /api/v1/admin/api-keys/{id}/rotate`: rotating a key owned by another
+  member now returns `404` (previously it issued a secret for that member).
+  Only the owner rotates. There is no v2 replacement: key rotation is
+  self-service by design, because a secret must only ever reach its owner.
+- Listing, getting, updating, and revoking another member's key in the same
+  tenant remain available to administrators.
+
+No client can keep the old behavior: use the owning member's session to create
+or rotate their key.
