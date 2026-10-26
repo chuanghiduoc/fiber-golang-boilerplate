@@ -156,6 +156,9 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	m.sessions = identityhandler.NewSessionHandler(sessionSvc)
 	m.invitations = identityhandler.NewInvitationHandler(invitationSvc)
 	m.mfa = identityhandler.NewMFAHandler(mfaSvc)
+	if stepUp, ok := mfaSvc.(identityservice.MFAStepUpService); ok {
+		m.mfaStepUp = identityhandler.NewMFAStepUpHandler(stepUp)
+	}
 	m.roles = identityhandler.NewRoleHandler(roleSvc)
 	m.platform = identityhandler.NewPlatformHandler(tenantSvc)
 	m.resetSvc = passwordResetSvc

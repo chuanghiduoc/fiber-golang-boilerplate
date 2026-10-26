@@ -260,8 +260,11 @@ type Session struct {
 	UserAgent    string
 	IP           string
 	AMR          []string
-	LastUsedAt   time.Time
-	CreatedAt    time.Time
+	// MFAVerifiedAt is when this session's second factor was last verified;
+	// nil for a first-factor-only session.
+	MFAVerifiedAt *time.Time
+	LastUsedAt    time.Time
+	CreatedAt     time.Time
 	// ExpiresAt is the absolute session lifetime (SESSION_MAX_LIFETIME).
 	ExpiresAt     time.Time
 	RevokedAt     *time.Time
@@ -280,13 +283,19 @@ type NewSession struct {
 	IP        string
 	// AMR is the authentication-method reference set (pwd, google, otp, rc).
 	AMR []string
+	// MFAVerifiedAt is set when the session is created after a second factor
+	// (otp/rc in AMR); nil leaves sessions.mfa_verified_at NULL.
+	MFAVerifiedAt *time.Time
 }
 
 // SessionState is everything the access-token validator compares.
 type SessionState struct {
-	TenantID         int64
-	Revoked          bool
-	ExpiresAt        time.Time
+	TenantID  int64
+	Revoked   bool
+	ExpiresAt time.Time
+	// MFAVerifiedAt is when the session's second factor was verified; the zero
+	// time means never (a first-factor-only session).
+	MFAVerifiedAt    time.Time
 	Role             string
 	Permissions      []string
 	Platform         bool
@@ -530,6 +539,10 @@ type SessionRepository interface {
 	// unknown or its session was already revoked.
 	RevokeByRefreshToken(ctx context.Context, tokenHash string, reason RevokeReason) (userID int64, revoked bool, err error)
 	Touch(ctx context.Context, id int64, userAgent, ip string) error
+	// MarkMFAVerified records a fresh second-factor proof on the caller's own
+	// live session and returns the new timestamp. A revoked or foreign session
+	// returns apperror.ErrNotFound.
+	MarkMFAVerified(ctx context.Context, userID, sessionID int64) (time.Time, error)
 	// State loads the validator view of a session of userID (any tenant; the
 	// caller compares SessionState.TenantID with the token's tenant).
 	State(ctx context.Context, sessionID, userID int64) (*SessionState, error)

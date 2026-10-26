@@ -27,7 +27,10 @@ const (
 
 	CodePermissionDenied Code = "permission.denied"
 	// CodeMFARequired is enforced by the platform RequireMFA guard: the access
-	// token lacks an otp/rc amr entry.
+	// token lacks an otp/rc amr entry, or the session's mfa_verified_at is
+	// missing or older than MFA_MAX_AGE. The stale case adds a detail pointing
+	// at POST /auth/mfa/step-up; the code is reused deliberately so clients
+	// switch on one value.
 	CodeMFARequired       Code = "auth.mfa_required"
 	CodeFeatureDisabled   Code = "feature.disabled"
 	CodeRateLimitExceeded Code = "rate_limit.exceeded"

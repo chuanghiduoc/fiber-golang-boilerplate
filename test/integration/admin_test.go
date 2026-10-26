@@ -110,7 +110,7 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
 // of the default tenant (the route has no tenant middleware).
 func registerMember(t *testing.T, app *fiber.App, email, name string) testutil.Member {
 	t.Helper()
-	body, err := json.Marshal(identitydto.RegisterRequest{Email: email, Password: "Password1!2026", Name: name})
+	body, err := json.Marshal(identitydto.RegisterRequest{Email: email, Password: testPassphrase, Name: name})
 	require.NoError(t, err)
 	req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

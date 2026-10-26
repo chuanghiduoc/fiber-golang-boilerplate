@@ -524,7 +524,8 @@ func (r memSessions) Create(ctx context.Context, in NewSession) (*Session, error
 	}
 	now := time.Now()
 	s := &Session{ID: r.db.id(), TenantID: tid, UserID: in.UserID, TokenVersion: in.TokenVersion,
-		UserAgent: in.UserAgent, IP: in.IP, AMR: in.AMR, ExpiresAt: in.ExpiresAt, CreatedAt: now, LastUsedAt: now}
+		UserAgent: in.UserAgent, IP: in.IP, AMR: in.AMR, MFAVerifiedAt: in.MFAVerifiedAt,
+		ExpiresAt: in.ExpiresAt, CreatedAt: now, LastUsedAt: now}
 	r.db.sessions[s.ID] = s
 	c := *s
 	return &c, nil
@@ -599,6 +600,18 @@ func (r memSessions) RevokeByRefreshToken(_ context.Context, hash string, why Re
 }
 
 func (r memSessions) Touch(context.Context, int64, string, string) error { return nil }
+
+func (r memSessions) MarkMFAVerified(ctx context.Context, userID, sessionID int64) (time.Time, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	s, ok := r.db.sessions[sessionID]
+	if !ok || s.UserID != userID || s.TenantID != tenant.EffectiveID(ctx) || s.RevokedAt != nil {
+		return time.Time{}, apperror.ErrNotFound
+	}
+	now := time.Now()
+	s.MFAVerifiedAt = &now
+	return now, nil
+}
 
 func (r memSessions) State(context.Context, int64, int64) (*SessionState, error) {
 	return nil, errFakeNotImplemented

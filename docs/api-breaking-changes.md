@@ -24,6 +24,37 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
 
 ## Entries
 
+### 2026-10-26 — Padded common passwords, Google refusals, and AAL2 freshness
+
+- `POST /api/v1/auth/register`, `POST /api/v1/auth/reset-password`,
+  `POST /api/v1/auth/invitations/signup`, and `PUT /api/v1/users/me/password`
+  now also reject a password whose leetspeak/punctuation-padded core is on the
+  bundled common-password list (`P@ssw0rd2026`), a single repeated character,
+  or a short repeated pattern (`abcabcabcabc`). The new field codes are
+  `password_repeated` and (when the operator enables
+  `PASSWORD_BREACH_CHECK=hibp`) `password_breached`; expose them alongside the
+  existing password codes. Values are NFKC-normalized before length checks and
+  before bcrypt on both set and verify, so compatibility spellings compare
+  equal. That changes the hashing input: a hash written by an older build must
+  be re-set (there is no deployed database yet). No v2 route is needed: the
+  old policy accepted weaker secrets.
+- `GET /api/v1/auth/google/callback` now returns `403
+  auth.oauth_email_not_verified` when Google authenticated an account with an
+  unverified address, and `400 auth.oauth_userinfo_incomplete` when the
+  userinfo response lacks the subject id or email. Both were `502
+  auth.oauth_upstream_unavailable`; clients should send the user back to
+  Google to verify the address or retry the sign-in instead of showing a
+  provider outage.
+- MFA-gated routes (every `/platform` route, including platform MFA reset)
+  now require the session's `mfa_verified_at` to be no older than
+  `MFA_MAX_AGE` (default `12h`). A stale session gets `403
+  auth.mfa_required` with a detail pointing at the new JWT-only `POST
+  /api/v1/auth/mfa/step-up` (`{"code": "<TOTP or recovery code>"}` →
+  `{"verifiedAt": "..."}`). Clients that cached a platform token across a
+  shift must step up before the next privileged call; the token's `amr` claim
+  is unchanged. There is no v2 route: the longer acceptance window was the
+  vulnerability.
+
 ### 2026-10-26 — Webhook port policy, inbound enumeration, and API-key lifetime
 
 - `POST /api/v1/webhooks/inbound/{id}`: an unknown, disabled, or soft-deleted

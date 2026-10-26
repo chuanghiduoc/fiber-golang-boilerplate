@@ -101,11 +101,12 @@ func JWTAuthKeys(keys *token.Keyring, stores ...session.Store) fiber.Handler {
 				permissions[authz.Permission(permission)] = struct{}{}
 			}
 			subject = authz.Subject{
-				UserID:      claims.UserID,
-				TenantID:    claims.TenantID,
-				Role:        state.Role,
-				Permissions: permissions,
-				CrossTenant: state.Platform,
+				UserID:        claims.UserID,
+				TenantID:      claims.TenantID,
+				Role:          state.Role,
+				Permissions:   permissions,
+				CrossTenant:   state.Platform,
+				MFAVerifiedAt: state.MFAVerifiedAt,
 			}
 		}
 

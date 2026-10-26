@@ -14,8 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -314,7 +312,7 @@ func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID int64
 		}
 		return apperror.NewInternal("failed to get user")
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(currentPassword)) != nil {
+	if !comparePassword(hash, currentPassword) {
 		return currentPasswordIncorrect()
 	}
 	clearReauthAttempts(ctx, s.Cache, userID)

@@ -25,12 +25,13 @@ func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID
 		return session.State{}, err
 	}
 	return session.State{
-		TenantID:     state.TenantID,
-		Role:         state.Role,
-		Permissions:  state.Permissions,
-		Platform:     state.Platform,
-		TokenVersion: state.TokenVersion,
-		ExpiresAt:    state.ExpiresAt,
+		TenantID:      state.TenantID,
+		Role:          state.Role,
+		Permissions:   state.Permissions,
+		Platform:      state.Platform,
+		TokenVersion:  state.TokenVersion,
+		ExpiresAt:     state.ExpiresAt,
+		MFAVerifiedAt: state.MFAVerifiedAt,
 		Active: !state.Revoked &&
 			state.MembershipStatus == identityservice.MembershipStatusActive &&
 			state.UserStatus == identityservice.UserStatusActive,

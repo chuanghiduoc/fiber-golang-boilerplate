@@ -649,6 +649,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- Authentication methods used to establish the session (RFC 8176). A
     -- refreshed access token repeats them; recovery codes record 'rc'.
     amr TEXT[] NOT NULL DEFAULT ARRAY['pwd']::TEXT[],
+    -- When the session's second factor was last verified (POST /auth/mfa/verify
+    -- or the step-up route). NULL for a first-factor-only session. AAL2
+    -- gates (authzhttp.RequireMFA) require this to be within MFA_MAX_AGE.
+    mfa_verified_at TIMESTAMP WITH TIME ZONE,
     last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     revoked_at TIMESTAMP WITH TIME ZONE,
     revoked_reason VARCHAR(30)

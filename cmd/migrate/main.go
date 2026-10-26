@@ -101,7 +101,7 @@ var requiredColumns = map[string][]string{
 	"invitations": {
 		"tenant_id", "email_normalized", "role", "token_hash", "invited_by", "expires_at", "accepted_at", "accepted_by",
 	},
-	"sessions":                  {"tenant_id", "user_id", "token_version", "expires_at", "amr", "ip", "last_used_at", "revoked_at", "revoked_reason"},
+	"sessions":                  {"tenant_id", "user_id", "token_version", "expires_at", "amr", "mfa_verified_at", "ip", "last_used_at", "revoked_at", "revoked_reason"},
 	"refresh_tokens":            {"tenant_id", "session_id", "token_hash", "used_at"},
 	"password_reset_tokens":     {"user_id", "token_hash"},
 	"email_verification_tokens": {"user_id", "email", "token_hash"},

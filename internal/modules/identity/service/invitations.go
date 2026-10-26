@@ -9,8 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -266,10 +264,6 @@ func (s *InvitationService) Accept(ctx context.Context, userID int64, token stri
 // commit together. It is not gated by user_registration: the tenant admin
 // invited this address explicitly.
 func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*Member, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcryptCost)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to hash password")
-	}
 	tokenHash := hashToken(in.Token)
 	// Resolve the invitation's tenant by possession, then require the request
 	// tenant to match before the tenant-scoped transaction starts. Only the
@@ -287,8 +281,16 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 	ctx = tenant.WithID(ctx, invitationTenant)
 	var member *Member
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		// The invitation is resolved and row-locked before the password is
+		// validated or hashed: bcrypt is expensive, and a caller without a
+		// live token must not be able to spend that CPU. The invitation's
+		// address is authoritative for the email-containment rule; the
+		// request carries no email to trust.
 		inv, ictx, err := s.pendingInvitation(ctx, tx.Stores, invitationTenant, tokenHash)
 		if err != nil {
+			return err
+		}
+		if err := ValidatePasswordForEmail(in.Password, inv.Email, "password"); err != nil {
 			return err
 		}
 		if err := ensureInviterCanGrant(ictx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
@@ -299,9 +301,13 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 		} else if !errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewInternal("failed to check existing user")
 		}
+		hash, err := hashPassword(in.Password)
+		if err != nil {
+			return err
+		}
 		created, err := createAccount(ictx, tx.Stores, NewUser{
 			Email: inv.Email, Name: strings.TrimSpace(in.Name), EmailVerified: true,
-		}, string(hash), inv.Role)
+		}, hash, inv.Role)
 		if err != nil {
 			return err
 		}

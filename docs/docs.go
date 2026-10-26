@@ -2489,6 +2489,75 @@ const docTemplate = `{
                 }
             }
         },
+        "/auth/mfa/step-up": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Verify a current TOTP or recovery code and stamp the caller's session as freshly second-factor authenticated. Use it when an MFA-gated route returns 403 auth.mfa_required because the previous verification is older than MFA_MAX_AGE.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Refresh MFA freshness for the current session",
+                "parameters": [
+                    {
+                        "description": "TOTP or recovery code",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.MFAStepUpRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.MFAStepUpResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "409": {
+                        "description": "auth.mfa_not_enabled",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/auth/mfa/totp/confirm": {
             "post": {
                 "security": [
@@ -7421,6 +7490,26 @@ const docTemplate = `{
                 },
                 "recoveryCodesRemaining": {
                     "type": "integer"
+                }
+            }
+        },
+        "dto.MFAStepUpRequest": {
+            "type": "object",
+            "required": [
+                "code"
+            ],
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "maxLength": 64
+                }
+            }
+        },
+        "dto.MFAStepUpResponse": {
+            "type": "object",
+            "properties": {
+                "verifiedAt": {
+                    "type": "string"
                 }
             }
         },

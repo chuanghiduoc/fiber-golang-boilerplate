@@ -32,17 +32,17 @@ func TestRegistrationAndLogin_AreScopedToMemberships(t *testing.T) {
 	ctx := context.Background()
 	acme := tenant.WithID(ctx, 2)
 
-	user, err := svc.Register(ctx, RegisterInput{Email: "Ada@Example.com", Password: "Password1!2026", Name: "Ada"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "Ada@Example.com", Password: testPassphrase, Name: "Ada"})
 	require.NoError(t, err)
 	assert.Equal(t, "ada@example.com", user.User.Email)
 	assert.Equal(t, int64(1), user.Membership.TenantID)
 	assert.Equal(t, RoleMember, user.Membership.Role)
 	assert.Equal(t, string(MembershipStatusActive), string(user.Membership.Status))
 
-	_, err = svc.Authenticate(acme, LoginInput{Email: "ada@example.com", Password: "Password1!2026"})
+	_, err = svc.Authenticate(acme, LoginInput{Email: "ada@example.com", Password: testPassphrase})
 	assert.Equal(t, string(identitycatalog.CodeAuthInvalidCredentials), codeOf(err), "no membership in tenant 2")
 
-	_, err = svc.Register(acme, RegisterInput{Email: "ada@example.com", Password: "Password1!2026", Name: "Ada again"})
+	_, err = svc.Register(acme, RegisterInput{Email: "ada@example.com", Password: testPassphrase, Name: "Ada again"})
 	assert.Equal(t, string(identitycatalog.CodeUserEmailTaken), codeOf(err))
 	assert.Len(t, db.users, 1, "no second account is created")
 }
@@ -51,17 +51,17 @@ func TestAuthenticate_BannedMemberGetsInvalidCredentials(t *testing.T) {
 	db := newMemDB()
 	svc := newTestUserService(db)
 	ctx := context.Background()
-	user, err := svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: "Password1!2026", Name: "B"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: testPassphrase, Name: "B"})
 	require.NoError(t, err)
 	_, err = db.stores().Memberships.Ban(ctx, user.User.ID)
 	require.NoError(t, err)
 
-	_, err = svc.Authenticate(ctx, LoginInput{Email: "b@example.com", Password: "Password1!2026"})
+	_, err = svc.Authenticate(ctx, LoginInput{Email: "b@example.com", Password: testPassphrase})
 	assert.Equal(t, string(identitycatalog.CodeAuthInvalidCredentials), codeOf(err))
 
 	// The ban survives in the tenant: the address cannot register there again
 	// (here it still has a live account, so it is simply taken).
-	_, err = svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: "Password1!2026", Name: "B"})
+	_, err = svc.Register(ctx, RegisterInput{Email: "b@example.com", Password: testPassphrase, Name: "B"})
 	assert.Equal(t, http.StatusConflict, statusOf(err))
 }
 
@@ -76,7 +76,7 @@ func newTestSessions(db *memDB, signed *[]AccessClaims) *SessionService {
 func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "s@example.com", Password: "Password1!2026", Name: "S"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "s@example.com", Password: testPassphrase, Name: "S"})
 	require.NoError(t, err)
 
 	var signed []AccessClaims
@@ -108,7 +108,7 @@ func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
 func TestSessions_ConcurrentRefreshKeepsSession(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "race@example.com", Password: "Password1!2026", Name: "Race"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "race@example.com", Password: testPassphrase, Name: "Race"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
@@ -146,7 +146,7 @@ func TestSessions_ConcurrentRefreshKeepsSession(t *testing.T) {
 func TestSessions_ConcurrentGraceRequiresLiveSession(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "dead@example.com", Password: "Password1!2026", Name: "Dead"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "dead@example.com", Password: testPassphrase, Name: "Dead"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
@@ -163,7 +163,7 @@ func TestSessions_ConcurrentGraceRequiresLiveSession(t *testing.T) {
 func TestSessions_CrossTenantRefreshHasNoSideEffects(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "x@example.com", Password: "Password1!2026", Name: "X"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "x@example.com", Password: testPassphrase, Name: "X"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
@@ -181,7 +181,7 @@ func TestSessions_CrossTenantRefreshHasNoSideEffects(t *testing.T) {
 func TestSessions_AdmissionRefusalDoesNotConsume(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "a@example.com", Password: "Password1!2026", Name: "A"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "a@example.com", Password: testPassphrase, Name: "A"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
@@ -199,7 +199,7 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
 	svc := newTestUserService(db)
-	user, err := svc.Register(ctx, RegisterInput{Email: "v@example.com", Password: "Password1!2026", Name: "V"})
+	user, err := svc.Register(ctx, RegisterInput{Email: "v@example.com", Password: testPassphrase, Name: "V"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)
@@ -217,7 +217,7 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 func TestSessions_RefreshTokenNeverOutlivesSession(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "life@example.com", Password: "Password1!2026", Name: "L"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "life@example.com", Password: testPassphrase, Name: "L"})
 	require.NoError(t, err)
 	sessionLifetime := 2 * time.Hour
 	sessions := NewSessionService(db.stores(), memTx{db}, func(AccessClaims) (string, error) { return "access", nil }, 30*24*time.Hour, sessionLifetime, nil)
@@ -235,7 +235,7 @@ func TestSessions_RefreshTokenNeverOutlivesSession(t *testing.T) {
 func TestSessions_ExpiredSessionCannotRefresh(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "expired@example.com", Password: "Password1!2026", Name: "E"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "expired@example.com", Password: testPassphrase, Name: "E"})
 	require.NoError(t, err)
 	var signed []AccessClaims
 	sessions := newTestSessions(db, &signed)

@@ -59,6 +59,7 @@ type identityHarness struct {
 	invitations  *identityservice.InvitationService
 	tenants      *identityservice.TenantService
 	roles        identityservice.RoleService
+	mfa          identityservice.MFAService
 	mail         *recordingSender
 	auth         *AuthHandler
 }
@@ -78,7 +79,7 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 	sign := func(c identityservice.AccessClaims) (string, error) {
 		return token.GenerateForSession(token.SessionClaims{
 			UserID: c.UserID, TenantID: c.TenantID, SessionID: c.SessionID,
-			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion,
+			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion, AMR: c.AMR,
 		}, harnessSecret, 1)
 	}
 	sessions := identityservice.NewSessionService(stores, transactor, sign, time.Hour, 720*time.Hour, sessionStore)
@@ -95,6 +96,9 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 		FrontendURL: "https://app.example.test", SessionCache: sessionStore,
 	})
 	tenants := identityservice.NewTenantService(stores, transactor)
+	mfa := identityservice.NewMFAService(identityservice.MFADeps{
+		Stores: stores, Tx: transactor, Cache: appCache, Sealer: harnessSealer{}, Sessions: sessions,
+	})
 	h := &identityHarness{
 		pool:         pool,
 		stores:       stores,
@@ -105,12 +109,13 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 		invitations:  identityservice.NewInvitationService(stores, transactor, mail, "https://app.example.test"),
 		tenants:      tenants,
 		roles:        identityservice.NewRoleService(stores, transactor, sessionStore),
+		mfa:          mfa,
 		mail:         mail,
 	}
 	h.auth = NewAuthHandler(AuthDeps{
 		Users: users, Sessions: sessions, Resets: resets, Verification: verification,
 		OAuthStateSecret: harnessSecret, GoogleOAuth: google, Tenants: tenants,
-		Cache: appCache, Sealer: harnessSealer{},
+		Cache: appCache, Sealer: harnessSealer{}, MFA: mfa,
 	})
 	return h
 }

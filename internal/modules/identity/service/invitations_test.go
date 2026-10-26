@@ -2,12 +2,15 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 // recordingInvitations records the RLS scope each possession lookup runs
@@ -128,6 +131,50 @@ func TestInvitationAccept_OnlyTheTokenLookupRunsWithBypass(t *testing.T) {
 	}
 	if tx.calls[0].tenantID != 2 {
 		t.Errorf("transaction tenant = %d, want 2", tx.calls[0].tenantID)
+	}
+}
+
+// The invitation's address is the authoritative email for the password
+// policy. Before this check existed a sign-up accepted a password containing
+// the invitee's own address, and it hashed the password before the token was
+// resolved.
+func TestInvitationSignUp_ValidatesPasswordAgainstInvitationEmail(t *testing.T) {
+	db := newMemDB()
+	now := time.Now().UTC()
+	db.mu.Lock()
+	db.users[1] = &User{ID: 1, Email: "owner@example.com", Name: "Owner", Status: UserStatusActive, CreatedAt: now, UpdatedAt: now}
+	db.memberships[[2]int64{1, 1}] = &Membership{
+		ID: db.id(), TenantID: 1, UserID: 1, Role: RoleOwner, Roles: []string{RoleOwner},
+		Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now,
+	}
+	db.mu.Unlock()
+	if _, err := (memInvitations{db}).Upsert(tenant.WithID(context.Background(), 1), NewInvitation{
+		Email: "signup.person@example.com", Role: RoleMember, TokenHash: hashToken("signup-token"),
+		InvitedBy: 1, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewInvitationService(db.stores(), memTx{db}, nil, "https://app.example.test")
+	_, err := svc.SignUp(tenant.WithID(context.Background(), tenant.DefaultID), InvitationSignUp{
+		Token: "signup-token", Name: "Signup", Password: "signup.person-2026", // ggignore: test fixture, not a credential
+	})
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("SignUp error = %v, want a validation error", err)
+	}
+	if appErr.Status != 422 || len(appErr.Errors) == 0 {
+		t.Fatalf("SignUp error = %v, want 422 with a field error", err)
+	}
+	if got := appErr.Errors[0].Code; got != validator.CodePasswordFromEmail {
+		t.Errorf("field code = %q, want %q", got, validator.CodePasswordFromEmail)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for _, u := range db.users {
+		if u.Email == "signup.person@example.com" {
+			t.Fatal("a rejected password must not create the account")
+		}
 	}
 }
 

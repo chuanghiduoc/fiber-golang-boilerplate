@@ -151,7 +151,7 @@ func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	broken := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: broken, Cache: cache.NewMemoryCache()})
 
-	_, err := users.Register(ctx, service.RegisterInput{Email: "atomic@example.com", Password: "Password1!2026", Name: "Atomic"})
+	_, err := users.Register(ctx, service.RegisterInput{Email: "atomic@example.com", Password: testPassphrase, Name: "Atomic"})
 	require.Error(t, err)
 	assert.Equal(t, string(apperror.CodeSystemAuditUnavailable), appCode(err))
 	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM users`))
@@ -194,7 +194,7 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 	testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
-	user, err := e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!2026", Name: "Banned"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: testPassphrase, Name: "Banned"})
 	require.NoError(t, err)
 	require.NoError(t, e.admin.BanUser(ctx, user.User.ID))
 	assert.NotNil(t, scalar[*time.Time](t, e.pool,
@@ -209,9 +209,9 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 	assert.Equal(t, "suspended", scalar[string](t, e.pool,
 		`SELECT status FROM memberships WHERE tenant_id = 1 AND user_id = $1`, user.User.ID), "the ban stays recorded")
 
-	_, err = e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!2026", Name: "Again"})
+	_, err = e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: testPassphrase, Name: "Again"})
 	assert.Equal(t, http.StatusConflict, appStatus(err))
-	again, err := e.users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "banned@example.com", Password: "Password1!2026", Name: "Again"})
+	again, err := e.users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "banned@example.com", Password: testPassphrase, Name: "Again"})
 	require.NoError(t, err, "the address is free elsewhere once the account is deleted")
 	assert.NotEqual(t, user.User.ID, again.User.ID)
 }
@@ -221,7 +221,7 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 func TestRefresh_ConcurrentRotationKeepsFamily(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	user, err := e.users.Register(ctx, service.RegisterInput{Email: "race@example.com", Password: "Password1!2026", Name: "Race"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "race@example.com", Password: testPassphrase, Name: "Race"})
 	require.NoError(t, err)
 	pair, err := e.sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	require.NoError(t, err)
@@ -258,7 +258,7 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
-	user, err := e.users.Register(ctx, service.RegisterInput{Email: "reset@example.com", Password: "Password1!2026", Name: "Reset"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "reset@example.com", Password: testPassphrase, Name: "Reset"})
 	require.NoError(t, err)
 	testutil.CreateMember(t, ctx, e.pool, acmeID, "reset@example.com", testutil.MemberOptions{})
 	inDefault, err := e.sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
@@ -283,7 +283,7 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 func TestEmailVerification_IsPerUser(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
-	user, err := e.users.Register(ctx, service.RegisterInput{Email: "verify@example.com", Password: "Password1!2026", Name: "V"})
+	user, err := e.users.Register(ctx, service.RegisterInput{Email: "verify@example.com", Password: testPassphrase, Name: "V"})
 	require.NoError(t, err)
 	require.NoError(t, e.verify.SendVerification(tenant.WithIdentity(ctx, tenant.DefaultID, "default"), user.User.ID, user.User.Email))
 	tok := e.mail.tokenFor(t, "verify@example.com")

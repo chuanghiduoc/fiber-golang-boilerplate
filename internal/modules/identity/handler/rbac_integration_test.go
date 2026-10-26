@@ -22,7 +22,7 @@ func TestIntegration_RolesAndPlatformTenants(t *testing.T) {
 	h := newIdentityHarness(t, nil)
 	app := identityApp(h)
 	ctx := context.Background()
-	const pw = "Password1!2026"
+	pw := testPassphrase
 
 	owner := testutil.CreateMember(t, ctx, h.pool, 1, "rbac-owner@example.com",
 		testutil.MemberOptions{Role: "owner", Password: pw})

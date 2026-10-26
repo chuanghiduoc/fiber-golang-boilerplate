@@ -234,6 +234,11 @@ flowchart TD
   `min(now() + JWT_REFRESH_EXPIRE_DAYS, sessions.expires_at)`, and both the
   session validator and the refresh endpoint reject an expired session with
   `401`.
+- `sessions.mfa_verified_at` records when the session's second factor was last
+  proven (an `otp`/`rc` sign-in, or `POST /auth/mfa/step-up`). It is `NULL` for
+  a first-factor-only session, and the session snapshot exposes it so
+  `authzhttp.RequireMFA` can reject a stale proof (`MFA_MAX_AGE`, default
+  `12h`).
 - `POST /auth/logout-all` requires `sessions:revoke` (the `member` role and
   therefore every role holds it), revokes every session of the user in every
   tenant, and bumps the token version, invalidating access tokens immediately.
@@ -260,6 +265,7 @@ are available per global user, not per tenant.
 | `POST /auth/mfa/recovery-codes/regenerate` | JWT, `mfa:write` | Require a code and return a fresh set of ten; the old set stops working. |
 | `GET /auth/mfa/status` | JWT, `mfa:read` | `{enabled, confirmedAt?, recoveryCodesRemaining}`. |
 | `POST /auth/mfa/verify` | public | `{challenge, code}` → the normal login response. The challenge is sealed, tenant-bound, five minutes old at most, and single use. |
+| `POST /auth/mfa/step-up` | JWT, `mfa:write` | `{code}` with a current TOTP or recovery code refreshes the caller's `sessions.mfa_verified_at` and returns `{verifiedAt}`. It spends the same per-user second-factor budget as verification and writes Tier 1 `auth.mfa_step_up`. Use it when an MFA-gated route returns `403 auth.mfa_required` because the proof is older than `MFA_MAX_AGE`; the stable `code` is reused with a detail that tells the client to step up. |
 | `POST /platform/users/:id/mfa/reset` | JWT, `platform:users:mfa_reset`, MFA session | Platform recovery for a user who lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`, Tier 1 audit. `404` for an unknown user. |
 
 Enrollment management is a credential change, so a mere access token is not
@@ -287,8 +293,12 @@ response keeps its original shape (`mfaRequired`/`mfaChallengeToken` are
 omitted).
 
 Access tokens carry `amr` (`pwd`, `google`, `otp`, `rc`); refresh preserves the
-session's set. `authzhttp.RequireMFA()` returns `403 auth.mfa_required` when
-the token lacks `otp`/`rc`; which roles must use it is a later RBAC decision.
+session's set. `authzhttp.RequireMFA(maxAge)` returns `403 auth.mfa_required`
+when the token lacks `otp`/`rc` **or** the session's `mfa_verified_at` is
+missing or older than the configured window (`MFA_MAX_AGE`, default `12h`;
+NIST SP 800-63B rev4 §2.2.3). The stale case adds a detail pointing at
+`POST /auth/mfa/step-up`; the code is deliberately reused so clients switch on
+one value instead of two. Which roles must use it is a later RBAC decision.
 Token-minting endpoints never take `Idempotency-Key`.
 
 ## Tenants
@@ -301,7 +311,7 @@ Token-minting endpoints never take `Idempotency-Key`.
 | Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership, effective permissions, and tenant status are re-read on every authentication, so bans, removals, deletions, role/permission changes, and suspensions apply immediately (`401`/`403`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
 | Scoping | Users are global: an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
-| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. A provider 4xx on the code exchange stays `400`; a 5xx, timeout, or network failure is `502 auth.oauth_upstream_unavailable`, and logs carry only the error class and upstream status. |
+| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. A provider 4xx on the code exchange stays `400`; a 5xx, timeout, or network failure is `502 auth.oauth_upstream_unavailable`, and logs carry only the error class and upstream status. A usable token whose user info cannot be trusted is a client-facing refusal instead: an unverified address is `403 auth.oauth_email_not_verified`, and missing subject id/email is `400 auth.oauth_userinfo_incomplete`. |
 | Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. The single revoke statement runs with RLS bypass because possession of the token is the authorization, so a tenant-B session is revoked even when the client omits `X-Tenant-Slug`. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
 | Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `roles`, `membershipStatus`, `joinedAt`, `bannedAt`). `role` is the highest system role key (`owner` > `admin` > `member`); `roles` lists every assigned role key. |
@@ -316,7 +326,7 @@ Users are global identities; a user joins tenants through memberships. Everythin
 | Register `POST /auth/register` | Creates user + password + active `member` membership in the request tenant (gated by the `user_registration` flag). An address that already has an account in **any** tenant gets `409 user.email_taken`; an existing user joins another tenant only through an invitation. An address banned in this tenant is refused even after the banned account was deleted. |
 | Login `POST /auth/login` | Global password plus an active membership in the request tenant; a correct password without one (never joined, banned, removed) gets the same `401 auth.invalid_credentials` as a wrong password. Opens a session; the JWT carries `sid`. |
 | Google OAuth | Authorization requests use PKCE (`S256`; the verifier stays server-side in the signed state cookie) and never request offline access, because Google refresh tokens are unused. The callback resolves the identity through `user_identities`: an existing link, a verified local account with the same address (linking requires both a verified local email and Google `verified_email`), or a new account with a membership in the state tenant (`user_registration` flag). An existing user must already be an active member of the state tenant; Google sign-in never joins a tenant implicitly. On success the callback redirects with only a 256-bit single-use code in the fragment (`#code=<code>`, valid 60 s) and `POST /auth/google/exchange {"code"}` (public, strict limiter) redeems it for the normal token response; the code is bound to the state tenant, and another tenant or a second redemption gets `401 auth.oauth_code_invalid`. An MFA sign-in still redirects with `mfa_required=true`/`mfa_challenge`. |
-| Password policy | NIST SP 800-63B: at least 12 and at most 64 characters (runes), at most 72 bytes (bcrypt's input limit), no composition rules. The bundled top-10k common-password list (`pkg/validator/data/common_passwords.txt`) is refused case-insensitively, and the password must not be or contain the local part of the account's email (at least three characters). Registration, password reset, and password change enforce the email rule where the address is known; failures are `422 validation_failed` with field codes `weak_password`, `password_common`, or `password_contains_email`. |
+| Password policy | NIST SP 800-63B: at least 12 and at most 64 characters (runes), at most 72 bytes (bcrypt's input limit), no composition rules. The bundled top-10k common-password list (`pkg/validator/data/common_passwords.txt`) is refused case-insensitively, including a padded/leetspeak "core" (`P@ssw0rd2026` matches `password`), and a single repeated character or a short pattern repeated to fill the length (`abcabcabcabc`) is refused. The password must not be or contain the local part of the account's email (at least three characters). Values are NFKC-normalized before length checks and before bcrypt, on both set and verify. Registration, password reset, and password change enforce the email rule where the address is known; failures are `422 validation_failed` with field codes `weak_password`, `password_common`, `password_repeated`, `password_breached`, or `password_contains_email`. With `PASSWORD_BREACH_CHECK=hibp` the validator also queries the HIBP range API with k-anonymity (only the first five SHA-1 hex characters leave the process, 2s timeout); a provider failure is logged and fails open so registration never depends on a third party. |
 | Password reset / email verification | Per user. The emailed link keeps `?tenant=<slug>` only so the frontend knows where to sign in afterwards. |
 | `GET /auth/sessions` | JWT only, `profile:read`. Cursor list of the caller's live sessions in the request tenant, newest first (`id`, `userAgent`, `ip`, `createdAt`, `lastUsedAt`, `current`). |
 | `DELETE /auth/sessions/:id` | JWT only, `sessions:revoke`, Tier 2 audited (`auth.session_revoked`). Revokes one of the caller's sessions in the request tenant (`204`); its refresh tokens stop working and its access tokens are rejected. Another user's session is `404`. |
@@ -418,7 +428,10 @@ as an alias for `member` in request bodies.
 
 Platform administration is the only cross-tenant surface. It requires a
 `platform_admin` role assignment (not a tenant role) and the `platform:*`
-permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, otherwise `403 auth.mfa_required`); a tenant admin without the assignment gets `403`.
+permissions, and every route needs an MFA session (`amr` with `otp` or `rc`) whose
+`sessions.mfa_verified_at` is no older than `MFA_MAX_AGE` (default `12h`);
+otherwise it returns `403 auth.mfa_required` (the stale case points at
+`POST /auth/mfa/step-up`). A tenant admin without the assignment gets `403`.
 
 | Route | Auth | Behavior |
 |---|---|---|
@@ -469,9 +482,15 @@ rate-limit headers (`RateLimit`, `RateLimit-Policy`, `X-RateLimit-Limit`,
   verification, so bogus credentials cannot drive unthrottled lookups.
 - Login attempts, password-reset requests, and verification resends have
   dedicated lockouts. Login failures count per (email, client IP), across
-  tenants because the password is global; the
-  account locks for every IP only after 5x the per-IP threshold, so one client
-  cannot lock someone else out.
+  tenants because the password is global. The per-source budget is 5; the
+  account-wide budget is 100 consecutive failures (NIST SP 800-63B rev4
+  §5.2.2), and a source that already spent its 5 attempts never touches the
+  account-wide counter, so exhausting it takes at least 20 addresses inside
+  one 15-minute window. A correct password clears only the caller's per-source
+  counter: the account-wide counter records distributed guessing and expires
+  with the window. The trade-off is that 20 cooperating addresses can still
+  lock the account for one window; anything lower let a handful of addresses
+  lock any victim out.
 
 ## Idempotency
 

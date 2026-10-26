@@ -84,9 +84,9 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 
 	tenantTwo := testutil.CreateTenant(t, ctx, pool, "links-acme")
 	userID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links@example.com",
-		testutil.MemberOptions{Password: "Password1!2026", Unverified: true}).UserID
+		testutil.MemberOptions{Password: testPassphrase, Unverified: true}).UserID
 	user2ID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links2@example.com",
-		testutil.MemberOptions{Password: "Password1!2026"}).UserID
+		testutil.MemberOptions{Password: testPassphrase}).UserID
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })

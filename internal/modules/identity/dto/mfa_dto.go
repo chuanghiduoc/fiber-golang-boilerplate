@@ -48,3 +48,15 @@ type MFAVerifyRequest struct {
 	Challenge string `json:"challenge" validate:"required,max=4096"`
 	Code      string `json:"code" validate:"required,max=64"`
 }
+
+// MFAStepUpRequest refreshes the current session's second-factor freshness
+// with a TOTP code or one of the single-use recovery codes.
+type MFAStepUpRequest struct {
+	Code string `json:"code" validate:"required,max=64"`
+}
+
+// MFAStepUpResponse reports when the second factor was verified; MFA-gated
+// routes accept the session for MFA_MAX_AGE after this instant.
+type MFAStepUpResponse struct {
+	VerifiedAt time.Time `json:"verifiedAt"`
+}

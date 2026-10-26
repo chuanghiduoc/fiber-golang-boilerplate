@@ -6,9 +6,11 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/go-playground/validator/v10"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -29,8 +31,15 @@ const (
 const (
 	CodeWeakPassword      = "weak_password"
 	CodePasswordCommon    = "password_common"
+	CodePasswordRepeated  = "password_repeated"
+	CodePasswordBreached  = "password_breached"
 	CodePasswordFromEmail = "password_contains_email"
 )
+
+// maxLeetVariants bounds the leetspeak expansions of one password, so a
+// pathological input cannot multiply the blocklist lookups without limit. The
+// canonical expansion (1 -> i) is always first, so it is never dropped.
+const maxLeetVariants = 32
 
 // commonPasswordsSource is the bundled list of the 10,000 most common
 // passwords from OWASP SecLists (Passwords/Common-Credentials/10k-most-common.txt,
@@ -68,18 +77,36 @@ func instance() *validator.Validate {
 	return validate
 }
 
+// NormalizePassword returns the canonical Unicode form used for every password
+// operation: NFKC folds compatibility variants (ligatures, full-width forms,
+// combined marks) to one representation, so a password set and offered with
+// two visually identical spellings compares equal. It is applied to both the
+// stored input (bcrypt) and the offered one. There is no deployed database, so
+// this intentionally changes the hashing input; any hash created before this
+// change would have to be re-set.
+func NormalizePassword(password string) string {
+	return norm.NFKC.String(password)
+}
+
 // PasswordWeakness classifies why password fails the policy and returns ""
-// when it passes. The returned value is the stable validation error code.
+// when it passes. The returned value is the stable validation error code. The
+// NFKC form is measured and matched, and the optional breached-password check
+// runs last so a local failure short-circuits the network call.
 func PasswordWeakness(password string) string {
+	normalized := NormalizePassword(password)
 	switch {
-	case utf8.RuneCountInString(password) < MinPasswordRunes:
+	case utf8.RuneCountInString(normalized) < MinPasswordRunes:
 		return CodeWeakPassword
-	case utf8.RuneCountInString(password) > MaxPasswordRunes:
+	case utf8.RuneCountInString(normalized) > MaxPasswordRunes:
 		return CodeWeakPassword
-	case len(password) > MaxPasswordBytes:
+	case len(normalized) > MaxPasswordBytes:
 		return CodeWeakPassword
-	case isCommonPassword(password):
+	case isRepetitivePassword(normalized):
+		return CodePasswordRepeated
+	case isCommonPassword(normalized):
 		return CodePasswordCommon
+	case isBreached(normalized):
+		return CodePasswordBreached
 	default:
 		return ""
 	}
@@ -89,14 +116,101 @@ func validatePassword(fl validator.FieldLevel) bool {
 	return PasswordWeakness(fl.Field().String()) == ""
 }
 
-// isCommonPassword reports whether the whole password appears in the bundled
-// top-10k list. A password that merely contains a common word is not rejected:
-// length is the dominant NIST control, and a long passphrase may legitimately
-// contain one.
+// isRepetitivePassword rejects a single repeated character and a short pattern
+// repeated to fill the length ("abcabcabcabc"). Such values meet a length rule
+// but carry almost no entropy.
+func isRepetitivePassword(password string) bool {
+	runes := []rune(strings.ToLower(password))
+	if len(runes) < 2 {
+		return false
+	}
+	for period := 1; period <= len(runes)/2; period++ {
+		if len(runes)%period != 0 {
+			continue
+		}
+		repeated := true
+		for i := period; i < len(runes); i++ {
+			if runes[i] != runes[i%period] {
+				repeated = false
+				break
+			}
+		}
+		if repeated {
+			return true
+		}
+	}
+	return false
+}
+
+// isCommonPassword reports whether the password, or its "core", appears in the
+// bundled top-10k list. The core is the lower-cased value with leading and
+// trailing digits/punctuation removed and common leetspeak folded, so
+// "P@ssw0rd2026" is recognized as "password" even though the full value is
+// long enough to satisfy the length rule. A long passphrase that merely
+// contains a common word is still accepted: only the full value and the
+// digit/punctuation-trimmed core are matched.
 func isCommonPassword(password string) bool {
 	set := commonPasswordSet()
-	_, found := set[strings.ToLower(password)]
-	return found
+	lower := strings.ToLower(password)
+	if _, found := set[lower]; found {
+		return true
+	}
+	for _, variant := range leetVariants(lower) {
+		if _, found := set[variant]; found {
+			return true
+		}
+		if core := passwordCore(variant); core != "" {
+			if _, found := set[core]; found {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// leetReplacements maps the common leetspeak characters to their letters. '1'
+// is ambiguous between i and l, so both spellings are produced.
+var leetReplacements = map[rune][]rune{
+	'0': {'o'},
+	'1': {'i', 'l'},
+	'3': {'e'},
+	'4': {'a'},
+	'5': {'s'},
+	'7': {'t'},
+	'@': {'a'},
+	'$': {'s'},
+}
+
+// leetVariants expands the leetspeak characters of s (already lower-cased) into
+// every plausible plain spelling, bounded by maxLeetVariants. The first
+// element is the unchanged value.
+func leetVariants(s string) []string {
+	variants := []string{""}
+	for _, r := range s {
+		options := []rune{r}
+		if replacements, ok := leetReplacements[r]; ok {
+			options = append(options, replacements...)
+		}
+		next := make([]string, 0, len(variants)*len(options))
+		for _, prefix := range variants {
+			for _, option := range options {
+				next = append(next, prefix+string(option))
+			}
+		}
+		if len(next) > maxLeetVariants {
+			next = next[:maxLeetVariants]
+		}
+		variants = next
+	}
+	return variants
+}
+
+// passwordCore trims leading and trailing digits and punctuation, leaving the
+// letters that a padded common password is built around.
+func passwordCore(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r)
+	})
 }
 
 func commonPasswordSet() map[string]struct{} {

@@ -30,6 +30,7 @@ type Module struct {
 	sessions    *identityhandler.SessionHandler
 	invitations *identityhandler.InvitationHandler
 	mfa         *identityhandler.MFAHandler
+	mfaStepUp   *identityhandler.MFAStepUpHandler
 	privacy     *identityhandler.PrivacyHandler
 	roles       *identityhandler.RoleHandler
 	platform    *identityhandler.PlatformHandler
@@ -125,6 +126,12 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 		auth.Post("/mfa/totp/confirm", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Confirm)
 		auth.Post("/mfa/disable", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Disable)
 		auth.Post("/mfa/recovery-codes/regenerate", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Regenerate)
+		// Freshness refresh for MFA-gated routes whose session's second
+		// factor is older than MFA_MAX_AGE. It is Tier 1: StepUp writes
+		// auth.mfa_step_up in the mutation transaction.
+		if m.mfaStepUp != nil {
+			auth.Post("/mfa/step-up", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfaStepUp.StepUp)
+		}
 		// The two-step login verification is public: the sealed, single-use
 		// challenge plus the second factor are the credentials.
 		auth.Post("/mfa/verify", rl.Strict, m.mfa.Verify)
@@ -170,8 +177,8 @@ func (m *Module) registerRoleRoutes(v1 fiber.Router, deps app.Deps) {
 // grants.
 func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
 	rl := deps.Limiters
-	// Platform-scope access requires a second factor.
-	mfa := authzhttp.RequireMFA()
+	// Platform-scope access requires a second factor no older than MFA_MAX_AGE.
+	mfa := authzhttp.RequireMFA(deps.Config.MFA.EffectiveMaxAge())
 	tenants := v1.Group("/platform/tenants", deps.Authenticate())
 	tenants.Get("/", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.ListTenants)
 	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)

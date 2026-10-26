@@ -121,6 +121,9 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 		UserAgent:    userAgentFromContext(ctx),
 		IP:           clientIPFromContext(ctx),
 		AMR:          amr,
+		// A session opened after a second factor starts its AAL2 clock now;
+		// a first-factor session leaves it NULL until POST /auth/mfa/step-up.
+		MFAVerifiedAt: sessionMFAVerifiedAt(amr),
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -154,6 +157,19 @@ func (s *SessionService) newRefreshToken(ctx context.Context, tokens RefreshToke
 		return "", apperror.NewInternal("failed to store refresh token")
 	}
 	return plain, nil
+}
+
+// sessionMFAVerifiedAt returns the session's AAL2 start time: now when the
+// session was opened after a second factor (otp/rc), nil for a first-factor
+// login that must step up before an MFA-gated route.
+func sessionMFAVerifiedAt(amr []string) *time.Time {
+	for _, method := range amr {
+		if method == AMROTP || method == AMRRecoveryCode {
+			now := time.Now()
+			return &now
+		}
+	}
+	return nil
 }
 
 func (s *SessionService) signFor(member *Member, sessionID int64, amr []string) (string, error) {

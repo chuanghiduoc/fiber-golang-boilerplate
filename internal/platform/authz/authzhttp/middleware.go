@@ -5,6 +5,8 @@
 package authzhttp
 
 import (
+	"time"
+
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -86,13 +88,22 @@ func RequireAny(permissions ...authz.Permission) fiber.Handler {
 }
 
 // RequireMFA returns middleware that allows the request only when the
-// authenticated subject's access token carries an MFA method (otp or rc). It
-// must run after authentication. API-key subjects have no amr and are denied.
-func RequireMFA() fiber.Handler {
+// authenticated subject's access token carries an MFA method (otp or rc) and
+// the session's second factor is no older than maxAge (NIST SP 800-63B rev4
+// §2.2.3: a second factor verified weeks ago is not AAL2 anymore). A missing
+// or stale proof is refused with 403 auth.mfa_required; the client refreshes
+// it with POST /auth/mfa/step-up. It must run after authentication. API-key
+// subjects have no amr and are denied. A non-positive maxAge still requires a
+// recorded verification, just without an age bound.
+func RequireMFA(maxAge time.Duration) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		subject, ok := requestSubject(c)
 		if !ok || !subject.HasMFA() {
 			return apperror.NewCode(apperror.CodeMFARequired, "multi-factor authentication is required")
+		}
+		if subject.MFAVerifiedAt.IsZero() || (maxAge > 0 && time.Since(subject.MFAVerifiedAt) > maxAge) {
+			return apperror.NewCode(apperror.CodeMFARequired,
+				"multi-factor authentication has expired; re-authenticate at POST /auth/mfa/step-up")
 		}
 		return c.Next()
 	}

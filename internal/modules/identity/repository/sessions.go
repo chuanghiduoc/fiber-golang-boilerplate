@@ -30,6 +30,7 @@ func toSession(row identitysqlc.Session) identityservice.Session {
 		UserAgent:     row.UserAgent.String,
 		IP:            ipString(row.Ip),
 		AMR:           row.Amr,
+		MFAVerifiedAt: timePtr(row.MfaVerifiedAt),
 		LastUsedAt:    row.LastUsedAt.Time,
 		CreatedAt:     row.CreatedAt.Time,
 		ExpiresAt:     row.ExpiresAt.Time,
@@ -40,13 +41,14 @@ func toSession(row identitysqlc.Session) identityservice.Session {
 
 func (r *SessionRepository) Create(ctx context.Context, session identityservice.NewSession) (*identityservice.Session, error) {
 	row, err := r.q.CreateSession(ctx, identitysqlc.CreateSessionParams{
-		TenantID:     tenantID(ctx),
-		UserID:       session.UserID,
-		TokenVersion: session.TokenVersion,
-		ExpiresAt:    timestamptz(session.ExpiresAt),
-		UserAgent:    optionalText(session.UserAgent),
-		Ip:           ipAddr(session.IP),
-		Amr:          session.AMR,
+		TenantID:      tenantID(ctx),
+		UserID:        session.UserID,
+		TokenVersion:  session.TokenVersion,
+		ExpiresAt:     timestamptz(session.ExpiresAt),
+		UserAgent:     optionalText(session.UserAgent),
+		Ip:            ipAddr(session.IP),
+		Amr:           session.AMR,
+		MfaVerifiedAt: optionalTimestamptz(session.MFAVerifiedAt),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -156,6 +158,18 @@ func (r *SessionRepository) Touch(ctx context.Context, id int64, userAgent, ip s
 	return nil
 }
 
+func (r *SessionRepository) MarkMFAVerified(ctx context.Context, userID, sessionID int64) (time.Time, error) {
+	verifiedAt, err := r.q.MarkSessionMFAVerified(ctx, identitysqlc.MarkSessionMFAVerifiedParams{
+		TenantID: tenantID(ctx),
+		UserID:   userID,
+		ID:       sessionID,
+	})
+	if err != nil {
+		return time.Time{}, wrapErr(err)
+	}
+	return verifiedAt.Time, nil
+}
+
 func (r *SessionRepository) State(ctx context.Context, sessionID, userID int64) (*identityservice.SessionState, error) {
 	row, err := r.q.GetSessionState(ctx, identitysqlc.GetSessionStateParams{ID: sessionID, UserID: userID})
 	if err != nil {
@@ -165,6 +179,7 @@ func (r *SessionRepository) State(ctx context.Context, sessionID, userID int64) 
 		TenantID:         row.TenantID,
 		Revoked:          row.RevokedAt.Valid,
 		ExpiresAt:        row.ExpiresAt.Time,
+		MFAVerifiedAt:    row.MfaVerifiedAt.Time,
 		Role:             highestRole(row.RoleKeys),
 		Permissions:      row.PermissionKeys,
 		Platform:         row.Platform,
