@@ -24,12 +24,21 @@ import (
 // enforced. Dropping the schema removes the rows; audit_events rejects DELETE.
 func setupAuditTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	pool, _ := setupAuditTestDBWithOwner(t)
+	return pool
+}
+
+// setupAuditTestDBWithOwner also returns a pool connected as the schema owner.
+// A test that must reach a trigger on a statement the app role no longer has
+// (TRUNCATE) uses it; application assertions stay on the app pool.
+func setupAuditTestDBWithOwner(t *testing.T) (*pgxpool.Pool, *pgxpool.Pool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	pool, cleanup, err := pgtest.SetupTestDB(ctx)
+	pool, owner, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
-	return pool
+	return pool, owner
 }
 
 // TestPostgresRecorderIntegration inserts an event and reads it back.
@@ -246,7 +255,7 @@ func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 // TestPostgresRecorderCompleteOnce covers intent creation, completion fields,
 // one-shot semantics, and the completion-only trigger.
 func TestPostgresRecorderCompleteOnce(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	pool, owner := setupAuditTestDBWithOwner(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -333,8 +342,9 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	_, err = pool.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceID)
 	require.ErrorContains(t, err, "append-only", "audit rows must reject DELETE")
 	// Inside a rolled-back transaction so a missing trigger cannot wipe a
-	// shared test database.
-	truncateTx, err := pool.Begin(ctx)
+	// shared test database. TRUNCATE runs as the schema owner: the app role is
+	// deliberately not granted it, because TRUNCATE ignores RLS.
+	truncateTx, err := owner.Begin(ctx)
 	require.NoError(t, err)
 	_, err = truncateTx.Exec(ctx, `TRUNCATE audit_events`)
 	require.NoError(t, truncateTx.Rollback(ctx))
@@ -343,4 +353,18 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, id, serviceID).Scan(&remaining))
 	assert.Equal(t, int64(2), remaining)
+}
+
+// TestAppRoleCannotTruncate keeps the runtime role's grant list honest:
+// TRUNCATE ignores row-level security, so the API/worker role must not have it.
+func TestAppRoleCannotTruncate(t *testing.T) {
+	pool := setupAuditTestDB(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, `TRUNCATE audit_events`)
+	require.NoError(t, tx.Rollback(ctx))
+	require.ErrorContains(t, err, "permission denied", "the app role must not be granted TRUNCATE")
 }

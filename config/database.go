@@ -16,9 +16,12 @@ type DBConfig struct {
 	Username string `env:"DB_USERNAME" envDefault:"postgres"`
 	// Password has no default: credentials always come from the environment
 	// (.env, Compose, or the Kubernetes Secret), never from code.
-	Password        string `env:"DB_PASSWORD"`
-	Schema          string `env:"DB_SCHEMA" envDefault:"public"`
-	SSLMode         string `env:"DB_SSLMODE" envDefault:"disable"`
+	Password string `env:"DB_PASSWORD"`
+	Schema   string `env:"DB_SCHEMA" envDefault:"public"`
+	SSLMode  string `env:"DB_SSLMODE" envDefault:"disable"`
+	// SSLRootCert is an optional path to the CA bundle that verifies the server
+	// certificate. verify-full without it uses the system trust store.
+	SSLRootCert     string `env:"DB_SSLROOTCERT"`
 	ConnectTimeout  int    `env:"DB_CONNECT_TIMEOUT" envDefault:"10"` // seconds
 	MaxConns        int32  `env:"DB_MAX_CONNS" envDefault:"25"`
 	MinConns        int32  `env:"DB_MIN_CONNS" envDefault:"5"`
@@ -112,8 +115,13 @@ func (db DBConfig) Validate() error {
 // set it on the role (ALTER ROLE ... SET search_path).
 func (db DBConfig) DSN() string {
 	q := url.Values{}
-	q.Set("sslmode", db.SSLMode)
+	// libpq/pgx compare sslmode case-sensitively; validation accepts
+	// DB_SSLMODE case-insensitively, so normalize before building the DSN.
+	q.Set("sslmode", strings.ToLower(strings.TrimSpace(db.SSLMode)))
 	q.Set("search_path", db.Schema)
+	if rootCert := strings.TrimSpace(db.SSLRootCert); rootCert != "" {
+		q.Set("sslrootcert", rootCert)
+	}
 
 	u := url.URL{
 		Scheme:   "postgres",
@@ -125,14 +133,15 @@ func (db DBConfig) DSN() string {
 	return u.String()
 }
 
-// validateProductionSSLMode rejects DB_SSLMODE values that permit plaintext:
-// disable never encrypts, and allow/prefer silently fall back to plaintext
-// when the server or a network attacker refuses TLS. The API and cmd/migrate
-// share this rule.
+// validateProductionSSLMode requires certificate verification in production.
+// disable never encrypts, allow/prefer fall back to plaintext, and require
+// encrypts but accepts any server certificate (so a network attacker with any
+// certificate can impersonate the database). Only verify-full both encrypts
+// and verifies the host name against DB_SSLROOTCERT (or the system trust
+// store). The API and cmd/migrate share this rule.
 func validateProductionSSLMode(mode string) error {
-	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "disable", "allow", "prefer":
-		return fmt.Errorf("DB_SSLMODE=%s permits plaintext in production; use require, verify-ca, or verify-full", mode)
+	if strings.ToLower(strings.TrimSpace(mode)) != "verify-full" {
+		return fmt.Errorf("DB_SSLMODE=%s does not verify the database server certificate in production; use verify-full", mode)
 	}
 	return nil
 }

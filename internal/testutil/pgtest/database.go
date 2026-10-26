@@ -36,6 +36,15 @@ import (
 // settings per statement (database.Scoped) or transaction (TxManager), and
 // TestRLS proves the enforcement.
 func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
+	pool, _, cleanup, err := SetupTestDBWithOwner(ctx)
+	return pool, cleanup, err
+}
+
+// SetupTestDBWithOwner is SetupTestDB plus a second pool connected as the
+// schema owner. Tests that must exercise owner-only DDL (a new table, a
+// policy, TRUNCATE past a trigger) use the owner pool; application assertions
+// keep using the app pool so RLS stays enforced.
+func SetupTestDBWithOwner(ctx context.Context) (*pgxpool.Pool, *pgxpool.Pool, func(), error) {
 	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
 		return setupExternalDB(ctx, dsn)
 	}
@@ -52,53 +61,79 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 		),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		_ = pgContainer.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	if err := database.RunMigrations(connStr, migrationsPath()); err != nil {
 		_ = pgContainer.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	owner, err := openOwnerPool(ctx, connStr, "public")
+	if err != nil {
+		_ = pgContainer.Terminate(ctx)
+		return nil, nil, nil, err
 	}
 
 	pool, err := OpenAppPool(ctx, connStr, "public")
 	if err != nil {
+		owner.Close()
 		_ = pgContainer.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	cleanup := func() {
 		pool.Close()
+		owner.Close()
 		_ = pgContainer.Terminate(context.Background())
 	}
 
-	return pool, cleanup, nil
+	return pool, owner, cleanup, nil
 }
 
-func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, func(), error) {
+// openOwnerPool connects as the schema owner with search_path set to schema.
+func openOwnerPool(ctx context.Context, dsn, schema string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse owner pool config: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect as schema owner: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping as schema owner: %w", err)
+	}
+	return pool, nil
+}
+
+func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, *pgxpool.Pool, func(), error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse TEST_DATABASE_URL: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse TEST_DATABASE_URL: %w", err)
 	}
 
 	adminCfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse TEST_DATABASE_URL pool config: %w", err)
+		return nil, nil, nil, fmt.Errorf("parse TEST_DATABASE_URL pool config: %w", err)
 	}
 	admin, err := pgxpool.NewWithConfig(ctx, adminCfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connect to TEST_DATABASE_URL: %w", err)
+		return nil, nil, nil, fmt.Errorf("connect to TEST_DATABASE_URL: %w", err)
 	}
 
 	schema := "test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		admin.Close()
-		return nil, nil, fmt.Errorf("create test schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("create test schema: %w", err)
 	}
 	dropSchema := func() {
 		_, _ = admin.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
@@ -112,20 +147,28 @@ func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, func(), er
 
 	if err := database.RunMigrations(schemaDSN, migrationsPath()); err != nil {
 		dropSchema()
-		return nil, nil, fmt.Errorf("run migrations in test schema: %w", err)
+		return nil, nil, nil, fmt.Errorf("run migrations in test schema: %w", err)
+	}
+
+	owner, err := openOwnerPool(ctx, schemaDSN, schema)
+	if err != nil {
+		dropSchema()
+		return nil, nil, nil, err
 	}
 
 	pool, err := OpenAppPool(ctx, schemaDSN, schema)
 	if err != nil {
+		owner.Close()
 		dropSchema()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	cleanup := func() {
 		pool.Close()
+		owner.Close()
 		dropSchema()
 	}
-	return pool, cleanup, nil
+	return pool, owner, cleanup, nil
 }
 
 // migrationsPath resolves the migrations directory relative to this file.

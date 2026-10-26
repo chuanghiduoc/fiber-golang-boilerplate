@@ -219,3 +219,99 @@ func TestJobsRequireTraceParentColumn(t *testing.T) {
 		t.Fatal("requiredColumns[jobs] must include trace_parent")
 	}
 }
+
+// TestRLSGaps verifies the decision for every shape a tenant-owned table can
+// have. The SQL only feeds it rows; the policy rules are testable without a
+// database.
+func TestRLSGaps(t *testing.T) {
+	goodPolicy := rlsPolicy{
+		Name:  "tenant_isolation",
+		Using: "app_tenant_visible(tenant_id)",
+		Check: "app_tenant_visible(tenant_id)",
+	}
+	required := func() []rlsTable {
+		tables := make([]rlsTable, 0, len(requiredRLS))
+		for _, table := range requiredRLS {
+			tables = append(tables, rlsTable{
+				Table:    table,
+				Enabled:  true,
+				Forced:   true,
+				Policies: []rlsPolicy{goodPolicy},
+			})
+		}
+		return tables
+	}
+
+	cases := []struct {
+		name   string
+		mutate func([]rlsTable) []rlsTable
+		want   string
+	}{
+		{name: "baseline", mutate: func(tables []rlsTable) []rlsTable { return tables }},
+		{name: "not enabled", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Enabled = false
+			return tables
+		}, want: "row-level security on " + requiredRLS[0]},
+		{name: "not forced", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Forced = false
+			return tables
+		}, want: "forced row-level security on " + requiredRLS[0]},
+		{name: "no policy", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = nil
+			return tables
+		}, want: "tenant_isolation policy on " + requiredRLS[0]},
+		{name: "wrong policy name", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = []rlsPolicy{{Name: "other", Using: "app_tenant_visible(tenant_id)"}}
+			return tables
+		}, want: "tenant_isolation policy on " + requiredRLS[0]},
+		{name: "policy does not reference the predicate", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = []rlsPolicy{{Name: "tenant_isolation", Using: "true", Check: "true"}}
+			return tables
+		}, want: "must reference app_tenant_visible"},
+		{name: "permissive USING with a correct check clause", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = []rlsPolicy{{
+				Name:  "tenant_isolation",
+				Using: "true",
+				Check: "app_tenant_visible(tenant_id)",
+			}}
+			return tables
+		}, want: "USING clause must reference app_tenant_visible"},
+		{name: "permissive WITH CHECK with a correct USING clause", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = []rlsPolicy{{
+				Name:  "tenant_isolation",
+				Using: "app_tenant_visible(tenant_id)",
+				Check: "true",
+			}}
+			return tables
+		}, want: "WITH CHECK clause must reference app_tenant_visible"},
+		{name: "USING only (WITH CHECK defaults to USING)", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = []rlsPolicy{{
+				Name:  "tenant_isolation",
+				Using: "app_tenant_visible(tenant_id)",
+			}}
+			return tables
+		}},
+		{name: "extra policy", mutate: func(tables []rlsTable) []rlsTable {
+			tables[0].Policies = append(tables[0].Policies, rlsPolicy{Name: "extra", Using: "true"})
+			return tables
+		}, want: "single tenant_isolation policy"},
+		{name: "required table missing from the dynamic result", mutate: func(tables []rlsTable) []rlsTable {
+			return tables[1:]
+		}, want: "row-level security on " + requiredRLS[0]},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gaps := rlsGaps(tc.mutate(required()))
+			if tc.want == "" {
+				if len(gaps) != 0 {
+					t.Fatalf("rlsGaps() = %v, want none", gaps)
+				}
+				return
+			}
+			if len(gaps) != 1 || !strings.Contains(gaps[0], tc.want) {
+				t.Fatalf("rlsGaps() = %v, want one gap containing %q", gaps, tc.want)
+			}
+		})
+	}
+}

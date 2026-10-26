@@ -1,9 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Prerequisites that must exist before the migration Job starts. The Secret is
-# NOT created here; create fiber-boilerplate-secrets in the target namespace
-# out of band (or via External Secrets / Sealed Secrets / SOPS).
+# Prerequisites that must exist before the migration Job starts. The Secrets are
+# NOT created here; create fiber-boilerplate-secrets (runtime) and
+# fiber-boilerplate-migrate-secrets (schema owner) in the target namespace out of
+# band (or via External Secrets / Sealed Secrets / SOPS).
 #
 # The deploy workflow applies this before the migration Job. The main production
 # overlay applies the same Namespace and ConfigMap again as part of the rollout.
