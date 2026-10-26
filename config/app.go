@@ -43,8 +43,9 @@ type AppConfig struct {
 	// BodyLimit must be larger than STORAGE_MAX_FILE_SIZE because multipart
 	// framing adds overhead before the upload handler sees the file.
 	BodyLimit int `env:"APP_BODY_LIMIT" envDefault:"12582912"` // 12MB
-	// JSONBodyLimit caps every non-multipart request body (JSON, form, raw).
-	// Only multipart/form-data uploads may use the larger APP_BODY_LIMIT.
+	// JSONBodyLimit caps every request body (JSON, form, raw, and multipart
+	// outside the upload route). Only the files upload route may use the larger
+	// APP_BODY_LIMIT for multipart/form-data.
 	JSONBodyLimit int    `env:"APP_JSON_BODY_LIMIT" envDefault:"1048576"` // 1 MiB
 	LogLevel      string `env:"LOG_LEVEL" envDefault:"info"`
 	// RequestTimeout plus PostHandlerReserve must fit the shutdown drain window

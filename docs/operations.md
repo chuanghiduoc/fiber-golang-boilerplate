@@ -1327,16 +1327,20 @@ scheme), region, bucket, access key, and secret key.
 
 | Limit | Behavior |
 | --- | --- |
-| `APP_BODY_LIMIT` (12 MiB) | Fiber's ceiling and the multipart upload limit. Fiber-generated 413s above it are rejected before any middleware, so they use `payload_too_large` but carry no CORS, request-ID, or locale headers. |
-| `APP_JSON_BODY_LIMIT` (default 1 MiB, must not exceed `APP_BODY_LIMIT`) | Caps every non-multipart body with `413 payload_too_large` before auth, rate limiting, or decoding. |
+| `APP_BODY_LIMIT` (12 MiB) | Fiber's configured body ceiling, and the multipart ceiling on `POST /api/v1/files/upload` only. The body-limit middleware rejects a larger declared `Content-Length` before the body is read; the upload handler parses the form lazily under this limit after authentication, and a chunked body over it is a `413`. |
+| `APP_JSON_BODY_LIMIT` (default 1 MiB, must not exceed `APP_BODY_LIMIT`) | Caps every other body (JSON, form, raw, and multipart on non-upload routes) with `413 payload_too_large` before auth, rate limiting, or decoding. |
 | `Content-Encoding` other than `identity` | `415 unsupported_media_type`: Fiber transparently decompresses gzip/br/deflate/zstd, so a small compressed body would otherwise expand past the limit after the check. |
 
-Residual risk: Fiber buffers the whole body before middleware runs, so a
-non-multipart request (including a chunked body without `Content-Length`) can
-still make a pod read up to `APP_BODY_LIMIT` before rejection, and a client can
-label a non-upload body `multipart/form-data` to reach the larger limit on any
-route (the check runs before routing, and body binding decodes multipart
-fields). Keep an ingress body limit in front of the API.
+Fiber streams request bodies (`StreamRequestBody`), so a declared
+`Content-Length` over the applicable limit is rejected without reading the
+body. A chunked body has no declared length: the middleware reads it through a
+limited reader (limit+1 bytes), rejects the over-limit body as soon as the extra
+byte arrives, and hands a body at or under the limit to the handler unchanged.
+The upload route is the only exception; its multipart parser enforces
+`APP_BODY_LIMIT` for chunked bodies too. Keep an ingress body limit in front of
+the API as the outer bound; a rejected request can still make a pod read up to
+the JSON limit (chunked) or 256 KiB of an unread upload body while the server
+drains or closes the connection.
 
 ### Graceful shutdown
 

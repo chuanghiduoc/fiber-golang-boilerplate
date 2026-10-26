@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/valyala/fasthttp"
 
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/dto"
@@ -50,6 +52,9 @@ func NewUploadHandler(svc filesvc.UploadService, maxFileSize int64, allowedTypes
 func (h *UploadHandler) Upload(c fiber.Ctx) error {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
+		if errors.Is(err, fasthttp.ErrBodyTooLarge) {
+			return apperror.NewPayloadTooLarge("request body too large")
+		}
 		return apperror.NewBadRequest("file is required")
 	}
 	if len([]rune(fileHeader.Filename)) > 255 {

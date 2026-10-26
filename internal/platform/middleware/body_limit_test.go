@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -11,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
@@ -32,24 +35,38 @@ func TestIsMultipartForm(t *testing.T) {
 }
 
 func TestBodyLimit(t *testing.T) {
-	const limit = 16
-	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler, BodyLimit: 1 << 20})
-	app.Use(BodyLimit(limit))
+	const limit = 1024
+	app := fiber.New(fiber.Config{
+		ErrorHandler:                 apperrorhttp.FiberErrorHandler,
+		BodyLimit:                    1 << 20,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+	})
+	app.Use(BodyLimit(limit, WithUploadLimit(limit*4, "/upload")))
 	app.Post("/", func(c fiber.Ctx) error { return c.SendString("ok") })
+	app.Post("/upload", func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	tests := []struct {
 		name        string
+		path        string
 		contentType string
 		body        string
 		chunked     bool
 		want        int
 	}{
-		{"small JSON", fiber.MIMEApplicationJSON, `{"a":1}`, false, fiber.StatusOK},
-		{"JSON at limit", fiber.MIMEApplicationJSON, strings.Repeat("a", limit), false, fiber.StatusOK},
-		{"JSON over limit", fiber.MIMEApplicationJSON, strings.Repeat("a", limit+1), false, fiber.StatusRequestEntityTooLarge},
-		{"no content type over limit", "", strings.Repeat("a", limit+1), false, fiber.StatusRequestEntityTooLarge},
-		{"chunked JSON over limit", fiber.MIMEApplicationJSON, strings.Repeat("a", limit+1), true, fiber.StatusRequestEntityTooLarge},
-		{"multipart keeps the upload limit", "multipart/form-data", strings.Repeat("a", limit*4), false, fiber.StatusOK},
+		{"small JSON", "/", fiber.MIMEApplicationJSON, `{"a":1}`, false, fiber.StatusOK},
+		{"JSON at limit", "/", fiber.MIMEApplicationJSON, strings.Repeat("a", limit), false, fiber.StatusOK},
+		{"JSON over limit", "/", fiber.MIMEApplicationJSON, strings.Repeat("a", limit+1), false, fiber.StatusRequestEntityTooLarge},
+		{"no content type over limit", "/", "", strings.Repeat("a", limit+1), false, fiber.StatusRequestEntityTooLarge},
+		{"chunked JSON at limit", "/", fiber.MIMEApplicationJSON, strings.Repeat("a", limit), true, fiber.StatusOK},
+		{"chunked JSON over limit", "/", fiber.MIMEApplicationJSON, strings.Repeat("a", limit+1), true, fiber.StatusRequestEntityTooLarge},
+		{"multipart over JSON limit on a non-upload route", "/", "multipart/form-data", strings.Repeat("a", limit*4), false, fiber.StatusRequestEntityTooLarge},
+		{"multipart under JSON limit on a non-upload route", "/", "multipart/form-data", strings.Repeat("a", 8), false, fiber.StatusOK},
+		{"multipart uses the upload limit on the upload route", "/upload", "multipart/form-data", strings.Repeat("a", limit), false, fiber.StatusOK},
+		{"multipart matches the upload path case-insensitively", "/UPLOAD", "multipart/form-data", strings.Repeat("a", limit), false, fiber.StatusOK},
+		{"multipart ignores a trailing slash on the upload path", "/upload/", "multipart/form-data", strings.Repeat("a", limit), false, fiber.StatusOK},
+		{"multipart over the upload limit", "/upload", "multipart/form-data", strings.Repeat("a", limit*4), false, fiber.StatusRequestEntityTooLarge},
+		{"non-multipart on the upload route keeps the JSON limit", "/upload", fiber.MIMEApplicationJSON, strings.Repeat("a", limit+1), false, fiber.StatusRequestEntityTooLarge},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -57,7 +74,7 @@ func TestBodyLimit(t *testing.T) {
 			if strings.HasPrefix(strings.ToLower(contentType), "multipart/") {
 				body, contentType = multipartBody(t, "file", tt.body)
 			}
-			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+			req := httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(body))
 			if contentType != "" {
 				req.Header.Set(fiber.HeaderContentType, contentType)
 			}
@@ -88,6 +105,32 @@ func TestBodyLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBodyLimit_ChunkedBodySurvivesTheCheck(t *testing.T) {
+	const limit = 16
+	app := fiber.New(fiber.Config{
+		ErrorHandler:                 apperrorhttp.FiberErrorHandler,
+		BodyLimit:                    1 << 20,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+	})
+	app.Use(BodyLimit(limit))
+	app.Post("/", func(c fiber.Ctx) error { return c.Send(c.Body()) })
+
+	body := strings.Repeat("a", limit)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+	req.ContentLength = 0
+	req.TransferEncoding = []string{"chunked"}
+
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, body, string(got), "the middleware must hand the bounded body to the handler")
 }
 
 func TestBodyLimit_RejectsCompressedBodies(t *testing.T) {

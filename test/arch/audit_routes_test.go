@@ -2,8 +2,13 @@ package arch_test
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -69,43 +74,37 @@ var tier1Mutations = map[string]tier1Audit{
 // auditPackage identifies audithttp.Guard by full import path.
 const auditPackage = "internal/platform/audit/audithttp"
 
-// tier1Recorders are the in-transaction audit calls a Tier 1 service uses.
-var tier1Recorders = []string{"audit.RecordInTx(", ".RecordTx("}
-
 // TestTier1RoutesRecordInTransaction makes the Tier 1 exemption verifiable:
-// a route may skip audithttp.Guard only if the owning module has a non-test
-// source file that both names the route's action literal and calls
-// RecordInTx/RecordTx. This is a source grep, not a call-graph proof: it
-// catches a renamed action, a removed in-transaction write, or a wrong owner,
-// but not a call that sits in the right file on the wrong code path (the
-// owning service's tests cover that).
+// a route may skip audithttp.Guard only if the owning module records its action
+// in a transaction. The action literal must sit in the same function as a
+// RecordInTx/RecordTx call, or the two must be connected by calls in the same
+// package. That covers the reviewed shapes without accepting a literal and a
+// recorder that merely share a file: a mutation calling an event builder that
+// names the action, a mutation naming the action and calling a shared commit
+// helper that records it, or a callback helper recording the event the
+// mutation returns (apikeys' mutate -> recordAudit).
 func TestTier1RoutesRecordInTransaction(t *testing.T) {
 	root := repoRoot(t)
-	sources := map[string][]string{}
+	owners := map[string][]auditFunc{}
 	for key, want := range tier1Mutations {
-		files, ok := sources[want.owner]
+		funcs, ok := owners[want.owner]
 		if !ok {
-			files = moduleSources(t, filepath.Join(root, "internal", "modules", want.owner))
-			sources[want.owner] = files
+			funcs = moduleAuditFuncs(t, filepath.Join(root, "internal", "modules", want.owner))
+			owners[want.owner] = funcs
 		}
-		found := false
-		for _, src := range files {
-			if strings.Contains(src, `"`+want.action+`"`) && containsAny(src, tier1Recorders) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("Tier 1 route %s: no internal/modules/%s source records %q with RecordInTx/RecordTx",
-				key, want.owner, want.action)
+		if problem := auditLinkProblem(funcs, want.action); problem != "" {
+			t.Errorf("Tier 1 route %s: internal/modules/%s does not record %q in a transaction: %s",
+				key, want.owner, want.action, problem)
 		}
 	}
 }
 
-// moduleSources returns the contents of every non-test Go file under dir.
-func moduleSources(t *testing.T, dir string) []string {
+// moduleAuditFuncs parses every non-test Go file under dir. Both the action
+// literal and the recorder call must be in this one module's source tree.
+func moduleAuditFuncs(t *testing.T, dir string) []auditFunc {
 	t.Helper()
-	var out []string
+	fset := token.NewFileSet()
+	var sources []moduleSource
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -117,19 +116,171 @@ func moduleSources(t *testing.T, dir string) []string {
 		if err != nil {
 			return err
 		}
-		out = append(out, string(raw))
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, moduleSource{name: filepath.ToSlash(rel), src: raw})
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("walk %s: %v", dir, err)
 	}
+	return parseAuditFuncs(t, fset, sources)
+}
+
+// moduleSource is one non-test module file, named relative to the module root.
+type moduleSource struct {
+	name string
+	src  []byte
+}
+
+// auditFunc is one declared function of a module package, reduced to the facts
+// the audit-link check needs: the action literals it contains, whether it calls
+// the in-transaction recorder, and the local function and method names it calls.
+// Function literals are part of their enclosing declaration, so a callback that
+// names the action belongs to the mutation that passes it.
+type auditFunc struct {
+	name      string
+	pkg       string // directory relative to the module root
+	file      string
+	actions   map[string]token.Position
+	records   bool
+	calls     map[string]bool
+	startLine int
+}
+
+// parseAuditFuncs parses sources and indexes the functions they declare.
+func parseAuditFuncs(t *testing.T, fset *token.FileSet, sources []moduleSource) []auditFunc {
+	t.Helper()
+	sort.Slice(sources, func(i, j int) bool { return sources[i].name < sources[j].name })
+	var out []auditFunc
+	for _, source := range sources {
+		file, err := parser.ParseFile(fset, source.name, source.src, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source.name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			info := auditFunc{
+				name:    fn.Name.Name,
+				pkg:     filepath.ToSlash(filepath.Dir(source.name)),
+				file:    source.name,
+				actions: map[string]token.Position{},
+				calls:   map[string]bool{},
+			}
+			info.startLine = fset.Position(fn.Pos()).Line
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				switch n := node.(type) {
+				case *ast.BasicLit:
+					if n.Kind != token.STRING {
+						return true
+					}
+					value, err := strconv.Unquote(n.Value)
+					if err == nil {
+						info.actions[value] = fset.Position(n.Pos())
+					}
+				case *ast.CallExpr:
+					callee := ""
+					switch fun := n.Fun.(type) {
+					case *ast.Ident:
+						callee = fun.Name
+					case *ast.SelectorExpr:
+						callee = fun.Sel.Name
+					}
+					if callee == "RecordTx" || callee == "RecordInTx" {
+						info.records = true
+					}
+					if callee != "" {
+						info.calls[callee] = true
+					}
+				}
+				return true
+			})
+			out = append(out, info)
+		}
+	}
 	return out
 }
 
-func containsAny(s string, needles []string) bool {
-	for _, needle := range needles {
-		if strings.Contains(s, needle) {
-			return true
+// auditLinkProblem returns why action is not tied to an in-transaction record,
+// or "" when it is. The function holding the action and the recorder function
+// must be in the same package and reachable from one another through local
+// calls; sharing a file or a callee does not connect them.
+func auditLinkProblem(funcs []auditFunc, action string) string {
+	var withAction, withRecorder []auditFunc
+	for _, fn := range funcs {
+		if _, ok := fn.actions[action]; ok {
+			withAction = append(withAction, fn)
+		}
+		if fn.records {
+			withRecorder = append(withRecorder, fn)
+		}
+	}
+	switch {
+	case len(withAction) == 0:
+		return "the action literal is not in any function"
+	case len(withRecorder) == 0:
+		return "no function calls RecordInTx/RecordTx"
+	}
+	for _, a := range withAction {
+		for _, r := range withRecorder {
+			if a.pkg != r.pkg {
+				continue
+			}
+			if a.file == r.file && a.name == r.name && a.startLine == r.startLine {
+				return ""
+			}
+			if samePackageCallPath(funcs, a, r) || samePackageCallPath(funcs, r, a) {
+				return ""
+			}
+		}
+	}
+	return fmt.Sprintf("action in %s; RecordTx/RecordInTx in %s; record the event in the same function or a called helper",
+		auditLocations(withAction), auditLocations(withRecorder))
+}
+
+func auditLocations(funcs []auditFunc) string {
+	out := make([]string, 0, len(funcs))
+	for _, fn := range funcs {
+		out = append(out, fmt.Sprintf("%s:%d %s", fn.file, fn.startLine, fn.name))
+	}
+	return strings.Join(out, ", ")
+}
+
+// samePackageCallPath reports whether from reaches to (or is to) through calls
+// to functions declared in their shared package. Only names declared in that
+// package are followed, so imports and interface methods never bridge two
+// unrelated mutation functions.
+func samePackageCallPath(funcs []auditFunc, from, to auditFunc) bool {
+	byName := map[string][]auditFunc{}
+	for _, fn := range funcs {
+		if fn.pkg == from.pkg {
+			byName[fn.name] = append(byName[fn.name], fn)
+		}
+	}
+	seen := map[string]bool{from.name: true}
+	queue := []string{from.name}
+	for len(queue) > 0 {
+		name := queue[0]
+		queue = queue[1:]
+		for _, fn := range byName[name] {
+			for callee := range fn.calls {
+				if callee == to.name {
+					return true
+				}
+				if seen[callee] {
+					continue
+				}
+				if _, ok := byName[callee]; !ok {
+					continue
+				}
+				seen[callee] = true
+				queue = append(queue, callee)
+			}
 		}
 	}
 	return false
@@ -236,5 +387,118 @@ func TestGuardedRouteProblem(t *testing.T) {
 		if problem := guardedRouteProblem(route); (problem == "") != tc.ok {
 			t.Errorf("%s: guardedRouteProblem = %q, want ok=%v", name, problem, tc.ok)
 		}
+	}
+}
+
+func TestAuditLinkProblem(t *testing.T) {
+	const action = "thing.changed"
+	cases := map[string]struct {
+		sources    map[string]string
+		wantBroken bool
+	}{
+		"same function": {
+			sources: map[string]string{"service/a.go": `package service
+
+func apply(ctx context.Context, tx TxRepos) error {
+	return tx.Audit.RecordTx(ctx, audit.Event{Action: "thing.changed"})
+}`},
+		},
+		"event builder called by the recorder": {
+			sources: map[string]string{"service/a.go": `package service
+
+func apply(ctx context.Context, tx TxRepos) error {
+	return tx.Audit.RecordTx(ctx, event())
+}
+
+func event() audit.Event { return audit.Event{Action: "thing.changed"} }`},
+		},
+		"mutation calls the commit helper": {
+			sources: map[string]string{"service/a.go": `package service
+
+func apply(ctx context.Context, tx TxRepos) error {
+	return commit(ctx, tx, "thing.changed")
+}
+
+func commit(ctx context.Context, tx TxRepos, action string) error {
+	return tx.Audit.RecordTx(ctx, audit.Event{Action: action})
+}`},
+		},
+		"callback helper records the returned event": {
+			sources: map[string]string{"service/a.go": `package service
+
+func apply(ctx context.Context) error {
+	return s.mutate(ctx, func(ctx context.Context) (*audit.Event, error) {
+		return &audit.Event{Action: "thing.changed"}, nil
+	})
+}
+
+func (s *service) mutate(ctx context.Context, fn func(context.Context) (*audit.Event, error)) error {
+	return s.recordAudit(ctx, nil)
+}
+
+func (s *service) recordAudit(ctx context.Context, event *audit.Event) error {
+	return tx.Audit.RecordTx(ctx, *event)
+}`},
+		},
+		"unrelated functions in one file": {
+			wantBroken: true,
+			sources: map[string]string{"service/a.go": `package service
+
+func apply() string { return "thing.changed" }
+
+func record(ctx context.Context, tx TxRepos) error {
+	return tx.Audit.RecordTx(ctx, audit.Event{})
+}`},
+		},
+		"unrelated functions in one package": {
+			wantBroken: true,
+			sources: map[string]string{
+				"service/a.go": `package service
+
+func apply() string { return "thing.changed" }`,
+				"service/b.go": `package service
+
+func record(ctx context.Context, tx TxRepos) error {
+	return tx.Audit.RecordTx(ctx, audit.Event{})
+}`,
+			},
+		},
+		"a common callee does not link them": {
+			wantBroken: true,
+			sources: map[string]string{"service/a.go": `package service
+
+func apply() {
+	helper()
+	_ = "thing.changed"
+}
+
+func record(ctx context.Context, tx TxRepos) error {
+	helper()
+	return tx.Audit.RecordTx(ctx, audit.Event{})
+}
+
+func helper() {}`},
+		},
+		"no action literal": {
+			wantBroken: true,
+			sources: map[string]string{"service/a.go": `package service
+
+func record(ctx context.Context, tx TxRepos) error {
+	return tx.Audit.RecordTx(ctx, audit.Event{})
+}`},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			fset := token.NewFileSet()
+			sources := make([]moduleSource, 0, len(tc.sources))
+			for file, src := range tc.sources {
+				sources = append(sources, moduleSource{name: file, src: []byte(src)})
+			}
+			problem := auditLinkProblem(parseAuditFuncs(t, fset, sources), action)
+			if (problem != "") != tc.wantBroken {
+				t.Errorf("auditLinkProblem = %q, wantBroken=%v", problem, tc.wantBroken)
+			}
+		})
 	}
 }
