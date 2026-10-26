@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -189,6 +190,11 @@ func (s *TenantService) Transition(ctx context.Context, id int64, to TenantStatu
 		}
 		if id == tenant.DefaultID && (to == TenantStatusPendingDeletion || to == TenantStatusDeleted) {
 			return apperror.NewConflict("the default tenant cannot be deleted")
+		}
+		if to == TenantStatusDeleted && (current.DeletionScheduledAt == nil ||
+			time.Now().Before(*current.DeletionScheduledAt)) {
+			return apperror.NewCode(identitycatalog.CodeTenantDeletionNotDue,
+				"the tenant deletion grace period has not ended")
 		}
 		t, err := tx.Tenants.UpdateStatus(ctx, id, to, deletionSchedule(current, to))
 		if err != nil {

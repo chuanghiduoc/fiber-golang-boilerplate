@@ -664,6 +664,29 @@ func (q *Queries) LockMemberPrincipal(ctx context.Context, arg LockMemberPrincip
 	return i, err
 }
 
+const lockMembership = `-- name: LockMembership :execrows
+SELECT 1 FROM memberships
+WHERE tenant_id = $1 AND user_id = $2
+FOR UPDATE
+`
+
+type LockMembershipParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+// Serializes rank checks and role changes for one membership: every mutation
+// that needs the target's current highest role locks this row first, and
+// role replacement takes the same lock, so a concurrent change cannot race
+// the rank comparison.
+func (q *Queries) LockMembership(ctx context.Context, arg LockMembershipParams) (int64, error) {
+	result, err := q.db.Exec(ctx, lockMembership, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const lockTenantOwnerChanges = `-- name: LockTenantOwnerChanges :exec
 SELECT pg_advisory_xact_lock(hashtextextended('identity.last_owner', $1::bigint))
 `

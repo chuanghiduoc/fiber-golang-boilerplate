@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -208,17 +209,18 @@ func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {
 	require.NoError(t, err)
 
 	adminSvc := NewAdminUserService(st, memTx{db}, nil)
-	err = adminSvc.BanUser(ctx, admin)
+	systemCtx := authz.SystemContext(ctx)
+	err = adminSvc.BanUser(systemCtx, admin)
 	assert.Equal(t, string(apperror.CodeUserLastAdmin), codeOf(err))
 
-	require.NoError(t, adminSvc.BanUser(ctx, member))
+	require.NoError(t, adminSvc.BanUser(systemCtx, member))
 	assert.Equal(t, RevokeMembershipChanged, db.sessions[inDefault.SessionID].RevokedReason)
 	assert.Nil(t, db.sessions[inAcme.SessionID].RevokedAt, "a ban in one tenant leaves the member's other tenants alone")
 	acmeMember, err := st.Memberships.GetActive(tenant.WithID(ctx, 2), member)
 	require.NoError(t, err)
 	assert.True(t, acmeMember.Active())
 
-	restored, err := adminSvc.UnbanUser(ctx, member)
+	restored, err := adminSvc.UnbanUser(systemCtx, member)
 	require.NoError(t, err)
 	assert.Equal(t, MembershipStatusActive, restored.Membership.Status)
 	assert.Nil(t, restored.Membership.BannedAt)
@@ -233,6 +235,36 @@ func seedMember(t *testing.T, db *memDB, tenantID int64, email, role string) int
 	_, err = st.Memberships.Create(ctx, user.ID, role)
 	require.NoError(t, err)
 	return user.ID
+}
+
+// deleteAccount must take the membership row lock before the per-tenant
+// owner-change advisory lock, the same order rank-checked mutations use; the
+// reverse order deadlocks with a concurrent ban or demotion.
+func TestDeleteAccountLocksMembershipBeforeOwnerChanges(t *testing.T) {
+	db := newMemDB()
+	owner := seedMember(t, db, tenant.DefaultID, "lock-order@example.com", RoleOwner)
+	st := db.stores()
+	var order []string
+	st.Memberships = lockOrderMemberships{MembershipRepository: st.Memberships, order: &order}
+
+	err := deleteAccount(context.Background(), st, owner)
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), codeOf(err))
+	assert.Equal(t, []string{"lock-membership", "lock-owner-changes"}, order)
+}
+
+type lockOrderMemberships struct {
+	MembershipRepository
+	order *[]string
+}
+
+func (r lockOrderMemberships) LockMembership(ctx context.Context, userID int64) error {
+	*r.order = append(*r.order, "lock-membership")
+	return r.MembershipRepository.LockMembership(ctx, userID)
+}
+
+func (r lockOrderMemberships) LockOwnerChanges(ctx context.Context) error {
+	*r.order = append(*r.order, "lock-owner-changes")
+	return r.MembershipRepository.LockOwnerChanges(ctx)
 }
 
 func TestMemberUpdatedAtAndDeletedAt(t *testing.T) {

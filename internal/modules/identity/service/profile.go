@@ -171,6 +171,12 @@ func deleteAccount(ctx context.Context, st Stores, id int64) error {
 			continue
 		}
 		tctx := tenant.WithID(ctx, m.TenantID)
+		// Take the membership row before the per-tenant owner-change advisory
+		// lock: rank checks and bans take row -> advisory, and the reverse
+		// order here would deadlock against a concurrent ban/demotion.
+		if err := st.Memberships.LockMembership(tctx, id); err != nil {
+			return userWriteError(err, "user not found", "failed to lock membership")
+		}
 		if m.Role == RoleOwner {
 			if err := ensureNotLastOwner(tctx, st.Memberships, "cannot delete the account: it is the last active owner of a tenant"); err != nil {
 				return err
@@ -214,6 +220,9 @@ func (s *userService) RemoveMember(ctx context.Context, id int64) error {
 
 func removeMembership(ctx context.Context, st Stores, id int64) error {
 	const notFound = "user not found"
+	if err := EnsureCanManageMember(ctx, st, id); err != nil {
+		return err
+	}
 	member, err := st.Memberships.Get(ctx, id)
 	if err != nil {
 		return userWriteError(err, notFound, "failed to get user")

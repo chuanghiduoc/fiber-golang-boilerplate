@@ -54,16 +54,15 @@ func (s *adminUserService) UpdateRole(ctx context.Context, id int64, role string
 	if !ValidRole(role) {
 		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
 	}
-	roleDef, err := s.stores.Roles.GetByKey(ctx, role)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to load role")
-	}
-	if err := authorizeGrant(ctx, roleDef.Permissions); err != nil {
-		return nil, err
-	}
 
 	var member *Member
-	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := EnsureCanManageMember(ctx, tx.Stores, id); err != nil {
+			return err
+		}
+		if err := EnsureCanGrantRoles(ctx, tx.Stores, []string{role}); err != nil {
+			return err
+		}
 		updated, previousRole, updateErr := changeRole(ctx, tx.Stores, id, role)
 		if updateErr != nil {
 			return updateErr
@@ -110,6 +109,9 @@ func changeRole(ctx context.Context, st Stores, id int64, role string) (*Member,
 
 func (s *adminUserService) BanUser(ctx context.Context, id int64) error {
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := EnsureCanManageMember(ctx, tx.Stores, id); err != nil {
+			return err
+		}
 		if banErr := banMember(ctx, tx.Stores, id); banErr != nil {
 			return banErr
 		}
@@ -148,6 +150,9 @@ func banMember(ctx context.Context, st Stores, id int64) error {
 func (s *adminUserService) UnbanUser(ctx context.Context, id int64) (*Member, error) {
 	var member *Member
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := EnsureCanManageMember(ctx, tx.Stores, id); err != nil {
+			return err
+		}
 		if _, err := tx.Memberships.Unban(ctx, id); err != nil {
 			return userWriteError(err, "user not found or not banned", "failed to unban user")
 		}

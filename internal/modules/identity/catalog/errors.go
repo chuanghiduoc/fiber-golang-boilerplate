@@ -37,8 +37,19 @@ const (
 	// CodeInvitationInvalid: unknown, expired, or already accepted
 	// invitation token, or one addressed to another email.
 	CodeInvitationInvalid apperror.Code = "invitation.invalid"
+	// CodeInvitationInviterIneligible: the inviter no longer exists as an
+	// active member who may grant the invitation's role.
+	CodeInvitationInviterIneligible apperror.Code = "invitation.inviter_ineligible"
 	// CodeMembershipExists: the invitee is already a member (or banned).
 	CodeMembershipExists apperror.Code = "membership.exists"
+
+	// CodeRoleInsufficientRank: the caller's tenant role rank is too low for
+	// the role being granted or the member being managed.
+	CodeRoleInsufficientRank apperror.Code = "role.insufficient_rank"
+
+	// CodeTenantDeletionNotDue: a pending_deletion tenant is still inside its
+	// deletion grace period.
+	CodeTenantDeletionNotDue apperror.Code = "tenant.deletion_not_due"
 
 	CodeDataExportInProgress apperror.Code = "data_export.in_progress"
 	CodeDataExportNotFound   apperror.Code = "data_export.not_found"
@@ -114,10 +125,25 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Title:   "Invalid invitation",
 			DocPath: "/errors/invitation-invalid",
 		},
+		CodeInvitationInviterIneligible: {
+			Status:  http.StatusConflict,
+			Title:   "Invitation inviter cannot grant its role",
+			DocPath: "/errors/invitation-inviter-ineligible",
+		},
 		CodeMembershipExists: {
 			Status:  http.StatusConflict,
 			Title:   "Already a member",
 			DocPath: "/errors/membership-exists",
+		},
+		CodeRoleInsufficientRank: {
+			Status:  http.StatusForbidden,
+			Title:   "Insufficient role rank",
+			DocPath: "/errors/role-insufficient-rank",
+		},
+		CodeTenantDeletionNotDue: {
+			Status:  http.StatusConflict,
+			Title:   "Tenant deletion is not due",
+			DocPath: "/errors/tenant-deletion-not-due",
 		},
 		CodeDataExportInProgress: {
 			Status:  http.StatusConflict,
