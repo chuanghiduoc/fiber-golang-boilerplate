@@ -73,12 +73,14 @@ data:
   # Runtime role: non-superuser, subject to FORCE row-level security. Create it
   # with deploy/postgres/database-roles.sql before the first migration.
   DB_USERNAME: "app"
-  # Schema owner for the migration Job only; its password is DB_MIGRATE_PASSWORD
-  # in the Secret. The API never uses this role.
-  DB_MIGRATE_USERNAME: "postgres"
   DB_SCHEMA: "public"
-  # "require" or "verify-full" is mandatory when APP_ENV=production.
-  DB_SSLMODE: "require"
+  # verify-full both encrypts and verifies the server certificate against
+  # DB_SSLROOTCERT; production rejects require/verify-ca because they accept
+  # any certificate.
+  DB_SSLMODE: "verify-full"
+  # CA bundle used for verify-full. The image ships the system bundle; mount a
+  # provider-specific CA here for RDS/Cloud SQL and point this at the file.
+  DB_SSLROOTCERT: "/etc/ssl/certs/ca-certificates.crt"
   DB_CONNECT_TIMEOUT: "10"
   # Per-pod pool. Keep DB_MAX_CONNS * HPA maxReplicas (10) below the managed
   # database's connection limit. The defaults here allow at most 100 connections.
@@ -115,9 +117,13 @@ data:
 
   # ---------------------------------------------------------------------------
   # Data retention (days, 1..3650). The purge jobs are scheduled only when
-  # SCHEDULER_ENABLED=true (not set here, so the default false applies);
-  # without the scheduler nothing below is ever purged.
+  # SCHEDULER_ENABLED=true, so the process that runs jobs (APP_ROLE=all, the
+  # default, or worker) must enable it; otherwise expired data-export blobs,
+  # trashed files, notifications, and tokens are never purged.
   # ---------------------------------------------------------------------------
+  # API-only pods ignore this (they run no worker or scheduler). A separate
+  # worker Deployment (base/worker) inherits this ConfigMap.
+  SCHEDULER_ENABLED: "true"
   # Soft-deleted files stay restorable this long, then files.trash.purge
   # deletes the blob and the metadata row.
   FILES_TRASH_RETENTION_DAYS: "30"

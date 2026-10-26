@@ -24,9 +24,11 @@ flowchart LR
         JOB["Job fiber-boilerplate-migrate<br/>/app/migrate"]
         CM[/"ConfigMap<br/>fiber-boilerplate-config"/]
         SEC[/"Secret<br/>fiber-boilerplate-secrets"/]
+        MSEC[/"Secret<br/>fiber-boilerplate-migrate-secrets"/]
         NP{{"NetworkPolicy<br/>(all pods in namespace)"}}
     end
-    CM & SEC -. envFrom .-> P1 & JOB
+    CM & SEC -. envFrom .-> P1
+    CM & MSEC -. envFrom .-> JOB
     P1 & JOB -->|"TCP 5432 (10.0.0.0/8)"| PG[(Managed PostgreSQL 18)]
     P1 -->|"TCP 6379 (10.0.0.0/8)"| RD[(Managed Redis)]
     P1 -->|"TCP 443"| S3[(S3 / SeaweedFS S3 gateway)]
@@ -53,7 +55,8 @@ an extra egress rule.
 | `overlays/staging/`, `overlays/production/` | Namespace, HPA, Deployment, and Ingress patches + image tag; each has `prereqs/` and `migration/` sub-overlays |
 | `overlays/components/<env>-config` | Environment ConfigMap patch shared by the app and prereqs builds |
 | `kustomization.yaml` | Convenience wrapper for `kubectl apply -k deploy/k8s` (legacy, `:latest`) |
-| `secret.example.yaml` | Template for the real Secret; excluded from every kustomization |
+| `secret.example.yaml` | Template for the runtime Secret; excluded from every kustomization |
+| `migrate-secret.example.yaml` | Template for the migration-only Secret (schema owner); excluded from every kustomization and mounted only by the Job |
 
 ```mermaid
 flowchart TB
@@ -79,7 +82,7 @@ flowchart TB
 | --- | --- |
 | Kubernetes 1.29+, `kubectl` | built-in kustomize renders |
 | `kustomize` v5.8.1+ | for `kustomize edit set image` in the manual flow (`kubectl kustomize` has no `edit`) |
-| Managed PostgreSQL 18 over TLS | `DB_SSLMODE=require` (or `verify-full`) is mandatory because `APP_ENV=production` |
+| Managed PostgreSQL 18 over TLS | `DB_SSLMODE=verify-full` is mandatory because `APP_ENV=production`; set `DB_SSLROOTCERT` to a mounted provider CA when it is not in the system trust store |
 | Managed Redis | required for correct session invalidation with more than one replica |
 | S3-compatible bucket + credentials | recommended storage; local disk needs a shared ReadWriteMany volume (see below) |
 | SMTP relay with STARTTLS | normally port 587; implicit TLS on 465 is not supported |
@@ -128,6 +131,7 @@ sequenceDiagram
     participant D as Deployment fiber-boilerplate
     Op->>K: apply -k overlays/<env>/prereqs (Namespace + ConfigMap)
     Op->>K: apply Secret fiber-boilerplate-secrets (out of band)
+    Op->>K: apply Secret fiber-boilerplate-migrate-secrets (out of band)
     Op->>K: delete previous Job only if Complete or Failed
     Op->>K: apply -k overlays/<env>/migration
     K->>J: run /app/migrate (backoffLimit 3, deadline 900s)
@@ -175,7 +179,7 @@ Configuration rules:
 | Image tag | immutable release tag (for example `1.4.2`) in production, never `:latest`. The app overlay's `images:` transformer updates the Deployment and the migration overlay's updates the Job; the deploy workflow sets both from one input |
 | `images[].name` | do not rename. Kustomize uses it only as the source key; the image is `newName:newTag`. If you must, change `SOURCE_IMAGE` in `.github/workflows/deploy.yml` and every base/overlay kustomization together, or the workflow fails its stable-key or rendered-image check |
 
-## 2. Create the namespace and Secret
+## 2. Create the namespace and Secrets
 
 ```bash
 export ENV=staging
@@ -187,12 +191,21 @@ kubectl apply -k deploy/k8s/overlays/$ENV/prereqs
 cp deploy/k8s/secret.example.yaml /tmp/fiber-secret.yaml
 # Edit metadata.namespace to $NS and replace every value, then:
 kubectl apply -f /tmp/fiber-secret.yaml
+
+cp deploy/k8s/migrate-secret.example.yaml /tmp/fiber-migrate-secret.yaml
+# Edit metadata.namespace to $NS and set the schema-owner credentials, then:
+kubectl apply -f /tmp/fiber-migrate-secret.yaml
 ```
 
 For production use `ENV=production` and `NS=fiber-boilerplate-production`. The
-`prereqs` kustomization contains only the Namespace and ConfigMap; the Secret is
-in no kustomization. Never commit the rendered Secret; for GitOps use External
-Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
+`prereqs` kustomization contains only the Namespace and ConfigMap; neither
+Secret is in a kustomization. Never commit a rendered Secret; for GitOps use
+External Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
+
+The schema-owner credentials are deliberately **not** in
+`fiber-boilerplate-secrets`: only the migration Job mounts
+`fiber-boilerplate-migrate-secrets`, so API and worker pods cannot read the
+role that may run DDL or `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`.
 
 | Secret value | Behavior |
 | --- | --- |
@@ -200,8 +213,16 @@ Secrets, Sealed Secrets, SOPS, or your cloud secret manager.
 | `*_PREVIOUS_*` keys | commented out; set only during a [rotation](#secret-rotation) |
 | `<NAME>_FILE` | any secret setting may instead point at a mounted file (for example `JWT_SECRET_FILE=/run/secrets/jwt`); setting both forms fails startup |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` (+ optional `ADMIN_NAME`) | commented out, so no admin is bootstrapped. Uncomment both to create one on API startup; password ≥ 12 characters. Setting only one fails production config validation |
-| `DB_PASSWORD` | Password of the runtime `app` role (`DB_USERNAME`). It must not be a superuser or have `BYPASSRLS`; production startup refuses one |
-| `DB_MIGRATE_PASSWORD` | Password of the schema owner (`DB_MIGRATE_USERNAME`), read only by the migration Job |
+| `DB_PASSWORD` | Password of the runtime `app` role (`DB_USERNAME`). It must not be a superuser, own tables in the schema, or be a member of a `BYPASSRLS` role; production startup refuses one |
+
+`fiber-boilerplate-migrate-secrets` holds only the schema-owner settings the
+migration Job reads:
+
+| Migrate Secret value | Behavior |
+| --- | --- |
+| `DB_MIGRATE_USERNAME` | Schema owner for `cmd/migrate` (`postgres` by default) |
+| `DB_MIGRATE_PASSWORD` | Password of that owner; never mounted by API or worker pods |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | commented out; point the Job directly at PostgreSQL when the API uses a transaction-mode pooler |
 
 Create the runtime role once as the owner before the first migration; the same script is in the repository:
 
@@ -224,8 +245,8 @@ kubectl -n "$NS" create secret docker-registry ghcr-pull \
 ## 3. Run the migration Job before the rollout
 
 Only `cmd/migrate` applies DDL; the API and seed commands never migrate, so
-replicas do not race on schema changes. Apply the namespace/ConfigMap/Secret,
-apply and await the Job, and only then apply the app overlay:
+replicas do not race on schema changes. Apply the namespace/ConfigMap and both
+Secrets, apply and await the Job, and only then apply the app overlay:
 
 ```bash
 export ENV=staging
@@ -370,9 +391,10 @@ each:
 | `KUBE_CONFIG` (secret) | yes for real deploys | Kubeconfig for that environment's cluster. Raw YAML or base64; base64 is recommended. |
 | `GHCR_IMAGE` (variable, or secret) | no | Bare lowercase image repository, for example `ghcr.io/acme/fiber`. It must equal the Release workflow image `ghcr.io/<owner>/<repo>`; otherwise the workflow fails. No scheme, tag, digest, port, or colon. Defaults to `ghcr.io/${{ github.repository }}`. |
 
-The workflow does not create the application Secret: create
-`fiber-boilerplate-secrets` in the target namespace out of band (or via External
-Secrets / Sealed Secrets / SOPS); the workflow fails early if it is missing.
+The workflow does not create the application Secrets: create
+`fiber-boilerplate-secrets` and `fiber-boilerplate-migrate-secrets` in the target
+namespace out of band (or via External Secrets / Sealed Secrets / SOPS); the
+workflow fails early if either is missing.
 The cluster pulls the image, so give it pull credentials separately if the
 package is private; `packages: read` is only for the optional preflight.
 
@@ -414,8 +436,10 @@ backups/point-in-time recovery, and private networking.
 
 | Setting | Where / rule |
 | --- | --- |
-| `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_SCHEMA`, `DB_SSLMODE` | ConfigMap |
+| `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_SCHEMA`, `DB_SSLMODE`, `DB_SSLROOTCERT` | ConfigMap |
 | `DB_PASSWORD` | Secret |
+| `DB_MIGRATE_USERNAME`, `DB_MIGRATE_PASSWORD`, `DB_MIGRATE_HOST`, `DB_MIGRATE_PORT` | migration-only Secret (mounted only by the Job) |
+| `DB_SSLMODE=verify-full` | mandatory in production. `require`/`verify-ca` encrypt but do not verify the server, so they are rejected; set `DB_SSLROOTCERT` to a mounted provider CA when the system trust store does not contain it |
 | `DB_MAX_CONNS` | per pod. Production 10 × HPA max 10, so keep the database connection limit above 100; staging 5 × max 4 |
 | `CACHE_DRIVER=redis`, `REDIS_URL` | required for multi-replica session invalidation; use `rediss://` when the provider supports TLS |
 | NetworkPolicy CIDRs | update DB/Redis CIDRs and ports in `base/networkpolicy.yaml` if not private `10.0.0.0/8`; a blocked migration Job fails to connect |
@@ -452,6 +476,33 @@ If you must use `STORAGE_DRIVER=local`:
   image's `appuser` owns `/app/uploads`), or adjust `runAsUser`/`runAsGroup`.
 - A local volume is not a substitute for object storage durability or backups.
 
+### Upgrading an existing deployment
+
+`kubectl apply` does not remove Secret keys or revoke privileges, so two fixes
+need an explicit step on a cluster created before this release:
+
+1. Move the schema-owner credentials out of the runtime Secret. Rotate that
+   password at the same time: every API and worker pod could read the old one.
+   Create `fiber-boilerplate-migrate-secrets` (step 2) with the new value, then
+   drop the old key and roll the app:
+   ```bash
+   kubectl -n "$NS" patch secret fiber-boilerplate-secrets \
+     --type=json -p '[{"op":"remove","path":"/data/DB_MIGRATE_PASSWORD"}]'
+   kubectl -n "$NS" rollout restart deployment/fiber-boilerplate
+   # Also restart fiber-boilerplate-worker when the worker component is enabled.
+   ```
+   A "missing path" error means the key was already absent.
+2. Revoke `TRUNCATE` from the runtime role as the schema owner. Re-running
+   `database-roles.sql` only adds privileges; it does not remove a grant, and
+   the old default-privilege entry still applies to new tables:
+   ```bash
+   psql -h <host> -U postgres -d <database> -c \
+     'REVOKE TRUNCATE ON ALL TABLES IN SCHEMA public FROM app'
+   psql -h <host> -U postgres -d <database> -c \
+     'ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public
+        REVOKE TRUNCATE ON TABLES FROM app'
+   ```
+
 ### Secret rotation
 
 | Secret | Effect of rotation | Procedure |
@@ -468,10 +519,10 @@ worker Deployment) before relying on new jobs.
 
 ### Job workers
 
-By default every API pod also runs the job worker, the scheduler (when
-`SCHEDULER_ENABLED=true`), and module background loops (`APP_ROLE=all` in the
-ConfigMap). To scale and fail them independently, enable the optional
-component in an overlay:
+By default every API pod also runs the job worker, the scheduler
+(`SCHEDULER_ENABLED=true` in the ConfigMap), and module background loops
+(`APP_ROLE=all` in the ConfigMap). To scale and fail them independently, enable
+the optional component in an overlay:
 
 ```yaml
 components:
@@ -485,6 +536,7 @@ components:
 | Selection | worker pods use their own `app.kubernetes.io/instance` label, so the API Service, HPA, and PDB never select them |
 | Scaling | replicas are safe: claims use `FOR UPDATE SKIP LOCKED` and the scheduler elects one leader through `scheduler_leases`. Count worker pods in the `DB_MAX_CONNS × replicas` budget |
 | Bulkheads | copy the Deployment under another name with `JOBS_WORKER_KINDS=<kinds>` and set `JOBS_WORKER_EXCLUDE_KINDS=<kinds>` on the general worker, so every kind is claimed by exactly one group |
+| Retention | `SCHEDULER_ENABLED=true` in the ConfigMap enables the hourly purge schedules (`identity.tokens.purge_expired`, `files.trash.purge`, `notifications.retention.purge`, `privacy.exports.purge`) on the worker-capable process. `cmd/api` logs a production warning when the scheduler is off |
 
 Apply it after the migration Job like the rest of the app overlay. No overlay
 enables it today, so the CI-rendered manifests keep the single-Deployment
@@ -536,8 +588,8 @@ deadlocking.
 The CI `Manifests` job runs `actionlint`, renders the base and both
 environment overlays (including `prereqs` and `migration`) with kustomize,
 checks that no app overlay contains the Secret or migration Job, and runs
-kubeconform strict against Kubernetes 1.29, including `migration/job.yaml` and
-`secret.example.yaml`.
+kubeconform strict against Kubernetes 1.29, including `migration/job.yaml`,
+`secret.example.yaml`, and `migrate-secret.example.yaml`.
 
 Example release:
 

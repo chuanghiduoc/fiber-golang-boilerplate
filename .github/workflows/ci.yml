@@ -235,7 +235,8 @@ jobs:
             /tmp/staging-migration.yaml \
             /tmp/production-migration.yaml \
             deploy/k8s/migration/job.yaml \
-            deploy/k8s/secret.example.yaml
+            deploy/k8s/secret.example.yaml \
+            deploy/k8s/migrate-secret.example.yaml
 
   migrations:
     name: Migrations

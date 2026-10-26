@@ -57,6 +57,7 @@ env:
   APP_DEPLOYMENT: fiber-boilerplate
   MIGRATION_JOB: fiber-boilerplate-migrate
   APP_SECRET: fiber-boilerplate-secrets
+  MIGRATE_SECRET: fiber-boilerplate-migrate-secrets
 
 jobs:
   deploy:
@@ -364,6 +365,11 @@ jobs:
           if ! kubectl -n "$NAMESPACE" get secret "$APP_SECRET" > /dev/null 2>&1; then
             echo "::error::Secret $APP_SECRET is missing in namespace $NAMESPACE."
             echo "Create it out of band (or via External Secrets / Sealed Secrets) before deploying."
+            exit 1
+          fi
+          if ! kubectl -n "$NAMESPACE" get secret "$MIGRATE_SECRET" > /dev/null 2>&1; then
+            echo "::error::Secret $MIGRATE_SECRET is missing in namespace $NAMESPACE."
+            echo "The migration Job reads the schema-owner credentials from it; create it out of band before deploying."
             exit 1
           fi
 

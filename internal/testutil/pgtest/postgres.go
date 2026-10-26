@@ -44,7 +44,9 @@ func OpenAppPool(ctx context.Context, adminDSN, schema string) (*pgxpool.Pool, e
 	ident := pgx.Identifier{schema}.Sanitize()
 	for _, statement := range []string{
 		"GRANT USAGE ON SCHEMA " + ident + " TO " + role,
-		"GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA " + ident + " TO " + role,
+		// No TRUNCATE: it ignores row-level security and would let a bug erase
+		// every tenant's rows. Tests that must truncate use the owner pool.
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA " + ident + " TO " + role,
 		"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA " + ident + " TO " + role,
 		"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA " + ident + " TO " + role,
 	} {

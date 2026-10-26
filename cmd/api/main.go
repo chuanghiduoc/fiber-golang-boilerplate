@@ -178,6 +178,11 @@ func warnRiskySettings(cfg *config.Config) {
 		if cfg.Storage.UsesS3() && !cfg.Storage.S3UseSSL {
 			slog.Warn("STORAGE_S3_ALLOW_INSECURE=true in production: object storage traffic is not encrypted")
 		}
+		if cfg.App.RunsWorker() && !cfg.Scheduler.Enabled {
+			slog.Warn("SCHEDULER_ENABLED=false in production: scheduled jobs and data-retention purges will never run in this deployment",
+				slog.String("app_role", cfg.App.EffectiveRole()),
+			)
+		}
 	}
 
 	if cfg.App.Env != "production" && cfg.App.BodyLimit <= int(cfg.Storage.MaxFileSize) {
@@ -250,7 +255,7 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := checkRLSRole(ctx, pool, cfg.App.Env); err != nil {
+	if err := checkRLSRole(ctx, pool, cfg.DB.Schema, cfg.App.Env); err != nil {
 		return err
 	}
 

@@ -204,9 +204,10 @@ var requiredTriggers = map[string][]string{
 	},
 }
 
-// requiredRLS lists every table with a tenant_id column. Row-level security
-// must be enabled and forced on each, with the tenant_isolation policy, or a
-// query that forgot its tenant predicate could read another tenant's rows.
+// requiredRLS is the expected set of tenant-owned tables. checkRLS discovers
+// every table in the schema with a tenant_id column dynamically; this list
+// additionally catches an expected table whose tenant_id column disappeared
+// (for example a hand-rebuilt schema) and keeps the baseline drift test honest.
 var requiredRLS = []string{
 	"tenant_settings",
 	"memberships",
@@ -582,53 +583,138 @@ func checkTenantLeadingIndexes(ctx context.Context, pool *pgxpool.Pool, schema s
 	return missing, nil
 }
 
-// checkRLS reports tenant-owned tables where row-level security is not enabled
-// and forced, or where the tenant_isolation policy is missing. A missing table
-// is already reported by checkTables.
+// rlsPolicy is one policy attached to a tenant-owned table. Using and Check
+// are the policy's USING and WITH CHECK expressions as PostgreSQL renders
+// them; they are checked separately because USING controls reads and a
+// permissive USING (true) exposes every tenant's rows even with a correct
+// WITH CHECK clause.
+type rlsPolicy struct {
+	Name  string
+	Using string
+	Check string
+}
+
+// rlsTable is the catalog state of one table with a tenant_id column.
+type rlsTable struct {
+	Table    string
+	Enabled  bool
+	Forced   bool
+	Policies []rlsPolicy
+}
+
+// checkRLS reports every table with a tenant_id column whose row-level
+// security is not enabled and forced, or whose policies are not exactly one
+// tenant_isolation policy calling app_tenant_visible. The table set is
+// discovered from the catalog rather than a static list, so a later migration
+// cannot add a tenant-owned table that this guard silently ignores: TRUNCATE
+// ignores RLS, but SELECT/INSERT/UPDATE/DELETE do not.
 func checkRLS(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
-	type state struct {
-		enabled bool
-		forced  bool
-		policy  bool
-	}
-	found := make(map[string]state, len(requiredRLS))
+	var tables []rlsTable
+	current := -1
 	err := scanRows(ctx, pool, "verify row-level security", "verify schema: scan row-level security",
 		func(rows pgx.Rows) error {
-			var table string
-			var s state
-			if err := rows.Scan(&table, &s.enabled, &s.forced, &s.policy); err != nil {
+			var (
+				table           string
+				enabled, forced bool
+				policy          string
+				qual, withCheck string
+			)
+			if err := rows.Scan(&table, &enabled, &forced, &policy, &qual, &withCheck); err != nil {
 				return err
 			}
-			found[table] = s
+			if current < 0 || tables[current].Table != table {
+				tables = append(tables, rlsTable{Table: table, Enabled: enabled, Forced: forced})
+				current = len(tables) - 1
+			}
+			if policy != "" {
+				tables[current].Policies = append(tables[current].Policies, rlsPolicy{
+					Name:  policy,
+					Using: qual,
+					Check: withCheck,
+				})
+			}
 			return nil
 		},
 		`SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
-		        EXISTS (SELECT 1 FROM pg_policy p
-		                WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation')
+		        COALESCE(p.polname, ''),
+		        COALESCE(pg_get_expr(p.polqual, p.polrelid), ''),
+		        COALESCE(pg_get_expr(p.polwithcheck, p.polrelid), '')
 		 FROM pg_class c
 		 JOIN pg_namespace n ON n.oid = c.relnamespace
-		 WHERE n.nspname = $1 AND c.relname = ANY($2)`,
-		schema, requiredRLS,
+		 LEFT JOIN pg_policy p ON p.polrelid = c.oid
+		 WHERE n.nspname = $1
+		   AND c.relkind IN ('r', 'p')
+		   AND EXISTS (
+		       SELECT 1 FROM pg_attribute a
+		       WHERE a.attrelid = c.oid
+		         AND a.attname = 'tenant_id'
+		         AND a.attnum > 0
+		         AND NOT a.attisdropped
+		   )
+		 ORDER BY c.relname, p.polname`,
+		schema,
 	)
 	if err != nil {
 		return nil, err
 	}
+	return rlsGaps(tables), nil
+}
 
-	var missing []string
-	for _, table := range requiredRLS {
-		s, ok := found[table]
+// rlsGaps turns the catalog state into operator-facing gaps. One problem per
+// table keeps the report readable when a table is missing several guards.
+func rlsGaps(tables []rlsTable) []string {
+	var gaps []string
+	seen := make(map[string]struct{}, len(tables))
+	for _, table := range tables {
+		seen[table.Table] = struct{}{}
 		switch {
-		case !ok:
-			continue
-		case !s.enabled:
-			missing = append(missing, "row-level security on "+table)
-		case !s.forced:
-			missing = append(missing, "forced row-level security on "+table)
-		case !s.policy:
-			missing = append(missing, "tenant_isolation policy on "+table)
+		case !table.Enabled:
+			gaps = append(gaps, "row-level security on "+table.Table)
+		case !table.Forced:
+			gaps = append(gaps, "forced row-level security on "+table.Table)
+		default:
+			if gap := policyGap(table); gap != "" {
+				gaps = append(gaps, gap)
+			}
 		}
 	}
-	return missing, nil
+	for _, table := range requiredRLS {
+		if _, ok := seen[table]; !ok {
+			gaps = append(gaps, "row-level security on "+table)
+		}
+	}
+	return gaps
+}
+
+// policyGap checks that the table has exactly one tenant_isolation policy and
+// that both its USING and (when present) WITH CHECK clauses call
+// app_tenant_visible. Any second policy (for example a USING (true) escape
+// hatch) makes the table readable across tenants.
+func policyGap(table rlsTable) string {
+	switch len(table.Policies) {
+	case 0:
+		return "tenant_isolation policy on " + table.Table
+	case 1:
+	default:
+		names := make([]string, len(table.Policies))
+		for i, policy := range table.Policies {
+			names[i] = policy.Name
+		}
+		slices.Sort(names)
+		return "single tenant_isolation policy on " + table.Table +
+			" (found " + strings.Join(names, ", ") + ")"
+	}
+	policy := table.Policies[0]
+	if policy.Name != "tenant_isolation" {
+		return "tenant_isolation policy on " + table.Table + " (found " + policy.Name + ")"
+	}
+	if !strings.Contains(policy.Using, "app_tenant_visible") {
+		return "tenant_isolation policy on " + table.Table + " USING clause must reference app_tenant_visible"
+	}
+	if policy.Check != "" && !strings.Contains(policy.Check, "app_tenant_visible") {
+		return "tenant_isolation policy on " + table.Table + " WITH CHECK clause must reference app_tenant_visible"
+	}
+	return ""
 }
 
 // checkTriggers reports required triggers that are absent or disabled.

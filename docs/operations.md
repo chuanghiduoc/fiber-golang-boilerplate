@@ -489,8 +489,11 @@ loops run in every worker process regardless.
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
-indefinitely, notifications are never deleted, and expired export documents
-stay in storage until the scheduler is enabled. The retention indexes
+indefinitely, notifications are never deleted, expired export documents stay in
+storage, and expired tokens and scheduler ledger rows accumulate. The Kubernetes
+ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
+(`APP_ROLE=all` or `worker`); `cmd/api` logs a production warning when a
+worker-capable process starts with it off. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
 every tenant; they are partial, so live files, unread notifications, and active
 exports are not indexed. These indexes and the purge claim/retry columns
@@ -1074,8 +1077,8 @@ During a Redis outage:
 Only `cmd/migrate` applies DDL; `cmd/api` and `cmd/seed` assume the schema
 exists, so replicas do not race. `cmd/migrate` loads only `DB_*` plus
 `APP_ENV`/`LOG_LEVEL`; it needs no JWT, admin, SMTP, storage, or other
-application secrets, and it rejects plaintext `DB_SSLMODE` values in
-production.
+application secrets, and it requires `DB_SSLMODE=verify-full` in production
+(the API and the migration Job share the rule).
 
 ```bash
 go run ./cmd/migrate   # apply pending migrations
@@ -1103,9 +1106,12 @@ flowchart TD
 ### Database roles and row-level security
 
 Every tenant-owned table has forced row-level security. The API,
-worker, and `cmd/seed` must connect as a dedicated non-superuser role without
-`BYPASSRLS`; a superuser or a `BYPASSRLS` role ignores every policy. `cmd/api`
-logs an error when it detects one and refuses to start when
+worker, and `cmd/seed` must connect as a dedicated non-superuser role that
+`BYPASSRLS` does not exempt and that owns no table in the configured schema;
+a superuser or a `BYPASSRLS` role ignores every policy, and a table owner can
+run `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`. A member of a
+superuser/`BYPASSRLS` role is unsafe too, because it can `SET ROLE`. `cmd/api`
+logs an error when it detects any of these and refuses to start when
 `APP_ENV=production`. `cmd/migrate` needs the schema owner instead
 (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
 `DB_USERNAME`/`DB_PASSWORD`).
@@ -1118,8 +1124,10 @@ psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
 ```
 
 The script grants schema access, table/sequence/function privileges, and
-`ALTER DEFAULT PRIVILEGES` for tables later migrations create. Docker Compose
-runs it automatically on a fresh volume (`deploy/postgres/init-app-role.sh`).
+`ALTER DEFAULT PRIVILEGES` for tables later migrations create. It deliberately
+does not grant `TRUNCATE`: truncation ignores RLS, so only the schema owner may
+do it. Docker Compose runs it automatically on a fresh volume
+(`deploy/postgres/init-app-role.sh`).
 
 Scoping is per transaction and never session-level:
 `database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
@@ -1306,7 +1314,7 @@ and topology diagram. The ordering invariant:
 
 ```mermaid
 flowchart LR
-    pre["1. Apply prereqs overlay<br/>Namespace + ConfigMap"] --> sec["2. Secret created<br/>out of band"]
+    pre["1. Apply prereqs overlay<br/>Namespace + ConfigMap"] --> sec["2. Secrets created<br/>out of band"]
     sec --> chk{"3. Old migration Job<br/>Complete or Failed?"}
     chk -- still running --> waitj[Wait; never interrupt]
     waitj --> chk
@@ -1316,9 +1324,10 @@ flowchart LR
 
 1. `kubectl apply -k deploy/k8s/overlays/<env>/prereqs` applies the Namespace
    and environment ConfigMap before the migration Job.
-2. Create `fiber-boilerplate-secrets` in that namespace out of band (or through
-   External Secrets / Sealed Secrets / SOPS). It is never part of a
-   kustomization.
+2. Create `fiber-boilerplate-secrets` (runtime) and
+   `fiber-boilerplate-migrate-secrets` (schema owner, mounted only by the Job)
+   in that namespace out of band (or through External Secrets / Sealed Secrets
+   / SOPS). Neither is part of a kustomization.
 3. Delete an existing migration Job only once it is `Complete` or `Failed`.
    Apply `kubectl apply -k deploy/k8s/overlays/<env>/migration`, wait for
    `condition=complete`, and read its logs. The deploy workflow refuses to
@@ -1452,7 +1461,8 @@ environment with `cancel-in-progress: false`.
 | Secret `KUBE_CONFIG` (per environment) | Raw or base64-encoded kubeconfig for that cluster; base64 is recommended. |
 | Variable `GHCR_IMAGE` (optional; a secret with the same name also works) | Bare lowercase GHCR repository equal to the Release image `ghcr.io/<owner>/<repo>`. Schemes, tags, digests, ports, and colons are rejected. Defaults to `ghcr.io/${{ github.repository }}`. |
 
-The workflow applies the prereqs, verifies the pre-created Secret exists,
+The workflow applies the prereqs, verifies both pre-created Secrets
+(`fiber-boilerplate-secrets` and `fiber-boilerplate-migrate-secrets`) exist,
 refuses to delete an unfinished migration Job, runs and awaits the migration
 Job (failing immediately on `Failed=True`), applies the app overlay, waits for
 the rollout, and smoke-checks `/healthz` and `/readyz` through a port-forward.
@@ -1638,7 +1648,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` | Comma-separated job kinds this process claims / skips (bulkhead workers); every kind must be claimed by some worker, and a kind in both lists fails startup |
 | `APP_BODY_LIMIT` | Must exceed `STORAGE_MAX_FILE_SIZE` (multipart overhead) |
 | `DB_CONNECT_TIMEOUT` | Database connect timeout in seconds (default 10) |
-| `DB_SSLMODE` | `disable`, `allow`, `prefer` rejected in production; use `require` or `verify-full` |
+| `DB_SSLMODE` | Production requires `verify-full`; `require` and `verify-ca` accept any server certificate and are rejected there, as are `disable`, `allow`, and `prefer` |
+| `DB_SSLROOTCERT` | Optional CA bundle path for `verify-full` (passed as `sslrootcert`); empty uses the system trust store |
 | `DB_QUERY_EXEC_MODE` | pgx execution mode: `cache_statement` (default; behind a transaction-mode PgBouncer needs 1.21+ with `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; `exec`/`simple_protocol` are rejected (json parameters break) |
 | `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | `cmd/migrate` only: connect here instead of `DB_HOST`/`DB_PORT`, so migrations (which hold a session advisory lock) bypass a transaction-mode pooler. See [docs/operations.md](#connection-poolers-pgbouncer) |
 | `JWT_SECRET` / `JWT_PREVIOUS_SECRETS` | Active signing key (32+ chars outside local/test; tokens carry its derived `kid`) and comma-separated verify-only retired keys |
@@ -1681,4 +1692,4 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
 | Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |
-| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |
+| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, any `DB_SSLMODE` other than `verify-full`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |
