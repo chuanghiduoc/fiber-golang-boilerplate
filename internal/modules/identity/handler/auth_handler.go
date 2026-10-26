@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -27,11 +29,21 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/oauth"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
 )
 
 const oauthStateCookieName = "oauth_state"
+
+const (
+	// googleExchangeTTL is how long the callback's one-time code can be
+	// redeemed.
+	googleExchangeTTL = 60 * time.Second
+	// googleExchangeCodeBytes makes the code 256 bits of entropy.
+	googleExchangeCodeBytes = 32
+	googleExchangeKeyPrefix = "oauth:google:exchange:"
+)
 
 // withClientIP returns the request context carrying the client IP that the
 // login lockout keys its per-source budget on. c.IP() honors Fiber's
@@ -94,13 +106,56 @@ func oauthStateMAC(key []byte, payload string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+// oauthFlowMACPrefix domain-separates the cookie flow MAC from the state MAC.
+const oauthFlowMACPrefix = "pkce-flow:"
+
+// encodeOAuthFlow stores the signed state and the PKCE verifier in the state
+// cookie. The verifier never leaves the server (it is not part of the state
+// query parameter sent to Google); the cookie MAC binds it to that state so a
+// tampered cookie cannot pair another verifier with the flow.
+func encodeOAuthFlow(key []byte, state, verifier string) string {
+	payload := state + "." + verifier
+	return payload + "." + oauthStateMAC(key, oauthFlowMACPrefix+payload)
+}
+
+// decodeOAuthFlow returns the state and PKCE verifier carried by the callback
+// cookie. A legacy cookie that holds only a signed state is accepted with an
+// empty verifier: the provider then rejects the exchange, but an in-flight
+// sign-in started before the PKCE upgrade is still recognized as well-formed.
+func decodeOAuthFlow(key []byte, value string) (state, verifier string, ok bool) {
+	if _, _, valid := decodeOAuthState(key, value); valid {
+		return value, "", true
+	}
+	macSep := strings.LastIndexByte(value, '.')
+	if macSep <= 0 || macSep == len(value)-1 {
+		return "", "", false
+	}
+	payload, mac := value[:macSep], value[macSep+1:]
+	if !hmac.Equal([]byte(mac), []byte(oauthStateMAC(key, oauthFlowMACPrefix+payload))) {
+		return "", "", false
+	}
+	sep := strings.LastIndexByte(payload, '.')
+	if sep <= 0 || sep == len(payload)-1 {
+		return "", "", false
+	}
+	state, verifier = payload[:sep], payload[sep+1:]
+	if _, _, valid := decodeOAuthState(key, state); !valid {
+		return "", "", false
+	}
+	return state, verifier, true
+}
+
 // GoogleOAuthProvider is the subset of oauth.GoogleOAuth the auth handler
 // needs. It is an interface so HTTP/integration tests can exercise the whole
 // start/callback flow without calling Google.
 type GoogleOAuthProvider interface {
-	AuthURL(state string) string
-	Exchange(ctx context.Context, code string) (*oauth.GoogleUserInfo, error)
-	BuildCallbackURL(accessToken, refreshToken string) string
+	// AuthURL builds the consent redirect with an S256 PKCE challenge derived
+	// from codeVerifier.
+	AuthURL(state, codeVerifier string) string
+	Exchange(ctx context.Context, code, codeVerifier string) (*oauth.GoogleUserInfo, error)
+	// BuildCodeCallbackURL redirects the browser with a single-use code that
+	// POST /auth/google/exchange redeems for the token pair.
+	BuildCodeCallbackURL(code string) string
 	// BuildMFACallbackURL redirects a first-factor Google sign-in to the
 	// frontend with only a two-step login challenge, never tokens.
 	BuildMFACallbackURL(challenge string) string
@@ -133,6 +188,10 @@ type AuthDeps struct {
 	OAuthStateSecret         string
 	RequireEmailVerification bool
 	GoogleOAuth              GoogleOAuthProvider
+	// Cache stores the short-lived one-time Google exchange grant.
+	Cache cache.Cache
+	// Sealer seals that grant with the data-encryption codec.
+	Sealer service.SecretSealer
 	// MFA is nil only in deployments and tests that do not wire MFA; login
 	// then issues tokens directly.
 	MFA service.MFAService
@@ -150,6 +209,8 @@ type AuthHandler struct {
 	googleOAuth              GoogleOAuthProvider
 	tenants                  TenantLookup
 	mfa                      service.MFAService
+	cache                    cache.Cache
+	sealer                   service.SecretSealer
 	// oauthStateKey signs the OAuth state (see encodeOAuthState).
 	oauthStateKey []byte
 	// flags gates registration, Google OAuth, and the email-verification
@@ -191,6 +252,8 @@ func NewAuthHandler(deps AuthDeps) *AuthHandler {
 		googleOAuth:              deps.GoogleOAuth,
 		tenants:                  deps.Tenants,
 		mfa:                      deps.MFA,
+		cache:                    deps.Cache,
+		sealer:                   deps.Sealer,
 		oauthStateKey:            oauthStateKey(deps.OAuthStateSecret),
 	}
 }
@@ -462,7 +525,22 @@ func (h *AuthHandler) ResetPassword(c fiber.Ctx) error {
 		return err
 	}
 
-	if err := h.resetSvc.ResetPassword(withClientIP(c), service.ResetPasswordInput{
+	// A live reset token resolves to its account, so the password/email
+	// policy can reject a password built from that address before the reset
+	// stores it. Unknown or expired tokens skip the check and fail below.
+	if lookup, ok := h.resetSvc.(service.PasswordResetEmailLookup); ok {
+		email, err := lookup.EmailForResetToken(c.Context(), req.Token)
+		if err != nil {
+			return err
+		}
+		if email != "" {
+			if err := service.ValidatePasswordForEmail(req.Password, email, "password"); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := h.resetSvc.ResetPassword(service.WithUserAgent(withClientIP(c), c.Get(fiber.HeaderUserAgent)), service.ResetPasswordInput{
 		Token:    req.Token,
 		Password: req.Password,
 	}); err != nil {
@@ -583,10 +661,11 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 	c.SetContext(tenant.WithIdentity(c.Context(), tenantID, tenantSlug))
 
 	state := encodeOAuthState(h.oauthStateKey, hex.EncodeToString(b), tenantID)
+	verifier := oauth2.GenerateVerifier()
 
 	c.Cookie(&fiber.Cookie{
 		Name:     oauthStateCookieName,
-		Value:    state,
+		Value:    encodeOAuthFlow(h.oauthStateKey, state, verifier),
 		HTTPOnly: true,
 		Secure:   true,
 		SameSite: fiber.CookieSameSiteLaxMode,
@@ -594,7 +673,7 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 		Path:     "/",
 	})
 
-	return c.Redirect().To(h.googleOAuth.AuthURL(state))
+	return c.Redirect().To(h.googleOAuth.AuthURL(state, verifier))
 }
 
 // GoogleCallback godoc
@@ -614,7 +693,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if h.googleOAuth == nil {
 		return apperror.NewNotFound("Google OAuth not configured")
 	}
-	tenantID, tenantSlug, err := h.verifyOAuthCallbackState(c)
+	tenantID, tenantSlug, verifier, err := h.verifyOAuthCallbackState(c)
 	if err != nil {
 		return err
 	}
@@ -633,7 +712,7 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if code == "" {
 		return apperror.NewBadRequest("missing authorization code")
 	}
-	info, err := h.googleOAuth.Exchange(ctx, code)
+	info, err := h.googleOAuth.Exchange(ctx, code, verifier)
 	if err != nil {
 		status := oauthErrorStatus(err)
 		// Log only the error class and upstream status: the code, tokens, and
@@ -684,34 +763,153 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 		}
 		return c.Redirect().To(h.googleOAuth.BuildMFACallbackURL(challenge))
 	}
-	return c.Redirect().To(h.googleOAuth.BuildCallbackURL(result.Tokens.AccessToken, result.Tokens.RefreshToken))
+	exchangeCode, err := h.issueGoogleExchangeGrant(ctx, tenantID, result)
+	if err != nil {
+		return err
+	}
+	return c.Redirect().To(h.googleOAuth.BuildCodeCallbackURL(exchangeCode))
+}
+
+// googleExchangeGrant is the sealed payload behind a callback's one-time
+// code. It carries the tenant that started the flow and the token response
+// the exchange endpoint returns, so the code alone mints nothing.
+type googleExchangeGrant struct {
+	TenantID  int64             `json:"tenantId"`
+	ExpiresAt int64             `json:"exp"`
+	Response  dto.LoginResponse `json:"response"`
+}
+
+func googleExchangeKey(code string) string {
+	sum := sha256.Sum256([]byte(code))
+	return googleExchangeKeyPrefix + hex.EncodeToString(sum[:])
+}
+
+func googleExchangeInvalid() error {
+	return apperror.NewCode(identitycatalog.CodeAuthOAuthCodeInvalid, "invalid or expired google sign-in code")
+}
+
+// issueGoogleExchangeGrant stores the signed-in user's tokens under a random
+// 256-bit code for googleExchangeTTL and returns the code. The tokens never
+// appear in the redirect URL.
+func (h *AuthHandler) issueGoogleExchangeGrant(ctx context.Context, tenantID int64, result *service.GoogleSignInResult) (string, error) {
+	if h.cache == nil || h.sealer == nil {
+		return "", apperror.NewInternal("google exchange store is not configured")
+	}
+	raw := make([]byte, googleExchangeCodeBytes)
+	if _, err := rand.Read(raw); err != nil {
+		return "", apperror.NewInternal("failed to generate google exchange code")
+	}
+	code := base64.RawURLEncoding.EncodeToString(raw)
+	grant := googleExchangeGrant{
+		TenantID:  tenantID,
+		ExpiresAt: time.Now().Add(googleExchangeTTL).Unix(),
+		Response: dto.LoginResponse{
+			AccessToken:  result.Tokens.AccessToken,
+			RefreshToken: result.Tokens.RefreshToken,
+			User:         toUserResponse(result.Member),
+		},
+	}
+	payload, err := json.Marshal(grant)
+	if err != nil {
+		return "", apperror.NewInternal("failed to encode google exchange grant")
+	}
+	sealed, err := h.sealer.Seal(payload)
+	if err != nil {
+		return "", apperror.NewInternal("failed to seal google exchange grant")
+	}
+	if err := h.cache.Set(ctx, googleExchangeKey(code), sealed, googleExchangeTTL); err != nil {
+		return "", apperror.NewInternal("failed to store google exchange code")
+	}
+	return code, nil
+}
+
+// GoogleExchange godoc
+// @Summary Redeem a Google sign-in code
+// @Description Exchange the single-use code from the Google callback's URL fragment for the normal access and refresh token pair. The code expires after 60 seconds, works once, and is bound to the tenant that started the flow.
+// @Tags Auth
+// @Accept json
+// @Produce json
+// @Param request body dto.GoogleExchangeRequest true "One-time code from the callback fragment"
+// @Success 200 {object} dto.LoginResponse
+// @Failure 401 {object} apperror.ProblemDetails "auth.oauth_code_invalid"
+// @Failure 422 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
+// @Router /auth/google/exchange [post]
+func (h *AuthHandler) GoogleExchange(c fiber.Ctx) error {
+	var req dto.GoogleExchangeRequest
+	if err := httpx.BindAndValidate(c, &req); err != nil {
+		return err
+	}
+	if h.cache == nil || h.sealer == nil {
+		return apperror.NewInternal("google exchange store is not configured")
+	}
+	key := googleExchangeKey(req.Code)
+	sealed, err := h.cache.Get(c.Context(), key)
+	if err != nil {
+		slog.Error("failed to read google exchange code", slog.Any("error", err))
+		return apperror.NewInternal("failed to read google exchange code")
+	}
+	if len(sealed) == 0 {
+		return googleExchangeInvalid()
+	}
+	plain, err := h.sealer.Open(sealed)
+	if err != nil {
+		return googleExchangeInvalid()
+	}
+	var grant googleExchangeGrant
+	if err := json.Unmarshal(plain, &grant); err != nil {
+		return googleExchangeInvalid()
+	}
+	if grant.TenantID != tenant.EffectiveID(c.Context()) || !time.Now().Before(time.Unix(grant.ExpiresAt, 0)) {
+		return googleExchangeInvalid()
+	}
+	// Read-then-compare-and-delete keeps redemption single-use: when two
+	// callers hold the same code, exactly one CompareAndDelete succeeds.
+	cd, ok := h.cache.(cache.CompareDeleter)
+	if !ok {
+		return apperror.NewCode(apperror.CodeSystemUnavailable, "unable to redeem google sign-in code")
+	}
+	consumed, err := cd.CompareAndDelete(c.Context(), key, sealed)
+	if err != nil {
+		slog.Error("failed to consume google exchange code", slog.Any("error", err))
+		return apperror.NewInternal("failed to consume google exchange code")
+	}
+	if !consumed {
+		return googleExchangeInvalid()
+	}
+	fiber.Locals(c, "user_id", grant.Response.User.ID)
+	return response.Success(c, grant.Response)
 }
 
 // verifyOAuthCallbackState checks the CSRF state against its cookie and
-// returns the active tenant bound into it. The callback ignores
-// X-Tenant-Slug: the signed state is the only trusted tenant source for this
-// browser redirect.
-func (h *AuthHandler) verifyOAuthCallbackState(c fiber.Ctx) (tenantID int64, tenantSlug string, err error) {
+// returns the active tenant bound into it plus the PKCE verifier stored in the
+// same signed cookie. The callback ignores X-Tenant-Slug: the signed state is
+// the only trusted tenant source for this browser redirect.
+func (h *AuthHandler) verifyOAuthCallbackState(c fiber.Ctx) (tenantID int64, tenantSlug, verifier string, err error) {
 	state := c.Query("state")
-	cookieState := c.Cookies(oauthStateCookieName)
-	if state == "" || cookieState == "" ||
-		subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
-		return 0, "", apperror.NewBadRequest("invalid oauth state")
+	cookieValue := c.Cookies(oauthStateCookieName)
+	if state == "" || cookieValue == "" {
+		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
+	}
+	cookieState, verifier, ok := decodeOAuthFlow(h.oauthStateKey, cookieValue)
+	if !ok || subtle.ConstantTimeCompare([]byte(state), []byte(cookieState)) != 1 {
+		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
 	_, stateTenantID, ok := decodeOAuthState(h.oauthStateKey, state)
 	if !ok {
-		return 0, "", apperror.NewBadRequest("invalid oauth state")
+		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
 	if h.tenants == nil {
-		return 0, "", apperror.NewInternal("oauth tenant validation is not configured")
+		return 0, "", "", apperror.NewInternal("oauth tenant validation is not configured")
 	}
 	// GetOperational only returns operational tenants, so a tenant suspended during the
 	// consent round-trip cannot complete the login.
 	stateTenant, err := h.tenants.GetOperational(c.Context(), stateTenantID)
 	if err != nil {
-		return 0, "", apperror.NewBadRequest("invalid oauth state")
+		return 0, "", "", apperror.NewBadRequest("invalid oauth state")
 	}
-	return stateTenant.ID, stateTenant.Slug, nil
+	return stateTenant.ID, stateTenant.Slug, verifier, nil
 }
 
 // oauthErrorStatus extracts the upstream HTTP status from the provider error,

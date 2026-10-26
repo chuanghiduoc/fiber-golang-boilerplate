@@ -70,8 +70,19 @@ func NewSessionService(stores Stores, tx Transactor, sign AccessTokenSigner, ref
 // by a concurrent request.
 var errRefreshReused = errors.New("identity: refresh token already used")
 
+// refreshRotationGrace is the window in which a second request presenting the
+// token that a concurrent refresh just rotated gets a dedicated 401 instead of
+// revoking the shared session. Two browser tabs refreshing at once are a
+// normal client race, not a stolen-token reuse.
+const refreshRotationGrace = 10 * time.Second
+
 func refreshInvalid(detail string) error {
 	return apperror.NewCode(identitycatalog.CodeAuthRefreshInvalid, detail)
+}
+
+func refreshConcurrent() error {
+	return apperror.NewCode(identitycatalog.CodeAuthRefreshConcurrent,
+		"refresh token was used by a concurrent request; the session is still valid")
 }
 
 func accountNotActive() error {
@@ -208,7 +219,7 @@ func (s *SessionService) Refresh(ctx context.Context, plain string, admit Admiss
 		return nil
 	})
 	if errors.Is(err, errRefreshReused) {
-		return nil, s.refreshReused(ctx, hash)
+		return nil, s.resolveUsedRefresh(ctx, hash)
 	}
 	if err != nil {
 		return nil, err
@@ -246,7 +257,7 @@ func (s *SessionService) loadRefreshSession(ctx context.Context, hash string) (r
 		return refreshSession{}, refreshInvalid("invalid refresh token")
 	}
 	if rt.UsedAt != nil {
-		return refreshSession{}, s.refreshReused(ctx, hash)
+		return refreshSession{}, s.resolveUsedRefresh(ctx, hash)
 	}
 	if !rt.ExpiresAt.After(time.Now()) {
 		return refreshSession{}, refreshInvalid("refresh token expired")
@@ -265,6 +276,29 @@ func (s *SessionService) loadRefreshSession(ctx context.Context, hash string) (r
 		return refreshSession{}, refreshInvalid("session has expired")
 	}
 	return refreshSession{token: rt, session: sess}, nil
+}
+
+// resolveUsedRefresh decides what a repeated refresh token means. The token
+// and its session are read in one statement, so a concurrent rotation cannot
+// slip between the grace check and a revocation: a token consumed less than
+// refreshRotationGrace ago by a rotation of a still-live session is the same
+// client racing itself and only gets 401 auth.refresh_concurrent. Anything
+// else (an older replay, a revoked/expired session, or a token that was not
+// rotated) keeps the RFC 9700 reuse response and revokes the family.
+func (s *SessionService) resolveUsedRefresh(ctx context.Context, hash string) error {
+	state, err := s.stores.RefreshTokens.ClassifyRotation(ctx, hash, time.Now().Add(-refreshRotationGrace))
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return refreshInvalid("invalid refresh token")
+		}
+		slog.Error("failed to classify refresh-token rotation", slog.Any("error", err))
+		return apperror.NewInternal("failed to verify refresh token")
+	}
+	if state.SessionLive && state.UsedWithinGrace && state.Rotated {
+		slog.Info("concurrent refresh inside the rotation grace window; session kept")
+		return refreshConcurrent()
+	}
+	return s.refreshReused(ctx, hash)
 }
 
 // refreshReused revokes the session that owns a reused refresh token (the

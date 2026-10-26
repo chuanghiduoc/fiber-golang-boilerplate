@@ -33,7 +33,9 @@
   "validation.invalid_email": "Trường {path} phải là địa chỉ email hợp lệ.",
   "validation.too_short": "Trường {path} phải có ít nhất {min} ký tự.",
   "validation.too_long": "Trường {path} phải có tối đa {max} ký tự.",
-  "validation.weak_password": "Trường {path} phải có 8-72 ký tự, bao gồm chữ hoa, chữ thường, chữ số và ký tự đặc biệt.",
+  "validation.weak_password": "Trường {path} phải có 12-64 ký tự (tối đa 72 byte do giới hạn đầu vào của bcrypt) và không được là mật khẩu phổ biến.",
+  "validation.password_common": "Trường {path} là mật khẩu phổ biến; hãy chọn mật khẩu khó đoán hơn.",
+  "validation.password_contains_email": "Trường {path} không được là hoặc chứa địa chỉ email của bạn.",
   "validation.invalid_value": "Trường {path} có giá trị không hợp lệ.",
   "validation.invalid": "Trường {path} không hợp lệ."
 }

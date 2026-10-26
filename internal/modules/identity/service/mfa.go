@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -84,6 +86,8 @@ type MFADeps struct {
 	Issuer   string
 	// Now is a test seam; nil uses time.Now.
 	Now func() time.Time
+	// Security sends the MFA change notifications. Nil disables them.
+	Security *SecurityNotifier
 }
 
 type mfaService struct {
@@ -208,7 +212,19 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate recovery codes")
 	}
-	ctx = database.WithRLSBypass(ctx) // Confirming MFA ends the user's other sessions in every tenant.
+	user, err := s.Stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("user not found")
+		}
+		return nil, apperror.NewInternal("failed to load user")
+	}
+	// Confirming the factor, replacing the recovery codes, and ending the
+	// user's other sessions in every tenant must not half-apply, so they share
+	// one bypass transaction. Every tenant-owned statement still carries its
+	// explicit scope: the revocation is cross-tenant by design and the audit
+	// event names the request tenant explicitly.
+	ctx = database.WithRLSBypass(ctx)
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		factor, err := tx.MFA.GetTOTPForUpdate(ctx, userID)
 		if err != nil {
@@ -249,10 +265,10 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 		if err := tx.Sessions.RevokeOtherUserSessions(ctx, userID, sessionID, RevokeMFAChanged); err != nil {
 			return apperror.NewInternal("failed to revoke other sessions")
 		}
-		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "auth.mfa_enabled", userID, map[string]any{
+		return s.recordMFAChange(ctx, tx, SecurityEventMFAEnabled, user, "auth.mfa_enabled", map[string]any{
 			"type":           MFAFactorTOTP,
 			"recovery_codes": len(plain),
-		})))
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -325,9 +341,16 @@ func (s *mfaService) reauthenticateSession(ctx context.Context, userID, sessionI
 // sessions. The platform route calls it when a user lost both the
 // authenticator and the recovery codes.
 func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
-	ctx = database.WithRLSBypass(ctx) // A platform reset ends the user's sessions in every tenant.
+	// A platform reset removes the global factor/codes, bumps the global token
+	// version, and ends the target user's sessions in every tenant: those
+	// steps must not half-apply, so one bypass transaction owns them. The
+	// factor and user rows are global; the revocation is deliberately
+	// cross-tenant by user id; the audit event names the administrator's
+	// request tenant explicitly.
+	ctx = database.WithRLSBypass(ctx)
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if _, err := tx.Users.GetByID(ctx, userID); err != nil {
+		user, err := tx.Users.GetByID(ctx, userID)
+		if err != nil {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("user not found")
 			}
@@ -345,9 +368,9 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
 		if err := tx.Sessions.RevokeAllForUser(ctx, userID, RevokeMFAChanged); err != nil {
 			return apperror.NewInternal("failed to revoke sessions")
 		}
-		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "admin.user.mfa_reset", userID, map[string]any{
+		return s.recordMFAChange(ctx, tx, SecurityEventMFAReset, user, "admin.user.mfa_reset", map[string]any{
 			"scope": "platform",
-		})))
+		})
 	})
 	if err != nil {
 		return err
@@ -359,11 +382,24 @@ func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
 }
 
 func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code string) error {
-	matched, err := s.checkCode(ctx, userID, code)
+	matched, attempts, err := s.checkCode(ctx, userID, code)
 	if err != nil {
+		s.auditSecondFactorFailure(ctx, userID, attempts, err)
 		return err
 	}
-	ctx = database.WithRLSBypass(ctx) // Disabling MFA ends the user's other sessions in every tenant.
+	user, err := s.Stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to load user")
+	}
+	// Disabling the factor and ending the user's other sessions in every
+	// tenant must not half-apply: a deleted factor with a still-live
+	// MFA-authenticated session would keep that session usable. The factor
+	// rows are global and the revocation is cross-tenant by user id; the
+	// audit event names the request tenant explicitly.
+	ctx = database.WithRLSBypass(ctx)
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := s.consumeCode(ctx, tx.Stores, userID, matched); err != nil {
 			return err
@@ -377,11 +413,12 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 		if err := tx.Sessions.RevokeOtherUserSessions(ctx, userID, sessionID, RevokeMFAChanged); err != nil {
 			return apperror.NewInternal("failed to revoke other sessions")
 		}
-		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "auth.mfa_disabled", userID, map[string]any{
+		return s.recordMFAChange(ctx, tx, SecurityEventMFADisabled, user, "auth.mfa_disabled", map[string]any{
 			"method": matched.auditMethod(),
-		})))
+		})
 	})
 	if err != nil {
+		s.auditSecondFactorFailure(ctx, userID, 0, err)
 		return err
 	}
 	clearMFAAttempts(ctx, s.Cache, userID)
@@ -392,13 +429,21 @@ func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code 
 }
 
 func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID int64, code string) ([]string, error) {
-	matched, err := s.checkCode(ctx, userID, code)
+	matched, attempts, err := s.checkCode(ctx, userID, code)
 	if err != nil {
+		s.auditSecondFactorFailure(ctx, userID, attempts, err)
 		return nil, err
 	}
 	plain, hashes, err := newRecoveryCodes()
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate recovery codes")
+	}
+	user, err := s.Stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("user not found")
+		}
+		return nil, apperror.NewInternal("failed to load user")
 	}
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := s.consumeCode(ctx, tx.Stores, userID, matched); err != nil {
@@ -410,16 +455,33 @@ func (s *mfaService) RegenerateRecoveryCodes(ctx context.Context, userID int64, 
 		if err := tx.MFA.CreateRecoveryCodes(ctx, userID, hashes); err != nil {
 			return apperror.NewInternal("failed to store recovery codes")
 		}
-		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "auth.mfa_recovery_codes_regenerated", userID, map[string]any{
+		return s.recordMFAChange(ctx, tx, SecurityEventRecoveryCodesRegenerated, user, "auth.mfa_recovery_codes_regenerated", map[string]any{
 			"method": matched.auditMethod(),
 			"count":  len(plain),
-		})))
+		})
 	})
 	if err != nil {
+		s.auditSecondFactorFailure(ctx, userID, 0, err)
 		return nil, err
 	}
 	clearMFAAttempts(ctx, s.Cache, userID)
 	return plain, nil
+}
+
+// recordMFAChange enqueues the account-owner notification and writes the Tier
+// 1 audit row in the same transaction as the factor change, so the change, its
+// notification job, and its audit row commit or roll back together.
+func (s *mfaService) recordMFAChange(ctx context.Context, tx TxRepos, event SecurityEvent, user *User, action string, metadata map[string]any) error {
+	if err := s.Security.Deliver(ctx, tx, SecurityNotice{
+		Event:      event,
+		UserID:     user.ID,
+		Name:       user.Name,
+		Email:      user.Email,
+		OccurredAt: time.Now().UTC(),
+	}); err != nil {
+		return err
+	}
+	return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, action, user.ID, metadata)))
 }
 
 // mfaCode is a verified TOTP step or recovery-code hash that still has to be
@@ -433,15 +495,21 @@ type mfaCode struct {
 func (c *mfaCode) auditMethod() string { return c.method }
 
 // checkCode counts one second-factor guess against the per-user MFA budget,
-// then matches code. Callers clear the budget after the code is claimed.
-func (s *mfaService) checkCode(ctx context.Context, userID int64, code string) (*mfaCode, error) {
+// then matches code. Callers clear the budget after the code is claimed and
+// audit a returned error through auditSecondFactorFailure.
+func (s *mfaService) checkCode(ctx context.Context, userID int64, code string) (*mfaCode, int64, error) {
 	if s.Cache == nil {
-		return nil, loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
+		return nil, 0, loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
 	}
-	if err := reserveMFAAttempt(ctx, s.Cache, userID); err != nil {
-		return nil, err
+	attempts, err := reserveMFAAttempt(ctx, s.Cache, userID)
+	if err != nil {
+		return nil, attempts, err
 	}
-	return s.matchCode(ctx, s.Stores, userID, code)
+	matched, err := s.matchCode(ctx, s.Stores, userID, code)
+	if err != nil {
+		return nil, attempts, err
+	}
+	return matched, attempts, nil
 }
 
 // matchCode checks code against the confirmed factor. A non-matching TOTP
@@ -488,6 +556,70 @@ func (s *mfaService) consumeCode(ctx context.Context, st Stores, userID int64, m
 		return mfaInvalidCode()
 	}
 	return nil
+}
+
+// auditSecondFactorFailure records a failed TOTP/recovery-code attempt in its
+// own transaction, so it persists although the request that failed rolls back
+// or returns a 401/429. attempts is the budget counter after this guess: the
+// 6th attempt (max+1) is the one that exhausted the budget, and only that one
+// records the lockout event. An audit write failure is logged and swallowed:
+// it must never turn a 401 into a 5xx.
+func (s *mfaService) auditSecondFactorFailure(ctx context.Context, userID, attempts int64, err error) {
+	var appErr *apperror.AppError
+	if userID <= 0 || !errors.As(err, &appErr) {
+		return
+	}
+	reason := ""
+	switch {
+	case appErr.Status == http.StatusTooManyRequests:
+		reason = "budget_exhausted"
+	case appErr.Code == string(identitycatalog.CodeAuthMFAInvalidCode):
+		reason = "invalid_code"
+	case appErr.Code == string(identitycatalog.CodeAuthMFANotEnabled):
+		reason = "not_enabled"
+	default:
+		// Internal and conflict failures are not second-factor guesses.
+		return
+	}
+	s.recordMFAFailure(ctx, userID, reason)
+	if reason == "budget_exhausted" && attempts == maxMFAAttempts+1 {
+		s.recordMFABudgetExhausted(ctx, userID)
+	}
+}
+
+func (s *mfaService) recordMFAFailure(ctx context.Context, userID int64, reason string) {
+	event := userEvent(ctx, "auth.mfa_verify_failed", userID, map[string]any{
+		"reason": reason,
+	})
+	event.ActorID = userID
+	event.ActorType = audit.ActorTypeUser
+	event.Outcome = audit.OutcomeFailed
+	s.recordMFAEventDetached(ctx, event)
+}
+
+func (s *mfaService) recordMFABudgetExhausted(ctx context.Context, userID int64) {
+	event := userEvent(ctx, "auth.mfa_attempts_exhausted", userID, map[string]any{
+		"reason": "budget_exhausted",
+	})
+	event.ActorID = userID
+	event.ActorType = audit.ActorTypeUser
+	event.Outcome = audit.OutcomeFailed
+	s.recordMFAEventDetached(ctx, event)
+}
+
+// recordMFAEventDetached writes a failure event in its own transaction. The
+// request context may be canceled while it fails; the audit must still commit.
+func (s *mfaService) recordMFAEventDetached(ctx context.Context, event audit.Event) {
+	ctx = context.WithoutCancel(ctx)
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		return tx.Audit.RecordTx(ctx, event)
+	})
+	if err != nil {
+		slog.Error("failed to record MFA failure audit event",
+			slog.String("action", event.Action),
+			slog.Any("error", err),
+		)
+	}
 }
 
 // mfaChallenge is the sealed two-step login payload. It carries only data the
@@ -556,9 +688,11 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		return nil, err
 	}
 	if payload.TenantID != tenant.EffectiveID(ctx) {
+		s.recordMFAFailure(ctx, payload.UserID, "challenge_invalid")
 		return nil, mfaChallengeInvalid()
 	}
 	if s.now().Unix() > payload.ExpiresAt {
+		s.recordMFAFailure(ctx, payload.UserID, "challenge_invalid")
 		return nil, mfaChallengeInvalid()
 	}
 
@@ -569,8 +703,9 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		}
 		return nil, apperror.NewInternal("failed to load user")
 	}
-	matched, err := s.checkCode(ctx, user.ID, code)
+	matched, attempts, err := s.checkCode(ctx, user.ID, code)
 	if err != nil {
+		s.auditSecondFactorFailure(ctx, user.ID, attempts, err)
 		return nil, err
 	}
 
@@ -609,6 +744,9 @@ func (s *mfaService) Verify(ctx context.Context, challenge, code string) (*MFALo
 		return nil
 	})
 	if err != nil {
+		// The claim or the challenge failed inside the transaction, which
+		// rolled back; record the failed attempt in its own transaction.
+		s.auditSecondFactorFailure(ctx, user.ID, 0, err)
 		return nil, err
 	}
 	clearMFAAttempts(ctx, s.Cache, user.ID)

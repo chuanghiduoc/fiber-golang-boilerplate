@@ -66,6 +66,10 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	}
 
 	stores := identityrepository.NewStores(infra.DB)
+	// Security notifications commit their email.send job with the change when
+	// the transactor has an outbox; the sender is only the after-commit
+	// fallback for deployments without one.
+	securityNotifier := identityservice.NewSecurityNotifier(stores.Tenants, infra.Email)
 	// cmd/api always supplies the DATA_ENCRYPTION_KEY codec. Builds without one
 	// (unit/arch tests, an app built with New) fall back to the JWT secret the
 	// same way local job payload encryption does.
@@ -99,6 +103,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		time.Duration(cfg.JWT.RefreshExpireDays)*24*time.Hour, cfg.JWT.SessionMaxLifetime, sessionStore)
 	mfaSvc := identityservice.NewMFAService(identityservice.MFADeps{
 		Stores: stores, Tx: transactor, Cache: infra.Cache, Sealer: sealer, Sessions: sessionSvc,
+		Security: securityNotifier,
 	})
 
 	emailVerifSvc := identityservice.NewEmailVerificationService(identityservice.VerificationDeps{
@@ -113,10 +118,11 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		Verification:             emailVerifSvc,
 		MailTransactional:        transactor.MailTransactional(),
 		RequireEmailVerification: cfg.App.RequireEmailVerification,
+		Security:                 securityNotifier,
 	})
 	passwordResetSvc := identityservice.NewPasswordResetService(identityservice.ResetDeps{
 		Stores: stores, Tx: transactor, Sender: infra.Email, Cache: infra.Cache,
-		FrontendURL: cfg.App.FrontendURL, SessionCache: sessionStore,
+		FrontendURL: cfg.App.FrontendURL, SessionCache: sessionStore, Security: securityNotifier,
 	})
 	// Forgot-password requests run as durable jobs so the public endpoint has
 	// the same cost and failure modes for registered and unknown addresses.
@@ -140,6 +146,8 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		RequireEmailVerification: cfg.App.RequireEmailVerification,
 		GoogleOAuth:              googleOAuthProvider(googleOAuth),
 		Tenants:                  tenantSvc,
+		Cache:                    infra.Cache,
+		Sealer:                   sealer,
 		MFA:                      mfaSvc,
 	})
 	userHandler := identityhandler.NewUserHandler(userSvc, emailVerifSvc)

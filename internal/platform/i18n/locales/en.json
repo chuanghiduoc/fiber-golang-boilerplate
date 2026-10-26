@@ -33,7 +33,9 @@
   "validation.invalid_email": "The {path} field must be a valid email address.",
   "validation.too_short": "The {path} field must be at least {min} characters.",
   "validation.too_long": "The {path} field must be at most {max} characters.",
-  "validation.weak_password": "The {path} field must be 8-72 characters with uppercase, lowercase, digit, and special character.",
+  "validation.weak_password": "The {path} field must be 12-64 characters (at most 72 bytes, the bcrypt input limit) and must not be a commonly used password.",
+  "validation.password_common": "The {path} field is a commonly used password; choose a less predictable one.",
+  "validation.password_contains_email": "The {path} field must not be or contain your email address.",
   "validation.invalid_value": "The {path} field has an invalid value.",
   "validation.invalid": "The {path} field is invalid."
 }

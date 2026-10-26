@@ -55,6 +55,7 @@ func identityApp(h *identityHarness) *fiber.App {
 	auth.Post("/invitations/signup", invitationHandler.SignUp)
 	auth.Get("/google", h.auth.GoogleRedirect)
 	auth.Get("/google/callback", h.auth.GoogleCallback)
+	auth.Post("/google/exchange", h.auth.GoogleExchange)
 
 	invitations := api.Group("/invitations", jwt)
 	invitations.Post("/", authzhttp.Require(identitycatalog.PermissionInvitationsWrite), invitationHandler.Create)
@@ -152,7 +153,7 @@ func refresh(t *testing.T, app *fiber.App, slug, refreshToken string) (int, dto.
 func TestIntegration_SessionLifecycle(t *testing.T) {
 	h := newIdentityHarness(t, nil)
 	app := identityApp(h)
-	const pw = "Password1!"
+	const pw = "Password1!2026"
 
 	status, body := do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/register",
 		body: dto.RegisterRequest{Email: "Life@Example.com", Password: pw, Name: "Life Cycle"}})
@@ -165,10 +166,23 @@ func TestIntegration_SessionLifecycle(t *testing.T) {
 	first := mustLogin(t, app, "", "life@example.com", pw)
 	assert.Equal(t, http.StatusOK, me(t, app, "", first.AccessToken))
 
-	// Rotation, then reuse of the consumed token revokes the whole family.
+	// Rotation, then an immediate replay is a concurrent refresh: 401 without
+	// revoking the session, so the newly rotated token still works.
 	status, rotated := refresh(t, app, "", first.RefreshToken)
 	require.Equal(t, http.StatusOK, status)
 	assert.Equal(t, http.StatusOK, me(t, app, "", rotated.AccessToken))
+	status, body = do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/refresh", tenant: "",
+		body: dto.RefreshRequest{RefreshToken: first.RefreshToken}})
+	assert.Equal(t, http.StatusUnauthorized, status)
+	assert.Contains(t, string(body), string(identitycatalog.CodeAuthRefreshConcurrent))
+	assert.Equal(t, http.StatusOK, me(t, app, "", rotated.AccessToken), "the grace keeps the session alive")
+
+	// Outside the 10-second grace the same replay is reuse and revokes the
+	// whole family.
+	_, err := h.pool.Exec(context.Background(),
+		`UPDATE refresh_tokens SET used_at = NOW() - INTERVAL '11 seconds'
+		 WHERE session_id IN (SELECT id FROM sessions WHERE user_id = $1) AND used_at IS NOT NULL`, registered.ID)
+	require.NoError(t, err)
 	status, _ = refresh(t, app, "", first.RefreshToken)
 	assert.Equal(t, http.StatusUnauthorized, status, "reused refresh token")
 	assert.Equal(t, http.StatusUnauthorized, me(t, app, "", rotated.AccessToken), "the family's access tokens die with the session")
@@ -256,7 +270,7 @@ func TestIntegration_InvitationJoinsAnotherTenant(t *testing.T) {
 	h := newIdentityHarness(t, nil)
 	app := identityApp(h)
 	ctx := context.Background()
-	const pw = "Password1!"
+	const pw = "Password1!2026"
 
 	acme, err := h.tenants.Create(ctx, identityservice.NewTenant{Slug: "acme", Name: "Acme", Status: identityservice.TenantStatusActive})
 	require.NoError(t, err)
@@ -365,9 +379,32 @@ func TestOAuthIntegration_NonDefaultTenantStartAndCallback(t *testing.T) {
 	assert.Equal(t, acme.ID, stateTenantID)
 
 	// An explicitly conflicting header is ignored: the signed state wins.
+	// The callback only carries a one-time code, never the tokens.
 	status, location := finishOAuth(t, app, state, cookie, "default")
 	require.Equal(t, http.StatusSeeOther, status)
-	assert.Contains(t, location, "access_token=")
+	assert.Contains(t, location, "#code=")
+	assert.NotContains(t, location, "access_token=")
+	exchangeCode := callbackCode(t, location)
+
+	// The code is bound to the state tenant: another tenant cannot redeem it.
+	status, body := do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/google/exchange", tenant: "default",
+		body: dto.GoogleExchangeRequest{Code: exchangeCode}})
+	assert.Equal(t, http.StatusUnauthorized, status)
+	assert.Contains(t, string(body), string(identitycatalog.CodeAuthOAuthCodeInvalid))
+
+	status, body = do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/google/exchange", tenant: "oauth-acme",
+		body: dto.GoogleExchangeRequest{Code: exchangeCode}})
+	require.Equal(t, http.StatusOK, status, string(body))
+	var exchanged dto.LoginResponse
+	require.NoError(t, json.Unmarshal(body, &exchanged))
+	assert.NotEmpty(t, exchanged.AccessToken)
+	assert.NotEmpty(t, exchanged.RefreshToken)
+	assert.Equal(t, "oauth@example.com", exchanged.User.Email)
+
+	// The code is single-use.
+	status, _ = do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/google/exchange", tenant: "oauth-acme",
+		body: dto.GoogleExchangeRequest{Code: exchangeCode}})
+	assert.Equal(t, http.StatusUnauthorized, status, "the exchange code was already redeemed")
 
 	user, err := h.stores.Users.GetByIdentity(ctx, identityservice.ProviderGoogle, "google-user-1")
 	require.NoError(t, err)
@@ -470,6 +507,18 @@ func finishOAuth(t *testing.T, app *fiber.App, state string, cookie *http.Cookie
 	resp, err := app.Test(req)
 	require.NoError(t, err)
 	return resp.StatusCode, resp.Header.Get("Location")
+}
+
+// callbackCode extracts the one-time code from a Google callback's fragment.
+func callbackCode(t *testing.T, location string) string {
+	t.Helper()
+	u, err := url.Parse(location)
+	require.NoError(t, err)
+	values, err := url.ParseQuery(u.Fragment)
+	require.NoError(t, err)
+	code := values.Get("code")
+	require.NotEmpty(t, code, "the callback must carry a one-time code")
+	return code
 }
 
 func itoa(n int64) string {

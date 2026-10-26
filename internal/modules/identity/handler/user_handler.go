@@ -262,6 +262,16 @@ func (h *UserHandler) ChangePassword(c fiber.Ctx) error {
 		return err
 	}
 
+	// The address is only known from the membership, so the password/email
+	// policy (NIST 800-63B) runs here rather than in the tag validator.
+	member, err := h.service.GetByID(c.Context(), httpx.AuthUserID(c))
+	if err != nil {
+		return err
+	}
+	if err := service.ValidatePasswordForEmail(req.NewPassword, member.User.Email, "newPassword"); err != nil {
+		return err
+	}
+
 	if err := h.service.ChangePassword(withClientIP(c), httpx.AuthUserID(c), service.ChangePasswordInput{
 		CurrentPassword: req.CurrentPassword,
 		NewPassword:     req.NewPassword,

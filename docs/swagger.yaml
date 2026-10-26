@@ -511,6 +511,15 @@ definitions:
     required:
     - email
     type: object
+  dto.GoogleExchangeRequest:
+    properties:
+      code:
+        maxLength: 128
+        minLength: 32
+        type: string
+    required:
+    - code
+    type: object
   dto.InboundEventResponse:
     properties:
       duplicate:
@@ -2462,6 +2471,46 @@ paths:
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       summary: Google OAuth callback
+      tags:
+      - Auth
+  /auth/google/exchange:
+    post:
+      consumes:
+      - application/json
+      description: Exchange the single-use code from the Google callback's URL fragment
+        for the normal access and refresh token pair. The code expires after 60 seconds,
+        works once, and is bound to the tenant that started the flow.
+      parameters:
+      - description: One-time code from the callback fragment
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.GoogleExchangeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.LoginResponse'
+        "401":
+          description: auth.oauth_code_invalid
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "422":
+          description: Unprocessable Entity
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      summary: Redeem a Google sign-in code
       tags:
       - Auth
   /auth/invitations/accept:

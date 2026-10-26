@@ -82,14 +82,14 @@ func TestAuthAudit_ActorAttribution(t *testing.T) {
 		{
 			name:        "login",
 			path:        "/auth/login",
-			payload:     identitydto.LoginRequest{Email: "test@example.com", Password: "Password1!"},
+			payload:     identitydto.LoginRequest{Email: "test@example.com", Password: "Password1!2026"},
 			wantStatus:  fiber.StatusOK,
 			wantActorID: 1,
 		},
 		{
 			name:        "register",
 			path:        "/auth/register",
-			payload:     identitydto.RegisterRequest{Email: "new@example.com", Password: "Password1!", Name: "New User"},
+			payload:     identitydto.RegisterRequest{Email: "new@example.com", Password: "Password1!2026", Name: "New User"},
 			wantStatus:  fiber.StatusCreated,
 			wantActorID: 2,
 		},

@@ -535,6 +535,19 @@ type SessionRepository interface {
 	State(ctx context.Context, sessionID, userID int64) (*SessionState, error)
 }
 
+// RefreshRotationState is the one-statement view of a repeated refresh token
+// used to decide between the concurrent-refresh grace and reuse revocation.
+type RefreshRotationState struct {
+	// SessionLive reports that the token's session is not revoked and not
+	// expired.
+	SessionLive bool
+	// UsedWithinGrace reports that the token was consumed after usedAfter.
+	UsedWithinGrace bool
+	// Rotated reports that a newer token already exists in the same session,
+	// so this token was consumed by a rotation (not by logout/revocation).
+	Rotated bool
+}
+
 // RefreshTokenRepository stores refresh-token hashes.
 type RefreshTokenRepository interface {
 	Create(ctx context.Context, sessionID int64, tokenHash string, expiresAt time.Time) error
@@ -544,6 +557,10 @@ type RefreshTokenRepository interface {
 	GetByHash(ctx context.Context, tokenHash string) (*RefreshToken, error)
 	// MarkUsed reports whether this call consumed the token.
 	MarkUsed(ctx context.Context, tenantID, id int64) (bool, error)
+	// ClassifyRotation reads the token and its session in one statement and
+	// reports whether the token was consumed by a recent rotation of a still
+	// live session. It is the race-safe input to the concurrent-refresh grace.
+	ClassifyRotation(ctx context.Context, tokenHash string, usedAfter time.Time) (RefreshRotationState, error)
 }
 
 // PasswordResetRepository stores per-user reset tokens.
@@ -569,9 +586,13 @@ type InvitationRepository interface {
 	Upsert(ctx context.Context, invitation NewInvitation) (*Invitation, error)
 	ListPendingCursor(ctx context.Context, cur pagination.DBCursor) ([]Invitation, error)
 	DeletePending(ctx context.Context, id int64) (bool, error)
-	// GetByTokenHashForUpdate is possession-based (no tenant predicate) and
-	// locks the row for the rest of the transaction.
-	GetByTokenHashForUpdate(ctx context.Context, tokenHash string) (*Invitation, error)
+	// TenantByTokenHash resolves the inviting tenant by token possession alone
+	// (the caller is not a member of that tenant yet). It is the single
+	// cross-tenant read of an accept/sign-up.
+	TenantByTokenHash(ctx context.Context, tokenHash string) (int64, error)
+	// GetByTokenHashForUpdate is scoped to tenantID and locks the row for the
+	// rest of the transaction.
+	GetByTokenHashForUpdate(ctx context.Context, tenantID int64, tokenHash string) (*Invitation, error)
 	// MarkAccepted scopes to Invitation.TenantID (passed explicitly because
 	// an authenticated invitee's request tenant is another tenant).
 	MarkAccepted(ctx context.Context, tenantID, id, userID int64) (bool, error)
@@ -768,9 +789,12 @@ type TxRepos struct {
 	// Mail is nil when the wired email sender cannot enqueue on the
 	// transaction; callers then send after commit.
 	Mail Mailer
-	// Jobs is never nil in production; privacy requests enqueue their durable
-	// job in the same transaction as the row.
+	// Jobs enqueues a durable job on the caller's transaction.
 	Jobs JobEnqueuer
+	// AfterCommit registers a callback that runs only after the transaction
+	// commits (never on rollback). It is nil outside a production transactor;
+	// callers must treat a nil hook as "no post-commit channel".
+	AfterCommit func(func())
 }
 
 // Transactor runs fn in one transaction: when fn returns an error every write

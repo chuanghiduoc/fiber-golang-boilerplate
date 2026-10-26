@@ -27,7 +27,7 @@ type testSealer struct{}
 
 // mfaIntegrationPassword is the local password of the MFA integration
 // fixtures, used to re-authenticate enrollment management.
-const mfaIntegrationPassword = "Password1!"
+const mfaIntegrationPassword = "Password1!2026"
 
 func (testSealer) Seal(p []byte) ([]byte, error) { return append([]byte("sealed:"), p...), nil }
 
@@ -53,6 +53,44 @@ func recoveryHash(code string) string {
 }
 
 // One RFC 6238 step may be consumed at most once, even by concurrent requests.
+// A failed second-factor guess is audited in its own transaction, so the row
+// is visible after the login request returns 401, attributed to the user and
+// without the attempted code.
+func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "mfa-audit@example.com",
+		testutil.MemberOptions{Password: mfaIntegrationPassword})
+	secret := enrollSecret(t, e, user.UserID)
+
+	code, err := totp.Code(secret, time.Now())
+	require.NoError(t, err)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	require.NoError(t, err)
+
+	challenge, err := e.mfa.BeginChallenge(ctx, user.UserID, service.AMRPassword)
+	require.NoError(t, err)
+	const attempted = "not-a-real-code"
+	_, err = e.mfa.Verify(ctx, challenge, attempted)
+	require.Error(t, err)
+
+	var actorID int64
+	var actorType, reason string
+	require.NoError(t, e.pool.QueryRow(ctx,
+		`SELECT actor_id, actor_type, metadata->>'reason' FROM audit_events
+		 WHERE action = 'auth.mfa_verify_failed' ORDER BY id DESC LIMIT 1`).
+		Scan(&actorID, &actorType, &reason))
+	assert.Equal(t, user.UserID, actorID)
+	assert.Equal(t, "user", actorType)
+	assert.Equal(t, "invalid_code", reason)
+
+	var leaked int64
+	require.NoError(t, e.pool.QueryRow(ctx,
+		`SELECT count(*) FROM audit_events WHERE metadata::text LIKE '%' || $1 || '%'`, attempted).
+		Scan(&leaked))
+	assert.Zero(t, leaked, "the attempted code must never be persisted")
+}
+
 func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()

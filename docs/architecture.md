@@ -274,7 +274,7 @@ normally and its requests return 404.
 | Feature flags | Targets are tenant-owned (`tenant.EffectiveID(ctx)`); a composite FK keeps user targets in their tenant. Definitions, defaults, and kill switches are process-wide. See [Feature Flags](feature-flags.md). |
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
-| OAuth | The tenant is bound into `state` and the state cookie; the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. |
+| OAuth | The tenant is bound into the signed `state` and the state cookie (which also holds the PKCE verifier); the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. The callback redirects with a single-use 60-second code, redeemed through `POST /auth/google/exchange`. |
 | Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
@@ -290,9 +290,15 @@ acquire it, so injected SQL cannot turn the predicate off. The deliberate
 cross-tenant paths (global job work, retention, feature snapshots, webhook
 inbound lookup, global-user operations) set `database.WithRLSBypass`; the
 transaction manager or statement then runs on a separate `BYPASSRLS` role
-pool that the normal role is not a member of. A bypass marker that appears
-only after a normal transaction began fails loudly. Per-tenant limits remain
-future work.
+pool that the normal role is not a member of. The pool is chosen at `BEGIN`:
+a bypass marker added inside a transaction that began on the normal pool does
+not change its connection, so those statements stay tenant-scoped (mark the
+context before `WithTx`). The scope is narrowed to what needs it: invitation
+accept/sign-up bypass only the possession-based tenant read, then lock the
+invitation and do the membership/audit work under that tenant; credential and
+MFA changes that must revoke every tenant's sessions keep one bypass
+transaction for atomicity and give every tenant-owned statement an explicit
+tenant predicate. Per-tenant limits remain future work.
 
 ## Authorization
 

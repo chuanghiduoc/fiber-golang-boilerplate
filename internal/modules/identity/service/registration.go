@@ -40,6 +40,9 @@ func (s *userService) Register(ctx context.Context, req RegisterInput) (*Member,
 	email := NormalizeEmail(req.Email)
 	name := strings.TrimSpace(req.Name)
 
+	if err := ValidatePasswordForEmail(req.Password, email, "password"); err != nil {
+		return nil, err
+	}
 	if err := ensureEmailUnregistered(ctx, s.Stores, email); err != nil {
 		return nil, err
 	}

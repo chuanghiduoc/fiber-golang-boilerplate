@@ -3,7 +3,9 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -108,25 +110,38 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 	h.auth = NewAuthHandler(AuthDeps{
 		Users: users, Sessions: sessions, Resets: resets, Verification: verification,
 		OAuthStateSecret: harnessSecret, GoogleOAuth: google, Tenants: tenants,
+		Cache: appCache, Sealer: harnessSealer{},
 	})
 	return h
+}
+
+// harnessSealer is a reversible test double for the data-encryption codec
+// used by the one-time Google exchange grant.
+type harnessSealer struct{}
+
+func (harnessSealer) Seal(p []byte) ([]byte, error) { return append([]byte("sealed:"), p...), nil }
+
+func (harnessSealer) Open(p []byte) ([]byte, error) {
+	if !bytes.HasPrefix(p, []byte("sealed:")) {
+		return nil, errors.New("sealed payload not recognized")
+	}
+	return p[len("sealed:"):], nil
 }
 
 type fakeGoogleOAuth struct {
 	info *oauth.GoogleUserInfo
 }
 
-func (f *fakeGoogleOAuth) AuthURL(state string) string {
+func (f *fakeGoogleOAuth) AuthURL(state, _ string) string {
 	return "https://accounts.example.test/o/oauth2/auth?state=" + state
 }
 
-func (f *fakeGoogleOAuth) Exchange(context.Context, string) (*oauth.GoogleUserInfo, error) {
+func (f *fakeGoogleOAuth) Exchange(context.Context, string, string) (*oauth.GoogleUserInfo, error) {
 	return f.info, nil
 }
 
-func (f *fakeGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string {
-	return "https://frontend.example.test/auth/callback#access_token=" + accessToken +
-		"&refresh_token=" + refreshToken
+func (f *fakeGoogleOAuth) BuildCodeCallbackURL(code string) string {
+	return "https://frontend.example.test/auth/callback#code=" + code
 }
 
 func (f *fakeGoogleOAuth) BuildMFACallbackURL(challenge string) string {

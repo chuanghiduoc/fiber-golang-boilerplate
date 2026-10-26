@@ -296,6 +296,9 @@ var fallbackAudited = map[string]bool{
 	// Public receiver: authenticated by the source HMAC, deduplicated per
 	// (source, webhook-id); every accepted event is stored.
 	"POST /api/v1/webhooks/inbound/:id": true,
+	// Redeems the callback's single-use code for tokens the callback already
+	// audited as auth.google_login; it changes no privileged state itself.
+	"POST /api/v1/auth/google/exchange": true,
 	// The caller's own notification state, not privileged configuration.
 	"POST /api/v1/notifications/read-all":   true,
 	"POST /api/v1/notifications/:id/read":   true,

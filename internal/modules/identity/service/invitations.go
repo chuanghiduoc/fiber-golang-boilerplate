@@ -219,16 +219,22 @@ func (s *InvitationService) Revoke(ctx context.Context, id int64) error {
 // address, so it also marks the email verified. A removed membership is
 // reactivated; an active or banned one is refused.
 func (s *InvitationService) Accept(ctx context.Context, userID int64, token string) (*Member, error) {
+	tokenHash := hashToken(token)
+	// Only the possession-based tenant lookup is cross-tenant; after it the
+	// transaction runs under the inviting tenant's RLS scope, so the
+	// membership work and the audit row are guarded like any tenant request.
+	invitationTenant, err := s.resolveInvitationTenant(ctx, tokenHash)
+	if err != nil {
+		return nil, err
+	}
+	tctx := tenant.WithID(ctx, invitationTenant)
 	var member *Member
-	// The token is possession-based and may belong to a tenant the caller is
-	// not signed in to yet; the transaction then writes under its owning tenant.
-	ctx = database.WithRLSBypass(ctx)
-	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		inv, tctx, err := s.pendingInvitation(ctx, tx.Stores, token)
+	err = s.tx.InTx(tctx, func(ctx context.Context, tx TxRepos) error {
+		inv, ictx, err := s.pendingInvitation(ctx, tx.Stores, invitationTenant, tokenHash)
 		if err != nil {
 			return err
 		}
-		if err := ensureInviterCanGrant(tctx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
+		if err := ensureInviterCanGrant(ictx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
 			return err
 		}
 		user, err := tx.Users.GetByID(ctx, userID)
@@ -238,7 +244,7 @@ func (s *InvitationService) Accept(ctx context.Context, userID int64, token stri
 		if user.Email != inv.Email {
 			return invitationInvalid("this invitation was sent to a different email address")
 		}
-		joined, err := joinTenant(tctx, tx.Stores, user, inv)
+		joined, err := joinTenant(ictx, tx.Stores, user, inv)
 		if err != nil {
 			return err
 		}
@@ -246,9 +252,9 @@ func (s *InvitationService) Accept(ctx context.Context, userID int64, token stri
 			return err
 		}
 		member = joined
-		event := invitationEvent(tctx, "invitation.accepted", inv, map[string]any{"signup": false, "role": inv.Role})
+		event := invitationEvent(ictx, "invitation.accepted", inv, map[string]any{"signup": false, "role": inv.Role})
 		event.ActorID, event.ActorType = userID, audit.ActorTypeUser
-		return checkAudit(tx.Audit.RecordTx(tctx, event))
+		return checkAudit(tx.Audit.RecordTx(ictx, event))
 	})
 	return member, err
 }
@@ -264,19 +270,25 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 	if err != nil {
 		return nil, apperror.NewInternal("failed to hash password")
 	}
+	tokenHash := hashToken(in.Token)
+	// Resolve the invitation's tenant by possession, then require the request
+	// tenant to match before the tenant-scoped transaction starts. Only the
+	// resolution is cross-tenant; the account, membership, and audit row are
+	// written under the invitation's RLS scope.
+	invitationTenant, err := s.resolveInvitationTenant(ctx, tokenHash)
+	if err != nil {
+		return nil, err
+	}
+	if invitationTenant != tenant.EffectiveID(ctx) {
+		return nil, invitationInvalid("invalid or expired invitation")
+	}
 	var member *Member
-	// The token is possession-based; the request tenant must still match the
-	// invitation's tenant below.
-	ctx = database.WithRLSBypass(ctx)
 	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		inv, tctx, err := s.pendingInvitation(ctx, tx.Stores, in.Token)
+		inv, ictx, err := s.pendingInvitation(ctx, tx.Stores, invitationTenant, tokenHash)
 		if err != nil {
 			return err
 		}
-		if inv.TenantID != tenant.EffectiveID(ctx) {
-			return invitationInvalid("invalid or expired invitation")
-		}
-		if err := ensureInviterCanGrant(tctx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
+		if err := ensureInviterCanGrant(ictx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
 			return err
 		}
 		if _, err := tx.Users.GetByEmail(ctx, inv.Email); err == nil {
@@ -284,7 +296,7 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 		} else if !errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewInternal("failed to check existing user")
 		}
-		created, err := createAccount(tctx, tx.Stores, NewUser{
+		created, err := createAccount(ictx, tx.Stores, NewUser{
 			Email: inv.Email, Name: strings.TrimSpace(in.Name), EmailVerified: true,
 		}, string(hash), inv.Role)
 		if err != nil {
@@ -294,11 +306,27 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 			return err
 		}
 		member = created
-		event := invitationEvent(tctx, "invitation.accepted", inv, map[string]any{"signup": true, "role": inv.Role})
+		event := invitationEvent(ictx, "invitation.accepted", inv, map[string]any{"signup": true, "role": inv.Role})
 		event.ActorID, event.ActorType = created.User.ID, audit.ActorTypeUser
-		return checkAudit(tx.Audit.RecordTx(tctx, event))
+		return checkAudit(tx.Audit.RecordTx(ictx, event))
 	})
 	return member, err
+}
+
+// resolveInvitationTenant resolves the inviting tenant from the token before
+// any tenant-scoped work: possession of the opaque token is the authorization
+// and the caller is not a member of that tenant yet. It is the only bypass
+// read in an accept/sign-up; the tenant-scoped transaction re-reads the
+// invitation with an explicit tenant predicate and locks it.
+func (s *InvitationService) resolveInvitationTenant(ctx context.Context, tokenHash string) (int64, error) {
+	tenantID, err := s.stores.Invitations.TenantByTokenHash(database.WithRLSBypass(ctx), tokenHash)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return 0, invitationInvalid("invalid or expired invitation")
+		}
+		return 0, apperror.NewInternal("failed to load invitation")
+	}
+	return tenantID, nil
 }
 
 // markAccepted stamps the (row-locked) invitation as accepted by userID. A
@@ -317,16 +345,19 @@ func markAccepted(ctx context.Context, invitations InvitationRepository, inv *In
 	}
 }
 
-// pendingInvitation locks the invitation of token and returns it with a
-// context scoped to its tenant.
-func (s *InvitationService) pendingInvitation(ctx context.Context, st Stores, token string) (*Invitation, context.Context, error) {
+// pendingInvitation re-reads and locks the invitation of tokenHash under its
+// tenant's scope and returns it with a context scoped to that tenant.
+func (s *InvitationService) pendingInvitation(ctx context.Context, st Stores, tenantID int64, tokenHash string) (*Invitation, context.Context, error) {
 	const invalid = "invalid or expired invitation"
-	inv, err := st.Invitations.GetByTokenHashForUpdate(ctx, hashToken(token))
+	inv, err := st.Invitations.GetByTokenHashForUpdate(ctx, tenantID, tokenHash)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, nil, invitationInvalid(invalid)
 		}
 		return nil, nil, apperror.NewInternal("failed to load invitation")
+	}
+	if inv.TenantID != tenantID {
+		return nil, nil, invitationInvalid(invalid)
 	}
 	if inv.AcceptedAt != nil || !inv.ExpiresAt.After(time.Now()) {
 		return nil, nil, invitationInvalid(invalid)

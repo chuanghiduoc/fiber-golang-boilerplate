@@ -45,7 +45,7 @@ func TestUserRegisteredEvent(t *testing.T) {
 func TestRegister_PublishesUserRegisteredInRequestTenant(t *testing.T) {
 	db := newMemDB()
 	ctx := tenant.WithID(context.Background(), 2)
-	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "e@example.com", Password: "Password1!", Name: "E"})
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "e@example.com", Password: "Password1!2026", Name: "E"})
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}

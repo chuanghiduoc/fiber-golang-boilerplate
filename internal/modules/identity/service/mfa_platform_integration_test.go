@@ -42,7 +42,7 @@ func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 
 	require.NoError(t, e.resets.ForgotPassword(ctx, service.ForgotPasswordInput{Email: user.Email}))
 	token := e.mail.tokenFor(t, user.Email)
-	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: token, Password: "NewPassword1!"}))
+	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: token, Password: "NewPassword1!2026"}))
 
 	assert.Zero(t, scalar[int64](t, e.pool,
 		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NULL`, user.UserID))

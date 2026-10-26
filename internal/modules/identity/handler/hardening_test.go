@@ -45,7 +45,7 @@ func TestUpdateMe_EmailChangeRequiresPassword(t *testing.T) {
 
 	body, _ = json.Marshal(map[string]string{
 		"email":           "new@example.com",
-		"currentPassword": "Password1!",
+		"currentPassword": "Password1!2026",
 	})
 	req, _ = http.NewRequest("PUT", "/users/me", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -59,7 +59,7 @@ func TestUpdateMe_EmailChangeRequiresPassword(t *testing.T) {
 func TestRegisterHandler_RejectsUnknownFields(t *testing.T) {
 	app := setupApp(newMockService())
 
-	body := []byte(`{"email":"new@example.com","password":"Password1!","name":"New","isAdmin":true}`)
+	body := []byte(`{"email":"new@example.com","password":"Password1!2026","name":"New","isAdmin":true}`)
 	req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 

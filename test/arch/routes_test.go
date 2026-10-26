@@ -30,6 +30,7 @@ var publicRoutes = map[string]string{
 	"POST /api/v1/auth/resend-verification": "anonymous, non-enumerating",
 	"GET /api/v1/auth/google":               "OAuth redirect",
 	"GET /api/v1/auth/google/callback":      "signed OAuth state",
+	"POST /api/v1/auth/google/exchange":     "single-use 256-bit one-time code bound to the signed-state tenant",
 	"POST /api/v1/webhooks/inbound/:id":     "source HMAC signature",
 }
 

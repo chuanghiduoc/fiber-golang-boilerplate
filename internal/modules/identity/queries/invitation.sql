@@ -23,11 +23,19 @@ LIMIT @row_limit::int;
 DELETE FROM invitations
 WHERE tenant_id = $1 AND id = $2 AND accepted_at IS NULL;
 
+-- name: GetInvitationTenantByTokenHash :one
+-- Possession-based pre-read: the invitee may not be signed in to (or a member
+-- of) the inviting tenant yet, so the tenant is resolved by token hash alone
+-- before the tenant-scoped transaction starts. The invitation is re-locked
+-- and re-validated under that tenant's scope.
+SELECT tenant_id FROM invitations
+WHERE token_hash = $1;
+
 -- name: GetInvitationByTokenHashForUpdate :one
--- Possession-based lookup: the invitee may not be a member of (or signed in
--- to) the inviting tenant yet. The row lock serializes concurrent accepts.
+-- Tenant-scoped possession lookup: the row lock serializes concurrent accepts.
+-- tenant_id is explicit so the statement stays safe even under RLS bypass.
 SELECT * FROM invitations
-WHERE token_hash = $1
+WHERE tenant_id = @tenant_id AND token_hash = @token_hash
 FOR UPDATE;
 
 -- name: MarkInvitationAccepted :execrows

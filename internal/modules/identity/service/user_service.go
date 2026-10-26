@@ -64,6 +64,9 @@ type UserDeps struct {
 	Verification             EmailVerificationService
 	MailTransactional        bool
 	RequireEmailVerification bool
+	// Security sends the account-change notification emails. Nil disables
+	// them (minimal test wirings).
+	Security *SecurityNotifier
 }
 
 type userService struct {

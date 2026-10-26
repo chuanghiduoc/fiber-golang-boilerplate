@@ -22,16 +22,16 @@ import (
 // errorGoogleOAuth fails the code exchange with a fixed error.
 type errorGoogleOAuth struct{ err error }
 
-func (f *errorGoogleOAuth) AuthURL(state string) string {
+func (f *errorGoogleOAuth) AuthURL(state, _ string) string {
 	return "https://accounts.example.test/?state=" + state
 }
 
-func (f *errorGoogleOAuth) Exchange(context.Context, string) (*oauth.GoogleUserInfo, error) {
+func (f *errorGoogleOAuth) Exchange(context.Context, string, string) (*oauth.GoogleUserInfo, error) {
 	return nil, f.err
 }
 
-func (f *errorGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string {
-	return "https://frontend.example.test/#access_token=" + accessToken + "&refresh_token=" + refreshToken
+func (f *errorGoogleOAuth) BuildCodeCallbackURL(code string) string {
+	return "https://frontend.example.test/#code=" + code
 }
 
 func (f *errorGoogleOAuth) BuildMFACallbackURL(challenge string) string {

@@ -262,7 +262,10 @@ migrations) to its owners; keep it current when adding a module.
   identity operations, tenant lifecycle, and the possession statements by
   token hash: API key `GetByHash` and `RevokeByRefreshToken` (logout), each
   for that one statement; refresh rotation stays tenant-scoped) and must
-  never appear on an HTTP path serving one tenant otherwise. The
+  never appear on an HTTP path serving one tenant otherwise. Invitation
+  accept/sign-up bypass only the possession lookup of the invitation's
+  tenant; credential/MFA changes that revoke every tenant's sessions keep one
+  bypass transaction for atomicity (each site comments why). The
   API/worker/seed connect as a non-superuser role without `BYPASSRLS`, and
   `cmd/api` refuses production startup unless the bypass role has
   `BYPASSRLS`, is not superuser, owns no tables, and the normal role is not a
@@ -346,7 +349,10 @@ handler/service/DTO/repository package.
   tenant-scoped, and version-bound; a session has an absolute
   `sessions.expires_at` (`SESSION_MAX_LIFETIME`, default 720h) that rotation
   never extends (refresh tokens expire at the earlier of the refresh TTL and
-  it), and access tokens default to 1h (`JWT_EXPIRE_HOUR`); presenting a used token revokes the whole
+  it), and access tokens default to 1h (`JWT_EXPIRE_HOUR`); a used token
+  presented again within 10s of rotating a still-live session is a client
+  race (401 `auth.refresh_concurrent`, session kept), decided in one SQL
+  statement; presenting a used token revokes the whole
   session (`refresh_reuse`) and returns 401; logout revokes the session by
   possession; logout-all revokes every session in every tenant and bumps
   `token_version`; refresh with an inactive member returns 401. Login lockout
@@ -381,6 +387,16 @@ handler/service/DTO/repository package.
   implicitly. `SignInWithGoogle` with a `Complete` hook runs these checks and
   session creation in the sign-in transaction before the Tier 1
   `auth.google_login` row, so refused logins are never audited as success.
+  The Google authorization request uses PKCE (S256, verifier bound to the
+  signed state) and no offline access; the callback never puts tokens in the
+  URL: it redirects with `#code=` (256-bit, single use, 60s, tenant-bound)
+  that the frontend redeems at `POST /auth/google/exchange` (401
+  `auth.oauth_code_invalid`). New passwords follow NIST 800-63B: 12–64
+  characters and ≤72 bytes, no composition rules, not on the embedded
+  common-password list, not containing the email local part. Password
+  change/reset, email change (old address too), MFA enable/disable,
+  recovery-code regeneration, and platform MFA reset email the user through
+  the transactional outbox in the change's transaction.
   Password reset and email verification are per user. The password-reset
   token insert re-checks the current email (an email change in between skips
   the send). The admin seed only creates a missing admin; an existing
@@ -412,7 +428,9 @@ handler/service/DTO/repository package.
   logout-all voids it; `POST /auth/mfa/verify` (challenge + TOTP/recovery
   code) issues the normal pair. Second-factor guesses (verify, disable,
   regenerate) use a per-user budget of 5 per 15 minutes that only a successful
-  verification clears (a correct password does not), and confirming/disabling
+  verification clears (a correct password does not); each failure is audited
+  as `auth.mfa_verify_failed` (reason class only, own transaction, a write
+  failure is logged and never changes the 401), and confirming/disabling
   revokes the user's other sessions
   (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
   `rc`; refresh repeats the session's `amr`, tokens without it still verify,

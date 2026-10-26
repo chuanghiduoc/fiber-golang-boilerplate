@@ -79,8 +79,19 @@ func (r *InvitationRepository) DeletePending(ctx context.Context, id int64) (boo
 	return n > 0, nil
 }
 
-func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tokenHash string) (*identityservice.Invitation, error) {
-	row, err := r.q.GetInvitationByTokenHashForUpdate(ctx, tokenHash)
+func (r *InvitationRepository) TenantByTokenHash(ctx context.Context, tokenHash string) (int64, error) {
+	tenant, err := r.q.GetInvitationTenantByTokenHash(ctx, tokenHash)
+	if err != nil {
+		return 0, wrapErr(err)
+	}
+	return tenant, nil
+}
+
+func (r *InvitationRepository) GetByTokenHashForUpdate(ctx context.Context, tenantID int64, tokenHash string) (*identityservice.Invitation, error) {
+	row, err := r.q.GetInvitationByTokenHashForUpdate(ctx, identitysqlc.GetInvitationByTokenHashForUpdateParams{
+		TenantID:  tenantID,
+		TokenHash: tokenHash,
+	})
 	if err != nil {
 		return nil, wrapErr(err)
 	}

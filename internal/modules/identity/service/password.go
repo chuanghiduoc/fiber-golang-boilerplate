@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -68,10 +69,24 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 		return apperror.NewInternal("failed to hash password")
 	}
 
-	ctx = database.WithRLSBypass(ctx) // A password change ends the user's sessions in every tenant.
+	// The password row and the revocation of every session (in every tenant)
+	// must not half-apply, so this stays one bypass transaction. Everything
+	// inside is either a global user/MFA/token statement keyed by user id or a
+	// cross-tenant revocation by user id; the audit event names its tenant
+	// explicitly rather than relying on RLS.
+	ctx = database.WithRLSBypass(ctx)
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if changeErr := replacePassword(ctx, tx.Stores, userID, string(hash)); changeErr != nil {
 			return changeErr
+		}
+		if notifyErr := s.Security.Deliver(ctx, tx, SecurityNotice{
+			Event:      SecurityEventPasswordChanged,
+			UserID:     userID,
+			Name:       member.User.Name,
+			Email:      member.User.Email,
+			OccurredAt: time.Now().UTC(),
+		}); notifyErr != nil {
+			return notifyErr
 		}
 		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "user.password_changed", userID, nil)))
 	})

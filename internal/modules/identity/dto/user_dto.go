@@ -17,6 +17,12 @@ type RefreshRequest struct {
 	RefreshToken string `json:"refreshToken" validate:"required,max=256"`
 }
 
+// GoogleExchangeRequest redeems the single-use code from the Google
+// callback's URL fragment.
+type GoogleExchangeRequest struct {
+	Code string `json:"code" validate:"required,min=32,max=128"`
+}
+
 type UpdateUserRequest struct {
 	Name  *string `json:"name" validate:"omitempty,min=2,max=255,notblank"`
 	Email *string `json:"email" validate:"omitempty,email,max=255"`

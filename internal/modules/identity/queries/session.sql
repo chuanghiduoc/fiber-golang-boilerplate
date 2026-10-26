@@ -133,3 +133,22 @@ WITH batch AS (
 DELETE FROM sessions AS t
 USING batch
 WHERE t.id = batch.id;
+
+-- name: ClassifyRefreshTokenRotation :one
+-- One-statement grace decision for a repeated refresh token. A recent used
+-- token may be treated as a concurrent refresh only when its session is still
+-- live (not revoked, not expired) and a newer token was already rotated into
+-- the same session. Reading the token and the session together leaves no
+-- check-then-act gap between the grace decision and the reuse revocation.
+SELECT
+    (s.revoked_at IS NULL AND s.expires_at > NOW()) AS session_live,
+    (r.used_at IS NOT NULL AND r.used_at > @used_after::timestamptz) AS recent,
+    EXISTS (
+        SELECT 1 FROM refresh_tokens n
+        WHERE n.tenant_id = r.tenant_id
+          AND n.session_id = r.session_id
+          AND n.id > r.id
+    ) AS rotated
+FROM refresh_tokens r
+JOIN sessions s ON s.tenant_id = r.tenant_id AND s.id = r.session_id
+WHERE r.token_hash = @token_hash AND r.tenant_id = @tenant_id;

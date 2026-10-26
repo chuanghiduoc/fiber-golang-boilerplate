@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -50,7 +51,13 @@ func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInp
 
 	var updated *User
 	if change.emailChanged {
-		ctx = database.WithRLSBypass(ctx) // An email change ends the user's sessions in every tenant.
+		// An email change and ending the user's sessions in every tenant must
+		// not half-apply, so they share one bypass transaction: the UPDATE
+		// bumps token_version (invalidating every token) and the revocation
+		// marks the session rows. Every statement that touches a tenant-owned
+		// table still names its tenant explicitly (the audit event's
+		// TenantID), because RLS is off inside this transaction.
+		ctx = database.WithRLSBypass(ctx)
 	}
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, updateErr := applyProfileChange(ctx, tx.Stores, id, change)
@@ -58,6 +65,20 @@ func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInp
 			return updateErr
 		}
 		updated = user
+		if change.emailChanged {
+			// The warning goes to the new address and the old one; the job
+			// commits with the change.
+			if notifyErr := s.Security.Deliver(ctx, tx, SecurityNotice{
+				Event:         SecurityEventEmailChanged,
+				UserID:        id,
+				Name:          user.Name,
+				Email:         user.Email,
+				PreviousEmail: existing.User.Email,
+				OccurredAt:    time.Now().UTC(),
+			}); notifyErr != nil {
+				return notifyErr
+			}
+		}
 		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "user.profile_updated", id, change.auditMetadata())))
 	})
 	if err != nil {
@@ -144,6 +165,10 @@ func (s *userService) DeleteAccount(ctx context.Context, id int64) error {
 		return err
 	}
 	ctx = database.WithRLSBypass(ctx) // Deleting the global account removes memberships and sessions in every tenant.
+	// This is a genuinely cross-tenant transaction: the global user row, the
+	// membership in each tenant, and the sessions in each tenant must change
+	// together. Every tenant-owned statement below keeps an explicit tenant
+	// predicate (tenant.WithID per membership; the audit event's TenantID).
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := deleteAccount(ctx, tx.Stores, id); err != nil {
 			return err
@@ -247,7 +272,11 @@ func removeMembership(ctx context.Context, st Stores, id int64) error {
 // RevokeSessions invalidates every access token and session of the user in
 // every tenant ("log out all devices").
 func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
-	ctx = database.WithRLSBypass(ctx) // Logout-all ends the user's sessions in every tenant.
+	// Logout-all bumps the global token version and revokes the user's session
+	// rows in every tenant in one transaction: a crash between the two would
+	// otherwise leave live rows the user believes are gone. Only global and
+	// deliberately cross-tenant statements run here.
+	ctx = database.WithRLSBypass(ctx)
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
 			return userWriteError(err, "user not found", "failed to revoke sessions")
