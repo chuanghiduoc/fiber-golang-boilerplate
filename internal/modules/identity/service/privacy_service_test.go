@@ -326,6 +326,135 @@ func TestIdentityExportIncludesProfileMembershipAndSessions(t *testing.T) {
 	assert.NotContains(t, strings.ToLower(string(section.Data)), "password")
 }
 
+// An admin erasure is a per-tenant operation: it touches only the request
+// tenant, never the global account or another membership.
+func TestRequestAdminErasureStaysInTheRequestTenant(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	acme := int64(2)
+	db.memberships[[2]int64{acme, 10}] = &Membership{
+		ID: 101, TenantID: acme, UserID: 10, Role: RoleMember,
+		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	registry := privacycontracts.NewRegistry()
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: store, Registry: registry})
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
+	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: fakeExporter{}})
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+
+	require.NoError(t, svc.RequestAdminErasure(ctx, 10))
+	require.Len(t, jobsQueue.jobs, 1, "exactly one tenant erase job")
+	assert.Equal(t, JobKindErase, jobsQueue.jobs[0].Kind)
+	assert.Equal(t, tenant.DefaultID, jobsQueue.jobs[0].TenantID)
+
+	require.NoError(t, svc.HandleEraseJob(ctx, mustJSON(eraseJob{UserID: 10})))
+	assert.Equal(t, MembershipStatusRemoved, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
+	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{acme, 10}].Status,
+		"the other tenant's membership must stay intact")
+	assert.Empty(t, repo.anonymized, "admin erasure must not anonymize the global user")
+	require.Len(t, tx.audits, 1)
+	assert.Equal(t, "admin.user.erasure_requested", tx.audits[0].Action)
+}
+
+func TestRequestAdminErasureRejectsACrossTenantID(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	delete(db.memberships, [2]int64{tenant.DefaultID, 10})
+	db.memberships[[2]int64{2, 10}] = &Membership{
+		ID: 101, TenantID: 2, UserID: 10, Role: RoleMember,
+		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+
+	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, 404, appErr.Status)
+	assert.Empty(t, jobsQueue.jobs)
+}
+
+func TestRequestAdminErasureRejectsARemovedMember(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Status = MembershipStatusRemoved
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+
+	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, 404, appErr.Status)
+	assert.Empty(t, jobsQueue.jobs)
+}
+
+func TestRequestAdminErasureRefusesTheLastOwner(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+
+	err := svc.RequestAdminErasure(tenant.WithID(context.Background(), tenant.DefaultID), 10)
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), appErr.Code)
+	assert.Empty(t, jobsQueue.jobs)
+}
+
+// A failing module eraser must leave identity's membership in place: the
+// finalizer then keeps refusing to anonymize the global user.
+func TestEraseJobRunsIdentityLastSoAFailureKeepsTheMembership(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	store, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+	registry := privacycontracts.NewRegistry()
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: store, Registry: registry})
+	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
+	registry.Register(privacycontracts.Provider{
+		Name: "files", Exporter: fakeExporter{},
+		Eraser: failingEraser{err: errors.New("storage outage")},
+	})
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+
+	err = svc.HandleEraseJob(ctx, mustJSON(eraseJob{UserID: 10}))
+	require.Error(t, err)
+	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{tenant.DefaultID, 10}].Status,
+		"identity must not remove the membership when another module failed")
+
+	err = svc.HandleFinalizeJob(context.Background(), mustJSON(finalizeJob{UserID: 10}))
+	assert.ErrorIs(t, err, errErasurePending)
+	assert.Empty(t, repo.anonymized)
+}
+
+// The job-time last-owner re-check runs inside a transaction and takes the
+// same per-tenant advisory lock the service uses.
+func TestEraseJobTakesTheOwnerLockInsideItsTransaction(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	state := &txState{}
+	stores.Memberships = lockRecordingMemberships{memMemberships: memMemberships{db}, state: state}
+	tx := txFlaggingTransactor{state: state, inner: &fakePrivateTx{stores: stores, jobs: &fakeJobs{}}}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
+
+	err := svc.HandleEraseJob(tenant.WithID(context.Background(), tenant.DefaultID), mustJSON(eraseJob{UserID: 10}))
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), appErr.Code)
+	assert.True(t, state.lockedInTx, "the last-owner lock must be taken inside the check transaction")
+}
+
 func TestErasureJobIsIdempotentAndDeletesExports(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	e, _ := repo.Create(context.Background(), 10)
@@ -497,6 +626,38 @@ type recordingEraser struct{ called bool }
 
 func (r *recordingEraser) Erase(context.Context, int64, int64) error {
 	r.called = true
+	return nil
+}
+
+type failingEraser struct{ err error }
+
+func (f failingEraser) Erase(context.Context, int64, int64) error { return f.err }
+
+// txState tracks whether the fake transactor is inside a transaction and
+// whether the last-owner lock ran there.
+type txState struct {
+	inTx       bool
+	lockedInTx bool
+}
+
+type txFlaggingTransactor struct {
+	state *txState
+	inner Transactor
+}
+
+func (t txFlaggingTransactor) InTx(ctx context.Context, fn func(context.Context, TxRepos) error) error {
+	t.state.inTx = true
+	defer func() { t.state.inTx = false }()
+	return t.inner.InTx(ctx, fn)
+}
+
+type lockRecordingMemberships struct {
+	memMemberships
+	state *txState
+}
+
+func (r lockRecordingMemberships) LockOwnerChanges(context.Context) error {
+	r.state.lockedInTx = r.state.inTx
 	return nil
 }
 

@@ -284,6 +284,12 @@ erDiagram
   invite is an `invitations` row (it can target an address with no account).
   `credentials_revoked_at` is set by a ban or removal and never cleared, so
   API keys created at or before it stay invalid after an unban or re-join.
+  `banned_email_hash` is the lowercase hex SHA-256 of the normalized address,
+  written by a ban. A removed membership keeps `banned_at` and the hash, so a
+  ban survives removal and erasure (the user's email may since have been
+  anonymized); an unban while the membership is still suspended clears both.
+  `EmailBannedInTenant` matches the hash on
+  registration, invitation acceptance, and email change (GDPR Art.17(3)(e)).
 - **Data exports** belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while

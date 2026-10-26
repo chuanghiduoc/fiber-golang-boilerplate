@@ -470,6 +470,7 @@ loops run in every worker process regardless.
 | Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
+| `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
 indefinitely, notifications are never deleted, and expired export documents
@@ -493,22 +494,38 @@ is `ready`; a failed module export marks the row `failed` and the job retries.
 | Two export requests for one membership | The partial unique index `idx_data_exports_active` makes the second insert fail; the service returns `409 data_export.in_progress` (the request idempotency key additionally collapses retries). The request also holds the active membership `FOR SHARE` so it cannot slip past an erasure. |
 | Erasure while an export is building | The erasure request updates the tenant's active/ready exports to `expired`; the export job's `running → ready` update is conditional, so a late writer cannot revive it and deletes its own document. The identity eraser deletes every export document (including already-expired ones), and the finalizer sweeps an export that committed just before the last membership was removed. |
 | Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. |
-| Already-deleted account | The finalizer upgrades an account deleted by the older self-service path: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. |
-| Last-admin erasure | The service takes the per-tenant admin lock and returns `409 user.last_admin` before any job or audit row is written; the per-tenant job re-checks before running any eraser. |
+| Already-deleted account | The self-erasure finalizer upgrades an account deleted by the older self-service path: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. |
+| Last-admin erasure | The service takes the per-tenant owner lock and returns `409 user.last_admin` before any job or audit row is written; the per-tenant job takes the same lock inside its check transaction and re-checks before running any eraser. |
+| Failed module eraser | In a tenant erase job identity's own eraser runs last; it removes the membership only after every other registered eraser succeeded, so a files/storage outage leaves the membership (and the global user) in place and the job retries. |
+| Ban vs self-erasure | A suspended membership keeps `banned_at` and `banned_email_hash` when removal/erasure removes it; registration, invitation acceptance, and email changes compare that pseudonymous hash, so the anonymized user's old address cannot rejoin the tenant (GDPR Art.17(3)(e)). Unban clears both. |
 
-Erasure has two stages: one `privacy.erase` job per membership runs every
-tenant `Eraser` (identity, files, notifications, apikeys, features, and stored
-webhook event history), then `privacy.erase.finalize` checks that every
-membership is `removed` before deleting credentials, identities, sessions, and
-tokens and anonymizing the global user (`erased+<id>@invalid`, empty name,
-`status = deleted`). Until then the finalizer fails and retries with backoff.
-The finalizer also sweeps leftover export documents. Pending `email.send`
-payloads are encrypted at rest and terminal jobs clear them; a queued email
-already committed before the request may still be delivered, and delivered
-webhooks cannot be recalled from third-party receivers.
-Audit rows are append-only and contain only ids/outcomes (`user.erasure_requested`,
-`admin.user.erasure_requested`, `user.erased`), never email, name, or document
-content; that is the retention basis for the request history itself.
+Erasure has two paths:
+
+- **Self erasure** (`POST /me/erasure`): one `privacy.erase` job per membership
+  runs every tenant `Eraser` (files, notifications, apikeys, features, stored
+  webhook event history, identity last), then `privacy.erase.finalize` checks
+  that every membership is `removed` before deleting credentials, identities,
+  sessions, and tokens and anonymizing the global user
+  (`erased+<id>@invalid`, empty name, `status = deleted`). Until then the
+  finalizer fails and retries with backoff. It also sweeps leftover export
+  documents.
+- **Admin erasure** (`POST /admin/users/:id/erasure`): one `privacy.erase` job
+  for the request tenant, no finalizer. Only that tenant's membership and data
+  are removed; the global user and memberships in other tenants stay intact,
+  and a cross-tenant id is `404`.
+
+Pending `email.send` payloads are encrypted at rest and terminal jobs clear
+them; a queued email already committed before the request may still be
+delivered, and delivered webhooks cannot be recalled from third-party
+receivers. Audit rows are append-only and contain only ids/outcomes
+(`user.erasure_requested`, `admin.user.erasure_requested`, `user.erased`),
+never email, name, or document content; that is the retention basis for the
+request history itself. The per-membership `banned_email_hash` is the only
+pseudonymous identity marker retained after erasure: a lowercase hex SHA-256
+of the normalized address, kept with `banned_at` solely to enforce the
+tenant's ban (GDPR Art.17(3)(e) legitimate interest). An unban of a suspended
+membership clears both; a removed membership keeps them for the tenant's
+records.
 
 #### Files trash purge
 

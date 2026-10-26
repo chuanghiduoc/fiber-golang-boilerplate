@@ -167,9 +167,12 @@ type Membership struct {
 	// Role is the highest system role key (owner > admin > member).
 	Role string
 	// Roles holds every assigned role key.
-	Roles                []string
-	Status               MembershipStatus
-	BannedAt             *time.Time
+	Roles    []string
+	Status   MembershipStatus
+	BannedAt *time.Time
+	// BannedEmailHash is the pseudonymous SHA-256 (lowercase hex) of the
+	// normalized address, written by a ban and kept after removal/erasure.
+	BannedEmailHash      string
 	RemovedAt            *time.Time
 	CredentialsRevokedAt *time.Time
 	CreatedAt            time.Time

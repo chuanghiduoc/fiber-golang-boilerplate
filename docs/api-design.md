@@ -326,8 +326,8 @@ All routes are in the request tenant; another user's or tenant's export id is
 | `GET /me/data-exports` | `profile:read` | Cursor list of the caller's exports, newest first. |
 | `GET /me/data-exports/:id` | `profile:read` | Status of one export (`queued`, `running`, `ready`, `failed`, `expired`). A ready export includes `downloadUrl`; unknown/other-owner/cross-tenant ids are `404 data_export.not_found`. |
 | `GET /me/data-exports/:id/download` | `profile:read` | Streams the ready JSON document with `Cache-Control: private, no-store`. `409 data_export.not_ready` before it is ready; `410 data_export.expired` once expired; after the hourly purge deletes the row it is `404`. Other users/tenants get `404`. |
-| `POST /me/erasure` | JWT only, `profile:write`, current password, Tier 1 (`user.erasure_requested`) | Re-authenticates with `currentPassword`, then queues one `privacy.erase` job per membership plus `privacy.erase.finalize`. `202 {status: accepted}`. API keys are refused; refused with `409 user.last_admin` when the caller is the last active admin of any tenant; passwordless accounts cannot self-erase this way. |
-| `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Same global erasure for a member of the request tenant; no password re-auth (the admin is already authenticated). `404` for a non-member, `409 user.last_admin` for the last active admin. API keys are refused because this ends global access. |
+| `POST /me/erasure` | JWT only, `profile:write`, current password, Tier 1 (`user.erasure_requested`) | Re-authenticates with `currentPassword`, then queues one `privacy.erase` job per membership plus `privacy.erase.finalize`; this is the global self-erasure path. `202 {status: accepted}`. API keys are refused; refused with `409 user.last_admin` when the caller is the last active admin of any tenant; passwordless accounts cannot self-erase this way. |
+| `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Erases the member's data and membership in the request tenant only; the global account and the user's memberships in other tenants stay intact. Queues exactly one `privacy.erase` job for the request tenant and no finalizer. `404` for a non-member (including a cross-tenant id), `409 user.last_admin` when the member is the request tenant's last active owner. API keys are refused because this is a destructive admin action. |
 
 The export document is `{userId, tenantId, generatedAt, sections: {identity,
 files, notifications, apikeys, features, webhooks}}`. Files include metadata
@@ -337,10 +337,19 @@ downloadable through the files API; apikeys include metadata and scopes, never a
 features include only user targets; webhooks include user-attributed event
 payloads and delivery summaries. The document is deleted at expiry (7 days),
 and failed/stuck builds are cleaned by the same hourly
-`privacy.exports.purge` job (blob, then row). Erasure anonymizes the global
-user (`erased+<id>@invalid`, empty name, `status: deleted`) only after every
-membership is `removed`, and deletes credentials, identities, sessions, and
-tokens. Audit rows keep only ids and outcomes.
+`privacy.exports.purge` job (blob, then row). Self erasure anonymizes the
+global user (`erased+<id>@invalid`, empty name, `status: deleted`) only after
+every membership is `removed`, and deletes credentials, identities, sessions,
+and tokens. Admin erasure is tenant-scoped: it removes only the request
+tenant's membership and data, so the global account and other memberships keep
+working. In a tenant erase job identity's own eraser runs last, so a removed
+membership implies every other module's eraser succeeded. Audit rows keep only
+ids and outcomes. A banned membership keeps `banned_at` and a pseudonymous
+`banned_email_hash` (SHA-256 of the normalized address) through removal and
+erasure; the registration, invitation, and email-change checks match that
+hash, so the address cannot rejoin the tenant that banned it (GDPR
+Art.17(3)(e), legitimate interest in defending the ban).
+
 ## Roles and platform administration
 
 Tenant roles are rows; the permission catalog stays in code and is

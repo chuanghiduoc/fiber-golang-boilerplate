@@ -91,7 +91,7 @@ var requiredColumns = map[string][]string{
 	"user_passwords":  {"user_id", "password_hash", "changed_at"},
 	"user_identities": {"user_id", "provider", "subject", "email"},
 	"memberships": {
-		"tenant_id", "user_id", "status", "banned_at", "removed_at", "credentials_revoked_at",
+		"tenant_id", "user_id", "status", "banned_at", "banned_email_hash", "removed_at", "credentials_revoked_at",
 	},
 	"permissions":               {"key", "owner"},
 	"roles":                     {"tenant_id", "scope", "key", "name"},
@@ -241,6 +241,7 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	"memberships": {
 		"idx_memberships_tenant_created_at_user",
 		"idx_memberships_tenant_suspended",
+		"idx_memberships_tenant_banned_email_hash",
 	},
 	"roles": {
 		"idx_roles_tenant_created_at_id",

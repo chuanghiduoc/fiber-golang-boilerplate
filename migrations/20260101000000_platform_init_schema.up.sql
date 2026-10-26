@@ -219,6 +219,10 @@ CREATE TRIGGER trigger_user_identities_updated_at
 -- Roles live in membership_roles.
 -- credentials_revoked_at is set by a ban or removal and never cleared: API
 -- keys created at or before it stay invalid after the member is restored.
+-- banned_email_hash is a pseudonymous SHA-256 of the normalized address,
+-- written by a ban so EmailBannedInTenant still refuses the address after an
+-- erasure rewrites users.email. It is retained with banned_at on a removed
+-- membership (GDPR Art.17(3)(e), defence of the tenant's ban decision).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memberships (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -227,13 +231,17 @@ CREATE TABLE IF NOT EXISTS memberships (
     status VARCHAR(20) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'suspended', 'removed')),
     banned_at TIMESTAMP WITH TIME ZONE,
+    banned_email_hash VARCHAR(64) CHECK (banned_email_hash ~ '^[0-9a-f]{64}$'),
     removed_at TIMESTAMP WITH TIME ZONE,
     credentials_revoked_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     -- Parent key for every cross-module (tenant_id, user_id) foreign key.
     CONSTRAINT uq_memberships_tenant_user UNIQUE (tenant_id, user_id),
-    CONSTRAINT chk_memberships_banned CHECK ((status = 'suspended') = (banned_at IS NOT NULL)),
+    CONSTRAINT chk_memberships_banned CHECK (
+        (status = 'suspended') = (banned_at IS NOT NULL)
+        OR (status = 'removed' AND banned_at IS NOT NULL)
+    ),
     CONSTRAINT chk_memberships_removed CHECK ((status = 'removed') = (removed_at IS NOT NULL))
 );
 
@@ -248,6 +256,11 @@ CREATE INDEX IF NOT EXISTS idx_memberships_tenant_created_at_user
 CREATE INDEX IF NOT EXISTS idx_memberships_tenant_suspended
     ON memberships (tenant_id, user_id)
     WHERE status = 'suspended';
+-- EmailBannedInTenant's pseudonymous match, which must keep a ban after the
+-- membership was removed by an erasure.
+CREATE INDEX IF NOT EXISTS idx_memberships_tenant_banned_email_hash
+    ON memberships (tenant_id, banned_email_hash)
+    WHERE banned_email_hash IS NOT NULL;
 
 DROP TRIGGER IF EXISTS trigger_memberships_updated_at ON memberships;
 CREATE TRIGGER trigger_memberships_updated_at

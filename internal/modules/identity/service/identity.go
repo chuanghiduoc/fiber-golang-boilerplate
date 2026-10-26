@@ -74,6 +74,15 @@ func emailKey(prefix, email string) string {
 	return prefix + hex.EncodeToString(digest[:emailKeyBytes])
 }
 
+// bannedEmailHash is the pseudonymous per-tenant ban marker stored on a
+// membership: the lower-case hex SHA-256 of the normalized address. It is the
+// same value BanMembership and EmailBannedInTenant compute in SQL, so the
+// marker survives an erasure that rewrites users.email.
+func bannedEmailHash(email string) string {
+	digest := sha256.Sum256([]byte(NormalizeEmail(email)))
+	return hex.EncodeToString(digest[:])
+}
+
 // hashToken is how every opaque identity token (refresh, reset,
 // verification, invitation) is stored: a SHA-256 hex digest, never the
 // plaintext, so a database leak cannot be replayed.
