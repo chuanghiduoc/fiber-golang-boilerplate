@@ -34,8 +34,12 @@ var tenantLocalePattern = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*
 //	trialing         -> active | suspended | pending_deletion
 //	active           -> suspended | pending_deletion
 //	suspended        -> active | pending_deletion
-//	pending_deletion -> active (deletion cancelled) | deleted
+//	pending_deletion -> suspended (deletion cancelled) | deleted
 //	deleted          -> (terminal)
+//
+// Cancelling a deletion lands on suspended, never directly on active: the
+// tenant was not necessarily operational before deletion, so a platform admin
+// must activate it explicitly afterwards.
 func TenantStatusTransitionAllowed(from, to TenantStatus) bool {
 	switch from {
 	case TenantStatusTrialing:
@@ -45,7 +49,7 @@ func TenantStatusTransitionAllowed(from, to TenantStatus) bool {
 	case TenantStatusSuspended:
 		return to == TenantStatusActive || to == TenantStatusPendingDeletion
 	case TenantStatusPendingDeletion:
-		return to == TenantStatusActive || to == TenantStatusDeleted
+		return to == TenantStatusSuspended || to == TenantStatusDeleted
 	case TenantStatusDeleted:
 		return false
 	default:
@@ -171,11 +175,11 @@ func normalizeNewTenant(in *NewTenant) error {
 }
 
 // Transition moves a tenant to status along the lifecycle state machine.
-// pending_deletion schedules deletion after TenantDeletionGrace; cancelling
-// it (back to active) clears the schedule. The compatibility tenant (id 1)
-// can never be deleted. Requests for a non-operational tenant return 404 from
-// tenant resolution (after the resolver cache TTL) and 401 for existing
-// sessions.
+// pending_deletion schedules deletion after TenantDeletionGrace; cancelling it
+// lands on suspended and clears the schedule (a platform admin activates it
+// explicitly afterwards). The compatibility tenant (id 1) can never be
+// deleted. Requests for a non-operational tenant return 404 from tenant
+// resolution (after the resolver cache TTL) and 401 for existing sessions.
 func (s *TenantService) Transition(ctx context.Context, id int64, to TenantStatus) (*Tenant, error) {
 	var updated *Tenant
 	// Deliberate RLS bypass: the platform transition targets a tenant other
@@ -238,6 +242,40 @@ func (s *TenantService) ExpireTrial(ctx context.Context, id int64) (bool, error)
 		changed = true
 		event := tenantEvent(ctx, "tenant.status_changed", t,
 			map[string]any{"from": string(TenantStatusTrialing), "to": string(TenantStatusSuspended), "reason": "trial_expired"})
+		event.ActorType = audit.ActorTypeSystem
+		event.Source = audit.SourceSystem
+		return checkAudit(tx.Audit.RecordTx(ctx, event))
+	})
+	return changed, err
+}
+
+// FinalizeDeletion moves a pending_deletion tenant whose grace period has
+// ended to deleted. It is the system-actor path used by the hourly schedule:
+// the status and schedule are re-checked under the row lock, a concurrent
+// admin transition is a no-op, and the change is audited as
+// tenant.status_changed with a reason=deletion_due metadata entry.
+func (s *TenantService) FinalizeDeletion(ctx context.Context, id int64) (bool, error) {
+	ctx = tenant.WithID(ctx, id)
+	var changed bool
+	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		current, err := tx.Tenants.GetByIDForUpdate(ctx, id)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil
+			}
+			return apperror.NewInternal("failed to load tenant")
+		}
+		if current.Status != TenantStatusPendingDeletion || current.DeletionScheduledAt == nil ||
+			current.DeletionScheduledAt.After(time.Now()) || id == tenant.DefaultID {
+			return nil
+		}
+		t, err := tx.Tenants.UpdateStatus(ctx, id, TenantStatusDeleted, current.DeletionScheduledAt)
+		if err != nil {
+			return apperror.NewInternal("failed to finalize tenant deletion")
+		}
+		changed = true
+		event := tenantEvent(ctx, "tenant.status_changed", t,
+			map[string]any{"from": string(TenantStatusPendingDeletion), "to": string(TenantStatusDeleted), "reason": "deletion_due"})
 		event.ActorType = audit.ActorTypeSystem
 		event.Source = audit.SourceSystem
 		return checkAudit(tx.Audit.RecordTx(ctx, event))

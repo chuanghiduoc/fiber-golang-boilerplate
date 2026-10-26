@@ -1,9 +1,14 @@
 -- name: CreateSession :one
 -- A session is only created for an active member whose token version still
 -- equals the one the caller authenticated at. This closes the bcrypt-length
--- window where a password change commits after the password check.
--- mfa_verified_at is set only when the session already carries an otp/rc
--- method (MFA verify or Google + MFA); a first-factor session leaves it NULL.
+-- window where a password change commits after the password check, and the
+-- MFA window where a login read "MFA not required" before a factor was
+-- confirmed: bumping users.token_version on every credential/MFA change makes
+-- the stale version check fail. The factor guard is the second line: once a
+-- confirmed factor exists, a session whose amr has no otp/rc can never be
+-- created, whatever the caller decided earlier. mfa_verified_at is set only
+-- when the session already carries an otp/rc method (MFA verify or Google +
+-- MFA); a first-factor session leaves it NULL.
 INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at)
 SELECT m.tenant_id, m.user_id, u.token_version, @expires_at, @user_agent, @ip, @amr, @mfa_verified_at
 FROM memberships m
@@ -11,6 +16,14 @@ JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = @tenant_id AND m.user_id = @user_id
   AND m.status = 'active' AND u.status = 'active'
   AND u.token_version = @token_version
+  AND (
+      'otp' = ANY(@amr::text[])
+      OR 'rc' = ANY(@amr::text[])
+      OR NOT EXISTS (
+          SELECT 1 FROM mfa_factors f
+          WHERE f.user_id = u.id AND f.confirmed_at IS NOT NULL
+      )
+  )
 RETURNING *;
 
 -- name: GetSession :one
@@ -50,6 +63,41 @@ WHERE user_id = @user_id AND revoked_at IS NULL;
 UPDATE sessions
 SET revoked_at = NOW(), revoked_reason = @reason
 WHERE user_id = @user_id AND id <> @keep_id AND revoked_at IS NULL;
+
+-- name: RevokeStaleUserSessions :exec
+-- The after-commit cleanup of a token-version bump: every session of the user
+-- whose version no longer matches the current one is already rejected by the
+-- session validator and refresh check, so this only records the revocation
+-- (revoked_at/reason) in every tenant. It runs as one bypass statement after
+-- the change commits, never inside the business transaction, and is idempotent
+-- (already-revoked rows are skipped).
+UPDATE sessions AS s
+SET revoked_at = NOW(), revoked_reason = @reason
+FROM users u
+WHERE s.user_id = @user_id AND u.id = s.user_id
+  AND s.token_version <> u.token_version
+  AND s.revoked_at IS NULL;
+
+-- name: RestampSession :one
+-- Re-issues the session that performed an MFA change under the user's new
+-- token version and adds the second factor to its amr. Tenant-scoped: only a
+-- live session of the request tenant can be restamped. The caller's previous
+-- access token still carries the old version and stops verifying; the re-issue
+-- replaces the session's refresh-token family (DeleteSessionRefreshTokens) and
+-- mints a new pair.
+UPDATE sessions
+SET token_version = @token_version, amr = @amr, last_used_at = NOW()
+WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
+  AND revoked_at IS NULL
+RETURNING *;
+
+-- name: DeleteSessionRefreshTokens :exec
+-- A re-issued session replaces its refresh-token family. A token minted before
+-- the MFA change must not survive the re-issue: refreshing with it would mint
+-- an access token carrying the restamped session's stronger amr without a
+-- second factor.
+DELETE FROM refresh_tokens
+WHERE tenant_id = @tenant_id AND session_id = @session_id;
 
 -- name: RevokeSessionByRefreshToken :one
 -- Possession-based (logout and refresh-token reuse): presenting the opaque

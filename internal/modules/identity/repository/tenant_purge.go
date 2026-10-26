@@ -33,9 +33,15 @@ func (r *TenantPurgeRepository) ListDeletedTenants(ctx context.Context, limit in
 	}
 	tenants := make([]identityservice.PurgeTenant, len(rows))
 	for i := range rows {
-		tenants[i] = identityservice.PurgeTenant{ID: rows[i].ID, Slug: rows[i].Slug}
+		tenants[i] = identityservice.PurgeTenant{
+			ID: rows[i].ID, Slug: rows[i].Slug, Cursor: rows[i].PurgeCursor,
+		}
 	}
 	return tenants, nil
+}
+
+func (r *TenantPurgeRepository) ListDueDeletionTenantIDs(ctx context.Context, limit int32) ([]int64, error) {
+	return identitysqlc.New(r.db).ListDueDeletionTenantIDs(ctx, limit)
 }
 
 func (r *TenantPurgeRepository) ListExpiredTrialTenantIDs(ctx context.Context, limit int32) ([]int64, error) {
@@ -75,6 +81,25 @@ func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID 
 		Ids:      ids,
 	})
 	return err
+}
+
+func (r *TenantPurgeRepository) DeleteMemberInvitations(ctx context.Context, tenantID, userID int64) (int64, error) {
+	return identitysqlc.New(r.db).DeleteMemberInvitations(ctx, identitysqlc.DeleteMemberInvitationsParams{
+		TenantID: tenantID, UserID: userID,
+	})
+}
+
+func (r *TenantPurgeRepository) DeleteMembership(ctx context.Context, tenantID, userID int64) error {
+	_, err := identitysqlc.New(r.db).DeleteTenantMembership(ctx, identitysqlc.DeleteTenantMembershipParams{
+		TenantID: tenantID, UserID: userID,
+	})
+	return err
+}
+
+func (r *TenantPurgeRepository) AdvancePurgeCursor(ctx context.Context, tenantID, cursor int64) error {
+	return identitysqlc.New(r.db).AdvanceTenantPurgeCursor(ctx, identitysqlc.AdvanceTenantPurgeCursorParams{
+		PurgeCursor: cursor, ID: tenantID,
+	})
 }
 
 func (r *TenantPurgeRepository) DeleteInvitationsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {

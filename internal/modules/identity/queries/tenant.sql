@@ -65,11 +65,33 @@ ORDER BY id
 LIMIT @row_limit::int;
 
 -- name: ListDeletedUnpurgedTenants :many
--- The deleted-tenant purge only considers rows that have not completed yet.
+-- The deleted-tenant purge only considers rows that have not completed yet,
+-- least recently advanced first so a large tenant cannot starve the rest.
+-- A NULL purge_progress_at (never attempted) comes first.
 SELECT * FROM tenants
 WHERE status = 'deleted'
   AND purged_at IS NULL
-ORDER BY id
+ORDER BY purge_progress_at ASC NULLS FIRST, id
+LIMIT @row_limit::int;
+
+-- name: AdvanceTenantPurgeCursor :exec
+-- Records the highest membership user id whose erasers succeeded. It only
+-- moves forward and only for an unfinished deleted tenant.
+UPDATE tenants
+SET purge_cursor = @purge_cursor::bigint,
+    purge_progress_at = NOW()
+WHERE id = @id::bigint
+  AND status = 'deleted'
+  AND purged_at IS NULL
+  AND purge_cursor < @purge_cursor::bigint;
+
+-- name: ListDueDeletionTenantIDs :many
+-- The hourly finalize job moves tenants whose pending_deletion grace ended to
+-- deleted through the audited TenantService.
+SELECT id FROM tenants
+WHERE status = 'pending_deletion'
+  AND deletion_scheduled_at <= NOW()
+ORDER BY deletion_scheduled_at, id
 LIMIT @row_limit::int;
 
 -- name: MarkTenantPurged :execrows

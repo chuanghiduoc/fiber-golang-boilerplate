@@ -68,15 +68,19 @@ func (r *{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Context, c
 	return out, nil
 }
 
-// Update{{.R.Pascal}} replaces the writable fields of one {{.R.Human}}.
-func (r *{{.R.Pascal}}Repository) Update{{.R.Pascal}}(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
-	row, err := r.q.Update{{.R.Pascal}}(ctx, {{.M.Ident}}sqlc.Update{{.R.Pascal}}Params{
-		Name:     in.Name,
+// Patch{{.R.Pascal}} changes only the fields the caller supplied; an omitted
+// field stays as it is.
+func (r *{{.R.Pascal}}Repository) Patch{{.R.Pascal}}(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	params := {{.M.Ident}}sqlc.Patch{{.R.Pascal}}Params{
 		TenantID: tenant.EffectiveID(ctx),
 		ID:       id,
-	})
+	}
+	if in.Name != nil {
+		params.SetName, params.Name = true, *in.Name
+	}
+	row, err := r.q.Patch{{.R.Pascal}}(ctx, params)
 	if err != nil {
-		return {{.M.Ident}}service.{{.R.Pascal}}{}, noRows(err, "update {{.R.Table}}")
+		return {{.M.Ident}}service.{{.R.Pascal}}{}, noRows(err, "patch {{.R.Table}}")
 	}
 	return to{{.R.Pascal}}(row), nil
 }

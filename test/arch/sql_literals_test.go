@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-
-	"golang.org/x/tools/go/packages"
 )
 
 // dynamicSQLAllowlist contains the only non-test query sites that may pass a
@@ -47,19 +45,7 @@ func TestSQLCallsUseConstantStrings(t *testing.T) {
 			len(dynamicSQLAllowlist), maxDynamicSQLSites)
 	}
 	root := repoRoot(t)
-	cfg := &packages.Config{
-		Dir:        root,
-		BuildFlags: []string{"-tags=integration"},
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
-			packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-	}
-	pkgs, err := packages.Load(cfg, "./internal/...", "./pkg/...", "./cmd/...")
-	if err != nil {
-		t.Fatalf("load packages: %v", err)
-	}
-	if errors := packages.PrintErrors(pkgs); errors > 0 {
-		t.Fatalf("%d package load errors; the SQL scan cannot type-check the tree", errors)
-	}
+	pkgs := typedPackages(t)
 
 	used := make(map[string]bool, len(dynamicSQLAllowlist))
 	for _, pkg := range pkgs {

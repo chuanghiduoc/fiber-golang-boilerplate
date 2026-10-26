@@ -137,7 +137,7 @@ func TestEveryRouteRequiresAuthentication(t *testing.T) {
 
 func TestHealthRequiresPermission(t *testing.T) {
 	fiberApp := testApp(t, app.Infra{}, app.Deps{})
-	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", bearer(t, 7, 1, authz.RoleUser), "")
+	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", bearer(t, 7, 1, authz.RoleMember), "")
 	if status != http.StatusForbidden {
 		t.Fatalf("GET health as a user = %d %s, want 403 ({{.M.Name}}:read is admin-only)", status, body)
 	}

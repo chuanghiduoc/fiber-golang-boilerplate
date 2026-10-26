@@ -73,6 +73,13 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	// storage/backup operations.
 	storagePath := fmt.Sprintf("%d/%d/%s%s", tenantID, userID, uuid.New().String(), extensionForMIME(contentType))
 
+	// Cheap pre-check before the blob Put and clamd scan: an upload that is
+	// already over quota is refused without spending storage or scanner work.
+	// The locked check inside the metadata transaction remains authoritative.
+	if err := s.precheckQuota(ctx, s.repo, userID, size); err != nil {
+		return nil, err
+	}
+
 	if err := s.storage.Put(ctx, storagePath, reader, size, contentType); err != nil {
 		return nil, apperror.NewInternal("failed to store file")
 	}
@@ -169,13 +176,42 @@ func (s *uploadService) removeBlob(ctx context.Context, storagePath, reason stri
 	}
 }
 
+// precheckQuota is the cheap, lock-free quota rejection before a blob is
+// written. It can race with a concurrent upload, which the locked check in the
+// metadata transaction then catches; its only job is to spare clearly
+// over-quota requests the Put and scan cost.
+func (s *uploadService) precheckQuota(ctx context.Context, repo FileRepository, userID, size int64) error {
+	if !s.quotasEnabled() {
+		return nil
+	}
+	tenantBytes, userBytes, err := repo.StorageUsage(ctx, userID)
+	if err != nil {
+		slog.Error("failed to check storage quota before upload", slog.Any("error", err))
+		return apperror.NewInternal("failed to check storage quota")
+	}
+	if s.quotaExceeded(tenantBytes, userBytes, size) {
+		return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")
+	}
+	return nil
+}
+
+func (s *uploadService) quotasEnabled() bool {
+	return s.opts.TenantQuotaBytes > 0 || s.opts.UserQuotaBytes > 0
+}
+
+func (s *uploadService) quotaExceeded(tenantBytes, userBytes, size int64) bool {
+	tenantExceeded := s.opts.TenantQuotaBytes > 0 && tenantBytes+size > s.opts.TenantQuotaBytes
+	userExceeded := s.opts.UserQuotaBytes > 0 && userBytes+size > s.opts.UserQuotaBytes
+	return tenantExceeded || userExceeded
+}
+
 // checkQuota refuses an upload that would push the tenant or the user over
 // its configured byte quota. The per-tenant advisory lock is taken first and
 // held until the transaction ends, so concurrent uploads serialize: the second
 // one sees the first one's row and cannot also pass. Trashed rows count
 // because their blobs are still stored.
 func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, userID, size int64) error {
-	if s.opts.TenantQuotaBytes <= 0 && s.opts.UserQuotaBytes <= 0 {
+	if !s.quotasEnabled() {
 		return nil
 	}
 	if err := repo.LockQuota(ctx); err != nil {
@@ -185,9 +221,7 @@ func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, use
 	if err != nil {
 		return err
 	}
-	tenantExceeded := s.opts.TenantQuotaBytes > 0 && tenantBytes+size > s.opts.TenantQuotaBytes
-	userExceeded := s.opts.UserQuotaBytes > 0 && userBytes+size > s.opts.UserQuotaBytes
-	if !tenantExceeded && !userExceeded {
+	if !s.quotaExceeded(tenantBytes, userBytes, size) {
 		return nil
 	}
 	return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")

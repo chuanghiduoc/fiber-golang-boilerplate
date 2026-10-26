@@ -75,6 +75,7 @@ type fakeBlobStore struct {
 func (s *fakeBlobStore) Put(context.Context, string, io.Reader, int64, string) error { return nil }
 func (s *fakeBlobStore) Get(context.Context, string) (io.ReadCloser, error)          { return nil, nil }
 func (s *fakeBlobStore) URL(path string) string                                      { return path }
+func (s *fakeBlobStore) List(context.Context, string) ([]storage.Object, error)      { return nil, nil }
 func (s *fakeBlobStore) Delete(_ context.Context, path string) error {
 	if err := s.errs[path]; err != nil {
 		return err

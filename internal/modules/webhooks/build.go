@@ -38,6 +38,8 @@ type Settings struct {
 	SecretKey string
 	// PreviousSecretKeys open secrets sealed before a key rotation.
 	PreviousSecretKeys []string
+	// RequireHTTPS rejects plaintext http:// endpoint URLs.
+	RequireHTTPS bool
 }
 
 // Build constructs tenant-scoped endpoints, durable outbound deliveries, and
@@ -75,6 +77,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 		TimestampTolerance: cfg.TimestampTolerance(),
 		Tenants:            tenants,
 		URLGuard:           guard,
+		RequireHTTPS:       settings.RequireHTTPS,
 	})
 	dispatcher := webhookservice.NewDispatcher(repo)
 

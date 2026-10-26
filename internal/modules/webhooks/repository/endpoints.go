@@ -189,7 +189,7 @@ func (r *Postgres) DeleteEndpoint(ctx context.Context, id int64) error {
 	return nil
 }
 
-func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*webhooksvc.Endpoint, error) {
+func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertext string, expirePrevious bool) (*webhooksvc.Endpoint, error) {
 	if r == nil || r.db == nil {
 		return nil, ErrNoPool
 	}
@@ -212,12 +212,28 @@ func (r *Postgres) RotateEndpointSecret(ctx context.Context, id int64, ciphertex
 		}); err != nil {
 			return err
 		}
+		graceSeconds := webhooksvc.SecretRotationGrace.Seconds()
+		if expirePrevious {
+			// A zero-length grace retires the replaced secret at commit time;
+			// the worker will not co-sign with it on any later delivery.
+			graceSeconds = 0
+		}
 		if err := q.DeactivateWebhookEndpointSecrets(ctx, webhooksqlc.DeactivateWebhookEndpointSecretsParams{
 			TenantID:     tid,
 			EndpointID:   id,
-			GraceSeconds: webhooksvc.SecretRotationGrace.Seconds(),
+			GraceSeconds: graceSeconds,
 		}); err != nil {
 			return err
+		}
+		if expirePrevious {
+			// Also close the grace of any older retired secret that was still
+			// co-signing before this rotation.
+			if err := q.ExpireOlderWebhookEndpointSecrets(ctx, webhooksqlc.ExpireOlderWebhookEndpointSecretsParams{
+				TenantID:   tid,
+				EndpointID: id,
+			}); err != nil {
+				return err
+			}
 		}
 		if _, err := q.CreateWebhookEndpointSecret(ctx, webhooksqlc.CreateWebhookEndpointSecretParams{
 			TenantID:         tid,

@@ -396,6 +396,7 @@ func (r memMemberships) Reactivate(ctx context.Context, userID int64, role strin
 		return nil, apperror.ErrNotFound
 	}
 	m.Status, m.RemovedAt, m.Role, m.Roles = MembershipStatusActive, nil, role, []string{role}
+	m.ErasureRequestedAt = nil
 	c := *m
 	return &c, nil
 }
@@ -417,18 +418,24 @@ func (r memMemberships) Ban(ctx context.Context, userID int64) (*Membership, err
 }
 
 func (r memMemberships) Unban(ctx context.Context, userID int64) (*Membership, error) {
-	return r.update(ctx, userID, is(MembershipStatusSuspended), func(m *Membership) {
-		m.Status, m.BannedAt, m.BannedEmailHash = MembershipStatusActive, nil, ""
-	})
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	m, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]
+	if !ok || m.Status != MembershipStatusSuspended || m.BannedAt == nil || m.ErasureRequestedAt != nil {
+		return nil, apperror.ErrNotFound
+	}
+	m.Status, m.BannedAt, m.BannedEmailHash = MembershipStatusActive, nil, ""
+	c := *m
+	return &c, nil
 }
 
 func (r memMemberships) Remove(ctx context.Context, userID int64) (*Membership, error) {
 	return r.update(ctx, userID, func(s MembershipStatus) bool { return s != MembershipStatusRemoved }, func(m *Membership) {
 		now := time.Now()
-		banned := m.Status == MembershipStatusSuspended
+		banned := m.BannedAt != nil
 		m.Status, m.RemovedAt, m.CredentialsRevokedAt = MembershipStatusRemoved, &now, &now
 		// A ban, and its pseudonymous email marker, survives removal and
-		// erasure; an active member's removal clears the (already empty) fields.
+		// erasure; an erasure reservation is not a ban and never derives one.
 		if banned {
 			if m.BannedEmailHash == "" {
 				if u := r.db.users[userID]; u != nil {
@@ -439,6 +446,16 @@ func (r memMemberships) Remove(ctx context.Context, userID int64) (*Membership, 
 			m.BannedAt, m.BannedEmailHash = nil, ""
 		}
 	})
+}
+
+// SuspendForErasure reserves a membership without setting a ban marker.
+func (r memMemberships) SuspendForErasure(ctx context.Context, userID int64) error {
+	_, err := r.update(ctx, userID, func(s MembershipStatus) bool { return s != MembershipStatusRemoved }, func(m *Membership) {
+		now := time.Now()
+		m.Status, m.ErasureRequestedAt, m.RemovedAt = MembershipStatusSuspended, &now, nil
+		m.CredentialsRevokedAt = &now
+	})
+	return err
 }
 
 func (r memMemberships) CountActiveOwners(ctx context.Context) (int64, error) {
@@ -581,10 +598,45 @@ func (r memSessions) RevokeAllForUser(_ context.Context, userID int64, why Revok
 	return nil
 }
 
+func (r memSessions) RevokeStaleForUser(_ context.Context, userID int64, why RevokeReason) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	u := r.db.users[userID]
+	if u == nil {
+		return nil
+	}
+	version := u.TokenVersion
+	r.revoke(func(s *Session) bool { return s.UserID == userID && s.TokenVersion != version }, why)
+	return nil
+}
+
 func (r memSessions) RevokeOtherUserSessions(_ context.Context, userID, keepID int64, why RevokeReason) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	r.revoke(func(s *Session) bool { return s.UserID == userID && s.ID != keepID }, why)
+	return nil
+}
+
+func (r memSessions) Restamp(ctx context.Context, userID, id int64, tokenVersion int32, amr []string) (*Session, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	s, ok := r.db.sessions[id]
+	if !ok || s.UserID != userID || s.TenantID != tenant.EffectiveID(ctx) || s.RevokedAt != nil {
+		return nil, apperror.ErrNotFound
+	}
+	s.TokenVersion, s.AMR, s.LastUsedAt = tokenVersion, amr, time.Now()
+	c := *s
+	return &c, nil
+}
+
+func (r memSessions) DeleteRefreshTokens(_ context.Context, sessionID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for hash, token := range r.db.refresh {
+		if token.SessionID == sessionID {
+			delete(r.db.refresh, hash)
+		}
+	}
 	return nil
 }
 

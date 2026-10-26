@@ -90,7 +90,10 @@ func (failingDeleteStorage) Get(context.Context, string) (io.ReadCloser, error) 
 	return nil, storage.ErrNotFound
 }
 func (failingDeleteStorage) Delete(context.Context, string) error { return fmt.Errorf("disk full") }
-func (failingDeleteStorage) URL(string) string                    { return "" }
+func (failingDeleteStorage) List(context.Context, string) ([]storage.Object, error) {
+	return nil, nil
+}
+func (failingDeleteStorage) URL(string) string { return "" }
 
 func mustDecode(t *testing.T, s string) []byte {
 	t.Helper()

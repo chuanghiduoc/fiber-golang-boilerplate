@@ -60,10 +60,14 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	admin.Get("/flags", rl.Relaxed, authzhttp.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.ListFlags)
 	admin.Get("/flags/:key", rl.Relaxed, authzhttp.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.GetFlag)
 	// Process-wide rows also accept a platform admin; the service re-checks
-	// the platform permission.
+	// the platform permission. The route requires a second factor because one
+	// of its accepted permissions is a platform grant: MFA applies to the
+	// whole route (a tenant admin using the tenant permission must also have
+	// one), which is stricter than splitting the path and simpler to audit.
+	mfa := authzhttp.RequireMFA(deps.Config.MFA.EffectiveMaxAge())
 	flagWrite := authzhttp.RequireAny(featurescatalog.PermissionAdminFeaturesWrite, authz.PermissionPlatformFeaturesWrite)
-	admin.Put("/flags/:key", rl.Normal, flagWrite, deps.Idempotency, guard("admin.feature_flag.updated", "feature_flag"), m.handler.UpsertFlag)
-	admin.Delete("/flags/:key", rl.Normal, flagWrite, deps.Idempotency, guard("admin.feature_flag.deleted", "feature_flag"), m.handler.DeleteFlag)
+	admin.Put("/flags/:key", rl.Normal, mfa, flagWrite, deps.Idempotency, guard("admin.feature_flag.updated", "feature_flag"), m.handler.UpsertFlag)
+	admin.Delete("/flags/:key", rl.Normal, mfa, flagWrite, deps.Idempotency, guard("admin.feature_flag.deleted", "feature_flag"), m.handler.DeleteFlag)
 	admin.Get("/flags/:key/targets", rl.Relaxed, authzhttp.Require(featurescatalog.PermissionAdminFeaturesRead), m.handler.ListTargets)
 	admin.Put("/flags/:key/targets", rl.Normal, authzhttp.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag_target.updated", "feature_flag_target"), m.handler.UpsertTarget)
 	admin.Delete("/flags/:key/targets/:id", rl.Normal, authzhttp.Require(featurescatalog.PermissionAdminFeaturesWrite), deps.Idempotency, guard("admin.feature_flag_target.deleted", "feature_flag_target"), m.handler.DeleteTarget)

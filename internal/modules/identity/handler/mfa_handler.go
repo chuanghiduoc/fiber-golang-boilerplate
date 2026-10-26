@@ -50,13 +50,13 @@ func (h *MFAHandler) Enroll(c fiber.Ctx) error {
 
 // Confirm godoc
 // @Summary Confirm TOTP enrollment
-// @Description Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown.
+// @Description Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown. Confirmation invalidates every older session everywhere, so the response also carries a re-issued access and refresh token pair for the session that confirmed the factor.
 // @Tags Auth
 // @Security BearerAuth
 // @Accept json
 // @Produce json
 // @Param request body dto.MFAConfirmRequest true "TOTP code and re-authentication proof"
-// @Success 200 {object} dto.MFARecoveryCodesResponse
+// @Success 200 {object} dto.MFAConfirmResponse
 // @Failure 400 {object} apperror.ProblemDetails "current password is incorrect"
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails "auth.mfa_reauth_required"
@@ -69,11 +69,15 @@ func (h *MFAHandler) Confirm(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	codes, err := h.mfa.ConfirmTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword, req.Code)
+	result, err := h.mfa.ConfirmTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword, req.Code)
 	if err != nil {
 		return err
 	}
-	return response.Success(c, dto.MFARecoveryCodesResponse{RecoveryCodes: codes})
+	return response.Success(c, dto.MFAConfirmResponse{
+		RecoveryCodes: result.RecoveryCodes,
+		AccessToken:   result.Tokens.AccessToken,
+		RefreshToken:  result.Tokens.RefreshToken,
+	})
 }
 
 // PlatformReset godoc

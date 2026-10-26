@@ -20,11 +20,11 @@ WHERE id IN (
 RETURNING id, tenant_id, storage_path;
 
 -- name: FailTrashedFiles :execrows
--- A blob delete failed: release the claim so the row stays restorable, count
--- the attempt, and defer the next try with a capped exponential backoff.
+-- A blob delete failed: keep the claim (the row is never restorable after the
+-- first delete attempt), count the attempt, and defer the next try with a
+-- capped exponential backoff. Only the blob delete is retried.
 UPDATE files
-SET purge_started_at = NULL,
-    purge_attempts = purge_attempts + 1,
+SET purge_attempts = purge_attempts + 1,
     purge_retry_after = now() + make_interval(hours => LEAST(24, 1 << LEAST(purge_attempts, 5)))
 WHERE id = ANY(@ids::bigint[])
   AND purge_started_at IS NOT NULL;

@@ -212,6 +212,35 @@ func (s *Storage) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
+// List returns every object under prefix with its size and last write time.
+func (s *Storage) List(ctx context.Context, prefix string) ([]storage.Object, error) {
+	paginator := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	var objects []storage.Object
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+		for _, object := range page.Contents {
+			if object.Key == nil {
+				continue
+			}
+			info := storage.Object{Path: *object.Key}
+			if object.Size != nil {
+				info.Size = *object.Size
+			}
+			if object.LastModified != nil {
+				info.ModifiedAt = object.LastModified.UTC()
+			}
+			objects = append(objects, info)
+		}
+	}
+	return objects, nil
+}
+
 func (s *Storage) URL(path string) string {
 	scheme := "http"
 	if s.useSSL {

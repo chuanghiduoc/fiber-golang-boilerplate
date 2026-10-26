@@ -38,6 +38,11 @@ type layerBan struct {
 // violation is gone must be deleted so the list only shrinks.
 const layeringAllowlist = "layering_allowlist.txt"
 
+// maxLayeringAllowlistLines is the reviewed size of the layering ratchet. Like
+// maxDynamicSQLSites it is hard-coded and may only decrease: fixing a
+// violation deletes its line and lowers this number in the same change.
+const maxLayeringAllowlistLines = 0
+
 func TestModuleLayering(t *testing.T) {
 	root := repoRoot(t)
 	modulesDir := filepath.Join(root, "internal", "modules")
@@ -80,6 +85,10 @@ func TestModuleLayering(t *testing.T) {
 	}
 
 	allowed := readLayeringAllowlist(t, filepath.Join(root, "test", "arch", layeringAllowlist))
+	if len(allowed) != maxLayeringAllowlistLines {
+		t.Fatalf("layering allowlist has %d entries, want exactly %d; the list may only shrink, so lower maxLayeringAllowlistLines when you remove a violation",
+			len(allowed), maxLayeringAllowlistLines)
+	}
 	var fresh []string
 	for key, reason := range found {
 		if !allowed[key] {

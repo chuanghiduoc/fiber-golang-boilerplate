@@ -96,10 +96,13 @@ func setupFeatureHarness(t *testing.T) *featureHarness {
 	t.Cleanup(func() { _ = appCache.Close() })
 	stores := identityrepo.NewStores(testutil.Scoped(pool))
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
-	tokenA := testutil.SessionToken(t, ctx, pool,
-		testutil.Member{UserID: userA, TenantID: tenant.DefaultID, Email: "flags-a@test.com"}, featureSecret)
-	tokenB := testutil.SessionToken(t, ctx, pool,
-		testutil.Member{UserID: userB, TenantID: tenantB, Email: "flags-b@test.com"}, featureSecret)
+	// Flag writes accept a platform permission, so the route requires MFA for
+	// every caller (tenant admins included).
+	mfa := []string{"pwd", "otp"}
+	tokenA := testutil.SessionTokenAMR(t, ctx, pool,
+		testutil.Member{UserID: userA, TenantID: tenant.DefaultID, Email: "flags-a@test.com"}, featureSecret, mfa)
+	tokenB := testutil.SessionTokenAMR(t, ctx, pool,
+		testutil.Member{UserID: userB, TenantID: tenantB, Email: "flags-b@test.com"}, featureSecret, mfa)
 
 	flags := featureflags.NewEvaluator(featureflags.Options{
 		Store:        featureflags.NewPostgresStore(pool),

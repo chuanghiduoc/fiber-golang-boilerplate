@@ -34,8 +34,11 @@ type Provides struct {
 	// TenantResolver resolves X-Tenant-Slug for the /api groups (cached).
 	TenantResolver tenant.Resolver
 	Principals     identitycontracts.PrincipalReader
-	Recipients     identitycontracts.NotificationRecipientLookup
-	Admin          identitycontracts.IdentityAdmin
+	// MemberRanks applies the tenant role hierarchy for another module that
+	// manages a member's resources (API-key ownership).
+	MemberRanks identitycontracts.MemberRankChecker
+	Recipients  identitycontracts.NotificationRecipientLookup
+	Admin       identitycontracts.IdentityAdmin
 	// TenantActive reports whether a tenant exists and serves requests
 	// (trialing or active); the webhooks inbound receiver uses it to reject
 	// suspended tenants.
@@ -189,6 +192,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		Sessions:       sessionStore,
 		TenantResolver: tenantResolver,
 		Principals:     identityadapter.NewPrincipalReader(stores.Memberships),
+		MemberRanks:    identityadapter.NewMemberRank(stores, transactor),
 		Recipients:     identityadapter.NewNotificationRecipient(stores.Memberships),
 		Admin:          identityadapter.NewAdminIdentity(identityAdminSvc),
 		TenantActive: func(ctx context.Context, id int64) (bool, error) {
@@ -246,6 +250,7 @@ func (m *Module) RegisterJobs(registrar jobs.Registrar) {
 	if m.tenantPurger != nil {
 		registrar.Register(identityservice.TenantPurgeJobKind, m.tenantPurger.HandlePurgeJob)
 		registrar.Register(identityservice.TrialExpiryJobKind, m.tenantPurger.HandleTrialExpiryJob)
+		registrar.Register(identityservice.TenantDeletionJobKind, m.tenantPurger.HandleDeletionJob)
 	}
 }
 
@@ -279,6 +284,14 @@ var trialExpirySchedule = scheduler.Spec{
 	Kind:     identityservice.TrialExpiryJobKind,
 }
 
+// tenantDeletionSchedule moves pending_deletion tenants past their grace
+// period to deleted, so the purge job can pick them up.
+var tenantDeletionSchedule = scheduler.Spec{
+	Name:     identityservice.TenantDeletionJobKind,
+	Interval: identityservice.TenantDeletionInterval,
+	Kind:     identityservice.TenantDeletionJobKind,
+}
+
 // RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
 // so a registration error is a programming error and fails startup loudly.
 func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
@@ -293,7 +306,7 @@ func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
 		}
 	}
 	if m.tenantPurger != nil {
-		for _, spec := range []scheduler.Spec{tenantPurgeSchedule, trialExpirySchedule} {
+		for _, spec := range []scheduler.Spec{tenantPurgeSchedule, trialExpirySchedule, tenantDeletionSchedule} {
 			if err := registry.Register(spec); err != nil {
 				panic(fmt.Sprintf("identity: register %s schedule: %v", spec.Name, err))
 			}

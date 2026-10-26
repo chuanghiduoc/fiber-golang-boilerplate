@@ -51,21 +51,23 @@ func (s *service) newSealedSecret(binding SecretBinding, label string) (secret, 
 }
 
 // RotateEndpointSecret makes a fresh secret active for new deliveries. The
-// delivery worker keeps dual-signing pending retries during the rotation grace.
-func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (*Endpoint, string, error) {
+// delivery worker keeps dual-signing pending retries during the rotation grace
+// unless expirePrevious asks for the previous secret to stop at once.
+func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64, expirePrevious bool) (*Endpoint, string, error) {
 	tenantID := tenant.EffectiveID(ctx)
 	secret, ciphertext, err := s.newSealedSecret(EndpointSecretBinding(tenantID, id), endpointSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}
-	endpoint, err := s.endpoints.RotateEndpointSecret(ctx, id, ciphertext)
+	endpoint, err := s.endpoints.RotateEndpointSecret(ctx, id, ciphertext, expirePrevious)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, "", apperror.NewNotFound("webhook endpoint not found")
 		}
 		return nil, "", apperror.NewInternal("failed to rotate webhook secret")
 	}
-	s.recordAudit(ctx, actorID, "webhook.endpoint.secret_rotated", "webhook_endpoint", id, nil)
+	metadata := map[string]any{"expirePrevious": expirePrevious}
+	s.recordAudit(ctx, actorID, "webhook.endpoint.secret_rotated", "webhook_endpoint", id, metadata)
 	return endpoint, secret, nil
 }
 

@@ -119,6 +119,42 @@ func (r *SessionRepository) RevokeAllForUser(ctx context.Context, userID int64, 
 	return nil
 }
 
+func (r *SessionRepository) RevokeStaleForUser(ctx context.Context, userID int64, why identityservice.RevokeReason) error {
+	ctx = database.WithRLSBypass(ctx) // The user's stale sessions in every tenant (after-commit cleanup of a version bump).
+	if err := r.q.RevokeStaleUserSessions(ctx, identitysqlc.RevokeStaleUserSessionsParams{
+		UserID: userID,
+		Reason: optionalText(string(why)),
+	}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
+}
+
+func (r *SessionRepository) Restamp(ctx context.Context, userID, id int64, tokenVersion int32, amr []string) (*identityservice.Session, error) {
+	row, err := r.q.RestampSession(ctx, identitysqlc.RestampSessionParams{
+		TenantID:     tenantID(ctx),
+		UserID:       userID,
+		ID:           id,
+		TokenVersion: tokenVersion,
+		Amr:          amr,
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	s := toSession(row)
+	return &s, nil
+}
+
+func (r *SessionRepository) DeleteRefreshTokens(ctx context.Context, sessionID int64) error {
+	if err := r.q.DeleteSessionRefreshTokens(ctx, identitysqlc.DeleteSessionRefreshTokensParams{
+		TenantID:  tenantID(ctx),
+		SessionID: sessionID,
+	}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
+}
+
 func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID, keepID int64, why identityservice.RevokeReason) error {
 	ctx = database.WithRLSBypass(ctx) // The user's other sessions in every tenant (MFA change).
 	if err := r.q.RevokeOtherUserSessions(ctx, identitysqlc.RevokeOtherUserSessionsParams{

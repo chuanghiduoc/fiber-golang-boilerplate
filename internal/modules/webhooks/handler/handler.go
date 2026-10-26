@@ -169,6 +169,7 @@ func (h *Handler) DeleteEndpoint(c fiber.Ctx) error {
 // @Produce json
 // @Security BearerAuth
 // @Param id path int true "Endpoint ID"
+// @Param request body dto.RotateEndpointSecretRequest false "Rotation options"
 // @Success 200 {object} dto.EndpointSecretResponse
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
@@ -180,7 +181,13 @@ func (h *Handler) RotateEndpointSecret(c fiber.Ctx) error {
 	if err != nil {
 		return err
 	}
-	result, secret, err := h.service.RotateEndpointSecret(c.Context(), httpx.AuthUserID(c), id)
+	var req dto.RotateEndpointSecretRequest
+	if len(c.Body()) > 0 {
+		if err := httpx.BindAndValidate(c, &req); err != nil {
+			return err
+		}
+	}
+	result, secret, err := h.service.RotateEndpointSecret(c.Context(), httpx.AuthUserID(c), id, req.ExpirePrevious)
 	if err != nil {
 		return err
 	}

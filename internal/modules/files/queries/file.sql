@@ -77,3 +77,10 @@ SELECT
     COALESCE(SUM(size) FILTER (WHERE user_id = @user_id::bigint), 0)::bigint AS user_bytes
 FROM files
 WHERE tenant_id = @tenant_id::bigint;
+
+-- name: ListFileStoragePaths :many
+-- The orphan sweep checks candidate storage keys against the owning tenant's
+-- rows; a key with no row is an orphan.
+SELECT storage_path FROM files
+WHERE tenant_id = @tenant_id::bigint
+  AND storage_path = ANY(@paths::text[]);

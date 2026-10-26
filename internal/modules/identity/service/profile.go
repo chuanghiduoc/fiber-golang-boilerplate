@@ -50,15 +50,10 @@ func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInp
 	}
 
 	var updated *User
-	if change.emailChanged {
-		// An email change and ending the user's sessions in every tenant must
-		// not half-apply, so they share one bypass transaction: the UPDATE
-		// bumps token_version (invalidating every token) and the revocation
-		// marks the session rows. Every statement that touches a tenant-owned
-		// table still names its tenant explicitly (the audit event's
-		// TenantID), because RLS is off inside this transaction.
-		ctx = database.WithRLSBypass(ctx)
-	}
+	// The email UPDATE also bumps the token version, which ends every session of
+	// the user in every tenant. Both are global statements, so the change needs
+	// no RLS bypass; the per-tenant session-row revocation is recorded by the
+	// follow-up statement after this commits.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, updateErr := applyProfileChange(ctx, tx.Stores, id, change)
 		if updateErr != nil {
@@ -85,6 +80,7 @@ func (s *userService) Update(ctx context.Context, id int64, req UpdateProfileInp
 		return nil, err
 	}
 	if change.emailChanged {
+		cleanupStaleSessions(ctx, s.Stores.Sessions, id, RevokeCredentialsChanged)
 		invalidateSessions(ctx, s.SessionCache, id)
 	}
 	existing.User = *updated
@@ -130,8 +126,8 @@ func ensureEmailFreeForChange(ctx context.Context, st Stores, email string) erro
 }
 
 // applyProfileChange stores the change. Changing the identity address ends
-// every session of the user in every tenant (the UPDATE also bumps the token
-// version).
+// every session of the user in every tenant through the token-version bump the
+// UPDATE makes; the caller records the per-tenant session-row revocation.
 func applyProfileChange(ctx context.Context, st Stores, id int64, change profileChange) (*User, error) {
 	user, err := st.Users.UpdateProfile(ctx, ProfileUpdate{
 		ID:          id,
@@ -146,9 +142,6 @@ func applyProfileChange(ctx context.Context, st Stores, id int64, change profile
 		return nil, userWriteError(err, "user not found", "failed to update user")
 	}
 	if change.emailChanged {
-		if err := st.Sessions.RevokeAllForUser(ctx, id, RevokeCredentialsChanged); err != nil {
-			return nil, apperror.NewInternal("failed to revoke sessions")
-		}
 		if err := st.Resets.DeleteByUser(ctx, id); err != nil {
 			return nil, apperror.NewInternal("failed to revoke reset tokens")
 		}
@@ -272,23 +265,19 @@ func removeMembership(ctx context.Context, st Stores, id int64) error {
 // RevokeSessions invalidates every access token and session of the user in
 // every tenant ("log out all devices").
 func (s *userService) RevokeSessions(ctx context.Context, userID int64) error {
-	// Logout-all bumps the global token version and revokes the user's session
-	// rows in every tenant in one transaction: a crash between the two would
-	// otherwise leave live rows the user believes are gone. Only global and
-	// deliberately cross-tenant statements run here.
-	ctx = database.WithRLSBypass(ctx)
+	// The token-version bump is a global users statement, so the transaction
+	// needs no RLS bypass; it alone ends every token in every tenant. The
+	// per-tenant session-row revocation is the follow-up bypass statement.
 	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
 			return userWriteError(err, "user not found", "failed to revoke sessions")
-		}
-		if err := tx.Sessions.RevokeAllForUser(ctx, userID, RevokeLogoutAll); err != nil {
-			return apperror.NewInternal("failed to revoke sessions")
 		}
 		return nil
 	})
 	if err != nil {
 		return err
 	}
+	cleanupStaleSessions(ctx, s.Stores.Sessions, userID, RevokeLogoutAll)
 	invalidateSessions(ctx, s.SessionCache, userID)
 	return nil
 }

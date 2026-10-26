@@ -14,7 +14,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/async"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
@@ -274,11 +273,11 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 	}
 
 	var owner *User
-	// The token consumption, the new password row, and ending every session
-	// in every tenant must not half-apply, so they share one bypass
-	// transaction. The token and user statements are global (token hash /
-	// user id); the revocation is deliberately cross-tenant by user id.
-	ctx = database.WithRLSBypass(ctx)
+	// The token consumption, the new password row, and the token-version bump
+	// live in the request tenant's transaction. They are all global statements
+	// (token hash / user id), so no RLS bypass is needed; the bump alone ends
+	// every session in every tenant and the per-tenant session-row revocation
+	// is recorded by the follow-up bypass statement below.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, consumeErr := consumeResetToken(ctx, tx.Stores, tokenHash)
 		if consumeErr != nil {
@@ -305,6 +304,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 
 	// A successful reset must also clear any brute-force lockout so the user
 	// can actually sign in with the new password.
+	cleanupStaleSessions(ctx, s.Stores.Sessions, owner.ID, RevokeCredentialsChanged)
 	clearLoginAttempts(ctx, s.Cache, owner.Email)
 	invalidateSessions(ctx, s.SessionCache, owner.ID)
 	return nil

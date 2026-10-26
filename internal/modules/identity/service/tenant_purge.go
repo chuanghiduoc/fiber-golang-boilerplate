@@ -25,6 +25,12 @@ const (
 	TrialExpiryJobKind = "identity.tenants.expire_trials"
 	// TrialExpiryInterval is the hourly cadence that closes expired trials.
 	TrialExpiryInterval = time.Hour
+	// TenantDeletionJobKind moves pending_deletion tenants past their grace
+	// period to deleted.
+	TenantDeletionJobKind = "identity.tenants.finalize_deletions"
+	// TenantDeletionInterval is the hourly cadence that finalizes due
+	// deletions.
+	TenantDeletionInterval = time.Hour
 
 	// tenantPurgeBatchSize bounds how many deleted tenants one run starts.
 	tenantPurgeBatchSize = 25
@@ -32,27 +38,42 @@ const (
 	tenantPurgeMembershipBatch = 100
 	// tenantPurgeTrialBatch bounds one expired-trial page.
 	tenantPurgeTrialBatch = 100
+
+	// tenantPurgeTenantBudget is how long one run may spend on a single
+	// tenant. Progress is persisted per member, so the next run resumes it.
+	tenantPurgeTenantBudget = 2 * time.Minute
+	// tenantPurgeRunBudget leaves headroom under the 10-minute job timeout so
+	// one slow tenant cannot consume the whole pass.
+	tenantPurgeRunBudget = 8 * time.Minute
 )
 
 // tenantPurgerName is identity's own tenant-wide purger. It runs last so the
-// memberships and roles still exist while every other module cleans up.
+// per-member erasers have already removed every module's user rows.
 const tenantPurgerName = "identity"
 
 // PurgeTenant is one tenant waiting for its deleted data to be erased.
 type PurgeTenant struct {
 	ID   int64
 	Slug string
+	// Cursor is the highest membership user id whose erasers already
+	// succeeded in an earlier run.
+	Cursor int64
 }
 
-// TenantPurgeRepository is the identity persistence the purge and hourly trial
-// expiry jobs need. Every tenant-scoped method runs under the tenant context
-// and therefore RLS; only the platform-wide tenant list is unscoped.
+// TenantPurgeRepository is the identity persistence the purge, hourly trial
+// expiry, and deletion-finalizer jobs need. Every tenant-scoped method runs
+// under the tenant context and therefore RLS; only the platform-wide tenant
+// lists are unscoped.
 type TenantPurgeRepository interface {
 	ListDeletedTenants(ctx context.Context, limit int32) ([]PurgeTenant, error)
+	ListDueDeletionTenantIDs(ctx context.Context, limit int32) ([]int64, error)
 	ListExpiredTrialTenantIDs(ctx context.Context, limit int32) ([]int64, error)
 	ListMembershipUserIDs(ctx context.Context, tenantID, afterUserID int64, limit int32) ([]int64, error)
 	ListDataExports(ctx context.Context, tenantID int64, limit int32) ([]DataExport, error)
 	DeleteDataExports(ctx context.Context, tenantID int64, ids []int64) error
+	DeleteMemberInvitations(ctx context.Context, tenantID, userID int64) (int64, error)
+	DeleteMembership(ctx context.Context, tenantID, userID int64) error
+	AdvancePurgeCursor(ctx context.Context, tenantID, cursor int64) error
 	DeleteInvitationsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
 	DeleteMembershipsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
 	DeleteTenantRolesBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
@@ -69,15 +90,18 @@ type TenantPurgeDeps struct {
 	Storage  storage.Storage
 }
 
-// TenantPurgeService orchestrates the deleted-tenant purge and the hourly
-// trial expiry. It also implements tenancy.Purger for identity's own
-// tenant-wide rows.
+// TenantPurgeService orchestrates the deleted-tenant purge, the hourly trial
+// expiry, and the pending-deletion finalizer. It also implements
+// tenancy.Purger for identity's own tenant-wide rows.
 type TenantPurgeService struct {
 	repo     TenantPurgeRepository
 	privacy  *PrivacyService
 	tenants  *TenantService
 	registry *tenancycontracts.Registry
 	storage  storage.Storage
+	// now is the clock used for the per-tenant and per-run budgets. Tests set
+	// it to advance time without sleeping.
+	now func() time.Time
 }
 
 var _ tenancycontracts.Purger = (*TenantPurgeService)(nil)
@@ -90,35 +114,58 @@ func NewTenantPurgeService(deps TenantPurgeDeps) *TenantPurgeService {
 		tenants:  deps.Tenants,
 		registry: deps.Registry,
 		storage:  deps.Storage,
+		now:      time.Now,
 	}
 }
 
-// HandlePurgeJob purges every deleted tenant that has not completed yet. It is
-// resumable: each phase is idempotent and purged_at is written only after every
-// module succeeded, so a failed run retries the same tenant. One failing tenant
-// does not stop the others; the joined error makes the job retry.
+// HandlePurgeJob purges every deleted tenant that has not completed yet,
+// least recently advanced first. It is resumable: progress is persisted per
+// member, each phase is idempotent, and purged_at is written only after every
+// module succeeded. One failing tenant does not stop the others; the joined
+// error makes the job retry. Per-tenant and per-run budgets keep a large
+// tenant from starving the rest.
 func (s *TenantPurgeService) HandlePurgeJob(ctx context.Context, _ json.RawMessage) error {
 	ctx = authz.SystemContext(ctx)
 	tenants, err := s.repo.ListDeletedTenants(ctx, tenantPurgeBatchSize)
 	if err != nil {
 		return fmt.Errorf("list deleted tenants: %w", err)
 	}
+	runStart := s.clock()
 	var errs []error
 	for _, t := range tenants {
-		if err := s.purgeDeletedTenant(ctx, t); err != nil {
+		if s.clock().Sub(runStart) >= tenantPurgeRunBudget {
+			slog.Info("tenant purge run budget exhausted; remaining tenants continue next run",
+				slog.Int64("next_tenant_id", t.ID))
+			break
+		}
+		completed, err := s.purgeDeletedTenant(ctx, t)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("tenant %d: %w", t.ID, err))
+			continue
+		}
+		if !completed {
+			slog.Info("tenant purge deferred by its per-tenant time budget",
+				slog.Int64("tenant_id", t.ID))
 		}
 	}
 	return errors.Join(errs...)
 }
 
-func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTenant) error {
+// purgeDeletedTenant reports completed=false when its per-tenant budget ran
+// out before the tenant was finished; the persisted cursor lets the next run
+// resume after the last finished member.
+func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTenant) (bool, error) {
+	start := s.clock()
 	tctx := tenant.WithID(ctx, t.ID)
-	if err := s.eraseMemberships(tctx, t.ID); err != nil {
-		return err
+	completed, err := s.eraseMemberships(tctx, start, t.ID, t.Cursor)
+	if err != nil {
+		return false, err
+	}
+	if !completed {
+		return false, nil
 	}
 	if s.registry == nil {
-		return fmt.Errorf("tenant purge registry is not configured")
+		return false, fmt.Errorf("tenant purge registry is not configured")
 	}
 	providers := s.registry.Providers()
 	identitySeen := false
@@ -126,21 +173,30 @@ func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTena
 		if provider.Name == tenantPurgerName {
 			continue
 		}
+		if s.budgetExhausted(start) {
+			return false, nil
+		}
 		if err := provider.Purger.PurgeTenant(tctx, t.ID); err != nil {
-			return fmt.Errorf("purge %s: %w", provider.Name, err)
+			return false, fmt.Errorf("purge %s: %w", provider.Name, err)
 		}
 	}
 	for _, provider := range providers {
 		if provider.Name != tenantPurgerName {
 			continue
 		}
+		if s.budgetExhausted(start) {
+			return false, nil
+		}
 		identitySeen = true
 		if err := provider.Purger.PurgeTenant(tctx, t.ID); err != nil {
-			return fmt.Errorf("purge %s: %w", provider.Name, err)
+			return false, fmt.Errorf("purge %s: %w", provider.Name, err)
 		}
 	}
 	if !identitySeen {
-		return fmt.Errorf("identity tenant purger is not registered")
+		return false, fmt.Errorf("identity tenant purger is not registered")
+	}
+	if s.budgetExhausted(start) {
+		return false, nil
 	}
 
 	event := audit.NewServiceEvent(tctx, "tenant.purged", "tenant")
@@ -150,38 +206,68 @@ func (s *TenantPurgeService) purgeDeletedTenant(ctx context.Context, t PurgeTena
 	event.Source = audit.SourceSystem
 	marked, err := s.repo.MarkPurged(tctx, t.ID, event)
 	if err != nil {
-		return fmt.Errorf("mark tenant purged: %w", err)
+		return false, fmt.Errorf("mark tenant purged: %w", err)
 	}
 	if marked {
 		slog.Info("deleted tenant purged", slog.Int64("tenant_id", t.ID), slog.String("tenant", t.Slug))
 	}
-	return nil
+	return true, nil
 }
 
 // eraseMemberships runs the privacy erasers for every membership of the
-// tenant, including removed ones, in user-id pages. Identity's eraser only
-// marks the membership removed; the final membership delete happens after the
-// tenant-wide module purgers.
-func (s *TenantPurgeService) eraseMemberships(ctx context.Context, tenantID int64) error {
+// tenant, including removed ones, in user-id pages from cursor. Each member's
+// membership is deleted as soon as every eraser succeeded, so a resumed run
+// never revisits finished work. Identity's own tenant-wide purger still runs
+// afterwards for anything left.
+func (s *TenantPurgeService) eraseMemberships(ctx context.Context, start time.Time, tenantID, cursor int64) (bool, error) {
 	if s.privacy == nil {
-		return fmt.Errorf("privacy service is not configured")
+		return false, fmt.Errorf("privacy service is not configured")
 	}
-	after := int64(0)
+	after := cursor
 	for {
+		if s.budgetExhausted(start) {
+			return false, nil
+		}
 		userIDs, err := s.repo.ListMembershipUserIDs(ctx, tenantID, after, tenantPurgeMembershipBatch)
 		if err != nil {
-			return fmt.Errorf("list tenant memberships: %w", err)
+			return false, fmt.Errorf("list tenant memberships: %w", err)
 		}
 		for _, userID := range userIDs {
-			if err := s.privacy.eraseUserInTenant(ctx, tenantID, userID); err != nil {
-				return fmt.Errorf("erase member %d: %w", userID, err)
+			if s.budgetExhausted(start) {
+				return false, nil
 			}
+			if err := s.privacy.eraseUserInTenant(ctx, tenantID, userID); err != nil {
+				return false, fmt.Errorf("erase member %d: %w", userID, err)
+			}
+			// Invitations reference the membership through two RESTRICT FKs
+			// (invited_by and accepted_by), so release them before the delete.
+			if _, err := s.repo.DeleteMemberInvitations(ctx, tenantID, userID); err != nil {
+				return false, fmt.Errorf("delete member %d invitations: %w", userID, err)
+			}
+			if err := s.repo.DeleteMembership(ctx, tenantID, userID); err != nil {
+				return false, fmt.Errorf("delete member %d membership: %w", userID, err)
+			}
+			if err := s.repo.AdvancePurgeCursor(ctx, tenantID, userID); err != nil {
+				return false, fmt.Errorf("persist tenant purge progress: %w", err)
+			}
+			after = userID
 		}
 		if len(userIDs) < tenantPurgeMembershipBatch {
-			return nil
+			return true, nil
 		}
-		after = userIDs[len(userIDs)-1]
 	}
+}
+
+func (s *TenantPurgeService) budgetExhausted(start time.Time) bool {
+	return s.clock().Sub(start) >= tenantPurgeTenantBudget
+}
+
+// clock is the budget clock; the constructor sets time.Now.
+func (s *TenantPurgeService) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // PurgeTenant implements tenancy.Purger for identity's own tenant-wide rows:
@@ -274,6 +360,29 @@ func (s *TenantPurgeService) HandleTrialExpiryJob(ctx context.Context, _ json.Ra
 		}
 		if changed {
 			slog.Info("tenant trial expired", slog.Int64("tenant_id", id))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// HandleDeletionJob moves pending_deletion tenants whose grace period ended to
+// deleted through the audited TenantService, so the hourly purge job can pick
+// them up. Each transition is re-checked under the tenant row lock.
+func (s *TenantPurgeService) HandleDeletionJob(ctx context.Context, _ json.RawMessage) error {
+	ctx = authz.SystemContext(ctx)
+	ids, err := s.repo.ListDueDeletionTenantIDs(ctx, tenantPurgeTrialBatch)
+	if err != nil {
+		return fmt.Errorf("list due deletions: %w", err)
+	}
+	var errs []error
+	for _, id := range ids {
+		changed, err := s.tenants.FinalizeDeletion(ctx, id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("finalize tenant %d deletion: %w", id, err))
+			continue
+		}
+		if changed {
+			slog.Info("tenant deletion finalized", slog.Int64("tenant_id", id))
 		}
 	}
 	return errors.Join(errs...)

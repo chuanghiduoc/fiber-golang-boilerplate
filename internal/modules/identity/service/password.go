@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // ChangePasswordInput sets a new password after verifying the current one.
@@ -67,12 +66,10 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 		return err
 	}
 
-	// The password row and the revocation of every session (in every tenant)
-	// must not half-apply, so this stays one bypass transaction. Everything
-	// inside is either a global user/MFA/token statement keyed by user id or a
-	// cross-tenant revocation by user id; the audit event names its tenant
-	// explicitly rather than relying on RLS.
-	ctx = database.WithRLSBypass(ctx)
+	// The password row and the token-version bump live in the request tenant's
+	// transaction; they are global statements and need no RLS bypass. The bump
+	// alone ends every session in every tenant, so the per-tenant session-row
+	// revocation is a follow-up bypass statement after this commits.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if changeErr := replacePassword(ctx, tx.Stores, userID, hash); changeErr != nil {
 			return changeErr
@@ -92,21 +89,20 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 		return err
 	}
 
+	cleanupStaleSessions(ctx, s.Stores.Sessions, userID, RevokeCredentialsChanged)
 	invalidateSessions(ctx, s.SessionCache, userID)
 	clearLoginAttempts(ctx, s.Cache, member.User.Email)
 	return nil
 }
 
-// replacePassword stores the new hash (which bumps the token version), revokes
-// every session and reset link, and removes a pending MFA enrollment: a
-// password change ends every existing session of the user in every tenant and
-// whoever started an unconfirmed enrollment no longer proves account control.
+// replacePassword stores the new hash (which bumps the token version), removes a
+// pending MFA enrollment, and invalidates reset links: a password change ends
+// every existing session of the user in every tenant (through the version bump;
+// the caller records the session-row cleanup after commit) and whoever started
+// an unconfirmed enrollment no longer proves account control.
 func replacePassword(ctx context.Context, st Stores, userID int64, hash string) error {
 	if _, err := st.Users.ReplacePassword(ctx, userID, hash); err != nil {
 		return userWriteError(err, "user not found", "failed to update password")
-	}
-	if err := st.Sessions.RevokeAllForUser(ctx, userID, RevokeCredentialsChanged); err != nil {
-		return apperror.NewInternal("failed to revoke sessions")
 	}
 	if err := st.MFA.DeletePendingTOTP(ctx, userID); err != nil {
 		return apperror.NewInternal("failed to delete pending MFA enrollment")

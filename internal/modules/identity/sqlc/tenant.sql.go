@@ -11,10 +11,32 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const advanceTenantPurgeCursor = `-- name: AdvanceTenantPurgeCursor :exec
+UPDATE tenants
+SET purge_cursor = $1::bigint,
+    purge_progress_at = NOW()
+WHERE id = $2::bigint
+  AND status = 'deleted'
+  AND purged_at IS NULL
+  AND purge_cursor < $1::bigint
+`
+
+type AdvanceTenantPurgeCursorParams struct {
+	PurgeCursor int64 `json:"purge_cursor"`
+	ID          int64 `json:"id"`
+}
+
+// Records the highest membership user id whose erasers succeeded. It only
+// moves forward and only for an unfinished deleted tenant.
+func (q *Queries) AdvanceTenantPurgeCursor(ctx context.Context, arg AdvanceTenantPurgeCursorParams) error {
+	_, err := q.db.Exec(ctx, advanceTenantPurgeCursor, arg.PurgeCursor, arg.ID)
+	return err
+}
+
 const createTenant = `-- name: CreateTenant :one
 INSERT INTO tenants (slug, name, status, trial_ends_at)
 VALUES ($1, $2, $3, $4)
-RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at
 `
 
 type CreateTenantParams struct {
@@ -41,6 +63,8 @@ func (q *Queries) CreateTenant(ctx context.Context, arg CreateTenantParams) (Ten
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -79,7 +103,7 @@ func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID int64) (int
 }
 
 const getOperationalTenantByID = `-- name: GetOperationalTenantByID :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE id = $1
   AND (status = 'active' OR (status = 'trialing' AND trial_ends_at > NOW()))
 `
@@ -96,6 +120,8 @@ func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenan
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -104,7 +130,7 @@ func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenan
 
 const getOperationalTenantBySlug = `-- name: GetOperationalTenantBySlug :one
 
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE slug = $1
   AND (status = 'active' OR (status = 'trialing' AND trial_ends_at > NOW()))
 `
@@ -124,6 +150,8 @@ func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -131,7 +159,7 @@ func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE id = $1
 `
 
@@ -149,6 +177,8 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -156,7 +186,7 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 }
 
 const getTenantByIDForUpdate = `-- name: GetTenantByIDForUpdate :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE id = $1
 FOR UPDATE
 `
@@ -173,6 +203,8 @@ func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -180,7 +212,7 @@ func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant,
 }
 
 const getTenantBySlug = `-- name: GetTenantBySlug :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE slug = $1
 `
 
@@ -196,6 +228,8 @@ func (q *Queries) GetTenantBySlug(ctx context.Context, slug string) (Tenant, err
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -221,14 +255,16 @@ func (q *Queries) GetTenantSettings(ctx context.Context, tenantID int64) (Tenant
 }
 
 const listDeletedUnpurgedTenants = `-- name: ListDeletedUnpurgedTenants :many
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE status = 'deleted'
   AND purged_at IS NULL
-ORDER BY id
+ORDER BY purge_progress_at ASC NULLS FIRST, id
 LIMIT $1::int
 `
 
-// The deleted-tenant purge only considers rows that have not completed yet.
+// The deleted-tenant purge only considers rows that have not completed yet,
+// least recently advanced first so a large tenant cannot starve the rest.
+// A NULL purge_progress_at (never attempted) comes first.
 func (q *Queries) ListDeletedUnpurgedTenants(ctx context.Context, rowLimit int32) ([]Tenant, error) {
 	rows, err := q.db.Query(ctx, listDeletedUnpurgedTenants, rowLimit)
 	if err != nil {
@@ -247,12 +283,44 @@ func (q *Queries) ListDeletedUnpurgedTenants(ctx context.Context, rowLimit int32
 			&i.TrialEndsAt,
 			&i.DeletionScheduledAt,
 			&i.PurgedAt,
+			&i.PurgeCursor,
+			&i.PurgeProgressAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDueDeletionTenantIDs = `-- name: ListDueDeletionTenantIDs :many
+SELECT id FROM tenants
+WHERE status = 'pending_deletion'
+  AND deletion_scheduled_at <= NOW()
+ORDER BY deletion_scheduled_at, id
+LIMIT $1::int
+`
+
+// The hourly finalize job moves tenants whose pending_deletion grace ended to
+// deleted through the audited TenantService.
+func (q *Queries) ListDueDeletionTenantIDs(ctx context.Context, rowLimit int32) ([]int64, error) {
+	rows, err := q.db.Query(ctx, listDueDeletionTenantIDs, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -291,7 +359,7 @@ func (q *Queries) ListExpiredTrialTenantIDs(ctx context.Context, rowLimit int32)
 }
 
 const listTenantsCursor = `-- name: ListTenantsCursor :many
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at FROM tenants
 WHERE (created_at, id) < ($1::timestamptz, $2::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT $3::int
@@ -322,6 +390,8 @@ func (q *Queries) ListTenantsCursor(ctx context.Context, arg ListTenantsCursorPa
 			&i.TrialEndsAt,
 			&i.DeletionScheduledAt,
 			&i.PurgedAt,
+			&i.PurgeCursor,
+			&i.PurgeProgressAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -359,7 +429,7 @@ SET status = $1,
     status_changed_at = NOW(),
     deletion_scheduled_at = $2
 WHERE id = $3
-RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, purge_cursor, purge_progress_at, created_at, updated_at
 `
 
 type UpdateTenantStatusParams struct {
@@ -380,6 +450,8 @@ func (q *Queries) UpdateTenantStatus(ctx context.Context, arg UpdateTenantStatus
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
 		&i.PurgedAt,
+		&i.PurgeCursor,
+		&i.PurgeProgressAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

@@ -40,6 +40,7 @@ type Guard struct {
 	allowedPorts map[int]struct{}
 	dialTimeout  time.Duration
 	resolver     *net.Resolver
+	lookupIP     func(context.Context, string) ([]net.IPAddr, error)
 }
 
 // NewGuard builds a Guard from operator-supplied allowlist entries with the
@@ -64,6 +65,7 @@ func NewGuardWithPorts(allowlist []string, ports []int) (*Guard, error) {
 		dialTimeout:  defaultConnectTimeout,
 		resolver:     net.DefaultResolver,
 	}
+	g.lookupIP = g.resolver.LookupIPAddr
 	for _, port := range defaultAllowedPorts {
 		g.allowedPorts[port] = struct{}{}
 	}
@@ -110,6 +112,17 @@ func (g *Guard) allow(entry string) error {
 	}
 	g.allowedHosts[host] = struct{}{}
 	return nil
+}
+
+// WithLookupIP returns a copy of g whose DNS resolution uses lookup. It exists
+// for validation-time resolution in tests and for deployments with a custom
+// resolver; the original Guard is unchanged.
+func (g *Guard) WithLookupIP(lookup func(context.Context, string) ([]net.IPAddr, error)) *Guard {
+	clone := *g
+	if lookup != nil {
+		clone.lookupIP = lookup
+	}
+	return &clone
 }
 
 // withDialTimeout returns a copy of g whose dialer uses timeout for the TCP
@@ -217,7 +230,11 @@ func (g *Guard) CheckHost(ctx context.Context, host string) ([]net.IP, error) {
 	}
 
 	hostAllowed := g.hostAllowed(host)
-	addrs, err := g.resolver.LookupIPAddr(ctx, host)
+	lookup := g.lookupIP
+	if lookup == nil {
+		lookup = g.resolver.LookupIPAddr
+	}
+	addrs, err := lookup(ctx, host)
 	if err != nil {
 		return nil, fmt.Errorf("webhook: resolve %q: %w", host, err)
 	}
@@ -330,6 +347,8 @@ func isReservedIPv4(v4 net.IP) bool {
 		return true
 	case v4[0] == 192 && v4[1] == 0 && v4[2] == 2: // 192.0.2.0/24 TEST-NET-1
 		return true
+	case v4[0] == 192 && v4[1] == 88 && v4[2] == 99: // 192.88.99.0/24 6to4 relay anycast
+		return true
 	case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // 198.18.0.0/15 benchmark
 		return true
 	case v4[0] == 198 && v4[1] == 51 && v4[2] == 100: // 198.51.100.0/24 TEST-NET-2
@@ -346,7 +365,9 @@ func isReservedIPv4(v4 net.IP) bool {
 var blockedIPv6Ranges = mustCIDRs(
 	"2001:db8::/32",  // documentation
 	"2001::/32",      // Teredo
+	"2001:2::/48",    // benchmarking
 	"fec0::/10",      // deprecated site-local
+	"100::/64",       // discard-only
 	"64:ff9b:1::/48", // local-use NAT64 (RFC 8215)
 )
 

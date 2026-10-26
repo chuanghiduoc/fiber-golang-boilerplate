@@ -23,6 +23,7 @@ import (
 type Module struct {
 	upload          *fileshandler.UploadHandler
 	trashPurger     *filesvc.TrashPurger
+	orphanSweeper   *filesvc.OrphanSweeper
 	privacyExporter *filesvc.PrivacyExporter
 	privacyEraser   *filesvc.PrivacyEraser
 	tenantPurger    tenancycontracts.Purger

@@ -28,6 +28,9 @@ func Build(infra app.Infra) ([]app.Module, error) {
 	_ = context.Background()
 	// gen:module-build
 
+	_ = admin.Build()
+	// gen:module-purge
+
 	return []app.Module{
 		admin.Build(),
 		// gen:module-list
@@ -179,7 +182,7 @@ func TestRegisterInBootstrapIsIdempotent(t *testing.T) {
 	if once != twice {
 		t.Fatal("a second registration must not change the file")
 	}
-	for _, want := range []string{`"example.com/app/internal/modules/billing"`, "billingModule, _, err := billing.Build(infra, billing.Settings{})", "\t\tbillingModule,\n"} {
+	for _, want := range []string{`"example.com/app/internal/modules/billing"`, "billingModule, _, err := billing.Build(infra, billing.Settings{})", "billingModule.RegisterTenantPurge(tenancyRegistry)", "\t\tbillingModule,\n"} {
 		if strings.Count(once, want) != 1 {
 			t.Errorf("want exactly one %q in:\n%s", want, once)
 		}
@@ -230,9 +233,11 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 	for _, want := range []string{
 		"internal/modules/billing/module.go",
 		"internal/modules/billing/build.go",
+		"internal/modules/billing/tenant_purge.go",
 		"internal/modules/billing/service/ports.go",
 		"internal/modules/billing/service/invoice.go",
 		"internal/modules/billing/repository/invoice.go",
+		"internal/modules/billing/repository/invoice_purge.go",
 		"internal/modules/billing/handler/command_issue_invoice.go",
 		"internal/modules/billing/service/query_list_overdue_invoices.go",
 		"migrations/20261025010203_billing_init.up.sql",
@@ -259,6 +264,67 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 	if !strings.Contains(files["internal/modules/billing/service/ports.go"], `"example.com/app/pkg/pagination"`) {
 		t.Error("ports.go must import pagination for the resource port")
 	}
+
+	// Tenancy: the repository uses the RLS-scoped handle, the table has RLS and
+	// the reviewed policy, and a bounded purger is wired into bootstrap.
+	build := strings.Join(strings.Fields(files["internal/modules/billing/build.go"]), " ")
+	for _, want := range []string{
+		"NewInvoiceRepository(infra.DB)",
+		"NewInvoiceTenantPurger(infra.DB)",
+		"m.tenantPurgers = append(m.tenantPurgers, billingrepository.NewInvoiceTenantPurger(infra.DB))",
+	} {
+		if !strings.Contains(build, want) {
+			t.Errorf("build.go is missing %q:\n%s", want, build)
+		}
+	}
+	if strings.Contains(build, "NewInvoiceRepository(infra.Pool)") {
+		t.Error("resource repository must use infra.DB (RLS-scoped), not the raw pool")
+	}
+	migration := files["migrations/20261025010204_billing_create_invoices.up.sql"]
+	for _, want := range []string{
+		"ENABLE ROW LEVEL SECURITY",
+		"FORCE ROW LEVEL SECURITY",
+		"CREATE POLICY tenant_isolation ON billing_invoices",
+		"app_tenant_visible(tenant_id)",
+	} {
+		if !strings.Contains(migration, want) {
+			t.Errorf("migration is missing %q:\n%s", want, migration)
+		}
+	}
+	if query := files["internal/modules/billing/queries/invoice.sql"]; !strings.Contains(query, "DeleteTenantInvoiceBatch") {
+		t.Error("resource queries must include a bounded tenant purge query")
+	}
+	if purge := files["internal/modules/billing/repository/invoice_purge.go"]; !strings.Contains(purge, "PurgeTenant") ||
+		!strings.Contains(purge, "tenancycontracts.PurgeBatchSize") {
+		t.Error("resource repository must include a bounded Tenancy Purger")
+	}
+	if module := files["internal/modules/billing/tenant_purge.go"]; !strings.Contains(module, "RegisterTenantPurge") ||
+		!strings.Contains(module, "tenancycontracts.Provider") {
+		t.Error("module must register its composite tenant purger")
+	}
+	if bootstrapSrc := files[bootstrapFile]; strings.Count(bootstrapSrc, "billingModule.RegisterTenantPurge(tenancyRegistry)") != 1 {
+		t.Errorf("bootstrap must register exactly one billing purger:\n%s", bootstrapSrc)
+	}
+
+	// Partial update: PATCH (not PUT) with a pointer patch input.
+	routes := files["internal/modules/billing/routes_invoice.go"]
+	if !strings.Contains(routes, `group.Patch("/invoices/:id"`) || strings.Contains(routes, `group.Put("/invoices/:id"`) {
+		t.Errorf("resource must mount PATCH, not PUT:\n%s", routes)
+	}
+	if service := files["internal/modules/billing/service/invoice.go"]; !strings.Contains(service, "type InvoicePatch struct") ||
+		!strings.Contains(service, "Name *string") {
+		t.Error("service must expose pointer-field partial update input")
+	}
+	if dto := files["internal/modules/billing/dto/invoice.go"]; !strings.Contains(dto, "InvoicePatchRequest") ||
+		!strings.Contains(dto, "Name *string") {
+		t.Error("dto must expose pointer-field partial update input")
+	}
+	if integration := files["internal/modules/billing/invoice_integration_test.go"]; !strings.Contains(integration, "testutil.Scoped(pool)") ||
+		!strings.Contains(integration, "DB: db") ||
+		!strings.Contains(integration, "NewInvoiceTenantPurger(db).PurgeTenant") {
+		t.Error("integration test must exercise the RLS app pool and the generated tenant purger, not the bypass pool")
+	}
+
 	if len(*ran) == 0 || !strings.Contains(strings.Join(*ran, "\n"), "go test -count=1 ./test/arch/...") {
 		t.Fatalf("verification steps = %v", *ran)
 	}

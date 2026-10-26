@@ -172,7 +172,11 @@ type Membership struct {
 	BannedAt *time.Time
 	// BannedEmailHash is the pseudonymous SHA-256 (lowercase hex) of the
 	// normalized address, written by a ban and kept after removal/erasure.
-	BannedEmailHash      string
+	BannedEmailHash string
+	// ErasureRequestedAt reserves the membership for erasure: it is suspended
+	// and can no longer act until privacy.erase removes it. Unlike BannedAt it
+	// carries no ban semantics.
+	ErasureRequestedAt   *time.Time
 	RemovedAt            *time.Time
 	CredentialsRevokedAt *time.Time
 	CreatedAt            time.Time
@@ -418,6 +422,16 @@ type MFAEnrollment struct {
 	OtpauthURI string
 }
 
+// MFAConfirmResult is the one-time result of confirming a factor: the plaintext
+// recovery codes and, when the caller confirmed from a session, the re-issued
+// token pair for that session. Confirmation bumps the user's token version, so
+// the caller's previous access token stops verifying; the new pair continues
+// the same session row with the second factor in its amr.
+type MFAConfirmResult struct {
+	RecoveryCodes []string
+	Tokens        TokenPair
+}
+
 // MFALogin is a completed two-step sign-in.
 type MFALogin struct {
 	Tokens TokenPair
@@ -499,6 +513,10 @@ type MembershipRepository interface {
 	Ban(ctx context.Context, userID int64) (*Membership, error)
 	Unban(ctx context.Context, userID int64) (*Membership, error)
 	Remove(ctx context.Context, userID int64) (*Membership, error)
+	// SuspendForErasure reserves a non-removed membership for erasure: it
+	// becomes suspended, records erasure_requested_at, and revokes its API
+	// keys, without setting either ban marker.
+	SuspendForErasure(ctx context.Context, userID int64) error
 	CountActiveOwners(ctx context.Context) (int64, error)
 	// LockMembership takes the membership row FOR UPDATE until the
 	// transaction ends. Rank checks and role changes use it to serialize a
@@ -531,9 +549,23 @@ type SessionRepository interface {
 	// RevokeAllForUser revokes the user's sessions in every tenant
 	// (deliberately cross-tenant: global credential events).
 	RevokeAllForUser(ctx context.Context, userID int64, reason RevokeReason) error
+	// RevokeStaleForUser records the revocation of the user's sessions in
+	// every tenant whose token version no longer matches the current one
+	// (deliberately cross-tenant: the after-commit cleanup of a credential or
+	// MFA change, where the version bump already invalidated them). It is
+	// idempotent.
+	RevokeStaleForUser(ctx context.Context, userID int64, reason RevokeReason) error
 	// RevokeOtherUserSessions revokes the user's sessions in every tenant
 	// except keepID (an MFA change keeps the session that performed it).
 	RevokeOtherUserSessions(ctx context.Context, userID, keepID int64, reason RevokeReason) error
+	// Restamp re-issues one live session of the request tenant under
+	// tokenVersion with amr, keeping the same session row. It returns
+	// apperror.ErrNotFound when the session is not live in the request tenant.
+	Restamp(ctx context.Context, userID, id int64, tokenVersion int32, amr []string) (*Session, error)
+	// DeleteRefreshTokens removes every refresh token of the session. A
+	// re-issued session replaces its family: a token minted before the MFA
+	// change must not refresh into the stronger amr.
+	DeleteRefreshTokens(ctx context.Context, sessionID int64) error
 	// RevokeByRefreshToken revokes the session owning a refresh-token hash,
 	// by possession (no tenant predicate). revoked is false when the token is
 	// unknown or its session was already revoked.
@@ -734,7 +766,8 @@ var ErrDataExportInProgress = errors.New("identity: a data export is already in 
 
 // DataExportRepository stores export requests, the export purge, and the
 // cross-table reads/writes the identity eraser and finalizer need. Every
-// method except ListPurgeableDataExports is tenant/user scoped.
+// method except the purge scan and the finalizer's all-tenants invitation
+// sweep is tenant/user scoped.
 type DataExportRepository interface {
 	Create(ctx context.Context, userID int64) (*DataExport, error)
 	Get(ctx context.Context, userID, id int64) (*DataExport, error)
@@ -749,6 +782,12 @@ type DataExportRepository interface {
 	Delete(ctx context.Context, id int64) error
 	ListSessions(ctx context.Context, userID int64) ([]Session, error)
 	AnonymizeUser(ctx context.Context, userID int64, email string) (*User, error)
+	// AnonymizeErasedUserInvitations replaces the address on invitations the
+	// user accepted or that were addressed to them, in the request tenant.
+	AnonymizeErasedUserInvitations(ctx context.Context, userID int64, replacement string) (int64, error)
+	// AnonymizeErasedUserInvitationsAllTenants is the global finalizer's sweep:
+	// it covers every tenant under the RLS bypass.
+	AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, userID int64, replacement string) (int64, error)
 	DeleteCredentialsAndIdentities(ctx context.Context, userID int64) error
 	DeleteSessionsInTenant(ctx context.Context, userID int64) error
 	DeleteSessionsForUser(ctx context.Context, userID int64) error

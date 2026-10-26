@@ -50,6 +50,8 @@ type fakeWorkerStore struct {
 	// signingSecrets is the endpoint's current secret plus its unexpired
 	// previous secret; nil means the snapshot is still the only active one.
 	signingSecrets *SigningSecrets
+	// signingErr makes the signing-secret lookup fail.
+	signingErr error
 	// leaseLost makes every fenced outcome write match no row.
 	leaseLost bool
 	// fencedAttempts records the attempt each fenced write was fenced on.
@@ -60,6 +62,9 @@ type fakeWorkerStore struct {
 }
 
 func (f *fakeWorkerStore) SigningSecrets(context.Context, int64) (*SigningSecrets, error) {
+	if f.signingErr != nil {
+		return nil, f.signingErr
+	}
 	if f.signingSecrets != nil {
 		return f.signingSecrets, nil
 	}
@@ -545,6 +550,38 @@ func TestDeliveryWorker_ShutdownBeforeResponseReleasesAttempt(t *testing.T) {
 	}
 }
 
+// TestDeliveryWorker_ShutdownDuringSecretLookupReleasesAttempt proves a
+// canceled job context during the signing-secret lookup gives the attempt back
+// instead of scheduling a retry or dead-lettering the delivery.
+func TestDeliveryWorker_ShutdownDuringSecretLookupReleasesAttempt(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	store := &fakeWorkerStore{
+		delivery:   fixedDelivery("https://example.com/hook", ciphertext, 2, 3),
+		signingErr: errors.New("database is unavailable"),
+	}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
+
+	err := worker.Handle(ctx, payload)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Handle() error = %v, want context.Canceled so the job is released", err)
+	}
+	if !store.released || len(store.fencedAttempts) != 1 || store.fencedAttempts[0] != 3 {
+		t.Fatalf("claim must be released fenced on attempt 3: released=%v fenced=%v", store.released, store.fencedAttempts)
+	}
+	if store.dead || store.succeeded || store.retryDraft != nil {
+		t.Fatalf("interrupted attempt must not finish the delivery: dead=%v succeeded=%v retry=%+v",
+			store.dead, store.succeeded, store.retryDraft)
+	}
+	if len(store.attempts) != 0 {
+		t.Fatalf("interrupted attempt must not be recorded as a failure: %+v", store.attempts)
+	}
+}
+
 // TestDeliveryWorker_StaleOutcomeIsDiscarded proves outcome writes are fenced
 // on the claimed attempt, and a lost lease is logged and dropped instead of
 // failing (and endlessly retrying) the job.
@@ -697,6 +734,116 @@ func verifyWith(secret string, header http.Header, body []byte, now time.Time) e
 		return err
 	}
 	return webhook.VerifyRequest(key, header, body, time.Minute, now)
+}
+
+// A replica during a key rollout may not yet have the key that sealed the
+// snapshot. That is retryable: the delivery must not dead-letter before a
+// replica with the key can send it.
+func TestDeliveryWorker_UnknownSecretKeyIsRetryable(t *testing.T) {
+	_, ciphertext := testCodec(t)
+	workerCodec, err := NewSecretCodec("a-different-encryption-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	store := &fakeWorkerStore{delivery: fixedDelivery("https://example.com/hook", ciphertext, 0, 3)}
+	worker, now := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = workerCodec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if store.dead || store.succeeded {
+		t.Fatalf("outcome: dead=%v succeeded=%v, want a retry", store.dead, store.succeeded)
+	}
+	if store.retryDraft == nil {
+		t.Fatal("an unknown decryption key must schedule a retry")
+	}
+	if !store.retryDraft.NextAttemptAt.After(now) {
+		t.Fatalf("retry at %v, want after %v", store.retryDraft.NextAttemptAt, now)
+	}
+	if len(store.attempts) != 1 {
+		t.Fatalf("attempts = %+v, want one recorded retryable failure", store.attempts)
+	}
+
+	// The last allowed attempt dead-letters instead of retrying forever.
+	store = &fakeWorkerStore{delivery: fixedDelivery("https://example.com/hook", ciphertext, 2, 3)}
+	worker, _ = testWorker(store, loopbackWebhookClient(t))
+	worker.codec = workerCodec
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle() on the last attempt: %v", err)
+	}
+	if !store.dead || store.retryDraft != nil {
+		t.Fatalf("outcome: dead=%v retry=%+v, want dead after max attempts", store.dead, store.retryDraft)
+	}
+}
+
+// TestDeliveryWorker_SigningSecretLookupFailureRetries proves a failed lookup
+// of the endpoint's current secret does not fall back to signing with the
+// delivery snapshot: after the rotation grace that would sign with a secret
+// the receiver may already have retired.
+func TestDeliveryWorker_SigningSecretLookupFailureRetries(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	store := &fakeWorkerStore{
+		delivery:   fixedDelivery(server.URL, ciphertext, 0, 3),
+		signingErr: errors.New("database is unavailable"),
+	}
+	worker, now := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want none: the snapshot must not be used as a fallback", requests)
+	}
+	if store.dead || store.succeeded {
+		t.Fatalf("outcome: dead=%v succeeded=%v, want a retry", store.dead, store.succeeded)
+	}
+	if store.retryDraft == nil || !store.retryDraft.NextAttemptAt.After(now) {
+		t.Fatalf("retry = %+v, want a scheduled later attempt", store.retryDraft)
+	}
+	if len(store.attempts) != 1 {
+		t.Fatalf("attempts = %+v, want one recorded retryable failure", store.attempts)
+	}
+}
+
+func TestDeliveryWorker_InvalidSecretEnvelopeIsPermanent(t *testing.T) {
+	codec, _ := testCodec(t)
+	store := &fakeWorkerStore{delivery: fixedDelivery("https://example.com/hook", "{not-json", 0, 3)}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if !store.dead || store.retryDraft != nil {
+		t.Fatalf("outcome: dead=%v retry=%+v, want a structurally invalid envelope dead", store.dead, store.retryDraft)
+	}
+}
+
+func TestDeliveryWorker_SealedPayloadIsNotInvalidEnvelope(t *testing.T) {
+	codec, ciphertext := testCodec(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	store := &fakeWorkerStore{delivery: fixedDelivery(server.URL, ciphertext, 0, 3)}
+	worker, _ := testWorker(store, loopbackWebhookClient(t))
+	worker.codec = codec
+	payload, _ := json.Marshal(DeliveryJobPayload{DeliveryID: 7})
+	if err := worker.Handle(context.Background(), payload); err != nil {
+		t.Fatalf("Handle(): %v", err)
+	}
+	if !store.succeeded {
+		t.Fatal("a valid v3 snapshot must still send")
+	}
 }
 
 // A secret created before Standard Webhooks cannot be decoded into a key: the

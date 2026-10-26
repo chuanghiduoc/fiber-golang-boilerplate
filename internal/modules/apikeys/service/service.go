@@ -46,6 +46,7 @@ type Service interface {
 type service struct {
 	keys        APIKeyRepository
 	principals  identitycontracts.PrincipalReader
+	ranks       identitycontracts.MemberRankChecker
 	tx          Transactor
 	now         func() time.Time
 	maxLifetime time.Duration
@@ -55,14 +56,16 @@ type service struct {
 // audited: the audit row is written in the mutation's transaction, so a
 // failed audit write rolls the change back (503 system.audit_unavailable).
 // maxLifetime caps every newly issued key; a non-positive value falls back to
-// the documented default for tests and minimal deployments.
-func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, tx Transactor, maxLifetime time.Duration) Service {
+// the documented default for tests and minimal deployments. ranks is identity's
+// member hierarchy; nil fails closed when a caller manages another member's key.
+func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, ranks identitycontracts.MemberRankChecker, tx Transactor, maxLifetime time.Duration) Service {
 	if maxLifetime <= 0 {
 		maxLifetime = defaultMaxLifetime
 	}
 	return &service{
 		keys:        keys,
 		principals:  principals,
+		ranks:       ranks,
 		tx:          tx,
 		now:         time.Now,
 		maxLifetime: maxLifetime,
@@ -209,6 +212,13 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 	if err != nil {
 		return nil, err
 	}
+	caller, hasCaller := authz.SubjectFromContext(ctx)
+	isOwner := (!hasCaller && authz.IsSystemContext(ctx)) || (hasCaller && caller.UserID == existing.UserID)
+	if !isOwner {
+		if err := s.ensureCanManageKey(ctx, existing); err != nil {
+			return nil, err
+		}
+	}
 	if existing.RevokedAt != nil {
 		return nil, apperror.NewConflict("API key has been revoked")
 	}
@@ -230,8 +240,15 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 		if err != nil {
 			return nil, err
 		}
-		if err := ensureCallerCanGrant(ctx, scopes); err != nil {
-			return nil, err
+		if isOwner {
+			if err := ensureCallerCanGrant(ctx, scopes); err != nil {
+				return nil, err
+			}
+		} else if !scopesSubset(scopes, existing.Scopes) {
+			// Another member may narrow or revoke a key, but never widen it:
+			// otherwise an admin could grant an owner's key a scope and then
+			// act with the owner's authority.
+			return nil, apperror.NewCode(apperror.CodePermissionDenied, "only the key owner may widen scopes")
 		}
 	}
 
@@ -254,29 +271,37 @@ func (s *service) Update(ctx context.Context, id int64, in UpdateInput) (*APIKey
 }
 
 func (s *service) Revoke(ctx context.Context, id int64) error {
+	existing, err := s.get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.ensureCanManageKey(ctx, existing); err != nil {
+		return err
+	}
+	if existing.RevokedAt != nil {
+		// Revocation is idempotent and writes no second audit row.
+		return nil
+	}
 	return s.mutate(ctx, func(ctx context.Context, tx TxRepos) (*audit.Event, error) {
 		revoked, err := tx.Keys.Revoke(ctx, id)
-		if err == nil {
-			return keyEvent(ctx, "api_key.revoked", revoked, nil), nil
-		}
-		if !errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewInternal("failed to revoke API key")
-		}
-
-		// Revocation is idempotent: revoking an already-revoked key succeeds
-		// without a second audit row, while a missing or cross-tenant id is
-		// concealed as not found.
-		existing, getErr := tx.Keys.GetByID(ctx, id)
-		if getErr != nil {
-			if errors.Is(getErr, apperror.ErrNotFound) {
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				// A concurrent revoke won the race; the outcome is the same.
+				current, getErr := tx.Keys.GetByID(ctx, id)
+				if getErr != nil {
+					if errors.Is(getErr, apperror.ErrNotFound) {
+						return nil, apperror.NewNotFound("API key not found")
+					}
+					return nil, apperror.NewInternal("failed to revoke API key")
+				}
+				if current.RevokedAt != nil {
+					return nil, nil
+				}
 				return nil, apperror.NewNotFound("API key not found")
 			}
 			return nil, apperror.NewInternal("failed to revoke API key")
 		}
-		if existing.RevokedAt != nil {
-			return nil, nil
-		}
-		return nil, apperror.NewNotFound("API key not found")
+		return keyEvent(ctx, "api_key.revoked", revoked, nil), nil
 	})
 }
 
@@ -325,6 +350,11 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 	}
 	if existing.RotatedAt != nil {
 		return nil, apperror.NewConflict("API key has already been rotated")
+	}
+	// A key past its expiry is already unusable; a successor inheriting that
+	// expiry would be dead on arrival.
+	if existing.ExpiresAt != nil && !existing.ExpiresAt.After(s.now()) {
+		return nil, apperror.NewConflict("API key has expired")
 	}
 	if err := s.ensureOwnerCanRotate(ctx, tx, existing); err != nil {
 		return nil, err
@@ -451,6 +481,47 @@ func (s *service) checkPrincipal(
 		return identitycontracts.Principal{}, apperror.NewNotFound("user not found")
 	}
 	return principal, nil
+}
+
+// ensureCanManageKey applies identity's member hierarchy to another member's
+// key. The owner manages their own keys; a trusted system caller is allowed;
+// everyone else must outrank the key's owner. A wired rank checker is required
+// for a real caller, so a missing one fails closed instead of skipping the
+// check.
+func (s *service) ensureCanManageKey(ctx context.Context, key *APIKey) error {
+	caller, hasCaller := authz.SubjectFromContext(ctx)
+	if !hasCaller {
+		if authz.IsSystemContext(ctx) {
+			return nil
+		}
+		return apperror.NewCode(apperror.CodePermissionDenied, "insufficient permissions")
+	}
+	if caller.UserID == key.UserID {
+		return nil
+	}
+	if s.ranks == nil {
+		slog.Error("API-key management has no member rank checker; refusing a cross-member operation",
+			slog.Int64("key_id", key.ID),
+			slog.Int64("owner_user_id", key.UserID),
+		)
+		return apperror.NewInternal("failed to check API key owner rank")
+	}
+	return s.ranks.CanManageMember(ctx, key.UserID)
+}
+
+// scopesSubset reports whether every scope in candidate is already present in
+// allowed.
+func scopesSubset(candidate, allowed []authz.Permission) bool {
+	have := make(map[authz.Permission]struct{}, len(allowed))
+	for _, scope := range allowed {
+		have[scope] = struct{}{}
+	}
+	for _, scope := range candidate {
+		if _, ok := have[scope]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeScopes(raw []string, principal identitycontracts.Principal) ([]authz.Permission, error) {

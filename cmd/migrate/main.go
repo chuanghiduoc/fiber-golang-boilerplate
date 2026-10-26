@@ -84,14 +84,14 @@ var requiredTables = []string{
 // requiredColumns catches a legacy schema that has the right table names but
 // predates the column hardening folded into the baseline.
 var requiredColumns = map[string][]string{
-	"tenants":         {"slug", "status", "status_changed_at", "trial_ends_at", "deletion_scheduled_at", "purged_at"},
+	"tenants":         {"slug", "status", "status_changed_at", "trial_ends_at", "deletion_scheduled_at", "purged_at", "purge_cursor", "purge_progress_at"},
 	"tenant_settings": {"tenant_id", "locale", "timezone"},
 	// Global users: no tenant_id, role, or credential columns.
 	"users":           {"email", "status", "token_version", "credentials_changed_at", "deleted_at"},
 	"user_passwords":  {"user_id", "password_hash", "changed_at"},
 	"user_identities": {"user_id", "provider", "subject", "email"},
 	"memberships": {
-		"tenant_id", "user_id", "status", "banned_at", "banned_email_hash", "removed_at", "credentials_revoked_at",
+		"tenant_id", "user_id", "status", "banned_at", "banned_email_hash", "erasure_requested_at", "removed_at", "credentials_revoked_at",
 	},
 	"permissions":               {"key", "owner"},
 	"roles":                     {"tenant_id", "scope", "key", "name"},

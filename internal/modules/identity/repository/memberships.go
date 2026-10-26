@@ -34,6 +34,7 @@ func toMembership(row identitysqlc.Membership, role string, roles []string) iden
 		Status:               identityservice.MembershipStatus(row.Status),
 		BannedAt:             timePtr(row.BannedAt),
 		BannedEmailHash:      row.BannedEmailHash.String,
+		ErasureRequestedAt:   timePtr(row.ErasureRequestedAt),
 		RemovedAt:            timePtr(row.RemovedAt),
 		CredentialsRevokedAt: timePtr(row.CredentialsRevokedAt),
 		CreatedAt:            row.CreatedAt.Time,
@@ -195,6 +196,21 @@ func (r *MembershipRepository) Remove(ctx context.Context, userID int64) (*ident
 		return nil, err
 	}
 	return r.hydrate(ctx, row)
+}
+
+// SuspendForErasure marks a non-removed membership as erasure-pending. It
+// leaves the ban columns alone; the trigger still protects the last owner.
+func (r *MembershipRepository) SuspendForErasure(ctx context.Context, userID int64) error {
+	rows, err := r.q.SuspendMembershipForErasure(ctx, identitysqlc.SuspendMembershipForErasureParams{
+		TenantID: tenantID(ctx), UserID: userID,
+	})
+	if err != nil {
+		return wrapErr(err)
+	}
+	if rows == 0 {
+		return apperror.ErrNotFound
+	}
+	return nil
 }
 
 // deleteInvitationsCreatedBy revokes the pending invitations a banned or

@@ -27,9 +27,16 @@ type {{.R.Pascal}} struct {
 	UpdatedAt time.Time
 }
 
-// {{.R.Pascal}}Input holds the writable {{.R.Human}} fields (create and full update).
+// {{.R.Pascal}}Input holds the writable {{.R.Human}} fields for create.
 type {{.R.Pascal}}Input struct {
 	Name string
+}
+
+// {{.R.Pascal}}Patch holds a partial update: nil means "leave unchanged".
+// Add a pointer field here and a matching CASE in queries/ when the table
+// grows, so an omitted field never overwrites a concurrent write.
+type {{.R.Pascal}}Patch struct {
+	Name *string
 }
 
 // {{.R.Pascal}}Page is one page of {{.R.HumanPlural}}, newest first.
@@ -119,21 +126,35 @@ func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfte
 	return page, nil
 }
 
-// Update replaces the writable fields of one {{.R.Human}} of the request tenant.
-func (s *{{.R.Pascal}}Service) Update(ctx context.Context, id int64, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+// Patch changes only the fields the caller supplied. An empty patch is a
+// validation error rather than a silent no-op, and a provided name follows the
+// same trim/length rules as create.
+func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id int64, in {{.R.Pascal}}Patch) ({{.R.Pascal}}, error) {
 	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
 	if id <= 0 {
 		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
 	}
-	in, err := normalize{{.R.Pascal}}Input(in)
-	if err != nil {
-		return {{.R.Pascal}}{}, err
+	if in.Name == nil {
+		return {{.R.Pascal}}{}, apperror.NewValidation("invalid {{.R.Human}}", []apperror.FieldError{
+			{Path: "body", Code: "required", Message: "at least one field is required"},
+		})
 	}
-	updated, err := s.repo.Update{{.R.Pascal}}(ctx, id, in)
+	name := strings.TrimSpace(*in.Name)
+	if name == "" {
+		return {{.R.Pascal}}{}, apperror.NewValidation("invalid {{.R.Human}}", []apperror.FieldError{
+			{Path: "name", Code: "required", Message: "name is required"},
+		})
+	}
+	if utf8.RuneCountInString(name) > max{{.R.Pascal}}NameLength {
+		return {{.R.Pascal}}{}, apperror.NewValidation("invalid {{.R.Human}}", []apperror.FieldError{
+			{Path: "name", Code: "max", Message: fmt.Sprintf("name must be at most %d characters", max{{.R.Pascal}}NameLength)},
+		})
+	}
+	updated, err := s.repo.Patch{{.R.Pascal}}(ctx, id, {{.R.Pascal}}Patch{Name: &name})
 	if err != nil {
-		return {{.R.Pascal}}{}, {{.R.Camel}}Error("update", err)
+		return {{.R.Pascal}}{}, {{.R.Camel}}Error("patch", err)
 	}
 	return ensure{{.R.Pascal}}Tenant(ctx, updated)
 }

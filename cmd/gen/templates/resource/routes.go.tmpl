@@ -30,6 +30,6 @@ func (m *Module) register{{.R.Pascal}}Routes(group fiber.Router, deps app.Deps) 
 	group.Get("/{{.R.PluralRoute}}", rl.Relaxed, read, h.List)
 	group.Get("/{{.R.PluralRoute}}/:id", rl.Relaxed, read, h.Get)
 	group.Post("/{{.R.PluralRoute}}", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.created"), h.Create)
-	group.Put("/{{.R.PluralRoute}}/:id", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.updated"), h.Update)
+	group.Patch("/{{.R.PluralRoute}}/:id", rl.Normal, write, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.updated"), h.Patch)
 	group.Delete("/{{.R.PluralRoute}}/:id", rl.Normal, remove, deps.Idempotency, guard("{{.M.Name}}.{{.R.Name}}.deleted"), h.Delete)
 }

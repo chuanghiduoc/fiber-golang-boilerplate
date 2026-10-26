@@ -57,10 +57,10 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 	if err != nil {
 		return nil, err
 	}
-	source, err := s.activeInboundSource(ctx, sourceID)
+	source, tenantChecked, err := s.activeInboundSource(ctx, sourceID)
 	if err != nil {
 		if errors.Is(err, errInboundSourceUnavailable) {
-			s.verifyWithDummySecret(headers, body)
+			s.performDummyInboundWork(ctx, sourceID, source, tenantChecked, headers, body)
 			return nil, inboundAuthError()
 		}
 		return nil, err
@@ -93,6 +93,31 @@ func (s *service) verifyWithDummySecret(headers http.Header, body []byte) {
 	_ = webhook.VerifyRequest(dummyInboundKey, headers, body, s.opts.TimestampTolerance, s.now())
 }
 
+// performDummyInboundWork spends roughly the same work on an unavailable source
+// as on a real one: a tenant lookup when the real path did not get to it, an
+// AES-GCM open of a valid envelope, and the HMAC verification. Without it,
+// sequential source ids could be probed by response latency. tenantChecked
+// reports whether activeInboundSource already ran the tenant lookup.
+func (s *service) performDummyInboundWork(ctx context.Context, sourceID int64, source *InboundSource, tenantChecked bool, headers http.Header, body []byte) {
+	if s.opts.Tenants != nil && !tenantChecked {
+		tenantID := sourceID
+		if source != nil {
+			tenantID = source.TenantID
+		}
+		if _, err := s.opts.Tenants.TenantActive(ctx, tenantID); err != nil {
+			slog.Error("webhooks: failed to check inbound source tenant",
+				slog.Int64("source_id", sourceID),
+				slog.Any("error", err),
+			)
+		}
+	}
+	if s.codec != nil && s.dummyInboundCiphertext != "" {
+		// The binding is deliberately wrong; only the AES-GCM work matters.
+		_, _ = s.codec.Open(InboundSourceSecretBinding(1, sourceID), s.dummyInboundCiphertext)
+	}
+	s.verifyWithDummySecret(headers, body)
+}
+
 // inboundAuthError is the single 401 used for every authentication failure of
 // the public receiver, including unavailable sources.
 func inboundAuthError() error {
@@ -112,22 +137,25 @@ func validateInboundBody(body []byte) error {
 	return nil
 }
 
-// activeInboundSource resolves the source across tenants. A disabled source
-// and a suspended tenant are indistinguishable from a missing source; all
-// return errInboundSourceUnavailable so the receiver can respond 401.
-func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*InboundSource, error) {
+// activeInboundSource resolves the source across tenants. A disabled source, a
+// suspended tenant, and a database error while checking the tenant all return
+// errInboundSourceUnavailable so the receiver can answer the same 401. The
+// source is returned alongside the error when it was loaded, and tenantChecked
+// reports whether the tenant lookup ran (so the caller can spend it only when
+// the real path did not).
+func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*InboundSource, bool, error) {
 	source, err := s.inbound.GetInboundSourceByID(ctx, sourceID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, errInboundSourceUnavailable
+			return nil, false, errInboundSourceUnavailable
 		}
-		return nil, apperror.NewInternal("failed to resolve inbound source")
+		return nil, false, apperror.NewInternal("failed to resolve inbound source")
 	}
 	if source.Status != StatusActive {
-		return nil, errInboundSourceUnavailable
+		return source, false, errInboundSourceUnavailable
 	}
 	if s.opts.Tenants == nil {
-		return source, nil
+		return source, false, nil
 	}
 	active, err := s.opts.Tenants.TenantActive(ctx, source.TenantID)
 	if err != nil {
@@ -135,12 +163,12 @@ func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*Inb
 			slog.Int64("source_id", source.ID),
 			slog.Any("error", err),
 		)
-		return nil, apperror.NewInternal("failed to resolve inbound source")
+		return source, true, errInboundSourceUnavailable
 	}
 	if !active {
-		return nil, errInboundSourceUnavailable
+		return source, true, errInboundSourceUnavailable
 	}
-	return source, nil
+	return source, true, nil
 }
 
 func inboundEventID(headers http.Header) (string, error) {

@@ -11,9 +11,17 @@ import (
 )
 
 // issueSession opens a session for the MFA harness user and returns its row.
+// The user has a confirmed factor, so (as in production, where CreateSession
+// refuses a first-factor-only session for such a user) the session carries the
+// otp method; its mfa_verified_at is then cleared to model a session whose
+// second factor is too old, which is what step-up refreshes. The session is
+// issued at the user's current token version, which MFA confirmation bumps.
 func (h *mfaHarness) issueSession(t *testing.T, amr []string) *Session {
 	t.Helper()
-	pair, err := h.sessions.Issue(tenant.WithID(context.Background(), tenant.DefaultID), 100, 0, amr)
+	h.db.mu.Lock()
+	version := h.db.users[100].TokenVersion
+	h.db.mu.Unlock()
+	pair, err := h.sessions.Issue(tenant.WithID(context.Background(), tenant.DefaultID), 100, version, append(amr, AMROTP))
 	if err != nil {
 		t.Fatalf("issue session: %v", err)
 	}
@@ -23,6 +31,7 @@ func (h *mfaHarness) issueSession(t *testing.T, amr []string) *Session {
 	if !ok {
 		t.Fatalf("session %d not stored", pair.SessionID)
 	}
+	session.MFAVerifiedAt = nil
 	copied := *session
 	return &copied
 }

@@ -13,6 +13,8 @@ current: it is the first file the next team reads.
 | Permissions | `{{.M.Name}}:read`, `{{.M.Name}}:write` (admin-only until granted) |
 | Error codes | `{{.M.Name}}.not_implemented` |
 | Jobs / events / schedules | none |
+| Tenant purge | `RegisterTenantPurge` (generated resources append their purger in `build.go`; bootstrap calls it at the `gen:module-purge` marker) |
+| Privacy | none until a generated table stores per-user rows (then add `RegisterPrivacy`) |
 | Contracts | none (add `internal/contracts/{{.M.Name}}/` when another module needs this one) |
 
 ## Routes

@@ -1,0 +1,39 @@
+package {{.M.Name}}
+
+import (
+	"context"
+	"fmt"
+
+	tenancycontracts "{{.M.ModulePath}}/internal/contracts/tenancy"
+	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+)
+
+// tenantPurger runs every generated resource purger for one tenant, in
+// registration order, and stops at the first error so identity's purge job can
+// retry the whole pass idempotently.
+type tenantPurger struct {
+	purgers []tenancycontracts.Purger
+}
+
+// PurgeTenant implements tenancy.Purger.
+func (p tenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+	for _, purger := range p.purgers {
+		if err := purger.PurgeTenant(ctx, tenantID); err != nil {
+			return fmt.Errorf("{{.M.Name}}: purge tenant %d: %w", tenantID, err)
+		}
+	}
+	return nil
+}
+
+// RegisterTenantPurge contributes {{.M.Name}}'s tenant-wide purger to the
+// composition root's registry. A module with no generated resource registers
+// nothing; cmd/gen adds the bootstrap call with the module.
+func (m *Module) RegisterTenantPurge(registry *tenancycontracts.Registry) {
+	if len(m.tenantPurgers) == 0 {
+		return
+	}
+	registry.Register(tenancycontracts.Provider{
+		Name:   {{.M.Ident}}catalog.Owner,
+		Purger: tenantPurger{purgers: m.tenantPurgers},
+	})
+}

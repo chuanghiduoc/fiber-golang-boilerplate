@@ -3,8 +3,10 @@ package features
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/stretchr/testify/assert"
@@ -12,10 +14,13 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	featurescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/catalog"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
 	featuresservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -78,11 +83,39 @@ func (r *intentRecorder) Complete(_ context.Context, _ int64, completion audit.C
 	return nil
 }
 
+// mfaSessionID marks the session bearerMFA tokens belong to; stubSessions
+// reports a fresh second factor only for it.
+const mfaSessionID = 99
+
+// stubSessions is the session store RequireMFA needs: the second factor's age
+// comes from the session, not the token. User 2 is a tenant admin with the
+// feature permissions; every other user has none.
+type stubSessions struct{}
+
+func (stubSessions) Validate(_ context.Context, claims session.Claims) (session.State, error) {
+	state := session.State{TenantID: claims.TenantID, Active: true}
+	if claims.UserID == 2 {
+		state.Role = "admin"
+		state.Permissions = []string{
+			string(featurescatalog.PermissionAdminFeaturesRead),
+			string(featurescatalog.PermissionAdminFeaturesWrite),
+		}
+	}
+	if claims.SessionID == mfaSessionID {
+		state.MFAVerifiedAt = time.Now()
+	}
+	return state, nil
+}
+
+func (stubSessions) Invalidate(context.Context, int64) error { return nil }
+
+func (stubSessions) InvalidatePermissions(context.Context) error { return nil }
+
 func setupModuleApp(t *testing.T) (*fiber.App, *stubService, *intentRecorder) {
 	t.Helper()
 	svc := &stubService{}
 	recorder := &intentRecorder{}
-	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache(), Audit: recorder})
+	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache(), Audit: recorder, Sessions: stubSessions{}})
 	application.Register(New(featureshandler.NewHandler(svc)))
 	return application.Fiber(), svc, recorder
 }
@@ -90,6 +123,18 @@ func setupModuleApp(t *testing.T) (*fiber.App, *stubService, *intentRecorder) {
 func bearer(t *testing.T, userID int64, role string) string {
 	t.Helper()
 	tok, err := token.GenerateWithTenant(userID, 1, "user@example.com", role, "module-test-secret", 24)
+	require.NoError(t, err)
+	return "Bearer " + tok
+}
+
+// bearerMFA mints a token that passed a second factor. Flag writes accept a
+// platform permission, so the route requires MFA even for a tenant admin.
+func bearerMFA(t *testing.T, userID int64, role string) string {
+	t.Helper()
+	tok, err := token.GenerateForSession(token.SessionClaims{
+		UserID: userID, TenantID: 1, SessionID: mfaSessionID, Email: "user@example.com", Role: role,
+		AMR: []string{"pwd", "otp"},
+	}, "module-test-secret", 24)
 	require.NoError(t, err)
 	return "Bearer " + tok
 }
@@ -115,14 +160,45 @@ func TestModuleRoutesRequireFeaturePermissions(t *testing.T) {
 	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
 }
 
-func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
+// TestFlagWritesRequireMFA pins the platform-permission rule: the flag write
+// routes accept platform:features:write, so they run RequireMFA for every
+// caller. A tenant admin without a second factor is rejected before the
+// service and the audit guard run; reads stay available without one.
+func TestFlagWritesRequireMFA(t *testing.T) {
 	application, svc, recorder := setupModuleApp(t)
 	body := []byte(`{"enabled":true,"killSwitch":false}`)
 
+	for _, method := range []string{http.MethodPut, http.MethodDelete} {
+		req, _ := http.NewRequest(method, "/api/v1/admin/features/flags/file_uploads", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", bearer(t, 2, "admin"))
+		resp, err := application.Test(req)
+		require.NoError(t, err)
+		require.Equal(t, fiber.StatusForbidden, resp.StatusCode, "%s without MFA must be denied", method)
+		var problem struct {
+			Code string `json:"code"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&problem))
+		assert.Equal(t, string(apperror.CodeMFARequired), problem.Code)
+		require.NoError(t, resp.Body.Close())
+	}
+	assert.Equal(t, 0, svc.upserts, "an unverified session must not reach the service")
+	assert.Empty(t, recorder.intents, "an unverified session must not write an intent row")
+
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/admin/features/flags", http.NoBody)
+	req.Header.Set("Authorization", bearer(t, 2, "admin"))
+	resp, err := application.Test(req)
+	require.NoError(t, err)
+	assert.Equal(t, fiber.StatusOK, resp.StatusCode)
+}
+
+func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
+	application, svc, recorder := setupModuleApp(t)
+	body := []byte(`{"enabled":true,"killSwitch":false}`)
 	for i := 0; i < 2; i++ {
 		req, _ := http.NewRequest(http.MethodPut, "/api/v1/admin/features/flags/file_uploads", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", bearer(t, 2, "admin"))
+		req.Header.Set("Authorization", bearerMFA(t, 2, "admin"))
 		req.Header.Set("Idempotency-Key", "feature-flag-update-1")
 		resp, err := application.Test(req)
 		require.NoError(t, err)
@@ -142,13 +218,13 @@ func TestModuleMutationRoutesAreIdempotent(t *testing.T) {
 func TestModuleMutationsFailClosedWithoutAuditStore(t *testing.T) {
 	svc := &stubService{}
 	// No Deps.Audit: the required Guard has no intent-capable recorder.
-	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache()})
+	application := app.New(moduleTestConfig(), app.Deps{Cache: cache.NewMemoryCache(), Sessions: stubSessions{}})
 	application.Register(New(featureshandler.NewHandler(svc)))
 
 	req, _ := http.NewRequest(http.MethodPut, "/api/v1/admin/features/flags/file_uploads",
 		bytes.NewReader([]byte(`{"enabled":true,"killSwitch":false}`)))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", bearer(t, 2, "admin"))
+	req.Header.Set("Authorization", bearerMFA(t, 2, "admin"))
 	resp, err := application.Fiber().Test(req)
 	require.NoError(t, err)
 	assert.Equal(t, fiber.StatusServiceUnavailable, resp.StatusCode)

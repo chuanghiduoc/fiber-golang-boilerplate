@@ -11,6 +11,29 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const deleteMemberInvitations = `-- name: DeleteMemberInvitations :execrows
+DELETE FROM invitations
+WHERE tenant_id = $1::bigint
+  AND (invited_by = $2::bigint OR accepted_by = $2::bigint)
+`
+
+type DeleteMemberInvitationsParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+// Tenant purge releases the RESTRICT foreign keys before deleting one
+// membership: invitations this member created or accepted. The tenant-wide
+// DeleteTenantInvitationsBatch removes the remaining rows later; the tenant is
+// already deleted, so its provenance has no reader left.
+func (q *Queries) DeleteMemberInvitations(ctx context.Context, arg DeleteMemberInvitationsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteMemberInvitations, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deletePendingInvitation = `-- name: DeletePendingInvitation :execrows
 DELETE FROM invitations
 WHERE tenant_id = $1 AND id = $2 AND accepted_at IS NULL

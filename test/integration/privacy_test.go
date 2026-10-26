@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,7 +89,7 @@ func setupPrivacyHarness(t *testing.T) *privacyHarness {
 	flags := featureflags.NewEvaluator(featureflags.Options{})
 
 	cfg := &config.Config{
-		App:  config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
+		App:  config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 12},
 		CORS: config.CORSConfig{AllowOrigins: "*"},
 		RateLimit: config.RateLimitConfig{
 			StrictMax: 10000, StrictWindow: 60,
@@ -153,7 +154,7 @@ func (h *privacyHarness) requestWithAuth(t *testing.T, method, path, authorizati
 	}
 	req.Header.Set(tenant.Header, tenantSlug)
 	req.Header.Set("Idempotency-Key", strconv.FormatInt(time.Now().UnixNano(), 10))
-	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
+	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 15 * time.Second})
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	payload, err = io.ReadAll(resp.Body)
@@ -424,6 +425,166 @@ func TestPrivacy_ErasureIsIdempotentAndAnonymizes(t *testing.T) {
 	assert.Equal(t, fiber.StatusUnauthorized, status)
 }
 
+// Two owners racing a self-erasure must not both be accepted: the request
+// transaction suspends (reserves) the caller's membership under the tenant
+// owner lock, so only one request sees another active owner. The loser gets
+// 409 user.last_admin and rolls back completely.
+func TestPrivacy_TwoOwnersConcurrentSelfErasureReservesOne(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	password := strings.Join([]string{"correct", "horse", "battery", "staple"}, "-")
+	slug := "privacy-race"
+	tenantID := testutil.CreateTenant(t, ctx, h.pool, slug)
+	ownerA := testutil.CreateMember(t, ctx, h.pool, tenantID, "race-a@example.com",
+		testutil.MemberOptions{Password: password, Role: "owner"})
+	ownerB := testutil.CreateMember(t, ctx, h.pool, tenantID, "race-b@example.com",
+		testutil.MemberOptions{Password: password, Role: "owner"})
+	tokenA := testutil.SessionToken(t, ctx, h.pool, ownerA, privacyIntegrationSecret)
+	tokenB := testutil.SessionToken(t, ctx, h.pool, ownerB, privacyIntegrationSecret)
+	body := fmt.Sprintf(`{"currentPassword":%q}`, password)
+
+	type result struct {
+		status int
+		err    error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for i, token := range []string{tokenA, tokenB} {
+		go func(i int, token string) {
+			<-start
+			req, err := http.NewRequest(http.MethodPost, "/api/v1/me/erasure", strings.NewReader(body))
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set(tenant.Header, slug)
+			req.Header.Set("Idempotency-Key", fmt.Sprintf("race-%d", i))
+			resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 15 * time.Second})
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			results <- result{status: resp.StatusCode}
+		}(i, token)
+	}
+	close(start)
+
+	statuses := make([]int, 0, 2)
+	for range 2 {
+		got := <-results
+		require.NoError(t, got.err)
+		statuses = append(statuses, got.status)
+	}
+	sort.Ints(statuses)
+	assert.Equal(t, []int{fiber.StatusAccepted, fiber.StatusConflict}, statuses,
+		"exactly one owner must win the reservation")
+
+	var reserved, active int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM memberships
+		 WHERE tenant_id = $1 AND status = 'suspended'
+		   AND erasure_requested_at IS NOT NULL AND banned_at IS NULL`, tenantID).Scan(&reserved))
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM memberships WHERE tenant_id = $1 AND status = 'active'`, tenantID).Scan(&active))
+	assert.Equal(t, 1, reserved, "one owner is reserved for erasure")
+	assert.Equal(t, 1, active, "the other owner stays active")
+
+	var eraseJobs, finalizers int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = 'privacy.erase' AND tenant_id = $1`, tenantID).Scan(&eraseJobs))
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = 'privacy.erase.finalize'`).Scan(&finalizers))
+	assert.Equal(t, 1, eraseJobs, "the refused request queues nothing")
+	assert.Equal(t, 1, finalizers)
+
+	// The winner's session is revoked at request time, before any job runs.
+	var revoked int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM sessions WHERE tenant_id = $1 AND revoked_at IS NOT NULL`, tenantID).Scan(&revoked))
+	assert.Equal(t, 1, revoked)
+}
+
+// Erasure removes the address from invitations the user accepted or that were
+// addressed to them, while accepted_by stays the membership id.
+func TestPrivacy_ErasureAnonymizesInvitationAddresses(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	password := strings.Join([]string{"correct", "horse", "battery", "staple"}, "-")
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "invite-erase-admin@example.com",
+		testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "invite-erase@example.com",
+		testutil.MemberOptions{Password: password, Role: "member"})
+	token := testutil.SessionToken(t, ctx, h.pool, user, privacyIntegrationSecret)
+
+	// One tenant the user belongs to, and one they never joined: the global
+	// finalizer must erase the address in both.
+	otherTenant := testutil.CreateTenant(t, ctx, h.pool, "invite-erase-other")
+	otherAdmin := testutil.CreateMember(t, ctx, h.pool, otherTenant, "invite-erase-other-admin@example.com",
+		testutil.MemberOptions{Role: "owner"})
+
+	_, err := h.pool.Exec(ctx,
+		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by)
+		 VALUES ($1, $2, 'member', 'invite-erase-accepted', $3, NOW() + interval '7 days', NOW(), $4)`,
+		tenant.DefaultID, user.Email, admin.UserID, user.UserID)
+	require.NoError(t, err)
+	_, err = h.pool.Exec(ctx,
+		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at)
+		 VALUES ($1, $2, 'member', 'invite-erase-pending', $3, NOW() + interval '7 days')`,
+		tenant.DefaultID, user.Email, admin.UserID)
+	require.NoError(t, err)
+	_, err = h.pool.Exec(ctx,
+		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at)
+		 VALUES ($1, $2, 'member', 'invite-erase-other-pending', $3, NOW() + interval '7 days')`,
+		otherTenant, user.Email, otherAdmin.UserID)
+	require.NoError(t, err)
+
+	status, body := h.request(t, http.MethodPost, "/api/v1/me/erasure", token, "default",
+		fmt.Sprintf(`{"currentPassword":%q}`, password))
+	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
+	require.NoError(t, h.runKind(t, "privacy.erase"))
+	require.NoError(t, h.runKind(t, "privacy.erase.finalize"))
+
+	replacement := fmt.Sprintf("erased+%d@invalid", user.UserID)
+	for _, check := range []struct {
+		tenantID int64
+		token    string
+	}{
+		{tenant.DefaultID, "invite-erase-accepted"},
+		{tenant.DefaultID, "invite-erase-pending"},
+		{otherTenant, "invite-erase-other-pending"},
+	} {
+		var email string
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT email_normalized FROM invitations WHERE tenant_id = $1 AND token_hash = $2`,
+			check.tenantID, check.token).Scan(&email))
+		assert.Equal(t, replacement, email, "the erased address must not remain in an invitation")
+	}
+	rows, err := h.pool.Query(ctx,
+		`SELECT email_normalized, accepted_by FROM invitations
+		 WHERE tenant_id = $1 AND token_hash = 'invite-erase-accepted'`, tenant.DefaultID)
+	require.NoError(t, err)
+	defer rows.Close()
+	var seen int
+	for rows.Next() {
+		var email string
+		var acceptedBy *int64
+		require.NoError(t, rows.Scan(&email, &acceptedBy))
+		seen++
+		assert.Equal(t, replacement, email, "the erased address must not remain in an invitation")
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, 1, seen)
+	var acceptedByKept *int64
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT accepted_by FROM invitations WHERE tenant_id = $1 AND token_hash = 'invite-erase-accepted'`,
+		tenant.DefaultID).Scan(&acceptedByKept))
+	require.NotNil(t, acceptedByKept)
+	assert.Equal(t, user.UserID, *acceptedByKept, "accepted_by stays the membership id")
+}
+
 func assertUserErased(t *testing.T, h *privacyHarness, tenantB, userID int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -457,6 +618,7 @@ func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin@example.com", testutil.MemberOptions{Role: "admin"})
 	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin-target@example.com", testutil.MemberOptions{Password: testPassphrase})
 	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-admin-target@example.com", testutil.MemberOptions{})
+	targetToken := testutil.SessionToken(t, ctx, h.pool, user, privacyIntegrationSecret)
 	h.seed(t, tenant.DefaultID, user.UserID)
 	h.seed(t, tenantB, user.UserID)
 	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
@@ -472,6 +634,31 @@ func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	status, body = h.request(t, http.MethodPost,
 		"/api/v1/admin/users/"+strconv.FormatInt(user.UserID, 10)+"/erasure", token, "default", "")
 	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
+
+	// The request transaction reserves the membership immediately: it is
+	// suspended without a ban marker, its sessions are revoked, and the other
+	// tenant's membership keeps working.
+	var reservedStatus string
+	var erasureRequested, bannedAt *time.Time
+	var bannedHash *string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status, erasure_requested_at, banned_at, banned_email_hash
+		 FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&reservedStatus, &erasureRequested, &bannedAt, &bannedHash))
+	assert.Equal(t, "suspended", reservedStatus)
+	require.NotNil(t, erasureRequested, "an admin erasure reserves the membership")
+	assert.Nil(t, bannedAt, "erasure is not a ban")
+	assert.Nil(t, bannedHash, "erasure never derives a ban hash")
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status, erasure_requested_at FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenantB, user.UserID).Scan(&reservedStatus, &erasureRequested))
+	assert.Equal(t, "active", reservedStatus, "another tenant's membership is untouched")
+	assert.Nil(t, erasureRequested)
+	status, _ = h.request(t, http.MethodGet, "/api/v1/users/me", targetToken, "default", "")
+	assert.Equal(t, fiber.StatusUnauthorized, status, "the reserved member's session is revoked")
+	status, _ = h.request(t, http.MethodPost,
+		"/api/v1/admin/users/"+strconv.FormatInt(user.UserID, 10)+"/unban", token, "default", "")
+	assert.Equal(t, fiber.StatusNotFound, status, "an erasure reservation is not a ban to lift")
 
 	var eraseJobs, finalizers int
 	require.NoError(t, h.pool.QueryRow(ctx,

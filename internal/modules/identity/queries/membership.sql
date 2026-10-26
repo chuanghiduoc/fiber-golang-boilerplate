@@ -124,12 +124,26 @@ RETURNING *;
 -- name: ReactivateMembership :one
 -- Re-joining after removal (invitation acceptance). A ban is never lifted
 -- here: a suspended membership matches no row, and neither does a removed
--- membership that kept its ban timestamp.
+-- membership that kept its ban timestamp. An erasure reservation is cleared:
+-- a re-invited member starts a fresh membership in the tenant.
 UPDATE memberships
-SET status = 'active', removed_at = NULL
+SET status = 'active', removed_at = NULL, erasure_requested_at = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'removed'
   AND banned_at IS NULL
 RETURNING *;
+
+-- name: SuspendMembershipForErasure :execrows
+-- Reserves a membership for erasure inside the request transaction: the
+-- member can no longer act in the tenant and a concurrent last-owner check
+-- sees one fewer active owner. banned_at/banned_email_hash are deliberately
+-- untouched: this is not a ban.
+UPDATE memberships
+SET status = 'suspended',
+    erasure_requested_at = NOW(),
+    removed_at = NULL,
+    credentials_revoked_at = clock_timestamp()
+WHERE tenant_id = $1 AND user_id = $2
+  AND status <> 'removed';
 
 -- name: BanMembership :one
 UPDATE memberships AS m
@@ -150,9 +164,12 @@ WHERE u.id = m.user_id
 RETURNING m.*;
 
 -- name: UnbanMembership :one
+-- Only a real ban is lifted. A membership suspended for a pending erasure
+-- matches no row, so an unban can never resurrect it.
 UPDATE memberships
 SET status = 'active', banned_at = NULL, banned_email_hash = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'suspended'
+  AND banned_at IS NOT NULL AND erasure_requested_at IS NULL
 RETURNING *;
 
 -- name: RemoveMembership :one
@@ -160,12 +177,13 @@ UPDATE memberships AS m
 SET status = 'removed', removed_at = NOW(),
     -- A ban (and its pseudonymous email marker) survives removal and erasure,
     -- so the address cannot re-register in this tenant. A ban recorded before
-    -- the hash existed derives it here from the still-intact users.email.
-    banned_at = CASE WHEN m.status = 'suspended' THEN m.banned_at ELSE NULL END,
+    -- the hash existed derives it here from the still-intact users.email; an
+    -- erasure reservation (no banned_at) must not create one.
+    banned_at = m.banned_at,
     banned_email_hash = CASE
-        WHEN m.status <> 'suspended' THEN NULL
         WHEN m.banned_email_hash IS NOT NULL THEN m.banned_email_hash
-        ELSE encode(sha256(convert_to(u.email, 'UTF8')), 'hex')
+        WHEN m.banned_at IS NOT NULL THEN encode(sha256(convert_to(u.email, 'UTF8')), 'hex')
+        ELSE NULL
     END,
     credentials_revoked_at = clock_timestamp()
 FROM users AS u
@@ -331,11 +349,17 @@ WHERE tenant_id = @tenant_id::bigint
 ORDER BY user_id
 LIMIT @row_limit::int;
 
+-- name: DeleteTenantMembership :execrows
+-- Tenant purge: removes one membership right after that member's erasers
+-- succeeded. Its sessions, refresh tokens, and role assignments cascade; the
+-- per-member invitations are deleted first to release the RESTRICT FKs.
+DELETE FROM memberships
+WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint;
+
 -- name: DeleteTenantMembershipsBatch :execrows
--- Runs after every module purger and invitation delete: those rows carry
--- RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
--- membership_roles cascade. A deleted tenant is not operational, so the
--- last-owner trigger permits the delete. One bounded page per statement.
+-- Final sweep after every module purger and invitation delete. A deleted
+-- tenant is not operational, so the last-owner trigger permits the delete.
+-- One bounded page per statement.
 DELETE FROM memberships
 WHERE id IN (
     SELECT id FROM memberships

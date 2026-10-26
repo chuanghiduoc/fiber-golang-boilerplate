@@ -39,6 +39,106 @@ func inboundTestHeaders(t *testing.T, secret, eventID string, body []byte, now t
 	return headers
 }
 
+type countingTenantChecker struct {
+	calls  int
+	active bool
+	err    error
+}
+
+func (c *countingTenantChecker) TenantActive(context.Context, int64) (bool, error) {
+	c.calls++
+	return c.active, c.err
+}
+
+// TestReceiveInbound_UnknownSourceRunsDummyTenantCheck proves the unknown-id
+// branch does the same tenant lookup as an existing source, so response
+// latency does not reveal which sequential source ids exist.
+func TestReceiveInbound_UnknownSourceRunsDummyTenantCheck(t *testing.T) {
+	codec, err := NewSecretCodec("inbound-timing-test-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	checker := &countingTenantChecker{}
+	store := &fakeInboundSourceStore{err: apperror.ErrNotFound}
+	svc := New(nil, nil, store, codec, nil, Options{TimestampTolerance: time.Minute, Tenants: checker})
+	body := []byte(`{"type":"invoice.paid"}`)
+	headers := inboundTestHeaders(t, testInboundSecret(t), "evt_1", body, time.Now().UTC())
+
+	_, err = svc.ReceiveInbound(context.Background(), 42, headers, body)
+	if !errors.Is(err, errInboundSourceUnavailable) && !isUnauthorized(err) {
+		t.Fatalf("error = %v, want the generic 401", err)
+	}
+	if checker.calls != 1 {
+		t.Fatalf("tenant checks = %d, want 1 dummy check for an unknown source", checker.calls)
+	}
+}
+
+// TestReceiveInbound_DisabledSourceRunsDummyTenantCheck proves a disabled
+// source still spends the tenant lookup the real path skipped, so its latency
+// matches an active source.
+func TestReceiveInbound_DisabledSourceRunsDummyTenantCheck(t *testing.T) {
+	codec, err := NewSecretCodec("inbound-disabled-timing-test-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	checker := &countingTenantChecker{}
+	store := &fakeInboundSourceStore{source: &InboundSource{ID: 42, TenantID: 7, Status: StatusDisabled}}
+	svc := New(nil, nil, store, codec, nil, Options{TimestampTolerance: time.Minute, Tenants: checker})
+	body := []byte(`{"type":"invoice.paid"}`)
+	headers := inboundTestHeaders(t, testInboundSecret(t), "evt_1", body, time.Now().UTC())
+
+	_, err = svc.ReceiveInbound(context.Background(), 42, headers, body)
+	if !isUnauthorized(err) {
+		t.Fatalf("error = %v, want the generic 401", err)
+	}
+	if checker.calls != 1 {
+		t.Fatalf("tenant checks = %d, want 1 dummy check for a disabled source", checker.calls)
+	}
+}
+
+// TestReceiveInbound_TenantCheckFailureLooksLikeBadSignature proves a database
+// error while resolving the source tenant is logged but still returns 401, not
+// a 500 that distinguishes the source id.
+func TestReceiveInbound_TenantCheckFailureLooksLikeBadSignature(t *testing.T) {
+	codec, err := NewSecretCodec("inbound-tenant-error-test-key")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	secret := testInboundSecret(t)
+	ciphertext, err := codec.Seal(InboundSourceSecretBinding(7, 42), []byte(secret))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	source := &InboundSource{ID: 42, TenantID: 7, Status: StatusActive, SecretCiphertext: ciphertext}
+	checker := &countingTenantChecker{err: errors.New("database is unavailable")}
+	store := &fakeInboundSourceStore{source: source}
+	svc := New(nil, nil, store, codec, nil, Options{TimestampTolerance: time.Minute, Tenants: checker})
+	body := []byte(`{"type":"invoice.paid"}`)
+	headers := inboundTestHeaders(t, secret, "evt_1", body, time.Now().UTC())
+
+	_, err = svc.ReceiveInbound(context.Background(), 42, headers, body)
+	if !isUnauthorized(err) {
+		t.Fatalf("error = %v, want the generic 401", err)
+	}
+	if checker.calls != 1 {
+		t.Fatalf("tenant checks = %d, want 1", checker.calls)
+	}
+}
+
+func testInboundSecret(t *testing.T) string {
+	t.Helper()
+	secret, err := webhook.NewSecret()
+	if err != nil {
+		t.Fatalf("NewSecret: %v", err)
+	}
+	return secret
+}
+
+func isUnauthorized(err error) bool {
+	var appErr *apperror.AppError
+	return errors.As(err, &appErr) && appErr.Status == http.StatusUnauthorized
+}
+
 func TestReceiveInbound_UnavailableSourceLooksLikeBadSignature(t *testing.T) {
 	codec, err := NewSecretCodec("inbound-enumeration-test-key")
 	if err != nil {

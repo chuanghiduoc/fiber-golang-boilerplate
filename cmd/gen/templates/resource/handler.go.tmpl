@@ -18,7 +18,7 @@ type {{.R.Pascal}}UseCases interface {
 	Create(ctx context.Context, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error)
 	Get(ctx context.Context, id int64) ({{.M.Ident}}service.{{.R.Pascal}}, error)
 	List(ctx context.Context, limit int, startingAfter string) ({{.M.Ident}}service.{{.R.Pascal}}Page, error)
-	Update(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error)
+	Patch(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error)
 	Delete(ctx context.Context, id int64) error
 }
 
@@ -115,8 +115,9 @@ func (h *{{.R.Pascal}}Handler) List(c fiber.Ctx) error {
 	return response.List(c, items, page.HasMore, page.NextCursor)
 }
 
-// Update godoc
-// @Summary Replace a {{.R.Human}}
+// Patch godoc
+// @Summary Update a {{.R.Human}}
+// @Description Partial update: only the fields present in the body change.
 // @Tags {{.M.Pascal}}
 // @Accept json
 // @Produce json
@@ -124,24 +125,24 @@ func (h *{{.R.Pascal}}Handler) List(c fiber.Ctx) error {
 // @Security ApiKeyAuth
 // @Param Idempotency-Key header string false "Idempotency key"
 // @Param id path int true "{{.R.Human}} ID"
-// @Param request body {{.M.Ident}}dto.{{.R.Pascal}}Request true "{{.R.Human}}"
+// @Param request body {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest true "{{.R.Human}} fields to change"
 // @Success 200 {object} {{.M.Ident}}dto.{{.R.Pascal}}Response
 // @Failure 400 {object} apperror.ProblemDetails
 // @Failure 401 {object} apperror.ProblemDetails
 // @Failure 403 {object} apperror.ProblemDetails
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 422 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}}/{id} [put]
-func (h *{{.R.Pascal}}Handler) Update(c fiber.Ctx) error {
+// @Router /{{.M.Route}}/{{.R.PluralRoute}}/{id} [patch]
+func (h *{{.R.Pascal}}Handler) Patch(c fiber.Ctx) error {
 	id, err := httpx.ParamID(c, "id")
 	if err != nil {
 		return err
 	}
-	var req {{.M.Ident}}dto.{{.R.Pascal}}Request
+	var req {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	updated, err := h.service.Update(c.Context(), id, {{.M.Ident}}service.{{.R.Pascal}}Input{Name: req.Name})
+	updated, err := h.service.Patch(c.Context(), id, {{.M.Ident}}service.{{.R.Pascal}}Patch{Name: req.Name})
 	if err != nil {
 		return err
 	}

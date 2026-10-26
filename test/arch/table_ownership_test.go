@@ -2,8 +2,10 @@ package arch_test
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -12,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // tableOwners maps every table referenced by module, platform, pkg, or cmd SQL
@@ -490,6 +494,21 @@ var goSQLLiteral = regexp.MustCompile(
 	`\b(?:FROM|JOIN|INSERT\s+INTO|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE|TABLE)\s+["a-z_]` +
 		`|\bUPDATE\s+(?:ONLY\s+)?["a-z_][a-z0-9_."]*(?:\s+(?:AS\s+)?[a-z_][a-z0-9_]*)?\s+SET\b`)
 
+// goSQLConstant recognizes a compile-time string constant that reaches a SQL
+// call argument, regardless of keyword case. It is deliberately only applied
+// to SQL call sites: matching every Go string would flag ordinary prose such
+// as "read from cache".
+var goSQLConstant = regexp.MustCompile(
+	`(?i)\b(?:FROM|JOIN|INSERT\s+INTO|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE|TABLE)\s+["a-z_]` +
+		`|\bUPDATE\s+(?:ONLY\s+)?["a-z_][a-z0-9_."]*(?:\s+(?:AS\s+)?[a-z_][a-z0-9_]*)?\s+SET\b`)
+
+// sqlConstantText reports whether a constant used as a SQL argument contains a
+// query. Lower-case SQL is included: a constant is already known to be SQL, so
+// keyword case cannot hide a table reference.
+func sqlConstantText(value string) bool {
+	return goSQLConstant.MatchString(value)
+}
+
 // goSQLLiterals returns the SQL-looking string literals in one Go file.
 func goSQLLiterals(fset *token.FileSet, file string, src []byte) ([]sqlSource, error) {
 	parsed, err := parser.ParseFile(fset, file, src, parser.SkipObjectResolution)
@@ -511,6 +530,95 @@ func goSQLLiterals(fset *token.FileSet, file string, src []byte) ([]sqlSource, e
 		return true
 	})
 	return out, nil
+}
+
+// constantSQLSources returns the compile-time string constants passed to SQL
+// call arguments (Exec/Query/QueryRow and pgx.Batch.Queue) in non-test,
+// non-generated Go under the scanned areas. It type-checks the tree so a
+// constant folded from several literals is evaluated; unlike goSQLLiterals it
+// scans case-insensitively, so `const q = "delete from users"` cannot evade
+// the table-ownership check. Only values that reach a SQL call site are
+// scanned, so ordinary English constants are never mistaken for queries.
+func constantSQLSources(t *testing.T, root string) []sqlSource {
+	t.Helper()
+	return scanConstantSQL(t, root, typedPackages(t))
+}
+
+// constantSQLSourcesIn loads patterns below root with cfg and returns the
+// constant SQL it finds. Tests use it against a temporary module, so the
+// go/types folding is exercised, not just the keyword regex.
+func constantSQLSourcesIn(t *testing.T, root string, cfg *packages.Config, patterns ...string) []sqlSource {
+	t.Helper()
+	cfg.Dir = root
+	pkgs, err := packages.Load(cfg, patterns...)
+	if err != nil {
+		t.Fatalf("load packages for constant SQL: %v", err)
+	}
+	if errors := packages.PrintErrors(pkgs); errors > 0 {
+		t.Fatalf("%d package load errors; the constant SQL scan cannot type-check the tree", errors)
+	}
+	return scanConstantSQL(t, root, pkgs)
+}
+
+// scanConstantSQL scans already type-checked packages for constant SQL passed
+// to a SQL call argument.
+func scanConstantSQL(t *testing.T, root string, pkgs []*packages.Package) []sqlSource {
+	t.Helper()
+	var out []sqlSource
+	for _, pkg := range pkgs {
+		for _, file := range pkg.Syntax {
+			path := pkg.Fset.Position(file.Pos()).Filename
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				t.Fatalf("relative path for %s: %v", path, err)
+			}
+			rel = filepath.ToSlash(rel)
+			if skipSQLScanFile(rel, file) {
+				continue
+			}
+			owner, ok := sqlSourceOwner(rel)
+			if !ok {
+				continue
+			}
+			ast.Inspect(file, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				selection := pkg.TypesInfo.Selections[selector]
+				if selection == nil {
+					return true
+				}
+				method, ok := selection.Obj().(*types.Func)
+				if !ok {
+					return true
+				}
+				argIndex, ok := sqlArgumentIndex(method)
+				if !ok || argIndex >= len(call.Args) {
+					return true
+				}
+				value := pkg.TypesInfo.Types[call.Args[argIndex]].Value
+				if value == nil || value.Kind() != constant.String {
+					return true
+				}
+				text := constant.StringVal(value)
+				if !sqlConstantText(text) {
+					return true
+				}
+				pos := pkg.Fset.Position(call.Pos())
+				out = append(out, sqlSource{where: rel + ":" + strconv.Itoa(pos.Line), owner: owner, sql: text})
+				return true
+			})
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("no constant SQL arguments found; the go/types SQL scan is broken")
+	}
+	return out
 }
 
 // codeSQLSources returns the module query files (internal/modules/*/queries)
@@ -587,6 +695,21 @@ func codeSQLSources(t *testing.T, root string) []sqlSource {
 		if goFiles[area] == 0 {
 			t.Fatalf("no Go files scanned under %s; the scan is broken", area)
 		}
+	}
+	// The literal pass sees SQL written inline; the go/types pass additionally
+	// sees a constant (possibly folded, possibly lower-case) at a call site.
+	// Deduplicate the overlap by source position.
+	seen := map[string]bool{}
+	for _, source := range out {
+		seen[source.where+"\x00"+source.sql] = true
+	}
+	for _, source := range constantSQLSources(t, root) {
+		key := source.where + "\x00" + source.sql
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, source)
 	}
 	return out
 }
@@ -789,6 +912,74 @@ func TestGoSQLLiterals(t *testing.T) {
 	want := []string{"p.go:3 SELECT id FROM jobs WHERE id = $1", "p.go:4 UPDATE users SET name = $1"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("goSQLLiterals = %q, want %q", got, want)
+	}
+}
+
+func TestSQLConstantText(t *testing.T) {
+	cases := map[string]bool{
+		"delete from users":                       true,
+		"DELETE FROM users":                       true,
+		"select id from api_keys where id = $1":   true,
+		"update users set name = $1":              true,
+		"insert into audit_events (id) values(1)": true,
+		"failed to update the user":               false,
+		"email already taken":                     false,
+	}
+	for value, want := range cases {
+		if got := sqlConstantText(value); got != want {
+			t.Errorf("sqlConstantText(%q) = %v, want %v", value, got, want)
+		}
+	}
+}
+
+// TestConstantSQLSourcesFindsFoldedConstant is the regression test for the
+// lower-case constant hole: the literal pass sees only UPPERCASE SQL, so a
+// folded lower-case constant at a call site must be found by the go/types pass.
+func TestConstantSQLSourcesFindsFoldedConstant(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("go.mod", "module example.com/constant_fixture\n\ngo 1.27\n")
+	write("internal/modules/fixture/fixture.go", `package fixture
+
+import "context"
+
+type db struct{}
+
+func (db) Exec(context.Context, string, ...any) error { return nil }
+
+func folded(ctx context.Context, d db) error {
+	const table = "users"
+	return d.Exec(ctx, "delete from "+table)
+}
+
+func prose(ctx context.Context, d db) error {
+	const message = "failed to update the user"
+	return d.Exec(ctx, message)
+}
+`)
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
+			packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo |
+			packages.NeedImports | packages.NeedDeps,
+	}
+	sources := constantSQLSourcesIn(t, root, cfg, "./...")
+	if len(sources) != 1 {
+		t.Fatalf("constant SQL sources = %+v, want exactly the folded query", sources)
+	}
+	if got, want := sources[0].sql, "delete from users"; got != want {
+		t.Errorf("constant SQL = %q, want %q", got, want)
+	}
+	if got, want := sources[0].owner, "fixture"; got != want {
+		t.Errorf("constant SQL owner = %q, want %q", got, want)
 	}
 }
 

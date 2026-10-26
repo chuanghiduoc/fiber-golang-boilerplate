@@ -46,9 +46,9 @@ func (r *TrashRepository) PurgeBatch(ctx context.Context, retentionDays, limit i
 		return 0, err
 	}
 	if len(failed) > 0 {
-		// Release the claim and record the attempt before the hard delete: a
-		// permanently failing blob must not keep newer rows behind it, and the
-		// row must become restorable again.
+		// Record the attempt and keep the claim: once a blob delete has been
+		// attempted the row must never become restorable again. Only the blob
+		// delete is retried.
 		err = r.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 			_, err := filesqlc.New(tx).FailTrashedFiles(ctx, failed)
 			return err

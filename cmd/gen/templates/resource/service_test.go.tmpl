@@ -65,13 +65,15 @@ func (f *fake{{.R.Pascal}}Repository) List{{.R.PluralPascal}}(ctx context.Contex
 	return out, nil
 }
 
-func (f *fake{{.R.Pascal}}Repository) Update{{.R.Pascal}}(ctx context.Context, id int64, in {{.R.Pascal}}Input) ({{.R.Pascal}}, error) {
+func (f *fake{{.R.Pascal}}Repository) Patch{{.R.Pascal}}(ctx context.Context, id int64, in {{.R.Pascal}}Patch) ({{.R.Pascal}}, error) {
 	if f.err != nil {
 		return {{.R.Pascal}}{}, f.err
 	}
 	for i, item := range f.rows {
 		if item.ID == id && f.visible(ctx, item) {
-			f.rows[i].Name = in.Name
+			if in.Name != nil {
+				f.rows[i].Name = *in.Name
+			}
 			return f.rows[i], nil
 		}
 	}
@@ -106,9 +108,13 @@ func Test{{.R.Pascal}}ServiceCRUD(t *testing.T) {
 	if err != nil || got.ID != created.ID {
 		t.Fatalf("Get = %+v, %v", got, err)
 	}
-	updated, err := svc.Update(ctx, created.ID, {{.R.Pascal}}Input{Name: "renamed"})
+	renamed := "renamed"
+	updated, err := svc.Patch(ctx, created.ID, {{.R.Pascal}}Patch{Name: &renamed})
 	if err != nil || updated.Name != "renamed" {
-		t.Fatalf("Update = %+v, %v", updated, err)
+		t.Fatalf("Patch = %+v, %v", updated, err)
+	}
+	if _, err := svc.Patch(ctx, created.ID, {{.R.Pascal}}Patch{}); err == nil {
+		t.Fatal("an empty patch must be rejected")
 	}
 	if err := svc.Delete(ctx, created.ID); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -139,7 +145,8 @@ func Test{{.R.Pascal}}ServiceTenantIsolation(t *testing.T) {
 	other := adminContext(2)
 	_, err = svc.Get(other, created.ID)
 	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
-	_, err = svc.Update(other, created.ID, {{.R.Pascal}}Input{Name: "stolen"})
+	stolen := "stolen"
+	_, err = svc.Patch(other, created.ID, {{.R.Pascal}}Patch{Name: &stolen})
 	requireCode(t, err, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
 	requireCode(t, svc.Delete(other, created.ID), {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
 	page, err := svc.List(other, 10, "")

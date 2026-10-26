@@ -51,6 +51,7 @@ type Membership struct {
 	Status               string             `json:"status"`
 	BannedAt             pgtype.Timestamptz `json:"banned_at"`
 	BannedEmailHash      pgtype.Text        `json:"banned_email_hash"`
+	ErasureRequestedAt   pgtype.Timestamptz `json:"erasure_requested_at"`
 	RemovedAt            pgtype.Timestamptz `json:"removed_at"`
 	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
@@ -122,6 +123,8 @@ type Tenant struct {
 	TrialEndsAt         pgtype.Timestamptz `json:"trial_ends_at"`
 	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
 	PurgedAt            pgtype.Timestamptz `json:"purged_at"`
+	PurgeCursor         int64              `json:"purge_cursor"`
+	PurgeProgressAt     pgtype.Timestamptz `json:"purge_progress_at"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }

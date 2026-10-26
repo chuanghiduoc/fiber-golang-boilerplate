@@ -301,7 +301,7 @@ type EndpointStore interface {
 	ListEndpoints(ctx context.Context, cur pagination.DBCursor) ([]Endpoint, error)
 	UpdateEndpoint(ctx context.Context, draft UpdateEndpointDraft) (*Endpoint, error)
 	DeleteEndpoint(ctx context.Context, id int64) error
-	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string) (*Endpoint, error)
+	RotateEndpointSecret(ctx context.Context, id int64, ciphertext string, expirePrevious bool) (*Endpoint, error)
 	ActiveEndpoints(ctx context.Context, tenantID int64) ([]ActiveEndpoint, error)
 	ActiveEndpointSecret(ctx context.Context, endpointID int64) (string, error)
 	SigningSecrets(ctx context.Context, endpointID int64) (*SigningSecrets, error)

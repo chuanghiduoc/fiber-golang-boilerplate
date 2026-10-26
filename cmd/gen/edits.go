@@ -18,6 +18,7 @@ import (
 const (
 	markerHandlers    = "// gen:handlers"
 	markerBuild       = "// gen:build"
+	markerPurge       = "// gen:purge"
 	markerRoutes      = "// gen:routes"
 	markerPermissions = "// gen:permissions"
 	markerGrants      = "// gen:grants"
@@ -26,6 +27,7 @@ const (
 	markerReadme      = "<!-- gen:slices -->"
 
 	markerBootstrapBuild = "// gen:module-build"
+	markerBootstrapPurge = "// gen:module-purge"
 	markerBootstrapList  = "// gen:module-list"
 )
 

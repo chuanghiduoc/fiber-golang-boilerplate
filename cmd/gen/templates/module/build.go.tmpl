@@ -27,5 +27,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 		Health: {{.M.Ident}}handler.NewHealthHandler({{.M.Ident}}service.NewHealthService({{.M.Ident}}repository.NewHealthRepository(infra.Pool))),
 		// gen:build
 	}
-	return New(handlers), Provides{}, nil
+	m := New(handlers)
+	// gen:purge
+	return m, Provides{}, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -32,6 +33,9 @@ type fakePrivacyRepo struct {
 	anonymized        []int64
 	deleted           []int64
 	anonymizeNotFound bool
+	// invitationAnonymizations records each (user, replacement) call the
+	// identity eraser and finalizer make.
+	invitationAnonymizations []string
 }
 
 func newFakePrivacyRepo() *fakePrivacyRepo {
@@ -145,6 +149,16 @@ func (r *fakePrivacyRepo) AnonymizeUser(_ context.Context, userID int64, _ strin
 func (r *fakePrivacyRepo) DeleteCredentialsAndIdentities(_ context.Context, userID int64) error {
 	r.deleted = append(r.deleted, userID)
 	return nil
+}
+
+func (r *fakePrivacyRepo) AnonymizeErasedUserInvitations(_ context.Context, userID int64, replacement string) (int64, error) {
+	r.invitationAnonymizations = append(r.invitationAnonymizations, fmt.Sprintf("%d:%s", userID, replacement))
+	return 0, nil
+}
+
+func (r *fakePrivacyRepo) AnonymizeErasedUserInvitationsAllTenants(_ context.Context, userID int64, replacement string) (int64, error) {
+	r.invitationAnonymizations = append(r.invitationAnonymizations, fmt.Sprintf("all:%d:%s", userID, replacement))
+	return 0, nil
 }
 
 func (r *fakePrivacyRepo) DeleteSessionsInTenant(context.Context, int64) error { return nil }
@@ -461,11 +475,12 @@ func TestEraseJobRunsIdentityLastSoAFailureKeepsTheMembership(t *testing.T) {
 		Name: "files", Exporter: fakeExporter{},
 		Eraser: failingEraser{err: errors.New("storage outage")},
 	})
+	markReserved(db.memberships[[2]int64{tenant.DefaultID, 10}])
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
 	err = svc.HandleEraseJob(ctx, mustJSON(eraseJob{UserID: 10}))
 	require.Error(t, err)
-	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{tenant.DefaultID, 10}].Status,
+	assert.Equal(t, MembershipStatusSuspended, db.memberships[[2]int64{tenant.DefaultID, 10}].Status,
 		"identity must not remove the membership when another module failed")
 
 	err = svc.HandleFinalizeJob(context.Background(), mustJSON(finalizeJob{UserID: 10}))
@@ -473,22 +488,112 @@ func TestEraseJobRunsIdentityLastSoAFailureKeepsTheMembership(t *testing.T) {
 	assert.Empty(t, repo.anonymized)
 }
 
-// The job-time last-owner re-check runs inside a transaction and takes the
-// same per-tenant advisory lock the service uses.
-func TestEraseJobTakesTheOwnerLockInsideItsTransaction(t *testing.T) {
+// A reserved membership can be reactivated only outside the normal flow (the
+// unban query refuses an erasure reservation); the job re-checks the last
+// owner under the same per-tenant lock before running any eraser.
+func TestEraseJobRechecksTheLastOwnerForAReactivatedMember(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
-	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	m := db.memberships[[2]int64{tenant.DefaultID, 10}]
+	m.Role = RoleOwner
+	m.Roles = []string{RoleOwner}
+	markReserved(m)
+	m.Status = MembershipStatusActive
 	state := &txState{}
 	stores.Memberships = lockRecordingMemberships{memMemberships: memMemberships{db}, state: state}
 	tx := txFlaggingTransactor{state: state, inner: &fakePrivateTx{stores: stores, jobs: &fakeJobs{}}}
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: failingPutStorage{}})
 
 	err := svc.HandleEraseJob(tenant.WithID(context.Background(), tenant.DefaultID), mustJSON(eraseJob{UserID: 10}))
+	require.Error(t, err)
+	assert.True(t, jobs.IsPermanent(err), "a job-time last-owner refusal is permanent")
+	assert.True(t, state.lockedInTx, "the last-owner lock must be taken inside the check transaction")
+}
+
+// The request transaction reserves each membership (suspended, no ban
+// markers) and revokes its sessions before it commits, so the account cannot
+// act while the erase jobs are pending.
+func TestRequestErasureReservesMembershipsAndRevokesSessions(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	acme := int64(2)
+	db.memberships[[2]int64{acme, 10}] = &Membership{
+		ID: 101, TenantID: acme, UserID: 10, Role: RoleMember, Roles: []string{RoleMember},
+		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	db.users[10] = &User{ID: 10, Email: "privacy@example.com", Name: "Privacy", Status: UserStatusActive}
+	db.sessions[1] = &Session{ID: 1, TenantID: tenant.DefaultID, UserID: 10}
+	db.sessions[2] = &Session{ID: 2, TenantID: acme, UserID: 10}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx})
+
+	require.NoError(t, svc.requestErasure(context.Background(), 10, "user.erasure_requested"))
+
+	for _, tenantID := range []int64{tenant.DefaultID, acme} {
+		m := db.memberships[[2]int64{tenantID, 10}]
+		assert.Equal(t, MembershipStatusSuspended, m.Status)
+		require.NotNil(t, m.ErasureRequestedAt, "the membership must be reserved")
+		assert.Nil(t, m.BannedAt, "erasure is not a ban")
+		assert.Empty(t, m.BannedEmailHash)
+	}
+	for id, session := range db.sessions {
+		assert.NotNil(t, session.RevokedAt, "session %d must be revoked", id)
+	}
+	require.Len(t, jobsQueue.jobs, 3, "one erase job per membership plus the finalizer")
+}
+
+// A second owner's self-erasure sees the first owner's reservation and is
+// refused before it can suspend itself or queue anything.
+func TestSecondOwnerSelfErasureIsRefusedUpFront(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	db.users[20] = &User{ID: 20, Email: "other-owner@example.com", Name: "Other", Status: UserStatusActive}
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	db.memberships[[2]int64{tenant.DefaultID, 10}].Roles = []string{RoleOwner}
+	db.memberships[[2]int64{tenant.DefaultID, 20}] = &Membership{
+		ID: 101, TenantID: tenant.DefaultID, UserID: 20, Role: RoleOwner, Roles: []string{RoleOwner},
+		Status: MembershipStatusActive, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	jobsQueue := &fakeJobs{}
+	tx := &fakePrivateTx{stores: stores, jobs: jobsQueue}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx})
+
+	require.NoError(t, svc.requestErasure(context.Background(), 10, "user.erasure_requested"))
+
+	err := svc.requestErasure(context.Background(), 20, "user.erasure_requested")
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, 409, appErr.Status)
 	assert.Equal(t, string(apperror.CodeUserLastAdmin), appErr.Code)
-	assert.True(t, state.lockedInTx, "the last-owner lock must be taken inside the check transaction")
+
+	assert.Equal(t, MembershipStatusSuspended, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
+	second := db.memberships[[2]int64{tenant.DefaultID, 20}]
+	assert.Equal(t, MembershipStatusActive, second.Status)
+	assert.Nil(t, second.ErasureRequestedAt)
+	assert.Len(t, jobsQueue.jobs, 2, "the refused request queues nothing")
+}
+
+func TestIdentityEraserAnonymizesInvitationAddresses(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, _ := privacyTestStores(repo)
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: &fakePrivateTx{stores: stores}})
+
+	require.NoError(t, svc.Erase(context.Background(), tenant.DefaultID, 10))
+	assert.Contains(t, repo.invitationAnonymizations, "10:erased+10@invalid")
+}
+
+func TestFinalizerAnonymizesInvitationAddresses(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	for key, m := range db.memberships {
+		m.Status = MembershipStatusRemoved
+		db.memberships[key] = m
+	}
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: &fakePrivateTx{stores: stores}})
+	require.NoError(t, svc.HandleFinalizeJob(context.Background(), mustJSON(finalizeJob{UserID: 10})))
+	assert.Contains(t, repo.invitationAnonymizations, "all:10:erased+10@invalid")
+	assert.Equal(t, []int64{10}, repo.anonymized)
 }
 
 // The finalizer must never see a removed membership without an identity
@@ -499,6 +604,7 @@ func TestEraseJobFailsWhenTheIdentityEraserIsMissing(t *testing.T) {
 	stores, db := privacyTestStores(repo)
 	registry := privacycontracts.NewRegistry()
 	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: fakeExporter{}})
+	markReserved(db.memberships[[2]int64{tenant.DefaultID, 10}])
 	svc := NewPrivacyService(PrivacyDeps{
 		Stores: stores, Tx: &fakePrivateTx{stores: stores, jobs: &fakeJobs{}},
 		Storage: failingPutStorage{}, Registry: registry,
@@ -507,7 +613,7 @@ func TestEraseJobFailsWhenTheIdentityEraserIsMissing(t *testing.T) {
 
 	err := svc.HandleEraseJob(ctx, mustJSON(eraseJob{UserID: 10}))
 	require.Error(t, err)
-	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
+	assert.Equal(t, MembershipStatusSuspended, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
 }
 
 func TestErasureJobIsIdempotentAndDeletesExports(t *testing.T) {
@@ -527,6 +633,7 @@ func TestErasureJobIsIdempotentAndDeletesExports(t *testing.T) {
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: tx, Storage: store, Registry: registry})
 	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: svc, Eraser: svc})
 	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: fakeExporter{}})
+	markReserved(db.memberships[[2]int64{tenant.DefaultID, 10}])
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	// The erasure request pre-expires exports; the eraser must still delete
 	// the already-expired document's blob.
@@ -628,20 +735,40 @@ func TestExportJobPanicMarksRowFailed(t *testing.T) {
 	assert.Equal(t, DataExportFailed, got.Status)
 }
 
-func TestEraseJobRefusesTheLastOwnerBeforeAnyEraser(t *testing.T) {
+func TestEraseJobRefusesAReactivatedLastOwnerBeforeAnyEraser(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	stores, db := privacyTestStores(repo)
-	db.memberships[[2]int64{tenant.DefaultID, 10}].Role = RoleOwner
+	m := db.memberships[[2]int64{tenant.DefaultID, 10}]
+	m.Role = RoleOwner
+	m.Roles = []string{RoleOwner}
+	markReserved(m)
+	m.Status = MembershipStatusActive
 	eraser := &recordingEraser{}
 	registry := privacycontracts.NewRegistry()
 	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: eraser})
 	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: &fakePrivateTx{stores: stores}, Registry: registry})
 
 	err := svc.HandleEraseJob(tenant.WithID(context.Background(), tenant.DefaultID), mustJSON(eraseJob{UserID: 10}))
-	var appErr *apperror.AppError
-	require.ErrorAs(t, err, &appErr)
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appErr.Code)
+	require.Error(t, err)
+	assert.True(t, jobs.IsPermanent(err))
 	assert.False(t, eraser.called)
+}
+
+// A job for a live membership that no request transaction reserved is a
+// permanent refusal: retrying can never create the missing request.
+func TestEraseJobPermanentlyRefusesAnUnreservedMembership(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	eraser := &recordingEraser{}
+	registry := privacycontracts.NewRegistry()
+	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: eraser})
+	svc := NewPrivacyService(PrivacyDeps{Stores: stores, Tx: &fakePrivateTx{stores: stores}, Registry: registry})
+
+	err := svc.HandleEraseJob(tenant.WithID(context.Background(), tenant.DefaultID), mustJSON(eraseJob{UserID: 10}))
+	require.Error(t, err)
+	assert.True(t, jobs.IsPermanent(err))
+	assert.False(t, eraser.called)
+	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
 }
 
 func TestFinalizerCleansCredentialsForAnAlreadyDeletedAccount(t *testing.T) {
@@ -668,7 +795,10 @@ func (failingPutStorage) Get(context.Context, string) (io.ReadCloser, error) {
 	return nil, storage.ErrNotFound
 }
 func (failingPutStorage) Delete(context.Context, string) error { return nil }
-func (failingPutStorage) URL(string) string                    { return "" }
+func (failingPutStorage) List(context.Context, string) ([]storage.Object, error) {
+	return nil, nil
+}
+func (failingPutStorage) URL(string) string { return "" }
 
 type panickingExporter struct{}
 
@@ -722,4 +852,12 @@ func mustJSON(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// markReserved simulates the request transaction's erasure reservation.
+func markReserved(m *Membership) {
+	now := time.Now()
+	m.Status = MembershipStatusSuspended
+	m.ErasureRequestedAt = &now
+	m.RemovedAt = nil
 }

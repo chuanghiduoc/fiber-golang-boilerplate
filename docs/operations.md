@@ -473,12 +473,17 @@ the hourly job writes `suspended`). Transitions go through
 the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
 which enforces the state machine (`trialing → active | suspended |
 pending_deletion`, `active ↔ suspended`, `active | suspended →
-pending_deletion`, `pending_deletion → active | deleted`) and writes a Tier 1
+pending_deletion`, `pending_deletion → suspended | deleted`) and writes a Tier 1
 audit row per change. Entering `pending_deletion` schedules deletion after a
-30-day grace; cancelling it clears the schedule. Tenant 1 can never be
-deleted (also a `CHECK`). Platform admins use `PATCH
-/platform/tenants/:id/status`; operator tooling must call the service rather
-than raw `UPDATE`s, which skip the audit row. A
+30-day grace; cancelling it clears the schedule and lands on `suspended`, never
+directly on `active`: the tenant was not necessarily operational before the
+deletion request, so a platform admin activates it explicitly afterwards. The
+hourly `identity.tenants.finalize_deletions` job moves a due
+`pending_deletion` tenant to `deleted` through the same audited service (system
+actor, `tenant.status_changed` with `reason: deletion_due`), so the purge job
+can pick it up. Tenant 1 can never be deleted (also a `CHECK`). Platform admins
+use `PATCH /platform/tenants/:id/status`; operator tooling must call the
+service rather than raw `UPDATE`s, which skip the audit row. A
 non-operational tenant returns `404` on tenant resolution after the resolver
 cache TTL (30s) and `401` for existing sessions and API keys. A `deleted`
 tenant's data is erased by the hourly purge (below); the `tenants` row and its
@@ -498,18 +503,22 @@ loops run in every worker process regardless.
 | `scheduler_runs` | Older than `SCHEDULER_RETENTION_DAYS` (30); newest row per schedule kept | Scheduler leader, hourly | See [Scheduler](#scheduler) | — |
 | Identity tokens | Expired | `identity.tokens.purge_expired`, hourly (scheduler) | 1,000-row batches, 1 min per table | `idx_refresh_tokens_expires_at` |
 | Webhook deliveries/events | Terminal, older than `WEBHOOK_RETENTION_DAYS` (30) | Webhooks background loop, hourly | 1,000-row batches, 30s per pass | See [Webhooks](webhooks.md) |
-| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
+| Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; once a blob delete is attempted the row never becomes restorable again and only the delete is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
+| Orphan file blobs | Storage keys under `<tenant>/<user>/<name>` older than 1 hour with no `files` row (a failed upload or lost metadata row); export blobs and other layouts are ignored | `files.orphans.sweep`, hourly (scheduler) | Up to 1,000 orphan delete attempts per run (live files never consume the budget); a delete failure is logged and retried next run | — |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
-| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers, then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, 100 memberships per page, 500-row batches per tenant table (files/export blobs before their rows); every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (id) WHERE status = 'deleted' AND purged_at IS NULL` |
+| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers (and its membership/invitations then deleted), then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, least recently advanced first, 2 min per tenant and 8 min per run, 100 memberships per page, 500-row batches per tenant table (files/export blobs before their rows); `tenants.purge_cursor` persists progress; every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (purge_progress_at ASC NULLS FIRST, id) WHERE status = 'deleted' AND purged_at IS NULL` |
+| Due deletions | A `pending_deletion` tenant whose `deletion_scheduled_at` has passed moves to `deleted` through the audited tenant service | `identity.tenants.finalize_deletions`, hourly (scheduler) | 100 tenants per run, re-checked under the tenant row lock; a concurrent admin transition wins and is a no-op | Partial `idx_tenants_deletion_due ON tenants (deletion_scheduled_at, id) WHERE status = 'pending_deletion'` |
 | Expired trials | A `trialing` tenant whose `trial_ends_at` has passed is not operational immediately (404) and is transitioned to `suspended` through the audited tenant service | `identity.tenants.expire_trials`, hourly (scheduler) | 100 tenants per run, re-checked under the row lock; an admin transition wins and is a no-op | — |
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
-indefinitely, notifications are never deleted, expired export documents stay in
-storage, expired tokens and scheduler ledger rows accumulate, expired trials
-keep their `trialing` status (though their requests already return 404), and
-deleted tenants keep their data (the `tenants` row is never removed). The
+indefinitely, orphan blobs from failed uploads accumulate, notifications are
+never deleted, expired export documents stay in storage, expired tokens and
+scheduler ledger rows accumulate, expired trials keep their `trialing` status
+(though their requests already return 404), tenants past their deletion grace
+stay `pending_deletion` (they already stop serving), and deleted tenants keep
+their data (the `tenants` row is never removed). The
 Kubernetes ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
 (`APP_ROLE=all` or `worker`); `cmd/api` logs a production warning when a
 worker-capable process starts with it off. The retention indexes
@@ -534,25 +543,33 @@ is `ready`; a failed module export marks the row `failed` and the job retries.
 | Erasure while an export is building | The erasure request updates the tenant's active/ready exports to `expired`; the export job's `running → ready` update is conditional, so a late writer cannot revive it and deletes its own document. The identity eraser deletes every export document (including already-expired ones), and the finalizer sweeps an export that committed just before the last membership was removed. |
 | Retried export/erase jobs | Each job re-reads state and is idempotent: export stops on `ready`/`expired`, a failed/timed-out/panicking export is marked `failed` on a detached context (and stale active rows are purged after a day), erase deletes by `(tenant, user)`, and finalization only anonymizes after every membership is `removed`. |
 | Already-deleted account | A finalizer still queued from an earlier self-erasure request upgrades an account deleted before it ran: it still anonymizes the email/name and deletes credentials, identities, sessions, and tokens. A plain `DELETE /users/:id` leaves no finalizer behind, so it does not trigger this upgrade. |
-| Last-admin erasure | The service takes the per-tenant owner lock and returns `409 user.last_admin` before any job or audit row is written; the per-tenant job takes the same lock inside its check transaction and re-checks before running any eraser. |
+| Last-admin erasure | The request transaction takes the per-tenant owner lock and returns `409 user.last_admin` before it reserves anything; the per-tenant job re-checks under the same lock if a reserved membership was reactivated, and a refusal there is permanent. |
+| Two owners erase at once | Each self-erasure request suspends (reserves) the caller's membership under the same per-tenant owner advisory lock, so the transactions serialize and the second one counts the first owner already gone and returns `409 user.last_admin` up front. Sequentially the same is true: the second request sees one active owner. The reservation also revokes the member's sessions in that tenant, so neither an upload nor an invitation acceptance can happen while erasure is pending. |
+| Unrequested erase job | A `privacy.erase` job only proceeds for a membership marked by a request (`erasure_requested_at`); a live membership without it is a `jobs.Permanent` refusal, logged at Error with the tenant and user ids, so it dead-letters immediately instead of retrying. |
 | Failed module eraser | In a tenant erase job identity's own eraser runs last; it removes the membership only after every other registered eraser succeeded, so a files/storage outage leaves the membership (and the global user) in place and the job retries. |
 | Missing identity eraser | The job fails instead of reporting a partial erase: without identity's eraser the membership cannot be removed, so the finalizer keeps retrying. |
-| Ban vs self-erasure | A suspended membership keeps `banned_at` and `banned_email_hash` when removal/erasure removes it; registration, invitation acceptance, and email changes compare that pseudonymous hash, so the anonymized user's old address cannot rejoin the tenant (GDPR Art.17(3)(e)). Unban clears both while the membership is still suspended; a removed membership keeps them and needs an audited operator action to release the address. |
+| Ban vs self-erasure | A suspended membership keeps `banned_at` and `banned_email_hash` when removal/erasure removes it; registration, invitation acceptance, and email changes compare that pseudonymous hash, so the anonymized user's old address cannot rejoin the tenant (GDPR Art.17(3)(e)). An erasure reservation is not a ban: it sets `erasure_requested_at`, never either ban column, and `UnbanMembership` refuses a reserved membership. Unban clears both ban columns while the membership is still suspended; a removed membership keeps them and needs an audited operator action to release the address. |
 
 Erasure has two paths:
 
-- **Self erasure** (`POST /me/erasure`): one `privacy.erase` job per membership
-  runs every tenant `Eraser` (files, notifications, apikeys, features, stored
-  webhook event history, identity last), then `privacy.erase.finalize` checks
+- **Self erasure** (`POST /me/erasure`): the request transaction suspends every
+  membership (without a ban marker), revokes its sessions in that tenant, and
+  commits one `privacy.erase` job per membership plus `privacy.erase.finalize`.
+  Each erase job runs every tenant `Eraser` (files, notifications, apikeys,
+  features, stored webhook event history, identity last; identity replaces the
+  address on invitations the user accepted or that were addressed to them and
+  keeps `accepted_by` as the membership id), then the finalizer checks
   that every membership is `removed` before deleting credentials, identities,
   sessions, and tokens and anonymizing the global user
   (`erased+<id>@invalid`, empty name, `status = deleted`). Until then the
   finalizer fails and retries with backoff. It also sweeps leftover export
-  documents.
+  documents and invitation addresses, including invitations in tenants the
+  user never joined.
 - **Admin erasure** (`POST /admin/users/:id/erasure`): one `privacy.erase` job
-  for the request tenant, no finalizer. Only that tenant's membership and data
-  are removed; the global user and memberships in other tenants stay intact,
-  and a cross-tenant id is `404`.
+  for the request tenant, no finalizer. The request suspends that membership
+  (and revokes its sessions) the same way; only that tenant's membership and
+  data are removed, the global user and memberships in other tenants stay
+  intact, and a cross-tenant id is `404`.
 
 Pending `email.send` payloads are encrypted at rest and terminal jobs clear
 them; a queued email already committed before the request may still be
@@ -582,19 +599,27 @@ is never exported.
 `status = 'deleted'` is terminal, but the row itself is never removed: it is
 the tenant's identity for audit and incident review. The hourly
 `identity.tenants.purge_deleted` job lists deleted tenants with `purged_at IS
-NULL` and, per tenant, runs the same registered privacy erasers as a tenant
-erase job for every membership (including removed ones; no global finalizer),
-then asks every module's `tenancy.Purger` to remove its tenant-wide rows
-(webhook endpoints/events/deliveries/inbound sources, tenant roles,
-`feature_flag_targets`, invitations, API keys, files and blobs, notifications,
-data exports) and the platform `jobs` purger, which is registered after every
-module. Identity's purger runs last overall: it deletes the memberships (and
-their sessions, refresh tokens, and role assignments), the tenant's custom
-roles, and `tenant_settings`. The jobs purger deletes the tenant's non-running
-rows (queued encrypted email payloads included); a `running` row is left to its
-lease owner so an in-flight handler is not stranded, and the retention purge
-removes it later. Every table is drained in bounded pages (500 rows for module
-purgers, 1,000 for jobs; every files/export page deletes its blobs before its
+NULL`, least recently advanced first, and, per tenant, runs the same registered
+privacy erasers as a tenant erase job for every membership from the persisted
+`tenants.purge_cursor` (including removed ones; no global finalizer). As soon as
+one member's erasers succeed, the job deletes that member's invitations
+(releasing the two `RESTRICT` membership FKs) and the membership itself, then
+advances `purge_cursor`; a run that stops mid-tenant resumes after the last
+finished member. Each tenant has a 2-minute budget and the whole pass 8
+minutes, so one large tenant cannot starve the others; the ordering by
+`purge_progress_at` (updated with the cursor) gives every tenant a turn across
+runs. Afterwards the job asks every module's `tenancy.Purger` to remove its
+tenant-wide rows (webhook endpoints/events/deliveries/inbound sources, tenant
+roles, `feature_flag_targets`, invitations, API keys, files and blobs,
+notifications, data exports) and the platform `jobs` purger, which is
+registered after every module. Identity's purger runs last overall: it sweeps
+any memberships left (and their sessions, refresh tokens, and role
+assignments), the tenant's custom roles, and `tenant_settings`. The jobs purger
+deletes the tenant's non-running rows (queued encrypted email payloads
+included); a `running` row is left to its lease owner so an in-flight handler is
+not stranded, and the retention purge removes it later. Every table is drained
+in bounded pages (500 rows for module purgers, 1,000 for jobs; every
+files/export page deletes its blobs before its
 rows), so a large tenant never loads its whole table or blob list into memory.
 Only after every phase succeeds does it write `tenants.purged_at` and a
 `tenant.purged` audit row in one transaction. Each phase is idempotent, so a
@@ -625,7 +650,7 @@ sequenceDiagram
                 S-->>W: error (row queued for deferred retry, logged)
             end
         end
-        W->>DB: UPDATE failed rows SET purge_started_at = NULL,<br/>purge_attempts = purge_attempts + 1, purge_retry_after = ...; COMMIT
+        W->>DB: UPDATE failed rows SET purge_attempts = purge_attempts + 1,<br/>purge_retry_after = ... (claim kept: never restorable); COMMIT
         W->>DB: DELETE FROM files WHERE id = ANY(ids) AND purge_started_at IS NOT NULL
     end
 ```
@@ -633,8 +658,8 @@ sequenceDiagram
 | Rule | Behavior |
 | --- | --- |
 | Order | Claim, blob, then row. A crash or failed hard delete after the blob delete leaves a claimed row with no blob; the next run deletes it (a missing blob counts as deleted). |
-| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` while the blob operation runs. A failed blob releases the claim; the row is restorable again and can be retried later. |
-| Failures | A blob that cannot be deleted is logged at error level with `file_id`/`tenant_id`, counted, and deferred on its own row: the claim is released, `purge_attempts` increments, and `purge_retry_after` moves out with a capped exponential backoff. The rest of the batch is still hard-deleted, the job succeeds, and claiming skips rows whose retry time is in the future, so one permanently failing blob cannot block newer rows. |
+| Restore race | The claim (`purge_started_at`) commits before any blob is deleted, and restore requires `purge_started_at IS NULL`, so a user/admin restore of a claimed row gets `404` while the blob operation runs. A failed blob keeps the claim, so the row is never restorable again; only the blob delete is retried. |
+| Failures | A blob that cannot be deleted is logged at error level with `file_id`/`tenant_id`, counted, and deferred on its own row: the claim is kept, `purge_attempts` increments, and `purge_retry_after` moves out with a capped exponential backoff. The rest of the batch is still hard-deleted, the job succeeds, and claiming skips rows whose retry time is in the future, so one permanently failing blob cannot block newer rows. |
 | Events | None. The purge publishes no domain event, so no webhook fires; the user-visible deletion already emitted `file.deleted`. No audit row is written (system retention, like the token purge). |
 
 ```sql
@@ -893,9 +918,12 @@ database failed for all 20 attempts).
   Response bodies are not stored.
 - URL, payload, event timestamp, attempt budget, and the sealed secret are
   snapshotted at dispatch, so endpoint edits do not change queued deliveries.
-  After a secret rotation, older deliveries are co-signed with the snapshot and
-  current secret for 24 hours, then signed with the current secret only.
-  Replay creates a new delivery with the endpoint's current URL and secret.
+  After a secret rotation, every attempt sent while the retired secret's grace
+  window is open is co-signed with the current and previous secret; after it
+  only the current secret signs. A failed lookup or open of the current secret
+  is retryable, so the worker never falls back to a snapshot that may be past
+  its grace. Replay creates a new delivery with the endpoint's current URL and
+  secret.
 
 ### Inspecting deliveries
 
@@ -944,9 +972,9 @@ with AES-256-GCM using
 `WEBHOOK_SECRET_ENCRYPTION_KEY`; outside production an empty key falls back to
 `JWT_SECRET`, while production **requires** a dedicated key of at least 32
 characters. Envelopes (v3) record the sealing key's `kid` and bind the
-secret's purpose, tenant, and owning endpoint/source as AAD; v2 envelopes
-(key id only) and v1 envelopes (no key id) remain readable. New seals always
-use v3.
+secret's purpose, tenant, and owning endpoint/source as AAD. Only v3 envelopes
+are accepted: the unbound v1/v2 formats are rejected, and no database predates
+v3, so there is nothing to migrate.
 
 Rotating the encryption key follows the two-phase procedure in
 [Key rotation](#key-rotation) with `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`:
@@ -964,7 +992,8 @@ Rotating the encryption key follows the two-phase procedure in
 
 Workers from before envelope v3 cannot open secrets sealed by an updated
 replica, so finish the rollout before creating or rotating webhook secrets.
-Rows sealed earlier stay readable because Open still accepts v1/v2.
+A pre-v3 ciphertext is invalid rather than opened without tenant/entity
+binding; rotate that endpoint/source secret to re-seal it.
 
 Endpoint secret rotation is safe for in-flight work because queued deliveries
 keep their snapshot. Inbound rotation is immediate: the old secret stops
@@ -1280,10 +1309,22 @@ no foreign rows. Mark the context before `WithTx`. Never mark an HTTP path that
 serves one tenant. The bypass covers as little as possible: invitation
 accept/sign-up uses it only for the possession-based tenant lookup, then locks
 the invitation and writes the membership and audit row in a tenant-scoped
-transaction; operations that must not half-apply (a password or email change
-plus ending the user's sessions in every tenant, an MFA change plus session
-revocation, a platform MFA reset) keep one bypass transaction with an explicit
-tenant predicate on every tenant-owned statement. Outside production an unset
+transaction. Password change/reset, email change, logout-all, MFA
+confirmation, and a platform MFA reset bump `users.token_version`, which
+invalidates every older session in every tenant through the validator and
+refresh checks; the per-tenant `sessions.revoked_at`/reason bookkeeping runs
+afterwards as one bypass statement (the follow-up cannot roll the change back,
+and a failure leaves only already-invalid rows). MFA confirmation re-issues the
+session that confirmed the factor under the new version and returns the new
+token pair, so that caller stays signed in. MFA disable does not bump the
+version (the factor is gone, so the caller's already-passed second factor
+cannot be bypassed): it keeps the caller's session and revokes the user's
+other sessions in every tenant with the same after-commit bypass statement (a
+cleanup failure there leaves already-MFA-authenticated sessions live until it
+is retried, never a second-factor bypass). The only whole-transaction bypass
+left on an HTTP path is deleting a global account, which genuinely removes
+memberships and sessions in every tenant and gives every tenant-owned
+statement an explicit tenant predicate. Outside production an unset
 bypass pair falls back to the normal pool with a startup warning; production
 validation rejects that configuration. `cmd/migrate` verifies
 `relrowsecurity`, `relforcerowsecurity`, the `tenant_isolation` policy, and
@@ -1844,7 +1885,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
 | `SCHEDULER_RETENTION_DAYS` | `scheduler_runs` retention (default 30) |
 | `FILES_TRASH_RETENTION_DAYS` / `NOTIFICATIONS_RETENTION_DAYS` | Days a soft-deleted file stays restorable before its blob and row are purged (default 30), and days a read notification is kept after being read (default 180; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
-| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; the per-tenant advisory lock makes concurrent uploads serializable |
+| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; a cheap lock-free pre-check rejects an already-over-quota upload before the blob `Put` and clamd scan, and the per-tenant advisory lock makes the authoritative check serializable |
 | `FILES_SCAN_DRIVER` / `FILES_CLAMAV_ADDR` / `FILES_CLAMAV_TIMEOUT_SECS` | Upload malware scanner: `none` (default) or `clamav` (clamd INSTREAM over TCP; address required, timeout default 10s). A configured scanner fails closed: infected is `422 file.infected`, scanner errors are `503 file.scan_unavailable`, and the blob is removed either way. Production warns at startup when scanning is off |
 | `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
 | `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
@@ -1856,6 +1897,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
 | `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |
 | `WEBHOOK_ALLOWED_PORTS` | Extra outbound destination ports (default `443,80`; always includes both) |
+| `WEBHOOK_REQUIRE_HTTPS` | Reject `http://` endpoint URLs at create/update; default true in production, false otherwise |
 | `APIKEYS_MAX_LIFETIME` | Maximum API-key lifetime as a Go duration (default `8760h`); omitted `expiresAt` uses it and later values are rejected |
 | `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_BYPASS_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
 
@@ -1869,8 +1911,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
 | Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
 | Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. Upload quotas are enforced transactionally per tenant, and an optional clamd scan runs before metadata commits (infected/unknown fails closed and removes the blob). |
-| Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
-| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`) and bind the secret's purpose, tenant, and owning endpoint/source as AAD (v3), so a ciphertext copied to another row fails to open; legacy v2/v1 envelopes remain readable. |
+| Outbound webhooks | Endpoint create/update resolves the host once (3s) and rejects internal targets; the delivery client checks again at dial time: private, loopback, link-local, multicast, CGNAT, 6to4 anycast `192.88.99.0/24`, discard-only `100::/64`, benchmarking `2001:2::/48`, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. `WEBHOOK_REQUIRE_HTTPS` defaults to true in production. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
+| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`) and bind the secret's purpose, tenant, and owning endpoint/source as AAD (v3), so a ciphertext copied to another row fails to open; unbound v1/v2 envelopes are rejected. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
 | Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |

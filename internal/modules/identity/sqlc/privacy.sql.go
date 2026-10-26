@@ -11,6 +11,60 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const anonymizeErasedUserInvitations = `-- name: AnonymizeErasedUserInvitations :execrows
+UPDATE invitations
+SET email_normalized = $1::varchar,
+    updated_at = NOW()
+WHERE tenant_id = $2::bigint
+  AND (accepted_by = $3::bigint
+       OR email_normalized = (SELECT email FROM users WHERE id = $3::bigint))
+  AND email_normalized <> $1::varchar
+`
+
+type AnonymizeErasedUserInvitationsParams struct {
+	Replacement string `json:"replacement"`
+	TenantID    int64  `json:"tenant_id"`
+	UserID      int64  `json:"user_id"`
+}
+
+// Erasure leaves no address in invitations the user accepted or that were
+// addressed to them; accepted_by stays the membership id. The users subselect
+// also covers an account an older path already marked deleted. A pending row
+// is unique per (tenant, address), so replacing the address cannot collide.
+func (q *Queries) AnonymizeErasedUserInvitations(ctx context.Context, arg AnonymizeErasedUserInvitationsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, anonymizeErasedUserInvitations, arg.Replacement, arg.TenantID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const anonymizeErasedUserInvitationsAllTenants = `-- name: AnonymizeErasedUserInvitationsAllTenants :execrows
+UPDATE invitations
+SET email_normalized = $1::varchar,
+    updated_at = NOW()
+WHERE (accepted_by = $2::bigint
+       OR email_normalized = (SELECT email FROM users WHERE id = $2::bigint))
+  AND email_normalized <> $1::varchar
+`
+
+type AnonymizeErasedUserInvitationsAllTenantsParams struct {
+	Replacement string `json:"replacement"`
+	UserID      int64  `json:"user_id"`
+}
+
+// The global finalizer runs under the RLS bypass after every membership is
+// removed. It also anonymizes invitations addressed to the erased address in a
+// tenant the user never joined, so no tenant keeps the address after a global
+// erasure.
+func (q *Queries) AnonymizeErasedUserInvitationsAllTenants(ctx context.Context, arg AnonymizeErasedUserInvitationsAllTenantsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, anonymizeErasedUserInvitationsAllTenants, arg.Replacement, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const anonymizeUser = `-- name: AnonymizeUser :one
 UPDATE users
 SET email = $1::varchar,

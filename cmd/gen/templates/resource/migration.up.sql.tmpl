@@ -19,3 +19,12 @@ CREATE TRIGGER trigger_{{.R.Table}}_updated_at
     BEFORE UPDATE ON {{.R.Table}}
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at();
+
+-- Row-level security is mandatory for every tenant-owned table: the API role
+-- is not a superuser, so FORCE makes the policy apply to the table owner too.
+-- cmd/migrate verifies this shape on every table with a tenant_id column.
+ALTER TABLE {{.R.Table}} ENABLE ROW LEVEL SECURITY;
+ALTER TABLE {{.R.Table}} FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON {{.R.Table}}
+    USING (app_tenant_visible(tenant_id))
+    WITH CHECK (app_tenant_visible(tenant_id));

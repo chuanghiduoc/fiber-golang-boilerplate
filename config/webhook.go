@@ -49,6 +49,24 @@ type WebhookConfig struct {
 	// AllowedPortsCSV extends the always-allowed outbound destinations 443 and
 	// 80 with a comma-separated list of ports (1-65535).
 	AllowedPortsCSV string `env:"WEBHOOK_ALLOWED_PORTS" envDefault:"443,80"`
+	// RequireHTTPS rejects http:// endpoint URLs. Empty means the default:
+	// true in production, false otherwise. Accepts true/false.
+	RequireHTTPS string `env:"WEBHOOK_REQUIRE_HTTPS"`
+}
+
+// RequiresHTTPS resolves the plaintext-URL policy: an explicit setting wins,
+// otherwise production requires HTTPS and other environments allow HTTP.
+func (w WebhookConfig) RequiresHTTPS(appEnv string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(w.RequireHTTPS)) {
+	case "":
+		return strings.EqualFold(strings.TrimSpace(appEnv), envProduction), nil
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("WEBHOOK_REQUIRE_HTTPS must be true or false")
+	}
 }
 
 // ResolvedSecretKey returns the dedicated webhook encryption key, or the JWT
@@ -141,6 +159,9 @@ func (w WebhookConfig) validate(appEnv, jwtSecret string) error {
 	}
 	if _, err := webhook.NewGuardWithPorts(w.SSRFAllowlistEntries(), ports); err != nil {
 		return fmt.Errorf("invalid WEBHOOK_ALLOWED_PORTS: %w", err)
+	}
+	if _, err := w.RequiresHTTPS(appEnv); err != nil {
+		return err
 	}
 	return nil
 }

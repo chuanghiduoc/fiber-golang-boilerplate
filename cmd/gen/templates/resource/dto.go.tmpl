@@ -2,9 +2,16 @@ package {{.M.Ident}}dto
 
 import "time"
 
-// {{.R.Pascal}}Request creates or fully replaces a {{.R.Human}}.
+// {{.R.Pascal}}Request creates a {{.R.Human}}.
 type {{.R.Pascal}}Request struct {
 	Name string `json:"name" validate:"required,max=255"`
+}
+
+// {{.R.Pascal}}PatchRequest updates only the fields present in the body.
+// Pointer fields distinguish "omitted" (nil, leave unchanged) from an explicit
+// value; the service rejects a blank name.
+type {{.R.Pascal}}PatchRequest struct {
+	Name *string `json:"name" validate:"omitempty,max=255"`
 }
 
 // {{.R.Pascal}}Response is one {{.R.Human}} on the wire.

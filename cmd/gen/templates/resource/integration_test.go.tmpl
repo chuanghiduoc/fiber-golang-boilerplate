@@ -11,6 +11,7 @@ import (
 
 	"{{.M.ModulePath}}/internal/app"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	{{.M.Ident}}repository "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/repository"
 	"{{.M.ModulePath}}/internal/platform/audit"
 	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/internal/testutil"
@@ -19,6 +20,10 @@ import (
 // Test{{.R.Pascal}}CRUDAndTenantIsolation runs the generated routes through the
 // full middleware stack against PostgreSQL (Testcontainers, or
 // TEST_DATABASE_URL): CRUD in one tenant, and every cross-tenant id is 404.
+// SetupTestDB returns the BYPASS fixture pool, so the application is wired
+// with testutil.Scoped/NewTxManager (the normal RLS role). If the repository
+// used the raw pool, the cross-tenant reads below would succeed and prove
+// nothing.
 func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	pool, cleanup, err := testutil.SetupTestDB(ctx)
@@ -33,7 +38,11 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	).Scan(&tenantB); err != nil {
 		t.Fatalf("insert tenant: %v", err)
 	}
-	fiberApp := testApp(t, app.Infra{Pool: pool}, app.Deps{Audit: audit.NewPostgresRecorder(pool)})
+	db := testutil.Scoped(pool)
+	recorder := audit.NewPostgresRecorder(db)
+	fiberApp := testApp(t,
+		app.Infra{Pool: pool, DB: db, Tx: testutil.NewTxManager(pool), Audit: recorder},
+		app.Deps{Audit: recorder})
 	adminA := bearer(t, 1, 1, authz.RoleAdmin)
 	adminB := bearer(t, 2, tenantB, authz.RoleAdmin)
 	base := "/api/v1/{{.M.Route}}/{{.R.PluralRoute}}"
@@ -54,8 +63,11 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	if status, body := do(t, fiberApp, http.MethodGet, item, adminA, ""); status != http.StatusOK {
 		t.Fatalf("get = %d %s", status, body)
 	}
-	if status, body := do(t, fiberApp, http.MethodPut, item, adminA, `{"name":"renamed"}`); status != http.StatusOK {
-		t.Fatalf("update = %d %s", status, body)
+	if status, body := do(t, fiberApp, http.MethodPatch, item, adminA, `{"name":"renamed"}`); status != http.StatusOK {
+		t.Fatalf("patch = %d %s", status, body)
+	}
+	if status, body := do(t, fiberApp, http.MethodPatch, item, adminA, `{}`); status != http.StatusUnprocessableEntity {
+		t.Fatalf("empty patch = %d %s, want 422", status, body)
 	}
 	var page struct {
 		Data []struct {
@@ -73,7 +85,7 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	notFound := string({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
 	for _, req := range []struct{ method, body string }{
 		{http.MethodGet, ""},
-		{http.MethodPut, `{"name":"stolen"}`},
+		{http.MethodPatch, `{"name":"stolen"}`},
 		{http.MethodDelete, ""},
 	} {
 		status, body := do(t, fiberApp, req.method, item, adminB, req.body)
@@ -106,5 +118,27 @@ func Test{{.R.Pascal}}CRUDAndTenantIsolation(t *testing.T) {
 	}
 	if audited != 3 {
 		t.Fatalf("succeeded audit rows = %d, want 3 (create, update, delete)", audited)
+	}
+
+	// The generated tenant purger erases one tenant's rows in bounded pages
+	// through the RLS app role and never touches another tenant.
+	if status, body := do(t, fiberApp, http.MethodPost, base, adminA, `{"name":"purge a"}`); status != http.StatusCreated {
+		t.Fatalf("create for purge = %d %s", status, body)
+	}
+	if status, body := do(t, fiberApp, http.MethodPost, base, adminB, `{"name":"keep b"}`); status != http.StatusCreated {
+		t.Fatalf("create in tenant B = %d %s", status, body)
+	}
+	if err := {{.M.Ident}}repository.New{{.R.Pascal}}TenantPurger(db).PurgeTenant(ctx, 1); err != nil {
+		t.Fatalf("PurgeTenant: %v", err)
+	}
+	for tenantID, want := range map[int64]int{1: 0, tenantB: 1} {
+		var remaining int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM {{.R.Table}} WHERE tenant_id = $1`, tenantID).Scan(&remaining); err != nil {
+			t.Fatalf("count tenant %d rows: %v", tenantID, err)
+		}
+		if remaining != want {
+			t.Errorf("tenant %d rows after purge = %d, want %d", tenantID, remaining, want)
+		}
 	}
 }

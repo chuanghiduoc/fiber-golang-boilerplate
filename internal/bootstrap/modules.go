@@ -67,12 +67,17 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	if err != nil {
 		return nil, err
 	}
+	requireWebhookHTTPS, err := cfg.Webhook.RequiresHTTPS(cfg.App.Env)
+	if err != nil {
+		return nil, err
+	}
 	webhooksModule, err := webhooks.Build(infra, webhooks.Settings{
 		Webhook: cfg.Webhook,
 		// JWT_SECRET is the local/test-only fallback; production requires
 		// the dedicated key (config validation).
 		SecretKey:          cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret),
 		PreviousSecretKeys: cfg.Webhook.PreviousSecretKeyList(),
+		RequireHTTPS:       requireWebhookHTTPS,
 	}, identityProvides.TenantActive)
 	if err != nil {
 		return nil, err
@@ -94,7 +99,7 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 		return nil, err
 	}
 
-	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals, apikeys.Settings{
+	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals, identityProvides.MemberRanks, apikeys.Settings{
 		MaxLifetime: cfg.APIKeys.MaxLifetime,
 	})
 
@@ -116,6 +121,9 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	featuresModule.RegisterTenantPurge(tenancyRegistry)
 	webhooksModule.RegisterTenantPurge(tenancyRegistry)
 	notificationsModule.RegisterTenantPurge(tenancyRegistry)
+	// cmd/gen (make gen module=<name>) inserts generated modules' purger
+	// registration above this marker; keep the line.
+	// gen:module-purge
 	identityModule.RegisterTenantPurge(tenancyRegistry)
 	// The durable jobs table is platform-owned rather than part of a module,
 	// so its purger is registered here, after every module: queued encrypted

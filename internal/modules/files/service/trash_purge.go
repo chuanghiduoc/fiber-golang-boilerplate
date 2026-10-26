@@ -43,9 +43,10 @@ type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs, fa
 // candidate carries its own tenant and storage path.
 type TrashRepository interface {
 	// PurgeBatch commits a claim on up to limit expired rows (making them
-	// unrestorable), calls purge, hard-deletes the returned IDs, and releases
-	// the claim on failed IDs after recording an attempt and retry time. On
-	// error the rows stay claimed and the next run finishes them.
+	// unrestorable), calls purge, hard-deletes the returned IDs, and keeps the
+	// claim on failed IDs after recording an attempt and retry time: only the
+	// blob delete is retried, never restorability. On error the rows stay
+	// claimed and the next run finishes them.
 	PurgeBatch(ctx context.Context, retentionDays, limit int32, purge TrashPurgeFunc) (int64, error)
 }
 

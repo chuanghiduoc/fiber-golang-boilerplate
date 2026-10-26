@@ -138,9 +138,13 @@ func TestMFAResetTOTP_PlatformRecovery(t *testing.T) {
 	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
-	defaultSession, err := e.sessions.Issue(ctx, user.UserID, user.TokenVersion, []string{service.AMRPassword})
+	// Confirmation bumped the token version; both post-enable sessions carry
+	// the second factor, as a real two-step sign-in does.
+	enabledVersion := scalar[int32](t, e.pool, `SELECT token_version FROM users WHERE id = $1`, user.UserID)
+	defaultSession, err := e.sessions.Issue(ctx, user.UserID, enabledVersion, []string{service.AMRPassword, service.AMROTP})
 	require.NoError(t, err)
-	acmeSession, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.UserID, user.TokenVersion, []string{service.AMRPassword})
+	acmeSession, err := e.sessions.Issue(tenant.WithID(ctx, acmeID), user.UserID, enabledVersion,
+		[]string{service.AMRPassword, service.AMROTP})
 	require.NoError(t, err)
 
 	require.NoError(t, e.mfa.ResetTOTP(ctx, user.UserID))

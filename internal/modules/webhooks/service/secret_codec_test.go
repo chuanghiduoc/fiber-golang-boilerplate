@@ -113,38 +113,13 @@ func TestSecretCodec_RotationKeepsOldSecretsReadable(t *testing.T) {
 	old, _ := NewSecretCodec("key-one")
 	sealedOld, _ := old.Seal(testBinding, []byte("old-secret"))
 
-	// A version 1 envelope (no key id), as stored before key ids existed.
-	aead := old.ring.Active().AEAD
-	nonce := make([]byte, aead.NonceSize())
-	legacy, _ := json.Marshal(secretEnvelope{
-		Version: legacySecretEnvelopeVer,
-		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
-		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, nonce, []byte("legacy-secret"), []byte(secretKeyInfo))),
-	})
-
-	// A version 2 envelope binds only the key id: still readable after upgrade.
-	keyedNonce := make([]byte, aead.NonceSize())
-	keyedAAD := secretAAD(keyedSecretEnvelopeVer, old.ring.Active().ID, SecretBinding{})
-	keyed, _ := json.Marshal(secretEnvelope{
-		Version: keyedSecretEnvelopeVer,
-		KeyID:   old.ring.Active().ID,
-		Nonce:   base64.RawURLEncoding.EncodeToString(keyedNonce),
-		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, keyedNonce, []byte("keyed-secret"), keyedAAD)),
-	})
-
 	rotated, err := NewSecretCodec("key-two", "key-one")
 	if err != nil {
 		t.Fatalf("NewSecretCodec: %v", err)
 	}
-	for envelope, want := range map[string]string{
-		sealedOld:      "old-secret",
-		string(legacy): "legacy-secret",
-		string(keyed):  "keyed-secret",
-	} {
-		plain, err := rotated.Open(testBinding, envelope)
-		if err != nil || string(plain) != want {
-			t.Fatalf("Open with previous key = %q, %v; want %q", plain, err, want)
-		}
+	plain, err := rotated.Open(testBinding, sealedOld)
+	if err != nil || string(plain) != "old-secret" {
+		t.Fatalf("Open with previous key = %q, %v; want old-secret", plain, err)
 	}
 
 	sealedNew, _ := rotated.Seal(testBinding, []byte("new-secret"))
@@ -155,6 +130,42 @@ func TestSecretCodec_RotationKeepsOldSecretsReadable(t *testing.T) {
 	missingKID := strings.Replace(sealedNew, `"kid":"`+rotated.ring.Active().ID+`",`, "", 1)
 	if _, err := rotated.Open(testBinding, missingKID); !errors.Is(err, ErrInvalidSecretEnvelope) {
 		t.Fatalf("v3 envelope without kid: err = %v, want ErrInvalidSecretEnvelope", err)
+	}
+}
+
+// TestSecretCodec_RejectsUnboundEnvelopes proves the pre-v3 envelopes whose
+// AAD had no tenant/entity binding are not opened, even with the right key: a
+// ciphertext copied between tenants or rows must never decrypt.
+func TestSecretCodec_RejectsUnboundEnvelopes(t *testing.T) {
+	old, _ := NewSecretCodec("key-one")
+	aead := old.ring.Active().AEAD
+
+	nonce := make([]byte, aead.NonceSize())
+	unboundV1, _ := json.Marshal(secretEnvelope{
+		Version: 1,
+		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
+		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, nonce, []byte("legacy-secret"), []byte(secretKeyInfo))),
+	})
+	keyedNonce := make([]byte, aead.NonceSize())
+	keyedAAD := []byte(secretKeyInfo + "|v2|" + old.ring.Active().ID)
+	keyedV2, _ := json.Marshal(secretEnvelope{
+		Version: 2,
+		KeyID:   old.ring.Active().ID,
+		Nonce:   base64.RawURLEncoding.EncodeToString(keyedNonce),
+		Data:    base64.RawURLEncoding.EncodeToString(aead.Seal(nil, keyedNonce, []byte("keyed-secret"), keyedAAD)),
+	})
+
+	rotated, err := NewSecretCodec("key-two", "key-one")
+	if err != nil {
+		t.Fatalf("NewSecretCodec: %v", err)
+	}
+	for name, envelope := range map[string]string{
+		"v1 without binding": string(unboundV1),
+		"v2 without binding": string(keyedV2),
+	} {
+		if _, err := rotated.Open(testBinding, envelope); !errors.Is(err, ErrInvalidSecretEnvelope) {
+			t.Fatalf("%s: error = %v, want ErrInvalidSecretEnvelope", name, err)
+		}
 	}
 }
 

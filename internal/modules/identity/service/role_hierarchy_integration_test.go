@@ -15,11 +15,79 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 func memberContext(userID int64, role string) context.Context {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	return authz.WithSubject(ctx, authz.NewSubject(userID, tenant.DefaultID, role))
+}
+
+func memberContextWithPermissions(userID int64, role string, permissions ...authz.Permission) context.Context {
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	return authz.WithSubject(ctx, authz.NewSubjectWithPermissions(userID, tenant.DefaultID, role, permissions...))
+}
+
+// A tenant-defined role that grants a member-management permission has the
+// admin rank: it manages members but not admins or owners, and it still needs
+// every permission of a role it grants (so it cannot mint a system admin).
+func TestRoleHierarchy_DelegatedAdminManagesMembersNotPeers(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
+	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-owner@example.com",
+		testutil.MemberOptions{Role: identityservice.RoleOwner})
+	admin := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-admin@example.com",
+		testutil.MemberOptions{Role: identityservice.RoleAdmin})
+	delegated := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-manager@example.com",
+		testutil.MemberOptions{})
+	member := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-member@example.com",
+		testutil.MemberOptions{Role: identityservice.RoleMember})
+	target := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "delegated-target@example.com",
+		testutil.MemberOptions{Role: identityservice.RoleMember})
+
+	memberPermissions := []string{
+		string(identitycatalog.PermissionProfileRead), string(identitycatalog.PermissionProfileWrite),
+		string(identitycatalog.PermissionSessionsRevoke), string(identitycatalog.PermissionMFARead),
+		string(identitycatalog.PermissionMFAWrite),
+		string(authz.PermissionAdminUsersRole),
+		string(authz.PermissionAdminUsersBan),
+		string(authz.PermissionAdminUsersDelete),
+	}
+	_, err := e.stores.Roles.Create(ctx, identityservice.NewRole{
+		Key: "delegated_admin", Name: "Delegated Admin", Permissions: memberPermissions,
+	})
+	require.NoError(t, err)
+	require.NoError(t, e.stores.Roles.ReplaceMemberRoles(ctx, delegated.UserID, []string{"delegated_admin"}))
+
+	delegatedCtx := memberContextWithPermissions(delegated.UserID, identityservice.RoleMember,
+		identitycatalog.PermissionProfileRead, identitycatalog.PermissionProfileWrite,
+		identitycatalog.PermissionSessionsRevoke, identitycatalog.PermissionMFARead,
+		identitycatalog.PermissionMFAWrite,
+		authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan, authz.PermissionAdminUsersDelete)
+
+	require.NoError(t, e.admin.BanUser(delegatedCtx, member.UserID),
+		"a delegated admin manages a member")
+	_, err = e.admin.UpdateRole(delegatedCtx, target.UserID, identityservice.RoleMember)
+	require.NoError(t, err, "it may grant a role whose permissions it holds")
+
+	_, err = e.admin.UpdateRole(delegatedCtx, admin.UserID, identityservice.RoleMember)
+	assert.Equal(t, string(identitycatalog.CodeRoleInsufficientRank), appCode(err),
+		"a delegated admin cannot manage a system admin")
+	assert.Equal(t, http.StatusForbidden, appStatus(err))
+
+	_, err = e.admin.UpdateRole(delegatedCtx, owner.UserID, identityservice.RoleMember)
+	assert.Equal(t, string(identitycatalog.CodeRoleInsufficientRank), appCode(err),
+		"a delegated admin cannot manage an owner")
+
+	_, err = e.admin.UpdateRole(delegatedCtx, target.UserID, identityservice.RoleAdmin)
+	assert.Equal(t, string(apperror.CodePermissionDenied), appCode(err),
+		"granting a system admin needs every admin permission, not just rank")
+	assert.Equal(t, http.StatusForbidden, appStatus(err))
+
+	// The escalation attempt changed nothing.
+	got, err := e.stores.Memberships.Get(tenant.WithID(ctx, tenant.DefaultID), target.UserID)
+	require.NoError(t, err)
+	assert.Equal(t, identityservice.RoleMember, got.Membership.Role)
 }
 
 func TestRoleHierarchy_AdminCannotGrantOwnerOrManageOwner(t *testing.T) {
