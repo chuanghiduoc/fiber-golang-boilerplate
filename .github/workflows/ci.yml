@@ -331,12 +331,33 @@ jobs:
       - name: Create the non-superuser app role and verify RLS
         run: |
           psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -v ON_ERROR_STOP=1 \
-            -v app_user=app -v app_password=app -v owner="$DB_USERNAME" -v schema=public \
+            -v app_user=app -v app_password=app \
+            -v bypass_user=app_bypass -v bypass_password=app_bypass \
+            -v owner="$DB_USERNAME" -v schema=public \
             -f deploy/postgres/database-roles.sql
           unsafe=$(psql -h "$DB_HOST" -U app -d "$DB_DATABASE" -tAc \
             "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user")
           if [ "$unsafe" != "f" ]; then
             echo "::error::the app role must be a non-superuser without BYPASSRLS"
+            exit 1
+          fi
+          bypass_state=$(psql -h "$DB_HOST" -U app_bypass -d "$DB_DATABASE" -tAc \
+            "SELECT rolbypassrls AND NOT rolsuper FROM pg_roles WHERE rolname = current_user")
+          if [ "$bypass_state" != "t" ]; then
+            echo "::error::the bypass role must be a non-superuser with BYPASSRLS"
+            exit 1
+          fi
+          bypass_owns=$(psql -h "$DB_HOST" -U app_bypass -d "$DB_DATABASE" -tAc \
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)")
+          if [ "$bypass_owns" -ne 0 ]; then
+            echo "::error::the bypass role must own no tables"
+            exit 1
+          fi
+          member=$(psql -h "$DB_HOST" -U app -d "$DB_DATABASE" -tAc \
+            "SELECT pg_has_role(current_user, 'app_bypass', 'MEMBER')")
+          if [ "$member" != "f" ]; then
+            echo "::error::the app role must not be a member of the bypass role"
             exit 1
           fi
           guarded=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \

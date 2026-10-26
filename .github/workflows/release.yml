@@ -95,6 +95,29 @@ jobs:
             org.opencontainers.image.description=Production-minded Go Fiber SaaS API
             org.opencontainers.image.licenses=MIT
 
+      # Build the same Dockerfile locally first so the vulnerability scan runs
+      # before anything reaches the registry. This is the single-arch build;
+      # the multi-arch build below is the one that is pushed and signed.
+      - name: Build image for vulnerability scan
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: prod
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: fiber-boilerplate:scan
+          cache-from: type=gha
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: fiber-boilerplate:scan
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0

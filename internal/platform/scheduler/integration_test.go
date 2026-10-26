@@ -303,11 +303,11 @@ func setupSchedulerIntegrationDB(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
-	pool, err := pgtest.OpenAppPool(ctx, dsn, schema)
+	pools, err := pgtest.OpenAppPools(ctx, dsn, schema)
 	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	t.Cleanup(func() { pgtest.ClosePools(pools) })
 
-	return pool
+	return pools.Bypass
 }
 
 // integrationMigration is one up migration file.

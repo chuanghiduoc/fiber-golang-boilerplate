@@ -1106,44 +1106,63 @@ flowchart TD
 ### Database roles and row-level security
 
 Every tenant-owned table has forced row-level security. The API,
-worker, and `cmd/seed` must connect as a dedicated non-superuser role that
-`BYPASSRLS` does not exempt and that owns no table in the configured schema;
-a superuser or a `BYPASSRLS` role ignores every policy, and a table owner can
-run `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`. A member of a
-superuser/`BYPASSRLS` role is unsafe too, because it can `SET ROLE`. `cmd/api`
-logs an error when it detects any of these and refuses to start when
-`APP_ENV=production`. `cmd/migrate` needs the schema owner instead
-(`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
+worker, and `cmd/seed` connect as two dedicated non-superuser roles:
+
+- the normal role (`DB_USERNAME`/`DB_PASSWORD`) has no `BYPASSRLS`, owns no
+  table in the configured schema, and is not a member of a
+  superuser/`BYPASSRLS` role, so it cannot `SET ROLE` into one;
+- the bypass role (`DB_BYPASS_USERNAME`/`DB_BYPASS_PASSWORD`, e.g.
+  `app_bypass`) has `BYPASSRLS`, is not a superuser, owns nothing, and the
+  normal role is not a member of it. It serves only deliberate cross-tenant
+  work.
+
+`cmd/api` logs an error when either role is misconfigured and refuses to start
+when `APP_ENV=production`. Production also requires both bypass settings and a
+username different from `DB_USERNAME`. `cmd/migrate` needs the schema owner
+instead (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
 `DB_USERNAME`/`DB_PASSWORD`).
 
-Create the runtime role once, before the first migration:
+Create both runtime roles once, before the first migration:
 
 ```bash
-psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
+psql -v app_user=app -v app_password='...' \
+  -v bypass_user=app_bypass -v bypass_password='...' \
+  -v owner=postgres -v schema=public \
   -f deploy/postgres/database-roles.sql
 ```
 
-The script grants schema access, table/sequence/function privileges, and
-`ALTER DEFAULT PRIVILEGES` for tables later migrations create. It deliberately
-does not grant `TRUNCATE`: truncation ignores RLS, so only the schema owner may
-do it. Docker Compose runs it automatically on a fresh volume
+The script grants both roles the same schema access, table/sequence/function
+privileges, and `ALTER DEFAULT PRIVILEGES` for tables later migrations create,
+and revokes any membership of the bypass role from the app role. It
+deliberately does not grant `TRUNCATE`: truncation ignores RLS, so only the
+schema owner may do it. Docker Compose runs it automatically on a fresh volume
 (`deploy/postgres/init-app-role.sh`).
 
 Scoping is per transaction and never session-level:
-`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
-set_config('app.rls_bypass', $2, true)` right after `BEGIN`; a statement
-outside a transaction (`database.Scoped`) runs
+`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true)` right
+after `BEGIN`; a statement outside a transaction (`database.Scoped`) runs
 `BEGIN; set_config(...); <statement>; COMMIT` as one pgx Batch. This keeps
 transaction-mode PgBouncer working. A connection with no setting sees no
 tenant-owned rows.
 
-`database.WithRLSBypass(ctx)` marks deliberate cross-tenant work (global job
-claim/lease/purge, retention purges, the feature-flag snapshot, the public
-webhook receiver's source lookup, invitation token acceptance, and identity
-operations on a global user across tenants). Never mark an HTTP path that
-serves one tenant. `cmd/migrate` verifies `relrowsecurity`,
-`relforcerowsecurity`, and the `tenant_isolation` policy on every table with a
-`tenant_id` column.
+`app_tenant_visible(tenant_id)` reads only that transaction-local setting, so
+no SQL the normal role can run can switch isolation off. Setting the old
+application-writable bypass GUC still succeeds (PostgreSQL accepts arbitrary
+GUCs) but changes nothing. `database.WithRLSBypass(ctx)`
+marks deliberate cross-tenant work (global job claim/lease/purge, retention
+purges, the feature-flag snapshot, the public webhook receiver's source
+lookup, invitation token acceptance, and identity operations on a global user
+across tenants); `TxManager` and `Scoped` choose the bypass pool at `BEGIN` /
+per statement from that marker. A transaction cannot switch pools mid-way: a
+bypass context created inside a transaction that began on the normal pool
+does not change its connection, so those statements stay tenant-scoped and see
+no foreign rows. Mark the context before `WithTx`. Never mark an HTTP path that
+serves one tenant. Outside production an unset
+bypass pair falls back to the normal pool with a startup warning; production
+validation rejects that configuration. `cmd/migrate` verifies
+`relrowsecurity`, `relforcerowsecurity`, the `tenant_isolation` policy, and
+that `app_tenant_visible` reads no application-writable bypass setting, on
+every table with a `tenant_id` column.
 
 ### Connection poolers (PgBouncer)
 
@@ -1153,6 +1172,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 | --- | --- |
 | `DB_QUERY_EXEC_MODE` | `cache_statement` (default, pgx named prepared statements per connection) needs PgBouncer 1.21+ with `max_prepared_statements > 0` in transaction mode. `cache_describe` and `describe_exec` use unnamed statements and keep server-side parameter types. `exec` and `simple_protocol` are rejected at startup: without described parameter types, `[]byte` values bound to `json`/`jsonb` columns (audit metadata) are sent as `bytea` and the insert fails. |
 | `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` / `DB_MIGRATE_USERNAME` / `DB_MIGRATE_PASSWORD` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT`/`DB_USERNAME`/`DB_PASSWORD`; database, schema, and TLS settings are shared. Use the schema owner here and the non-superuser role for the API. golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
+| `DB_MAX_CONNS` / `DB_MIN_CONNS` | Per pool. The API, worker, and seed open both the normal and bypass pools, so budget twice these values per process. |
 | `search_path` | Sent as a startup parameter from `DB_SCHEMA`, never as a `SET` after connect (behind a transaction pooler that `SET` would land on one server connection only). Configure PgBouncer to forward it (`track_extra_parameters = search_path`, on versions that support it) or to ignore it (`ignore_startup_parameters = search_path`) and set it on the role with `ALTER ROLE ... SET search_path`. |
 
 ### Fresh installs vs deployed databases

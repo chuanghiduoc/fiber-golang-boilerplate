@@ -15,8 +15,9 @@ import (
 var ErrNoPool = errors.New("database: pool is nil")
 
 // Scope is the row-level-security context of one statement or transaction.
-// A zero TenantID sees no tenant-owned rows; Bypass disables tenant isolation
-// for a deliberate cross-tenant operation.
+// A zero TenantID sees no tenant-owned rows. Bypass selects the dedicated
+// BYPASSRLS role pool for a deliberate cross-tenant operation; the normal
+// role's policies are never switched off at runtime.
 type Scope struct {
 	TenantID int64
 	Bypass   bool
@@ -73,9 +74,12 @@ func newScopeConfig(opts []ScopeOption) scopeConfig {
 
 type bypassKey struct{}
 
-// WithRLSBypass marks ctx as a deliberate cross-tenant operation: transactions
-// and scoped statements started from it ignore tenant isolation. Never use it
-// on an HTTP request path that serves one tenant.
+// WithRLSBypass marks ctx as a deliberate cross-tenant operation: Scoped uses
+// the dedicated BYPASSRLS role pool for the statement and TxManager uses it
+// when a transaction begins. The pool is fixed at BEGIN, so a context marked
+// after BEGIN cannot switch a running transaction; those statements stay on
+// the transaction's pool and keep its isolation (see TxManager.WithTx). Never
+// use it on an HTTP request path that serves one tenant.
 func WithRLSBypass(ctx context.Context) context.Context {
 	return context.WithValue(ctx, bypassKey{}, true)
 }
@@ -86,43 +90,58 @@ func RLSBypass(ctx context.Context) bool {
 	return bypass
 }
 
-// setScopeSQL sets both settings in one statement. The third argument of
-// set_config (true) makes them transaction-local, so a pooled connection is
-// never left scoped to the previous caller.
-const setScopeSQL = `SELECT set_config('app.tenant_id', $1, true), set_config('app.rls_bypass', $2, true)`
+// setScopeSQL sets the tenant in one statement. The third argument of
+// set_config (true) makes it transaction-local, so a pooled connection is
+// never left scoped to the previous caller. Cross-tenant isolation is a role
+// property (a separate BYPASSRLS pool), never a setting the application role
+// can turn on.
+const setScopeSQL = `SELECT set_config('app.tenant_id', $1, true)`
 
-// scopeArgs maps a Scope onto the two text settings. A non-positive tenant
+// scopeArgs maps a Scope onto the tenant text setting. A non-positive tenant
 // becomes an empty string, which NULLIF turns into NULL and fails the policy
 // closed.
-func scopeArgs(scope Scope) (tenant, bypass string) {
+func scopeArgs(scope Scope) string {
 	if scope.TenantID > 0 {
-		tenant = strconv.FormatInt(scope.TenantID, 10)
+		return strconv.FormatInt(scope.TenantID, 10)
 	}
-	bypass = "off"
-	if scope.Bypass {
-		bypass = "on"
-	}
-	return tenant, bypass
+	return ""
 }
 
 // Scoped runs every statement in its own short transaction that sets the RLS
 // scope first. One pgx Batch means one network round trip, so PgBouncer's
-// transaction mode keeps working.
+// transaction mode keeps working. The pool is chosen per statement from the
+// context: the dedicated bypass pool for a deliberate cross-tenant operation,
+// the normal role otherwise.
 type Scoped struct {
-	pool    *pgxpool.Pool
+	pools   Pools
 	resolve ScopeResolver
 }
 
 var _ DBTX = (*Scoped)(nil)
 
-// NewScoped returns a DBTX whose statements are scoped from their context.
+// NewScoped returns a DBTX whose statements run on one pool. It is the
+// single-pool form used where both roles share a connection (tests with an
+// owner pool); prefer NewScopedPools in a process that has a bypass role.
 func NewScoped(pool *pgxpool.Pool, opts ...ScopeOption) *Scoped {
-	return &Scoped{pool: pool, resolve: newScopeConfig(opts).resolve}
+	return NewScopedPools(Pools{Primary: pool}, opts...)
+}
+
+// NewScopedPools returns a DBTX that uses the bypass pool for statements whose
+// context is marked with WithRLSBypass (or whose resolver sets Bypass) and the
+// normal pool otherwise.
+func NewScopedPools(pools Pools, opts ...ScopeOption) *Scoped {
+	return &Scoped{pools: pools, resolve: newScopeConfig(opts).resolve}
+}
+
+// poolForScope returns the pool for a scope and whether it is the bypass role.
+func (s *Scoped) poolForScope(ctx context.Context) (*pgxpool.Pool, bool) {
+	bypass := s.resolve(ctx).Bypass || RLSBypass(ctx)
+	return s.pools.forBypass(bypass)
 }
 
 // Exec implements DBTX.
 func (s *Scoped) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if s == nil || s.pool == nil {
+	if s == nil {
 		return pgconn.CommandTag{}, ErrNoPool
 	}
 	conn, results, err := s.begin(ctx, sql, args)
@@ -153,7 +172,7 @@ func (s *Scoped) Exec(ctx context.Context, sql string, args ...any) (pgconn.Comm
 // so callers must check Err (the usual Next/Err loop does) to observe a failed
 // COMMIT.
 func (s *Scoped) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	if s == nil || s.pool == nil {
+	if s == nil {
 		return nil, ErrNoPool
 	}
 	conn, results, err := s.begin(ctx, sql, args)
@@ -175,16 +194,20 @@ func (s *Scoped) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row 
 	return scopedRow{scoped: s, ctx: ctx, sql: sql, args: args}
 }
 
-// begin acquires a connection and queues BEGIN, the scope settings, and sql.
+// begin acquires a connection and queues BEGIN, the scope setting, and sql.
 func (s *Scoped) begin(ctx context.Context, sql string, args []any) (*pgxpool.Conn, pgx.BatchResults, error) {
-	conn, err := s.pool.Acquire(ctx)
+	pool, _ := s.poolForScope(ctx)
+	if pool == nil {
+		return nil, nil, ErrNoPool
+	}
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	tenant, bypass := scopeArgs(s.resolve(ctx))
+	tenant := scopeArgs(s.resolve(ctx))
 	batch := &pgx.Batch{}
 	batch.Queue("BEGIN")
-	batch.Queue(setScopeSQL, tenant, bypass)
+	batch.Queue(setScopeSQL, tenant)
 	batch.Queue(sql, args...)
 	batch.Queue("COMMIT")
 	results := conn.SendBatch(ctx, batch)

@@ -283,11 +283,16 @@ Repositories derive the tenant from `tenant.EffectiveID(ctx)`; the tenant-1
 fallback is only for jobs, internal callers, and tests. Cross-tenant ids or
 tokens behave as not found. As a second line, every tenant-owned table has
 forced row-level security: `database.TxManager` and `database.Scoped` set the
-transaction-local `app.tenant_id`/`app.rls_bypass` settings, so a query that
-forgot its predicate still cannot read or write another tenant's rows. The
-deliberate cross-tenant paths (global job work, retention, feature snapshots,
-webhook inbound lookup, global-user operations) set `database.WithRLSBypass`.
-Per-tenant limits remain future work.
+transaction-local `app.tenant_id` setting, so a query that forgot its
+predicate still cannot read or write another tenant's rows. Isolation is a
+role property, not a setting: the normal role has no `BYPASSRLS` and cannot
+acquire it, so injected SQL cannot turn the predicate off. The deliberate
+cross-tenant paths (global job work, retention, feature snapshots, webhook
+inbound lookup, global-user operations) set `database.WithRLSBypass`; the
+transaction manager or statement then runs on a separate `BYPASSRLS` role
+pool that the normal role is not a member of. A bypass marker that appears
+only after a normal transaction began fails loudly. Per-tenant limits remain
+future work.
 
 ## Authorization
 

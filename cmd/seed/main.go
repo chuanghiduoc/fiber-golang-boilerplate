@@ -39,19 +39,19 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), seedTimeout)
 	defer cancel()
 
-	pool, err := database.NewPool(ctx, cfg.DB)
+	pools, err := database.OpenPools(ctx, cfg.DB)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}
-	defer pool.Close()
+	defer pools.Close()
 
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
 	// Seeding reads and writes tenant-owned rows, so it uses the scoped handle
-	// like the API.
-	stores := repository.NewStores(database.NewScoped(pool, database.WithResolver(app.RLSResolver)))
+	// like the API. Cross-tenant seeding paths use the same bypass pool.
+	stores := repository.NewStores(database.NewScopedPools(pools, database.WithResolver(app.RLSResolver)))
 	// The seed writes no audit rows, so the transactor has no recorder.
 	transactor := repository.NewTransactor(
-		database.NewTxManager(pool, database.WithResolver(app.RLSResolver)), nil, nil, nil)
+		database.NewTxManagerPools(pools, database.WithResolver(app.RLSResolver)), nil, nil, nil)
 	// Seeding checks existence, not request eligibility: an operator may need
 	// to seed an admin before reactivating a suspended default tenant.
 	_, defaultTenant, err := service.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)

@@ -32,10 +32,14 @@ type Infra struct {
 	Platform PlatformConfig
 	// Pool is for pool-level infrastructure only (health checks, shutdown).
 	// Repositories take DB so every statement carries the RLS scope.
-	Pool  *pgxpool.Pool
-	DB    database.DBTX
-	Tx    *database.TxManager
-	Cache cache.Cache
+	Pool *pgxpool.Pool
+	// BypassPool is the dedicated BYPASSRLS role pool used by DB and Tx for
+	// WithRLSBypass statements. It is nil outside production when the process
+	// deliberately runs with one role.
+	BypassPool *pgxpool.Pool
+	DB         database.DBTX
+	Tx         *database.TxManager
+	Cache      cache.Cache
 	// Audit is the process-wide recorder; it implements both audit.Recorder
 	// (Tier 2 guards, best-effort events) and audit.TxRecorder (Tier 1).
 	Audit *audit.PostgresRecorder

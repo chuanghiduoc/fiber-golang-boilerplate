@@ -17,19 +17,37 @@ const rollbackTimeout = 5 * time.Second
 
 // TxManager manages database transactions. Every transaction starts with the
 // RLS scope resolved from its context, so a pooled connection is never reused
-// with another tenant's settings.
+// with another tenant's settings. The pool is chosen once at BEGIN: the
+// dedicated bypass role pool when the context (or its resolver) asks for
+// bypass, the normal role otherwise.
 type TxManager struct {
-	pool    *pgxpool.Pool
+	pools   Pools
 	resolve ScopeResolver
 }
 
-// NewTxManager creates a new TxManager.
+// NewTxManager creates a TxManager over one pool. It is the single-pool form
+// used where both roles share a connection (tests with an owner pool); prefer
+// NewTxManagerPools in a process that has a bypass role.
 func NewTxManager(pool *pgxpool.Pool, opts ...ScopeOption) *TxManager {
-	return &TxManager{pool: pool, resolve: newScopeConfig(opts).resolve}
+	return NewTxManagerPools(Pools{Primary: pool}, opts...)
+}
+
+// NewTxManagerPools creates a TxManager that starts cross-tenant transactions
+// on the bypass pool and every other transaction on the normal pool.
+func NewTxManagerPools(pools Pools, opts ...ScopeOption) *TxManager {
+	return &TxManager{pools: pools, resolve: newScopeConfig(opts).resolve}
 }
 
 // WithTx executes fn within a database transaction.
 // If fn returns an error the transaction is rolled back; otherwise it is committed.
+//
+// The transaction runs on the bypass pool when ctx (or its resolver) requests
+// bypass and that pool exists. That choice is fixed at BEGIN: marking a
+// context with WithRLSBypass inside fn cannot move the transaction to another
+// connection, so those statements keep running on the transaction's pool. On
+// a normal transaction they stay tenant-scoped and see no foreign rows (fail
+// closed). Callers that need every tenant must mark the context before
+// WithTx.
 //
 // Usage in services:
 //
@@ -40,7 +58,12 @@ func NewTxManager(pool *pgxpool.Pool, opts ...ScopeOption) *TxManager {
 //	    return nil
 //	})
 func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) (err error) {
-	tx, err := tm.pool.Begin(ctx)
+	bypass := tm.resolve(ctx).Bypass || RLSBypass(ctx)
+	pool, _ := tm.pools.forBypass(bypass)
+	if pool == nil {
+		return ErrNoPool
+	}
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
@@ -65,8 +88,7 @@ func (tm *TxManager) WithTx(ctx context.Context, fn func(tx pgx.Tx) error) (err 
 		err = fmt.Errorf("rollback failed: %w", rbErr)
 	}()
 
-	tenant, bypass := scopeArgs(tm.resolve(ctx))
-	if _, err := tx.Exec(ctx, setScopeSQL, tenant, bypass); err != nil {
+	if _, err := tx.Exec(ctx, setScopeSQL, scopeArgs(tm.resolve(ctx))); err != nil {
 		return fmt.Errorf("set transaction scope: %w", err)
 	}
 

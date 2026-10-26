@@ -278,6 +278,89 @@ func TestDBConfig_DSN(t *testing.T) {
 	}
 }
 
+func TestDBConfig_DSNForUsesOnlyTheCredentials(t *testing.T) {
+	db := DBConfig{
+		Host:     "db.internal",
+		Port:     5433,
+		Database: "app",
+		Username: "app",
+		Password: "app-secret",
+		SSLMode:  "verify-full",
+		Schema:   "tenant",
+	}
+
+	dsn := db.DSNFor("app_bypass", "bypass-secret")
+	for _, want := range []string{
+		"app_bypass:bypass-secret@db.internal:5433/app",
+		"search_path=tenant",
+		"sslmode=verify-full",
+	} {
+		if !strings.Contains(dsn, want) {
+			t.Errorf("DSNFor() = %q, want it to contain %q", dsn, want)
+		}
+	}
+	if strings.Contains(dsn, "app-secret") {
+		t.Errorf("DSNFor() must not leak the normal role password: %q", dsn)
+	}
+}
+
+func TestDBConfig_BypassConfigured(t *testing.T) {
+	if (DBConfig{}).BypassConfigured() {
+		t.Error("an empty bypass username must not be configured")
+	}
+	if !(DBConfig{BypassUsername: " app_bypass "}).BypassConfigured() {
+		t.Error("a non-empty bypass username must be configured")
+	}
+}
+
+func TestDBConfig_ValidateProductionBypassRole(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(*Config)
+		wantErr  bool
+		wantText string
+	}{
+		{
+			name:   "valid",
+			mutate: func(*Config) {},
+		},
+		{
+			name:     "missing username",
+			mutate:   func(c *Config) { c.DB.BypassUsername = "" },
+			wantErr:  true,
+			wantText: "DB_BYPASS_USERNAME is required",
+		},
+		{
+			name:     "missing password",
+			mutate:   func(c *Config) { c.DB.BypassPassword = "" },
+			wantErr:  true,
+			wantText: "DB_BYPASS_PASSWORD is required",
+		},
+		{
+			name: "same as the normal role",
+			mutate: func(c *Config) {
+				c.DB.Username = "app"
+				c.DB.BypassUsername = "app"
+			},
+			wantErr:  true,
+			wantText: "must differ from DB_USERNAME",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := productionValidConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() = %v, want error %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("Validate() = %v, want it to mention %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
 func TestDBConfig_DSN_SSLROOTCERT(t *testing.T) {
 	db := DBConfig{
 		Host:        "localhost",
@@ -762,6 +845,8 @@ func productionValidConfig() Config {
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "verify-full"
+	cfg.DB.BypassUsername = "app_bypass"
+	cfg.DB.BypassPassword = "bypass-secret"
 	cfg.Tenant.RequireHeader = true
 	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	return cfg

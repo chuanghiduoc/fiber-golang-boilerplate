@@ -29,14 +29,15 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- app_tenant_visible is the single RLS predicate for tenant-owned tables. It
--- reads the transaction-local settings TxManager/Scoped install, so a pooled
--- connection is never scoped to its previous caller. Bypass is for
--- deliberate cross-tenant platform work only. With neither setting, the
--- comparison against NULL is NULL, so the row is invisible (fail closed).
+-- reads only the transaction-local app.tenant_id that TxManager/Scoped
+-- install, so a pooled connection is never scoped to its previous caller.
+-- With no setting, the comparison against NULL is NULL, so the row is
+-- invisible (fail closed). Cross-tenant work uses a separate role with
+-- BYPASSRLS (a role property the application role cannot acquire); reading an
+-- application-writable GUC here would let any injected statement escape RLS.
 CREATE OR REPLACE FUNCTION app_tenant_visible(row_tenant BIGINT) RETURNS BOOLEAN
 LANGUAGE sql STABLE AS $$
-  SELECT current_setting('app.rls_bypass', true) = 'on'
-      OR row_tenant = NULLIF(current_setting('app.tenant_id', true), '')::BIGINT
+  SELECT row_tenant = NULLIF(current_setting('app.tenant_id', true), '')::BIGINT
 $$;
 
 -- owner: identity
@@ -884,7 +885,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_terminal_updated_at
     WHERE status IN ('succeeded', 'dead');
 
 -- Global claim/lease recovery is a deliberate cross-tenant job path, so those
--- statements run with app.rls_bypass.
+-- statements run on the dedicated BYPASSRLS role pool.
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE jobs FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON jobs
@@ -1244,7 +1245,7 @@ CREATE TRIGGER trigger_feature_flag_targets_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 -- feature_flags stays unprotected: it is process-wide configuration. Loads of
--- the full target snapshot run with app.rls_bypass.
+-- the full target snapshot run on the dedicated BYPASSRLS role pool.
 ALTER TABLE feature_flag_targets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE feature_flag_targets FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON feature_flag_targets

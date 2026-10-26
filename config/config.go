@@ -135,6 +135,7 @@ func (cfg *Config) productionChecks() []func() error {
 		cfg.CORS.validateProduction,
 		cfg.App.validateProductionFrontendURL,
 		func() error { return validateProductionSSLMode(cfg.DB.SSLMode) },
+		cfg.DB.validateProduction,
 		cfg.Storage.validateProductionTransport,
 		cfg.OAuth.validateProduction,
 		cfg.App.validateProductionMetricsToken,

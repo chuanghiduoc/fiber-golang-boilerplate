@@ -28,10 +28,11 @@ func TestRLSTenantIsolation(t *testing.T) {
 	userA := testutil.CreateMember(t, ctx, pool, tenantA, "rls-a@example.test", testutil.MemberOptions{})
 	userB := testutil.CreateMember(t, ctx, pool, tenantB, "rls-b@example.test", testutil.MemberOptions{})
 
+	appPool := testutil.AppPool(pool)
 	var unsafe bool
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, appPool.QueryRow(ctx,
 		`SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user`).Scan(&unsafe))
-	require.False(t, unsafe, "integration tests must run as a role RLS applies to")
+	require.False(t, unsafe, "application assertions must run as a role RLS applies to")
 
 	scoped := testutil.Scoped(pool)
 	insert := func(tenantID, userID int64, path string) {
@@ -75,20 +76,14 @@ func TestRLSTenantIsolation(t *testing.T) {
 		tenantA, userA.UserID)
 	require.Error(t, err, "WITH CHECK must reject another tenant's row")
 
-	// No setting at all sees nothing: reset the pool's fixture default on one
-	// dedicated connection (and restore it before releasing the connection).
-	conn, err := pool.Acquire(ctx)
+	// No setting at all sees nothing. The app pool never carries a session
+	// default; Scoped installs the tenant transaction-locally.
+	conn, err := appPool.Acquire(ctx)
 	require.NoError(t, err)
 	defer conn.Release()
-	_, err = conn.Exec(ctx, `RESET app.tenant_id`)
-	require.NoError(t, err)
-	_, err = conn.Exec(ctx, `RESET app.rls_bypass`)
-	require.NoError(t, err)
 	var unset int
 	require.NoError(t, conn.QueryRow(ctx, `SELECT COUNT(*) FROM files`).Scan(&unset))
 	require.Zero(t, unset, "a connection without a tenant must see no rows")
-	_, err = conn.Exec(ctx, `SELECT set_config('app.rls_bypass', 'on', false)`)
-	require.NoError(t, err)
 
 	// Bypass sees every tenant, for the deliberate cross-tenant job paths.
 	bypass := testutil.BypassScoped(pool)
