@@ -8,6 +8,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/scan"
 )
 
 // File is the files module's view of one metadata row. DeletedAt is nil for a
@@ -45,6 +46,14 @@ type FileStats struct {
 // path already exists (unique violation).
 var ErrStoragePathTaken = errors.New("file storage path already exists")
 
+// UploadOptions are the upload-time limits files enforces. Zero quotas are
+// unlimited; a nil Scanner disables scanning.
+type UploadOptions struct {
+	TenantQuotaBytes int64
+	UserQuotaBytes   int64
+	Scanner          scan.Scanner
+}
+
 // FileRepository is the metadata persistence port. Implementations scope every
 // query to the request tenant (tenant.EffectiveID(ctx)) and return
 // apperror.ErrNotFound when no row matches.
@@ -57,6 +66,14 @@ type FileRepository interface {
 	Delete(ctx context.Context, id int64) (*File, error)
 	Restore(ctx context.Context, id int64) (*File, error)
 	AdminFileStats(ctx context.Context) (FileStats, error)
+	// LockQuota serializes uploads of the context tenant for the rest of the
+	// transaction. It must be called inside the upload's metadata transaction,
+	// before StorageUsage, so two concurrent uploads cannot both observe the
+	// same free space and both pass.
+	LockQuota(ctx context.Context) error
+	// StorageUsage returns the tenant's total stored bytes (live plus trash)
+	// and the same total for one user.
+	StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error)
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction, so the

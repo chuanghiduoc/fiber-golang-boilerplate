@@ -5,6 +5,7 @@ package cache
 import (
 	"context"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -62,6 +63,47 @@ func TestRedisCacheSetNX(t *testing.T) {
 	}
 	if got, _ := rc.Get(ctx, "it:setnx"); string(got) != "owner-1" {
 		t.Fatalf("value = %q, want owner-1", got)
+	}
+}
+
+func TestRedisCacheIncrementBelow(t *testing.T) {
+	rc, err := NewRedisCache(config.CacheConfig{RedisURL: redisURL(t)})
+	if err != nil {
+		t.Fatalf("NewRedisCache: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.Close() })
+	ctx := context.Background()
+	key := "it:increment-below"
+
+	for want := int64(1); want <= 2; want++ {
+		got, ok, err := rc.IncrementBelow(ctx, key, time.Minute, 2)
+		if err != nil {
+			t.Fatalf("IncrementBelow: %v", err)
+		}
+		stored, _ := rc.Get(ctx, key)
+		if !ok || got != want || string(stored) != strconv.FormatInt(want, 10) {
+			t.Fatalf("IncrementBelow = %d, %v, stored %q; want %d, true", got, ok, stored, want)
+		}
+	}
+	got, ok, err := rc.IncrementBelow(ctx, key, time.Minute, 2)
+	if err != nil {
+		t.Fatalf("IncrementBelow at cap: %v", err)
+	}
+	if ok || got != 2 {
+		t.Fatalf("IncrementBelow at cap = %d, %v; want 2, false", got, ok)
+	}
+
+	// A rejected first increment must not create the key.
+	absent := "it:increment-below-absent"
+	got, ok, err = rc.IncrementBelow(ctx, absent, time.Minute, 0)
+	if err != nil {
+		t.Fatalf("IncrementBelow(absent): %v", err)
+	}
+	if ok || got != 0 {
+		t.Fatalf("IncrementBelow(absent, max 0) = %d, %v; want 0, false", got, ok)
+	}
+	if exists, err := rc.Exists(ctx, absent); err != nil || exists {
+		t.Fatalf("Exists(absent) = %v, %v; want false, nil", exists, err)
 	}
 }
 

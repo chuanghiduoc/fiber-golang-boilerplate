@@ -18,7 +18,7 @@ import (
 func TestMutationsPublishDomainEvents(t *testing.T) {
 	repo := newMockFileRepo()
 	tx := newFakeTx(repo)
-	svc := NewUploadService(repo, tx, newMockStorage())
+	svc := NewUploadService(repo, tx, newMockStorage(), UploadOptions{})
 	admin := NewAdminFileService(repo, tx, newMockStorage())
 
 	file, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
@@ -99,7 +99,7 @@ func TestPublishFailureFailsMutation(t *testing.T) {
 	tx := newFakeTx(repo)
 	tx.events.err = errors.New("queue unavailable")
 	store := newMockStorage()
-	svc := NewUploadService(repo, tx, store)
+	svc := NewUploadService(repo, tx, store, UploadOptions{})
 
 	_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 	requireStatus(t, err, 500)

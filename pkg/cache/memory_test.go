@@ -204,6 +204,60 @@ func TestIncrementExpiryNotExtended(t *testing.T) {
 	}
 }
 
+func TestIncrementBelow(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	for want := int64(1); want <= 2; want++ {
+		got, ok, err := mc.IncrementBelow(ctx, "bounded", time.Minute, 2)
+		if err != nil {
+			t.Fatalf("IncrementBelow failed: %v", err)
+		}
+		if !ok || got != want {
+			t.Fatalf("IncrementBelow = %d, %v; want %d, true", got, ok, want)
+		}
+	}
+	got, ok, err := mc.IncrementBelow(ctx, "bounded", time.Minute, 2)
+	if err != nil {
+		t.Fatalf("IncrementBelow failed: %v", err)
+	}
+	if ok || got != 2 {
+		t.Fatalf("IncrementBelow at cap = %d, %v; want 2, false", got, ok)
+	}
+	if value, _ := mc.Get(ctx, "bounded"); string(value) != "2" {
+		t.Fatalf("stored counter = %q, want it left at 2", value)
+	}
+
+	// A rejected first increment must not create a counter.
+	got, ok, err = mc.IncrementBelow(ctx, "absent", time.Minute, 0)
+	if err != nil {
+		t.Fatalf("IncrementBelow failed: %v", err)
+	}
+	if ok || got != 0 {
+		t.Fatalf("IncrementBelow(max 0) = %d, %v; want 0, false", got, ok)
+	}
+	if exists, _ := mc.Exists(ctx, "absent"); exists {
+		t.Fatal("a rejected increment must not create the key")
+	}
+}
+
+func TestIncrementBelowRejectsNonIntegerValue(t *testing.T) {
+	mc := NewMemoryCache()
+	defer mc.Close()
+	ctx := context.Background()
+
+	if err := mc.Set(ctx, "token", []byte("owner-token"), time.Minute); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+	if _, _, err := mc.IncrementBelow(ctx, "token", time.Minute, 5); err == nil {
+		t.Fatal("IncrementBelow should reject a non-integer value")
+	}
+	if value, _ := mc.Get(ctx, "token"); string(value) != "owner-token" {
+		t.Fatalf("token = %q, want it untouched", value)
+	}
+}
+
 func TestCompareAndDelete(t *testing.T) {
 	mc := NewMemoryCache()
 	defer mc.Close()

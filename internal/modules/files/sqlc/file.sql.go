@@ -236,6 +236,32 @@ func (q *Queries) DeleteFile(ctx context.Context, arg DeleteFileParams) (File, e
 	return i, err
 }
 
+const filesStorageUsage = `-- name: FilesStorageUsage :one
+SELECT
+    COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
+    COALESCE(SUM(size) FILTER (WHERE user_id = $1::bigint), 0)::bigint AS user_bytes
+FROM files
+WHERE tenant_id = $2::bigint
+`
+
+type FilesStorageUsageParams struct {
+	UserID   int64 `json:"user_id"`
+	TenantID int64 `json:"tenant_id"`
+}
+
+type FilesStorageUsageRow struct {
+	TenantBytes int64 `json:"tenant_bytes"`
+	UserBytes   int64 `json:"user_bytes"`
+}
+
+// Both quotas count trashed rows: a soft-deleted blob still occupies storage.
+func (q *Queries) FilesStorageUsage(ctx context.Context, arg FilesStorageUsageParams) (FilesStorageUsageRow, error) {
+	row := q.db.QueryRow(ctx, filesStorageUsage, arg.UserID, arg.TenantID)
+	var i FilesStorageUsageRow
+	err := row.Scan(&i.TenantBytes, &i.UserBytes)
+	return i, err
+}
+
 const getFileByID = `-- name: GetFileByID :one
 SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
@@ -409,6 +435,17 @@ func (q *Queries) ListFilesByUserID(ctx context.Context, arg ListFilesByUserIDPa
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockFilesQuota = `-- name: LockFilesQuota :exec
+SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || $1::bigint, 0))
+`
+
+// Serializes uploads of one tenant for the rest of the metadata transaction,
+// so a concurrent upload cannot read the same free space and also pass.
+func (q *Queries) LockFilesQuota(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, lockFilesQuota, tenantID)
+	return err
 }
 
 const restoreFile = `-- name: RestoreFile :one

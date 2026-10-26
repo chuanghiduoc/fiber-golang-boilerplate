@@ -194,7 +194,7 @@ func TestUploadService_RejectsLeakedCrossTenantRows(t *testing.T) {
 	base := newMockFileRepo()
 	repo := &tenantBlindRepo{mockFileRepo: base}
 	store := newMockStorage()
-	svc := NewUploadService(repo, newFakeTx(repo), store)
+	svc := NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
 
 	base.files[1] = &File{
 		ID: 1, TenantID: 2, UserID: 20, OriginalName: "tenant-two.pdf",
