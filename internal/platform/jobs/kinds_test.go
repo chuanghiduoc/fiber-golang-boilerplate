@@ -42,26 +42,26 @@ func TestClaimIntegrationKindFilters(t *testing.T) {
 
 	queue := NewQueue(pgtest.Scoped(pool))
 	for _, kind := range []string{"kinds.fast", "kinds.slow", "kinds.other"} {
-		_, err := queue.Enqueue(ctx, Job{Kind: kind})
+		_, err := queue.Enqueue(ctx, Job{Kind: kind, RunAt: time.Now().Add(-time.Minute)})
 		require.NoError(t, err)
 	}
 
 	dedicated := &pgStore{db: pgtest.Scoped(pool), includeKinds: []string{"kinds.slow"}}
-	claimed, err := dedicated.Claim(ctx, "slow-worker", 10, time.Minute)
+	batch, err := dedicated.Claim(ctx, "slow-worker", 10, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, "kinds.slow", claimed[0].Kind)
-	assert.GreaterOrEqual(t, claimed[0].QueueLag, time.Duration(0))
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, "kinds.slow", batch.Jobs[0].Kind)
+	assert.GreaterOrEqual(t, batch.Jobs[0].QueueLag, time.Duration(0))
 
 	general := &pgStore{db: pgtest.Scoped(pool), excludeKinds: []string{"kinds.slow", "kinds.other"}}
-	claimed, err = general.Claim(ctx, "general-worker", 10, time.Minute)
+	batch, err = general.Claim(ctx, "general-worker", 10, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, "kinds.fast", claimed[0].Kind)
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, "kinds.fast", batch.Jobs[0].Kind)
 
 	unfiltered := newPGStore(pgtest.Scoped(pool))
-	claimed, err = unfiltered.Claim(ctx, "any-worker", 10, time.Minute)
+	batch, err = unfiltered.Claim(ctx, "any-worker", 10, time.Minute)
 	require.NoError(t, err)
-	require.Len(t, claimed, 1)
-	assert.Equal(t, "kinds.other", claimed[0].Kind)
+	require.Len(t, batch.Jobs, 1)
+	assert.Equal(t, "kinds.other", batch.Jobs[0].Kind)
 }

@@ -194,7 +194,10 @@ module asynchronously. Every event is one versioned envelope
 `tenantId`, `actor`, `data`), with the payload struct and version owned by the
 producer in `internal/contracts/<producer>`. Producers publish with
 `PublishTx` in their own transaction; subscribers register through
-`app.EventProvider` and run on the shared jobs worker.
+`app.EventProvider` and run on the shared jobs worker. `PublishTx` enqueues
+durable subscriptions only: local `Subscribe` handlers are notified by
+`Publish`/`PublishLocal` after the transaction, never inside it (a `pgx.Tx`
+has no after-commit hook).
 
 ```mermaid
 flowchart LR
@@ -223,7 +226,7 @@ flowchart LR
 | **Privacy contract** (`internal/contracts/privacy`) | A GDPR export or erasure must reach every module holding per-user data. | Modules register an exporter/eraser through `app.PrivacyProvider`; identity orchestrates through the registry, so no module imports another. |
 | **Outbox** (`jobs` table) | A side effect must exist if and only if the business change commits. | Job row commits with the business row (`EnqueueTx`/`EnqueueOnceTx`); delivery is at-least-once, so handlers are idempotent. |
 | **Durable event** (`events.PublishTx` + `SubscribeDurable`) | Several independent reactions to one fact. | One job per subscription, key `event:<type>:<id>:<handler>:<tenantId>`; at-least-once. |
-| **Local event** (`Subscribe`) | In-process reactions that may fail with the request. | Runs synchronously before commit; panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
+| **Local event** (`Subscribe` via `Publish`/`PublishLocal`) | In-process reactions that may fail with the request. | Runs synchronously in the publisher's call, not inside a business transaction (`PublishTx` skips local handlers and only enqueues durable work); panics recovered per handler, errors combined with `errors.Join`. Keep irreversible side effects out. |
 
 Contract wiring performed by `internal/bootstrap`:
 
