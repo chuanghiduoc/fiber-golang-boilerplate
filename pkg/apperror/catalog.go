@@ -35,7 +35,7 @@ const (
 	CodeAPIVersionUnsupported Code = "api.version_unsupported"
 
 	// CodeIdempotencyKeyMismatch is an Idempotency-Key reused with a different
-	// request body (ADR 0008). A duplicate still in progress is a plain 409.
+	// request body. A duplicate still in progress is a plain 409.
 	CodeIdempotencyKeyMismatch Code = "idempotency.key_mismatch"
 
 	CodeSystemInternal         Code = "system.internal"

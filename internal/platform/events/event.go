@@ -3,7 +3,7 @@
 // in the publisher's goroutine; durable subscriptions enqueue one idempotent
 // job per event and handler so delivery survives a process restart.
 //
-// Every event uses one versioned envelope (ADR 0011):
+// Every event uses one versioned envelope:
 //
 //	{
 //	  "id":          "0192f1d2-...",          // UUIDv7, unique per event

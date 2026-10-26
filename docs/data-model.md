@@ -1,6 +1,6 @@
 # Data Model
 
-The fresh-install schema is one init migration (ADR 0012),
+The fresh-install schema is one init migration,
 `migrations/20260101000000_platform_init_schema.{up,down}.sql`, applied only by
 `cmd/migrate`. Its `-- owner:` sections, in order:
 
@@ -46,9 +46,9 @@ Conventions that apply to every diagram below:
   no `tenant_id` of its own (the key id is global; the parent row holds the
   tenant); `users` and the per-user rows `user_passwords`, `user_identities`,
   `password_reset_tokens`, `email_verification_tokens`, `mfa_factors`, and
-  `mfa_recovery_codes` are global (ADR 0004) and have no `tenant_id`.
+  `mfa_recovery_codes` are global and have no `tenant_id`.
 - Every table with a `tenant_id` has `ENABLE`/`FORCE ROW LEVEL SECURITY` and a
-  `tenant_isolation` policy on `app_tenant_visible(tenant_id)` (ADR 0007);
+  `tenant_isolation` policy on `app_tenant_visible(tenant_id)`;
   `roles` additionally lets every tenant read the system roles (`tenant_id IS
   NULL`), whose writes need the bypass (startup catalog sync).
   `api_key_scopes` has no tenant column and stays unprotected because it is
@@ -72,7 +72,7 @@ Conventions that apply to every diagram below:
 
 ## Tenants, identity, and credentials
 
-Users are global identities that join tenants through memberships (ADR 0004).
+Users are global identities that join tenants through memberships.
 The membership, not the user, is the tenant-scoped principal: every
 cross-module reference to "a user in a tenant" is a `(tenant_id, user_id)`
 foreign key to `memberships`.
@@ -284,13 +284,13 @@ erDiagram
   invite is an `invitations` row (it can target an address with no account).
   `credentials_revoked_at` is set by a ban or removal and never cleared, so
   API keys created at or before it stay invalid after an unban or re-join.
-- **Data exports** (ADR 0013) belong to one membership. A `queued`/`running`
+- **Data exports** belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while
   the job has attempts. Expired, failed, and stale (>1 day) queued/running rows
   are removed by `privacy.exports.purge` (blob, then row); erasure removes them
   immediately.
-- **RBAC** (ADR 0003): `permissions` is the code-owned catalog synchronized at
+- **RBAC**: `permissions` is the code-owned catalog synchronized at
   API startup (key + registering owner). `roles` holds system roles
   (`tenant_id IS NULL`, seeded: tenant `owner`, `admin`, `member`; platform
   `platform_admin`) and tenant-defined roles (`tenant_id` set, `scope =
@@ -320,7 +320,7 @@ erDiagram
   used tokens are kept until they expire so a replay is recognized as reuse.
 - Password-reset and email-verification tokens are **per user**
   (`user_id UNIQUE`), not per tenant: the password is a global credential.
-- **MFA is per user** (ADR 0010): `mfa_factors` holds at most one confirmed
+- **MFA is per user**: `mfa_factors` holds at most one confirmed
   TOTP factor (partial unique `WHERE confirmed_at IS NOT NULL`) and one pending
   enrollment (`WHERE confirmed_at IS NULL`). The secret is sealed with
   `DATA_ENCRYPTION_KEY`; `last_used_step` makes one RFC 6238 step usable once.
@@ -499,7 +499,7 @@ erDiagram
 - `webhook_events` stores each event once. The first delivery of an event
   writes it in the same transaction as the delivery row and its job; later
   endpoints of the event reuse it. Its columns are the versioned event
-  envelope (ADR 0011), and every delivery of the event signs the same
+  envelope, and every delivery of the event signs the same
   `{id, type, dataVersion, occurredAt, tenantId, actor, data}` body built from
   this row. A replay is a new event (new id and `occurredAt`) carrying the
   original type, `dataVersion`, actor, and payload.

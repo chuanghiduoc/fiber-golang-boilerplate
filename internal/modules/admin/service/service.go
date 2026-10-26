@@ -8,7 +8,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// System role keys (ADR 0003). "user" is accepted as the legacy name of member.
+// System role keys. "user" is accepted as the legacy name of member.
 const (
 	RoleMember     = "member"
 	RoleAdmin      = "admin"

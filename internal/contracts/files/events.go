@@ -2,7 +2,7 @@ package files
 
 import "time"
 
-// Domain events published by the files module (ADR 0011). The envelope (id,
+// Domain events published by the files module. The envelope (id,
 // type, dataVersion, occurredAt, tenantId, actor) is
 // internal/platform/events.Event; these structs are its data. They are public
 // webhook contracts, deliberately separate from the REST DTOs: evolve them

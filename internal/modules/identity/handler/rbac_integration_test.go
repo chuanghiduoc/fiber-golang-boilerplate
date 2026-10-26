@@ -38,7 +38,7 @@ func TestIntegration_RolesAndPlatformTenants(t *testing.T) {
 	adminLogin := mustLogin(t, app, "default", admin.Email, pw)
 	memberLogin := mustLogin(t, app, "default", member.Email, pw)
 	platformLogin := mustLogin(t, app, "default", platform.Email, pw)
-	// Platform routes require a second factor (ADR 0010): a password-only
+	// Platform routes require a second factor: a password-only
 	// session is refused, an otp session is allowed.
 	platformMFA := testutil.SessionTokenAMR(t, ctx, h.pool, platform, harnessSecret, []string{"pwd", "otp"})
 

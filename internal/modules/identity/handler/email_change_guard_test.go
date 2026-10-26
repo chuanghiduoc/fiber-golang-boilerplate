@@ -60,7 +60,7 @@ func putUser(t *testing.T, app *fiber.App, path string, req dto.UpdateUserReques
 
 func ptr(s string) *string { return &s }
 
-// Users are global identities (ADR 0004): a tenant admin manages
+// Users are global identities: a tenant admin manages
 // memberships, never another person's profile. Moving another account's
 // address and then using forgot-password would take that account over in
 // every tenant, so delegated updates are refused for JWT admins and API keys

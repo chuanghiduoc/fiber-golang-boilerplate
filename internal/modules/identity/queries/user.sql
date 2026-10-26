@@ -1,4 +1,4 @@
--- Global user identities (ADR 0004). These queries are deliberately not
+-- Global user identities. These queries are deliberately not
 -- tenant-scoped: a user exists once across tenants. Tenant-facing reads go
 -- through membership.sql, which always filters by tenant_id.
 

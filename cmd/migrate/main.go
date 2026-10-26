@@ -21,7 +21,7 @@ import (
 )
 
 // maxSequentialVersion is the largest pre-timestamp (6-digit -seq) version.
-// Every migration, including the init (ADR 0012), uses a UTC
+// Every migration, including the init, uses a UTC
 // timestamp version, so a database recorded at 1..999999 is a legacy
 // sequential history (the old 000001 baseline or 000001-000003) whose source
 // files no longer exist in this repository.
@@ -86,7 +86,7 @@ var requiredTables = []string{
 var requiredColumns = map[string][]string{
 	"tenants":         {"slug", "status", "status_changed_at", "trial_ends_at", "deletion_scheduled_at"},
 	"tenant_settings": {"tenant_id", "locale", "timezone"},
-	// Global users (ADR 0004): no tenant_id, role, or credential columns.
+	// Global users: no tenant_id, role, or credential columns.
 	"users":           {"email", "status", "token_version", "credentials_changed_at", "deleted_at"},
 	"user_passwords":  {"user_id", "password_hash", "changed_at"},
 	"user_identities": {"user_id", "provider", "subject", "email"},
@@ -235,7 +235,7 @@ var requiredRLS = []string{
 // legacy global index that kept its name after the tenant rewrite.
 var requiredTenantLeadingIndexes = map[string][]string{
 	// users, user_passwords, user_identities, and the reset/verification
-	// tokens are global (ADR 0004) and have no tenant_id.
+	// tokens are global and have no tenant_id.
 	// uq_memberships_tenant_user (tenant_id, user_id) is verified as a
 	// required unique index above.
 	"memberships": {

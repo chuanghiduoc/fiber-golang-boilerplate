@@ -1,4 +1,4 @@
-// Command gen scaffolds code that follows ADR 0002 (module layering), so the
+// Command gen scaffolds code that follows the module layering rules, so the
 // architecture tests in test/arch pass for generated code with no allowlist
 // entries.
 //

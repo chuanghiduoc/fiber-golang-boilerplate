@@ -2,7 +2,6 @@
 
 | Document | Covers |
 |---|---|
-| [Architecture Decisions](adr/README.md) | ADRs: why the layering, RBAC, tenancy, migration, API, webhook, MFA, and event decisions were made |
 | [Architecture](architecture.md) | Module map and dependency rules, request lifecycle, cross-module communication, tenant model, authorization, transactions/outbox, migration policy |
 | [Data Model](data-model.md) | ER diagrams of the baseline schema, table ownership, keys, and FK delete actions |
 | [API Design System](api-design.md) | URLs/versioning, JSON conventions, success/error (RFC 9457) shapes, pagination, JWT vs API-key auth, tenants, headers, rate limits, idempotency, compatibility rules |
@@ -18,4 +17,4 @@ Deployment and tooling:
 | Link | Covers |
 |---|---|
 | [Kubernetes](../deploy/k8s/README.md) | Manifests, staging/production overlays, GitHub Actions CD, migration Job, release workflow, external DB/Redis, storage choices |
-| [Code generator](../cmd/gen/main.go) | `make gen module=<name>` / `resource=` / `command=` / `query=` generates ADR 0002 code, then runs sqlc, build, vet, module tests, and `test/arch`, rolling back on failure (`scripts/new-module.sh` wraps the module command) |
+| [Code generator](../cmd/gen/main.go) | `make gen module=<name>` / `resource=` / `command=` / `query=` generates layered module code, then runs sqlc, build, vet, module tests, and `test/arch`, rolling back on failure (`scripts/new-module.sh` wraps the module command) |

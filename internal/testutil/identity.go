@@ -14,7 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
-// Member is a fixture user with a membership in one tenant (ADR 0004: users
+// Member is a fixture user with a membership in one tenant (users
 // are global identities; tenant-owned rows reference memberships).
 type Member struct {
 	UserID       int64

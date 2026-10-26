@@ -1,4 +1,4 @@
-// Package repository is identity's Postgres driven adapter (ADR 0002): it
+// Package repository is identity's Postgres driven adapter: it
 // implements the service ports over sqlc and maps generated rows to service
 // types, so services never see sqlc or pgx.
 package repository

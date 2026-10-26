@@ -14,7 +14,7 @@ import (
 )
 
 // TestRLSTenantIsolation proves row-level security is the second line behind
-// the application's tenant predicates (ADR 0007): the test pool connects as
+// the application's tenant predicates: the test pool connects as
 // the non-superuser app role, and every assertion runs through the same
 // database.Scoped handle the API uses.
 func TestRLSTenantIsolation(t *testing.T) {

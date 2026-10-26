@@ -80,7 +80,7 @@ watch:
 # these are for authoring and for disposable local databases only.
 DSN ?= postgres://$(DB_USERNAME):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_DATABASE)?sslmode=$(DB_SSLMODE)&search_path=$(DB_SCHEMA)
 
-# Roll back every migration. The init down migration (ADR 0012) DROPS THE
+# Roll back every migration. The init down migration DROPS THE
 # WHOLE SCHEMA and all data, so it requires CONFIRM=yes.
 migrate-down:
 	@if [ "$(CONFIRM)" != "yes" ]; then \
@@ -112,7 +112,7 @@ sqlc-generate:
 		sqlc generate -f "$$config" || exit 1; \
 	done
 
-# Code generator (cmd/gen, ADR 0002 layout). It writes the files, then runs
+# Code generator (cmd/gen, layered module layout). It writes the files, then runs
 # sqlc, go build/vet, the module tests, and test/arch, and rolls every write
 # back if a step fails. Usage:
 #   make gen module=billing

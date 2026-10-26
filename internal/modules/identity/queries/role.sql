@@ -1,4 +1,4 @@
--- RBAC roles (ADR 0003). System roles have tenant_id IS NULL; tenant roles
+-- RBAC roles. System roles have tenant_id IS NULL; tenant roles
 -- belong to the request tenant. Reads include system roles plus the tenant's.
 
 -- name: ListRolesCursor :many

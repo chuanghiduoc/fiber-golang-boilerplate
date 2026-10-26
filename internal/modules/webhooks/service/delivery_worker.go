@@ -184,7 +184,7 @@ func (w *DeliveryWorker) signingKey(ciphertext string) ([]byte, error) {
 	return webhook.DecodeSecret(string(secret))
 }
 
-// deliveryBody rebuilds the event envelope (ADR 0011) stored in
+// deliveryBody rebuilds the event envelope stored in
 // webhook_events. The event type and dataVersion travel in this signed body.
 // RequestID is process-internal and stays empty, so it is never sent.
 func deliveryBody(delivery *Delivery) ([]byte, error) {

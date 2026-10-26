@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// layerRules is ADR 0002: the application layer (service/) and the HTTP
+// layerRules is the application layer (service/) and the HTTP
 // adapter (handler/) of a module must not reach into persistence or
 // transport details. Each rule lists import-path fragments the layer may not
 // import.

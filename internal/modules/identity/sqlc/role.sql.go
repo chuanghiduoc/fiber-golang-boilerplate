@@ -251,7 +251,7 @@ type ListRolesCursorRow struct {
 	Permissions []string           `json:"permissions"`
 }
 
-// RBAC roles (ADR 0003). System roles have tenant_id IS NULL; tenant roles
+// RBAC roles. System roles have tenant_id IS NULL; tenant roles
 // belong to the request tenant. Reads include system roles plus the tenant's.
 func (q *Queries) ListRolesCursor(ctx context.Context, arg ListRolesCursorParams) ([]ListRolesCursorRow, error) {
 	rows, err := q.db.Query(ctx, listRolesCursor,

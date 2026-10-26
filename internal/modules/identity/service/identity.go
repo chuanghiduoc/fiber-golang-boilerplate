@@ -67,7 +67,7 @@ const emailKeyBytes = 16
 // emailKey builds a per-address rate-limit cache key. The address appears
 // only as a truncated SHA-256 of its normalized form, so cache keys (visible
 // to cache operators, dumps, and monitoring) never carry the raw email.
-// Users and their passwords are global (ADR 0004), so the key is too: a
+// Users and their passwords are global, so the key is too: a
 // password guess in one tenant counts against the same account everywhere.
 func emailKey(prefix, email string) string {
 	digest := sha256.Sum256([]byte(NormalizeEmail(email)))

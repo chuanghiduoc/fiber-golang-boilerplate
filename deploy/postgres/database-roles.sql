@@ -1,4 +1,4 @@
--- Creates the non-superuser role the API and worker connect as (ADR 0007).
+-- Creates the non-superuser role the API and worker connect as.
 -- Run once as the schema owner, before the first cmd/migrate:
 --
 --   psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \

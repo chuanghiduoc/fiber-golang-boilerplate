@@ -56,7 +56,7 @@ func mfaAttemptKey(userID int64) string {
 // loginAttemptKeys returns the per-source key (email, client IP) and the
 // global per-account key (email) for one password attempt. The email is
 // hashed by emailKey, so neither key contains the address. The password is
-// a global credential (ADR 0004), so neither key is tenant-scoped.
+// a global credential, so neither key is tenant-scoped.
 func loginAttemptKeys(ctx context.Context, email string) (source, account string) {
 	account = emailKey(loginAttemptPrefix, email)
 	return account + ":ip=" + clientIPFromContext(ctx), account

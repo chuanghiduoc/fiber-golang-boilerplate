@@ -39,7 +39,7 @@ type InvitationSignUp struct {
 }
 
 // InvitationService invites people into tenants. A global user joins another
-// tenant only by accepting an invitation (ADR 0004); registering again with
+// tenant only by accepting an invitation; registering again with
 // the same address is refused with user.email_taken.
 type InvitationService struct {
 	stores      Stores

@@ -1,4 +1,4 @@
--- Fresh-install schema (ADR 0012): the single init migration. Each section
+-- Fresh-install schema: the single init migration. Each section
 -- starts with an `-- owner: <module|platform>` marker, and test/arch checks
 -- that a section only creates its owner's tables. Sections run in foreign-key
 -- dependency order: shared functions, identity, platform tables, modules.
@@ -17,7 +17,7 @@
 --     with ON DELETE RESTRICT: a module row for a user in a tenant requires
 --     that membership, memberships are never hard-deleted while referenced,
 --     and another module's rows must never vanish through a cascade it does
---     not own (users are global identities, ADR 0004).
+--     not own (users are global identities).
 
 -- owner: platform
 CREATE OR REPLACE FUNCTION update_updated_at()
@@ -30,7 +30,7 @@ $$ LANGUAGE plpgsql;
 
 -- app_tenant_visible is the single RLS predicate for tenant-owned tables. It
 -- reads the transaction-local settings TxManager/Scoped install, so a pooled
--- connection is never scoped to its previous caller (ADR 0007). Bypass is for
+-- connection is never scoped to its previous caller. Bypass is for
 -- deliberate cross-tenant platform work only. With neither setting, the
 -- comparison against NULL is NULL, so the row is invisible (fail closed).
 CREATE OR REPLACE FUNCTION app_tenant_visible(row_tenant BIGINT) RETURNS BOOLEAN
@@ -40,7 +40,7 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- owner: identity
--- Identity baseline (ADR 0004): users are global identities and join tenants
+-- Identity baseline: users are global identities and join tenants
 -- through memberships. Credentials (user_passwords) and external identities
 -- (user_identities) live outside users; sessions are first-class and own a
 -- rotating refresh-token family (RFC 9700 reuse detection).
@@ -216,7 +216,7 @@ CREATE TRIGGER trigger_user_identities_updated_at
 -- accepting it creates or reactivates the membership. Rows are never hard
 -- deleted while other modules reference (tenant_id, user_id).
 --
--- Roles live in membership_roles (ADR 0003).
+-- Roles live in membership_roles.
 -- credentials_revoked_at is set by a ban or removal and never cleared: API
 -- keys created at or before it stay invalid after the member is restored.
 -- ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ CREATE TRIGGER trigger_memberships_updated_at
     EXECUTE FUNCTION update_updated_at();
 
 -- ---------------------------------------------------------------------------
--- identity: RBAC (ADR 0003)
+-- identity: RBAC
 --
 -- The permission catalog is code-owned and synchronized into permissions at
 -- API startup. Roles are rows: system roles have tenant_id IS NULL (seeded
@@ -703,7 +703,7 @@ CREATE TABLE IF NOT EXISTS email_verification_tokens (
 );
 
 -- ---------------------------------------------------------------------------
--- identity: MFA factors (ADR 0010)
+-- identity: MFA factors
 --
 -- MFA is per global user, not per tenant. The TOTP secret is sealed with the
 -- data encryption keyring (DATA_ENCRYPTION_KEY) and never returned again after
@@ -756,7 +756,7 @@ CREATE INDEX IF NOT EXISTS idx_mfa_recovery_codes_user_unused
     ON mfa_recovery_codes (user_id)
     WHERE used_at IS NULL;
 
--- Tenant isolation (ADR 0007). FORCE subjects the table owner too, so the app
+-- Tenant isolation. FORCE subjects the table owner too, so the app
 -- role cannot silently bypass a policy it owns.
 ALTER TABLE tenant_settings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE tenant_settings FORCE ROW LEVEL SECURITY;
@@ -865,7 +865,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_terminal_updated_at
     WHERE status IN ('succeeded', 'dead');
 
 -- Global claim/lease recovery is a deliberate cross-tenant job path, so those
--- statements run with app.rls_bypass (ADR 0007).
+-- statements run with app.rls_bypass.
 ALTER TABLE jobs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE jobs FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON jobs
@@ -1396,7 +1396,7 @@ CREATE INDEX IF NOT EXISTS idx_webhook_endpoint_secrets_tenant_endpoint
 -- change a queued delivery's signed request. event_id is deduplicated per
 -- endpoint so re-dispatching the same domain event is safe.
 -- ---------------------------------------------------------------------------
--- The columns are the versioned event envelope (ADR 0011): event_id (UUIDv7),
+-- The columns are the versioned event envelope: event_id (UUIDv7),
 -- event_type, data_version, occurred_at, tenant_id, actor_type/actor_id, and
 -- payload (the envelope's data). The delivery worker rebuilds the signed
 -- JSON body from them.

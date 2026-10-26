@@ -14,7 +14,7 @@ import (
 var bcryptCost = 12
 
 // UserService owns the account lifecycle as seen from the request tenant.
-// Users are global identities (ADR 0004); every read here goes through the
+// Users are global identities; every read here goes through the
 // caller's membership in the request tenant. Its methods are split by
 // responsibility across this package: registration.go, authentication.go and
 // lockout.go, oauth_google.go, profile.go (update/delete/sessions), and

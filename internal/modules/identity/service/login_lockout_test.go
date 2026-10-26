@@ -98,7 +98,7 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 	}
 }
 
-// The password is global (ADR 0004), so the lockout is too: failures in one
+// The password is global, so the lockout is too: failures in one
 // tenant count against the same account in another.
 func TestAuthenticate_LockoutIsGlobalAcrossTenants(t *testing.T) {
 	svc := newTestUserService(newMemDB())

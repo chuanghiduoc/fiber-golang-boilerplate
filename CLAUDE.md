@@ -73,7 +73,7 @@ module, and `platform`/`pkg` never import modules.
 | `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
-| `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections (ADR 0012); later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
+| `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections; later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
 
 **Request flow:** client → global middleware (request ID, i18n, tracing,
 metrics, logger, audit fallback, timeout) → `/api/vN` guard → tenant
@@ -93,7 +93,6 @@ PostgreSQL. Diagram: `docs/architecture.md`.
 | `docs/tracing.md` | OpenTelemetry config, span privacy rules, collector, job trace links |
 | `docs/feature-flags.md` | Catalog, precedence, cache, admin API, metrics |
 | `docs/webhooks.md` | Outbound dispatch/signing/SSRF/retries, inbound receiver, secrets |
-| `docs/adr/README.md` | Architecture Decision Records (layering, RBAC, tenancy, migrations, ...); add one for a decision that changes a boundary |
 
 `.github/CODEOWNERS` maps platform areas and each module (code, contracts,
 migrations) to its owners; keep it current when adding a module.
@@ -119,8 +118,7 @@ migrations) to its owners; keep it current when adding a module.
   `featureshttp`, `apikeyhttp`). `pkg/storage` (interface + local driver) and
   `files/service` must not import the AWS SDK; S3/SeaweedFS is
   `pkg/storage/s3store`, selected by `pkg/storage/drivers.New`.
-- Layering ratchet ([ADR 0002](docs/adr/0002-module-layering.md),
-  `test/arch/layering_test.go`): `service/` may not import sqlc, pgx, Fiber,
+- Layering ratchet (`test/arch/layering_test.go`): `service/` may not import sqlc, pgx, Fiber,
   or the module's own `dto/`/`handler/`; `handler/` may not import
   `repository/`, sqlc, or pgx. Existing violations are listed in
   `test/arch/layering_allowlist.txt`, which only shrinks: never add a line,
@@ -140,7 +138,7 @@ migrations) to its owners; keep it current when adding a module.
 - Only `cmd/migrate` applies DDL; API/seed assume the schema exists.
   `cmd/migrate` uses `config.LoadDatabase` (DB_* only; no JWT/admin/SMTP
   secrets).
-- Fresh installs apply the single init migration (ADR 0012), whose
+- Fresh installs apply the single init migration, whose
   `-- owner: <module|platform>` sections run shared functions, identity,
   platform jobs/scheduler/audit, then modules. There is still no deployed
   database, so the init is edited in place until the first release; after
@@ -165,7 +163,7 @@ migrations) to its owners; keep it current when adding a module.
   inherits its tenant through the parent key. `data_exports` is identity-owned:
   its partial unique index allows one queued/running export per membership,
   and `storage_path` is the authoritative export blob key.
-- Users are global (ADR 0004): `users`, `user_passwords`, `user_identities`,
+- Users are global: `users`, `user_passwords`, `user_identities`,
   `password_reset_tokens`, and `email_verification_tokens` have no
   `tenant_id`; `tenants`/`tenant_settings` are the tenant rows themselves. A
   user joins a tenant through `memberships` (`UNIQUE (tenant_id, user_id)`,
@@ -221,7 +219,7 @@ migrations) to its owners; keep it current when adding a module.
 - Tokens without a positive `tenant_id` or `sid` claim are rejected
   fail-closed; rotate legacy tokens after upgrading. `tenant.EffectiveID(ctx)`'s tenant-1 fallback
   is for jobs/internal/tests only, never HTTP handling.
-- **Row-level security (ADR 0007):** every table with a `tenant_id` has
+- **Row-level security:** every table with a `tenant_id` has
   `ENABLE`+`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy calling
   `app_tenant_visible(tenant_id)` (`roles` also exposes the shared system roles,
   `tenant_id IS NULL`, to every tenant; writing one needs the bypass, as the
@@ -351,8 +349,9 @@ handler/service/DTO/repository package.
   token insert re-checks the current email (an email change in between skips
   the send). The admin seed only creates a missing admin; an existing
   demoted/banned/deleted or non-member account is skipped, never re-promoted
-  or added.
-- **MFA (ADR 0010):** TOTP only (RFC 6238, SHA-1/6 digits/30s, ±1 step),
+  or added. A newly seeded admin becomes tenant `owner` and gets the
+  `platform_admin` assignment.
+- **MFA:** TOTP only (RFC 6238, SHA-1/6 digits/30s, ±1 step),
   per global user, not per tenant. `mfa_factors` keeps at most one confirmed
   factor and one pending enrollment; the secret is sealed with
   `infra.PayloadCodec` (`DATA_ENCRYPTION_KEY`, previous keys decrypt) and is
@@ -375,10 +374,8 @@ handler/service/DTO/repository package.
   (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
   `rc`; refresh repeats the session's `amr`, tokens without it still verify,
   and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
-  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Every `/platform` route (platform-scope roles) requires it (ADR 0010, enforced
+  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Every `/platform` route (platform-scope roles) requires it (enforced
   by `test/arch` `TestPlatformRoutesRequireMFA`).
-  or added. A newly seeded admin becomes tenant `owner` and gets the
-  `platform_admin` assignment; `cmd/seed` does the same.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).
   The system tenant roles are `owner`, `admin`, and `member`; owner and admin
@@ -503,7 +500,7 @@ handler/service/DTO/repository package.
   parameter: with PgBouncer either `track_extra_parameters = search_path` or
   `ignore_startup_parameters = search_path` plus
   `ALTER ROLE ... SET search_path`.
-- **Webhooks** (`docs/webhooks.md`, ADR 0009/0011): producers never call
+- **Webhooks** (`docs/webhooks.md`): producers never call
   webhooks. Identity registration and file upload/delete/restore publish
   domain events with `events.PublishTx` in their transaction; the webhooks
   module subscribes durably (`app.EventProvider`, types in
@@ -523,7 +520,7 @@ handler/service/DTO/repository package.
   production) and returned only on create/rotate. `POST /webhooks/inbound/:id`
   verifies the same scheme with the source secret, takes the type from the
   body, and deduplicates `(source, webhook-id)`.
-- **Events** (ADR 0011): typed bus over one versioned envelope `events.Event`
+- **Events**: typed bus over one versioned envelope `events.Event`
   {`id` UUIDv7, `type`, `dataVersion`, `occurredAt`, `tenantId`, `actor`
   {type user|service|system, id}, `data`} (1:1 with CloudEvents attributes;
   internal `requestId` is never sent out). Payload structs and versions live
@@ -572,7 +569,7 @@ handler/service/DTO/repository package.
   never raw paths, payloads, SQL, headers, or error text. pgx is instrumented
   only under a recording parent. Jobs persist `trace_parent`; each attempt is a
   new-root `job.process` span linked to the enqueue span.
-- **Privacy (GDPR, ADR 0013):** `internal/contracts/privacy` is the stdlib
+- **Privacy (GDPR):** `internal/contracts/privacy` is the stdlib
   `Exporter`/`Eraser`/`Registry` contract. Every module with per-user data
   registers through `app.PrivacyProvider` (identity, files, notifications,
   apikeys, features, and webhooks' stored event history; endpoint config is
@@ -618,7 +615,7 @@ handler/service/DTO/repository package.
 - **Idempotency** (`docs/operations.md` flowchart): opt-in `Idempotency-Key`
   via `deps.Idempotency`, scoped by method/path/tenant ID+slug/caller (user, or
   IP for public routes). 2xx replays for 24h; non-multipart bodies ≤1 MiB are
-  body-bound (different body → 422 `idempotency.key_mismatch`, ADR 0008). The
+  body-bound (different body → 422 `idempotency.key_mismatch`). The
   2m lock is an atomic owner-token
   claim (`cache.Cache.SetNX` → `SET NX PX`, UUID token): concurrent duplicates
   get 409. On a lost reply the key is re-read (own token ⇒ held; other ⇒ 409;
@@ -633,7 +630,7 @@ handler/service/DTO/repository package.
 ## Adding a Module
 
 Use the Go generator `cmd/gen` (stdlib `text/template` + `embed`) and follow
-`docs/module-template.md`; its output follows ADR 0002, so `test/arch`
+`docs/module-template.md`; its output follows the layering rules, so `test/arch`
 (layering ratchet included) passes with no allowlist entries.
 
 - `make gen module=<name>`: `module.go` (`Handlers`, catalog providers,

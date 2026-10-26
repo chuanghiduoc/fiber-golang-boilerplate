@@ -1,6 +1,6 @@
 # Intentional breaking API changes
 
-CI's `API compatibility` job (ADR 0006) converts the base branch's and the
+CI's `API compatibility` job converts the base branch's and the
 pull request's `docs/swagger.json` to OpenAPI 3 (`go run ./cmd/openapi3`) and
 runs `oasdiff breaking --fail-on ERR`. A pull request that **edits this file**
 acknowledges its breaking changes: the job still prints the oasdiff report but

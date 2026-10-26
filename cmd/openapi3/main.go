@@ -1,6 +1,6 @@
 // Command openapi3 converts the swag-generated Swagger 2.0 spec
 // (docs/swagger.json) to OpenAPI 3 so CI can run `oasdiff breaking` against
-// the base branch (ADR 0006). It is a build tool only; the API never links it.
+// the base branch. It is a build tool only; the API never links it.
 //
 //	go run ./cmd/openapi3 -in docs/swagger.json -out /tmp/openapi3.json
 package main
