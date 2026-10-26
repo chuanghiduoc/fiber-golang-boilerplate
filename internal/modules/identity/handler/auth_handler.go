@@ -643,9 +643,10 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 			slog.Int("upstream_status", status),
 		)
 		// A 4xx means Google rejected this client's code or credentials; the
-		// caller must start over. Anything else (5xx, timeout, network) is an
-		// upstream outage and must not masquerade as a bad request.
-		if status >= 400 && status < 500 {
+		// caller must start over. A 429 is Google rate-limiting us, and
+		// anything else (5xx, timeout, network) is an upstream outage: neither
+		// may masquerade as a bad request.
+		if status >= 400 && status < 500 && status != fiber.StatusTooManyRequests {
 			return apperror.NewBadRequest("failed to exchange authorization code")
 		}
 		return apperror.NewCode(identitycatalog.CodeAuthOAuthUpstreamUnavailable, "oauth provider is unavailable")

@@ -293,6 +293,11 @@ erDiagram
   anonymized); an unban while the membership is still suspended clears both.
   `EmailBannedInTenant` matches the hash on
   registration, invitation acceptance, and email change (GDPR Art.17(3)(e)).
+  Residual risk: the hash is unkeyed, so anyone with read access to the
+  table (a dump or backup) can confirm whether a known address was banned
+  or recover common addresses by dictionary attack. It is pseudonymous, not
+  anonymous, data; a keyed HMAC would need a stable key outside the
+  rotating encryption keys.
 - **Data exports** belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while

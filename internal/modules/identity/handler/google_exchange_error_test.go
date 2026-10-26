@@ -38,8 +38,8 @@ func (f *errorGoogleOAuth) BuildMFACallbackURL(challenge string) string {
 	return "https://frontend.example.test/#mfa_challenge=" + challenge
 }
 
-// A provider 4xx keeps the existing 400; a 5xx or transport failure is a 502
-// upstream-unavailable, never a misleading bad request.
+// A provider 4xx keeps the existing 400; a 429, 5xx, or transport failure is a
+// 502 upstream-unavailable, never a misleading bad request.
 func TestGoogleCallback_ExchangeErrorClassification(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -59,9 +59,21 @@ func TestGoogleCallback_ExchangeErrorClassification(t *testing.T) {
 			wantCode: string(identitycatalog.CodeAuthOAuthUpstreamUnavailable),
 		},
 		{
-			name:   "userinfo 429",
-			err:    &oauth.UpstreamError{Op: "userinfo", StatusCode: http.StatusTooManyRequests},
+			name:   "userinfo 404",
+			err:    &oauth.UpstreamError{Op: "userinfo", StatusCode: http.StatusNotFound},
 			status: fiber.StatusBadRequest,
+		},
+		{
+			name:     "userinfo 429",
+			err:      &oauth.UpstreamError{Op: "userinfo", StatusCode: http.StatusTooManyRequests},
+			status:   fiber.StatusBadGateway,
+			wantCode: string(identitycatalog.CodeAuthOAuthUpstreamUnavailable),
+		},
+		{
+			name:     "token 429",
+			err:      &oauth2.RetrieveError{Response: &http.Response{StatusCode: http.StatusTooManyRequests}},
+			status:   fiber.StatusBadGateway,
+			wantCode: string(identitycatalog.CodeAuthOAuthUpstreamUnavailable),
 		},
 		{
 			name:     "transport timeout",
