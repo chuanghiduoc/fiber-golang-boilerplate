@@ -114,7 +114,7 @@ func TestPlatformAdminVersusTenantAdmin(t *testing.T) {
 
 func TestReplaceMemberRolesProtectsTheLastOwner(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := authz.SystemContext(context.Background())
 	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-owner@example.com",
 		testutil.MemberOptions{Role: "owner"})
@@ -168,7 +168,7 @@ func TestSyncCatalogPrunesPermissionHeldByAnAPIKey(t *testing.T) {
 
 func TestReplaceMemberRolesIsSerialized(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := authz.SystemContext(context.Background())
 	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
 	member := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-concurrent@example.com",
 		testutil.MemberOptions{})
@@ -200,7 +200,7 @@ func TestReplaceMemberRolesIsSerialized(t *testing.T) {
 
 func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := authz.SystemContext(context.Background())
 	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
 	first := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-concurrent-owner-a@example.com",
 		testutil.MemberOptions{Role: "owner"})
@@ -239,7 +239,7 @@ func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 func TestTenantRoleCannotShadowASystemRoleKey(t *testing.T) {
 	e := newEnv(t, nil)
 	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
-	_, err := roles.Create(context.Background(), identityservice.NewRole{Key: "owner", Name: "Fake owner"})
+	_, err := roles.Create(authz.SystemContext(context.Background()), identityservice.NewRole{Key: "owner", Name: "Fake owner"})
 	assert.Equal(t, http.StatusConflict, appStatus(err))
 }
 

@@ -19,6 +19,7 @@ import (
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -71,6 +72,7 @@ type env struct {
 	tx       *identityrepo.Transactor
 	users    service.UserService
 	admin    service.AdminUserService
+	roles    service.RoleService
 	sessions *service.SessionService
 	mfa      service.MFAService
 	resets   service.PasswordResetService
@@ -94,7 +96,7 @@ func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), recorder, nil, nil)
 	mail := &mailbox{}
 	sign := func(c service.AccessClaims) (string, error) { return "access", nil }
-	sessions := service.NewSessionService(stores, tx, sign, time.Hour, nil)
+	sessions := service.NewSessionService(stores, tx, sign, time.Hour, 720*time.Hour, nil)
 	verify := service.NewEmailVerificationService(service.VerificationDeps{
 		Stores: stores, Tx: tx, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",
 	})
@@ -106,6 +108,7 @@ func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 			Stores: stores, Tx: tx, Cache: appCache, Sessions: sessions, Verification: verify,
 		}),
 		admin:    service.NewAdminUserService(stores, tx, nil),
+		roles:    service.NewRoleService(stores, tx, nil),
 		sessions: sessions,
 		mfa: service.NewMFAService(service.MFADeps{
 			Stores: stores, Tx: tx, Cache: appCache, Sealer: testSealer{}, Sessions: sessions,
@@ -160,7 +163,7 @@ func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 // service checks.
 func TestLastOwnerProtection(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := authz.SystemContext(context.Background())
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "owner@example.com", testutil.MemberOptions{Role: "owner"})
 	// The same user is a plain member elsewhere, which must not count.
@@ -188,7 +191,7 @@ func TestLastOwnerProtection(t *testing.T) {
 // the address cannot register into (or be invited to) that tenant again.
 func TestBanSurvivesAccountDeletion(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := authz.SystemContext(context.Background())
 	testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
 	user, err := e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!", Name: "Banned"})
 	require.NoError(t, err)
@@ -316,6 +319,13 @@ func TestTenantService_CreateAndLifecycle(t *testing.T) {
 
 	_, err = tenants.Transition(ctx, created.ID, service.TenantStatusPendingDeletion)
 	require.NoError(t, err)
+	_, err = tenants.Transition(ctx, created.ID, service.TenantStatusDeleted)
+	assert.Equal(t, string(identitycatalog.CodeTenantDeletionNotDue), appCode(err),
+		"deletion is refused until the grace period ends")
+	if _, err := e.pool.Exec(ctx,
+		`UPDATE tenants SET deletion_scheduled_at = NOW() - interval '1 minute' WHERE id = $1`, created.ID); err != nil {
+		t.Fatalf("move deletion schedule into the past: %v", err)
+	}
 	deleted, err := tenants.Transition(ctx, created.ID, service.TenantStatusDeleted)
 	require.NoError(t, err)
 	assert.NotNil(t, deleted.DeletionScheduledAt, "the schedule is kept as history")

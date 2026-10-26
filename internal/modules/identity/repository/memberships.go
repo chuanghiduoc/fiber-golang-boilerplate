@@ -33,6 +33,7 @@ func toMembership(row identitysqlc.Membership, role string, roles []string) iden
 		Roles:                roles,
 		Status:               identityservice.MembershipStatus(row.Status),
 		BannedAt:             timePtr(row.BannedAt),
+		BannedEmailHash:      row.BannedEmailHash.String,
 		RemovedAt:            timePtr(row.RemovedAt),
 		CredentialsRevokedAt: timePtr(row.CredentialsRevokedAt),
 		CreatedAt:            row.CreatedAt.Time,
@@ -164,6 +165,9 @@ func (r *MembershipRepository) Ban(ctx context.Context, userID int64) (*identity
 	if err != nil {
 		return nil, wrapErr(err)
 	}
+	if err := r.deleteInvitationsCreatedBy(ctx, userID); err != nil {
+		return nil, err
+	}
 	return r.hydrate(ctx, row)
 }
 
@@ -187,7 +191,23 @@ func (r *MembershipRepository) Remove(ctx context.Context, userID int64) (*ident
 	}); err != nil {
 		return nil, wrapErr(err)
 	}
+	if err := r.deleteInvitationsCreatedBy(ctx, userID); err != nil {
+		return nil, err
+	}
 	return r.hydrate(ctx, row)
+}
+
+// deleteInvitationsCreatedBy revokes the pending invitations a banned or
+// removed member created in the request tenant. It runs in the membership
+// mutation's transaction so an invitation cannot outlive its inviter's
+// authority.
+func (r *MembershipRepository) deleteInvitationsCreatedBy(ctx context.Context, userID int64) error {
+	if _, err := r.q.DeletePendingInvitationsByInviter(ctx, identitysqlc.DeletePendingInvitationsByInviterParams{
+		TenantID: tenantID(ctx), InvitedBy: userID,
+	}); err != nil {
+		return wrapErr(err)
+	}
+	return nil
 }
 
 // hydrate fills the derived role fields of a membership row written by a
@@ -227,6 +247,9 @@ func (r *MembershipRepository) insertRole(ctx context.Context, userID int64, rol
 
 func (r *MembershipRepository) replaceRoles(ctx context.Context, userID int64, roles []string) error {
 	tid := tenantID(ctx)
+	if err := r.LockMembership(ctx, userID); err != nil {
+		return err
+	}
 	if err := r.q.LockMembershipRoles(ctx, identitysqlc.LockMembershipRolesParams{
 		TenantID: tid, UserID: userID,
 	}); err != nil {
@@ -264,6 +287,19 @@ func (r *MembershipRepository) CountActiveOwners(ctx context.Context) (int64, er
 		return 0, wrapErr(err)
 	}
 	return n, nil
+}
+
+func (r *MembershipRepository) LockMembership(ctx context.Context, userID int64) error {
+	n, err := r.q.LockMembership(ctx, identitysqlc.LockMembershipParams{
+		TenantID: tenantID(ctx), UserID: userID,
+	})
+	if err != nil {
+		return wrapErr(err)
+	}
+	if n == 0 {
+		return apperror.ErrNotFound
+	}
+	return nil
 }
 
 func (r *MembershipRepository) LockOwnerChanges(ctx context.Context) error {

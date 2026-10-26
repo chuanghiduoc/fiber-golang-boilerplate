@@ -43,6 +43,10 @@ const (
 
 	exportPurgeBatchSize = 100
 	exportPurgeBudget    = time.Minute
+
+	// identityProviderName is identity's own privacy provider. Its eraser
+	// removes the membership, so it runs last in a tenant erase job.
+	identityProviderName = "identity"
 )
 
 var errErasurePending = errors.New("private erasure is waiting for tenant memberships")
@@ -262,15 +266,46 @@ func (s *PrivacyService) RequestSelfErasure(ctx context.Context, userID int64, p
 	return s.requestErasure(ctx, userID, "user.erasure_requested")
 }
 
-// RequestAdminErasure starts erasure for a member of the request tenant.
+// RequestAdminErasure starts erasure for a member of the request tenant. It
+// is deliberately tenant-scoped: the request tenant's membership is removed
+// and only that tenant's data is erased, while the global account and the
+// user's memberships in other tenants stay intact.
 func (s *PrivacyService) RequestAdminErasure(ctx context.Context, userID int64) error {
-	if _, err := s.stores.Memberships.Get(ctx, userID); err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
+	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if tx.Privacy == nil || tx.Jobs == nil {
+			return apperror.NewInternal("privacy services are not configured")
+		}
+		if err := EnsureCanManageMember(ctx, tx.Stores, userID); err != nil {
+			return err
+		}
+		member, err := tx.Memberships.Get(ctx, userID)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found")
+			}
+			return apperror.NewInternal("failed to get user")
+		}
+		// A cross-tenant id and a member who already left both look absent.
+		if member.Membership.Status == MembershipStatusRemoved {
 			return apperror.NewNotFound("user not found")
 		}
-		return apperror.NewInternal("failed to get user")
-	}
-	return s.requestErasure(ctx, userID, "admin.user.erasure_requested")
+		if member.Membership.Status == MembershipStatusActive && member.Membership.Role == RoleOwner {
+			if err := ensureNotLastOwner(ctx, tx.Memberships, "cannot erase the last active owner"); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Privacy.ExpireForUser(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to expire data exports")
+		}
+		erasePayload, _ := json.Marshal(eraseJob{UserID: userID})
+		if _, err := tx.Jobs.Enqueue(ctx, jobs.Job{
+			TenantID: tenant.EffectiveID(ctx), Kind: JobKindErase, Payload: erasePayload, MaxAttempts: 20,
+		}); err != nil {
+			return apperror.NewInternal("failed to queue erasure")
+		}
+		event := userEvent(ctx, "admin.user.erasure_requested", userID, map[string]any{"scope": "tenant"})
+		return checkAudit(tx.Audit.RecordTx(ctx, event))
+	})
 }
 
 // requestErasure refuses to erase the last active owner of any tenant, then
@@ -532,8 +567,10 @@ func (s *PrivacyService) buildExportDocument(ctx context.Context, export *DataEx
 	return raw, nil
 }
 
-// HandleEraseJob runs every tenant Eraser. Each implementation is idempotent,
-// so a retry is safe.
+// HandleEraseJob runs every tenant Eraser, identity's own eraser last: it
+// removes the membership, and the finalizer treats a removed membership as
+// proof that every other module's data is gone. Each implementation is
+// idempotent, so a retry is safe.
 func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMessage) error {
 	var in eraseJob
 	if err := json.Unmarshal(payload, &in); err != nil || in.UserID <= 0 {
@@ -543,38 +580,65 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 	if err := s.refuseLastOwnerErasure(ctx, in.UserID); err != nil {
 		return err
 	}
+	var providers []privacycontracts.Provider
 	if s.registry != nil {
-		for _, provider := range s.registry.Providers() {
-			if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
-				return fmt.Errorf("erase %s: %w", provider.Name, err)
-			}
+		providers = s.registry.Providers()
+	}
+	identitySeen := false
+	for _, provider := range providers {
+		if provider.Name == identityProviderName {
+			continue
 		}
+		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+			return fmt.Errorf("erase %s: %w", provider.Name, err)
+		}
+	}
+	for _, provider := range providers {
+		if provider.Name != identityProviderName {
+			continue
+		}
+		identitySeen = true
+		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+			return fmt.Errorf("erase %s: %w", provider.Name, err)
+		}
+	}
+	if !identitySeen {
+		// Without identity's eraser the membership stays and no finalizer can
+		// make progress; fail loudly instead of reporting a partial erase.
+		return fmt.Errorf("identity privacy eraser is not registered")
 	}
 	return nil
 }
 
 // refuseLastOwnerErasure re-checks at job time: another admin may have been
-// demoted after the request was accepted. It runs before any eraser, so a
+// demoted after the request was accepted. It takes the same per-tenant owner
+// advisory lock the service uses inside the check transaction, so a
+// concurrent owner change serializes with it. It runs before any eraser, so a
 // refusal leaves the tenant (and other modules) untouched.
 func (s *PrivacyService) refuseLastOwnerErasure(ctx context.Context, userID int64) error {
-	member, err := s.stores.Memberships.Get(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
+	return s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if err := tx.Memberships.LockOwnerChanges(ctx); err != nil {
+			return apperror.NewInternal("failed to lock owner changes")
+		}
+		member, err := tx.Memberships.Get(ctx, userID)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil
+			}
+			return fmt.Errorf("load membership: %w", err)
+		}
+		if member.Membership.Status != MembershipStatusActive || member.Membership.Role != RoleOwner {
 			return nil
 		}
-		return fmt.Errorf("load membership: %w", err)
-	}
-	if member.Membership.Status != MembershipStatusActive || member.Membership.Role != RoleOwner {
+		owners, err := tx.Memberships.CountActiveOwners(ctx)
+		if err != nil {
+			return fmt.Errorf("count owners: %w", err)
+		}
+		if owners <= 1 {
+			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot erase the last active owner")
+		}
 		return nil
-	}
-	owners, err := s.stores.Memberships.CountActiveOwners(ctx)
-	if err != nil {
-		return fmt.Errorf("count owners: %w", err)
-	}
-	if owners <= 1 {
-		return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot erase the last active owner")
-	}
-	return nil
+	})
 }
 
 // HandleFinalizeJob anonymizes the global user only after every membership has

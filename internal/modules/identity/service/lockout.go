@@ -28,7 +28,36 @@ const (
 	// password reset the TOTP guessing budget at will.
 	maxMFAAttempts   = 5
 	mfaAttemptPrefix = "mfa_attempts:"
+
+	// mfaReauthAttemptPrefix bounds password guesses made to re-authenticate
+	// for MFA enrollment management. It is a separate per-user budget so a
+	// successful re-authentication can clear the password failures without
+	// touching the TOTP/ recovery-code budget.
+	mfaReauthAttemptPrefix = "mfa_reauth_attempts:"
 )
+
+func mfaReauthAttemptKey(userID int64) string {
+	return fmt.Sprintf("%s%d", mfaReauthAttemptPrefix, userID)
+}
+
+// reserveReauthAttempt atomically spends one password guess before the bcrypt
+// comparison, so parallel requests cannot all pass a read-only budget check.
+func reserveReauthAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+	attempts, err := store.Increment(ctx, mfaReauthAttemptKey(userID), lockoutDuration)
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if attempts > maxMFAAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
+}
+
+func clearReauthAttempts(ctx context.Context, store cache.Cache, userID int64) {
+	if err := store.Delete(ctx, mfaReauthAttemptKey(userID)); err != nil {
+		slog.Warn("cache error clearing MFA re-authentication attempts", slog.Any("error", err))
+	}
+}
 
 // reserveMFAAttempt counts one second-factor attempt for userID and rejects
 // it once the budget is spent. Only a successful verification clears it.

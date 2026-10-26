@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 )
 
 func TestTenantStatusTransitions(t *testing.T) {
@@ -63,6 +65,25 @@ func TestTenantTransition_SchedulesAndAudits(t *testing.T) {
 	require.Len(t, db.audits, 2)
 	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
 	assert.Equal(t, int64(2), db.audits[0].TenantID)
+}
+
+func TestTenantTransition_RefusesDeletionBeforeGrace(t *testing.T) {
+	db := newMemDB()
+	svc := NewTenantService(db.stores(), memTx{db})
+	ctx := context.Background()
+
+	future := time.Now().Add(time.Hour)
+	db.tenants[2].Status = TenantStatusPendingDeletion
+	db.tenants[2].DeletionScheduledAt = &future
+	_, err := svc.Transition(ctx, 2, TenantStatusDeleted)
+	assert.Equal(t, http.StatusConflict, statusOf(err))
+	assert.Equal(t, string(identitycatalog.CodeTenantDeletionNotDue), codeOf(err))
+
+	past := time.Now().Add(-time.Minute)
+	db.tenants[2].DeletionScheduledAt = &past
+	deleted, err := svc.Transition(ctx, 2, TenantStatusDeleted)
+	require.NoError(t, err)
+	assert.Equal(t, TenantStatusDeleted, deleted.Status)
 }
 
 func TestNormalizeNewTenant(t *testing.T) {

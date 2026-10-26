@@ -91,7 +91,7 @@ var requiredColumns = map[string][]string{
 	"user_passwords":  {"user_id", "password_hash", "changed_at"},
 	"user_identities": {"user_id", "provider", "subject", "email"},
 	"memberships": {
-		"tenant_id", "user_id", "status", "banned_at", "removed_at", "credentials_revoked_at",
+		"tenant_id", "user_id", "status", "banned_at", "banned_email_hash", "removed_at", "credentials_revoked_at",
 	},
 	"permissions":               {"key", "owner"},
 	"roles":                     {"tenant_id", "scope", "key", "name"},
@@ -101,7 +101,7 @@ var requiredColumns = map[string][]string{
 	"invitations": {
 		"tenant_id", "email_normalized", "role", "token_hash", "invited_by", "expires_at", "accepted_at", "accepted_by",
 	},
-	"sessions":                  {"tenant_id", "user_id", "token_version", "amr", "ip", "last_used_at", "revoked_at", "revoked_reason"},
+	"sessions":                  {"tenant_id", "user_id", "token_version", "expires_at", "amr", "ip", "last_used_at", "revoked_at", "revoked_reason"},
 	"refresh_tokens":            {"tenant_id", "session_id", "token_hash", "used_at"},
 	"password_reset_tokens":     {"user_id", "token_hash"},
 	"email_verification_tokens": {"user_id", "email", "token_hash"},
@@ -241,6 +241,7 @@ var requiredTenantLeadingIndexes = map[string][]string{
 	"memberships": {
 		"idx_memberships_tenant_created_at_user",
 		"idx_memberships_tenant_suspended",
+		"idx_memberships_tenant_banned_email_hash",
 	},
 	"roles": {
 		"idx_roles_tenant_created_at_id",

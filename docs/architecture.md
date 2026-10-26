@@ -271,7 +271,7 @@ normally and its requests return 404.
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
 | OAuth | The tenant is bound into `state` and the state cookie; the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. |
-| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, and the tenant status, so a revocation, ban, role change, or suspension takes effect within the 5-second session-cache TTL. |
+| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
 
@@ -372,7 +372,10 @@ keeps the repository's tenant scoping.
   tenant-leading indexes. `data_exports` (identity) is tenant-owned and
   references `(tenant_id, user_id) → memberships`.
 - `api_keys.key_hash` is globally unique; it is the only lookup made before a
-  request tenant can be trusted.
+  request tenant can be trusted, so that single statement deliberately runs
+  with the RLS bypass. The verifier still compares the key's tenant with an
+  explicit `X-Tenant-Slug` and scopes the last-used write to the key's own
+  tenant.
 - `files.storage_path` is the authoritative blob key; moving a blob without
   updating it (or vice versa) breaks the file.
 
@@ -383,7 +386,7 @@ Table-by-table details, keys, and FK actions: [Data Model](data-model.md).
 | Concern | Convention |
 |---|---|
 | Authorization | Module permissions live in `catalog/permissions.go` and register through `app.PermissionProvider`; only shared back-office permissions stay in `internal/platform/authz`. Notification routes use `notifications:read`/`notifications:write`; sending to another user needs admin-only `notifications:send`. Legacy exceptions: [Module Template](module-template.md#legacy-exceptions-do-not-copy). |
-| Privacy | `internal/contracts/privacy` exporters/erasers are registered by every module with per-user data; identity owns `data_exports` and orchestrates export/erasure jobs. Export documents live 7 days; erasure anonymizes the global user after every membership is removed. |
+| Privacy | `internal/contracts/privacy` exporters/erasers are registered by every module with per-user data; identity owns `data_exports` and orchestrates export/erasure jobs. Export documents live 7 days; self erasure anonymizes the global user after every membership is removed, while admin erasure stays in the request tenant. Identity's eraser runs last within a tenant erase job, so a membership removed by that job implies the other modules finished. |
 | Audit | Privileged mutations are fail-closed. Tier 1 services (identity registration/profile/password/delete, invitations create/revoke/accept/sign-up, tenant lifecycle, role definitions/member roles, admin role/ban/unban, admin file delete/restore, API-key lifecycle) call `audit.TxRecorder.RecordTx` in the mutation transaction. Tier 2 routes use `audithttp.Guard`: an `outcome=started` intent row before the handler, completed as succeeded/failed/denied; a required guard returns `503 system.audit_unavailable` when the intent cannot be stored. Rows carry actor type/role, source, request ID, IP, route, and tenant. `audit.NewServiceEvent` enriches domain events from the context. |
 | Errors | `*apperror.AppError` with a stable catalog code, rendered as RFC 9457 `application/problem+json`. With `Deps.I18n`, titles and validation messages follow `Accept-Language`; `DetailKey` opts a detail in. A nil localizer keeps English. |
 | i18n | `en`/`vi` catalogs must keep identical keys and `{placeholders}` (`i18n.New` fails otherwise). `vi-VN` truncates to `vi`; unsupported languages fall back to `I18N_DEFAULT_LOCALE`. |
@@ -415,7 +418,8 @@ flowchart TD
   `rate_limit.exceeded`, `api.version_unsupported`, `system.*`, generic status
   titles, validation messages, the shared back-office permissions
   (`admin:users:*`, `admin:files:*`, `admin:stats:read`), and the platform
-  permissions (`platform:tenants:*`, `platform:features:write`).
+  permissions (`platform:tenants:*`, `platform:features:write`,
+  `platform:users:mfa_reset`).
 - `internal/bootstrap` is the only non-`cmd` package that imports several
   modules. `test/arch` uses the same `bootstrap.Build`, so route authorization,
   audit coverage, group-middleware overlap, and SQL table ownership are

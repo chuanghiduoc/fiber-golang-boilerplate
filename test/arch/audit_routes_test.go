@@ -56,6 +56,7 @@ var tier1Mutations = map[string]tier1Audit{
 	"DELETE /api/v1/admin/roles/:id":            {"identity", "admin.role.deleted"},
 	"POST /api/v1/platform/tenants/":            {"identity", "tenant.created"},
 	"PATCH /api/v1/platform/tenants/:id/status": {"identity", "tenant.status_changed"},
+	"POST /api/v1/platform/users/:id/mfa/reset": {"identity", "admin.user.mfa_reset"},
 	"DELETE /api/v1/admin/files/:id":            {"files", "admin.file.deleted"},
 	"POST /api/v1/admin/files/:id/restore":      {"files", "admin.file.restored"},
 	// API-key lifecycle: apikeys service records in the mutation transaction.

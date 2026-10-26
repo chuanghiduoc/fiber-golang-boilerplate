@@ -88,6 +88,18 @@ func (q *Queries) DeleteMFAFactor(ctx context.Context, userID int64) error {
 	return err
 }
 
+const deletePendingMFAFactor = `-- name: DeletePendingMFAFactor :exec
+DELETE FROM mfa_factors
+WHERE user_id = $1 AND type = 'totp' AND confirmed_at IS NULL
+`
+
+// A password change or reset removes an unconfirmed enrollment: whoever
+// started it no longer proves control of the account.
+func (q *Queries) DeletePendingMFAFactor(ctx context.Context, userID int64) error {
+	_, err := q.db.Exec(ctx, deletePendingMFAFactor, userID)
+	return err
+}
+
 const deleteRecoveryCodes = `-- name: DeleteRecoveryCodes :exec
 DELETE FROM mfa_recovery_codes
 WHERE user_id = $1
@@ -140,11 +152,40 @@ func (q *Queries) GetMFAFactor(ctx context.Context, userID int64) (MfaFactor, er
 	return i, err
 }
 
+const getMFAFactorForUpdate = `-- name: GetMFAFactorForUpdate :one
+SELECT id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, created_at, updated_at FROM mfa_factors
+WHERE user_id = $1 AND type = 'totp'
+ORDER BY confirmed_at ASC NULLS LAST, id DESC
+LIMIT 1
+FOR UPDATE
+`
+
+// Confirmation locks the pending factor so a concurrent enrollment cannot
+// replace the secret between verification and the confirm update. A confirmed
+// row (if one coexists) wins so the caller reports "already enabled".
+func (q *Queries) GetMFAFactorForUpdate(ctx context.Context, userID int64) (MfaFactor, error) {
+	row := q.db.QueryRow(ctx, getMFAFactorForUpdate, userID)
+	var i MfaFactor
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Type,
+		&i.SecretCiphertext,
+		&i.ConfirmedAt,
+		&i.LastUsedStep,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertUnconfirmedMFAFactor = `-- name: UpsertUnconfirmedMFAFactor :one
 INSERT INTO mfa_factors (user_id, type, secret_ciphertext)
 VALUES ($1, 'totp', $2)
 ON CONFLICT (user_id) WHERE type = 'totp' AND confirmed_at IS NULL
-DO UPDATE SET secret_ciphertext = mfa_factors.secret_ciphertext
+DO UPDATE SET secret_ciphertext = EXCLUDED.secret_ciphertext,
+              last_used_step = 0,
+              updated_at = NOW()
 RETURNING id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, created_at, updated_at
 `
 
@@ -153,9 +194,9 @@ type UpsertUnconfirmedMFAFactorParams struct {
 	SecretCiphertext string `json:"secret_ciphertext"`
 }
 
-// One pending enrollment per user. A concurrent re-enrollment keeps the secret
-// the first writer stored (the no-op update), so every caller can return the
-// same still-valid provisioning URI.
+// One pending enrollment per user. Re-enrollment replaces the pending secret
+// and resets its timestamp: only the most recently generated secret can be
+// confirmed, and a stale pending enrollment expires.
 func (q *Queries) UpsertUnconfirmedMFAFactor(ctx context.Context, arg UpsertUnconfirmedMFAFactorParams) (MfaFactor, error) {
 	row := q.db.QueryRow(ctx, upsertUnconfirmedMFAFactor, arg.UserID, arg.SecretCiphertext)
 	var i MfaFactor

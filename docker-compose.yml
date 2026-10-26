@@ -41,6 +41,7 @@ services:
       OTEL_INSTRUMENT_DB: ${OTEL_INSTRUMENT_DB:-true}
       CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-*}"
       JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-30}
+      SESSION_MAX_LIFETIME: ${SESSION_MAX_LIFETIME:-720h}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
@@ -50,7 +51,7 @@ services:
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
-      JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-24}
+      JWT_EXPIRE_HOUR: ${JWT_EXPIRE_HOUR:-1}
       # Empty falls back to JWT_SECRET locally; production requires its own key.
       DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:-}
       STORAGE_DRIVER: ${STORAGE_DRIVER:-local}

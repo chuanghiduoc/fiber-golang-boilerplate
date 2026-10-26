@@ -45,6 +45,7 @@ const (
 	PermissionPlatformTenantsRead   Permission = "platform:tenants:read"
 	PermissionPlatformTenantsWrite  Permission = "platform:tenants:write"
 	PermissionPlatformFeaturesWrite Permission = "platform:features:write"
+	PermissionPlatformUsersMFAReset Permission = "platform:users:mfa_reset"
 )
 
 // System role keys (roles.key). Member permissions come from the catalog;
@@ -104,6 +105,7 @@ func init() {
 		{Permission: PermissionPlatformTenantsRead, Platform: true},
 		{Permission: PermissionPlatformTenantsWrite, Platform: true},
 		{Permission: PermissionPlatformFeaturesWrite, Platform: true},
+		{Permission: PermissionPlatformUsersMFAReset, Platform: true},
 	}
 	state.Store(&catalogState{
 		owners:   map[Permission]string{},

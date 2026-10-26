@@ -155,10 +155,10 @@ flowchart TD
 | 204 | Deleted/no content |
 | 400 | Malformed request, invalid cursor, invalid token |
 | 401 | Missing/invalid authentication |
-| 403 | Authenticated but not permitted, or tenant mismatch |
+| 403 | Authenticated but not permitted, tenant mismatch, or insufficient role rank |
 | 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-owner, idempotency key still in progress, data export not ready |
+| 409 | Conflict, duplicate, last-owner, tenant deletion not due, inviter no longer eligible, idempotency key still in progress, data export not ready |
 | 410 | Expired data export |
 | 413 | Body or upload too large |
 | 415 | Unsupported media type |
@@ -224,7 +224,12 @@ flowchart TD
   issuing tenant. Presenting an already-used refresh token is reuse: the whole
   session is revoked (`refresh_reuse`) and the call returns `401
   auth.refresh_invalid`, so both the legitimate client and an attacker must
-  sign in again. Access tokens are short-lived.
+  sign in again. Access tokens are short-lived (`JWT_EXPIRE_HOUR`, default 1).
+- A session has an absolute lifetime (`SESSION_MAX_LIFETIME`, default `720h`).
+  Every refresh token, initial or rotated, expires at
+  `min(now() + JWT_REFRESH_EXPIRE_DAYS, sessions.expires_at)`, and both the
+  session validator and the refresh endpoint reject an expired session with
+  `401`.
 - `POST /auth/logout-all` requires `sessions:revoke` (the `member` role and
   therefore every role holds it), revokes every session of the user in every
   tenant, and bumps the token version, invalidating access tokens immediately.
@@ -245,12 +250,20 @@ are available per global user, not per tenant.
 
 | Endpoint | Auth | Behavior |
 |---|---|---|
-| `POST /auth/mfa/totp/enroll` | JWT, `mfa:write` | Start or restart a pending enrollment; returns `{type, otpauthUri}`. The secret is only inside the URI. |
-| `POST /auth/mfa/totp/confirm` | JWT, `mfa:write` | Verify a code, enable the factor, revoke the user's other sessions, and return ten recovery codes once. |
+| `POST /auth/mfa/totp/enroll` | JWT, `mfa:write`, re-auth | Start or restart a pending enrollment and return `{type, otpauthUri}`. Re-enrolling generates a fresh secret (last writer wins) and resets the 15-minute window. Requires `currentPassword` for accounts with a local password; a Google-only account instead needs a session created within the last 15 minutes. |
+| `POST /auth/mfa/totp/confirm` | JWT, `mfa:write`, re-auth | Require re-authentication (`currentPassword`, or the recent-session rule), verify the code against the currently stored pending secret, enable the factor, revoke the user's other sessions, and return ten recovery codes once. A pending enrollment older than 15 minutes is `409 auth.mfa_enrollment_expired`. |
 | `POST /auth/mfa/disable` | JWT, `mfa:write` | Require a current TOTP or recovery code, delete the factor and codes, revoke other sessions. |
 | `POST /auth/mfa/recovery-codes/regenerate` | JWT, `mfa:write` | Require a code and return a fresh set of ten; the old set stops working. |
 | `GET /auth/mfa/status` | JWT, `mfa:read` | `{enabled, confirmedAt?, recoveryCodesRemaining}`. |
 | `POST /auth/mfa/verify` | public | `{challenge, code}` → the normal login response. The challenge is sealed, tenant-bound, five minutes old at most, and single use. |
+| `POST /platform/users/:id/mfa/reset` | JWT, `platform:users:mfa_reset`, MFA session | Platform recovery for a user who lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`, Tier 1 audit. `404` for an unknown user. |
+
+Enrollment management is a credential change, so a mere access token is not
+enough: an account with a local password proves it with `currentPassword`
+(counted against the per-user second-factor budget; a correct password does
+not clear it), and a passwordless account proves a fresh interactive sign-in.
+A password change or reset also deletes any pending enrollment in the same
+transaction.
 
 With a confirmed factor, `POST /auth/login` and the Google callback do not
 issue tokens. Login returns `200` with the user, `mfaRequired: true`, and
@@ -277,8 +290,8 @@ Token-minting endpoints never take `Idempotency-Key`.
 | Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership, effective permissions, and tenant status are re-read on every authentication, so bans, removals, deletions, role/permission changes, and suspensions apply immediately (`401`/`403`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
 | Scoping | Users are global: an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
-| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
-| Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
+| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. A provider 4xx on the code exchange stays `400`; a 5xx, timeout, or network failure is `502 auth.oauth_upstream_unavailable`, and logs carry only the error class and upstream status. |
+| Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. The single revoke statement runs with RLS bypass because possession of the token is the authorization, so a tenant-B session is revoked even when the client omits `X-Tenant-Slug`. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
 | Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `roles`, `membershipStatus`, `joinedAt`, `bannedAt`). `role` is the highest system role key (`owner` > `admin` > `member`); `roles` lists every assigned role key. |
 | Remaining | Per-tenant limits/quotas. |
@@ -298,7 +311,7 @@ Users are global identities; a user joins tenants through memberships. Everythin
 | `POST /auth/logout-all` | Revokes every session in every tenant and bumps `token_version`. |
 | `PUT /users/:id` | Own id only (the global profile is editable only by its owner); another id is `403 permission.denied`, even for a tenant admin. |
 | `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active owner of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
-| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
+| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. Rank hierarchy: `owner` (3) > `admin` (2) > `member` and tenant roles (1). Granting a role (including an invitation's role) needs caller rank ≥ the role's rank and every permission the role grants; only an owner may grant `owner`. Managing a member (role change, demotion, ban, unban, removal) needs caller rank strictly greater than the target's current highest rank, except that an owner may manage another owner; failures are `403 role.insufficient_rank`. A non-owner cannot change their own roles (equal rank is refused). The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
 | Member lists | `GET /users`, `GET /admin/users` paginate members by `(joinedAt, id)`; `UserResponse` adds `membershipStatus` and `joinedAt`. |
 
 Invitations (pending invites are `invitations` rows; there is no "invited"
@@ -306,14 +319,16 @@ membership state):
 
 | Route | Auth | Behavior |
 |---|---|---|
-| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `member`; `user` is accepted as an alias) and emails a link; the token is never returned. Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
+| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `member`; `user` is accepted as an alias) and emails a link; the token is never returned. The inviter may only grant a role at or below their own rank and must hold every permission it grants, so an admin cannot invite an owner (`403 role.insufficient_rank`). Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
 | `GET /invitations` | `invitations:read` (admin only) | Cursor list of the tenant's pending invitations, newest first. |
 | `DELETE /invitations/:id` | `invitations:write` | Deletes a pending invitation (`204`); its link stops working. Tier 1 (`invitation.revoked`). |
-| `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
-| `POST /auth/invitations/signup` | Public (token possession), strict limiter, `Idempotency-Key` | Creates the account for the invited address and joins the tenant (send `X-Tenant-Slug` from the link). The email is verified by the token; not gated by `user_registration`. An address that already has an account is `409 user.email_taken` (sign in and accept instead). `201 UserResponse`; no tokens are issued. Tier 1 (`invitation.accepted`). |
+| `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Acceptance re-checks inside its transaction that the inviter is still an active member who may grant the invitation's role; otherwise it is `409 invitation.inviter_ineligible`. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
+| `POST /auth/invitations/signup` | Public (token possession), strict limiter, `Idempotency-Key` | Creates the account for the invited address and joins the tenant (send `X-Tenant-Slug` from the link). The email is verified by the token; not gated by `user_registration`. The same inviter re-check applies (`409 invitation.inviter_ineligible`). An address that already has an account is `409 user.email_taken` (sign in and accept instead). `201 UserResponse`; no tokens are issued. Tier 1 (`invitation.accepted`). |
 
 Unknown, expired, already accepted, or misaddressed invitation tokens are
-`400 invitation.invalid`.
+`400 invitation.invalid`. A ban or removal deletes every pending invitation the
+member created in that tenant inside the same transaction, and acceptance
+re-checks the inviter's rank and permissions (`409 invitation.inviter_ineligible`).
 
 ## Privacy: data export and erasure
 
@@ -326,8 +341,8 @@ All routes are in the request tenant; another user's or tenant's export id is
 | `GET /me/data-exports` | `profile:read` | Cursor list of the caller's exports, newest first. |
 | `GET /me/data-exports/:id` | `profile:read` | Status of one export (`queued`, `running`, `ready`, `failed`, `expired`). A ready export includes `downloadUrl`; unknown/other-owner/cross-tenant ids are `404 data_export.not_found`. |
 | `GET /me/data-exports/:id/download` | `profile:read` | Streams the ready JSON document with `Cache-Control: private, no-store`. `409 data_export.not_ready` before it is ready; `410 data_export.expired` once expired; after the hourly purge deletes the row it is `404`. Other users/tenants get `404`. |
-| `POST /me/erasure` | JWT only, `profile:write`, current password, Tier 1 (`user.erasure_requested`) | Re-authenticates with `currentPassword`, then queues one `privacy.erase` job per membership plus `privacy.erase.finalize`. `202 {status: accepted}`. API keys are refused; refused with `409 user.last_admin` when the caller is the last active admin of any tenant; passwordless accounts cannot self-erase this way. |
-| `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Same global erasure for a member of the request tenant; no password re-auth (the admin is already authenticated). `404` for a non-member, `409 user.last_admin` for the last active admin. API keys are refused because this ends global access. |
+| `POST /me/erasure` | JWT only, `profile:write`, current password, Tier 1 (`user.erasure_requested`) | Re-authenticates with `currentPassword`, then queues one `privacy.erase` job per membership plus `privacy.erase.finalize`; this is the global self-erasure path. `202 {status: accepted}`. API keys are refused; refused with `409 user.last_admin` when the caller is the last active admin of any tenant; passwordless accounts cannot self-erase this way. |
+| `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Erases the member's data and membership in the request tenant only; the global account and the user's memberships in other tenants stay intact. Queues exactly one `privacy.erase` job for the request tenant and no finalizer. `404` for a non-member (including a cross-tenant id), `409 user.last_admin` when the member is the request tenant's last active owner. API keys are refused because this is a destructive admin action. |
 
 The export document is `{userId, tenantId, generatedAt, sections: {identity,
 files, notifications, apikeys, features, webhooks}}`. Files include metadata
@@ -337,10 +352,21 @@ downloadable through the files API; apikeys include metadata and scopes, never a
 features include only user targets; webhooks include user-attributed event
 payloads and delivery summaries. The document is deleted at expiry (7 days),
 and failed/stuck builds are cleaned by the same hourly
-`privacy.exports.purge` job (blob, then row). Erasure anonymizes the global
-user (`erased+<id>@invalid`, empty name, `status: deleted`) only after every
-membership is `removed`, and deletes credentials, identities, sessions, and
-tokens. Audit rows keep only ids and outcomes.
+`privacy.exports.purge` job (blob, then row). Self erasure anonymizes the
+global user (`erased+<id>@invalid`, empty name, `status: deleted`) only after
+every membership is `removed`, and deletes credentials, identities, sessions,
+and tokens. Admin erasure is tenant-scoped: it removes only the request
+tenant's membership and data, so the global account and other memberships keep
+working. In a tenant erase job identity's own eraser runs last, so within that
+job a removed membership implies every other module's eraser succeeded. Audit
+rows keep only ids and outcomes. A banned membership keeps `banned_at` and a
+pseudonymous `banned_email_hash` (SHA-256 of the normalized address) through
+removal and erasure; the registration, invitation, and email-change checks
+match that hash, so the address cannot rejoin the tenant that banned it (GDPR
+Art.17(3)(e), legitimate interest in defending the ban). The marker of a
+membership removed while banned has no API to clear it; lifting that ban later
+is an audited operator action.
+
 ## Roles and platform administration
 
 Tenant roles are rows; the permission catalog stays in code and is
@@ -369,6 +395,7 @@ permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, oth
 | `POST /platform/tenants` | `platform:tenants:write`, `Idempotency-Key` | Creates a tenant (default status `active`, or `trialing` with a future `trialEndsAt`) and its settings, and makes the caller its first `owner`. A duplicate slug is `409`. Tier 1 (`tenant.created`). |
 | `GET /platform/tenants/:id` | `platform:tenants:read` | Any tenant by id in any state. |
 | `PATCH /platform/tenants/:id/status` | `platform:tenants:write`, `Idempotency-Key` | Moves a tenant along the lifecycle state machine; an invalid transition is `409`, and the default tenant cannot be deleted. Tier 1 (`tenant.status_changed`). |
+| `POST /platform/users/:id/mfa/reset` | `platform:users:mfa_reset` (JWT only), `Idempotency-Key` | Recovery when a user lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`. `404` for an unknown user. Tier 1 (`admin.user.mfa_reset`). |
 
 Global feature-flag rows (database default, kill switch, delete) require
 `platform:features:write` in addition to the tenant feature permissions; tenant
@@ -469,18 +496,21 @@ Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
 ## API keys
 
 - `POST /admin/api-keys` returns the plaintext key once; list/get never do.
-  Name, owner (`userId`, defaults to the caller), scopes, and optional
-  `expiresAt` are recorded. Scopes must be known permissions within the owner's
-  role.
+  The owner is always the authenticated caller (the request has no `userId`
+  field); name, scopes, and optional `expiresAt` are recorded. Scopes must be
+  known permissions within the caller's own role or key.
 - `PUT /admin/api-keys/:id` updates name/scopes; `DELETE /admin/api-keys/:id`
   or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent);
   `POST /admin/api-keys/:id/rotate` issues a new secret while the old one stays
-  valid for 24 hours unless revoked. Create, update, and rotate reject (`400`)
-  any scope the caller does not hold, so an API-key caller cannot mint a
-  broader key.
+  valid for 24 hours unless revoked. Rotation is owner-only: an administrator
+  rotating another member's key gets `404`. Create, update, and rotate reject
+  (`400`) any scope the caller does not hold, so an API-key caller cannot mint
+  a broader key.
 - Routes require `admin:api_keys:read|create|update|revoke|rotate`, are
-  tenant-scoped, and return `404` for another tenant's key id. Mutations accept
-  `Idempotency-Key` except create and rotate.
+  tenant-scoped, and return `404` for another tenant's key id. Listing and
+  revoking other members' keys in the request tenant stays allowed (revocation
+  is safe); only create and rotate are bound to the caller as owner. Mutations
+  accept `Idempotency-Key` except create and rotate.
 - Every lifecycle mutation is Tier 1 audited (`api_key.created|updated|revoked|rotated`
   in the mutation transaction): an audit failure rolls back and returns
   `503 system.audit_unavailable` with no secret. Re-revoking writes no second

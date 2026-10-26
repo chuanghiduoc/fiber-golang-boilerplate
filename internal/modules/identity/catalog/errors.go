@@ -21,6 +21,15 @@ const (
 	CodeAuthMFAAlreadyEnabled apperror.Code = "auth.mfa_already_enabled"
 	// CodeAuthMFANotEnabled: no confirmed factor exists.
 	CodeAuthMFANotEnabled apperror.Code = "auth.mfa_not_enabled"
+	// CodeAuthMFAEnrollmentExpired: the pending enrollment is older than its
+	// 15-minute window; start a new one.
+	CodeAuthMFAEnrollmentExpired apperror.Code = "auth.mfa_enrollment_expired"
+	// CodeAuthMFAReauthRequired: a passwordless account must sign in again
+	// (the session is older than the re-authentication window).
+	CodeAuthMFAReauthRequired apperror.Code = "auth.mfa_reauth_required"
+	// CodeAuthOAuthUpstreamUnavailable: Google's token or userinfo endpoint
+	// failed in a way the client cannot fix (5xx, timeout, network).
+	CodeAuthOAuthUpstreamUnavailable apperror.Code = "auth.oauth_upstream_unavailable"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
@@ -28,8 +37,19 @@ const (
 	// CodeInvitationInvalid: unknown, expired, or already accepted
 	// invitation token, or one addressed to another email.
 	CodeInvitationInvalid apperror.Code = "invitation.invalid"
+	// CodeInvitationInviterIneligible: the inviter no longer exists as an
+	// active member who may grant the invitation's role.
+	CodeInvitationInviterIneligible apperror.Code = "invitation.inviter_ineligible"
 	// CodeMembershipExists: the invitee is already a member (or banned).
 	CodeMembershipExists apperror.Code = "membership.exists"
+
+	// CodeRoleInsufficientRank: the caller's tenant role rank is too low for
+	// the role being granted or the member being managed.
+	CodeRoleInsufficientRank apperror.Code = "role.insufficient_rank"
+
+	// CodeTenantDeletionNotDue: a pending_deletion tenant is still inside its
+	// deletion grace period.
+	CodeTenantDeletionNotDue apperror.Code = "tenant.deletion_not_due"
 
 	CodeDataExportInProgress apperror.Code = "data_export.in_progress"
 	CodeDataExportNotFound   apperror.Code = "data_export.not_found"
@@ -75,6 +95,21 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Title:   "MFA is not enabled",
 			DocPath: "/errors/auth-mfa-not-enabled",
 		},
+		CodeAuthMFAEnrollmentExpired: {
+			Status:  http.StatusConflict,
+			Title:   "MFA enrollment has expired",
+			DocPath: "/errors/auth-mfa-enrollment-expired",
+		},
+		CodeAuthMFAReauthRequired: {
+			Status:  http.StatusForbidden,
+			Title:   "Re-authentication required",
+			DocPath: "/errors/auth-mfa-reauth-required",
+		},
+		CodeAuthOAuthUpstreamUnavailable: {
+			Status:  http.StatusBadGateway,
+			Title:   "OAuth provider is unavailable",
+			DocPath: "/errors/auth-oauth-upstream-unavailable",
+		},
 		CodeUserEmailTaken: {
 			Status:  http.StatusConflict,
 			Title:   "Email already in use",
@@ -90,10 +125,25 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Title:   "Invalid invitation",
 			DocPath: "/errors/invitation-invalid",
 		},
+		CodeInvitationInviterIneligible: {
+			Status:  http.StatusConflict,
+			Title:   "Invitation inviter cannot grant its role",
+			DocPath: "/errors/invitation-inviter-ineligible",
+		},
 		CodeMembershipExists: {
 			Status:  http.StatusConflict,
 			Title:   "Already a member",
 			DocPath: "/errors/membership-exists",
+		},
+		CodeRoleInsufficientRank: {
+			Status:  http.StatusForbidden,
+			Title:   "Insufficient role rank",
+			DocPath: "/errors/role-insufficient-rank",
+		},
+		CodeTenantDeletionNotDue: {
+			Status:  http.StatusConflict,
+			Title:   "Tenant deletion is not due",
+			DocPath: "/errors/tenant-deletion-not-due",
 		},
 		CodeDataExportInProgress: {
 			Status:  http.StatusConflict,

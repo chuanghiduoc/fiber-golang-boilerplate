@@ -7,6 +7,7 @@ import (
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -161,7 +162,11 @@ func (v *Verifier) touchLastUsed(ctx context.Context, key Key, now time.Time) {
 	// The write is synchronous but throttled to once per touchInterval per key
 	// and bounded by lastUsedTimeout, so it adds at most that latency to one
 	// request per interval. A failure is logged and never fails the request.
-	touchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v.lastUsedTimeout)
+	// It must run under the key's own tenant: the request may have resolved the
+	// default tenant while the key belongs to another one, and RLS would
+	// otherwise update no row.
+	touchCtx := tenant.WithID(context.WithoutCancel(ctx), key.TenantID)
+	touchCtx, cancel := context.WithTimeout(touchCtx, v.lastUsedTimeout)
 	defer cancel()
 	if err := v.store.TouchLastUsed(touchCtx, key.ID, now); err != nil {
 		slog.Warn("failed to update API key last-used timestamp",

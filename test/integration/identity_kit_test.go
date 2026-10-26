@@ -49,7 +49,7 @@ func newIdentityKit(pool *pgxpool.Pool, appCache cache.Cache, recorder audit.TxR
 			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion,
 		}, secret, 1)
 	}
-	sessionSvc := identityservice.NewSessionService(stores, tx, sign, identityKitRefreshTTL, sessionStore)
+	sessionSvc := identityservice.NewSessionService(stores, tx, sign, identityKitRefreshTTL, 720*time.Hour, sessionStore)
 
 	kit := &identityKit{stores: stores, sessions: sessionStore}
 	if sender != nil {

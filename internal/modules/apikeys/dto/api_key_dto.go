@@ -4,12 +4,10 @@ package apikeydto
 
 import "time"
 
-// CreateRequest asks for a new key. UserID defaults to the authenticated
-// administrator; when supplied the owner must belong to the request tenant and
-// must already hold every requested scope through its role.
+// CreateRequest asks for a new key owned by the authenticated caller. Scopes
+// must already be held by the caller through its role or key.
 type CreateRequest struct {
 	Name      string     `json:"name" validate:"required,min=1,max=255"`
-	UserID    int64      `json:"userId,omitempty" validate:"omitempty,gt=0"`
 	Scopes    []string   `json:"scopes" validate:"required,min=1,max=100,dive,required"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }

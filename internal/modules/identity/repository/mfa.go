@@ -44,6 +44,14 @@ func (r *MFARepository) GetTOTP(ctx context.Context, userID int64) (*identityser
 	return toMFAFactor(row), nil
 }
 
+func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID int64) (*identityservice.MFAFactor, error) {
+	row, err := r.q.GetMFAFactorForUpdate(ctx, userID)
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return toMFAFactor(row), nil
+}
+
 func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID int64) (*identityservice.MFAFactor, error) {
 	row, err := r.q.GetConfirmedMFAFactor(ctx, userID)
 	if err != nil {
@@ -88,6 +96,10 @@ func (r *MFARepository) ConsumeTOTPStep(ctx context.Context, userID, step int64)
 
 func (r *MFARepository) DeleteTOTP(ctx context.Context, userID int64) error {
 	return wrapErr(r.q.DeleteMFAFactor(ctx, userID))
+}
+
+func (r *MFARepository) DeletePendingTOTP(ctx context.Context, userID int64) error {
+	return wrapErr(r.q.DeletePendingMFAFactor(ctx, userID))
 }
 
 func (r *MFARepository) DeleteRecoveryCodes(ctx context.Context, userID int64) error {

@@ -172,6 +172,14 @@ func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
 	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)
 	tenants.Get("/:id", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.GetTenant)
 	tenants.Patch("/:id/status", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.UpdateTenantStatus)
+
+	if m.mfa != nil {
+		// MFA recovery is JWT-only (an API key has no second factor to
+		// recover) and runs the same platform chain: limiter, second factor,
+		// platform permission, idempotency, handler.
+		users := v1.Group("/platform/users", middleware.JWTAuthKeys(deps.Config.JWT.Keyring(), deps.Sessions))
+		users.Post("/:id/mfa/reset", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformUsersMFAReset), deps.Idempotency, m.mfa.PlatformReset)
+	}
 }
 
 // registerPrivacyRoutes mounts the caller's exports/erasure and the admin
@@ -188,8 +196,8 @@ func (m *Module) registerPrivacyRoutes(v1 fiber.Router, deps app.Deps, jwtOnly f
 
 	// /admin is shared with the admin module, so middleware stays per route
 	// (a group middleware would run on the other module's admin routes).
-	// Global account erasure is JWT-only, like self-deletion: a tenant-scoped
-	// API key must not end access in every tenant.
+	// The route is JWT-only: a tenant-scoped API key must not trigger a
+	// destructive member erasure (it removes that tenant's membership).
 	admin := v1.Group("/admin")
 	admin.Post("/users/:id/erasure", jwtOnly, rl.Normal, authzhttp.Require(authz.PermissionAdminUsersDelete), deps.Idempotency, m.privacy.EraseUser)
 }

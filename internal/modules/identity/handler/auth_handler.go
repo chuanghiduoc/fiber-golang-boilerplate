@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/oauth2"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
@@ -607,6 +608,7 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 429 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
+// @Failure 502 {object} apperror.ProblemDetails "auth.oauth_upstream_unavailable"
 // @Router /auth/google/callback [get]
 func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if h.googleOAuth == nil {
@@ -633,7 +635,21 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	}
 	info, err := h.googleOAuth.Exchange(ctx, code)
 	if err != nil {
-		return apperror.NewBadRequest("failed to exchange authorization code")
+		status := oauthErrorStatus(err)
+		// Log only the error class and upstream status: the code, tokens, and
+		// provider response bodies must never reach the logs.
+		slog.Error("google oauth code exchange failed",
+			slog.String("error_type", oauthErrorType(err)),
+			slog.Int("upstream_status", status),
+		)
+		// A 4xx means Google rejected this client's code or credentials; the
+		// caller must start over. A 429 is Google rate-limiting us, and
+		// anything else (5xx, timeout, network) is an upstream outage: neither
+		// may masquerade as a bad request.
+		if status >= 400 && status < 500 && status != fiber.StatusTooManyRequests {
+			return apperror.NewBadRequest("failed to exchange authorization code")
+		}
+		return apperror.NewCode(identitycatalog.CodeAuthOAuthUpstreamUnavailable, "oauth provider is unavailable")
 	}
 
 	// An existing or linkable account may always sign in; only creating a new
@@ -696,6 +712,34 @@ func (h *AuthHandler) verifyOAuthCallbackState(c fiber.Ctx) (tenantID int64, ten
 		return 0, "", apperror.NewBadRequest("invalid oauth state")
 	}
 	return stateTenant.ID, stateTenant.Slug, nil
+}
+
+// oauthErrorStatus extracts the upstream HTTP status from the provider error,
+// or 0 when the failure never reached an HTTP response (timeout, DNS, TLS).
+func oauthErrorStatus(err error) int {
+	var retrieve *oauth2.RetrieveError
+	if errors.As(err, &retrieve) && retrieve.Response != nil {
+		return retrieve.Response.StatusCode
+	}
+	var upstream *oauth.UpstreamError
+	if errors.As(err, &upstream) {
+		return upstream.StatusCode
+	}
+	return 0
+}
+
+// oauthErrorType names the recognized error class for logs without exposing
+// the wrapped message (which may contain the code or a response body).
+func oauthErrorType(err error) string {
+	var retrieve *oauth2.RetrieveError
+	if errors.As(err, &retrieve) {
+		return "oauth2.RetrieveError"
+	}
+	var upstream *oauth.UpstreamError
+	if errors.As(err, &upstream) {
+		return "oauth.UpstreamError"
+	}
+	return "transport"
 }
 
 func clearOAuthStateCookie(c fiber.Ctx) {

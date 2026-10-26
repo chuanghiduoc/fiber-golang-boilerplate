@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
@@ -69,7 +70,7 @@ func newTestSessions(db *memDB, signed *[]AccessClaims) *SessionService {
 		*signed = append(*signed, c)
 		return "access", nil
 	}
-	return NewSessionService(db.stores(), memTx{db}, sign, time.Hour, nil)
+	return NewSessionService(db.stores(), memTx{db}, sign, time.Hour, 720*time.Hour, nil)
 }
 
 func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
@@ -154,6 +155,43 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err), "a password checked at the old version cannot open a session")
 }
 
+func TestSessions_RefreshTokenNeverOutlivesSession(t *testing.T) {
+	db := newMemDB()
+	ctx := context.Background()
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "life@example.com", Password: "Password1!", Name: "L"})
+	require.NoError(t, err)
+	sessionLifetime := 2 * time.Hour
+	sessions := NewSessionService(db.stores(), memTx{db}, func(AccessClaims) (string, error) { return "access", nil }, 30*24*time.Hour, sessionLifetime, nil)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
+	require.NoError(t, err)
+
+	sess := db.sessions[pair.SessionID]
+	assert.WithinDuration(t, time.Now().Add(sessionLifetime), sess.ExpiresAt, time.Minute)
+
+	token, err := db.stores().RefreshTokens.GetByHash(ctx, hashToken(pair.RefreshToken))
+	require.NoError(t, err)
+	assert.False(t, token.ExpiresAt.After(sess.ExpiresAt), "the refresh TTL must be capped by the session lifetime")
+}
+
+func TestSessions_ExpiredSessionCannotRefresh(t *testing.T) {
+	db := newMemDB()
+	ctx := context.Background()
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "expired@example.com", Password: "Password1!", Name: "E"})
+	require.NoError(t, err)
+	var signed []AccessClaims
+	sessions := newTestSessions(db, &signed)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
+	require.NoError(t, err)
+
+	db.mu.Lock()
+	db.sessions[pair.SessionID].ExpiresAt = time.Now().Add(-time.Second)
+	db.mu.Unlock()
+
+	_, err = sessions.Refresh(ctx, pair.RefreshToken, nil)
+	assert.Equal(t, http.StatusUnauthorized, statusOf(err))
+	assert.Empty(t, signed[1:], "an expired session must not mint an access token")
+}
+
 func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {
 	db := newMemDB()
 	ctx := context.Background()
@@ -171,17 +209,18 @@ func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {
 	require.NoError(t, err)
 
 	adminSvc := NewAdminUserService(st, memTx{db}, nil)
-	err = adminSvc.BanUser(ctx, admin)
+	systemCtx := authz.SystemContext(ctx)
+	err = adminSvc.BanUser(systemCtx, admin)
 	assert.Equal(t, string(apperror.CodeUserLastAdmin), codeOf(err))
 
-	require.NoError(t, adminSvc.BanUser(ctx, member))
+	require.NoError(t, adminSvc.BanUser(systemCtx, member))
 	assert.Equal(t, RevokeMembershipChanged, db.sessions[inDefault.SessionID].RevokedReason)
 	assert.Nil(t, db.sessions[inAcme.SessionID].RevokedAt, "a ban in one tenant leaves the member's other tenants alone")
 	acmeMember, err := st.Memberships.GetActive(tenant.WithID(ctx, 2), member)
 	require.NoError(t, err)
 	assert.True(t, acmeMember.Active())
 
-	restored, err := adminSvc.UnbanUser(ctx, member)
+	restored, err := adminSvc.UnbanUser(systemCtx, member)
 	require.NoError(t, err)
 	assert.Equal(t, MembershipStatusActive, restored.Membership.Status)
 	assert.Nil(t, restored.Membership.BannedAt)
@@ -196,6 +235,36 @@ func seedMember(t *testing.T, db *memDB, tenantID int64, email, role string) int
 	_, err = st.Memberships.Create(ctx, user.ID, role)
 	require.NoError(t, err)
 	return user.ID
+}
+
+// deleteAccount must take the membership row lock before the per-tenant
+// owner-change advisory lock, the same order rank-checked mutations use; the
+// reverse order deadlocks with a concurrent ban or demotion.
+func TestDeleteAccountLocksMembershipBeforeOwnerChanges(t *testing.T) {
+	db := newMemDB()
+	owner := seedMember(t, db, tenant.DefaultID, "lock-order@example.com", RoleOwner)
+	st := db.stores()
+	var order []string
+	st.Memberships = lockOrderMemberships{MembershipRepository: st.Memberships, order: &order}
+
+	err := deleteAccount(context.Background(), st, owner)
+	assert.Equal(t, string(apperror.CodeUserLastAdmin), codeOf(err))
+	assert.Equal(t, []string{"lock-membership", "lock-owner-changes"}, order)
+}
+
+type lockOrderMemberships struct {
+	MembershipRepository
+	order *[]string
+}
+
+func (r lockOrderMemberships) LockMembership(ctx context.Context, userID int64) error {
+	*r.order = append(*r.order, "lock-membership")
+	return r.MembershipRepository.LockMembership(ctx, userID)
+}
+
+func (r lockOrderMemberships) LockOwnerChanges(ctx context.Context) error {
+	*r.order = append(*r.order, "lock-owner-changes")
+	return r.MembershipRepository.LockOwnerChanges(ctx)
 }
 
 func TestMemberUpdatedAtAndDeletedAt(t *testing.T) {

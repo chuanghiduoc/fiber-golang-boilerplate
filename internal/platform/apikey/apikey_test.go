@@ -10,13 +10,15 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 type fakeStore struct {
-	key     Key
-	findErr error
-	touched []time.Time
+	key            Key
+	findErr        error
+	touched        []time.Time
+	touchedTenants []int64
 }
 
 func (s *fakeStore) FindByHash(_ context.Context, hash string) (Key, error) {
@@ -29,11 +31,12 @@ func (s *fakeStore) FindByHash(_ context.Context, hash string) (Key, error) {
 	return s.key, nil
 }
 
-func (s *fakeStore) TouchLastUsed(_ context.Context, id int64, at time.Time) error {
+func (s *fakeStore) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
 	if id != s.key.ID {
 		return apperror.ErrNotFound
 	}
 	s.touched = append(s.touched, at)
+	s.touchedTenants = append(s.touchedTenants, tenant.EffectiveID(ctx))
 	lastUsed := at
 	s.key.LastUsedAt = &lastUsed
 	return nil
@@ -149,6 +152,9 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	if len(store.touched) != 1 || !store.touched[0].Equal(now) {
 		t.Fatalf("touched = %v, want one write at %v", store.touched, now)
 	}
+	if len(store.touchedTenants) != 1 || store.touchedTenants[0] != key.TenantID {
+		t.Fatalf("touch tenants = %v, want the key's tenant %d", store.touchedTenants, key.TenantID)
+	}
 
 	// No second write inside the touch interval.
 	verifier.Verify(context.Background(), credentials.Key, 1)
@@ -161,6 +167,25 @@ func TestVerifier_SuccessAndLastUsedTouch(t *testing.T) {
 	verifier.Verify(context.Background(), credentials.Key, 1)
 	if len(store.touched) != 2 {
 		t.Fatalf("touches = %d, want 2 after interval", len(store.touched))
+	}
+}
+
+func TestVerifier_LastUsedTouchUsesKeyTenant(t *testing.T) {
+	credentials, key := newTestKey(t)
+	key.TenantID = 2
+	store := &fakeStore{key: key}
+	now := time.Unix(1_700_000_100, 0).UTC()
+	principal := identitycontracts.Principal{ID: 42, TenantID: 2, Role: authz.RoleMember, TenantStatus: identitycontracts.TenantStatusActive}
+	verifier := NewVerifier(store, fakePrincipals{principal: principal}, fixedClock(now))
+
+	// A header-less request resolves the default tenant; the write must still
+	// run under the key's own tenant or RLS would update no row.
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+	if _, err := verifier.Verify(ctx, credentials.Key, 0); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if len(store.touchedTenants) != 1 || store.touchedTenants[0] != key.TenantID {
+		t.Fatalf("touch tenants = %v, want the key's tenant %d", store.touchedTenants, key.TenantID)
 	}
 }
 

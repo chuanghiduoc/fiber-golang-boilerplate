@@ -24,8 +24,9 @@ import (
 const moduleTestSecret = "api-key-module-test-secret"
 
 type fakeService struct {
-	createCalls int
-	created     *apikeysvc.CreatedKey
+	createCalls  int
+	created      *apikeysvc.CreatedKey
+	rotateCaller int64
 }
 
 var _ apikeysvc.Service = (*fakeService)(nil)
@@ -63,7 +64,8 @@ func (s *fakeService) Update(context.Context, int64, apikeysvc.UpdateInput) (*ap
 
 func (s *fakeService) Revoke(context.Context, int64) error { return nil }
 
-func (s *fakeService) Rotate(context.Context, int64) (*apikeysvc.RotatedKey, error) {
+func (s *fakeService) Rotate(_ context.Context, callerUserID, _ int64) (*apikeysvc.RotatedKey, error) {
+	s.rotateCaller = callerUserID
 	return &apikeysvc.RotatedKey{}, nil
 }
 
@@ -163,6 +165,43 @@ func TestModule_RoutePermissions(t *testing.T) {
 	resp, respBody = request(t, application, http.MethodDelete, "/api/v1/admin/api-keys/5", authz.RoleAdmin, "")
 	if resp.StatusCode != fiber.StatusNoContent {
 		t.Fatalf("revoke status = %d, want 204 (body=%s)", resp.StatusCode, respBody)
+	}
+}
+
+func TestModule_CreateAndRotateUseTheAuthenticatedCaller(t *testing.T) {
+	svc := &fakeService{}
+	application := newModuleTestApp(t, svc)
+
+	// The old owner field is gone and unknown fields are rejected, so a client
+	// cannot ask for a key owned by another member.
+	resp, body := request(t, application, http.MethodPost, "/api/v1/admin/api-keys/", authz.RoleAdmin,
+		`{"name":"deploy","userId":42,"scopes":["files:read"]}`)
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("create with userId status = %d, want 400 (body=%s)", resp.StatusCode, body)
+	}
+	if svc.createCalls != 0 {
+		t.Fatal("a rejected create must not reach the service")
+	}
+
+	resp, body = request(t, application, http.MethodPost, "/api/v1/admin/api-keys/", authz.RoleAdmin,
+		`{"name":"deploy","scopes":["files:read"]}`)
+	if resp.StatusCode != fiber.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", resp.StatusCode, body)
+	}
+	var created apikeydto.KeyWithSecretResponse
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created.UserID != 1 {
+		t.Fatalf("created owner = %d, want the authenticated caller 1", created.UserID)
+	}
+
+	resp, body = request(t, application, http.MethodPost, "/api/v1/admin/api-keys/5/rotate", authz.RoleAdmin, "")
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("rotate status = %d, want 200 (body=%s)", resp.StatusCode, body)
+	}
+	if svc.rotateCaller != 1 {
+		t.Fatalf("rotate caller = %d, want the authenticated caller 1", svc.rotateCaller)
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -28,6 +30,13 @@ const (
 	mfaRecoveryCodeBytes = 10
 	mfaChallengeBytes    = 16
 	mfaDefaultIssuer     = "Fiber Golang Boilerplate"
+	// mfaEnrollmentTTL bounds a pending enrollment: its secret is generated
+	// once (re-enrolling replaces it) and can only be confirmed while fresh.
+	mfaEnrollmentTTL = 15 * time.Minute
+	// mfaReauthSessionMaxAge is how recent a passwordless (Google-only)
+	// user's interactive sign-in must be to enroll or confirm a factor. The
+	// session row's created_at records that sign-in.
+	mfaReauthSessionMaxAge = 15 * time.Minute
 )
 
 var recoveryEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
@@ -36,17 +45,24 @@ var recoveryEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // challenge.
 type MFAService interface {
 	// EnrollTOTP starts (or restarts) a pending TOTP enrollment and returns
-	// the provisioning URI; the secret is never returned again.
-	EnrollTOTP(ctx context.Context, userID int64) (*MFAEnrollment, error)
+	// the provisioning URI; the secret is never returned again. The caller
+	// re-authenticates with the current password, or (passwordless accounts)
+	// with a session created within the last 15 minutes.
+	EnrollTOTP(ctx context.Context, userID, sessionID int64, currentPassword string) (*MFAEnrollment, error)
 	// ConfirmTOTP verifies the first code, confirms the factor, replaces the
-	// recovery codes, and returns them once.
-	ConfirmTOTP(ctx context.Context, userID, sessionID int64, code string) ([]string, error)
+	// recovery codes, and returns them once. Like enrollment it requires
+	// re-authentication.
+	ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) ([]string, error)
 	// Disable removes the factor and recovery codes after a TOTP or recovery
 	// code proof.
 	Disable(ctx context.Context, userID, sessionID int64, code string) error
 	// RegenerateRecoveryCodes replaces the set after a code proof and returns
 	// the new codes once.
 	RegenerateRecoveryCodes(ctx context.Context, userID int64, code string) ([]string, error)
+	// ResetTOTP is the platform recovery path: it removes the confirmed and
+	// pending factor plus recovery codes, revokes every session, and bumps the
+	// token version. It does not require the user's password or a code.
+	ResetTOTP(ctx context.Context, userID int64) error
 	Status(ctx context.Context, userID int64) (*MFAStatus, error)
 	// Required reports whether the user has a confirmed factor.
 	Required(ctx context.Context, userID int64) (bool, error)
@@ -103,6 +119,14 @@ func mfaAlreadyEnabled() error {
 	return apperror.NewCode(identitycatalog.CodeAuthMFAAlreadyEnabled, "MFA is already enabled")
 }
 
+func mfaEnrollmentExpired() error {
+	return apperror.NewCode(identitycatalog.CodeAuthMFAEnrollmentExpired, "MFA enrollment has expired")
+}
+
+func mfaReauthRequired() error {
+	return apperror.NewCode(identitycatalog.CodeAuthMFAReauthRequired, "re-authentication is required")
+}
+
 func (s *mfaService) Required(ctx context.Context, userID int64) (bool, error) {
 	_, err := s.Stores.MFA.GetConfirmedTOTP(ctx, userID)
 	if err == nil {
@@ -133,7 +157,10 @@ func (s *mfaService) Status(ctx context.Context, userID int64) (*MFAStatus, erro
 	}, nil
 }
 
-func (s *mfaService) EnrollTOTP(ctx context.Context, userID int64) (*MFAEnrollment, error) {
+func (s *mfaService) EnrollTOTP(ctx context.Context, userID, sessionID int64, currentPassword string) (*MFAEnrollment, error) {
+	if err := s.reauthenticate(ctx, userID, sessionID, currentPassword); err != nil {
+		return nil, err
+	}
 	if _, err := s.Stores.MFA.GetConfirmedTOTP(ctx, userID); err == nil {
 		return nil, mfaAlreadyEnabled()
 	} else if !errors.Is(err, apperror.ErrNotFound) {
@@ -156,13 +183,10 @@ func (s *mfaService) EnrollTOTP(ctx context.Context, userID int64) (*MFAEnrollme
 		return nil, apperror.NewInternal("failed to seal MFA secret")
 	}
 
-	var stored *MFAFactor
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		factor, err := tx.MFA.UpsertUnconfirmedTOTP(ctx, userID, string(sealed))
-		if err != nil {
+		if _, err := tx.MFA.UpsertUnconfirmedTOTP(ctx, userID, string(sealed)); err != nil {
 			return apperror.NewInternal("failed to store MFA factor")
 		}
-		stored = factor
 		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "auth.mfa_enrollment_started", userID, map[string]any{
 			"type": MFAFactorTOTP,
 		})))
@@ -170,41 +194,45 @@ func (s *mfaService) EnrollTOTP(ctx context.Context, userID int64) (*MFAEnrollme
 	if err != nil {
 		return nil, err
 	}
-	// A concurrent enrollment may have stored its secret first; return that
-	// one so every caller hands out a URI that can actually be confirmed.
-	effective, err := s.Sealer.Open([]byte(stored.SecretCiphertext))
-	if err != nil {
-		return nil, apperror.NewInternal("failed to open MFA secret")
-	}
-	return &MFAEnrollment{OtpauthURI: totp.URI(s.Issuer, user.Email, string(effective))}, nil
+	// Re-enrollment always starts over with a fresh secret (last writer wins).
+	// Only the most recently stored pending secret can be confirmed, so this
+	// caller's URI is the one that works unless a concurrent enroll replaces it.
+	return &MFAEnrollment{OtpauthURI: totp.URI(s.Issuer, user.Email, secret)}, nil
 }
 
-func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, code string) ([]string, error) {
-	factor, err := s.Stores.MFA.GetTOTP(ctx, userID)
-	if err != nil {
-		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, mfaNotEnabled()
-		}
-		return nil, apperror.NewInternal("failed to load MFA factor")
+func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, currentPassword, code string) ([]string, error) {
+	if err := s.reauthenticate(ctx, userID, sessionID, currentPassword); err != nil {
+		return nil, err
 	}
-	if factor.Confirmed() {
-		return nil, mfaAlreadyEnabled()
-	}
-	secret, err := s.Sealer.Open([]byte(factor.SecretCiphertext))
-	if err != nil {
-		return nil, apperror.NewInternal("failed to open MFA secret")
-	}
-	step, ok := totp.Validate(string(secret), code, s.now())
-	if !ok {
-		return nil, mfaInvalidCode()
-	}
-
 	plain, hashes, err := newRecoveryCodes()
 	if err != nil {
 		return nil, apperror.NewInternal("failed to generate recovery codes")
 	}
 	ctx = database.WithRLSBypass(ctx) // Confirming MFA ends the user's other sessions in every tenant.
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		factor, err := tx.MFA.GetTOTPForUpdate(ctx, userID)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return mfaNotEnabled()
+			}
+			return apperror.NewInternal("failed to load MFA factor")
+		}
+		if factor.Confirmed() {
+			return mfaAlreadyEnabled()
+		}
+		if s.now().After(factor.UpdatedAt.Add(mfaEnrollmentTTL)) {
+			return mfaEnrollmentExpired()
+		}
+		// The row is locked: this is the secret a concurrent enroll cannot
+		// replace between verification and the confirm update.
+		secret, err := s.Sealer.Open([]byte(factor.SecretCiphertext))
+		if err != nil {
+			return apperror.NewInternal("failed to open MFA secret")
+		}
+		step, ok := totp.Validate(string(secret), code, s.now())
+		if !ok {
+			return mfaInvalidCode()
+		}
 		confirmed, err := tx.MFA.ConfirmTOTP(ctx, factor.ID, userID, step)
 		if err != nil {
 			return apperror.NewInternal("failed to confirm MFA factor")
@@ -233,6 +261,101 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 		s.Sessions.invalidate(ctx, userID)
 	}
 	return plain, nil
+}
+
+// reauthenticate proves the caller may change the account's second factor.
+// A local password is checked against the bcrypt hash; every attempt spends
+// the per-user re-authentication budget before the comparison, so parallel
+// guesses cannot bypass it. A correct password clears that password budget
+// (but never the TOTP/recovery-code budget). A passwordless account instead
+// needs an interactive sign-in no older than mfaReauthSessionMaxAge: a stolen
+// access token alone must not bind a new authenticator.
+func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID int64, currentPassword string) error {
+	user, err := s.Stores.Users.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to load user")
+	}
+	if !user.HasPassword {
+		return s.reauthenticateSession(ctx, userID, sessionID)
+	}
+	if s.Cache == nil {
+		return loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
+	}
+	// Reserve atomically before the bcrypt comparison so parallel guesses
+	// cannot each pass a read-only budget check. This budget is separate from
+	// the TOTP/recovery-code budget; a success clears it and leaves the TOTP
+	// budget untouched.
+	if err := reserveReauthAttempt(ctx, s.Cache, userID); err != nil {
+		return err
+	}
+	hash, err := s.Stores.Users.PasswordHash(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return currentPasswordIncorrect()
+		}
+		return apperror.NewInternal("failed to get user")
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(currentPassword)) != nil {
+		return currentPasswordIncorrect()
+	}
+	clearReauthAttempts(ctx, s.Cache, userID)
+	return nil
+}
+
+func (s *mfaService) reauthenticateSession(ctx context.Context, userID, sessionID int64) error {
+	sess, err := s.Stores.Sessions.Get(ctx, sessionID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return mfaReauthRequired()
+		}
+		return apperror.NewInternal("failed to load session")
+	}
+	if sess.UserID != userID || sess.TenantID != tenant.EffectiveID(ctx) ||
+		sess.RevokedAt != nil || !sess.ExpiresAt.After(s.now()) ||
+		s.now().Sub(sess.CreatedAt) > mfaReauthSessionMaxAge {
+		return mfaReauthRequired()
+	}
+	return nil
+}
+
+// ResetTOTP removes every second factor of a global user and ends all their
+// sessions. The platform route calls it when a user lost both the
+// authenticator and the recovery codes.
+func (s *mfaService) ResetTOTP(ctx context.Context, userID int64) error {
+	ctx = database.WithRLSBypass(ctx) // A platform reset ends the user's sessions in every tenant.
+	err := s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		if _, err := tx.Users.GetByID(ctx, userID); err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found")
+			}
+			return apperror.NewInternal("failed to load user")
+		}
+		if err := tx.MFA.DeleteTOTP(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to delete MFA factor")
+		}
+		if err := tx.MFA.DeleteRecoveryCodes(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to delete recovery codes")
+		}
+		if _, err := tx.Users.RevokeTokens(ctx, userID); err != nil {
+			return apperror.NewInternal("failed to bump token version")
+		}
+		if err := tx.Sessions.RevokeAllForUser(ctx, userID, RevokeMFAChanged); err != nil {
+			return apperror.NewInternal("failed to revoke sessions")
+		}
+		return checkAudit(tx.Audit.RecordTx(ctx, userEvent(ctx, "admin.user.mfa_reset", userID, map[string]any{
+			"scope": "platform",
+		})))
+	})
+	if err != nil {
+		return err
+	}
+	if s.Sessions != nil {
+		s.Sessions.invalidate(ctx, userID)
+	}
+	return nil
 }
 
 func (s *mfaService) Disable(ctx context.Context, userID, sessionID int64, code string) error {

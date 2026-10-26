@@ -80,11 +80,7 @@ func (s *InvitationService) Invite(ctx context.Context, in InviteInput) (*Invita
 	if !ValidRole(in.Role) {
 		return nil, apperror.NewBadRequest("role must be one of: member, admin, owner")
 	}
-	role, err := s.stores.Roles.GetByKey(ctx, in.Role)
-	if err != nil {
-		return nil, apperror.NewInternal("failed to load invitation role")
-	}
-	if err := authorizeGrant(ctx, role.Permissions); err != nil {
+	if err := EnsureCanGrantRoles(ctx, s.stores, []string{in.Role}); err != nil {
 		return nil, err
 	}
 	if err := s.ensureNotMember(ctx, addr); err != nil {
@@ -232,6 +228,9 @@ func (s *InvitationService) Accept(ctx context.Context, userID int64, token stri
 		if err != nil {
 			return err
 		}
+		if err := ensureInviterCanGrant(tctx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
+			return err
+		}
 		user, err := tx.Users.GetByID(ctx, userID)
 		if err != nil || user.Status != UserStatusActive {
 			return accountNotActive()
@@ -276,6 +275,9 @@ func (s *InvitationService) SignUp(ctx context.Context, in InvitationSignUp) (*M
 		}
 		if inv.TenantID != tenant.EffectiveID(ctx) {
 			return invitationInvalid("invalid or expired invitation")
+		}
+		if err := ensureInviterCanGrant(tctx, tx.Stores, inv.InvitedBy, inv.Role); err != nil {
+			return err
 		}
 		if _, err := tx.Users.GetByEmail(ctx, inv.Email); err == nil {
 			return apperror.NewCode(identitycatalog.CodeUserEmailTaken, "email already registered; sign in and accept the invitation")

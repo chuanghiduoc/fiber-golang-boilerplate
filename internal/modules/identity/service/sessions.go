@@ -52,12 +52,18 @@ type SessionService struct {
 	tx         Transactor
 	sign       AccessTokenSigner
 	refreshTTL time.Duration
-	cache      session.Store
+	// sessionLifetime is the absolute lifetime of a session
+	// (SESSION_MAX_LIFETIME); refresh tokens never outlive it.
+	sessionLifetime time.Duration
+	cache           session.Store
 }
 
 // NewSessionService wires the session service. cache may be nil.
-func NewSessionService(stores Stores, tx Transactor, sign AccessTokenSigner, refreshTTL time.Duration, cache session.Store) *SessionService {
-	return &SessionService{stores: stores, tx: tx, sign: sign, refreshTTL: refreshTTL, cache: cache}
+func NewSessionService(stores Stores, tx Transactor, sign AccessTokenSigner, refreshTTL, sessionLifetime time.Duration, cache session.Store) *SessionService {
+	return &SessionService{
+		stores: stores, tx: tx, sign: sign, refreshTTL: refreshTTL,
+		sessionLifetime: sessionLifetime, cache: cache,
+	}
 }
 
 // errRefreshReused aborts a rotation transaction whose token was consumed
@@ -100,6 +106,7 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 	sess, err := st.Sessions.Create(ctx, NewSession{
 		UserID:       userID,
 		TokenVersion: tokenVersion,
+		ExpiresAt:    time.Now().Add(s.sessionLifetime),
 		UserAgent:    userAgentFromContext(ctx),
 		IP:           clientIPFromContext(ctx),
 		AMR:          amr,
@@ -110,7 +117,7 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 		}
 		return TokenPair{}, apperror.NewInternal("failed to create session")
 	}
-	refresh, err := s.newRefreshToken(ctx, st.RefreshTokens, sess.ID)
+	refresh, err := s.newRefreshToken(ctx, st.RefreshTokens, sess.ID, sess.ExpiresAt)
 	if err != nil {
 		return TokenPair{}, err
 	}
@@ -121,12 +128,18 @@ func (s *SessionService) issueTx(ctx context.Context, st Stores, userID int64, t
 	return TokenPair{AccessToken: access, RefreshToken: refresh, SessionID: sess.ID}, nil
 }
 
-func (s *SessionService) newRefreshToken(ctx context.Context, tokens RefreshTokenRepository, sessionID int64) (string, error) {
+func (s *SessionService) newRefreshToken(ctx context.Context, tokens RefreshTokenRepository, sessionID int64, sessionExpiresAt time.Time) (string, error) {
 	plain, hash, err := newOpaqueToken()
 	if err != nil {
 		return "", apperror.NewInternal("failed to generate refresh token")
 	}
-	if err := tokens.Create(ctx, sessionID, hash, time.Now().Add(s.refreshTTL)); err != nil {
+	// A rotated token never outlives its session, even when the refresh TTL
+	// would reach further (the session's absolute lifetime wins).
+	expiresAt := time.Now().Add(s.refreshTTL)
+	if sessionExpiresAt.Before(expiresAt) {
+		expiresAt = sessionExpiresAt
+	}
+	if err := tokens.Create(ctx, sessionID, hash, expiresAt); err != nil {
 		return "", apperror.NewInternal("failed to store refresh token")
 	}
 	return plain, nil
@@ -186,7 +199,7 @@ func (s *SessionService) Refresh(ctx context.Context, plain string, admit Admiss
 		if !used {
 			return errRefreshReused
 		}
-		if refresh, err = s.newRefreshToken(ctx, tx.RefreshTokens, sess.session.ID); err != nil {
+		if refresh, err = s.newRefreshToken(ctx, tx.RefreshTokens, sess.session.ID, sess.session.ExpiresAt); err != nil {
 			return err
 		}
 		if err := tx.Sessions.Touch(ctx, sess.session.ID, userAgentFromContext(ctx), clientIPFromContext(ctx)); err != nil {
@@ -247,6 +260,9 @@ func (s *SessionService) loadRefreshSession(ctx context.Context, hash string) (r
 	}
 	if sess.RevokedAt != nil {
 		return refreshSession{}, refreshInvalid("session has been revoked")
+	}
+	if !sess.ExpiresAt.After(time.Now()) {
+		return refreshSession{}, refreshInvalid("session has expired")
 	}
 	return refreshSession{token: rt, session: sess}, nil
 }

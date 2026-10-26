@@ -50,7 +50,7 @@ func TestIntegration_APIKeyScopesRoundTrip(t *testing.T) {
 	require.NoError(t, result.Err())
 	assert.Equal(t, []string{"files:read", "notifications:read"}, rows, "update replaces the scope rows")
 
-	rotated, err := h.svc.Rotate(ctx, created.ID)
+	rotated, err := h.svc.Rotate(ctx, h.user, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []authz.Permission{"files:read", "notifications:read"}, rotated.Scopes)
 

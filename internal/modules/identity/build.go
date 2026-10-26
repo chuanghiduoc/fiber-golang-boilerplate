@@ -94,7 +94,7 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 	)
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), infra.Cache)
 	sessionSvc := identityservice.NewSessionService(stores, transactor, accessTokenSigner(cfg.JWT),
-		time.Duration(cfg.JWT.RefreshExpireDays)*24*time.Hour, sessionStore)
+		time.Duration(cfg.JWT.RefreshExpireDays)*24*time.Hour, cfg.JWT.SessionMaxLifetime, sessionStore)
 	mfaSvc := identityservice.NewMFAService(identityservice.MFADeps{
 		Stores: stores, Tx: transactor, Cache: infra.Cache, Sealer: sealer, Sessions: sessionSvc,
 	})

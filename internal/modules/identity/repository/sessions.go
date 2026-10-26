@@ -32,6 +32,7 @@ func toSession(row identitysqlc.Session) identityservice.Session {
 		AMR:           row.Amr,
 		LastUsedAt:    row.LastUsedAt.Time,
 		CreatedAt:     row.CreatedAt.Time,
+		ExpiresAt:     row.ExpiresAt.Time,
 		RevokedAt:     timePtr(row.RevokedAt),
 		RevokedReason: identityservice.RevokeReason(row.RevokedReason.String),
 	}
@@ -42,6 +43,7 @@ func (r *SessionRepository) Create(ctx context.Context, session identityservice.
 		TenantID:     tenantID(ctx),
 		UserID:       session.UserID,
 		TokenVersion: session.TokenVersion,
+		ExpiresAt:    timestamptz(session.ExpiresAt),
 		UserAgent:    optionalText(session.UserAgent),
 		Ip:           ipAddr(session.IP),
 		Amr:          session.AMR,
@@ -128,6 +130,7 @@ func (r *SessionRepository) RevokeOtherUserSessions(ctx context.Context, userID,
 }
 
 func (r *SessionRepository) RevokeByRefreshToken(ctx context.Context, tokenHash string, why identityservice.RevokeReason) (userID int64, revoked bool, err error) {
+	ctx = database.WithRLSBypass(ctx) // Possession of the opaque token is the authorization; logout and reuse revoke across the request tenant boundary.
 	userID, err = r.q.RevokeSessionByRefreshToken(ctx, identitysqlc.RevokeSessionByRefreshTokenParams{
 		TokenHash: tokenHash,
 		Reason:    optionalText(string(why)),
@@ -161,6 +164,7 @@ func (r *SessionRepository) State(ctx context.Context, sessionID, userID int64) 
 	return &identityservice.SessionState{
 		TenantID:         row.TenantID,
 		Revoked:          row.RevokedAt.Valid,
+		ExpiresAt:        row.ExpiresAt.Time,
 		Role:             highestRole(row.RoleKeys),
 		Permissions:      row.PermissionKeys,
 		Platform:         row.Platform,
@@ -210,6 +214,10 @@ func (r *RefreshTokenRepository) Create(ctx context.Context, sessionID int64, to
 }
 
 func (r *RefreshTokenRepository) GetByHash(ctx context.Context, tokenHash string) (*identityservice.RefreshToken, error) {
+	// Intentionally tenant-scoped: a refresh token is usable only in the
+	// tenant that issued it, and RLS is a second line behind the explicit
+	// tenant comparison in SessionService.loadRefreshSession. Unlike logout,
+	// this lookup has no cross-tenant possession semantics.
 	row, err := r.q.GetRefreshTokenByHash(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)

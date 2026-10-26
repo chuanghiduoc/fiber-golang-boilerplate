@@ -177,6 +177,7 @@ erDiagram
         varchar user_agent
         inet ip
         text amr "pwd | google | otp | rc"
+        timestamptz expires_at "absolute session lifetime"
         timestamptz last_used_at
         timestamptz revoked_at "set together with revoked_reason"
         varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | mfa_changed | ..."
@@ -262,9 +263,11 @@ erDiagram
   timestamps each state needs are pinned by `CHECK`s): `trialing → active |
   suspended | pending_deletion`, `active → suspended | pending_deletion`,
   `suspended → active | pending_deletion`, `pending_deletion → active
-  (cancelled) | deleted`; `deleted` is terminal. Only `trialing` and `active`
-  tenants serve requests. Tenant 1 can never enter `pending_deletion` or
-  `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
+  (cancelled) | deleted`; `deleted` is terminal. A `pending_deletion` tenant
+  cannot become `deleted` before `deletion_scheduled_at` (`409
+  tenant.deletion_not_due`, a 30-day grace period). Only `trialing` and
+  `active` tenants serve requests. Tenant 1 can never enter `pending_deletion`
+  or `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
   `RESTRICT`/`NO ACTION`.
 - **Users** are global. `email` is stored normalized (`CHECK (email =
   lower(btrim(email)))`) and the partial unique index `idx_users_email_live`
@@ -284,6 +287,17 @@ erDiagram
   invite is an `invitations` row (it can target an address with no account).
   `credentials_revoked_at` is set by a ban or removal and never cleared, so
   API keys created at or before it stay invalid after an unban or re-join.
+  `banned_email_hash` is the lowercase hex SHA-256 of the normalized address,
+  written by a ban. A removed membership keeps `banned_at` and the hash, so a
+  ban survives removal and erasure (the user's email may since have been
+  anonymized); an unban while the membership is still suspended clears both.
+  `EmailBannedInTenant` matches the hash on
+  registration, invitation acceptance, and email change (GDPR Art.17(3)(e)).
+  Residual risk: the hash is unkeyed, so anyone with read access to the
+  table (a dump or backup) can confirm whether a known address was banned
+  or recover common addresses by dictionary attack. It is pseudonymous, not
+  anonymous, data; a keyed HMAC would need a stable key outside the
+  rotating encryption keys.
 - **Data exports** belong to one membership. A `queued`/`running`
   row is the active request (partial unique index); `ready` rows carry the
   document key and a 7-day `expires_at`; a failed export is retried only while
@@ -298,7 +312,10 @@ erDiagram
   tenant-scoped roles to a membership (a trigger rejects cross-tenant and
   platform roles). `platform_role_assignments` is the only cross-tenant grant
   and accepts only `scope = 'platform'` roles. `api_key_scopes.permission_key`
-  references the catalog (`RESTRICT`).
+  references the catalog (`RESTRICT`). Tenant role rank is `owner` 3 > `admin`
+  2 > `member` and tenant-defined roles 1: a caller may grant a role only at
+  or below its rank (owner alone grants owner) and may manage a member only
+  with a strictly higher rank (owners may manage co-owners).
 - The last-owner trigger (`protect_last_owner`) lives on `memberships` and
   `membership_roles`: removing the last active system `owner` of an
   operational tenant is refused. Counting and locking are scoped to the
@@ -312,7 +329,9 @@ erDiagram
   (partial unique `WHERE accepted_at IS NULL`); re-inviting refreshes the
   token, role, and expiry. Revoking deletes the pending row (the trail is in
   `audit_events`); accepting stamps `accepted_at`/`accepted_by` in the
-  transaction that creates or reactivates the membership.
+  transaction that creates or reactivates the membership. A ban or removal
+  deletes the member's pending invitations in the same transaction, and
+  acceptance re-checks the inviter's current rank and permissions.
 - **Sessions** are the RFC 9700 refresh-token family, so there is no separate
   family id: every rotated refresh token references its session, and
   presenting an already-used token revokes the session (`revoked_reason =
@@ -324,11 +343,15 @@ erDiagram
   TOTP factor (partial unique `WHERE confirmed_at IS NOT NULL`) and one pending
   enrollment (`WHERE confirmed_at IS NULL`). The secret is sealed with
   `DATA_ENCRYPTION_KEY`; `last_used_step` makes one RFC 6238 step usable once.
+  Re-enrolling overwrites the pending secret and resets its timestamp; a
+  pending enrollment can only be confirmed within 15 minutes. A password change
+  or reset deletes a pending enrollment in the same transaction.
   `mfa_recovery_codes` stores SHA-256 hashes; `used_at` makes each code single
   use.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request
-  tenant cannot be trusted until the key is verified. A key's owner is a
-  membership (`(tenant_id, user_id) → memberships`).
+  tenant cannot be trusted until the key is verified, so that statement runs
+  with the RLS bypass while the request's last-used write stays under the key's
+  tenant. A key's owner is a membership (`(tenant_id, user_id) → memberships`).
 - `api_key_scopes` holds one row per granted permission. Every API-key query
   returns the scopes as one array sorted in byte order, so the API still
   returns a `scopes` array exactly as before. Create and update change the key

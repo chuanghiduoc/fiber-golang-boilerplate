@@ -40,6 +40,9 @@ type State struct {
 	Permissions  []string
 	Platform     bool
 	TokenVersion int32
+	// ExpiresAt is the session's absolute lifetime; a session past it is dead
+	// even before its access token expires.
+	ExpiresAt time.Time
 	// Active is true when the session is not revoked, the membership is
 	// active, and the user is active.
 	Active bool
@@ -66,13 +69,14 @@ type Store interface {
 }
 
 type snapshot struct {
-	TenantID     int64    `json:"tenantId"`
-	Role         string   `json:"role"`
-	Permissions  []string `json:"permissions"`
-	Platform     bool     `json:"platform"`
-	TokenVersion int32    `json:"tokenVersion"`
-	Active       bool     `json:"active"`
-	TenantActive bool     `json:"tenantActive"`
+	TenantID     int64     `json:"tenantId"`
+	Role         string    `json:"role"`
+	Permissions  []string  `json:"permissions"`
+	Platform     bool      `json:"platform"`
+	TokenVersion int32     `json:"tokenVersion"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+	Active       bool      `json:"active"`
+	TenantActive bool      `json:"tenantActive"`
 }
 
 type store struct {
@@ -172,6 +176,9 @@ func stateOf(snap snapshot, claims Claims) (State, error) {
 	}
 	if snap.TokenVersion != claims.TokenVersion {
 		return State{}, apperror.NewUnauthorized("session is no longer valid")
+	}
+	if snap.ExpiresAt.IsZero() || !snap.ExpiresAt.After(time.Now()) {
+		return State{}, apperror.NewUnauthorized("session has expired")
 	}
 	return state, nil
 }
