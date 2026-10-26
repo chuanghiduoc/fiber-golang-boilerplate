@@ -378,6 +378,15 @@ func (r memMemberships) CountActiveOwners(ctx context.Context) (int64, error) {
 
 func (r memMemberships) LockOwnerChanges(context.Context) error { return nil }
 
+func (r memMemberships) LockMembership(ctx context.Context, userID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	if _, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]; !ok {
+		return apperror.ErrNotFound
+	}
+	return nil
+}
+
 func (r memMemberships) Stats(context.Context) (MemberStats, error) {
 	return MemberStats{}, errFakeNotImplemented
 }

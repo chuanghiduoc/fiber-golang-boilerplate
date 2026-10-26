@@ -477,6 +477,10 @@ type MembershipRepository interface {
 	Unban(ctx context.Context, userID int64) (*Membership, error)
 	Remove(ctx context.Context, userID int64) (*Membership, error)
 	CountActiveOwners(ctx context.Context) (int64, error)
+	// LockMembership takes the membership row FOR UPDATE until the
+	// transaction ends. Rank checks and role changes use it to serialize a
+	// concurrent role change against the target's current highest role.
+	LockMembership(ctx context.Context, userID int64) error
 	// LockOwnerChanges takes the per-tenant owner-change lock. It is only
 	// meaningful inside a transaction and must run before the target row is
 	// updated.

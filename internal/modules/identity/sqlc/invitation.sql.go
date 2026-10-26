@@ -29,6 +29,26 @@ func (q *Queries) DeletePendingInvitation(ctx context.Context, arg DeletePending
 	return result.RowsAffected(), nil
 }
 
+const deletePendingInvitationsByInviter = `-- name: DeletePendingInvitationsByInviter :execrows
+DELETE FROM invitations
+WHERE tenant_id = $1 AND invited_by = $2 AND accepted_at IS NULL
+`
+
+type DeletePendingInvitationsByInviterParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	InvitedBy int64 `json:"invited_by"`
+}
+
+// A ban or removal ends every pending invitation the member created: the
+// invitation no longer reflects a live grant of authority.
+func (q *Queries) DeletePendingInvitationsByInviter(ctx context.Context, arg DeletePendingInvitationsByInviterParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deletePendingInvitationsByInviter, arg.TenantID, arg.InvitedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one
 SELECT id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at FROM invitations
 WHERE token_hash = $1

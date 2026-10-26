@@ -147,6 +147,9 @@ func (r *RoleRepository) MemberIDs(ctx context.Context, roleID int64) ([]int64, 
 
 func (r *RoleRepository) ReplaceMemberRoles(ctx context.Context, userID int64, roleKeys []string) error {
 	tid := tenantID(ctx)
+	if _, err := r.q.LockMembership(ctx, identitysqlc.LockMembershipParams{TenantID: tid, UserID: userID}); err != nil {
+		return wrapErr(err)
+	}
 	if err := r.q.LockMembershipRoles(ctx, identitysqlc.LockMembershipRolesParams{
 		TenantID: tid, UserID: userID,
 	}); err != nil {

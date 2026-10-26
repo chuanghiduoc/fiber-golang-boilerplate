@@ -202,6 +202,12 @@ func (s *roleService) ReplaceMemberRoles(ctx context.Context, userID int64, role
 }
 
 func replaceMemberRolesTx(ctx context.Context, tx TxRepos, userID int64, keys []string) (*Member, error) {
+	if err := EnsureCanManageMember(ctx, tx.Stores, userID); err != nil {
+		return nil, err
+	}
+	if err := EnsureCanGrantRoles(ctx, tx.Stores, keys); err != nil {
+		return nil, err
+	}
 	existing, err := tx.Memberships.GetActive(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
@@ -270,12 +276,15 @@ func addedPermissions(before, next []string) []string {
 }
 
 // authorizeGrant keeps a caller from granting permissions it does not hold
-// itself. HTTP requests always carry a subject; an internal/system caller
-// without one has already passed the trusted boundary.
+// itself. A context without a subject is allowed only for the authz system
+// marker; any other subject-less caller fails closed.
 func authorizeGrant(ctx context.Context, permissions []string) error {
 	subject, ok := authz.SubjectFromContext(ctx)
 	if !ok {
-		return nil
+		if authz.IsSystemContext(ctx) {
+			return nil
+		}
+		return permissionDenied()
 	}
 	for _, permission := range permissions {
 		if !subject.Has(authz.Permission(permission)) {

@@ -262,9 +262,11 @@ erDiagram
   timestamps each state needs are pinned by `CHECK`s): `trialing → active |
   suspended | pending_deletion`, `active → suspended | pending_deletion`,
   `suspended → active | pending_deletion`, `pending_deletion → active
-  (cancelled) | deleted`; `deleted` is terminal. Only `trialing` and `active`
-  tenants serve requests. Tenant 1 can never enter `pending_deletion` or
-  `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
+  (cancelled) | deleted`; `deleted` is terminal. A `pending_deletion` tenant
+  cannot become `deleted` before `deletion_scheduled_at` (`409
+  tenant.deletion_not_due`, a 30-day grace period). Only `trialing` and
+  `active` tenants serve requests. Tenant 1 can never enter `pending_deletion`
+  or `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
   `RESTRICT`/`NO ACTION`.
 - **Users** are global. `email` is stored normalized (`CHECK (email =
   lower(btrim(email)))`) and the partial unique index `idx_users_email_live`
@@ -298,7 +300,10 @@ erDiagram
   tenant-scoped roles to a membership (a trigger rejects cross-tenant and
   platform roles). `platform_role_assignments` is the only cross-tenant grant
   and accepts only `scope = 'platform'` roles. `api_key_scopes.permission_key`
-  references the catalog (`RESTRICT`).
+  references the catalog (`RESTRICT`). Tenant role rank is `owner` 3 > `admin`
+  2 > `member` and tenant-defined roles 1: a caller may grant a role only at
+  or below its rank (owner alone grants owner) and may manage a member only
+  with a strictly higher rank (owners may manage co-owners).
 - The last-owner trigger (`protect_last_owner`) lives on `memberships` and
   `membership_roles`: removing the last active system `owner` of an
   operational tenant is refused. Counting and locking are scoped to the
@@ -312,7 +317,9 @@ erDiagram
   (partial unique `WHERE accepted_at IS NULL`); re-inviting refreshes the
   token, role, and expiry. Revoking deletes the pending row (the trail is in
   `audit_events`); accepting stamps `accepted_at`/`accepted_by` in the
-  transaction that creates or reactivates the membership.
+  transaction that creates or reactivates the membership. A ban or removal
+  deletes the member's pending invitations in the same transaction, and
+  acceptance re-checks the inviter's current rank and permissions.
 - **Sessions** are the RFC 9700 refresh-token family, so there is no separate
   family id: every rotated refresh token references its session, and
   presenting an already-used token revokes the session (`revoked_reason =

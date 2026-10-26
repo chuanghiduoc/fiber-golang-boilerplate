@@ -154,6 +154,15 @@ SET status = 'removed', removed_at = NOW(), banned_at = NULL,
 WHERE tenant_id = $1 AND user_id = $2 AND status <> 'removed'
 RETURNING *;
 
+-- name: LockMembership :execrows
+-- Serializes rank checks and role changes for one membership: every mutation
+-- that needs the target's current highest role locks this row first, and
+-- role replacement takes the same lock, so a concurrent change cannot race
+-- the rank comparison.
+SELECT 1 FROM memberships
+WHERE tenant_id = @tenant_id AND user_id = @user_id
+FOR UPDATE;
+
 -- name: CountActiveOwners :one
 SELECT count(*) FROM membership_roles mr
 JOIN memberships m ON m.tenant_id = mr.tenant_id AND m.user_id = mr.user_id

@@ -35,6 +35,12 @@ UPDATE invitations
 SET accepted_at = NOW(), accepted_by = @accepted_by
 WHERE tenant_id = @tenant_id AND id = @id AND accepted_at IS NULL;
 
+-- name: DeletePendingInvitationsByInviter :execrows
+-- A ban or removal ends every pending invitation the member created: the
+-- invitation no longer reflects a live grant of authority.
+DELETE FROM invitations
+WHERE tenant_id = @tenant_id AND invited_by = @invited_by AND accepted_at IS NULL;
+
 -- name: PurgeExpiredInvitations :execrows
 -- Maintenance purge across every tenant: expired pending invitations can
 -- never be accepted. Accepted rows are kept as the membership's provenance.

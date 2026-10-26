@@ -155,10 +155,10 @@ flowchart TD
 | 204 | Deleted/no content |
 | 400 | Malformed request, invalid cursor, invalid token |
 | 401 | Missing/invalid authentication |
-| 403 | Authenticated but not permitted, or tenant mismatch |
+| 403 | Authenticated but not permitted, tenant mismatch, or insufficient role rank |
 | 404 | Not found (including non-owned or cross-tenant resources) |
 | 406 | Accept-Version mismatch or unsupported `/api/vN` |
-| 409 | Conflict, duplicate, last-owner, idempotency key still in progress, data export not ready |
+| 409 | Conflict, duplicate, last-owner, tenant deletion not due, inviter no longer eligible, idempotency key still in progress, data export not ready |
 | 410 | Expired data export |
 | 413 | Body or upload too large |
 | 415 | Unsupported media type |
@@ -298,7 +298,7 @@ Users are global identities; a user joins tenants through memberships. Everythin
 | `POST /auth/logout-all` | Revokes every session in every tenant and bumps `token_version`. |
 | `PUT /users/:id` | Own id only (the global profile is editable only by its owner); another id is `403 permission.denied`, even for a tenant admin. |
 | `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active owner of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
-| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
+| Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. Rank hierarchy: `owner` (3) > `admin` (2) > `member` and tenant roles (1). Granting a role (including an invitation's role) needs caller rank ≥ the role's rank and every permission the role grants; only an owner may grant `owner`. Managing a member (role change, demotion, ban, unban, removal) needs caller rank strictly greater than the target's current highest rank, except that an owner may manage another owner; failures are `403 role.insufficient_rank`. A non-owner cannot change their own roles (equal rank is refused). The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
 | Member lists | `GET /users`, `GET /admin/users` paginate members by `(joinedAt, id)`; `UserResponse` adds `membershipStatus` and `joinedAt`. |
 
 Invitations (pending invites are `invitations` rows; there is no "invited"
@@ -306,14 +306,16 @@ membership state):
 
 | Route | Auth | Behavior |
 |---|---|---|
-| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `member`; `user` is accepted as an alias) and emails a link; the token is never returned. Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
+| `POST /invitations` | `invitations:write` (admin only), `Idempotency-Key` | Invites an address (role defaults to `member`; `user` is accepted as an alias) and emails a link; the token is never returned. The inviter may only grant a role at or below their own rank and must hold every permission it grants, so an admin cannot invite an owner (`403 role.insufficient_rank`). Re-inviting a pending address replaces its token, role, and 7-day expiry. An active or banned member is `409 membership.exists`. Tier 1 audited (`invitation.created`, committed with the email job). |
 | `GET /invitations` | `invitations:read` (admin only) | Cursor list of the tenant's pending invitations, newest first. |
 | `DELETE /invitations/:id` | `invitations:write` | Deletes a pending invitation (`204`); its link stops working. Tier 1 (`invitation.revoked`). |
-| `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
-| `POST /auth/invitations/signup` | Public (token possession), strict limiter, `Idempotency-Key` | Creates the account for the invited address and joins the tenant (send `X-Tenant-Slug` from the link). The email is verified by the token; not gated by `user_registration`. An address that already has an account is `409 user.email_taken` (sign in and accept instead). `201 UserResponse`; no tokens are issued. Tier 1 (`invitation.accepted`). |
+| `POST /auth/invitations/accept` | JWT only, `profile:write`, `Idempotency-Key` | A signed-in user (from any tenant) joins the invitation's tenant. The token is checked by possession; the invitation must be pending, unexpired, addressed to the caller's current email, and its tenant operational. Acceptance re-checks inside its transaction that the inviter is still an active member who may grant the invitation's role; otherwise it is `409 invitation.inviter_ineligible`. Marks the email verified; reactivates a removed membership; an active or banned membership is `409 membership.exists`. Returns the new membership (`200 UserResponse`); sign in again with that tenant's `X-Tenant-Slug`. Tier 1 (`invitation.accepted`). |
+| `POST /auth/invitations/signup` | Public (token possession), strict limiter, `Idempotency-Key` | Creates the account for the invited address and joins the tenant (send `X-Tenant-Slug` from the link). The email is verified by the token; not gated by `user_registration`. The same inviter re-check applies (`409 invitation.inviter_ineligible`). An address that already has an account is `409 user.email_taken` (sign in and accept instead). `201 UserResponse`; no tokens are issued. Tier 1 (`invitation.accepted`). |
 
 Unknown, expired, already accepted, or misaddressed invitation tokens are
-`400 invitation.invalid`.
+`400 invitation.invalid`. A ban or removal deletes every pending invitation the
+member created in that tenant inside the same transaction, and acceptance
+re-checks the inviter's rank and permissions (`409 invitation.inviter_ineligible`).
 
 ## Privacy: data export and erasure
 
