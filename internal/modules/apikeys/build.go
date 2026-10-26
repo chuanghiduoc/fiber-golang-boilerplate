@@ -28,6 +28,7 @@ func Build(infra app.Infra, principals identitycontracts.PrincipalReader) (*Modu
 	svc := apikeyservice.NewService(repo, principals, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals))
 	m := New(apikeyhandler.NewHandler(svc))
 	m.privacy = apikeysprivacy.New(apikeyrepo.NewPrivacyStore(infra.DB))
+	m.tenantPurger = apikeyrepo.NewTenantPurger(infra.DB)
 	return m, Provides{Verifier: verifier}
 }
 

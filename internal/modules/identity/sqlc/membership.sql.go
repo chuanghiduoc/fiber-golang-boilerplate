@@ -99,17 +99,30 @@ func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipPara
 	return i, err
 }
 
-const deleteTenantMemberships = `-- name: DeleteTenantMemberships :exec
-DELETE FROM memberships WHERE tenant_id = $1
+const deleteTenantMembershipsBatch = `-- name: DeleteTenantMembershipsBatch :execrows
+DELETE FROM memberships
+WHERE id IN (
+    SELECT id FROM memberships
+    WHERE tenant_id = $1::bigint
+    LIMIT $2::int
+)
 `
+
+type DeleteTenantMembershipsBatchParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	BatchSize int32 `json:"batch_size"`
+}
 
 // Runs after every module purger and invitation delete: those rows carry
 // RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
 // membership_roles cascade. A deleted tenant is not operational, so the
-// last-owner trigger permits the delete.
-func (q *Queries) DeleteTenantMemberships(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, deleteTenantMemberships, tenantID)
-	return err
+// last-owner trigger permits the delete. One bounded page per statement.
+func (q *Queries) DeleteTenantMembershipsBatch(ctx context.Context, arg DeleteTenantMembershipsBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantMembershipsBatch, arg.TenantID, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const emailBannedInTenant = `-- name: EmailBannedInTenant :one

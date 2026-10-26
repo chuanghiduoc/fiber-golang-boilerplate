@@ -105,13 +105,24 @@ func (q *Queries) DeleteDataExportsForUser(ctx context.Context, arg DeleteDataEx
 	return err
 }
 
-const deleteTenantDataExports = `-- name: DeleteTenantDataExports :exec
-DELETE FROM data_exports WHERE tenant_id = $1
+const deleteTenantDataExportsForPurge = `-- name: DeleteTenantDataExportsForPurge :execrows
+DELETE FROM data_exports
+WHERE tenant_id = $1::bigint
+  AND id = ANY($2::bigint[])
 `
 
-func (q *Queries) DeleteTenantDataExports(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, deleteTenantDataExports, tenantID)
-	return err
+type DeleteTenantDataExportsForPurgeParams struct {
+	TenantID int64   `json:"tenant_id"`
+	Ids      []int64 `json:"ids"`
+}
+
+// Tenant purge: deletes exactly the page whose blobs the caller just removed.
+func (q *Queries) DeleteTenantDataExportsForPurge(ctx context.Context, arg DeleteTenantDataExportsForPurgeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantDataExportsForPurge, arg.TenantID, arg.Ids)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const deleteTenantUserSessions = `-- name: DeleteTenantUserSessions :exec
@@ -360,31 +371,35 @@ func (q *Queries) ListPurgeableDataExports(ctx context.Context, batchSize int32)
 	return items, nil
 }
 
-const listTenantDataExports = `-- name: ListTenantDataExports :many
-SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports WHERE tenant_id = $1 ORDER BY id
+const listTenantDataExportsForPurge = `-- name: ListTenantDataExportsForPurge :many
+SELECT id, COALESCE(storage_path, '') AS storage_path
+FROM data_exports
+WHERE tenant_id = $1::bigint
+LIMIT $2::int
 `
 
-// Tenant purge: every export of the tenant (including rows of memberships
-// already erased) so their blobs can be deleted before the rows.
-func (q *Queries) ListTenantDataExports(ctx context.Context, tenantID int64) ([]DataExport, error) {
-	rows, err := q.db.Query(ctx, listTenantDataExports, tenantID)
+type ListTenantDataExportsForPurgeParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	BatchSize int32 `json:"batch_size"`
+}
+
+type ListTenantDataExportsForPurgeRow struct {
+	ID          int64  `json:"id"`
+	StoragePath string `json:"storage_path"`
+}
+
+// Tenant purge: one bounded page of the tenant's exports (including rows of
+// memberships already erased) so their blobs can be deleted before the rows.
+func (q *Queries) ListTenantDataExportsForPurge(ctx context.Context, arg ListTenantDataExportsForPurgeParams) ([]ListTenantDataExportsForPurgeRow, error) {
+	rows, err := q.db.Query(ctx, listTenantDataExportsForPurge, arg.TenantID, arg.BatchSize)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []DataExport{}
+	items := []ListTenantDataExportsForPurgeRow{}
 	for rows.Next() {
-		var i DataExport
-		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.UserID,
-			&i.Status,
-			&i.StoragePath,
-			&i.ExpiresAt,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
+		var i ListTenantDataExportsForPurgeRow
+		if err := rows.Scan(&i.ID, &i.StoragePath); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -490,7 +490,7 @@ loops run in every worker process regardless.
 | Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
-| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers, then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, 100 memberships per page; every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (id) WHERE status = 'deleted' AND purged_at IS NULL` |
+| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers, then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, 100 memberships per page, 500-row batches per tenant table (files/export blobs before their rows); every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (id) WHERE status = 'deleted' AND purged_at IS NULL` |
 | Expired trials | A `trialing` tenant whose `trial_ends_at` has passed is not operational immediately (404) and is transitioned to `suspended` through the audited tenant service | `identity.tenants.expire_trials`, hourly (scheduler) | 100 tenants per run, re-checked under the row lock; an admin transition wins and is a no-op | — |
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
@@ -578,7 +578,10 @@ then asks every module's `tenancy.Purger` to remove its tenant-wide rows
 `feature_flag_targets`, invitations, API keys, files and blobs, notifications,
 data exports). Identity's purger runs last: it deletes the memberships (and
 their sessions, refresh tokens, and role assignments), the tenant's custom
-roles, and `tenant_settings`. Only after every phase succeeds does it write `tenants.purged_at` and a
+roles, and `tenant_settings`. Every table is drained in bounded 500-row pages
+(and every files/export page deletes its blobs before its rows), so a large
+tenant never loads its whole table or blob list into memory. Only after every
+phase succeeds does it write `tenants.purged_at` and a
 `tenant.purged` audit row in one transaction. Each phase is idempotent, so a
 failure or worker restart retries the same tenant; no phase accepts a tenant
 id other than the job's explicit tenant scope, and RLS backs that.

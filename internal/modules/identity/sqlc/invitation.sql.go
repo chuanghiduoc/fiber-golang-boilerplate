@@ -49,15 +49,29 @@ func (q *Queries) DeletePendingInvitationsByInviter(ctx context.Context, arg Del
 	return result.RowsAffected(), nil
 }
 
-const deleteTenantInvitations = `-- name: DeleteTenantInvitations :exec
-DELETE FROM invitations WHERE tenant_id = $1
+const deleteTenantInvitationsBatch = `-- name: DeleteTenantInvitationsBatch :execrows
+DELETE FROM invitations
+WHERE id IN (
+    SELECT id FROM invitations
+    WHERE tenant_id = $1::bigint
+    LIMIT $2::int
+)
 `
 
+type DeleteTenantInvitationsBatchParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	BatchSize int32 `json:"batch_size"`
+}
+
 // Tenant purge: invitations reference memberships through invited_by and
-// accepted_by (RESTRICT), so they must go before the memberships.
-func (q *Queries) DeleteTenantInvitations(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, deleteTenantInvitations, tenantID)
-	return err
+// accepted_by (RESTRICT), so they must go before the memberships. One bounded
+// page per statement keeps a large tenant from loading everything at once.
+func (q *Queries) DeleteTenantInvitationsBatch(ctx context.Context, arg DeleteTenantInvitationsBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantInvitationsBatch, arg.TenantID, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one

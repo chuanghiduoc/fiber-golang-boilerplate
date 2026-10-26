@@ -106,15 +106,29 @@ func (q *Queries) DeleteRole(ctx context.Context, arg DeleteRoleParams) (int64, 
 	return result.RowsAffected(), nil
 }
 
-const deleteTenantRoles = `-- name: DeleteTenantRoles :exec
-DELETE FROM roles WHERE tenant_id = $1::bigint
+const deleteTenantRolesBatch = `-- name: DeleteTenantRolesBatch :execrows
+DELETE FROM roles
+WHERE id IN (
+    SELECT id FROM roles
+    WHERE tenant_id = $1::bigint
+    LIMIT $2::int
+)
 `
 
-// Tenant purge: custom roles of the tenant. role_permissions cascade, and the
-// memberships (with their membership_roles) were deleted first.
-func (q *Queries) DeleteTenantRoles(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, deleteTenantRoles, tenantID)
-	return err
+type DeleteTenantRolesBatchParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	BatchSize int32 `json:"batch_size"`
+}
+
+// Tenant purge: custom roles of the tenant, one bounded id page per statement.
+// role_permissions cascade, and the memberships (with their membership_roles)
+// were deleted first.
+func (q *Queries) DeleteTenantRolesBatch(ctx context.Context, arg DeleteTenantRolesBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantRolesBatch, arg.TenantID, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getRole = `-- name: GetRole :one

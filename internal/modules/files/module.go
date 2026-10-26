@@ -7,6 +7,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
@@ -24,6 +25,7 @@ type Module struct {
 	trashPurger     *filesvc.TrashPurger
 	privacyExporter *filesvc.PrivacyExporter
 	privacyEraser   *filesvc.PrivacyEraser
+	tenantPurger    tenancycontracts.Purger
 }
 
 var (

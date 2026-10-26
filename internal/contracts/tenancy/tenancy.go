@@ -13,6 +13,11 @@ import (
 	"sync"
 )
 
+// PurgeBatchSize is the maximum number of rows one tenant-purge statement may
+// touch. A purger loops until a batch comes back empty, so memory use and lock
+// sets stay constant no matter how large the tenant is.
+const PurgeBatchSize int32 = 500
+
 // Purger erases every row the module owns for one tenant. It never deletes the
 // tenants row, the tenant's audit trail, or another tenant's data. It must be
 // idempotent: a repeated call after a successful one succeeds.

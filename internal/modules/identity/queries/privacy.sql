@@ -109,13 +109,19 @@ DELETE FROM user_passwords WHERE user_id = @user_id::bigint;
 -- name: DeleteUserIdentities :exec
 DELETE FROM user_identities WHERE user_id = @user_id::bigint;
 
--- name: ListTenantDataExports :many
--- Tenant purge: every export of the tenant (including rows of memberships
--- already erased) so their blobs can be deleted before the rows.
-SELECT * FROM data_exports WHERE tenant_id = $1 ORDER BY id;
+-- name: ListTenantDataExportsForPurge :many
+-- Tenant purge: one bounded page of the tenant's exports (including rows of
+-- memberships already erased) so their blobs can be deleted before the rows.
+SELECT id, COALESCE(storage_path, '') AS storage_path
+FROM data_exports
+WHERE tenant_id = @tenant_id::bigint
+LIMIT @batch_size::int;
 
--- name: DeleteTenantDataExports :exec
-DELETE FROM data_exports WHERE tenant_id = $1;
+-- name: DeleteTenantDataExportsForPurge :execrows
+-- Tenant purge: deletes exactly the page whose blobs the caller just removed.
+DELETE FROM data_exports
+WHERE tenant_id = @tenant_id::bigint
+  AND id = ANY(@ids::bigint[]);
 
 -- name: ListUserExternalIdentities :many
 -- Export: linked external accounts, without any token material (none is

@@ -12,8 +12,8 @@ import (
 )
 
 // TenantPurgeRepository implements service.TenantPurgeRepository. The
-// tenant-scoped deletes run through sqlc on the RLS-scoped handle; the
-// completion marker and its audit row share one transaction.
+// tenant-scoped deletes run through sqlc on the RLS-scoped handle in bounded
+// pages; the completion marker and its audit row share one transaction.
 type TenantPurgeRepository struct {
 	db    identitysqlc.DBTX
 	tx    *database.TxManager
@@ -50,36 +50,57 @@ func (r *TenantPurgeRepository) ListMembershipUserIDs(ctx context.Context, tenan
 	})
 }
 
-func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID int64) ([]identityservice.DataExport, error) {
-	rows, err := identitysqlc.New(r.db).ListTenantDataExports(ctx, tenantID)
+func (r *TenantPurgeRepository) ListDataExports(ctx context.Context, tenantID int64, limit int32) ([]identityservice.DataExport, error) {
+	rows, err := identitysqlc.New(r.db).ListTenantDataExportsForPurge(ctx, identitysqlc.ListTenantDataExportsForPurgeParams{
+		TenantID:  tenantID,
+		BatchSize: limit,
+	})
 	if err != nil {
 		return nil, err
 	}
 	exports := make([]identityservice.DataExport, len(rows))
 	for i := range rows {
-		exports[i] = toDataExport(rows[i])
+		exports[i] = identityservice.DataExport{
+			ID:          rows[i].ID,
+			TenantID:    tenantID,
+			StoragePath: rows[i].StoragePath,
+		}
 	}
 	return exports, nil
 }
 
-func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID int64) error {
-	return identitysqlc.New(r.db).DeleteTenantDataExports(ctx, tenantID)
+func (r *TenantPurgeRepository) DeleteDataExports(ctx context.Context, tenantID int64, ids []int64) error {
+	_, err := identitysqlc.New(r.db).DeleteTenantDataExportsForPurge(ctx, identitysqlc.DeleteTenantDataExportsForPurgeParams{
+		TenantID: tenantID,
+		Ids:      ids,
+	})
+	return err
 }
 
-func (r *TenantPurgeRepository) DeleteInvitations(ctx context.Context, tenantID int64) error {
-	return identitysqlc.New(r.db).DeleteTenantInvitations(ctx, tenantID)
+func (r *TenantPurgeRepository) DeleteInvitationsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+	return identitysqlc.New(r.db).DeleteTenantInvitationsBatch(ctx, identitysqlc.DeleteTenantInvitationsBatchParams{
+		TenantID:  tenantID,
+		BatchSize: limit,
+	})
 }
 
-func (r *TenantPurgeRepository) DeleteMemberships(ctx context.Context, tenantID int64) error {
-	return identitysqlc.New(r.db).DeleteTenantMemberships(ctx, tenantID)
+func (r *TenantPurgeRepository) DeleteMembershipsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+	return identitysqlc.New(r.db).DeleteTenantMembershipsBatch(ctx, identitysqlc.DeleteTenantMembershipsBatchParams{
+		TenantID:  tenantID,
+		BatchSize: limit,
+	})
 }
 
-func (r *TenantPurgeRepository) DeleteTenantRoles(ctx context.Context, tenantID int64) error {
-	return identitysqlc.New(r.db).DeleteTenantRoles(ctx, tenantID)
+func (r *TenantPurgeRepository) DeleteTenantRolesBatch(ctx context.Context, tenantID int64, limit int32) (int64, error) {
+	return identitysqlc.New(r.db).DeleteTenantRolesBatch(ctx, identitysqlc.DeleteTenantRolesBatchParams{
+		TenantID:  tenantID,
+		BatchSize: limit,
+	})
 }
 
 func (r *TenantPurgeRepository) DeleteTenantSettings(ctx context.Context, tenantID int64) error {
-	return identitysqlc.New(r.db).DeleteTenantSettings(ctx, tenantID)
+	_, err := identitysqlc.New(r.db).DeleteTenantSettings(ctx, tenantID)
+	return err
 }
 
 // MarkPurged stamps purged_at and writes the completion audit row in one

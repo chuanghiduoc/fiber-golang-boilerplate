@@ -331,9 +331,14 @@ WHERE tenant_id = @tenant_id::bigint
 ORDER BY user_id
 LIMIT @row_limit::int;
 
--- name: DeleteTenantMemberships :exec
+-- name: DeleteTenantMembershipsBatch :execrows
 -- Runs after every module purger and invitation delete: those rows carry
 -- RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
 -- membership_roles cascade. A deleted tenant is not operational, so the
--- last-owner trigger permits the delete.
-DELETE FROM memberships WHERE tenant_id = $1;
+-- last-owner trigger permits the delete. One bounded page per statement.
+DELETE FROM memberships
+WHERE id IN (
+    SELECT id FROM memberships
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);

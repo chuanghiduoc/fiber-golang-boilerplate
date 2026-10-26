@@ -51,11 +51,11 @@ type TenantPurgeRepository interface {
 	ListDeletedTenants(ctx context.Context, limit int32) ([]PurgeTenant, error)
 	ListExpiredTrialTenantIDs(ctx context.Context, limit int32) ([]int64, error)
 	ListMembershipUserIDs(ctx context.Context, tenantID, afterUserID int64, limit int32) ([]int64, error)
-	ListDataExports(ctx context.Context, tenantID int64) ([]DataExport, error)
-	DeleteDataExports(ctx context.Context, tenantID int64) error
-	DeleteInvitations(ctx context.Context, tenantID int64) error
-	DeleteMemberships(ctx context.Context, tenantID int64) error
-	DeleteTenantRoles(ctx context.Context, tenantID int64) error
+	ListDataExports(ctx context.Context, tenantID int64, limit int32) ([]DataExport, error)
+	DeleteDataExports(ctx context.Context, tenantID int64, ids []int64) error
+	DeleteInvitationsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
+	DeleteMembershipsBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
+	DeleteTenantRolesBatch(ctx context.Context, tenantID int64, limit int32) (int64, error)
 	DeleteTenantSettings(ctx context.Context, tenantID int64) error
 	MarkPurged(ctx context.Context, tenantID int64, event audit.Event) (bool, error)
 }
@@ -186,37 +186,74 @@ func (s *TenantPurgeService) eraseMemberships(ctx context.Context, tenantID int6
 
 // PurgeTenant implements tenancy.Purger for identity's own tenant-wide rows:
 // export documents, invitations, memberships (with their sessions, refresh
-// tokens, and role assignments), and custom roles.
+// tokens, and role assignments), custom roles, and tenant settings. Every
+// table is drained in bounded pages so a large tenant never loads in one
+// statement; a failure leaves the deleted pages gone and the rest resumable.
 func (s *TenantPurgeService) PurgeTenant(ctx context.Context, tenantID int64) error {
 	ctx = tenant.WithID(ctx, tenantID)
-	exports, err := s.repo.ListDataExports(ctx, tenantID)
-	if err != nil {
-		return fmt.Errorf("list tenant data exports: %w", err)
+	if err := s.purgeDataExports(ctx, tenantID); err != nil {
+		return err
 	}
-	for _, export := range exports {
-		if export.StoragePath == "" {
-			continue
-		}
-		if err := s.storage.Delete(ctx, export.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("delete tenant data export %d: %w", export.ID, err)
-		}
-	}
-	if err := s.repo.DeleteDataExports(ctx, tenantID); err != nil {
-		return fmt.Errorf("delete tenant data exports: %w", err)
-	}
-	if err := s.repo.DeleteInvitations(ctx, tenantID); err != nil {
+	if err := purgeInBatches(func() (int64, error) {
+		return s.repo.DeleteInvitationsBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
+	}); err != nil {
 		return fmt.Errorf("delete tenant invitations: %w", err)
 	}
-	if err := s.repo.DeleteMemberships(ctx, tenantID); err != nil {
+	if err := purgeInBatches(func() (int64, error) {
+		return s.repo.DeleteMembershipsBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
+	}); err != nil {
 		return fmt.Errorf("delete tenant memberships: %w", err)
 	}
-	if err := s.repo.DeleteTenantRoles(ctx, tenantID); err != nil {
+	if err := purgeInBatches(func() (int64, error) {
+		return s.repo.DeleteTenantRolesBatch(ctx, tenantID, tenancycontracts.PurgeBatchSize)
+	}); err != nil {
 		return fmt.Errorf("delete tenant roles: %w", err)
 	}
+	// tenant_settings is keyed by tenant_id, so this affects at most one row.
 	if err := s.repo.DeleteTenantSettings(ctx, tenantID); err != nil {
 		return fmt.Errorf("delete tenant settings: %w", err)
 	}
 	return nil
+}
+
+// purgeDataExports deletes each page's blobs before its rows. A missing blob
+// counts as deleted, so a retry after a partial run finishes the same page.
+func (s *TenantPurgeService) purgeDataExports(ctx context.Context, tenantID int64) error {
+	for {
+		exports, err := s.repo.ListDataExports(ctx, tenantID, tenancycontracts.PurgeBatchSize)
+		if err != nil {
+			return fmt.Errorf("list tenant data exports: %w", err)
+		}
+		if len(exports) == 0 {
+			return nil
+		}
+		ids := make([]int64, len(exports))
+		for i, export := range exports {
+			ids[i] = export.ID
+			if export.StoragePath == "" {
+				continue
+			}
+			if err := s.storage.Delete(ctx, export.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return fmt.Errorf("delete tenant data export %d: %w", export.ID, err)
+			}
+		}
+		if err := s.repo.DeleteDataExports(ctx, tenantID, ids); err != nil {
+			return fmt.Errorf("delete tenant data exports: %w", err)
+		}
+	}
+}
+
+// purgeInBatches repeats one bounded delete until it reports no rows.
+func purgeInBatches(batch func() (int64, error)) error {
+	for {
+		deleted, err := batch()
+		if err != nil {
+			return err
+		}
+		if deleted == 0 {
+			return nil
+		}
+	}
 }
 
 // HandleTrialExpiryJob suspends trialing tenants whose trial has ended. The

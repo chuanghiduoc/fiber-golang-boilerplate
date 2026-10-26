@@ -99,12 +99,12 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	// Tenant purgers are registered after every module is built, non-identity
 	// first and identity last: only identity deletes memberships, so every
 	// other module can still reach the rows its foreign keys reference.
-	filesModule.RegisterTenantPurge(tenancyRegistry, infra.DB, infra.Storage)
-	apikeysModule.RegisterTenantPurge(tenancyRegistry, infra.DB)
+	filesModule.RegisterTenantPurge(tenancyRegistry)
+	apikeysModule.RegisterTenantPurge(tenancyRegistry)
 	featuresModule := features.Build(infra)
-	featuresModule.RegisterTenantPurge(tenancyRegistry, infra.DB)
-	webhooksModule.RegisterTenantPurge(tenancyRegistry, infra.DB)
-	notificationsModule.RegisterTenantPurge(tenancyRegistry, infra.DB)
+	featuresModule.RegisterTenantPurge(tenancyRegistry)
+	webhooksModule.RegisterTenantPurge(tenancyRegistry)
+	notificationsModule.RegisterTenantPurge(tenancyRegistry)
 	identityModule.RegisterTenantPurge(tenancyRegistry)
 
 	return &Modules{

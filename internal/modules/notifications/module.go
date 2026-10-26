@@ -8,6 +8,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	notificationscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/catalog"
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
 	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
@@ -22,6 +23,7 @@ type Module struct {
 	retentionPurger *notificationsservice.RetentionPurger
 	notifier        notificationcontracts.Notifier
 	privacy         *notificationsprivacy.Provider
+	tenantPurger    tenancycontracts.Purger
 }
 
 var (

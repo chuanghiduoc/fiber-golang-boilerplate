@@ -273,7 +273,8 @@ erDiagram
   `pending_deletion` or `deleted`. Tenants are never hard-deleted, so every
   `tenants` reference is `RESTRICT`/`NO ACTION`. A `deleted` tenant keeps its
   row and `audit_events`; the hourly purge erases the memberships' per-user
-  data and every module's tenant-wide rows, then stamps `purged_at` (a
+  data and every module's tenant-wide rows in bounded 500-row pages (deleting
+  file/export blobs before their rows), then stamps `purged_at` (a
   `CHECK` allows it only on `deleted`).
 - **Users** are global. `email` is stored normalized (`CHECK (email =
   lower(btrim(email)))`) and the partial unique index `idx_users_email_live`

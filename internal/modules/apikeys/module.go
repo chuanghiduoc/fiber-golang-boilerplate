@@ -5,6 +5,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	apikeyhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/handler"
 	apikeysprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/privacy"
@@ -15,8 +16,9 @@ import (
 // the platform api-key middleware on other modules; this module only manages
 // their lifecycle.
 type Module struct {
-	handler *apikeyhandler.Handler
-	privacy *apikeysprivacy.Provider
+	handler      *apikeyhandler.Handler
+	privacy      *apikeysprivacy.Provider
+	tenantPurger tenancycontracts.Purger
 }
 
 var _ app.PrivacyProvider = (*Module)(nil)

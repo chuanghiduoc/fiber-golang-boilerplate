@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,16 +13,22 @@ import (
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
 type fakeTenantPurgeRepo struct {
-	tenants   []PurgeTenant
-	members   []int64
-	purged    []int64
-	events    []audit.Event
-	marked    bool
-	listErr   error
-	deleteErr error
+	tenants     []PurgeTenant
+	members     []int64
+	dataExports []DataExport
+	invitations int64
+	memberships int64
+	roles       int64
+	purged      []int64
+	events      []audit.Event
+	batchSizes  []int32
+	marked      bool
+	listErr     error
+	deleteErr   error
 }
 
 func (r *fakeTenantPurgeRepo) ListDeletedTenants(context.Context, int32) ([]PurgeTenant, error) {
@@ -42,17 +49,53 @@ func (r *fakeTenantPurgeRepo) ListMembershipUserIDs(_ context.Context, _, after 
 	return out, nil
 }
 
-func (r *fakeTenantPurgeRepo) ListDataExports(context.Context, int64) ([]DataExport, error) {
-	return nil, nil
+func (r *fakeTenantPurgeRepo) ListDataExports(_ context.Context, _ int64, limit int32) ([]DataExport, error) {
+	if len(r.dataExports) == 0 {
+		return nil, nil
+	}
+	n := int(limit)
+	if n > len(r.dataExports) {
+		n = len(r.dataExports)
+	}
+	return r.dataExports[:n], nil
 }
-func (r *fakeTenantPurgeRepo) DeleteDataExports(context.Context, int64) error {
-	return r.deleteErr
+
+func (r *fakeTenantPurgeRepo) DeleteDataExports(_ context.Context, _ int64, ids []int64) error {
+	if r.deleteErr != nil {
+		return r.deleteErr
+	}
+	r.batchSizes = append(r.batchSizes, int32(len(ids)))
+	r.dataExports = r.dataExports[len(ids):]
+	return nil
 }
-func (r *fakeTenantPurgeRepo) DeleteInvitations(context.Context, int64) error { return nil }
-func (r *fakeTenantPurgeRepo) DeleteMemberships(context.Context, int64) error { return nil }
-func (r *fakeTenantPurgeRepo) DeleteTenantRoles(context.Context, int64) error { return nil }
+
+func (r *fakeTenantPurgeRepo) DeleteInvitationsBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+	return r.batchDelete(&r.invitations, limit)
+}
+
+func (r *fakeTenantPurgeRepo) DeleteMembershipsBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+	return r.batchDelete(&r.memberships, limit)
+}
+
+func (r *fakeTenantPurgeRepo) DeleteTenantRolesBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+	return r.batchDelete(&r.roles, limit)
+}
+
 func (r *fakeTenantPurgeRepo) DeleteTenantSettings(context.Context, int64) error {
 	return nil
+}
+
+func (r *fakeTenantPurgeRepo) batchDelete(remaining *int64, limit int32) (int64, error) {
+	if r.deleteErr != nil {
+		return 0, r.deleteErr
+	}
+	r.batchSizes = append(r.batchSizes, limit)
+	deleted := int64(limit)
+	if *remaining < deleted {
+		deleted = *remaining
+	}
+	*remaining -= deleted
+	return deleted, nil
 }
 
 func (r *fakeTenantPurgeRepo) MarkPurged(_ context.Context, tenantID int64, event audit.Event) (bool, error) {
@@ -134,6 +177,50 @@ func TestTenantPurgeErasesMembersThenModulesThenIdentity(t *testing.T) {
 	assert.Equal(t, "tenant.purged", repo.events[0].Action)
 	assert.Equal(t, audit.ActorTypeSystem, repo.events[0].ActorType)
 	assert.Equal(t, int64(7), repo.events[0].TenantID)
+}
+
+// TestTenantPurgeDrainsTenantWideRowsInBoundedBatches proves identity's own
+// purger never loads a whole table: every delete is bounded by PurgeBatchSize
+// and repeats until the table is empty.
+func TestTenantPurgeDrainsTenantWideRowsInBoundedBatches(t *testing.T) {
+	const total = 1200
+	repo := &fakeTenantPurgeRepo{
+		invitations: total,
+		memberships: total,
+		roles:       total,
+	}
+	repo.dataExports = make([]DataExport, total)
+	for i := range repo.dataExports {
+		repo.dataExports[i] = DataExport{
+			ID: int64(i + 1), TenantID: 9,
+			StoragePath: fmt.Sprintf("9/exports/%d.json", i+1),
+		}
+	}
+	store := &purgeBlobStore{}
+	svc := NewTenantPurgeService(TenantPurgeDeps{Repo: repo, Storage: store})
+
+	require.NoError(t, svc.PurgeTenant(context.Background(), 9))
+
+	assert.Empty(t, repo.dataExports)
+	assert.Zero(t, repo.invitations)
+	assert.Zero(t, repo.memberships)
+	assert.Zero(t, repo.roles)
+	assert.Len(t, store.deleted, total, "every export blob is deleted before its row")
+	require.NotEmpty(t, repo.batchSizes)
+	for _, size := range repo.batchSizes {
+		assert.LessOrEqual(t, size, tenancycontracts.PurgeBatchSize,
+			"no delete page may exceed the shared batch bound")
+	}
+}
+
+type purgeBlobStore struct {
+	storage.Storage // unused methods fail loudly if called
+	deleted         []string
+}
+
+func (s *purgeBlobStore) Delete(_ context.Context, path string) error {
+	s.deleted = append(s.deleted, path)
+	return nil
 }
 
 func TestTenantPurgeFailureLeavesTheTenantUnmarkedAndRetries(t *testing.T) {

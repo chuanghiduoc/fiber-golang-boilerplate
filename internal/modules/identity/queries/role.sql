@@ -124,10 +124,16 @@ VALUES (NULL, @scope, @key, @name)
 ON CONFLICT (tenant_id, key) DO UPDATE SET scope = EXCLUDED.scope, name = EXCLUDED.name
 RETURNING *;
 
--- name: DeleteTenantRoles :exec
--- Tenant purge: custom roles of the tenant. role_permissions cascade, and the
--- memberships (with their membership_roles) were deleted first.
-DELETE FROM roles WHERE tenant_id = @tenant_id::bigint;
+-- name: DeleteTenantRolesBatch :execrows
+-- Tenant purge: custom roles of the tenant, one bounded id page per statement.
+-- role_permissions cascade, and the memberships (with their membership_roles)
+-- were deleted first.
+DELETE FROM roles
+WHERE id IN (
+    SELECT id FROM roles
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);
 
 -- name: ListUserRoleAssignments :many
 -- Export: the user's current membership role assignments in the request

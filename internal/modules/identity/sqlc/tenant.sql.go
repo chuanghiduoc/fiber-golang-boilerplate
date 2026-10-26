@@ -63,15 +63,19 @@ func (q *Queries) CreateTenantSettings(ctx context.Context, arg CreateTenantSett
 	return err
 }
 
-const deleteTenantSettings = `-- name: DeleteTenantSettings :exec
+const deleteTenantSettings = `-- name: DeleteTenantSettings :execrows
 DELETE FROM tenant_settings WHERE tenant_id = $1
 `
 
 // Tenant purge: the deleted tenant's configuration has no reader left. The
-// tenants row itself is kept for audit and incident review.
-func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID int64) error {
-	_, err := q.db.Exec(ctx, deleteTenantSettings, tenantID)
-	return err
+// primary key is tenant_id, so this affects at most one row and needs no
+// batching. The tenants row itself is kept for audit and incident review.
+func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantSettings, tenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getOperationalTenantByID = `-- name: GetOperationalTenantByID :one

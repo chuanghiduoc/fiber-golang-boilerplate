@@ -81,7 +81,8 @@ WHERE id = @id::bigint
   AND status = 'deleted'
   AND purged_at IS NULL;
 
--- name: DeleteTenantSettings :exec
+-- name: DeleteTenantSettings :execrows
 -- Tenant purge: the deleted tenant's configuration has no reader left. The
--- tenants row itself is kept for audit and incident review.
+-- primary key is tenant_id, so this affects at most one row and needs no
+-- batching. The tenants row itself is kept for audit and incident review.
 DELETE FROM tenant_settings WHERE tenant_id = $1;

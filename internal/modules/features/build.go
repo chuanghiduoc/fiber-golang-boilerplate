@@ -16,6 +16,7 @@ func Build(infra app.Infra) *Module {
 	repo := featuresrepo.New(infra.DB)
 	m := New(featureshandler.NewHandler(featuressvc.New(repo, infra.Flags, infra.Audit)))
 	m.privacy = featuresprivacy.New(featuresrepo.NewPrivacyStore(infra.DB))
+	m.tenantPurger = featuresrepo.NewTenantPurger(infra.DB)
 	return m
 }
 
