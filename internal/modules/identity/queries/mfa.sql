@@ -7,14 +7,23 @@ SELECT * FROM mfa_factors
 WHERE user_id = @user_id AND type = 'totp' AND confirmed_at IS NOT NULL;
 
 -- name: UpsertUnconfirmedMFAFactor :one
--- One pending enrollment per user. A concurrent re-enrollment keeps the secret
--- the first writer stored (the no-op update), so every caller can return the
--- same still-valid provisioning URI.
+-- One pending enrollment per user. Re-enrollment replaces the pending secret
+-- and resets its timestamp: only the most recently generated secret can be
+-- confirmed, and a stale pending enrollment expires.
 INSERT INTO mfa_factors (user_id, type, secret_ciphertext)
 VALUES (@user_id, 'totp', @secret_ciphertext)
 ON CONFLICT (user_id) WHERE type = 'totp' AND confirmed_at IS NULL
-DO UPDATE SET secret_ciphertext = mfa_factors.secret_ciphertext
+DO UPDATE SET secret_ciphertext = EXCLUDED.secret_ciphertext,
+              last_used_step = 0,
+              updated_at = NOW()
 RETURNING *;
+
+-- name: GetMFAFactorForUpdate :one
+-- Confirmation locks the pending factor so a concurrent enrollment cannot
+-- replace the secret between verification and the confirm update.
+SELECT * FROM mfa_factors
+WHERE user_id = @user_id AND type = 'totp'
+FOR UPDATE;
 
 -- name: ConfirmMFAFactor :execrows
 UPDATE mfa_factors
@@ -32,6 +41,12 @@ WHERE user_id = @user_id AND type = 'totp' AND confirmed_at IS NOT NULL
 -- name: DeleteMFAFactor :exec
 DELETE FROM mfa_factors
 WHERE user_id = @user_id AND type = 'totp';
+
+-- name: DeletePendingMFAFactor :exec
+-- A password change or reset removes an unconfirmed enrollment: whoever
+-- started it no longer proves control of the account.
+DELETE FROM mfa_factors
+WHERE user_id = @user_id AND type = 'totp' AND confirmed_at IS NULL;
 
 -- name: DeleteRecoveryCodes :exec
 DELETE FROM mfa_recovery_codes

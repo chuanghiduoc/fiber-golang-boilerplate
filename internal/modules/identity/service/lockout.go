@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -33,6 +34,41 @@ const (
 // reserveMFAAttempt counts one second-factor attempt for userID and rejects
 // it once the budget is spent. Only a successful verification clears it.
 func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	if attempts > maxMFAAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
+}
+
+// checkMFAAttemptBudget rejects a second-factor attempt once the per-user
+// budget is spent, without spending another attempt itself. Re-authentication
+// uses it so a correct password does not consume the TOTP budget.
+func checkMFAAttemptBudget(ctx context.Context, store cache.Cache, userID int64) error {
+	raw, err := store.Get(ctx, mfaAttemptKey(userID))
+	if err != nil {
+		return loginLockoutUnavailable(err)
+	}
+	attempts := 0
+	if len(raw) > 0 {
+		if attempts, err = strconv.Atoi(string(raw)); err != nil {
+			// An unreadable counter is treated as spent: fail closed rather
+			// than hand out unlimited guesses.
+			return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+		}
+	}
+	if attempts >= maxMFAAttempts {
+		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+	return nil
+}
+
+// recordFailedMFAAttempt spends one attempt after a failed re-authentication
+// proof and rejects the next request once the budget is exceeded.
+func recordFailedMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
 	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
 	if err != nil {
 		return loginLockoutUnavailable(err)

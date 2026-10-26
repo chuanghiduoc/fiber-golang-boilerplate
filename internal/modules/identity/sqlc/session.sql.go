@@ -13,23 +13,24 @@ import (
 )
 
 const createSession = `-- name: CreateSession :one
-INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip, amr)
-SELECT m.tenant_id, m.user_id, u.token_version, $1, $2, $3
+INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr)
+SELECT m.tenant_id, m.user_id, u.token_version, $1, $2, $3, $4
 FROM memberships m
 JOIN users u ON u.id = m.user_id
-WHERE m.tenant_id = $4 AND m.user_id = $5
+WHERE m.tenant_id = $5 AND m.user_id = $6
   AND m.status = 'active' AND u.status = 'active'
-  AND u.token_version = $6
-RETURNING id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at
+  AND u.token_version = $7
+RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at
 `
 
 type CreateSessionParams struct {
-	UserAgent    pgtype.Text `json:"user_agent"`
-	Ip           *netip.Addr `json:"ip"`
-	Amr          []string    `json:"amr"`
-	TenantID     int64       `json:"tenant_id"`
-	UserID       int64       `json:"user_id"`
-	TokenVersion int32       `json:"token_version"`
+	ExpiresAt    pgtype.Timestamptz `json:"expires_at"`
+	UserAgent    pgtype.Text        `json:"user_agent"`
+	Ip           *netip.Addr        `json:"ip"`
+	Amr          []string           `json:"amr"`
+	TenantID     int64              `json:"tenant_id"`
+	UserID       int64              `json:"user_id"`
+	TokenVersion int32              `json:"token_version"`
 }
 
 // A session is only created for an active member whose token version still
@@ -37,6 +38,7 @@ type CreateSessionParams struct {
 // window where a password change commits after the password check.
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, createSession,
+		arg.ExpiresAt,
 		arg.UserAgent,
 		arg.Ip,
 		arg.Amr,
@@ -50,6 +52,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.TenantID,
 		&i.UserID,
 		&i.TokenVersion,
+		&i.ExpiresAt,
 		&i.UserAgent,
 		&i.Ip,
 		&i.Amr,
@@ -63,7 +66,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
+SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1 AND id = $2
 `
 
@@ -80,6 +83,7 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 		&i.TenantID,
 		&i.UserID,
 		&i.TokenVersion,
+		&i.ExpiresAt,
 		&i.UserAgent,
 		&i.Ip,
 		&i.Amr,
@@ -93,7 +97,7 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 }
 
 const getSessionState = `-- name: GetSessionState :one
-SELECT s.tenant_id, s.revoked_at, m.status AS membership_status,
+SELECT s.tenant_id, s.revoked_at, s.expires_at, m.status AS membership_status,
        u.token_version, u.status AS user_status, t.status AS tenant_status,
        COALESCE((
            SELECT array_agg(r.key ORDER BY
@@ -139,6 +143,7 @@ type GetSessionStateParams struct {
 type GetSessionStateRow struct {
 	TenantID         int64              `json:"tenant_id"`
 	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
 	MembershipStatus string             `json:"membership_status"`
 	TokenVersion     int32              `json:"token_version"`
 	UserStatus       string             `json:"user_status"`
@@ -158,6 +163,7 @@ func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams
 	err := row.Scan(
 		&i.TenantID,
 		&i.RevokedAt,
+		&i.ExpiresAt,
 		&i.MembershipStatus,
 		&i.TokenVersion,
 		&i.UserStatus,
@@ -170,7 +176,7 @@ func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams
 }
 
 const listLiveSessionsCursor = `-- name: ListLiveSessionsCursor :many
-SELECT id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
+SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1::bigint AND user_id = $2::bigint
   AND revoked_at IS NULL
   AND (created_at, id) < ($3::timestamptz, $4::bigint)
@@ -206,6 +212,7 @@ func (q *Queries) ListLiveSessionsCursor(ctx context.Context, arg ListLiveSessio
 			&i.TenantID,
 			&i.UserID,
 			&i.TokenVersion,
+			&i.ExpiresAt,
 			&i.UserAgent,
 			&i.Ip,
 			&i.Amr,

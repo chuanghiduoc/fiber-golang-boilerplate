@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
@@ -25,7 +26,7 @@ func (f *fakeStates) SessionState(_ context.Context, _, _ int64) (State, error) 
 func activeState() State {
 	return State{
 		TenantID: 1, Role: "member", Permissions: []string{"profile:read"},
-		TokenVersion: 0, Active: true, TenantActive: true,
+		TokenVersion: 0, ExpiresAt: time.Now().Add(time.Hour), Active: true, TenantActive: true,
 	}
 }
 
@@ -123,7 +124,7 @@ func TestStore_RejectsMissingClaims(t *testing.T) {
 
 func TestStateOf(t *testing.T) {
 	snap := snapshot{TenantID: 1, Role: "admin", Permissions: []string{"admin:users:read"},
-		TokenVersion: 3, Active: true, TenantActive: true}
+		TokenVersion: 3, ExpiresAt: time.Now().Add(time.Hour), Active: true, TenantActive: true}
 	ok := Claims{UserID: 1, TenantID: 1, SessionID: 1, TokenVersion: 3}
 
 	state, err := stateOf(snap, ok)
@@ -153,5 +154,15 @@ func TestStateOf(t *testing.T) {
 	suspended.TenantActive = false
 	if _, err := stateOf(suspended, ok); err == nil {
 		t.Error("non-operational tenant must be rejected")
+	}
+	expired := snap
+	expired.ExpiresAt = time.Now().Add(-time.Second)
+	if _, err := stateOf(expired, ok); err == nil {
+		t.Error("an expired session must be rejected")
+	}
+	noExpiry := snap
+	noExpiry.ExpiresAt = time.Time{}
+	if _, err := stateOf(noExpiry, ok); err == nil {
+		t.Error("a snapshot without an expiry must fail closed")
 	}
 }

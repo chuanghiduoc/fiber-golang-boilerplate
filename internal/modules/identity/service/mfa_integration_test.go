@@ -25,6 +25,10 @@ import (
 // database guards under test do not depend on the ciphertext format.
 type testSealer struct{}
 
+// mfaIntegrationPassword is the local password of the MFA integration
+// fixtures, used to re-authenticate enrollment management.
+const mfaIntegrationPassword = "Password1!"
+
 func (testSealer) Seal(p []byte) ([]byte, error) { return append([]byte("sealed:"), p...), nil }
 
 func (testSealer) Open(p []byte) ([]byte, error) {
@@ -33,7 +37,7 @@ func (testSealer) Open(p []byte) ([]byte, error) {
 
 func enrollSecret(t *testing.T, e *env, userID int64) string {
 	t.Helper()
-	enrollment, err := e.mfa.EnrollTOTP(context.Background(), userID)
+	enrollment, err := e.mfa.EnrollTOTP(context.Background(), userID, 0, mfaIntegrationPassword)
 	require.NoError(t, err)
 	u, err := url.Parse(enrollment.OtpauthURI)
 	require.NoError(t, err)
@@ -52,13 +56,13 @@ func recoveryHash(code string) string {
 func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "step@example.com", testutil.MemberOptions{})
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "step@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	step := totp.Step(t0) + 1
@@ -80,13 +84,13 @@ func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "recovery@example.com", testutil.MemberOptions{})
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "recovery@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
 	t0 := time.Now()
 	code, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	codes, err := e.mfa.ConfirmTOTP(ctx, user.UserID, 0, code)
+	codes, err := e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 	require.Len(t, codes, 10)
 
@@ -110,13 +114,13 @@ func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "verify@example.com", testutil.MemberOptions{})
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "verify@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
 	t0 := time.Now()
 	first, err := totp.Code(secret, t0)
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, first)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, first)
 	require.NoError(t, err)
 	// Confirmation used step(t0); the login uses the next step, still inside
 	// the +/-1 acceptance window.
@@ -159,7 +163,7 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := context.Background()
-	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "confirm@example.com", testutil.MemberOptions{})
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "confirm@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
 	code, err := totp.Code(secret, time.Now())
@@ -171,7 +175,7 @@ func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, results[i] = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, code)
+			_, results[i] = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
 		}()
 	}
 	wg.Wait()

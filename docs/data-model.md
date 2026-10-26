@@ -177,6 +177,7 @@ erDiagram
         varchar user_agent
         inet ip
         text amr "pwd | google | otp | rc"
+        timestamptz expires_at "absolute session lifetime"
         timestamptz last_used_at
         timestamptz revoked_at "set together with revoked_reason"
         varchar revoked_reason "logout | logout_all | revoked | refresh_reuse | mfa_changed | ..."
@@ -324,6 +325,9 @@ erDiagram
   TOTP factor (partial unique `WHERE confirmed_at IS NOT NULL`) and one pending
   enrollment (`WHERE confirmed_at IS NULL`). The secret is sealed with
   `DATA_ENCRYPTION_KEY`; `last_used_step` makes one RFC 6238 step usable once.
+  Re-enrolling overwrites the pending secret and resets its timestamp; a
+  pending enrollment can only be confirmed within 15 minutes. A password change
+  or reset deletes a pending enrollment in the same transaction.
   `mfa_recovery_codes` stores SHA-256 hashes; `used_at` makes each code single
   use.
 - `api_keys.key_hash` is the only global (pre-tenant) lookup: the request

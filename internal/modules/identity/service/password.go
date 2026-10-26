@@ -84,15 +84,19 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 	return nil
 }
 
-// replacePassword stores the new hash (which bumps the token version) and
-// revokes every session and reset link: a password change ends every
-// existing session of the user in every tenant.
+// replacePassword stores the new hash (which bumps the token version), revokes
+// every session and reset link, and removes a pending MFA enrollment: a
+// password change ends every existing session of the user in every tenant and
+// whoever started an unconfirmed enrollment no longer proves account control.
 func replacePassword(ctx context.Context, st Stores, userID int64, hash string) error {
 	if _, err := st.Users.ReplacePassword(ctx, userID, hash); err != nil {
 		return userWriteError(err, "user not found", "failed to update password")
 	}
 	if err := st.Sessions.RevokeAllForUser(ctx, userID, RevokeCredentialsChanged); err != nil {
 		return apperror.NewInternal("failed to revoke sessions")
+	}
+	if err := st.MFA.DeletePendingTOTP(ctx, userID); err != nil {
+		return apperror.NewInternal("failed to delete pending MFA enrollment")
 	}
 	if err := st.Resets.DeleteByUser(ctx, userID); err != nil {
 		return apperror.NewInternal("failed to delete reset tokens")

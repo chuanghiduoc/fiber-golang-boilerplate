@@ -22,18 +22,26 @@ func NewMFAHandler(mfa service.MFAService) *MFAHandler {
 
 // Enroll godoc
 // @Summary Start TOTP enrollment
-// @Description Generate a TOTP secret and return its otpauth provisioning URI. The secret is never returned again; re-enrolling before confirmation replaces it.
+// @Description Generate a fresh TOTP secret and return its otpauth provisioning URI. Requires re-authentication: the current password (accounts with a local password) or a session created within the last 15 minutes (Google-only). Re-enrolling before confirmation replaces the pending secret, and a pending enrollment older than 15 minutes cannot be confirmed.
 // @Tags Auth
 // @Security BearerAuth
+// @Accept json
 // @Produce json
+// @Param request body dto.MFAEnrollRequest true "Re-authentication proof"
 // @Success 200 {object} dto.MFAEnrollResponse
+// @Failure 400 {object} apperror.ProblemDetails "current password is incorrect"
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails "auth.mfa_reauth_required"
 // @Failure 409 {object} apperror.ProblemDetails "auth.mfa_already_enabled"
+// @Failure 429 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/mfa/totp/enroll [post]
 func (h *MFAHandler) Enroll(c fiber.Ctx) error {
-	enrollment, err := h.mfa.EnrollTOTP(c.Context(), httpx.AuthUserID(c))
+	var req dto.MFAEnrollRequest
+	if err := httpx.BindAndValidate(c, &req); err != nil {
+		return err
+	}
+	enrollment, err := h.mfa.EnrollTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword)
 	if err != nil {
 		return err
 	}
@@ -42,16 +50,18 @@ func (h *MFAHandler) Enroll(c fiber.Ctx) error {
 
 // Confirm godoc
 // @Summary Confirm TOTP enrollment
-// @Description Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. This is the only time the recovery codes are shown.
+// @Description Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown.
 // @Tags Auth
 // @Security BearerAuth
 // @Accept json
 // @Produce json
-// @Param request body dto.MFAConfirmRequest true "TOTP code"
+// @Param request body dto.MFAConfirmRequest true "TOTP code and re-authentication proof"
 // @Success 200 {object} dto.MFARecoveryCodesResponse
+// @Failure 400 {object} apperror.ProblemDetails "current password is incorrect"
 // @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails "auth.mfa_reauth_required"
+// @Failure 409 {object} apperror.ProblemDetails "auth.mfa_already_enabled" or "auth.mfa_enrollment_expired"
+// @Failure 429 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
 // @Router /auth/mfa/totp/confirm [post]
 func (h *MFAHandler) Confirm(c fiber.Ctx) error {
@@ -59,11 +69,35 @@ func (h *MFAHandler) Confirm(c fiber.Ctx) error {
 	if err := httpx.BindAndValidate(c, &req); err != nil {
 		return err
 	}
-	codes, err := h.mfa.ConfirmTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.Code)
+	codes, err := h.mfa.ConfirmTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword, req.Code)
 	if err != nil {
 		return err
 	}
 	return response.Success(c, dto.MFARecoveryCodesResponse{RecoveryCodes: codes})
+}
+
+// PlatformReset godoc
+// @Summary Reset a user's MFA (platform)
+// @Description Remove the confirmed and pending TOTP factor and recovery codes, revoke every session of the user in every tenant, and bump the token version, so the account can enroll a new authenticator (platform permission).
+// @Tags Platform
+// @Security BearerAuth
+// @Param id path int true "User ID"
+// @Success 204
+// @Failure 401 {object} apperror.ProblemDetails
+// @Failure 403 {object} apperror.ProblemDetails
+// @Failure 404 {object} apperror.ProblemDetails
+// @Failure 429 {object} apperror.ProblemDetails
+// @Failure 500 {object} apperror.ProblemDetails
+// @Router /platform/users/{id}/mfa/reset [post]
+func (h *MFAHandler) PlatformReset(c fiber.Ctx) error {
+	id, err := httpx.ParamID(c, "id")
+	if err != nil {
+		return err
+	}
+	if err := h.mfa.ResetTOTP(c.Context(), id); err != nil {
+		return err
+	}
+	return response.NoContent(c)
 }
 
 // Disable godoc

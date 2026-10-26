@@ -422,7 +422,7 @@ func (r memSessions) Create(ctx context.Context, in NewSession) (*Session, error
 	}
 	now := time.Now()
 	s := &Session{ID: r.db.id(), TenantID: tid, UserID: in.UserID, TokenVersion: in.TokenVersion,
-		UserAgent: in.UserAgent, IP: in.IP, AMR: in.AMR, CreatedAt: now, LastUsedAt: now}
+		UserAgent: in.UserAgent, IP: in.IP, AMR: in.AMR, ExpiresAt: in.ExpiresAt, CreatedAt: now, LastUsedAt: now}
 	r.db.sessions[s.ID] = s
 	c := *s
 	return &c, nil
@@ -642,6 +642,10 @@ func (r memMFA) GetTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
 	return &c, nil
 }
 
+func (r memMFA) GetTOTPForUpdate(ctx context.Context, userID int64) (*MFAFactor, error) {
+	return r.GetTOTP(ctx, userID)
+}
+
 func (r memMFA) GetConfirmedTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
@@ -699,6 +703,15 @@ func (r memMFA) DeleteTOTP(_ context.Context, userID int64) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	delete(r.db.factors, userID)
+	return nil
+}
+
+func (r memMFA) DeletePendingTOTP(_ context.Context, userID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	if f, ok := r.db.factors[userID]; ok && f.ConfirmedAt == nil {
+		delete(r.db.factors, userID)
+	}
 	return nil
 }
 

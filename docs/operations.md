@@ -426,6 +426,11 @@ another reset email) instead of updating dead rows back to `queued`.
   it. Tokens without a positive `sid` (or `tenant_id`) claim are rejected with
   `401` fail-closed, so after deploying this release every user signs in again;
   no migration of old tokens is possible or needed.
+- `sessions.expires_at` is the absolute lifetime (`SESSION_MAX_LIFETIME`,
+  default `720h`). Each refresh token expires at
+  `min(now() + JWT_REFRESH_EXPIRE_DAYS, sessions.expires_at)`; the validator and
+  the refresh endpoint reject an expired session with `401`, so rotation can
+  never extend a session indefinitely.
 - Revocation reasons in `sessions.revoked_reason`: `logout`, `logout_all`,
   `revoked` (`DELETE /auth/sessions/:id`), `refresh_reuse`,
   `credentials_changed`, `membership_changed` (ban, removal, role change),

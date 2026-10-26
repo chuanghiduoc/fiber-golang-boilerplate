@@ -168,7 +168,7 @@ func TestAuditTx_BanRollsBackWhenAuditFails(t *testing.T) {
 	targetID := h.insertUser(t, tenant.DefaultID, "audit-target-ban@test.com", "user")
 	var sessionID int64
 	require.NoError(t, h.pool.QueryRow(context.Background(),
-		`INSERT INTO sessions (tenant_id, user_id, token_version) VALUES ($1, $2, 0) RETURNING id`,
+		`INSERT INTO sessions (tenant_id, user_id, token_version, expires_at) VALUES ($1, $2, 0, NOW() + INTERVAL '720 hours') RETURNING id`,
 		tenant.DefaultID, targetID).Scan(&sessionID))
 	_, err := h.pool.Exec(context.Background(),
 		`INSERT INTO refresh_tokens (tenant_id, session_id, token_hash, expires_at)

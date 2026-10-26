@@ -611,6 +611,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT NOT NULL,
     token_version INTEGER NOT NULL,
+    -- Absolute session lifetime (SESSION_MAX_LIFETIME). Refresh tokens never
+    -- outlive it, and the validator rejects the session past this instant.
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
     user_agent VARCHAR(512),
     ip INET,
     -- Authentication methods used to establish the session (RFC 8176). A

@@ -286,7 +286,7 @@ func baseValidConfig() Config {
 			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
 			RequestTimeout: 12, FrontendURL: "http://localhost:3000",
 		},
-		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30},
+		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30, SessionMaxLifetime: 720 * time.Hour},
 		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
 		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
@@ -404,6 +404,16 @@ func TestValidate_InvalidExpireHour(t *testing.T) {
 	cfg.JWT.ExpireHour = 0
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for ExpireHour < 1")
+	}
+}
+
+func TestValidate_InvalidSessionMaxLifetime(t *testing.T) {
+	for _, lifetime := range []time.Duration{0, -time.Hour} {
+		cfg := baseValidConfig()
+		cfg.JWT.SessionMaxLifetime = lifetime
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should fail for SessionMaxLifetime %s", lifetime)
+		}
 	}
 }
 
@@ -775,6 +785,7 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"wildcard CORS", func(c *Config) { c.CORS.AllowOrigins = "*" }},
 		{"http frontend", func(c *Config) { c.App.FrontendURL = "http://app.example.com" }},
 		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshExpireDays = 0 }},
+		{"session lifetime zero", func(c *Config) { c.JWT.SessionMaxLifetime = 0 }},
 		{"invalid env", func(c *Config) { c.App.Env = "prod" }},
 		{"missing metrics token", func(c *Config) { c.App.MetricsAuthToken = "" }},
 		{"tenant header not required", func(c *Config) { c.Tenant.RequireHeader = false }},

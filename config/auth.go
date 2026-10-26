@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
@@ -26,8 +27,11 @@ type JWTConfig struct {
 	// PreviousSecrets are comma-separated retired signing keys that still
 	// verify tokens during a rotation. They never sign.
 	PreviousSecrets   string `env:"JWT_PREVIOUS_SECRETS"`
-	ExpireHour        int    `env:"JWT_EXPIRE_HOUR" envDefault:"24"`
+	ExpireHour        int    `env:"JWT_EXPIRE_HOUR" envDefault:"1"`
 	RefreshExpireDays int    `env:"JWT_REFRESH_EXPIRE_DAYS" envDefault:"30"`
+	// SessionMaxLifetime is the absolute lifetime of a sign-in session. Every
+	// refresh token (initial or rotated) expires at the session's expiry.
+	SessionMaxLifetime time.Duration `env:"SESSION_MAX_LIFETIME" envDefault:"720h"`
 }
 
 // PreviousSecretList returns the parsed JWT_PREVIOUS_SECRETS entries.
@@ -96,6 +100,9 @@ func (j JWTConfig) validate() error {
 	}
 	if j.RefreshExpireDays < 1 {
 		return fmt.Errorf("JWT_REFRESH_EXPIRE_DAYS must be at least 1")
+	}
+	if j.SessionMaxLifetime <= 0 {
+		return fmt.Errorf("SESSION_MAX_LIFETIME must be greater than zero")
 	}
 	return nil
 }

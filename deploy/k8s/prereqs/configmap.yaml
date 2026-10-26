@@ -90,8 +90,9 @@ data:
   # ---------------------------------------------------------------------------
   # JWT (JWT_SECRET lives in the Secret)
   # ---------------------------------------------------------------------------
-  JWT_EXPIRE_HOUR: "24"
+  JWT_EXPIRE_HOUR: "1"
   JWT_REFRESH_EXPIRE_DAYS: "30"
+  SESSION_MAX_LIFETIME: "720h"
 
   # ---------------------------------------------------------------------------
   # Object storage (recommended for multi-replica production deployments)
