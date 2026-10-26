@@ -30,6 +30,7 @@ func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID
 		Permissions:  state.Permissions,
 		Platform:     state.Platform,
 		TokenVersion: state.TokenVersion,
+		ExpiresAt:    state.ExpiresAt,
 		Active: !state.Revoked &&
 			state.MembershipStatus == identityservice.MembershipStatusActive &&
 			state.UserStatus == identityservice.UserStatusActive,

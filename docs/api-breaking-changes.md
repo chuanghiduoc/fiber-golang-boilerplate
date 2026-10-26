@@ -40,3 +40,18 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
 
 No client can keep the old behavior: use the owning member's session to create
 or rotate their key.
+
+### 2026-10-26 — MFA enrollment requires re-authentication
+
+- `POST /api/v1/auth/mfa/totp/enroll` now requires a JSON body. Accounts with
+  a local password must send `{"currentPassword": "<password>"}`; a
+  Google-only account sends `{}` and must use a session created within the
+  last 15 minutes. A missing body is `400`.
+- `POST /api/v1/auth/mfa/totp/confirm` accepts the new optional
+  `currentPassword` field. Password accounts must send it (a wrong password is
+  the same `400` as the password-change flow); Google-only accounts omit it
+  and need the recent session.
+- Clients must re-authenticate before starting or confirming enrollment.
+  There is no v2 route for this security fix; update clients in the same
+  release. A pending enrollment is also valid for only 15 minutes
+  (`409 auth.mfa_enrollment_expired`); start a new enrollment after that.

@@ -129,8 +129,8 @@ func SessionTokenAMR(t testing.TB, ctx context.Context, pool *pgxpool.Pool, m Me
 		version   int32
 	)
 	err := pool.QueryRow(ctx, `
-		INSERT INTO sessions (tenant_id, user_id, token_version, amr)
-		SELECT m.tenant_id, m.user_id, u.token_version, $3
+		INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, amr)
+		SELECT m.tenant_id, m.user_id, u.token_version, NOW() + INTERVAL '720 hours', $3
 		FROM memberships m JOIN users u ON u.id = m.user_id
 		WHERE m.tenant_id = $1 AND m.user_id = $2
 		RETURNING id, token_version`,

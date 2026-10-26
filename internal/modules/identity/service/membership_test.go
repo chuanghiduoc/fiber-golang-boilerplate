@@ -69,7 +69,7 @@ func newTestSessions(db *memDB, signed *[]AccessClaims) *SessionService {
 		*signed = append(*signed, c)
 		return "access", nil
 	}
-	return NewSessionService(db.stores(), memTx{db}, sign, time.Hour, nil)
+	return NewSessionService(db.stores(), memTx{db}, sign, time.Hour, 720*time.Hour, nil)
 }
 
 func TestSessions_RotationAndReuseRevokesFamily(t *testing.T) {
@@ -152,6 +152,43 @@ func TestSessions_StaleTokenVersionCannotIssueOrRefresh(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err))
 	_, err = sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
 	assert.Equal(t, http.StatusUnauthorized, statusOf(err), "a password checked at the old version cannot open a session")
+}
+
+func TestSessions_RefreshTokenNeverOutlivesSession(t *testing.T) {
+	db := newMemDB()
+	ctx := context.Background()
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "life@example.com", Password: "Password1!", Name: "L"})
+	require.NoError(t, err)
+	sessionLifetime := 2 * time.Hour
+	sessions := NewSessionService(db.stores(), memTx{db}, func(AccessClaims) (string, error) { return "access", nil }, 30*24*time.Hour, sessionLifetime, nil)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
+	require.NoError(t, err)
+
+	sess := db.sessions[pair.SessionID]
+	assert.WithinDuration(t, time.Now().Add(sessionLifetime), sess.ExpiresAt, time.Minute)
+
+	token, err := db.stores().RefreshTokens.GetByHash(ctx, hashToken(pair.RefreshToken))
+	require.NoError(t, err)
+	assert.False(t, token.ExpiresAt.After(sess.ExpiresAt), "the refresh TTL must be capped by the session lifetime")
+}
+
+func TestSessions_ExpiredSessionCannotRefresh(t *testing.T) {
+	db := newMemDB()
+	ctx := context.Background()
+	user, err := newTestUserService(db).Register(ctx, RegisterInput{Email: "expired@example.com", Password: "Password1!", Name: "E"})
+	require.NoError(t, err)
+	var signed []AccessClaims
+	sessions := newTestSessions(db, &signed)
+	pair, err := sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
+	require.NoError(t, err)
+
+	db.mu.Lock()
+	db.sessions[pair.SessionID].ExpiresAt = time.Now().Add(-time.Second)
+	db.mu.Unlock()
+
+	_, err = sessions.Refresh(ctx, pair.RefreshToken, nil)
+	assert.Equal(t, http.StatusUnauthorized, statusOf(err))
+	assert.Empty(t, signed[1:], "an expired session must not mint an access token")
 }
 
 func TestAdmin_BanIsPerTenantAndProtectsLastOwner(t *testing.T) {

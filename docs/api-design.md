@@ -224,7 +224,12 @@ flowchart TD
   issuing tenant. Presenting an already-used refresh token is reuse: the whole
   session is revoked (`refresh_reuse`) and the call returns `401
   auth.refresh_invalid`, so both the legitimate client and an attacker must
-  sign in again. Access tokens are short-lived.
+  sign in again. Access tokens are short-lived (`JWT_EXPIRE_HOUR`, default 1).
+- A session has an absolute lifetime (`SESSION_MAX_LIFETIME`, default `720h`).
+  Every refresh token, initial or rotated, expires at
+  `min(now() + JWT_REFRESH_EXPIRE_DAYS, sessions.expires_at)`, and both the
+  session validator and the refresh endpoint reject an expired session with
+  `401`.
 - `POST /auth/logout-all` requires `sessions:revoke` (the `member` role and
   therefore every role holds it), revokes every session of the user in every
   tenant, and bumps the token version, invalidating access tokens immediately.
@@ -245,12 +250,20 @@ are available per global user, not per tenant.
 
 | Endpoint | Auth | Behavior |
 |---|---|---|
-| `POST /auth/mfa/totp/enroll` | JWT, `mfa:write` | Start or restart a pending enrollment; returns `{type, otpauthUri}`. The secret is only inside the URI. |
-| `POST /auth/mfa/totp/confirm` | JWT, `mfa:write` | Verify a code, enable the factor, revoke the user's other sessions, and return ten recovery codes once. |
+| `POST /auth/mfa/totp/enroll` | JWT, `mfa:write`, re-auth | Start or restart a pending enrollment and return `{type, otpauthUri}`. Re-enrolling generates a fresh secret (last writer wins) and resets the 15-minute window. Requires `currentPassword` for accounts with a local password; a Google-only account instead needs a session created within the last 15 minutes. |
+| `POST /auth/mfa/totp/confirm` | JWT, `mfa:write`, re-auth | Require re-authentication (`currentPassword`, or the recent-session rule), verify the code against the currently stored pending secret, enable the factor, revoke the user's other sessions, and return ten recovery codes once. A pending enrollment older than 15 minutes is `409 auth.mfa_enrollment_expired`. |
 | `POST /auth/mfa/disable` | JWT, `mfa:write` | Require a current TOTP or recovery code, delete the factor and codes, revoke other sessions. |
 | `POST /auth/mfa/recovery-codes/regenerate` | JWT, `mfa:write` | Require a code and return a fresh set of ten; the old set stops working. |
 | `GET /auth/mfa/status` | JWT, `mfa:read` | `{enabled, confirmedAt?, recoveryCodesRemaining}`. |
 | `POST /auth/mfa/verify` | public | `{challenge, code}` → the normal login response. The challenge is sealed, tenant-bound, five minutes old at most, and single use. |
+| `POST /platform/users/:id/mfa/reset` | JWT, `platform:users:mfa_reset`, MFA session | Platform recovery for a user who lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`, Tier 1 audit. `404` for an unknown user. |
+
+Enrollment management is a credential change, so a mere access token is not
+enough: an account with a local password proves it with `currentPassword`
+(counted against the per-user second-factor budget; a correct password does
+not clear it), and a passwordless account proves a fresh interactive sign-in.
+A password change or reset also deletes any pending enrollment in the same
+transaction.
 
 With a confirmed factor, `POST /auth/login` and the Google callback do not
 issue tokens. Login returns `200` with the user, `mfaRequired: true`, and
@@ -277,8 +290,8 @@ Token-minting endpoints never take `Idempotency-Key`.
 | Authenticated requests | Use the JWT claim or the key's tenant. An explicit header resolving elsewhere is `403 permission.denied` (`tenant mismatch`). An API key without a header stays usable for its own tenant. The key owner's membership, effective permissions, and tenant status are re-read on every authentication, so bans, removals, deletions, role/permission changes, and suspensions apply immediately (`401`/`403`). |
 | Slug cache | `tenant.CachedResolver`: 30s for hits, 5s for unknown slugs, 1,024 entries per process. Suspension reaches header-resolved public routes within 30s; authenticated requests are rejected independently by the session/API-key checks. |
 | Scoping | Users are global: an email and a Google subject belong to one live account across all tenants, and a user joins tenants through memberships. Login, registration, refresh, and member lists use the request tenant; login needs an active membership there. Password reset and email verification are per user and ignore the tenant for the token lookup. Non-member user ids and cross-tenant file/notification ids return `404`, refresh tokens of another tenant `401`. |
-| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. |
-| Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. |
+| OAuth | Tenant bound into the signed `state`; the callback ignores `X-Tenant-Slug` and rejects unknown or suspended tenants (including mid-flow). Require-header mode does not block it. A provider 4xx on the code exchange stays `400`; a 5xx, timeout, or network failure is `502 auth.oauth_upstream_unavailable`, and logs carry only the error class and upstream status. |
+| Logout | `POST /auth/logout` revokes the session of the presented refresh token by possession, with or without the header; `204` even if already gone. The single revoke statement runs with RLS bypass because possession of the token is the authorization, so a tenant-B session is revoked even when the client omits `X-Tenant-Slug`. |
 | Idempotency | Scope includes tenant ID/slug, so the same key/body/IP in another tenant is a new request. |
 | Responses | `UserResponse`/`FileResponse` include additive `tenantId`; `UserResponse` is the user as a member of that tenant (`role`, `roles`, `membershipStatus`, `joinedAt`, `bannedAt`). `role` is the highest system role key (`owner` > `admin` > `member`); `roles` lists every assigned role key. |
 | Remaining | Per-tenant limits/quotas. |
@@ -369,6 +382,7 @@ permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, oth
 | `POST /platform/tenants` | `platform:tenants:write`, `Idempotency-Key` | Creates a tenant (default status `active`, or `trialing` with a future `trialEndsAt`) and its settings, and makes the caller its first `owner`. A duplicate slug is `409`. Tier 1 (`tenant.created`). |
 | `GET /platform/tenants/:id` | `platform:tenants:read` | Any tenant by id in any state. |
 | `PATCH /platform/tenants/:id/status` | `platform:tenants:write`, `Idempotency-Key` | Moves a tenant along the lifecycle state machine; an invalid transition is `409`, and the default tenant cannot be deleted. Tier 1 (`tenant.status_changed`). |
+| `POST /platform/users/:id/mfa/reset` | `platform:users:mfa_reset` (JWT only), `Idempotency-Key` | Recovery when a user lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`. `404` for an unknown user. Tier 1 (`admin.user.mfa_reset`). |
 
 Global feature-flag rows (database default, kill switch, delete) require
 `platform:features:write` in addition to the tenant feature permissions; tenant

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -15,6 +17,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
 )
+
+// testMFAPassword is the local password of the MFA harness user.
+const testMFAPassword = "Password1!"
 
 // reversibleSealer is a deterministic test sealer; production uses
 // jobs.PayloadCodec (AES-256-GCM).
@@ -55,7 +60,7 @@ func newMFAHarness(t *testing.T) *mfaHarness {
 			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion, AMR: c.AMR,
 		}, "mfa-test-jwt-secret-0000000000000", 1)
 	}
-	h.sessions = NewSessionService(db.stores(), memTx{db}, sign, time.Hour, nil)
+	h.sessions = NewSessionService(db.stores(), memTx{db}, sign, time.Hour, 720*time.Hour, nil)
 	h.svc = NewMFAService(MFADeps{
 		Stores: db.stores(), Tx: memTx{db}, Cache: cache.NewMemoryCache(),
 		Sealer: reversibleSealer{}, Sessions: h.sessions, Now: h.clock.now,
@@ -66,6 +71,10 @@ func newMFAHarness(t *testing.T) *mfaHarness {
 
 func (h *mfaHarness) seedUser(id int64, email string) {
 	now := time.Unix(1_700_000_000, 0)
+	hash, err := bcrypt.GenerateFromPassword([]byte(testMFAPassword), bcrypt.MinCost)
+	if err != nil {
+		panic(err)
+	}
 	h.db.mu.Lock()
 	defer h.db.mu.Unlock()
 	h.db.users[id] = &User{
@@ -76,14 +85,14 @@ func (h *mfaHarness) seedUser(id int64, email string) {
 		ID: h.db.id(), TenantID: 1, UserID: id, Role: RoleMember,
 		Status: MembershipStatusActive, CreatedAt: now, UpdatedAt: now,
 	}
-	h.db.passwords[id] = "hash"
+	h.db.passwords[id] = string(hash)
 }
 
 // enrollAndConfirm returns the secret and the plaintext recovery codes.
 func (h *mfaHarness) enrollAndConfirm(t *testing.T) (secret string, codes []string) {
 	t.Helper()
 	ctx := context.Background()
-	enrollment, err := h.svc.EnrollTOTP(ctx, 100)
+	enrollment, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -92,7 +101,7 @@ func (h *mfaHarness) enrollAndConfirm(t *testing.T) (secret string, codes []stri
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	codes, err = h.svc.ConfirmTOTP(ctx, 100, 1, code)
+	codes, err = h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, code)
 	if err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
@@ -126,6 +135,208 @@ func errorCode(err error) string {
 	return ""
 }
 
+func TestMFAEnrollRequiresCurrentPassword(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, ""); statusOf(err) != 400 {
+		t.Fatalf("enroll without a password err = %v, want 400", err)
+	}
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, "wrong-password"); statusOf(err) != 400 {
+		t.Fatalf("enroll with a wrong password err = %v, want 400", err)
+	}
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword); err != nil {
+		t.Fatalf("enroll with the current password: %v", err)
+	}
+}
+
+// A wrong current password spends the per-user second-factor budget, so a
+// stolen access token cannot brute-force the password through enroll.
+func TestMFAEnrollWrongPasswordSpendsSecondFactorBudget(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	for i := range maxMFAAttempts {
+		if _, err := h.svc.EnrollTOTP(ctx, 100, 1, "wrong-password"); statusOf(err) != 400 {
+			t.Fatalf("attempt %d: err = %v, want 400", i+1, err)
+		}
+	}
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword); statusOf(err) != 429 {
+		t.Fatalf("enroll after the budget err = %v, want 429", err)
+	}
+}
+
+// A passwordless account must have signed in within the re-authentication
+// window; an old session (or no session) is refused.
+func TestMFAEnrollPasswordlessRequiresRecentSession(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	h.db.mu.Lock()
+	delete(h.db.passwords, 100)
+	h.db.mu.Unlock()
+
+	old, err := h.sessions.Issue(ctx, 100, 0, []string{AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue old session: %v", err)
+	}
+	h.db.mu.Lock()
+	h.db.sessions[old.SessionID].CreatedAt = h.clock.at.Add(-mfaReauthSessionMaxAge - time.Minute)
+	h.db.mu.Unlock()
+	if _, err := h.svc.EnrollTOTP(ctx, 100, old.SessionID, ""); errorCode(err) != string(identitycatalog.CodeAuthMFAReauthRequired) {
+		t.Fatalf("old session err = %v, want mfa_reauth_required", err)
+	}
+
+	fresh, err := h.sessions.Issue(ctx, 100, 0, []string{AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue fresh session: %v", err)
+	}
+	h.db.mu.Lock()
+	h.db.sessions[fresh.SessionID].CreatedAt = h.clock.at
+	h.db.mu.Unlock()
+	if _, err := h.svc.EnrollTOTP(ctx, 100, fresh.SessionID, ""); err != nil {
+		t.Fatalf("fresh session enroll: %v", err)
+	}
+}
+
+// Re-enrolling replaces the pending secret; only the newest URI can confirm.
+func TestMFAEnrollReplacesPendingSecret(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	first, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
+	if err != nil {
+		t.Fatalf("first enroll: %v", err)
+	}
+	firstSecret := secretFromURI(t, first.OtpauthURI)
+
+	h.clock.at = h.clock.at.Add(time.Minute)
+	second, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
+	if err != nil {
+		t.Fatalf("second enroll: %v", err)
+	}
+	secondSecret := secretFromURI(t, second.OtpauthURI)
+	if firstSecret == secondSecret {
+		t.Fatal("re-enrollment reused the pending secret")
+	}
+
+	firstCode, err := totp.Code(firstSecret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, firstCode); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
+		t.Fatalf("confirm with replaced secret err = %v, want mfa_invalid_code", err)
+	}
+	secondCode, err := totp.Code(secondSecret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, secondCode); err != nil {
+		t.Fatalf("confirm with the current secret: %v", err)
+	}
+}
+
+func TestMFAConfirmRejectsExpiredEnrollment(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	enrollment, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
+	if err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	secret := secretFromURI(t, enrollment.OtpauthURI)
+	h.db.mu.Lock()
+	h.db.factors[100].UpdatedAt = h.clock.at.Add(-mfaEnrollmentTTL - time.Second)
+	h.db.mu.Unlock()
+
+	code, err := totp.Code(secret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, code); errorCode(err) != string(identitycatalog.CodeAuthMFAEnrollmentExpired) {
+		t.Fatalf("expired enrollment err = %v, want mfa_enrollment_expired", err)
+	}
+}
+
+func TestMFAConfirmRequiresCurrentPassword(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	enrollment, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
+	if err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	secret := secretFromURI(t, enrollment.OtpauthURI)
+	code, err := totp.Code(secret, h.clock.at)
+	if err != nil {
+		t.Fatalf("totp.Code: %v", err)
+	}
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, "wrong-password", code); statusOf(err) != 400 {
+		t.Fatalf("confirm with a wrong password err = %v, want 400", err)
+	}
+}
+
+// A password change removes a pending enrollment in the same transaction, so
+// an enrollment started before the change cannot be confirmed afterwards.
+func TestPasswordChangeDeletesPendingMFA(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword); err != nil {
+		t.Fatalf("EnrollTOTP: %v", err)
+	}
+	users := NewUserService(UserDeps{
+		Stores: h.db.stores(), Tx: memTx{h.db}, Cache: cache.NewMemoryCache(),
+	})
+	if err := users.ChangePassword(ctx, 100, ChangePasswordInput{
+		CurrentPassword: testMFAPassword, NewPassword: "NewPassword1!",
+	}); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	if _, ok := h.db.factors[100]; ok {
+		t.Fatal("password change left the pending MFA enrollment")
+	}
+}
+
+// The platform reset removes the factor, recovery codes, all sessions, and
+// bumps the token version, and records a Tier 1 audit event.
+func TestMFAResetTOTP(t *testing.T) {
+	h := newMFAHarness(t)
+	ctx := context.Background()
+	_, _ = h.enrollAndConfirm(t)
+	current, err := h.sessions.Issue(ctx, 100, h.db.users[100].TokenVersion, []string{AMRPassword})
+	if err != nil {
+		t.Fatalf("Issue session: %v", err)
+	}
+	version := h.db.users[100].TokenVersion
+
+	if err := h.svc.ResetTOTP(ctx, 100); err != nil {
+		t.Fatalf("ResetTOTP: %v", err)
+	}
+	if _, ok := h.db.factors[100]; ok {
+		t.Fatal("reset left the MFA factor")
+	}
+	if len(h.db.recovery[100]) != 0 {
+		t.Fatal("reset left recovery codes")
+	}
+	if h.db.sessions[current.SessionID].RevokedAt == nil {
+		t.Fatal("reset left the user's session live")
+	}
+	if h.db.users[100].TokenVersion <= version {
+		t.Fatal("reset did not bump the token version")
+	}
+	found := false
+	for _, event := range h.db.audits {
+		if event.Action == "admin.user.mfa_reset" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("reset did not write its audit event")
+	}
+}
+
+func TestMFAResetUnknownUser(t *testing.T) {
+	h := newMFAHarness(t)
+	if err := h.svc.ResetTOTP(context.Background(), 999); statusOf(err) != 404 {
+		t.Fatalf("reset unknown user err = %v, want 404", err)
+	}
+}
+
 func TestMFAEnrollConfirmAndTOTPLogin(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := context.Background()
@@ -138,7 +349,7 @@ func TestMFAEnrollConfirmAndTOTPLogin(t *testing.T) {
 	if !status.Enabled || status.RecoveryCodesRemaining != 10 {
 		t.Fatalf("status = %+v, want enabled with 10 codes", status)
 	}
-	if _, err := h.svc.EnrollTOTP(ctx, 100); errorCode(err) != string(identitycatalog.CodeAuthMFAAlreadyEnabled) {
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword); errorCode(err) != string(identitycatalog.CodeAuthMFAAlreadyEnabled) {
 		t.Fatalf("second enroll err = %v, want mfa_already_enabled", err)
 	}
 
@@ -318,10 +529,10 @@ func TestMFARegenerateRecoveryCodes(t *testing.T) {
 func TestMFAConfirmRejectsInvalidCode(t *testing.T) {
 	h := newMFAHarness(t)
 	ctx := context.Background()
-	if _, err := h.svc.EnrollTOTP(ctx, 100); err != nil {
+	if _, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword); err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, "000000"); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, 1, testMFAPassword, "000000"); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
 		t.Fatalf("confirm invalid code err = %v, want mfa_invalid_code", err)
 	}
 }
@@ -363,7 +574,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 		signed = append(signed, c)
 		return "access", nil
 	}
-	sessions := NewSessionService(db.stores(), memTx{db}, sign, time.Hour, nil)
+	sessions := NewSessionService(db.stores(), memTx{db}, sign, time.Hour, 720*time.Hour, nil)
 	users := NewUserService(UserDeps{
 		Stores: db.stores(), Tx: memTx{db}, Cache: cache.NewMemoryCache(), Sessions: sessions,
 	})
@@ -387,7 +598,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	}
 
 	// Enroll and confirm a TOTP factor for the Google account.
-	enrollment, err := mfa.EnrollTOTP(ctx, first.Member.User.ID)
+	enrollment, err := mfa.EnrollTOTP(ctx, first.Member.User.ID, first.Tokens.SessionID, "")
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -396,7 +607,7 @@ func TestGoogleSignInTwoStep(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := mfa.ConfirmTOTP(ctx, first.Member.User.ID, 0, code); err != nil {
+	if _, err := mfa.ConfirmTOTP(ctx, first.Member.User.ID, first.Tokens.SessionID, "", code); err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
 
@@ -445,7 +656,7 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 		t.Fatalf("Issue other: %v", err)
 	}
 
-	enrollment, err := h.svc.EnrollTOTP(ctx, 100)
+	enrollment, err := h.svc.EnrollTOTP(ctx, 100, 1, testMFAPassword)
 	if err != nil {
 		t.Fatalf("EnrollTOTP: %v", err)
 	}
@@ -454,7 +665,7 @@ func TestMFAConfirmRevokesOtherSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("totp.Code: %v", err)
 	}
-	if _, err := h.svc.ConfirmTOTP(ctx, 100, current.SessionID, code); err != nil {
+	if _, err := h.svc.ConfirmTOTP(ctx, 100, current.SessionID, testMFAPassword, code); err != nil {
 		t.Fatalf("ConfirmTOTP: %v", err)
 	}
 	if h.db.sessions[other.SessionID].RevokedAt == nil {

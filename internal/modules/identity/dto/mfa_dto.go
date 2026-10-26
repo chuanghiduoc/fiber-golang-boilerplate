@@ -9,8 +9,17 @@ type MFAEnrollResponse struct {
 	OtpauthURI string `json:"otpauthUri"`
 }
 
+// MFAEnrollRequest re-authenticates the caller before a new factor is bound.
+// CurrentPassword is required for an account with a local password; a
+// Google-only account proves a recent interactive sign-in instead.
+type MFAEnrollRequest struct {
+	CurrentPassword string `json:"currentPassword" validate:"omitempty,max=128"`
+}
+
 type MFAConfirmRequest struct {
 	Code string `json:"code" validate:"required,max=64"`
+	// CurrentPassword re-authenticates the caller (password accounts).
+	CurrentPassword string `json:"currentPassword" validate:"omitempty,max=128"`
 }
 
 // MFARecoveryCodesResponse is returned once, on confirmation and on

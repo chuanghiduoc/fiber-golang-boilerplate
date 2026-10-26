@@ -172,6 +172,14 @@ func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
 	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)
 	tenants.Get("/:id", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.GetTenant)
 	tenants.Patch("/:id/status", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.UpdateTenantStatus)
+
+	if m.mfa != nil {
+		// MFA recovery is JWT-only (an API key has no second factor to
+		// recover) and runs the same platform chain: limiter, second factor,
+		// platform permission, idempotency, handler.
+		users := v1.Group("/platform/users", middleware.JWTAuthKeys(deps.Config.JWT.Keyring(), deps.Sessions))
+		users.Post("/:id/mfa/reset", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformUsersMFAReset), deps.Idempotency, m.mfa.PlatformReset)
+	}
 }
 
 // registerPrivacyRoutes mounts the caller's exports/erasure and the admin

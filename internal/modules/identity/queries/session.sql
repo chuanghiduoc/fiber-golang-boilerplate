@@ -2,8 +2,8 @@
 -- A session is only created for an active member whose token version still
 -- equals the one the caller authenticated at. This closes the bcrypt-length
 -- window where a password change commits after the password check.
-INSERT INTO sessions (tenant_id, user_id, token_version, user_agent, ip, amr)
-SELECT m.tenant_id, m.user_id, u.token_version, @user_agent, @ip, @amr
+INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr)
+SELECT m.tenant_id, m.user_id, u.token_version, @expires_at, @user_agent, @ip, @amr
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = @tenant_id AND m.user_id = @user_id
@@ -19,6 +19,7 @@ WHERE tenant_id = $1 AND id = $2;
 SELECT * FROM sessions
 WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint
   AND revoked_at IS NULL
+  AND expires_at > NOW()
   AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
@@ -70,7 +71,7 @@ WHERE tenant_id = @tenant_id AND id = @id;
 -- and revocation), the membership status and effective permissions (tenant
 -- roles plus platform assignments), the user's token version and status, and
 -- the tenant's status. role_keys is ordered owner, admin, member.
-SELECT s.tenant_id, s.revoked_at, m.status AS membership_status,
+SELECT s.tenant_id, s.revoked_at, s.expires_at, m.status AS membership_status,
        u.token_version, u.status AS user_status, t.status AS tenant_status,
        COALESCE((
            SELECT array_agg(r.key ORDER BY
@@ -114,6 +115,7 @@ WHERE s.id = $1 AND s.user_id = $2;
 WITH batch AS (
     SELECT s.id FROM sessions s
     WHERE (s.revoked_at IS NOT NULL AND s.revoked_at < @revoked_before::timestamptz)
+       OR s.expires_at < NOW()
        OR (s.last_used_at < @idle_before::timestamptz
            AND NOT EXISTS (
                SELECT 1 FROM refresh_tokens r

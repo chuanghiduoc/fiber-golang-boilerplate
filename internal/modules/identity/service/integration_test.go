@@ -94,7 +94,7 @@ func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 	tx := identityrepo.NewTransactor(testutil.NewTxManager(pool), recorder, nil, nil)
 	mail := &mailbox{}
 	sign := func(c service.AccessClaims) (string, error) { return "access", nil }
-	sessions := service.NewSessionService(stores, tx, sign, time.Hour, nil)
+	sessions := service.NewSessionService(stores, tx, sign, time.Hour, 720*time.Hour, nil)
 	verify := service.NewEmailVerificationService(service.VerificationDeps{
 		Stores: stores, Tx: tx, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",
 	})

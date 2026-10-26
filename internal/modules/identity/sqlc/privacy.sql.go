@@ -352,7 +352,7 @@ func (q *Queries) ListPurgeableDataExports(ctx context.Context, batchSize int32)
 }
 
 const listUserSessionsForPrivacy = `-- name: ListUserSessionsForPrivacy :many
-SELECT id, tenant_id, user_id, token_version, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
+SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1::bigint AND user_id = $2::bigint
 ORDER BY created_at DESC, id DESC
 `
@@ -376,6 +376,7 @@ func (q *Queries) ListUserSessionsForPrivacy(ctx context.Context, arg ListUserSe
 			&i.TenantID,
 			&i.UserID,
 			&i.TokenVersion,
+			&i.ExpiresAt,
 			&i.UserAgent,
 			&i.Ip,
 			&i.Amr,

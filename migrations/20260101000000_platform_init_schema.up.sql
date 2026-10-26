@@ -611,6 +611,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id),
     user_id BIGINT NOT NULL,
     token_version INTEGER NOT NULL,
+    -- Absolute session lifetime (SESSION_MAX_LIFETIME). Refresh tokens never
+    -- outlive it, and the validator rejects the session past this instant.
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
     user_agent VARCHAR(512),
     ip INET,
     -- Authentication methods used to establish the session (RFC 8176). A
@@ -639,9 +642,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_tenant_user_created_at
 CREATE INDEX IF NOT EXISTS idx_sessions_user_live
     ON sessions (user_id)
     WHERE revoked_at IS NULL;
--- The session purge (revoked or idle sessions without live refresh tokens).
+-- The session purge (revoked, expired, or idle sessions without live refresh
+-- tokens).
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at
     ON sessions (last_used_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+    ON sessions (expires_at);
 
 DROP TRIGGER IF EXISTS trigger_sessions_updated_at ON sessions;
 CREATE TRIGGER trigger_sessions_updated_at

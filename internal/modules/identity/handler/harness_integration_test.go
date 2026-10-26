@@ -79,7 +79,7 @@ func newIdentityHarness(t *testing.T, google GoogleOAuthProvider) *identityHarne
 			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion,
 		}, harnessSecret, 1)
 	}
-	sessions := identityservice.NewSessionService(stores, transactor, sign, time.Hour, sessionStore)
+	sessions := identityservice.NewSessionService(stores, transactor, sign, time.Hour, 720*time.Hour, sessionStore)
 	mail := &recordingSender{}
 	verification := identityservice.NewEmailVerificationService(identityservice.VerificationDeps{
 		Stores: stores, Tx: transactor, Sender: mail, Cache: appCache, FrontendURL: "https://app.example.test",

@@ -106,7 +106,7 @@ func TestSchemaConstraints(t *testing.T) {
 		requireFKViolation(t, err, "fk_api_keys_tenant_user")
 
 		_, err = pool.Exec(ctx,
-			`INSERT INTO sessions (tenant_id, user_id, token_version) VALUES ($1, $2, 0)`, tenantB, userA)
+			`INSERT INTO sessions (tenant_id, user_id, token_version, expires_at) VALUES ($1, $2, 0, NOW() + INTERVAL '720 hours')`, tenantB, userA)
 		requireFKViolation(t, err, "fk_sessions_membership")
 	})
 

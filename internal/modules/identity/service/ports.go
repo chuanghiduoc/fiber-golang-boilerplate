@@ -250,15 +250,17 @@ type Principal struct {
 
 // Session is one sign-in in one tenant: the refresh-token family.
 type Session struct {
-	ID            int64
-	TenantID      int64
-	UserID        int64
-	TokenVersion  int32
-	UserAgent     string
-	IP            string
-	AMR           []string
-	LastUsedAt    time.Time
-	CreatedAt     time.Time
+	ID           int64
+	TenantID     int64
+	UserID       int64
+	TokenVersion int32
+	UserAgent    string
+	IP           string
+	AMR          []string
+	LastUsedAt   time.Time
+	CreatedAt    time.Time
+	// ExpiresAt is the absolute session lifetime (SESSION_MAX_LIFETIME).
+	ExpiresAt     time.Time
 	RevokedAt     *time.Time
 	RevokedReason RevokeReason
 }
@@ -269,8 +271,10 @@ type NewSession struct {
 	// TokenVersion is the user's version the caller authenticated at; the
 	// insert fails (apperror.ErrNotFound) when it is stale.
 	TokenVersion int32
-	UserAgent    string
-	IP           string
+	// ExpiresAt is now + SESSION_MAX_LIFETIME; refresh tokens never outlive it.
+	ExpiresAt time.Time
+	UserAgent string
+	IP        string
 	// AMR is the authentication-method reference set (pwd, google, otp, rc).
 	AMR []string
 }
@@ -279,6 +283,7 @@ type NewSession struct {
 type SessionState struct {
 	TenantID         int64
 	Revoked          bool
+	ExpiresAt        time.Time
 	Role             string
 	Permissions      []string
 	Platform         bool
@@ -412,8 +417,12 @@ type MFARepository interface {
 	// GetTOTP returns the user's TOTP factor (confirmed or pending); the
 	// service distinguishes them through ConfirmedAt.
 	GetTOTP(ctx context.Context, userID int64) (*MFAFactor, error)
+	// GetTOTPForUpdate is GetTOTP holding the row until the surrounding
+	// transaction ends, so confirmation verifies the secret stored at confirm
+	// time.
+	GetTOTPForUpdate(ctx context.Context, userID int64) (*MFAFactor, error)
 	GetConfirmedTOTP(ctx context.Context, userID int64) (*MFAFactor, error)
-	// UpsertUnconfirmedTOTP replaces a pending enrollment.
+	// UpsertUnconfirmedTOTP replaces a pending enrollment (last writer wins).
 	UpsertUnconfirmedTOTP(ctx context.Context, userID int64, secretCiphertext string) (*MFAFactor, error)
 	// ConfirmTOTP marks a pending factor confirmed and records step as used.
 	ConfirmTOTP(ctx context.Context, id, userID, step int64) (bool, error)
@@ -421,6 +430,8 @@ type MFARepository interface {
 	// which makes concurrent uses of one code unable to both succeed.
 	ConsumeTOTPStep(ctx context.Context, userID, step int64) (bool, error)
 	DeleteTOTP(ctx context.Context, userID int64) error
+	// DeletePendingTOTP removes only an unconfirmed enrollment.
+	DeletePendingTOTP(ctx context.Context, userID int64) error
 	DeleteRecoveryCodes(ctx context.Context, userID int64) error
 	CreateRecoveryCodes(ctx context.Context, userID int64, hashes []string) error
 	// UseRecoveryCode claims an unused code; the first concurrent caller wins.
@@ -520,8 +531,9 @@ type SessionRepository interface {
 // RefreshTokenRepository stores refresh-token hashes.
 type RefreshTokenRepository interface {
 	Create(ctx context.Context, sessionID int64, tokenHash string, expiresAt time.Time) error
-	// GetByHash is possession-based (no tenant predicate); the caller compares
-	// RefreshToken.TenantID with the request tenant.
+	// GetByHash is tenant-scoped (RLS plus the caller's explicit tenant
+	// comparison): a refresh token is only usable in the tenant that issued
+	// it. The caller compares RefreshToken.TenantID with the request tenant.
 	GetByHash(ctx context.Context, tokenHash string) (*RefreshToken, error)
 	// MarkUsed reports whether this call consumed the token.
 	MarkUsed(ctx context.Context, tenantID, id int64) (bool, error)

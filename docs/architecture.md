@@ -271,7 +271,7 @@ normally and its requests return 404.
 | Jobs, events, audit | Enqueue writes `jobs.tenant_id` from the context; the worker restores it with `tenant.WithID`. Event metadata carries tenant/request/actor; audit rows record the request tenant. Retention and metrics stay global. |
 | Scheduler | One global leader. Each schedule chooses a tenant in its spec; the job stores it. `scheduler_leases`/`scheduler_runs` have no tenant column. |
 | OAuth | The tenant is bound into `state` and the state cookie; the callback rejects unknown/suspended tenants instead of trusting `X-Tenant-Slug`. |
-| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, and the tenant status, so a revocation, ban, role change, or suspension takes effect within the 5-second session-cache TTL. |
+| Sessions | Tokens without a positive `tenant_id` or `sid` claim are rejected. The session validator loads the token's session and compares its tenant, the membership role and status, the user status and token version, the tenant status, and the session's absolute expiry (`SESSION_MAX_LIFETIME`), so a revocation, ban, role change, suspension, or expired session takes effect within the 5-second session-cache TTL. |
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
 
@@ -418,7 +418,8 @@ flowchart TD
   `rate_limit.exceeded`, `api.version_unsupported`, `system.*`, generic status
   titles, validation messages, the shared back-office permissions
   (`admin:users:*`, `admin:files:*`, `admin:stats:read`), and the platform
-  permissions (`platform:tenants:*`, `platform:features:write`).
+  permissions (`platform:tenants:*`, `platform:features:write`,
+  `platform:users:mfa_reset`).
 - `internal/bootstrap` is the only non-`cmd` package that imports several
   modules. `test/arch` uses the same `bootstrap.Build`, so route authorization,
   audit coverage, group-middleware overlap, and SQL table ownership are

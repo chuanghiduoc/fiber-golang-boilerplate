@@ -91,6 +91,19 @@ func (g *GoogleOAuth) BuildMFACallbackURL(challenge string) string {
 	return u.String()
 }
 
+// UpstreamError is a non-2xx response from a Google endpoint other than the
+// token exchange (which oauth2 reports as *oauth2.RetrieveError). It carries
+// only the operation and status, never a response body that might echo a
+// credential.
+type UpstreamError struct {
+	Op         string
+	StatusCode int
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("google %s returned status %d", e.Op, e.StatusCode)
+}
+
 func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInfo, error) {
 	token, err := g.cfg.Exchange(ctx, code)
 	if err != nil {
@@ -105,8 +118,10 @@ func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInf
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return nil, fmt.Errorf("google userinfo returned status %d: %s", resp.StatusCode, body)
+		// Drain a bounded amount so the connection can be reused; the body is
+		// deliberately not part of the error or the logs.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+		return nil, &UpstreamError{Op: "userinfo", StatusCode: resp.StatusCode}
 	}
 
 	var info GoogleUserInfo

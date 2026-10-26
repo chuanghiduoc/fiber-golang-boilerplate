@@ -21,6 +21,15 @@ const (
 	CodeAuthMFAAlreadyEnabled apperror.Code = "auth.mfa_already_enabled"
 	// CodeAuthMFANotEnabled: no confirmed factor exists.
 	CodeAuthMFANotEnabled apperror.Code = "auth.mfa_not_enabled"
+	// CodeAuthMFAEnrollmentExpired: the pending enrollment is older than its
+	// 15-minute window; start a new one.
+	CodeAuthMFAEnrollmentExpired apperror.Code = "auth.mfa_enrollment_expired"
+	// CodeAuthMFAReauthRequired: a passwordless account must sign in again
+	// (the session is older than the re-authentication window).
+	CodeAuthMFAReauthRequired apperror.Code = "auth.mfa_reauth_required"
+	// CodeAuthOAuthUpstreamUnavailable: Google's token or userinfo endpoint
+	// failed in a way the client cannot fix (5xx, timeout, network).
+	CodeAuthOAuthUpstreamUnavailable apperror.Code = "auth.oauth_upstream_unavailable"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
@@ -74,6 +83,21 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusConflict,
 			Title:   "MFA is not enabled",
 			DocPath: "/errors/auth-mfa-not-enabled",
+		},
+		CodeAuthMFAEnrollmentExpired: {
+			Status:  http.StatusConflict,
+			Title:   "MFA enrollment has expired",
+			DocPath: "/errors/auth-mfa-enrollment-expired",
+		},
+		CodeAuthMFAReauthRequired: {
+			Status:  http.StatusForbidden,
+			Title:   "Re-authentication required",
+			DocPath: "/errors/auth-mfa-reauth-required",
+		},
+		CodeAuthOAuthUpstreamUnavailable: {
+			Status:  http.StatusBadGateway,
+			Title:   "OAuth provider is unavailable",
+			DocPath: "/errors/auth-oauth-upstream-unavailable",
 		},
 		CodeUserEmailTaken: {
 			Status:  http.StatusConflict,
