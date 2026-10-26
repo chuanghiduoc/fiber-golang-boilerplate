@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "race@example.com", Password: "Password1!2026", Name: "Race",
+		Email: "race@example.com", Password: testPassphrase, Name: "Race",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -69,7 +70,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 	}
 
 	// The correct password is also refused while locked.
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: "Password1!2026"}); statusOf(err) != http.StatusTooManyRequests {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: testPassphrase}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("locked account login err = %v, want 429", err)
 	}
 }
@@ -79,7 +80,7 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "known@example.com", Password: "Password1!2026", Name: "Known",
+		Email: "known@example.com", Password: testPassphrase, Name: "Known",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -103,13 +104,13 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 func TestAuthenticate_LockoutIsGlobalAcrossTenants(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
-	if _, err := svc.Register(ctx, RegisterInput{Email: "g@example.com", Password: "Password1!2026", Name: "G"}); err != nil {
+	if _, err := svc.Register(ctx, RegisterInput{Email: "g@example.com", Password: testPassphrase, Name: "G"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	for range maxLoginAttempts {
 		_, _ = svc.Authenticate(tenant.WithID(ctx, 2), LoginInput{Email: "g@example.com", Password: "Wrong!"})
 	}
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "g@example.com", Password: "Password1!2026"}); statusOf(err) != http.StatusTooManyRequests {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "g@example.com", Password: testPassphrase}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("login in tenant 1 after failures in tenant 2: err = %v, want 429", err)
 	}
 }
@@ -123,12 +124,109 @@ func TestRegister_ClearsPreexistingLockout(t *testing.T) {
 		_, _ = svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Wrong!"})
 	}
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "future@example.com", Password: "Password1!2026", Name: "Future",
+		Email: "future@example.com", Password: testPassphrase, Name: "Future",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Password1!2026"}); err != nil {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: testPassphrase}); err != nil {
 		t.Fatalf("login after registration: %v", err)
+	}
+}
+
+// Five sources (25 failures) must no longer lock the account: NIST SP 800-63B
+// rev4 caps the account-wide budget at 100 consecutive failures.
+func TestAuthenticate_FiveSourcesDoNotLockTheAccount(t *testing.T) {
+	svc := newTestUserService(newMemDB())
+	ctx := context.Background()
+	const email = "budget@example.com"
+	if _, err := svc.Register(ctx, RegisterInput{
+		Email: email, Password: testPassphrase, Name: "Budget",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	for i := range 5 {
+		source := WithClientIP(ctx, fmt.Sprintf("203.0.113.%d", i))
+		for range maxLoginAttempts {
+			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+				t.Fatalf("source %d failure: err = %v, want 401", i, err)
+			}
+		}
+	}
+
+	// A correct password from a fresh source still works: the old 5x5 budget
+	// would have locked the account after the fifth source.
+	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.1"), LoginInput{Email: email, Password: testPassphrase}); err != nil {
+		t.Fatalf("correct password after 25 distributed failures: %v", err)
+	}
+}
+
+// The account-wide counter rejects the 101st failure and then refuses even the
+// correct password until the window expires. One source stops contributing
+// after its own budget, so reaching the ceiling takes 20 addresses.
+func TestAuthenticate_AccountBudgetCapsAtOneHundred(t *testing.T) {
+	svc := newTestUserService(newMemDB())
+	ctx := context.Background()
+	const email = "ceiling@example.com"
+	if _, err := svc.Register(ctx, RegisterInput{
+		Email: email, Password: testPassphrase, Name: "Ceiling",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	for i := range maxAccountLoginFailures / maxLoginAttempts {
+		source := WithClientIP(ctx, fmt.Sprintf("203.0.113.%d", i))
+		for range maxLoginAttempts {
+			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+				t.Fatalf("source %d failure: err = %v, want 401", i, err)
+			}
+		}
+	}
+	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.2"), LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusTooManyRequests {
+		t.Fatalf("first failure past the account budget: err = %v, want 429", err)
+	}
+	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.3"), LoginInput{Email: email, Password: testPassphrase}); statusOf(err) != http.StatusTooManyRequests {
+		t.Fatalf("correct password while the account is locked: err = %v, want 429", err)
+	}
+}
+
+// A correct password clears only its own source counter. The account-wide
+// counter keeps counting failures from other addresses until it expires.
+func TestAuthenticate_SuccessClearsOnlyTheSourceCounter(t *testing.T) {
+	db := newMemDB()
+	store := cache.NewMemoryCache()
+	svc := NewUserService(UserDeps{Stores: db.stores(), Tx: memTx{db}, Cache: store})
+	ctx := context.Background()
+	const email = "source-only@example.com"
+	if _, err := svc.Register(ctx, RegisterInput{
+		Email: email, Password: testPassphrase, Name: "Source",
+	}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	source := WithClientIP(ctx, "203.0.113.10")
+	for range 3 {
+		if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+			t.Fatalf("failure: err = %v, want 401", err)
+		}
+	}
+	if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: testPassphrase}); err != nil {
+		t.Fatalf("correct password: %v", err)
+	}
+
+	sourceKey, accountKey := loginAttemptKeys(source, email)
+	exists, err := store.Exists(ctx, sourceKey)
+	if err != nil {
+		t.Fatalf("source counter: %v", err)
+	}
+	if exists {
+		t.Error("a correct password must clear the per-source counter")
+	}
+	exists, err = store.Exists(ctx, accountKey)
+	if err != nil {
+		t.Fatalf("account counter: %v", err)
+	}
+	if !exists {
+		t.Error("a correct password must not clear the account-wide counter")
 	}
 }
 

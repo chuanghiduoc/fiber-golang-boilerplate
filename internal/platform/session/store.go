@@ -43,6 +43,10 @@ type State struct {
 	// ExpiresAt is the session's absolute lifetime; a session past it is dead
 	// even before its access token expires.
 	ExpiresAt time.Time
+	// MFAVerifiedAt is when the session's second factor was last verified (MFA
+	// login or step-up); the zero time means never. AAL2-gated routes compare
+	// it with MFA_MAX_AGE.
+	MFAVerifiedAt time.Time
 	// Active is true when the session is not revoked, the membership is
 	// active, and the user is active.
 	Active bool
@@ -69,14 +73,15 @@ type Store interface {
 }
 
 type snapshot struct {
-	TenantID     int64     `json:"tenantId"`
-	Role         string    `json:"role"`
-	Permissions  []string  `json:"permissions"`
-	Platform     bool      `json:"platform"`
-	TokenVersion int32     `json:"tokenVersion"`
-	ExpiresAt    time.Time `json:"expiresAt"`
-	Active       bool      `json:"active"`
-	TenantActive bool      `json:"tenantActive"`
+	TenantID      int64     `json:"tenantId"`
+	Role          string    `json:"role"`
+	Permissions   []string  `json:"permissions"`
+	Platform      bool      `json:"platform"`
+	TokenVersion  int32     `json:"tokenVersion"`
+	ExpiresAt     time.Time `json:"expiresAt"`
+	MFAVerifiedAt time.Time `json:"mfaVerifiedAt"`
+	Active        bool      `json:"active"`
+	TenantActive  bool      `json:"tenantActive"`
 }
 
 type store struct {

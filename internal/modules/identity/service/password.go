@@ -5,8 +5,6 @@ import (
 	"errors"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -42,7 +40,7 @@ func (s *userService) VerifyPassword(ctx context.Context, userID int64, password
 	if err := reserveLoginAttempt(ctx, s.Cache, emailAddr); err != nil {
 		return err
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+	if !comparePassword(hash, password) {
 		return currentPasswordIncorrect()
 	}
 	clearLoginAttempts(ctx, s.Cache, emailAddr)
@@ -64,9 +62,9 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 		return apperror.NewBadRequest("new password must be different from the current password")
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcryptCost)
+	hash, err := hashPassword(req.NewPassword)
 	if err != nil {
-		return apperror.NewInternal("failed to hash password")
+		return err
 	}
 
 	// The password row and the revocation of every session (in every tenant)
@@ -76,7 +74,7 @@ func (s *userService) ChangePassword(ctx context.Context, userID int64, req Chan
 	// explicitly rather than relying on RLS.
 	ctx = database.WithRLSBypass(ctx)
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		if changeErr := replacePassword(ctx, tx.Stores, userID, string(hash)); changeErr != nil {
+		if changeErr := replacePassword(ctx, tx.Stores, userID, hash); changeErr != nil {
 			return changeErr
 		}
 		if notifyErr := s.Security.Deliver(ctx, tx, SecurityNotice{

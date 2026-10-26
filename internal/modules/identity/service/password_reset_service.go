@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -270,9 +268,9 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 	if err := s.precheckResetToken(ctx, tokenHash); err != nil {
 		return err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	hash, err := hashPassword(req.Password)
 	if err != nil {
-		return apperror.NewInternal("failed to hash password")
+		return err
 	}
 
 	var owner *User
@@ -286,7 +284,7 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 		if consumeErr != nil {
 			return consumeErr
 		}
-		if resetErr := replacePassword(ctx, tx.Stores, user.ID, string(hash)); resetErr != nil {
+		if resetErr := replacePassword(ctx, tx.Stores, user.ID, hash); resetErr != nil {
 			return resetErr
 		}
 		if notifyErr := s.Security.Deliver(ctx, tx, SecurityNotice{

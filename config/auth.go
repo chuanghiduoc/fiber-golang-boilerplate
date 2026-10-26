@@ -58,6 +58,60 @@ type OAuthConfig struct {
 	FrontendURL        string `env:"OAUTH_FRONTEND_URL" envDefault:"http://localhost:3000/auth/callback"`
 }
 
+// Password policy settings for new passwords.
+type PasswordConfig struct {
+	// BreachCheck is none (default) or hibp. With hibp, the Have I Been Pwned
+	// range API is queried with k-anonymity (only the first five SHA-1 hex
+	// characters leave the process); the check fails open with a warning when
+	// the provider is unavailable, so a third party cannot block sign-ups.
+	BreachCheck string `env:"PASSWORD_BREACH_CHECK" envDefault:"none"`
+}
+
+// HIBPEnabled reports whether the optional breached-password check is on.
+func (p PasswordConfig) HIBPEnabled() bool {
+	return p.BreachCheck == "hibp"
+}
+
+// validate accepts only the documented modes. An empty value is the compiled
+// default ("none"), so a programmatically built Config needs no env parsing.
+func (p PasswordConfig) validate() error {
+	switch p.BreachCheck {
+	case "", "none", "hibp":
+		return nil
+	default:
+		return fmt.Errorf("PASSWORD_BREACH_CHECK must be one of: none, hibp")
+	}
+}
+
+// DefaultMFAMaxAge is how fresh a second-factor verification stays valid when
+// MFA_MAX_AGE is unset.
+const DefaultMFAMaxAge = 12 * time.Hour
+
+// MFAConfig bounds the freshness of a session's second factor.
+type MFAConfig struct {
+	// MaxAge is how long an MFA verification stays valid for MFA-gated
+	// routes (NIST SP 800-63B rev4 §2.2.3). A session whose mfa_verified_at is
+	// older is refused with 403 auth.mfa_required and must step up again.
+	MaxAge time.Duration `env:"MFA_MAX_AGE" envDefault:"12h"`
+}
+
+func (m MFAConfig) validate() error {
+	if m.MaxAge < 0 {
+		return fmt.Errorf("MFA_MAX_AGE must not be negative")
+	}
+	return nil
+}
+
+// EffectiveMaxAge returns the configured freshness window, falling back to
+// DefaultMFAMaxAge for the zero value so a programmatically built Config never
+// disables the AAL2 age bound by accident.
+func (m MFAConfig) EffectiveMaxAge() time.Duration {
+	if m.MaxAge <= 0 {
+		return DefaultMFAMaxAge
+	}
+	return m.MaxAge
+}
+
 // validateSigningSecret rejects sample or short JWT secrets in every
 // environment except local and test, including staging and development.
 func (j JWTConfig) validateSigningSecret(appEnv string) error {

@@ -11,6 +11,8 @@
   "errors.auth.mfa_reauth_required.title": "Re-authentication required",
   "errors.auth.oauth_upstream_unavailable.title": "OAuth provider is unavailable",
   "errors.auth.oauth_code_invalid.title": "Invalid Google sign-in code",
+  "errors.auth.oauth_email_not_verified.title": "Google email address is not verified",
+  "errors.auth.oauth_userinfo_incomplete.title": "Incomplete Google user info",
   "errors.user.email_taken.title": "Email already in use",
   "errors.user.not_found.title": "User not found",
   "errors.invitation.invalid.title": "Invalid invitation",

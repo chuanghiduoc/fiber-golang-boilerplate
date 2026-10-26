@@ -178,6 +178,7 @@ erDiagram
         varchar user_agent
         inet ip
         text amr "pwd | google | otp | rc"
+        timestamptz mfa_verified_at "AAL2 freshness; NULL until a second factor"
         timestamptz expires_at "absolute session lifetime"
         timestamptz last_used_at
         timestamptz revoked_at "set together with revoked_reason"

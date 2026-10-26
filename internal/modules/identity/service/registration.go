@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"strings"
 
-	"golang.org/x/crypto/bcrypt"
-
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -48,14 +46,14 @@ func (s *userService) Register(ctx context.Context, req RegisterInput) (*Member,
 	}
 	// Hash before opening a transaction: bcrypt is intentionally expensive and
 	// must not hold a pooled database connection for hundreds of milliseconds.
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	hash, err := hashPassword(req.Password)
 	if err != nil {
-		return nil, apperror.NewInternal("failed to hash password")
+		return nil, err
 	}
 
 	var member *Member
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
-		created, createErr := createAccount(ctx, tx.Stores, NewUser{Email: email, Name: name}, string(hash), RoleMember)
+		created, createErr := createAccount(ctx, tx.Stores, NewUser{Email: email, Name: name}, hash, RoleMember)
 		if createErr != nil {
 			return createErr
 		}

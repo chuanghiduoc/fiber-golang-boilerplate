@@ -105,6 +105,7 @@ type Session struct {
 	UserAgent     pgtype.Text        `json:"user_agent"`
 	Ip            *netip.Addr        `json:"ip"`
 	Amr           []string           `json:"amr"`
+	MfaVerifiedAt pgtype.Timestamptz `json:"mfa_verified_at"`
 	LastUsedAt    pgtype.Timestamptz `json:"last_used_at"`
 	RevokedAt     pgtype.Timestamptz `json:"revoked_at"`
 	RevokedReason pgtype.Text        `json:"revoked_reason"`

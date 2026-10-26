@@ -2,8 +2,10 @@
 -- A session is only created for an active member whose token version still
 -- equals the one the caller authenticated at. This closes the bcrypt-length
 -- window where a password change commits after the password check.
-INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr)
-SELECT m.tenant_id, m.user_id, u.token_version, @expires_at, @user_agent, @ip, @amr
+-- mfa_verified_at is set only when the session already carries an otp/rc
+-- method (MFA verify or Google + MFA); a first-factor session leaves it NULL.
+INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at)
+SELECT m.tenant_id, m.user_id, u.token_version, @expires_at, @user_agent, @ip, @amr, @mfa_verified_at
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = @tenant_id AND m.user_id = @user_id
@@ -66,12 +68,22 @@ UPDATE sessions
 SET last_used_at = NOW(), user_agent = @user_agent, ip = @ip
 WHERE tenant_id = @tenant_id AND id = @id;
 
+-- name: MarkSessionMFAVerified :one
+-- Step-up: record a fresh second-factor proof on the session that performed
+-- it. A revoked or foreign session matches no row, so the step-up fails closed
+-- instead of refreshing a session the caller does not hold.
+UPDATE sessions
+SET mfa_verified_at = NOW(), updated_at = NOW()
+WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
+  AND revoked_at IS NULL
+RETURNING mfa_verified_at;
+
 -- name: GetSessionState :one
 -- The access-token validator's single lookup: the session (with its tenant
 -- and revocation), the membership status and effective permissions (tenant
 -- roles plus platform assignments), the user's token version and status, and
 -- the tenant's status. role_keys is ordered owner, admin, member.
-SELECT s.tenant_id, s.revoked_at, s.expires_at, m.status AS membership_status,
+SELECT s.tenant_id, s.revoked_at, s.expires_at, s.mfa_verified_at, m.status AS membership_status,
        u.token_version, u.status AS user_status,
        CASE
            WHEN t.status = 'active'

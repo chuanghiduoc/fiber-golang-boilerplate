@@ -55,7 +55,7 @@ func (m *mockUserService) Register(_ context.Context, req service.RegisterInput)
 }
 
 func (m *mockUserService) Authenticate(_ context.Context, req service.LoginInput) (*service.Member, error) {
-	if req.Email == "test@example.com" && req.Password == "Password1!2026" {
+	if req.Email == "test@example.com" && req.Password == testPassphrase {
 		return testMember(1, "test@example.com", "Test User", "user"), nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
@@ -123,7 +123,7 @@ func (m *mockUserService) RevokeSessions(_ context.Context, _ int64) error {
 }
 
 func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password string) error {
-	if password == "Password1!2026" {
+	if password == testPassphrase {
 		return nil
 	}
 	return apperror.NewBadRequest("current password is incorrect")
@@ -225,7 +225,7 @@ func TestRegisterHandler(t *testing.T) {
 
 	body, _ := json.Marshal(dto.RegisterRequest{
 		Email:    "new@example.com",
-		Password: "Password1!2026",
+		Password: testPassphrase,
 		Name:     "New User",
 	})
 
@@ -242,7 +242,7 @@ func TestRegisterHandler_VerificationEmailDispatch(t *testing.T) {
 		t.Helper()
 		body, _ := json.Marshal(dto.RegisterRequest{
 			Email:    "new@example.com",
-			Password: "Password1!2026",
+			Password: testPassphrase,
 			Name:     "New User",
 		})
 		req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
@@ -284,7 +284,7 @@ func TestLoginHandler(t *testing.T) {
 
 	body, _ := json.Marshal(dto.LoginRequest{
 		Email:    "test@example.com",
-		Password: "Password1!2026",
+		Password: testPassphrase,
 	})
 
 	req, _ := http.NewRequest("POST", "/auth/login", bytes.NewReader(body))

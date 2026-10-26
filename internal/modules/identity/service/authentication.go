@@ -55,13 +55,15 @@ func (s *userService) Authenticate(ctx context.Context, req LoginInput) (*Member
 		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(req.Password))
 		return nil, invalidCredentials()
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)); err != nil {
+	if !comparePassword(hash, req.Password) {
 		return nil, invalidCredentials()
 	}
 
-	// The password was correct: clear the counters even if the account still
-	// needs verification, so a correct password never accrues a lockout.
-	clearLoginAttempts(ctx, s.Cache, email)
+	// The password was correct: clear this source's counter even if the
+	// account still needs verification, so a correct password never accrues a
+	// lockout from one address. The account-wide counter stays: it records
+	// distributed guessing, which one successful login must not erase.
+	clearLoginSourceAttempts(ctx, s.Cache, email)
 
 	if user.Status != UserStatusActive {
 		return nil, invalidCredentials()

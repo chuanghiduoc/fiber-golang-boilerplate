@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -62,6 +63,62 @@ func TestBuildCodeCallbackURL(t *testing.T) {
 	}
 	if u.RawQuery != "" {
 		t.Errorf("query = %q, want empty", u.RawQuery)
+	}
+}
+
+// newExchangeServer returns a Google OAuth whose userinfo endpoint serves the
+// supplied JSON body, so Exchange's classification can be tested without the
+// network.
+func newExchangeServer(t *testing.T, userInfo string) *GoogleOAuth {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "provider-access", "token_type": "Bearer", "expires_in": 3600,
+			})
+		case "/userinfo":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(userInfo))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := configForTest()
+	return &GoogleOAuth{
+		cfg: &oauth2.Config{
+			ClientID:     cfg.GoogleClientID,
+			ClientSecret: cfg.GoogleClientSecret,
+			RedirectURL:  cfg.GoogleRedirectURL,
+			Scopes:       []string{"email", "profile"},
+			Endpoint:     oauth2.Endpoint{AuthURL: srv.URL + "/auth", TokenURL: srv.URL + "/token"},
+		},
+		frontendURL: cfg.FrontendURL,
+		userInfoURL: srv.URL + "/userinfo",
+	}
+}
+
+func TestExchangeReturnsSentinelForUnverifiedEmail(t *testing.T) {
+	g := newExchangeServer(t, `{"id":"google-1","email":"user@example.com","verified_email":false}`)
+	if _, err := g.Exchange(context.Background(), "auth-code", "verifier"); !errors.Is(err, ErrEmailNotVerified) {
+		t.Fatalf("Exchange error = %v, want ErrEmailNotVerified", err)
+	}
+}
+
+func TestExchangeReturnsSentinelForIncompleteUserInfo(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing id":    `{"email":"user@example.com","verified_email":true}`,
+		"missing email": `{"id":"google-1","verified_email":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newExchangeServer(t, body)
+			if _, err := g.Exchange(context.Background(), "auth-code", "verifier"); !errors.Is(err, ErrIncompleteUserInfo) {
+				t.Fatalf("Exchange error = %v, want ErrIncompleteUserInfo", err)
+			}
+		})
 	}
 }
 

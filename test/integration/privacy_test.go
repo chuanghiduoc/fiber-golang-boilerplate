@@ -248,7 +248,7 @@ func TestPrivacy_ExportEndToEndAndIsolation(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()
 	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-b")
-	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-export@example.com", testutil.MemberOptions{Password: "Password1!2026"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-export@example.com", testutil.MemberOptions{Password: testPassphrase})
 	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-export@example.com", testutil.MemberOptions{})
 	other := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-other@example.com", testutil.MemberOptions{})
 	h.seed(t, tenant.DefaultID, user.UserID)
@@ -333,7 +333,7 @@ func TestPrivacy_ErasureIsIdempotentAndAnonymizes(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()
 	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-erase-b")
-	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-erase@example.com", testutil.MemberOptions{Password: "Password1!2026"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-erase@example.com", testutil.MemberOptions{Password: testPassphrase})
 	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-erase@example.com", testutil.MemberOptions{})
 	h.seed(t, tenant.DefaultID, user.UserID)
 	h.seed(t, tenantB, user.UserID)
@@ -370,7 +370,7 @@ func TestPrivacy_ErasureIsIdempotentAndAnonymizes(t *testing.T) {
 		`SELECT count(*) FROM jobs WHERE kind IN ('privacy.erase', 'privacy.erase.finalize')`).Scan(&queued))
 	assert.Zero(t, queued)
 
-	status, body = h.request(t, http.MethodPost, "/api/v1/me/erasure", token, "default", `{"currentPassword":"Password1!2026"}`)
+	status, body = h.request(t, http.MethodPost, "/api/v1/me/erasure", token, "default", `{"currentPassword":"`+testPassphrase+`"}`)
 	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 
 	require.NoError(t, h.pool.QueryRow(ctx,
@@ -455,7 +455,7 @@ func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	ctx := context.Background()
 	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-admin-b")
 	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin@example.com", testutil.MemberOptions{Role: "admin"})
-	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin-target@example.com", testutil.MemberOptions{Password: "Password1!2026"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin-target@example.com", testutil.MemberOptions{Password: testPassphrase})
 	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-admin-target@example.com", testutil.MemberOptions{})
 	h.seed(t, tenant.DefaultID, user.UserID)
 	h.seed(t, tenantB, user.UserID)
@@ -546,7 +546,7 @@ func TestPrivacy_BanSurvivesSelfErasure(t *testing.T) {
 	ctx := context.Background()
 	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-ban-b")
 	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-ban-admin@example.com", testutil.MemberOptions{Role: "admin"})
-	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-ban@example.com", testutil.MemberOptions{Password: "Password1!2026"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-ban@example.com", testutil.MemberOptions{Password: testPassphrase})
 	memberB := testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-ban@example.com", testutil.MemberOptions{})
 	adminToken := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
 
@@ -568,7 +568,7 @@ func TestPrivacy_BanSurvivesSelfErasure(t *testing.T) {
 	// banned; the banned membership must keep its marker through the removal.
 	bToken := testutil.SessionToken(t, ctx, h.pool, memberB, privacyIntegrationSecret)
 	status, body = h.request(t, http.MethodPost, "/api/v1/me/erasure", bToken, "privacy-ban-b",
-		`{"currentPassword":"Password1!2026"}`)
+		`{"currentPassword":"`+testPassphrase+`"}`)
 	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 	require.NoError(t, h.runKind(t, "privacy.erase"))
 	require.NoError(t, h.runKind(t, "privacy.erase.finalize"))
@@ -585,10 +585,10 @@ func TestPrivacy_BanSurvivesSelfErasure(t *testing.T) {
 	// The anonymized account's old address cannot register into the tenant
 	// that banned it, but it is free in the other tenant.
 	status, body = h.requestWithAuth(t, http.MethodPost, "/api/v1/auth/register", "", "default",
-		`{"email":"privacy-ban@example.com","password":"Password1!2026","name":"Again"}`)
+		`{"email":"privacy-ban@example.com","password":"`+testPassphrase+`","name":"Again"}`)
 	assert.Equal(t, fiber.StatusConflict, status, "body: %s", body)
 	status, body = h.requestWithAuth(t, http.MethodPost, "/api/v1/auth/register", "", "privacy-ban-b",
-		`{"email":"privacy-ban@example.com","password":"Password1!2026","name":"Again"}`)
+		`{"email":"privacy-ban@example.com","password":"`+testPassphrase+`","name":"Again"}`)
 	assert.Equal(t, fiber.StatusCreated, status, "body: %s", body)
 }
 

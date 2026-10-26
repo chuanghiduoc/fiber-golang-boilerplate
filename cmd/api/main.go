@@ -45,6 +45,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/drivers"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 
 	_ "github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics" // register Prometheus metrics
 )
@@ -164,6 +165,15 @@ func loadConfig() *config.Config {
 	}
 
 	logger.Setup(cfg.App.Env, cfg.App.LogLevel)
+
+	// The optional breached-password check is process-wide: the validator tag
+	// runs deep inside DTO binding, so the checker is installed once here.
+	if cfg.Password.HIBPEnabled() {
+		validator.SetBreachChecker(validator.NewHIBPChecker(2 * time.Second))
+		slog.Info("breached-password check enabled", slog.String("provider", "hibp"))
+	} else {
+		validator.SetBreachChecker(nil)
+	}
 
 	// Base URL for RFC 9457 problem "type" links in error responses.
 	apperror.DocsBaseURL = cfg.App.ErrorDocsBaseURL

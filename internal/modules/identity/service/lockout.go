@@ -14,13 +14,19 @@ const (
 	// maxLoginAttempts is the per-(email, client IP) budget. Keying by source
 	// means a stranger cannot lock a victim out from one address.
 	maxLoginAttempts = 5
-	// accountLockoutMultiplier sets the global per-email budget, which still
-	// stops guessing distributed across many addresses. One source
-	// contributes at most maxLoginAttempts per window to it.
-	accountLockoutMultiplier = 5
-	maxAccountLoginAttempts  = accountLockoutMultiplier * maxLoginAttempts
-	lockoutDuration          = 15 * time.Minute
-	loginAttemptPrefix       = "login_attempts:"
+	// maxAccountLoginFailures is the account-wide budget across every source.
+	// NIST SP 800-63B rev4 §5.2.2 caps consecutive authentication failures at
+	// 100; a lower multiplier (the old 5x5=25) let five addresses lock any
+	// account for the whole window. One source contributes at most
+	// maxLoginAttempts before it is rejected without touching this counter, so
+	// exhausting it takes at least 100 failures from 20 distinct addresses
+	// inside one lockoutDuration. The budget is per lockout window rather than
+	// strictly consecutive: a correct password from a locked source cannot be
+	// checked, and it clears only its own source counter (not this one), so
+	// distributed-guessing evidence survives until it expires.
+	maxAccountLoginFailures = 100
+	lockoutDuration         = 15 * time.Minute
+	loginAttemptPrefix      = "login_attempts:"
 
 	// maxMFAAttempts bounds second-factor guesses per user across every
 	// source. It is separate from the password counters because a correct
@@ -95,7 +101,7 @@ func loginAttemptKeys(ctx context.Context, email string) (source, account string
 
 // reserveLoginAttempt atomically counts one password attempt and rejects it
 // once the source made more than maxLoginAttempts, or all sources together
-// more than maxAccountLoginAttempts, inside the lockout window. A source that
+// more than maxAccountLoginFailures, inside the lockout window. A source that
 // is already locked is rejected before it touches the account counter, so one
 // address alone can never exhaust the global budget. It fails closed: when
 // the cache is unavailable the attempt is denied (503) rather than allowed
@@ -115,7 +121,7 @@ func reserveLoginAttempt(ctx context.Context, store cache.Cache, email string) e
 	if err != nil {
 		return loginLockoutUnavailable(err)
 	}
-	if attempts > maxAccountLoginAttempts {
+	if attempts > maxAccountLoginFailures {
 		return locked
 	}
 	return nil
@@ -127,14 +133,31 @@ func loginLockoutUnavailable(err error) error {
 }
 
 // clearLoginAttempts drops the caller's source counter and the account
-// counter after a proof of the password (or a registration/reset). Other
-// sources' counters expire on their own.
+// counter. Registration, a completed password change/reset, and a successful
+// second factor call it: those prove account control, so every preexisting
+// lockout may go.
 func clearLoginAttempts(ctx context.Context, store cache.Cache, email string) {
+	clearLoginCounter(ctx, store, email, true)
+}
+
+// clearLoginSourceAttempts drops only the caller's (email, client IP) counter
+// after a correct password. The account-wide counter is deliberately kept: it
+// records failures from other sources, and a legitimate login must not erase
+// the evidence of distributed guessing. It expires with the lockout window.
+func clearLoginSourceAttempts(ctx context.Context, store cache.Cache, email string) {
+	clearLoginCounter(ctx, store, email, false)
+}
+
+func clearLoginCounter(ctx context.Context, store cache.Cache, email string, includeAccount bool) {
 	if store == nil {
 		return
 	}
 	sourceKey, accountKey := loginAttemptKeys(ctx, email)
-	for _, key := range []string{sourceKey, accountKey} {
+	keys := []string{sourceKey}
+	if includeAccount {
+		keys = append(keys, accountKey)
+	}
+	for _, key := range keys {
 		if err := store.Delete(ctx, key); err != nil {
 			slog.Warn("cache error clearing login attempts", slog.Any("error", err))
 		}

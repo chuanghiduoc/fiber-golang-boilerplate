@@ -485,7 +485,9 @@ func baseValidConfig() Config {
 			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
 			RetentionDays: 30, TimestampToleranceSeconds: 300,
 		},
-		APIKeys: APIKeysConfig{MaxLifetime: 8760 * time.Hour},
+		APIKeys:  APIKeysConfig{MaxLifetime: 8760 * time.Hour},
+		Password: PasswordConfig{BreachCheck: "none"},
+		MFA:      MFAConfig{MaxAge: DefaultMFAMaxAge},
 	}
 }
 
@@ -493,6 +495,43 @@ func TestValidate_ValidLocalConfig(t *testing.T) {
 	cfg := baseValidConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() returned error for valid config: %v", err)
+	}
+}
+
+// The zero value is the compiled default, so a Config built without env
+// parsing does not accidentally disable the breach check or the AAL2 age bound.
+func TestPasswordAndMFAConfig_ZeroValueDefaults(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Password = PasswordConfig{}
+	cfg.MFA = MFAConfig{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected zero-value password/MFA config: %v", err)
+	}
+	if cfg.Password.HIBPEnabled() {
+		t.Error("an empty breach-check mode must be disabled")
+	}
+	if got := cfg.MFA.EffectiveMaxAge(); got != DefaultMFAMaxAge {
+		t.Errorf("EffectiveMaxAge() = %v, want %v", got, DefaultMFAMaxAge)
+	}
+}
+
+func TestPasswordConfig_ValidateModes(t *testing.T) {
+	for _, mode := range []string{"", "none", "hibp"} {
+		if err := (PasswordConfig{BreachCheck: mode}).validate(); err != nil {
+			t.Errorf("mode %q: %v", mode, err)
+		}
+	}
+	if err := (PasswordConfig{BreachCheck: "remote"}).validate(); err == nil {
+		t.Fatal("an unknown breach-check mode must be rejected")
+	}
+}
+
+func TestMFAConfig_ValidateMaxAge(t *testing.T) {
+	if err := (MFAConfig{MaxAge: -time.Minute}).validate(); err == nil {
+		t.Fatal("a negative MFA_MAX_AGE must be rejected")
+	}
+	if got := (MFAConfig{MaxAge: 90 * time.Minute}).EffectiveMaxAge(); got != 90*time.Minute {
+		t.Errorf("EffectiveMaxAge() = %v, want 90m", got)
 	}
 }
 

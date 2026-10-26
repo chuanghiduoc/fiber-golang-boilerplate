@@ -721,6 +721,15 @@ func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 			slog.String("error_type", oauthErrorType(err)),
 			slog.Int("upstream_status", status),
 		)
+		// A usable token whose user info cannot be trusted is a client-facing
+		// refusal: the user can verify the address (or re-consent) and retry.
+		// It must not masquerade as a provider outage.
+		if errors.Is(err, oauth.ErrEmailNotVerified) {
+			return apperror.NewCode(identitycatalog.CodeAuthOAuthEmailNotVerified, "google account email address is not verified")
+		}
+		if errors.Is(err, oauth.ErrIncompleteUserInfo) {
+			return apperror.NewCode(identitycatalog.CodeAuthOAuthUserInfoIncomplete, "google did not return an account id and email address")
+		}
 		// A 4xx means Google rejected this client's code or credentials; the
 		// caller must start over. A 429 is Google rate-limiting us, and
 		// anything else (5xx, timeout, network) is an upstream outage: neither
@@ -936,6 +945,12 @@ func oauthErrorType(err error) string {
 	var upstream *oauth.UpstreamError
 	if errors.As(err, &upstream) {
 		return "oauth.UpstreamError"
+	}
+	if errors.Is(err, oauth.ErrEmailNotVerified) {
+		return "oauth.ErrEmailNotVerified"
+	}
+	if errors.Is(err, oauth.ErrIncompleteUserInfo) {
+		return "oauth.ErrIncompleteUserInfo"
 	}
 	return "transport"
 }

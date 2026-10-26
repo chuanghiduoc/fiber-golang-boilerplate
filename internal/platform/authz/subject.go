@@ -1,6 +1,9 @@
 package authz
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Attribute keys used by the built-in policies and middleware. Attributes are
 // intentionally plain strings so modules can attach their own facts without
@@ -31,6 +34,9 @@ type Subject struct {
 	// AMR is the access token's authentication-methods set (pwd, google,
 	// otp, rc). Tokens without it have an empty set.
 	AMR []string
+	// MFAVerifiedAt is the session's second-factor freshness (nil-safe zero
+	// time means never verified). RequireMFA compares it with MFA_MAX_AGE.
+	MFAVerifiedAt time.Time
 }
 
 // NewSubject builds a subject whose permissions derive from role.
@@ -87,6 +93,13 @@ func (s Subject) WithAttribute(name, value string) Subject {
 // WithAMR returns a copy carrying the access token's authentication methods.
 func (s Subject) WithAMR(amr []string) Subject {
 	s.AMR = append([]string(nil), amr...)
+	return s
+}
+
+// WithMFAVerifiedAt returns a copy carrying the session's second-factor
+// freshness timestamp.
+func (s Subject) WithMFAVerifiedAt(at time.Time) Subject {
+	s.MFAVerifiedAt = at
 	return s
 }
 

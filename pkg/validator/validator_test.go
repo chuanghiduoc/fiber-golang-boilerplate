@@ -22,13 +22,17 @@ func TestValidatePassword(t *testing.T) {
 		{"valid without composition", "alllowercase", false},
 		{"exactly 12 runes", "abcdefghijkl", false},
 		{"11 runes", "abcdefghijk", true},
-		{"exactly 64 runes", strings.Repeat("a", 64), false},
-		{"65 runes", strings.Repeat("a", 65), true},
-		{"72 bytes accepted", strings.Repeat("é", 36), false},
-		{"73 bytes rejected", strings.Repeat("é", 37), true},
+		{"exactly 64 runes", "abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789", false}, // ggignore: test fixture, not a credential
+		{"65 runes", "abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789!", true},         // ggignore: test fixture, not a credential
+		{"72 bytes accepted", twoBytePassword(36), false},
+		{"73 bytes rejected", twoBytePassword(37), true},
 		{"common password", "unbelievable", true},
 		{"common password case-insensitive", "UNBELIEVABLE", true},
 		{"trivially short", "Ab1!", true},
+		{"single repeated character", strings.Repeat("x", 12), true},
+		{"short pattern repeated", "abcabcabcabc", true},    // ggignore: test fixture, not a credential
+		{"padded common password", "P@ssw0rd2026", true},    // ggignore: test fixture, not a credential
+		{"leetspeak common password", "l3tm31n-2026", true}, // ggignore: test fixture, not a credential
 	}
 
 	for _, tt := range tests {
@@ -44,10 +48,21 @@ func TestValidatePassword(t *testing.T) {
 	}
 }
 
+// twoBytePassword builds distinct two-byte runes so a byte-length test does
+// not accidentally become a repeated-pattern test.
+func twoBytePassword(runes int) string {
+	var b strings.Builder
+	for r := rune(0x00E0); b.Len() < runes*2; r++ {
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
 func TestValidatePassword_Codes(t *testing.T) {
 	tests := map[string]string{
 		"short":                 "weak_password",
 		"unbelievable":          "password_common",
+		"abcabcabcabc":          "password_repeated",
 		strings.Repeat("a", 65): "weak_password",
 	}
 	for pw, want := range tests {
@@ -59,6 +74,24 @@ func TestValidatePassword_Codes(t *testing.T) {
 		if got := appErr.Errors[0].Code; got != want {
 			t.Errorf("password %q code = %q, want %q", pw, got, want)
 		}
+	}
+}
+
+// NFKC folds compatibility characters before length and blocklist checks, so
+// a full-width or ligature spelling cannot smuggle a short/common password
+// past the policy.
+func TestPasswordWeakness_NFKC(t *testing.T) {
+	if got := NormalizePassword("\uFB01"); got != "fi" {
+		t.Fatalf("NormalizePassword(ligature) = %q, want %q", got, "fi")
+	}
+	// Full-width digits become ASCII, exposing the common core "password".
+	if got := PasswordWeakness("Password\uFF12\uFF10\uFF12\uFF16"); got != CodePasswordCommon {
+		t.Errorf("full-width padded common password code = %q, want %q", got, CodePasswordCommon)
+	}
+	// Five ligatures are ten runes after NFKC but only five before it; the rune
+	// length is measured after normalization.
+	if got := PasswordWeakness("\uFB01\uFB01\uFB01\uFB01\uFB01"); got != CodeWeakPassword {
+		t.Errorf("ligature password code = %q, want %q", got, CodeWeakPassword)
 	}
 }
 

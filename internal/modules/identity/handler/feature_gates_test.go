@@ -68,7 +68,7 @@ func TestRegisterGatedByUserRegistrationFlag(t *testing.T) {
 	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, nil)
 	authHandler.SetFeatureFlags(tenantTargetFlags(identitycatalog.KeyUserRegistration, 2))
-	body := []byte(`{"email":"new@example.com","password":"Password1!2026","name":"New User"}`)
+	body := []byte(`{"email":"new@example.com","password":"` + testPassphrase + `","name":"New User"}`)
 
 	for _, tc := range []struct {
 		tenantID int64
@@ -89,7 +89,7 @@ func TestRegisterGatedByUserRegistrationFlag(t *testing.T) {
 func TestLoginRequiresVerificationWhenEmailVerificationFlagOn(t *testing.T) {
 	authHandler := newTestAuthHandler(newMockService(), &mockSessions{}, &mockPasswordResetService{},
 		&mockEmailVerificationService{}, "test-secret", 24, false, nil)
-	login := []byte(`{"email":"test@example.com","password":"Password1!2026"}`)
+	login := []byte(`{"email":"test@example.com","password":"` + testPassphrase + `"}`)
 	doLogin := func() *http.Response {
 		req, _ := http.NewRequest(http.MethodPost, "/auth/login", bytes.NewReader(login))
 		req.Header.Set("Content-Type", "application/json")

@@ -38,6 +38,13 @@ const (
 	// CodeAuthOAuthCodeInvalid: the one-time Google exchange code is unknown,
 	// already redeemed, expired, or bound to another tenant.
 	CodeAuthOAuthCodeInvalid apperror.Code = "auth.oauth_code_invalid"
+	// CodeAuthOAuthEmailNotVerified: Google authenticated the account but its
+	// email address is unverified, so it cannot be linked or used to create a
+	// local account.
+	CodeAuthOAuthEmailNotVerified apperror.Code = "auth.oauth_email_not_verified"
+	// CodeAuthOAuthUserInfoIncomplete: Google's userinfo response lacked the
+	// stable subject id or the email address.
+	CodeAuthOAuthUserInfoIncomplete apperror.Code = "auth.oauth_userinfo_incomplete"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
@@ -127,6 +134,16 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid Google sign-in code",
 			DocPath: "/errors/auth-oauth-code-invalid",
+		},
+		CodeAuthOAuthEmailNotVerified: {
+			Status:  http.StatusForbidden,
+			Title:   "Google email address is not verified",
+			DocPath: "/errors/auth-oauth-email-not-verified",
+		},
+		CodeAuthOAuthUserInfoIncomplete: {
+			Status:  http.StatusBadRequest,
+			Title:   "Incomplete Google user info",
+			DocPath: "/errors/auth-oauth-userinfo-incomplete",
 		},
 		CodeUserEmailTaken: {
 			Status:  http.StatusConflict,

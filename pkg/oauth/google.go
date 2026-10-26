@@ -3,6 +3,7 @@ package oauth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,20 @@ import (
 )
 
 const googleUserInfoURL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+// Errors that describe a usable token whose user info cannot be trusted. They
+// are sentinels so the HTTP adapter can answer with a client-facing problem
+// (the caller can fix an unverified address in their Google account) instead
+// of the 502 reserved for a provider outage.
+var (
+	// ErrEmailNotVerified means Google returned an address the account owner
+	// has not verified; linking or creating an account from it would let
+	// someone claim an address they do not control.
+	ErrEmailNotVerified = errors.New("google account email address is not verified")
+	// ErrIncompleteUserInfo means the userinfo response lacked the stable
+	// subject id or the email.
+	ErrIncompleteUserInfo = errors.New("incomplete user info from Google")
+)
 
 type GoogleUserInfo struct {
 	ID            string `json:"id"`
@@ -138,10 +153,10 @@ func (g *GoogleOAuth) Exchange(ctx context.Context, code, codeVerifier string) (
 	}
 
 	if info.ID == "" || info.Email == "" {
-		return nil, fmt.Errorf("incomplete user info from Google")
+		return nil, ErrIncompleteUserInfo
 	}
 	if !info.VerifiedEmail {
-		return nil, fmt.Errorf("google email address is not verified")
+		return nil, ErrEmailNotVerified
 	}
 
 	return &info, nil

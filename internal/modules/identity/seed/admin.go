@@ -15,6 +15,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 const adminBcryptCost = 12
@@ -71,7 +72,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		return nil
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(cfg.Password), adminBcryptCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(validator.NormalizePassword(cfg.Password)), adminBcryptCost)
 	if err != nil {
 		return fmt.Errorf("hash admin password: %w", err)
 	}

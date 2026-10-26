@@ -19,7 +19,7 @@ import (
 )
 
 // testMFAPassword is the local password of the MFA harness user.
-const testMFAPassword = "Password1!2026"
+var testMFAPassword = testPassphrase
 
 // reversibleSealer is a deterministic test sealer; production uses
 // jobs.PayloadCodec (AES-256-GCM).

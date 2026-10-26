@@ -27,7 +27,7 @@ type testSealer struct{}
 
 // mfaIntegrationPassword is the local password of the MFA integration
 // fixtures, used to re-authenticate enrollment management.
-const mfaIntegrationPassword = "Password1!2026"
+var mfaIntegrationPassword = testPassphrase
 
 func (testSealer) Seal(p []byte) ([]byte, error) { return append([]byte("sealed:"), p...), nil }
 

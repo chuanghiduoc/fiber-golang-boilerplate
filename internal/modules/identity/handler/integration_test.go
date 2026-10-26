@@ -57,6 +57,11 @@ func identityApp(h *identityHarness) *fiber.App {
 	auth.Get("/google/callback", h.auth.GoogleCallback)
 	auth.Post("/google/exchange", h.auth.GoogleExchange)
 
+	mfaHandler := NewMFAHandler(h.mfa)
+	auth.Post("/mfa/verify", mfaHandler.Verify)
+	auth.Post("/mfa/step-up", jwt, authzhttp.Require(identitycatalog.PermissionMFAWrite),
+		NewMFAStepUpHandler(h.mfa.(identityservice.MFAStepUpService)).StepUp)
+
 	invitations := api.Group("/invitations", jwt)
 	invitations.Post("/", authzhttp.Require(identitycatalog.PermissionInvitationsWrite), invitationHandler.Create)
 	invitations.Get("/", authzhttp.Require(identitycatalog.PermissionInvitationsRead), invitationHandler.List)
@@ -71,7 +76,7 @@ func identityApp(h *identityHarness) *fiber.App {
 	api.Put("/admin/users/:id/roles", jwt, authzhttp.Require(authz.PermissionAdminUsersRole), roles.ReplaceMemberRoles)
 
 	platform := NewPlatformHandler(h.tenants)
-	mfa := authzhttp.RequireMFA()
+	mfa := authzhttp.RequireMFA(time.Hour)
 	tenants := api.Group("/platform/tenants", jwt)
 	tenants.Get("/", mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), platform.ListTenants)
 	tenants.Post("/", mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), platform.CreateTenant)
@@ -153,7 +158,7 @@ func refresh(t *testing.T, app *fiber.App, slug, refreshToken string) (int, dto.
 func TestIntegration_SessionLifecycle(t *testing.T) {
 	h := newIdentityHarness(t, nil)
 	app := identityApp(h)
-	const pw = "Password1!2026"
+	pw := testPassphrase
 
 	status, body := do(t, app, call{method: http.MethodPost, path: "/api/v1/auth/register",
 		body: dto.RegisterRequest{Email: "Life@Example.com", Password: pw, Name: "Life Cycle"}})
@@ -270,7 +275,7 @@ func TestIntegration_InvitationJoinsAnotherTenant(t *testing.T) {
 	h := newIdentityHarness(t, nil)
 	app := identityApp(h)
 	ctx := context.Background()
-	const pw = "Password1!2026"
+	pw := testPassphrase
 
 	acme, err := h.tenants.Create(ctx, identityservice.NewTenant{Slug: "acme", Name: "Acme", Status: identityservice.TenantStatusActive})
 	require.NoError(t, err)

@@ -373,8 +373,10 @@ handler/service/DTO/repository package.
   session (`refresh_reuse`) and returns 401; logout revokes the session by
   possession; logout-all revokes every session in every tenant and bumps
   `token_version`; refresh with an inactive member returns 401. Login lockout
-  counts failures per (email, IP) and locks the account globally only after
-  5x that threshold; neither key is tenant-scoped (the password is global).
+  counts failures per (email, IP) (5) and locks the account globally only
+  after 100 consecutive failures (NIST 800-63B rev4 cap), so a handful of IPs
+  cannot lock a victim out; neither key is tenant-scoped (the password is
+  global).
   Lockout/rate-limit cache keys hash the normalized email (SHA-256, 128-bit
   hex: `<prefix><hash>[:ip=…]`), never store it raw. Admin ban/unban/role
   change/removal are membership changes in the request tenant; ban, removal,
@@ -399,7 +401,9 @@ handler/service/DTO/repository package.
   `user.email_taken`, and an existing user joins another tenant only through
   an invitation (`/invitations`, `/auth/invitations/accept|signup`). Google
   sign-in links/creates through `user_identities` (linking needs a verified
-  local email and Google `verified_email`); a new Google account gets a
+  local email and Google `verified_email`; an unverified or incomplete Google
+  profile is 400 `auth.oauth_email_not_verified`/`auth.oauth_userinfo_incomplete`,
+  not an upstream 502); a new Google account gets a
   membership in the state tenant, an existing user never joins a tenant
   implicitly. `SignInWithGoogle` with a `Complete` hook runs these checks and
   session creation in the sign-in transaction before the Tier 1
@@ -409,8 +413,14 @@ handler/service/DTO/repository package.
   URL: it redirects with `#code=` (256-bit, single use, 60s, tenant-bound)
   that the frontend redeems at `POST /auth/google/exchange` (401
   `auth.oauth_code_invalid`). New passwords follow NIST 800-63B: 12–64
-  characters and ≤72 bytes, no composition rules, not on the embedded
-  common-password list, not containing the email local part. Password
+  characters and ≤72 bytes after NFKC normalization (applied on set and
+  verify), no composition rules, not on the embedded common-password list —
+  checked on the full value and on its "core" (lowercased, edge digits and
+  punctuation stripped, common leetspeak folded) — not a repeated character or
+  pattern, and not containing the email local part (invitation sign-up checks
+  the invitation's email after resolving the token, then hashes). Optional
+  `PASSWORD_BREACH_CHECK=hibp` queries the HIBP range API (k-anonymity, 2s,
+  fails open with a warning; default `none`). Password
   change/reset, email change (old address too), MFA enable/disable,
   recovery-code regeneration, and platform MFA reset email the user through
   the transactional outbox in the change's transaction.
@@ -451,8 +461,13 @@ handler/service/DTO/repository package.
   revokes the user's other sessions
   (`mfa_changed`). `amr` on access tokens records `pwd`, `google`, `otp`, or
   `rc`; refresh repeats the session's `amr`, tokens without it still verify,
-  and `authz.Subject.AMR`/`authzhttp.RequireMFA()` gate routes that need
-  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). Every `/platform` route (platform-scope roles) requires it (enforced
+  and `authz.Subject.AMR`/`authzhttp.RequireMFA(maxAge)` gate routes that need
+  `otp`/`rc` (403 `auth.mfa_required`, a platform code in `pkg/apperror`). The
+  gate is also an AAL2 freshness check: `sessions.mfa_verified_at` (set by MFA
+  login/Google+MFA, carried in the session snapshot) must be within
+  `MFA_MAX_AGE` (default 12h); a stale session refreshes it with
+  `POST /auth/mfa/step-up` (JWT, current TOTP/recovery code, shared guess
+  budget, Tier 1). Every `/platform` route (platform-scope roles) requires it (enforced
   by `test/arch` `TestPlatformRoutesRequireMFA`).
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).

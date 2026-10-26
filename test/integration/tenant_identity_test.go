@@ -131,25 +131,25 @@ func (h *tenantHarness) tenantCtx(id int64) context.Context {
 func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 	h := setupTenantHarness(t)
 
-	userA := registerTenantUser(t, h, "default", "shared@example.com", "Password1!2026", "Tenant One")
+	userA := registerTenantUser(t, h, "default", "shared@example.com", testPassphrase, "Tenant One")
 	assert.Equal(t, h.tenantOne, userA.TenantID)
 
 	// One global account per address: registering it again from another
 	// tenant is a conflict, not a second account.
-	body, err := json.Marshal(identitydto.RegisterRequest{Email: "Shared@Example.com", Password: "Password2!2026", Name: "Tenant Two"})
+	body, err := json.Marshal(identitydto.RegisterRequest{Email: "Shared@Example.com", Password: testPassphrase, Name: "Tenant Two"})
 	require.NoError(t, err)
 	resp, respBody := tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/register", "acme", body, "")
 	assert.Equal(t, fiber.StatusConflict, resp.StatusCode, "body: %s", respBody)
 	assert.Contains(t, string(respBody), "user.email_taken")
 
 	// An account without a membership in a tenant cannot sign in there.
-	body, err = json.Marshal(identitydto.LoginRequest{Email: "shared@example.com", Password: "Password1!2026"})
+	body, err = json.Marshal(identitydto.LoginRequest{Email: "shared@example.com", Password: testPassphrase})
 	require.NoError(t, err)
 	resp, _ = tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/login", "acme", body, "")
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
 	// A header-less login uses the default tenant.
-	loginA := loginTenantUser(t, h, "", "shared@example.com", "Password1!2026")
+	loginA := loginTenantUser(t, h, "", "shared@example.com", testPassphrase)
 	claimsA, err := token.Parse(loginA.AccessToken, integrationTenantSecret)
 	require.NoError(t, err)
 	assert.Equal(t, h.tenantOne, claimsA.TenantID)
@@ -158,7 +158,7 @@ func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 	// Joining tenant two adds a membership to the same global user, who signs
 	// in there with the same (global) password and gets a tenant-two token.
 	testutil.CreateMember(t, context.Background(), h.pool, h.tenantTwo, "shared@example.com", testutil.MemberOptions{})
-	loginB := loginTenantUser(t, h, "acme", "shared@example.com", "Password1!2026")
+	loginB := loginTenantUser(t, h, "acme", "shared@example.com", testPassphrase)
 	claimsB, err := token.Parse(loginB.AccessToken, integrationTenantSecret)
 	require.NoError(t, err)
 	assert.Equal(t, h.tenantTwo, claimsB.TenantID)
@@ -167,7 +167,7 @@ func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 	assert.NotEqual(t, claimsA.SessionID, claimsB.SessionID, "each tenant sign-in is its own session")
 
 	// Membership lookups are tenant scoped.
-	solo := registerTenantUser(t, h, "default", "solo@example.com", "Password1!2026", "Solo")
+	solo := registerTenantUser(t, h, "default", "solo@example.com", testPassphrase, "Solo")
 	_, err = h.stores.Memberships.Get(h.tenantCtx(h.tenantTwo), solo.ID)
 	assert.ErrorIs(t, err, apperror.ErrNotFound)
 	member, err := h.stores.Memberships.Get(h.tenantCtx(h.tenantTwo), userA.ID)
@@ -244,8 +244,8 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 
 func TestTenantIdentity_RefreshTokenTenantMismatch(t *testing.T) {
 	h := setupTenantHarness(t)
-	registerTenantUser(t, h, "acme", "refresh@example.com", "Password1!2026", "Refresh User")
-	login := loginTenantUser(t, h, "acme", "refresh@example.com", "Password1!2026")
+	registerTenantUser(t, h, "acme", "refresh@example.com", testPassphrase, "Refresh User")
+	login := loginTenantUser(t, h, "acme", "refresh@example.com", testPassphrase)
 
 	body, err := json.Marshal(identitydto.RefreshRequest{RefreshToken: login.RefreshToken})
 	require.NoError(t, err)
@@ -267,8 +267,8 @@ func TestTenantIdentity_RefreshTokenTenantMismatch(t *testing.T) {
 
 func TestTenantIdentity_SuspendedTenantAndLegacyToken(t *testing.T) {
 	h := setupTenantHarness(t)
-	registerTenantUser(t, h, "acme", "suspended@example.com", "Password1!2026", "Suspended User")
-	login := loginTenantUser(t, h, "acme", "suspended@example.com", "Password1!2026")
+	registerTenantUser(t, h, "acme", "suspended@example.com", testPassphrase, "Suspended User")
+	login := loginTenantUser(t, h, "acme", "suspended@example.com", testPassphrase)
 
 	// A legacy token without tenant_id is rejected fail-closed.
 	legacy, err := token.Generate(login.User.ID, login.User.Email, login.User.Role, integrationTenantSecret, 24)
@@ -289,7 +289,7 @@ func TestTenantIdentity_SuspendedTenantAndLegacyToken(t *testing.T) {
 	h.suspendTenant(t, "acme")
 
 	// The middleware refuses to resolve a suspended tenant for public auth.
-	body, _ := json.Marshal(identitydto.LoginRequest{Email: "suspended@example.com", Password: "Password1!2026"})
+	body, _ := json.Marshal(identitydto.LoginRequest{Email: "suspended@example.com", Password: testPassphrase})
 	resp, _ = tenantRequest(t, h.app, http.MethodPost, "/api/v1/auth/login", "acme", body, "")
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 

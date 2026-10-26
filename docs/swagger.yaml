@@ -739,6 +739,19 @@ definitions:
       recoveryCodesRemaining:
         type: integer
     type: object
+  dto.MFAStepUpRequest:
+    properties:
+      code:
+        maxLength: 64
+        type: string
+    required:
+    - code
+    type: object
+  dto.MFAStepUpResponse:
+    properties:
+      verifiedAt:
+        type: string
+    type: object
   dto.MFAVerifyRequest:
     properties:
       challenge:
@@ -2790,6 +2803,52 @@ paths:
       security:
       - BearerAuth: []
       summary: MFA status
+      tags:
+      - Auth
+  /auth/mfa/step-up:
+    post:
+      consumes:
+      - application/json
+      description: Verify a current TOTP or recovery code and stamp the caller's session
+        as freshly second-factor authenticated. Use it when an MFA-gated route returns
+        403 auth.mfa_required because the previous verification is older than MFA_MAX_AGE.
+      parameters:
+      - description: TOTP or recovery code
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAStepUpRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.MFAStepUpResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "409":
+          description: auth.mfa_not_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Refresh MFA freshness for the current session
       tags:
       - Auth
   /auth/mfa/totp/confirm:

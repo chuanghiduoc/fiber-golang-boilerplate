@@ -81,6 +81,18 @@ func TestGoogleCallback_ExchangeErrorClassification(t *testing.T) {
 			status:   fiber.StatusBadGateway,
 			wantCode: string(identitycatalog.CodeAuthOAuthUpstreamUnavailable),
 		},
+		{
+			name:     "google email not verified",
+			err:      oauth.ErrEmailNotVerified,
+			status:   fiber.StatusForbidden,
+			wantCode: string(identitycatalog.CodeAuthOAuthEmailNotVerified),
+		},
+		{
+			name:     "incomplete google user info",
+			err:      oauth.ErrIncompleteUserInfo,
+			status:   fiber.StatusBadRequest,
+			wantCode: string(identitycatalog.CodeAuthOAuthUserInfoIncomplete),
+		},
 	}
 
 	for _, tt := range tests {

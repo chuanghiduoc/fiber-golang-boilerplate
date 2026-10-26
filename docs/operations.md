@@ -442,6 +442,13 @@ another reset email) instead of updating dead rows back to `queued`.
   `min(now() + JWT_REFRESH_EXPIRE_DAYS, sessions.expires_at)`; the validator and
   the refresh endpoint reject an expired session with `401`, so rotation can
   never extend a session indefinitely.
+- `sessions.mfa_verified_at` is the AAL2 clock: an `otp`/`rc` sign-in sets it
+  at session creation, `POST /auth/mfa/step-up` refreshes it, and a
+  first-factor session leaves it `NULL`. MFA-gated routes require it to be at
+  most `MFA_MAX_AGE` (default `12h`) old and return `403 auth.mfa_required`
+  otherwise; the session cache is invalidated on step-up, so the next request
+  sees the new value. Raising `MFA_MAX_AGE` weakens the NIST SP 800-63B rev4
+  §2.2.3 freshness bound for every platform route.
 - Revocation reasons in `sessions.revoked_reason`: `logout`, `logout_all`,
   `revoked` (`DELETE /auth/sessions/:id`), `refresh_reuse`,
   `credentials_changed`, `membership_changed` (ban, removal, role change),
@@ -1824,6 +1831,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `JWT_SECRET` / `JWT_PREVIOUS_SECRETS` | Active signing key (32+ chars outside local/test; tokens carry its derived `kid`) and comma-separated verify-only retired keys |
 | `DATA_ENCRYPTION_KEY` / `DATA_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for email/password-reset job payloads (32+ chars; required in production and must differ from `JWT_SECRET`; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `REQUIRE_EMAIL_VERIFICATION` | Require a verified email before login/refresh |
+| `PASSWORD_BREACH_CHECK` | `none` (default) or `hibp`: optional breached-password check via the HIBP range API (k-anonymity, 2s timeout, fails open with a warning) |
+| `MFA_MAX_AGE` | Freshness bound for a session's second factor on MFA-gated routes as a Go duration (default `12h`); older proofs return `403 auth.mfa_required` and must call `POST /auth/mfa/step-up` |
 | `TENANT_DEFAULT_SLUG` | Tenant for header-less requests in compatibility mode (default `default`) |
 | `TENANT_REQUIRE_HEADER` | Require `X-Tenant-Slug` on `/api/v1`/`/api/v2` (default `false`; **must be `true` in production**, recommended in staging) |
 | `I18N_DEFAULT_LOCALE` | Fallback locale, `en` or `vi` (default `en`; unsupported values fail startup) |

@@ -36,6 +36,10 @@ type Config struct {
 	// DataEncryption seals job payloads at rest.
 	DataEncryption DataEncryptionConfig
 	Jobs           JobsConfig
+	// Password holds the new-password policy toggles.
+	Password PasswordConfig
+	// MFA bounds how long a second-factor verification stays valid.
+	MFA MFAConfig
 }
 
 func Load() (*Config, error) {
@@ -155,6 +159,8 @@ func (cfg *Config) Validate() error {
 		cfg.CORS.validate,
 		cfg.App.validateTrustedProxies,
 		cfg.OAuth.validate,
+		cfg.Password.validate,
+		cfg.MFA.validate,
 		cfg.Storage.validateDriver,
 	}
 	if cfg.App.Env == envProduction {
