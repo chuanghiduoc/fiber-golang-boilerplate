@@ -30,7 +30,7 @@ func (q *Queries) DeleteFileForPrivacy(ctx context.Context, arg DeleteFileForPri
 
 const listFilesForPrivacy = `-- name: ListFilesForPrivacy :many
 
-SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at FROM files
+SELECT id, tenant_id, user_id, original_name, storage_path, mime_type, size, created_at, updated_at, deleted_at, purge_started_at, purge_attempts, purge_retry_after FROM files
 WHERE tenant_id = $1 AND user_id = $2
 ORDER BY id
 `
@@ -63,6 +63,8 @@ func (q *Queries) ListFilesForPrivacy(ctx context.Context, arg ListFilesForPriva
 			&i.UpdatedAt,
 			&i.DeletedAt,
 			&i.PurgeStartedAt,
+			&i.PurgeAttempts,
+			&i.PurgeRetryAfter,
 		); err != nil {
 			return nil, err
 		}

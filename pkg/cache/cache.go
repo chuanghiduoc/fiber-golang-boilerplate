@@ -39,7 +39,7 @@ func NewCache(cfg config.CacheConfig) (Cache, error) {
 	case "redis":
 		return NewRedisCache(cfg)
 	case "memory":
-		return NewMemoryCache(), nil
+		return NewMemoryCacheWithLimit(cfg.MemoryMaxEntries), nil
 	default:
 		return nil, fmt.Errorf("unsupported cache driver: %q (supported: memory, redis)", cfg.Driver)
 	}

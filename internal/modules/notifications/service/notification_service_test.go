@@ -261,6 +261,30 @@ func TestCreateRequiresRecipient(t *testing.T) {
 	assert.Empty(t, repo.notifications)
 }
 
+func TestCreateResolvesRecipientForInAppOnly(t *testing.T) {
+	repo := newMockRepository()
+	sender := &mockEmailSender{}
+	svc := newTestService(repo, sender)
+	ctx := testContext(1)
+
+	// An in-app-only notification must still reject a removed or suspended
+	// member instead of writing a feed row that violates the membership FK.
+	_, err := svc.SetPreference(ctx, 99, PreferenceUpdate{
+		Type: "system.info", Channel: ChannelEmail, Enabled: new(false),
+	})
+	require.NoError(t, err)
+
+	_, err = svc.Create(ctx, notificationcontracts.CreateNotificationInput{
+		UserID: 99, Type: "system.info", Title: "Title", Body: "Body",
+	})
+	require.Error(t, err)
+	var appErr *apperror.AppError
+	require.ErrorAs(t, err, &appErr)
+	assert.Equal(t, 404, appErr.Status)
+	assert.Empty(t, repo.notifications)
+	assert.Empty(t, sender.messages)
+}
+
 func TestListUnreadReadAndIsolation(t *testing.T) {
 	repo := newMockRepository()
 	svc := newTestService(repo, &mockEmailSender{})

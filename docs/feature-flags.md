@@ -116,7 +116,10 @@ flowchart TD
 
 Without a usable snapshot (no store, cold start with the database down, or the
 last good snapshot is older than the max staleness), evaluation skips the
-database layers entirely.
+target and database-default layers. Kill switches are the exception: once a
+snapshot has loaded, its kill switches keep applying even after the snapshot is
+too stale to serve (fail closed), so a database outage cannot turn a killed
+flag whose compiled default is `true` back on.
 
 A target can be `true` or `false`; both override lower levels. Tenant/user
 lookups use the request tenant resolved by `tenanthttp.Middleware` (and the JWT
@@ -192,7 +195,7 @@ flowchart TD
 | Stale-while-revalidate | An expired snapshot still within `FEATURE_FLAGS_MAX_STALENESS_SECONDS` is served immediately while one background reload runs, so a slow database never stalls requests. |
 | Blocking reload | Only with no usable snapshot (cold start, older than max staleness) or after `Invalidate`. Concurrent blocked callers serialize behind the refresh lock and reuse the fresh result. |
 | Detached loads | Loads use `context.WithoutCancel` plus a 5s timeout, so a client disconnect cannot fail a load for everyone. A load that still returns `context.Canceled` is not a database failure and does not throttle the next reload. |
-| Failed reload | The last good snapshot is served while no older than max staleness; after that, evaluation falls back to force-off/environment/compiled defaults. Failed reloads are throttled for one TTL so an outage does not query on every request. |
+| Failed reload | The last good snapshot is served while no older than max staleness; after that, targets and database defaults fall back to force-off/environment/compiled defaults, while the last snapshot's kill switches remain in force. Failed reloads are throttled for one TTL so an outage does not query on every request. |
 | Invalidate | The admin service calls `Evaluator.Invalidate` after every successful write, so the writing replica sees the change immediately. It marks the snapshot stale instead of dropping it: if the next reload fails the previous snapshot remains the fallback, so a database blip right after a write cannot lift a kill switch. A load already in flight when `Invalidate` runs is discarded and reloaded. |
 | Other replicas | Converge within the cache TTL; there is no pub/sub dependency. |
 

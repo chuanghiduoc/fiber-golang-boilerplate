@@ -1144,6 +1144,11 @@ CREATE TABLE IF NOT EXISTS files (
     deleted_at TIMESTAMP WITH TIME ZONE,
     -- files.trash.purge claim: set before the blob is deleted; restore requires NULL.
     purge_started_at TIMESTAMP WITH TIME ZONE,
+    -- A blob delete failure releases the claim (restore stays possible) and
+    -- records the attempt; rows are skipped until purge_retry_after so a
+    -- permanently failing blob cannot block newer rows.
+    purge_attempts INTEGER NOT NULL DEFAULT 0 CHECK (purge_attempts >= 0),
+    purge_retry_after TIMESTAMP WITH TIME ZONE,
     CONSTRAINT fk_files_tenant_user FOREIGN KEY (tenant_id, user_id)
         REFERENCES memberships (tenant_id, user_id) ON DELETE RESTRICT
 );

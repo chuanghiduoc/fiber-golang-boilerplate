@@ -5,9 +5,17 @@ import (
 	"time"
 )
 
+// DefaultMemoryMaxEntries bounds the process-local cache: every stored entry
+// keeps its full value in memory (idempotency responses can be large), so an
+// unbounded map lets clients grow the heap until the process is OOM-killed.
+const DefaultMemoryMaxEntries = 100000
+
 type CacheConfig struct {
 	Driver   string `env:"CACHE_DRIVER" envDefault:"memory"`
 	RedisURL string `env:"REDIS_URL"`
+	// MemoryMaxEntries bounds the memory driver. Expired entries are dropped
+	// first, then the least recently used ones. Validation requires > 0.
+	MemoryMaxEntries int `env:"CACHE_MEMORY_MAX_ENTRIES" envDefault:"100000"`
 	// AllowMemoryInProduction acknowledges a single-replica production
 	// deployment. The memory driver keeps rate limits, idempotency, login
 	// lockout, and session invalidation per process, so it is rejected in
@@ -73,6 +81,9 @@ func (c CacheConfig) Validate() error {
 		}
 	default:
 		return fmt.Errorf("CACHE_DRIVER must be one of: memory, redis (got %q)", c.Driver)
+	}
+	if c.MemoryMaxEntries <= 0 {
+		return fmt.Errorf("CACHE_MEMORY_MAX_ENTRIES must be greater than 0")
 	}
 	if c.RedisDialTimeoutMS < 0 || c.RedisReadTimeoutMS < 0 || c.RedisWriteTimeoutMS < 0 || c.RedisPoolTimeoutMS < 0 {
 		return fmt.Errorf("REDIS_*_TIMEOUT_MS values must not be negative")

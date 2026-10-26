@@ -7,6 +7,7 @@ import (
 	"io"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,12 +16,16 @@ import (
 )
 
 // fakeTrashRepo models PurgeBatch: it hands out the oldest rows still in the
-// trash and removes the returned IDs only when purge succeeds.
+// trash, skips rows whose retry time is in the future, removes the returned
+// IDs, and records the failed ones like the SQL repository does.
 type fakeTrashRepo struct {
-	trash    []TrashedFile
-	batches  int
-	gotDays  int32
-	batchErr error
+	trash      []TrashedFile
+	retryAfter map[int64]time.Time
+	attempts   map[int64]int
+	now        time.Time
+	batches    int
+	gotDays    int32
+	batchErr   error
 }
 
 func (r *fakeTrashRepo) PurgeBatch(ctx context.Context, retentionDays, limit int32, purge TrashPurgeFunc) (int64, error) {
@@ -29,15 +34,35 @@ func (r *fakeTrashRepo) PurgeBatch(ctx context.Context, retentionDays, limit int
 	if r.batchErr != nil {
 		return 0, r.batchErr
 	}
-	batch := slices.Clone(r.trash[:min(int(limit), len(r.trash))])
+	now := r.now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	candidates := make([]TrashedFile, 0, len(r.trash))
+	for _, f := range r.trash {
+		if retry := r.retryAfter[f.ID]; !retry.After(now) {
+			candidates = append(candidates, f)
+		}
+	}
+	batch := slices.Clone(candidates[:min(int(limit), len(candidates))])
 	if len(batch) == 0 {
 		return 0, nil
 	}
-	ids, err := purge(ctx, batch)
+	ids, failed, err := purge(ctx, batch)
 	if err != nil {
 		return 0, err
 	}
 	r.trash = slices.DeleteFunc(r.trash, func(f TrashedFile) bool { return slices.Contains(ids, f.ID) })
+	for _, id := range failed {
+		if r.attempts == nil {
+			r.attempts = make(map[int64]int)
+		}
+		if r.retryAfter == nil {
+			r.retryAfter = make(map[int64]time.Time)
+		}
+		r.attempts[id]++
+		r.retryAfter[id] = now.Add(time.Hour)
+	}
 	return int64(len(ids)), nil
 }
 
@@ -91,15 +116,45 @@ func TestTrashPurgeMissingBlobIsSuccess(t *testing.T) {
 	assert.Empty(t, repo.trash, "a row whose blob is already gone is hard-deleted")
 }
 
-func TestTrashPurgeKeepsRowsWhoseBlobDeleteFailed(t *testing.T) {
-	repo := &fakeTrashRepo{trash: trashOf(3)}
+func TestTrashPurgeRetriesFailedBlobWithoutFailingTheJob(t *testing.T) {
+	repo := &fakeTrashRepo{trash: trashOf(3), now: time.Now()}
 	failing := repo.trash[1]
 	store := &fakeBlobStore{errs: map[string]error{failing.StoragePath: errors.New("s3 unavailable")}}
+	purger := NewTrashPurger(repo, store, 30)
+
+	require.NoError(t, purger.HandleJob(context.Background(), nil),
+		"a blob failure is recorded on the row, so the batch and job succeed")
+	assert.Equal(t, []TrashedFile{failing}, repo.trash, "only the failed row stays in the trash")
+	assert.Equal(t, 1, repo.attempts[failing.ID], "the failed attempt is counted")
+	assert.True(t, repo.retryAfter[failing.ID].After(repo.now), "the row is retried later")
+	assert.Equal(t, 1, repo.batches, "the other rows of the batch were still purged")
+
+	// Before the retry time the row is skipped; after it the blob delete is
+	// attempted again.
+	delete(store.errs, failing.StoragePath)
+	require.NoError(t, purger.HandleJob(context.Background(), nil))
+	assert.Equal(t, []TrashedFile{failing}, repo.trash, "a row in backoff is not re-claimed")
+	assert.Equal(t, 1, repo.attempts[failing.ID])
+
+	repo.now = repo.now.Add(2 * time.Hour)
+	require.NoError(t, purger.HandleJob(context.Background(), nil))
+	assert.Empty(t, repo.trash, "the retry removes the row once the backoff has passed")
+}
+
+func TestTrashPurgeAllFailedBlobsDoNotLoop(t *testing.T) {
+	repo := &fakeTrashRepo{trash: trashOf(3), now: time.Now()}
+	store := &fakeBlobStore{errs: make(map[string]error, 3)}
+	for _, f := range repo.trash {
+		store.errs[f.StoragePath] = errors.New("s3 unavailable")
+	}
 
 	err := NewTrashPurger(repo, store, 30).HandleJob(context.Background(), nil)
-	require.Error(t, err, "a failed blob delete is reported so the job retries")
-	assert.Equal(t, []TrashedFile{failing}, repo.trash, "only the failed row stays in the trash")
-	assert.Equal(t, 1, repo.batches, "the run stops instead of reselecting the failed row")
+	require.NoError(t, err, "per-row backoff replaces a job-level retry loop")
+	assert.Len(t, repo.trash, 3)
+	assert.Equal(t, 1, repo.batches, "the whole failed batch is deferred instead of re-claimed")
+	for _, f := range repo.trash {
+		assert.Equal(t, 1, repo.attempts[f.ID])
+	}
 }
 
 func TestTrashPurgeRepositoryErrorFails(t *testing.T) {

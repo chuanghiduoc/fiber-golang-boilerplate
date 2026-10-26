@@ -108,7 +108,7 @@ var requiredColumns = map[string][]string{
 	"mfa_factors":               {"user_id", "type", "secret_ciphertext", "confirmed_at", "last_used_step"},
 	"mfa_recovery_codes":        {"user_id", "code_hash", "used_at"},
 	"data_exports":              {"tenant_id", "user_id", "status", "storage_path", "expires_at"},
-	"files":                     {"tenant_id", "updated_at"},
+	"files":                     {"tenant_id", "updated_at", "purge_started_at", "purge_attempts", "purge_retry_after"},
 	"api_keys": {
 		"tenant_id", "user_id", "key_hash", "expires_at",
 		"revoked_at", "rotated_at", "rotation_grace_until", "last_used_at",

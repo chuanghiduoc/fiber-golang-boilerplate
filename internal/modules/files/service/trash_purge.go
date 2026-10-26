@@ -34,17 +34,18 @@ type TrashedFile struct {
 }
 
 // TrashPurgeFunc removes the blobs of a claimed batch and returns the IDs whose
-// rows may now be hard-deleted. A row whose blob could not be removed is left
-// out, so it stays claimed for the next run.
-type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs []int64, err error)
+// rows may now be hard-deleted and the IDs whose blob delete failed. A failed
+// row is deferred with a per-row backoff, so the rest of the batch continues.
+type TrashPurgeFunc func(ctx context.Context, batch []TrashedFile) (purgeIDs, failedIDs []int64, err error)
 
 // TrashRepository is the purge persistence port. Unlike FileRepository it is
 // not tenant-scoped: retention is a cross-tenant maintenance pass, and every
 // candidate carries its own tenant and storage path.
 type TrashRepository interface {
 	// PurgeBatch commits a claim on up to limit expired rows (making them
-	// unrestorable), calls purge, then hard-deletes the returned IDs. On
-	// failure the rows stay claimed and the next run finishes them.
+	// unrestorable), calls purge, hard-deletes the returned IDs, and releases
+	// the claim on failed IDs after recording an attempt and retry time. On
+	// error the rows stay claimed and the next run finishes them.
 	PurgeBatch(ctx context.Context, retentionDays, limit int32, purge TrashPurgeFunc) (int64, error)
 }
 
@@ -70,28 +71,29 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 	budgetCtx, cancel := context.WithTimeout(ctx, trashPurgeBudget)
 	defer cancel()
 
-	var total int64
+	var total, failedTotal int64
 	defer func() {
-		if total > 0 {
-			slog.Info("purged trashed files", slog.Int64("rows", total))
+		if total > 0 || failedTotal > 0 {
+			slog.Info("purged trashed files",
+				slog.Int64("rows", total),
+				slog.Int64("failed", failedTotal),
+			)
 		}
 	}()
 	for {
-		var claimed, failed int
+		var claimed int
 		deleted, err := p.repo.PurgeBatch(budgetCtx, p.retentionDays, trashPurgeBatchSize,
-			func(ctx context.Context, batch []TrashedFile) ([]int64, error) {
+			func(ctx context.Context, batch []TrashedFile) ([]int64, []int64, error) {
 				claimed = len(batch)
-				ids, failures, err := p.deleteBlobs(ctx, batch)
-				failed = failures
-				return ids, err
+				ids, failed, err := p.deleteBlobs(ctx, batch)
+				failedTotal += int64(len(failed))
+				return ids, failed, err
 			})
 		total += deleted
 		switch {
-		case err == nil && failed > 0:
-			// The rest of the batch committed. Stop instead of looping: the
-			// failed rows are the oldest and would be selected again at once.
-			return fmt.Errorf("purge trashed files: %d blob deletes failed", failed)
 		case err == nil && claimed < trashPurgeBatchSize:
+			// A failed row is deferred on its own record, so a short batch (or
+			// an empty one) means this run has no more eligible rows.
 			return nil
 		case err == nil:
 			continue
@@ -106,20 +108,21 @@ func (p *TrashPurger) HandleJob(ctx context.Context, _ json.RawMessage) error {
 
 // deleteBlobs removes each candidate's blob. A blob that is already gone is a
 // success (a previous attempt deleted it before its row). Other failures are
-// logged and the row stays claimed. Cancellation aborts the batch before its
-// hard delete.
-func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids []int64, failed int, err error) {
+// logged, counted, and returned so the repository can defer that row with a
+// retry time while the rest of the batch continues. Cancellation aborts the
+// batch before its hard delete.
+func (p *TrashPurger) deleteBlobs(ctx context.Context, batch []TrashedFile) (ids, failed []int64, err error) {
 	ids = make([]int64, 0, len(batch))
 	for _, file := range batch {
 		if err := ctx.Err(); err != nil {
-			return nil, failed, err
+			return nil, nil, err
 		}
 		if err := p.storage.Delete(ctx, file.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			if ctx.Err() != nil {
-				return nil, failed, ctx.Err()
+				return nil, nil, ctx.Err()
 			}
-			failed++
-			slog.Error("failed to delete trashed file blob; the row is kept for the next run",
+			failed = append(failed, file.ID)
+			slog.Error("failed to delete trashed file blob; the row is deferred for a later run",
 				slog.Int64("file_id", file.ID), slog.Int64("tenant_id", file.TenantID), slog.Any("error", err))
 			continue
 		}
