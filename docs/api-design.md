@@ -221,7 +221,11 @@ flowchart TD
 
 - Each sign-in opens a session (the RFC 9700 refresh-token family). Refresh
   tokens rotate atomically, are single-use, version-bound, and scoped to the
-  issuing tenant. Presenting an already-used refresh token is reuse: the whole
+  issuing tenant. Presenting a token that a concurrent rotation consumed less
+  than 10 seconds ago, in a session that is still live, is a client race:
+  the call returns `401 auth.refresh_concurrent` and the session is **not**
+  revoked (two tabs refreshing at once are normal). Outside that grace, or
+  when the session is no longer live, the same request is reuse: the whole
   session is revoked (`refresh_reuse`) and the call returns `401
   auth.refresh_invalid`, so both the legitimate client and an attacker must
   sign in again. Access tokens are short-lived (`JWT_EXPIRE_HOUR`, default 1).
@@ -271,9 +275,16 @@ issue tokens. Login returns `200` with the user, `mfaRequired: true`, and
 and `mfa_challenge` in the URL fragment. Complete either with
 `POST /auth/mfa/verify`. Wrong codes spend a per-user second-factor budget
 (5 per 15 minutes, `429` after it) that only a successful verification clears;
-a correct password does not reset it. A password change or logout-all voids
-pending challenges. When MFA is off, the login response
-keeps its original shape (`mfaRequired`/`mfaChallengeToken` are omitted).
+a correct password does not reset it. Every failed TOTP/recovery-code attempt
+by `/auth/mfa/verify`, `/auth/mfa/disable`, and
+`/auth/mfa/recovery-codes/regenerate` writes `auth.mfa_verify_failed` in its
+own transaction (actor = the user, metadata = a reason class such as
+`invalid_code` or `budget_exhausted`, never the code); the attempt that
+exhausts the budget also writes `auth.mfa_attempts_exhausted` once. A failed
+audit write is logged and never changes the 401/429 response. A password
+change or logout-all voids pending challenges. When MFA is off, the login
+response keeps its original shape (`mfaRequired`/`mfaChallengeToken` are
+omitted).
 
 Access tokens carry `amr` (`pwd`, `google`, `otp`, `rc`); refresh preserves the
 session's set. `authzhttp.RequireMFA()` returns `403 auth.mfa_required` when
@@ -304,7 +315,8 @@ Users are global identities; a user joins tenants through memberships. Everythin
 |---|---|
 | Register `POST /auth/register` | Creates user + password + active `member` membership in the request tenant (gated by the `user_registration` flag). An address that already has an account in **any** tenant gets `409 user.email_taken`; an existing user joins another tenant only through an invitation. An address banned in this tenant is refused even after the banned account was deleted. |
 | Login `POST /auth/login` | Global password plus an active membership in the request tenant; a correct password without one (never joined, banned, removed) gets the same `401 auth.invalid_credentials` as a wrong password. Opens a session; the JWT carries `sid`. |
-| Google OAuth | Resolves the identity through `user_identities`: an existing link, a verified local account with the same address (linking requires both a verified local email and Google `verified_email`), or a new account with a membership in the state tenant (`user_registration` flag). An existing user must already be an active member of the state tenant; Google sign-in never joins a tenant implicitly. |
+| Google OAuth | Authorization requests use PKCE (`S256`; the verifier stays server-side in the signed state cookie) and never request offline access, because Google refresh tokens are unused. The callback resolves the identity through `user_identities`: an existing link, a verified local account with the same address (linking requires both a verified local email and Google `verified_email`), or a new account with a membership in the state tenant (`user_registration` flag). An existing user must already be an active member of the state tenant; Google sign-in never joins a tenant implicitly. On success the callback redirects with only a 256-bit single-use code in the fragment (`#code=<code>`, valid 60 s) and `POST /auth/google/exchange {"code"}` (public, strict limiter) redeems it for the normal token response; the code is bound to the state tenant, and another tenant or a second redemption gets `401 auth.oauth_code_invalid`. An MFA sign-in still redirects with `mfa_required=true`/`mfa_challenge`. |
+| Password policy | NIST SP 800-63B: at least 12 and at most 64 characters (runes), at most 72 bytes (bcrypt's input limit), no composition rules. The bundled top-10k common-password list (`pkg/validator/data/common_passwords.txt`) is refused case-insensitively, and the password must not be or contain the local part of the account's email (at least three characters). Registration, password reset, and password change enforce the email rule where the address is known; failures are `422 validation_failed` with field codes `weak_password`, `password_common`, or `password_contains_email`. |
 | Password reset / email verification | Per user. The emailed link keeps `?tenant=<slug>` only so the frontend knows where to sign in afterwards. |
 | `GET /auth/sessions` | JWT only, `profile:read`. Cursor list of the caller's live sessions in the request tenant, newest first (`id`, `userAgent`, `ip`, `createdAt`, `lastUsedAt`, `current`). |
 | `DELETE /auth/sessions/:id` | JWT only, `sessions:revoke`, Tier 2 audited (`auth.session_revoked`). Revokes one of the caller's sessions in the request tenant (`204`); its refresh tokens stop working and its access tokens are rejected. Another user's session is `404`. |
@@ -313,6 +325,17 @@ Users are global identities; a user joins tenants through memberships. Everythin
 | `DELETE /users/:id` | Own id: deletes the global account (every tenant; JWT only; refused with `409` while the caller is the last active owner of any tenant). Another id: removes that membership from the request tenant (`admin:users:delete`); the account and other tenants are untouched. |
 | Admin ban/unban/role | Membership changes in the request tenant; ban, role change, and removal end the member's sessions there. API keys issued before a ban or removal stay revoked after an unban or re-join. Rank hierarchy: `owner` (3) > `admin` (2) > `member` and tenant roles (1). Granting a role (including an invitation's role) needs caller rank ≥ the role's rank and every permission the role grants; only an owner may grant `owner`. Managing a member (role change, demotion, ban, unban, removal) needs caller rank strictly greater than the target's current highest rank, except that an owner may manage another owner; failures are `403 role.insufficient_rank`. A non-owner cannot change their own roles (equal rank is refused). The last active owner of an operational tenant cannot be banned, demoted, removed, or have the owner role deleted. |
 | Member lists | `GET /users`, `GET /admin/users` paginate members by `(joinedAt, id)`; `UserResponse` adds `membershipStatus` and `joinedAt`. |
+
+Security notifications: every credential or second-factor change (password
+change, password reset, email change, MFA enabled, MFA disabled, recovery codes
+regenerated, platform MFA reset) emails the account owner. An email change is
+also sent to the previous address, so its former owner learns the address no
+longer belongs to the account. The message states what changed, the UTC time,
+the request IP and user agent when available, and "if this wasn't you"
+guidance; it never contains a password, token, or recovery code. The
+`email.send` job is enqueued in the same transaction as the change (never
+before commit), and the text is localized from `tenant_settings.locale`
+(`en`/`vi`).
 
 Invitations (pending invites are `invitations` rows; there is no "invited"
 membership state):

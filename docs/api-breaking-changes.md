@@ -47,6 +47,36 @@ oasdiff breaking /tmp/base.json /tmp/pr.json --fail-on ERR
   the old base64url format still verify but are deprecated. Rotate them to get
   the current format.
 
+### 2026-10-26 — Google sign-in returns a one-time code, not tokens
+
+- `GET /api/v1/auth/google/callback`: the redirect fragment changes from
+  `#access_token=…&refresh_token=…` to `#code=<one-time-code>`. The code is
+  256 bits, single use, expires after 60 seconds, and is bound to the tenant in
+  the signed `state`; browser history no longer records credentials.
+- New public endpoint `POST /api/v1/auth/google/exchange` with
+  `{"code": "<code>"}` and `X-Tenant-Slug` resolves the code to the normal
+  login response (`accessToken`, `refreshToken`, `user`). An unknown, expired,
+  already-redeemed, or other-tenant code returns `401 auth.oauth_code_invalid`.
+- The authorization request now uses PKCE (S256) and no longer sends
+  `access_type=offline`; this needs no client change.
+- Clients must read `code` from the callback fragment and call the exchange
+  endpoint instead of taking tokens from the fragment. There is no v2 route:
+  the old fragment would keep credentials in browser history, which this change
+  removes.
+
+### 2026-10-26 — NIST 800-63B password policy
+
+- `POST /api/v1/auth/register`, `POST /api/v1/auth/reset-password`, and
+  `PUT /api/v1/users/me/password` now reject passwords shorter than 12
+  characters, longer than 64 characters or 72 bytes, on the bundled
+  top-10k common-password list, or containing the email local part.
+  Composition rules (uppercase/lowercase/digit/special) are gone.
+- Existing passwords keep working for sign-in; only a new password is
+  validated. Clients should surface the `422 validation_failed` field codes
+  `weak_password`, `password_common`, and `password_contains_email` and ask the
+  user for a longer passphrase. No v2 route is needed: the old policy accepted
+  weaker secrets and cannot be kept for new passwords.
+
 ### 2026-10-26 — API keys are owner-bound on create and rotate
 
 - `POST /api/v1/admin/api-keys`: the `userId` request field is removed. A key is

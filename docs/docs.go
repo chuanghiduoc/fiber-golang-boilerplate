@@ -2012,6 +2012,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/auth/google/exchange": {
+            "post": {
+                "description": "Exchange the single-use code from the Google callback's URL fragment for the normal access and refresh token pair. The code expires after 60 seconds, works once, and is bound to the tenant that started the flow.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Auth"
+                ],
+                "summary": "Redeem a Google sign-in code",
+                "parameters": [
+                    {
+                        "description": "One-time code from the callback fragment",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.GoogleExchangeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/dto.LoginResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "auth.oauth_code_invalid",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/auth/invitations/accept": {
             "post": {
                 "security": [
@@ -7029,6 +7087,19 @@ const docTemplate = `{
                 "email": {
                     "type": "string",
                     "maxLength": 255
+                }
+            }
+        },
+        "dto.GoogleExchangeRequest": {
+            "type": "object",
+            "required": [
+                "code"
+            ],
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "minLength": 32
                 }
             }
         },

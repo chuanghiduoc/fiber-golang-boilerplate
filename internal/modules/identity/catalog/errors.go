@@ -12,6 +12,11 @@ const (
 	CodeAuthInvalidCredentials apperror.Code = "auth.invalid_credentials"
 	CodeAuthEmailNotVerified   apperror.Code = "auth.email_not_verified"
 	CodeAuthRefreshInvalid     apperror.Code = "auth.refresh_invalid"
+	// CodeAuthRefreshConcurrent: a second refresh presented the same token
+	// while the rotation was still inside the 10-second grace window. The
+	// session stays valid; the caller should retry with the token it already
+	// holds or the one from the winning response.
+	CodeAuthRefreshConcurrent apperror.Code = "auth.refresh_concurrent"
 	// CodeAuthMFAChallengeInvalid: the challenge expired, was already used,
 	// or belongs to another tenant.
 	CodeAuthMFAChallengeInvalid apperror.Code = "auth.mfa_challenge_invalid"
@@ -30,6 +35,9 @@ const (
 	// CodeAuthOAuthUpstreamUnavailable: Google's token or userinfo endpoint
 	// failed in a way the client cannot fix (5xx, timeout, network).
 	CodeAuthOAuthUpstreamUnavailable apperror.Code = "auth.oauth_upstream_unavailable"
+	// CodeAuthOAuthCodeInvalid: the one-time Google exchange code is unknown,
+	// already redeemed, expired, or bound to another tenant.
+	CodeAuthOAuthCodeInvalid apperror.Code = "auth.oauth_code_invalid"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
 	CodeUserNotFound   apperror.Code = "user.not_found"
@@ -75,6 +83,11 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Title:   "Invalid refresh token",
 			DocPath: "/errors/auth-refresh-invalid",
 		},
+		CodeAuthRefreshConcurrent: {
+			Status:  http.StatusUnauthorized,
+			Title:   "Concurrent refresh",
+			DocPath: "/errors/auth-refresh-concurrent",
+		},
 		CodeAuthMFAChallengeInvalid: {
 			Status:  http.StatusUnauthorized,
 			Title:   "Invalid MFA challenge",
@@ -109,6 +122,11 @@ func ErrorCodes() map[apperror.Code]apperror.Spec {
 			Status:  http.StatusBadGateway,
 			Title:   "OAuth provider is unavailable",
 			DocPath: "/errors/auth-oauth-upstream-unavailable",
+		},
+		CodeAuthOAuthCodeInvalid: {
+			Status:  http.StatusUnauthorized,
+			Title:   "Invalid Google sign-in code",
+			DocPath: "/errors/auth-oauth-code-invalid",
 		},
 		CodeUserEmailTaken: {
 			Status:  http.StatusConflict,

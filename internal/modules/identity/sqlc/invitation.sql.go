@@ -76,14 +76,19 @@ func (q *Queries) DeleteTenantInvitationsBatch(ctx context.Context, arg DeleteTe
 
 const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one
 SELECT id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at FROM invitations
-WHERE token_hash = $1
+WHERE tenant_id = $1 AND token_hash = $2
 FOR UPDATE
 `
 
-// Possession-based lookup: the invitee may not be a member of (or signed in
-// to) the inviting tenant yet. The row lock serializes concurrent accepts.
-func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, tokenHash string) (Invitation, error) {
-	row := q.db.QueryRow(ctx, getInvitationByTokenHashForUpdate, tokenHash)
+type GetInvitationByTokenHashForUpdateParams struct {
+	TenantID  int64  `json:"tenant_id"`
+	TokenHash string `json:"token_hash"`
+}
+
+// Tenant-scoped possession lookup: the row lock serializes concurrent accepts.
+// tenant_id is explicit so the statement stays safe even under RLS bypass.
+func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, arg GetInvitationByTokenHashForUpdateParams) (Invitation, error) {
+	row := q.db.QueryRow(ctx, getInvitationByTokenHashForUpdate, arg.TenantID, arg.TokenHash)
 	var i Invitation
 	err := row.Scan(
 		&i.ID,
@@ -99,6 +104,22 @@ func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, tokenHa
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getInvitationTenantByTokenHash = `-- name: GetInvitationTenantByTokenHash :one
+SELECT tenant_id FROM invitations
+WHERE token_hash = $1
+`
+
+// Possession-based pre-read: the invitee may not be signed in to (or a member
+// of) the inviting tenant yet, so the tenant is resolved by token hash alone
+// before the tenant-scoped transaction starts. The invitation is re-locked
+// and re-validated under that tenant's scope.
+func (q *Queries) GetInvitationTenantByTokenHash(ctx context.Context, tokenHash string) (int64, error) {
+	row := q.db.QueryRow(ctx, getInvitationTenantByTokenHash, tokenHash)
+	var tenant_id int64
+	err := row.Scan(&tenant_id)
+	return tenant_id, err
 }
 
 const listPendingInvitationsCursor = `-- name: ListPendingInvitationsCursor :many

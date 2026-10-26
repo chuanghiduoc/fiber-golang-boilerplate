@@ -60,16 +60,18 @@ func clearReauthAttempts(ctx context.Context, store cache.Cache, userID int64) {
 }
 
 // reserveMFAAttempt counts one second-factor attempt for userID and rejects
-// it once the budget is spent. Only a successful verification clears it.
-func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+// it once the budget is spent. It returns the new count so the caller can
+// audit the exhaustion once (on the attempt that crosses the limit). Only a
+// successful verification clears it.
+func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) (int64, error) {
 	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
 	if err != nil {
-		return loginLockoutUnavailable(err)
+		return 0, loginLockoutUnavailable(err)
 	}
 	if attempts > maxMFAAttempts {
-		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
+		return attempts, apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
 	}
-	return nil
+	return attempts, nil
 }
 
 func clearMFAAttempts(ctx context.Context, store cache.Cache, userID int64) {

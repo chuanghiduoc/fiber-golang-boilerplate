@@ -55,7 +55,7 @@ func (m *mockUserService) Register(_ context.Context, req service.RegisterInput)
 }
 
 func (m *mockUserService) Authenticate(_ context.Context, req service.LoginInput) (*service.Member, error) {
-	if req.Email == "test@example.com" && req.Password == "Password1!" {
+	if req.Email == "test@example.com" && req.Password == "Password1!2026" {
 		return testMember(1, "test@example.com", "Test User", "user"), nil
 	}
 	return nil, apperror.NewUnauthorized("invalid email or password")
@@ -123,7 +123,7 @@ func (m *mockUserService) RevokeSessions(_ context.Context, _ int64) error {
 }
 
 func (m *mockUserService) VerifyPassword(_ context.Context, _ int64, password string) error {
-	if password == "Password1!" {
+	if password == "Password1!2026" {
 		return nil
 	}
 	return apperror.NewBadRequest("current password is incorrect")
@@ -134,7 +134,11 @@ func (m *mockUserService) RegistrationEmailsTransactional() bool {
 }
 
 // mockPasswordResetService is a manual mock for testing handlers.
-type mockPasswordResetService struct{}
+type mockPasswordResetService struct {
+	// email is the address EmailForResetToken resolves; empty means the
+	// token is unknown, so the handler skips the email/password policy.
+	email string
+}
 
 func (m *mockPasswordResetService) ForgotPassword(_ context.Context, _ service.ForgotPasswordInput) error {
 	return nil
@@ -146,6 +150,10 @@ func (m *mockPasswordResetService) ResetPassword(_ context.Context, _ service.Re
 
 func (m *mockPasswordResetService) HandleResetRequestJob(_ context.Context, _ json.RawMessage) error {
 	return nil
+}
+
+func (m *mockPasswordResetService) EmailForResetToken(_ context.Context, _ string) (string, error) {
+	return m.email, nil
 }
 
 // mockEmailVerificationService is a manual mock for testing handlers.
@@ -217,7 +225,7 @@ func TestRegisterHandler(t *testing.T) {
 
 	body, _ := json.Marshal(dto.RegisterRequest{
 		Email:    "new@example.com",
-		Password: "Password1!",
+		Password: "Password1!2026",
 		Name:     "New User",
 	})
 
@@ -234,7 +242,7 @@ func TestRegisterHandler_VerificationEmailDispatch(t *testing.T) {
 		t.Helper()
 		body, _ := json.Marshal(dto.RegisterRequest{
 			Email:    "new@example.com",
-			Password: "Password1!",
+			Password: "Password1!2026",
 			Name:     "New User",
 		})
 		req, _ := http.NewRequest("POST", "/auth/register", bytes.NewReader(body))
@@ -276,7 +284,7 @@ func TestLoginHandler(t *testing.T) {
 
 	body, _ := json.Marshal(dto.LoginRequest{
 		Email:    "test@example.com",
-		Password: "Password1!",
+		Password: "Password1!2026",
 	})
 
 	req, _ := http.NewRequest("POST", "/auth/login", bytes.NewReader(body))
@@ -464,7 +472,7 @@ func TestResetPasswordHandler(t *testing.T) {
 
 	body, _ := json.Marshal(dto.ResetPasswordRequest{
 		Token:    "valid-reset-token",
-		Password: "NewPassword1!",
+		Password: "NewPassword1!2026",
 	})
 
 	req, _ := http.NewRequest("POST", "/auth/reset-password", bytes.NewReader(body))
@@ -539,8 +547,8 @@ func TestChangePasswordHandler(t *testing.T) {
 	app := setupApp(newMockService())
 
 	body, _ := json.Marshal(dto.ChangePasswordRequest{
-		CurrentPassword: "OldPassword1!",
-		NewPassword:     "NewPassword1!",
+		CurrentPassword: "OldPassword1!2026",
+		NewPassword:     "NewPassword1!2026",
 	})
 	req, _ := http.NewRequest("PUT", "/users/me/password", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

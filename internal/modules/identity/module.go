@@ -97,6 +97,9 @@ func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
 	auth.Post("/verify-email", rl.Normal, guard("auth.email_verified", "auth"), m.auth.VerifyEmail)
 	auth.Post("/resend-verification", rl.Normal, guard("auth.verification_resent", "auth"), m.auth.ResendVerification)
 	auth.Get("/google", rl.Normal, m.auth.GoogleRedirect)
+	// The one-time code redeemed here is minted by the callback and expires
+	// after 60 seconds; the strict limiter bounds guessing at 256 bits.
+	auth.Post("/google/exchange", rl.Strict, m.auth.GoogleExchange)
 	// The callback is Tier 1: tenant middleware skips it and the tenant comes
 	// from the signed state, which a route-level Guard would record too early
 	// (tenant 1, anonymous). UserService writes auth.google_login with the

@@ -344,8 +344,10 @@ erDiagram
   deletes the member's pending invitations in the same transaction, and
   acceptance re-checks the inviter's current rank and permissions.
 - **Sessions** are the RFC 9700 refresh-token family, so there is no separate
-  family id: every rotated refresh token references its session, and
-  presenting an already-used token revokes the session (`revoked_reason =
+  family id: every rotated refresh token references its session. Presenting a
+  token that a rotation consumed less than 10 seconds ago in a still-live
+  session is a concurrent refresh (`401 auth.refresh_concurrent`, session
+  kept); any other replay revokes the session (`revoked_reason =
   'refresh_reuse'`). `refresh_tokens` is append-only apart from `used_at`;
   used tokens are kept until they expire so a replay is recognized as reuse.
 - Password-reset and email-verification tokens are **per user**

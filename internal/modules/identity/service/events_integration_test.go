@@ -43,7 +43,7 @@ func TestRegister_PublishesUserRegisteredInTransaction(t *testing.T) {
 	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
-	user, err := users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "event@example.com", Password: "Password1!", Name: "Event"})
+	user, err := users.Register(tenant.WithID(ctx, acmeID), service.RegisterInput{Email: "event@example.com", Password: "Password1!2026", Name: "Event"})
 	require.NoError(t, err)
 
 	var (
@@ -79,7 +79,7 @@ func TestRegister_RollsBackWhenPublishFails(t *testing.T) {
 	tx := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), audit.NewPostgresRecorder(testutil.Scoped(e.pool)), nil, bus)
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: tx, Cache: cache.NewMemoryCache()})
 
-	_, err := users.Register(ctx, service.RegisterInput{Email: "rollback@example.com", Password: "Password1!", Name: "Rollback"})
+	_, err := users.Register(ctx, service.RegisterInput{Email: "rollback@example.com", Password: "Password1!2026", Name: "Rollback"})
 	require.Error(t, err)
 	assert.Equal(t, 500, appStatus(err))
 	assert.Zero(t, scalar[int64](t, e.pool, `SELECT count(*) FROM users`))

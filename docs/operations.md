@@ -445,9 +445,13 @@ another reset email) instead of updating dead rows back to `queued`.
 - Revocation reasons in `sessions.revoked_reason`: `logout`, `logout_all`,
   `revoked` (`DELETE /auth/sessions/:id`), `refresh_reuse`,
   `credentials_changed`, `membership_changed` (ban, removal, role change),
-  `account_deleted`. A burst of `refresh_reuse` (also logged as
-  `refresh token reuse detected; session revoked`) points at stolen refresh
-  tokens or a client that retries refresh with an old token.
+  `account_deleted`. A token rotated less than 10 seconds ago in a still-live
+  session is a concurrent refresh, not reuse: it returns
+  `401 auth.refresh_concurrent`, logs `concurrent refresh inside the rotation
+  grace window; session kept`, and revokes nothing. A burst of
+  `refresh_reuse` (also logged as `refresh token reuse detected; session
+  revoked`) points at stolen refresh tokens or a client that retries refresh
+  with an old token too late.
 - To force everyone to sign in again without rotating `JWT_SECRET`, revoke
   live sessions (`UPDATE sessions SET revoked_at = now(), revoked_reason =
   'revoked' WHERE revoked_at IS NULL`) and wait out the 5-second session cache,
@@ -1206,7 +1210,13 @@ per statement from that marker. A transaction cannot switch pools mid-way: a
 bypass context created inside a transaction that began on the normal pool
 does not change its connection, so those statements stay tenant-scoped and see
 no foreign rows. Mark the context before `WithTx`. Never mark an HTTP path that
-serves one tenant. Outside production an unset
+serves one tenant. The bypass covers as little as possible: invitation
+accept/sign-up uses it only for the possession-based tenant lookup, then locks
+the invitation and writes the membership and audit row in a tenant-scoped
+transaction; operations that must not half-apply (a password or email change
+plus ending the user's sessions in every tenant, an MFA change plus session
+revocation, a platform MFA reset) keep one bypass transaction with an explicit
+tenant predicate on every tenant-owned statement. Outside production an unset
 bypass pair falls back to the normal pool with a startup warning; production
 validation rejects that configuration. `cmd/migrate` verifies
 `relrowsecurity`, `relforcerowsecurity`, the `tenant_isolation` policy, and

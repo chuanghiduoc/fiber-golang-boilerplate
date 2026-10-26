@@ -12,6 +12,45 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const classifyRefreshTokenRotation = `-- name: ClassifyRefreshTokenRotation :one
+SELECT
+    (s.revoked_at IS NULL AND s.expires_at > NOW()) AS session_live,
+    (r.used_at IS NOT NULL AND r.used_at > $1::timestamptz) AS recent,
+    EXISTS (
+        SELECT 1 FROM refresh_tokens n
+        WHERE n.tenant_id = r.tenant_id
+          AND n.session_id = r.session_id
+          AND n.id > r.id
+    ) AS rotated
+FROM refresh_tokens r
+JOIN sessions s ON s.tenant_id = r.tenant_id AND s.id = r.session_id
+WHERE r.token_hash = $2 AND r.tenant_id = $3
+`
+
+type ClassifyRefreshTokenRotationParams struct {
+	UsedAfter pgtype.Timestamptz `json:"used_after"`
+	TokenHash string             `json:"token_hash"`
+	TenantID  int64              `json:"tenant_id"`
+}
+
+type ClassifyRefreshTokenRotationRow struct {
+	SessionLive pgtype.Bool `json:"session_live"`
+	Recent      pgtype.Bool `json:"recent"`
+	Rotated     bool        `json:"rotated"`
+}
+
+// One-statement grace decision for a repeated refresh token. A recent used
+// token may be treated as a concurrent refresh only when its session is still
+// live (not revoked, not expired) and a newer token was already rotated into
+// the same session. Reading the token and the session together leaves no
+// check-then-act gap between the grace decision and the reuse revocation.
+func (q *Queries) ClassifyRefreshTokenRotation(ctx context.Context, arg ClassifyRefreshTokenRotationParams) (ClassifyRefreshTokenRotationRow, error) {
+	row := q.db.QueryRow(ctx, classifyRefreshTokenRotation, arg.UsedAfter, arg.TokenHash, arg.TenantID)
+	var i ClassifyRefreshTokenRotationRow
+	err := row.Scan(&i.SessionLive, &i.Recent, &i.Rotated)
+	return i, err
+}
+
 const createSession = `-- name: CreateSession :one
 INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr)
 SELECT m.tenant_id, m.user_id, u.token_version, $1, $2, $3, $4

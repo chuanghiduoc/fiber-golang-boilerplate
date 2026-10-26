@@ -84,9 +84,9 @@ func setupTenantAuthLinksHarness(t *testing.T) *tenantAuthLinksHarness {
 
 	tenantTwo := testutil.CreateTenant(t, ctx, pool, "links-acme")
 	userID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links@example.com",
-		testutil.MemberOptions{Password: "Password1!", Unverified: true}).UserID
+		testutil.MemberOptions{Password: "Password1!2026", Unverified: true}).UserID
 	user2ID := testutil.CreateMember(t, ctx, pool, tenantTwo, "links2@example.com",
-		testutil.MemberOptions{Password: "Password1!"}).UserID
+		testutil.MemberOptions{Password: "Password1!2026"}).UserID
 
 	appCache := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = appCache.Close() })
@@ -164,7 +164,7 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	status, body = h.postJSON(t, "/api/v1/auth/reset-password?tenant=links-acme",
 		identitydto.ResetPasswordRequest{
 			Token:    resetLink.Query().Get("token"),
-			Password: "NewPassword1!",
+			Password: "NewPassword1!2026",
 		})
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 
@@ -200,7 +200,7 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	status, body = h.postJSON(t, "/api/v1/auth/reset-password?tenant=default",
 		identitydto.ResetPasswordRequest{
 			Token:    secondReset.Query().Get("token"),
-			Password: "AnotherPassword1!",
+			Password: "AnotherPassword1!2026",
 		})
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 
@@ -208,6 +208,6 @@ func TestTenantAuthLinks_ResetAndVerificationCarryTenant(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT password_hash FROM user_passwords WHERE user_id = $1`, h.user2ID,
 	).Scan(&hash))
-	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(hash), []byte("AnotherPassword1!")),
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(hash), []byte("AnotherPassword1!2026")),
 		"the global password must be the reset one")
 }

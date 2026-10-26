@@ -66,11 +66,20 @@ func NewTransactorWithQueue(txManager *database.TxManager, recorder audit.TxReco
 func (t *Transactor) MailTransactional() bool { return t.mail != nil }
 
 func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx identityservice.TxRepos) error) error {
-	return t.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+	var afterCommit []func()
+	err := t.txManager.WithTx(ctx, func(tx pgx.Tx) error {
 		repos := identityservice.TxRepos{
 			Stores: NewStores(tx),
 			Audit:  txAudit{recorder: t.audit, tx: tx},
 			Events: txEvents{bus: t.bus, tx: tx},
+			// The callback list only runs after WithTx commits, so a
+			// post-commit fallback (for example an email sent outside the
+			// outbox) can never fire on a rollback.
+			AfterCommit: func(f func()) {
+				if f != nil {
+					afterCommit = append(afterCommit, f)
+				}
+			},
 		}
 		if t.mail != nil {
 			repos.Mail = txMail{sender: t.mail, tx: tx}
@@ -80,6 +89,13 @@ func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx i
 		}
 		return fn(ctx, repos)
 	})
+	if err != nil {
+		return err
+	}
+	for _, f := range afterCommit {
+		f()
+	}
+	return nil
 }
 
 // txAudit writes Tier 1 audit events through the open transaction. A nil

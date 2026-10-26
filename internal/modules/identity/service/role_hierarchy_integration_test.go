@@ -168,7 +168,7 @@ func TestInvitations_SignUpRechecksInviterAuthority(t *testing.T) {
 	require.NoError(t, err, "a co-owner may demote the inviter")
 
 	_, err = invitations.SignUp(context.Background(), identityservice.InvitationSignUp{
-		Token: token, Name: "Invitee", Password: "Password1!",
+		Token: token, Name: "Invitee", Password: "Password1!2026",
 	})
 	assert.Equal(t, string(identitycatalog.CodeInvitationInviterIneligible), appCode(err))
 	assert.Equal(t, http.StatusConflict, appStatus(err))

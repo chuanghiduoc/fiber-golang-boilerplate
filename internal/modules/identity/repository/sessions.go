@@ -239,3 +239,19 @@ func (r *RefreshTokenRepository) MarkUsed(ctx context.Context, tenant, id int64)
 	}
 	return n > 0, nil
 }
+
+func (r *RefreshTokenRepository) ClassifyRotation(ctx context.Context, tokenHash string, usedAfter time.Time) (identityservice.RefreshRotationState, error) {
+	row, err := r.q.ClassifyRefreshTokenRotation(ctx, identitysqlc.ClassifyRefreshTokenRotationParams{
+		UsedAfter: timestamptz(usedAfter),
+		TokenHash: tokenHash,
+		TenantID:  tenantID(ctx),
+	})
+	if err != nil {
+		return identityservice.RefreshRotationState{}, wrapErr(err)
+	}
+	return identityservice.RefreshRotationState{
+		SessionLive:     row.SessionLive.Bool,
+		UsedWithinGrace: row.Recent.Bool,
+		Rotated:         row.Rotated,
+	}, nil
+}

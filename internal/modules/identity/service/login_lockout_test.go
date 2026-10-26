@@ -34,7 +34,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "race@example.com", Password: "Password1!", Name: "Race",
+		Email: "race@example.com", Password: "Password1!2026", Name: "Race",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 	}
 
 	// The correct password is also refused while locked.
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: "Password1!"}); statusOf(err) != http.StatusTooManyRequests {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: "Password1!2026"}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("locked account login err = %v, want 429", err)
 	}
 }
@@ -79,7 +79,7 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "known@example.com", Password: "Password1!", Name: "Known",
+		Email: "known@example.com", Password: "Password1!2026", Name: "Known",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -103,13 +103,13 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 func TestAuthenticate_LockoutIsGlobalAcrossTenants(t *testing.T) {
 	svc := newTestUserService(newMemDB())
 	ctx := context.Background()
-	if _, err := svc.Register(ctx, RegisterInput{Email: "g@example.com", Password: "Password1!", Name: "G"}); err != nil {
+	if _, err := svc.Register(ctx, RegisterInput{Email: "g@example.com", Password: "Password1!2026", Name: "G"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	for range maxLoginAttempts {
 		_, _ = svc.Authenticate(tenant.WithID(ctx, 2), LoginInput{Email: "g@example.com", Password: "Wrong!"})
 	}
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "g@example.com", Password: "Password1!"}); statusOf(err) != http.StatusTooManyRequests {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "g@example.com", Password: "Password1!2026"}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("login in tenant 1 after failures in tenant 2: err = %v, want 429", err)
 	}
 }
@@ -123,11 +123,11 @@ func TestRegister_ClearsPreexistingLockout(t *testing.T) {
 		_, _ = svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Wrong!"})
 	}
 	if _, err := svc.Register(ctx, RegisterInput{
-		Email: "future@example.com", Password: "Password1!", Name: "Future",
+		Email: "future@example.com", Password: "Password1!2026", Name: "Future",
 	}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if _, err := svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Password1!"}); err != nil {
+	if _, err := svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Password1!2026"}); err != nil {
 		t.Fatalf("login after registration: %v", err)
 	}
 }

@@ -21,6 +21,7 @@ import (
 // integration tests.
 type memDB struct {
 	mu          sync.Mutex
+	txMu        sync.Mutex
 	nextID      int64
 	users       map[int64]*User
 	passwords   map[int64]string
@@ -31,6 +32,12 @@ type memDB struct {
 	tenants     map[int64]*Tenant
 	factors     map[int64]*MFAFactor
 	recovery    map[int64]map[string]bool // user -> code hash -> used
+	invitations map[int64]*Invitation
+	tokens      map[int64]string // invitation id -> token hash
+	locale      string
+	mail        Mailer
+	resetTokens map[string]*PasswordResetToken
+	resetOwner  map[string]int64
 	audits      []audit.Event
 	published   []events.Event
 }
@@ -48,6 +55,11 @@ func newMemDB() *memDB {
 		tenants:     map[int64]*Tenant{},
 		factors:     map[int64]*MFAFactor{},
 		recovery:    map[int64]map[string]bool{},
+		invitations: map[int64]*Invitation{},
+		tokens:      map[int64]string{},
+		locale:      "en",
+		resetTokens: map[string]*PasswordResetToken{},
+		resetOwner:  map[string]int64{},
 	}
 	db.tenants[1] = &Tenant{ID: 1, Slug: "default", Name: "Default", Status: TenantStatusActive}
 	db.tenants[2] = &Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: TenantStatusActive}
@@ -62,20 +74,44 @@ func (db *memDB) stores() Stores {
 		Memberships:   memMemberships{db},
 		Sessions:      memSessions{db},
 		RefreshTokens: memRefresh{db},
-		Resets:        memResets{},
+		Resets:        memResets{db},
 		Verifications: memVerifications{},
-		Invitations:   memInvitations{},
+		Invitations:   memInvitations{db},
 		Tenants:       memTenants{db},
 		MFA:           memMFA{db},
+		Privacy:       nil,
+		Roles:         memRoles{db},
 	}
 }
 
 // memTx runs fn against the same in-memory stores (no rollback) and records
-// audit events.
+// audit events. db.mail, when set, is the transactional email outbox.
 type memTx struct{ db *memDB }
 
 func (t memTx) InTx(ctx context.Context, fn func(ctx context.Context, tx TxRepos) error) error {
-	return fn(ctx, TxRepos{Stores: t.db.stores(), Audit: memAudit(t), Events: memEvents(t)})
+	// Serialize transactions so a rotation's two writes (mark used + insert
+	// the next token) are visible together, like one committed SQL transaction,
+	// while individual repository calls keep their own short locks.
+	// After-commit callbacks run once the "transaction" lock is released, so
+	// a callback that opens another transaction cannot deadlock.
+	t.db.txMu.Lock()
+	var afterCommit []func()
+	err := fn(ctx, TxRepos{
+		Stores: t.db.stores(), Audit: memAudit(t), Events: memEvents(t), Mail: t.db.mail,
+		AfterCommit: func(f func()) {
+			if f != nil {
+				afterCommit = append(afterCommit, f)
+			}
+		},
+	})
+	t.db.txMu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, f := range afterCommit {
+		f()
+	}
+	return nil
 }
 
 type memEvents struct{ db *memDB }
@@ -198,8 +234,28 @@ func (r memUsers) LinkIdentity(_ context.Context, in ExternalIdentity) error {
 	return nil
 }
 
-func (r memUsers) UpdateProfile(context.Context, ProfileUpdate) (*User, error) {
-	return nil, errFakeNotImplemented
+func (r memUsers) UpdateProfile(_ context.Context, in ProfileUpdate) (*User, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	u, ok := r.db.users[in.ID]
+	if !ok || u.Status == UserStatusDeleted {
+		return nil, apperror.ErrNotFound
+	}
+	if in.UpdateEmail && in.Email != u.Email {
+		for _, other := range r.db.users {
+			if other.ID != u.ID && other.Email == in.Email && other.Status != UserStatusDeleted {
+				return nil, ErrEmailTaken
+			}
+		}
+		now := time.Now()
+		u.Email = in.Email
+		u.EmailVerifiedAt = nil
+		u.TokenVersion++
+		u.CredentialsChangedAt = &now
+	}
+	u.Name = in.Name
+	u.UpdatedAt = time.Now()
+	return cloneUser(u, r.db), nil
 }
 
 func (r memUsers) VerifyEmail(_ context.Context, id int64, email string) (*User, error) {
@@ -431,8 +487,16 @@ func (r memMemberships) EmailBanned(ctx context.Context, email string) (bool, er
 	return false, nil
 }
 
-func (r memMemberships) GetPrincipal(context.Context, int64) (*Principal, error) {
-	return nil, errFakeNotImplemented
+func (r memMemberships) GetPrincipal(ctx context.Context, userID int64) (*Principal, error) {
+	m, err := r.GetActive(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return &Principal{
+		UserID: m.User.ID, TenantID: m.Membership.TenantID,
+		Email: m.User.Email, Name: m.User.Name, Role: m.Membership.Role,
+		TenantStatus: TenantStatusActive,
+	}, nil
 }
 
 func (r memMemberships) LockPrincipal(ctx context.Context, userID int64) (*Principal, error) {
@@ -573,19 +637,99 @@ func (r memRefresh) MarkUsed(_ context.Context, tenantID, id int64) (bool, error
 	return false, nil
 }
 
-type memResets struct{}
+func (r memRefresh) ClassifyRotation(_ context.Context, hash string, usedAfter time.Time) (RefreshRotationState, error) {
+	// The real query reads committed rows only. Waiting for any in-flight
+	// fake transaction models that: a concurrent rotation's "mark used" and
+	// "insert next token" are seen together or not at all. The service calls
+	// this outside any transaction, so taking txMu cannot deadlock.
+	r.db.txMu.Lock()
+	defer r.db.txMu.Unlock()
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	rt, ok := r.db.refresh[hash]
+	if !ok {
+		return RefreshRotationState{}, apperror.ErrNotFound
+	}
+	sess, ok := r.db.sessions[rt.SessionID]
+	if !ok {
+		return RefreshRotationState{}, apperror.ErrNotFound
+	}
+	state := RefreshRotationState{
+		SessionLive:     sess.RevokedAt == nil && sess.ExpiresAt.After(time.Now()),
+		UsedWithinGrace: rt.UsedAt != nil && rt.UsedAt.After(usedAfter),
+	}
+	for _, other := range r.db.refresh {
+		if other.SessionID == rt.SessionID && other.ID > rt.ID {
+			state.Rotated = true
+			break
+		}
+	}
+	return state, nil
+}
 
-func (memResets) Create(context.Context, int64, string, string, time.Time) (bool, error) {
-	return false, errFakeNotImplemented
+type memResets struct{ db *memDB }
+
+func (r memResets) Create(_ context.Context, userID int64, email, tokenHash string, expiresAt time.Time) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	u, ok := r.db.users[userID]
+	if !ok || u.Status == UserStatusDeleted || u.Email != email {
+		return false, nil
+	}
+	for hash, owner := range r.db.resetOwner {
+		if owner == userID {
+			delete(r.db.resetOwner, hash)
+			delete(r.db.resetTokens, hash)
+		}
+	}
+	r.db.resetOwner[tokenHash] = userID
+	r.db.resetTokens[tokenHash] = &PasswordResetToken{ID: r.db.id(), UserID: userID, ExpiresAt: expiresAt, CreatedAt: time.Now()}
+	return true, nil
 }
-func (memResets) GetByHash(context.Context, string) (*PasswordResetToken, error) {
-	return nil, errFakeNotImplemented
+
+func (r memResets) GetByHash(_ context.Context, tokenHash string) (*PasswordResetToken, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	token, ok := r.db.resetTokens[tokenHash]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	c := *token
+	return &c, nil
 }
-func (memResets) Consume(context.Context, string) (*PasswordResetToken, error) {
-	return nil, errFakeNotImplemented
+
+func (r memResets) Consume(_ context.Context, tokenHash string) (*PasswordResetToken, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	token, ok := r.db.resetTokens[tokenHash]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	delete(r.db.resetTokens, tokenHash)
+	delete(r.db.resetOwner, tokenHash)
+	c := *token
+	return &c, nil
 }
-func (memResets) Delete(context.Context, string) error      { return nil }
-func (memResets) DeleteByUser(context.Context, int64) error { return nil }
+
+func (r memResets) Delete(_ context.Context, tokenHash string) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	delete(r.db.resetTokens, tokenHash)
+	delete(r.db.resetOwner, tokenHash)
+	return nil
+}
+
+func (r memResets) DeleteByUser(_ context.Context, userID int64) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for hash, owner := range r.db.resetOwner {
+		if owner == userID {
+			delete(r.db.resetOwner, hash)
+			delete(r.db.resetTokens, hash)
+		}
+	}
+	return nil
+}
 
 type memVerifications struct{}
 
@@ -595,22 +739,85 @@ func (memVerifications) Consume(context.Context, string) (*VerificationToken, er
 }
 func (memVerifications) DeleteByUser(context.Context, int64) error { return nil }
 
-type memInvitations struct{}
+type memInvitations struct{ db *memDB }
 
-func (memInvitations) Upsert(context.Context, NewInvitation) (*Invitation, error) {
+func (r memInvitations) Upsert(ctx context.Context, in NewInvitation) (*Invitation, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	tid := tenant.EffectiveID(ctx)
+	now := time.Now()
+	for id, inv := range r.db.invitations {
+		if inv.TenantID == tid && inv.Email == in.Email && inv.AcceptedAt == nil {
+			inv.Role, inv.InvitedBy, inv.ExpiresAt, inv.UpdatedAt = in.Role, in.InvitedBy, in.ExpiresAt, now
+			r.db.tokens[id] = in.TokenHash
+			c := *inv
+			return &c, nil
+		}
+	}
+	inv := &Invitation{
+		ID: r.db.id(), TenantID: tid, Email: in.Email, Role: in.Role,
+		InvitedBy: in.InvitedBy, ExpiresAt: in.ExpiresAt, CreatedAt: now, UpdatedAt: now,
+	}
+	r.db.invitations[inv.ID] = inv
+	r.db.tokens[inv.ID] = in.TokenHash
+	c := *inv
+	return &c, nil
+}
+
+func (r memInvitations) ListPendingCursor(context.Context, pagination.DBCursor) ([]Invitation, error) {
 	return nil, errFakeNotImplemented
 }
-func (memInvitations) ListPendingCursor(context.Context, pagination.DBCursor) ([]Invitation, error) {
-	return nil, errFakeNotImplemented
+
+func (r memInvitations) DeletePending(ctx context.Context, id int64) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	inv, ok := r.db.invitations[id]
+	if !ok || inv.TenantID != tenant.EffectiveID(ctx) || inv.AcceptedAt != nil {
+		return false, nil
+	}
+	delete(r.db.invitations, id)
+	delete(r.db.tokens, id)
+	return true, nil
 }
-func (memInvitations) DeletePending(context.Context, int64) (bool, error) {
-	return false, errFakeNotImplemented
+
+func (r memInvitations) TenantByTokenHash(_ context.Context, tokenHash string) (int64, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for id, hash := range r.db.tokens {
+		if hash == tokenHash {
+			return r.db.invitations[id].TenantID, nil
+		}
+	}
+	return 0, apperror.ErrNotFound
 }
-func (memInvitations) GetByTokenHashForUpdate(context.Context, string) (*Invitation, error) {
-	return nil, errFakeNotImplemented
+
+func (r memInvitations) GetByTokenHashForUpdate(ctx context.Context, tenantID int64, tokenHash string) (*Invitation, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for id, hash := range r.db.tokens {
+		if hash != tokenHash {
+			continue
+		}
+		inv := r.db.invitations[id]
+		if inv.TenantID != tenantID || inv.TenantID != tenant.EffectiveID(ctx) {
+			return nil, apperror.ErrNotFound
+		}
+		c := *inv
+		return &c, nil
+	}
+	return nil, apperror.ErrNotFound
 }
-func (memInvitations) MarkAccepted(context.Context, int64, int64, int64) (bool, error) {
-	return false, errFakeNotImplemented
+
+func (r memInvitations) MarkAccepted(ctx context.Context, tenantID, id, userID int64) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	inv, ok := r.db.invitations[id]
+	if !ok || inv.TenantID != tenantID || inv.AcceptedAt != nil {
+		return false, nil
+	}
+	now := time.Now()
+	inv.AcceptedAt, inv.AcceptedBy, inv.UpdatedAt = &now, &userID, now
+	return true, nil
 }
 
 type memTenants struct{ db *memDB }
@@ -663,8 +870,17 @@ func (r memTenants) UpdateStatus(_ context.Context, id int64, status TenantStatu
 	c := *t
 	return &c, nil
 }
-func (r memTenants) Settings(context.Context, int64) (*TenantSettings, error) {
-	return nil, errFakeNotImplemented
+func (r memTenants) Settings(_ context.Context, id int64) (*TenantSettings, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	if _, ok := r.db.tenants[id]; !ok {
+		return nil, apperror.ErrNotFound
+	}
+	locale := r.db.locale
+	if locale == "" {
+		locale = "en"
+	}
+	return &TenantSettings{TenantID: id, Locale: locale, Timezone: "UTC"}, nil
 }
 
 type memMFA struct{ db *memDB }
@@ -796,4 +1012,43 @@ func (r memMFA) CountUnusedRecoveryCodes(_ context.Context, userID int64) (int64
 		}
 	}
 	return n, nil
+}
+
+// memRoles resolves the built-in tenant roles (enough for inviter authority
+// checks in unit tests); tenant-defined roles are covered by integration tests.
+type memRoles struct{ db *memDB }
+
+func (r memRoles) GetByKey(_ context.Context, key string) (*Role, error) {
+	if !ValidRole(key) {
+		return nil, apperror.ErrNotFound
+	}
+	return &Role{Key: key, Name: key, Scope: "tenant"}, nil
+}
+
+func (r memRoles) SyncCatalog(context.Context, []CatalogPermission, []CatalogRole) error {
+	return errFakeNotImplemented
+}
+func (r memRoles) ListCursor(context.Context, pagination.DBCursor) ([]Role, error) {
+	return nil, errFakeNotImplemented
+}
+func (r memRoles) Get(context.Context, int64) (*Role, error) {
+	return nil, errFakeNotImplemented
+}
+func (r memRoles) Create(context.Context, NewRole) (*Role, error) {
+	return nil, errFakeNotImplemented
+}
+func (r memRoles) Update(context.Context, int64, string, []string) (*Role, error) {
+	return nil, errFakeNotImplemented
+}
+func (r memRoles) Delete(context.Context, int64) (bool, error) {
+	return false, errFakeNotImplemented
+}
+func (r memRoles) MemberIDs(context.Context, int64) ([]int64, error) {
+	return nil, errFakeNotImplemented
+}
+func (r memRoles) ReplaceMemberRoles(context.Context, int64, []string) error {
+	return errFakeNotImplemented
+}
+func (r memRoles) AssignPlatformRole(context.Context, int64, string) error {
+	return errFakeNotImplemented
 }

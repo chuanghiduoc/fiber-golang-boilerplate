@@ -19,7 +19,7 @@ import (
 )
 
 // testMFAPassword is the local password of the MFA harness user.
-const testMFAPassword = "Password1!"
+const testMFAPassword = "Password1!2026"
 
 // reversibleSealer is a deterministic test sealer; production uses
 // jobs.PayloadCodec (AES-256-GCM).
@@ -51,6 +51,11 @@ type mfaHarness struct {
 func newMFAHarness(t *testing.T) *mfaHarness {
 	t.Helper()
 	db := newMemDB()
+	return newMFAHarnessWithTx(t, db, memTx{db})
+}
+
+func newMFAHarnessWithTx(t *testing.T, db *memDB, tx Transactor) *mfaHarness {
+	t.Helper()
 	h := &mfaHarness{db: db, clock: &mfaClock{at: time.Unix(1_700_000_000, 0)}}
 
 	sign := func(c AccessClaims) (string, error) {
@@ -60,9 +65,9 @@ func newMFAHarness(t *testing.T) *mfaHarness {
 			Email: c.Email, Role: c.Role, TokenVersion: c.TokenVersion, AMR: c.AMR,
 		}, "mfa-test-jwt-secret-0000000000000", 1)
 	}
-	h.sessions = NewSessionService(db.stores(), memTx{db}, sign, time.Hour, 720*time.Hour, nil)
+	h.sessions = NewSessionService(db.stores(), tx, sign, time.Hour, 720*time.Hour, nil)
 	h.svc = NewMFAService(MFADeps{
-		Stores: db.stores(), Tx: memTx{db}, Cache: cache.NewMemoryCache(),
+		Stores: db.stores(), Tx: tx, Cache: cache.NewMemoryCache(),
 		Sealer: reversibleSealer{}, Sessions: h.sessions, Now: h.clock.now,
 	})
 	h.seedUser(100, "mfa@example.com")
@@ -283,7 +288,7 @@ func TestPasswordChangeDeletesPendingMFA(t *testing.T) {
 		Stores: h.db.stores(), Tx: memTx{h.db}, Cache: cache.NewMemoryCache(),
 	})
 	if err := users.ChangePassword(ctx, 100, ChangePasswordInput{
-		CurrentPassword: testMFAPassword, NewPassword: "NewPassword1!",
+		CurrentPassword: testMFAPassword, NewPassword: "NewPassword1!2026",
 	}); err != nil {
 		t.Fatalf("ChangePassword: %v", err)
 	}

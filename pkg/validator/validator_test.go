@@ -2,6 +2,7 @@ package validator
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -17,15 +18,17 @@ func TestValidatePassword(t *testing.T) {
 		pw      string
 		wantErr bool
 	}{
-		{"valid", "Abcdef1!", false},
-		{"too short", "Ab1!", true},
-		{"no uppercase", "abcdef1!", true},
-		{"no lowercase", "ABCDEF1!", true},
-		{"no digit", "Abcdefg!", true},
-		{"no special", "Abcdefg1", true},
-		{"exactly 8 chars", "Abcdef1@", false},
-		{"73 bytes rejected", "Aa1!" + repeat('x', 69), true},
-		{"72 bytes accepted", "Aa1!" + repeat('x', 68), false},
+		{"valid long phrase", "correct horse battery staple", false},
+		{"valid without composition", "alllowercase", false},
+		{"exactly 12 runes", "abcdefghijkl", false},
+		{"11 runes", "abcdefghijk", true},
+		{"exactly 64 runes", strings.Repeat("a", 64), false},
+		{"65 runes", strings.Repeat("a", 65), true},
+		{"72 bytes accepted", strings.Repeat("é", 36), false},
+		{"73 bytes rejected", strings.Repeat("é", 37), true},
+		{"common password", "unbelievable", true},
+		{"common password case-insensitive", "UNBELIEVABLE", true},
+		{"trivially short", "Ab1!", true},
 	}
 
 	for _, tt := range tests {
@@ -41,23 +44,43 @@ func TestValidatePassword(t *testing.T) {
 	}
 }
 
-func TestValidatePassword_BcryptLimit72(t *testing.T) {
-	// 72 bytes should pass
-	pw72 := "Aa1!" + repeat('x', 68) // 4 + 68 = 72
-	if len(pw72) != 72 {
-		t.Fatalf("expected 72, got %d", len(pw72))
+func TestValidatePassword_Codes(t *testing.T) {
+	tests := map[string]string{
+		"short":                 "weak_password",
+		"unbelievable":          "password_common",
+		strings.Repeat("a", 65): "weak_password",
 	}
-	if err := ValidateStruct(passwordReq{Password: pw72}); err != nil {
-		t.Errorf("72-byte password should be valid: %v", err)
+	for pw, want := range tests {
+		err := ValidateStruct(passwordReq{Password: pw})
+		var appErr *apperror.AppError
+		if !errors.As(err, &appErr) || len(appErr.Errors) == 0 {
+			t.Fatalf("password %q: expected a validation error, got %v", pw, err)
+		}
+		if got := appErr.Errors[0].Code; got != want {
+			t.Errorf("password %q code = %q, want %q", pw, got, want)
+		}
 	}
+}
 
-	// 73 bytes should fail
-	pw73 := "Aa1!" + repeat('x', 69) // 4 + 69 = 73
-	if len(pw73) != 73 {
-		t.Fatalf("expected 73, got %d", len(pw73))
+func TestPasswordContainsEmailLocalPart(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		email    string
+		want     bool
+	}{
+		{"equals local part", "alice", "alice@example.com", true},
+		{"contains local part", "alice-in-wonderland", "Alice@Example.com", true},
+		{"unrelated password", "correct horse battery", "alice@example.com", false},
+		{"empty email", "correct horse battery", "", false},
+		{"two-letter local part is ignored", "my-password", "ab@example.com", false},
 	}
-	if err := ValidateStruct(passwordReq{Password: pw73}); err == nil {
-		t.Error("73-byte password should be rejected")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PasswordContainsEmailLocalPart(tt.password, tt.email); got != tt.want {
+				t.Errorf("PasswordContainsEmailLocalPart(%q, %q) = %v, want %v", tt.password, tt.email, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -73,14 +96,6 @@ func TestValidateStruct_Required(t *testing.T) {
 	if appErr.Status != 422 {
 		t.Errorf("expected status 422, got %d", appErr.Status)
 	}
-}
-
-func repeat(ch byte, n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = ch
-	}
-	return string(b)
 }
 
 // ---------------------------------------------------------------------------

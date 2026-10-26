@@ -74,6 +74,8 @@ type ResetDeps struct {
 	Cache        cache.Cache
 	FrontendURL  string
 	SessionCache session.Store
+	// Security sends the password-reset notification. Nil disables it.
+	Security *SecurityNotifier
 }
 
 type passwordResetService struct {
@@ -274,7 +276,11 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 	}
 
 	var owner *User
-	ctx = database.WithRLSBypass(ctx) // A password reset ends the user's sessions in every tenant.
+	// The token consumption, the new password row, and ending every session
+	// in every tenant must not half-apply, so they share one bypass
+	// transaction. The token and user statements are global (token hash /
+	// user id); the revocation is deliberately cross-tenant by user id.
+	ctx = database.WithRLSBypass(ctx)
 	err = s.Tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		user, consumeErr := consumeResetToken(ctx, tx.Stores, tokenHash)
 		if consumeErr != nil {
@@ -282,6 +288,15 @@ func (s *passwordResetService) ResetPassword(ctx context.Context, req ResetPassw
 		}
 		if resetErr := replacePassword(ctx, tx.Stores, user.ID, string(hash)); resetErr != nil {
 			return resetErr
+		}
+		if notifyErr := s.Security.Deliver(ctx, tx, SecurityNotice{
+			Event:      SecurityEventPasswordReset,
+			UserID:     user.ID,
+			Name:       user.Name,
+			Email:      user.Email,
+			OccurredAt: time.Now().UTC(),
+		}); notifyErr != nil {
+			return notifyErr
 		}
 		owner = user
 		return nil

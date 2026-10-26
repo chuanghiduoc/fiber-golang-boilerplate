@@ -39,16 +39,16 @@ type stubGoogleOAuth struct {
 	info *oauth.GoogleUserInfo
 }
 
-func (s *stubGoogleOAuth) AuthURL(state string) string {
+func (s *stubGoogleOAuth) AuthURL(state, _ string) string {
 	return "https://accounts.example.test/auth?state=" + url.QueryEscape(state)
 }
 
-func (s *stubGoogleOAuth) Exchange(context.Context, string) (*oauth.GoogleUserInfo, error) {
+func (s *stubGoogleOAuth) Exchange(context.Context, string, string) (*oauth.GoogleUserInfo, error) {
 	return s.info, nil
 }
 
-func (s *stubGoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string {
-	return "https://frontend.example.test/cb#a=" + accessToken + "&r=" + refreshToken
+func (s *stubGoogleOAuth) BuildCodeCallbackURL(code string) string {
+	return "https://frontend.example.test/cb#code=" + code
 }
 
 func (s *stubGoogleOAuth) BuildMFACallbackURL(challenge string) string {

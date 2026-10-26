@@ -26,6 +26,9 @@ type GoogleUserInfo struct {
 type GoogleOAuth struct {
 	cfg         *oauth2.Config
 	frontendURL string
+	// userInfoURL is Google's userinfo endpoint; a field so tests can point
+	// it at a local server.
+	userInfoURL string
 }
 
 func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
@@ -38,6 +41,7 @@ func NewGoogleOAuth(cfg config.OAuthConfig) *GoogleOAuth {
 			Endpoint:     google.Endpoint,
 		},
 		frontendURL: cfg.FrontendURL,
+		userInfoURL: googleUserInfoURL,
 	}
 }
 
@@ -56,16 +60,20 @@ func (g *GoogleOAuth) ValidateFrontendURL() error {
 	return nil
 }
 
-func (g *GoogleOAuth) AuthURL(state string) string {
-	return g.cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
+// AuthURL builds the Google authorization request with PKCE (S256, RFC 9700)
+// and without access_type=offline: the application never uses Google refresh
+// tokens, and an offline grant would only widen the consent surface.
+func (g *GoogleOAuth) AuthURL(state, codeVerifier string) string {
+	return g.cfg.AuthCodeURL(state, oauth2.S256ChallengeOption(codeVerifier))
 }
 
-// BuildCallbackURL constructs the redirect URL with tokens in the URL fragment.
-// Fragment data is never sent to the server, preventing token leakage via Referer headers.
-func (g *GoogleOAuth) BuildCallbackURL(accessToken, refreshToken string) string {
+// BuildCodeCallbackURL constructs the redirect to the frontend with a
+// single-use code in the URL fragment. Fragment data is never sent to the
+// server, so the code does not reach referrer headers or access logs; the
+// caller redeems it at POST /auth/google/exchange.
+func (g *GoogleOAuth) BuildCodeCallbackURL(code string) string {
 	params := url.Values{}
-	params.Set("access_token", accessToken)
-	params.Set("refresh_token", refreshToken)
+	params.Set("code", code)
 
 	u, err := url.Parse(g.frontendURL)
 	if err != nil {
@@ -104,14 +112,14 @@ func (e *UpstreamError) Error() string {
 	return fmt.Sprintf("google %s returned status %d", e.Op, e.StatusCode)
 }
 
-func (g *GoogleOAuth) Exchange(ctx context.Context, code string) (*GoogleUserInfo, error) {
-	token, err := g.cfg.Exchange(ctx, code)
+func (g *GoogleOAuth) Exchange(ctx context.Context, code, codeVerifier string) (*GoogleUserInfo, error) {
+	token, err := g.cfg.Exchange(ctx, code, oauth2.VerifierOption(codeVerifier))
 	if err != nil {
 		return nil, fmt.Errorf("failed to exchange code: %w", err)
 	}
 
 	client := g.cfg.Client(ctx, token)
-	resp, err := client.Get(googleUserInfoURL)
+	resp, err := client.Get(g.userInfoURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user info: %w", err)
 	}
