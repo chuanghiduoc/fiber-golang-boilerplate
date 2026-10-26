@@ -117,7 +117,9 @@ authorization:
 | `jobs_claimed_total` | `kind` | Jobs claimed by workers. |
 | `jobs_succeeded_total` | `kind` | Successful outcomes recorded in the database. |
 | `jobs_retried_total` | `kind` | Failed jobs requeued for another attempt. |
-| `jobs_dead_total` | `kind` | Handler failures that exhausted attempts. Lease-expiry dead letters are visible in the table but not counted here. |
+| `jobs_dead_total` | `kind` | Jobs dead-lettered by a handler failure after exhausting attempts (permanent failures included). Lease-expiry dead letters are counted by `jobs_lease_dead_total` instead. |
+| `jobs_lease_lost_total` | `kind` | Running handlers canceled because their worker lost the lease (a fenced heartbeat matched no row, or heartbeats failed for the whole lease). No outcome is recorded for them, so this is a duplicate-execution risk signal. |
+| `jobs_lease_dead_total` | `kind` | Jobs dead-lettered by the claim query because their lease expired on the final attempt. |
 | `jobs_queue_lag_seconds` | `kind` | Histogram of seconds between a job becoming due (`run_at`) and its claim, computed by the claim query (database clock). Only claimed jobs are observed, so a fully stalled queue shows up as missing observations; alert on `jobs_claimed_total` too. |
 | `jobs_claim_errors_total` | — | Failed claim attempts; the worker retries with backoff capped at 30s. |
 | `jobs_purged_total` | — | Terminal job rows deleted by retention. |
@@ -155,6 +157,12 @@ histogram_quantile(0.95,
 
 # New dead letters
 increase(jobs_dead_total[15m]) > 0
+
+# Lost leases (possible duplicate execution)
+increase(jobs_lease_lost_total[15m]) > 0
+
+# Jobs dead-lettered because their worker lease expired on the final attempt
+increase(jobs_lease_dead_total[15m]) > 0
 
 # Sustained claim failures
 rate(jobs_claim_errors_total[5m]) > 0
@@ -326,7 +334,7 @@ stateDiagram-v2
 | Permanent failure | A handler error wrapped with `jobs.Permanent(err)` dead-letters on that attempt; `last_error` starts with `permanent failure (not retried): ` and `jobs_dead_total{kind}` counts it. Used for undecodable or invalid payloads (email, password-reset request, webhook dispatch/delivery). Decryption failures are **not** permanent: a replica missing a key another one already seals with retries until the rollout completes. |
 | Unknown kind | Follows the same retry path, so a rollout can register the handler before pending work dies; a permanently missing handler eventually dead-letters. |
 | Handler timeout | 10m by default. A timeout is a normal failure that consumes the attempt. Cancellation is cooperative: a handler that ignores its context keeps running and heartbeating, and one that still returns success after its deadline is recorded as succeeded with a warning. |
-| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt). The crashed attempt counts. The previous owner may still be executing, so concurrent duplicate execution is possible. |
+| Lease | Each row stores `lease_expires_at` = `now()` + the owning worker's lease (`WithLeaseDuration`, default 5m), set on claim and on every heartbeat (default every 30s); a `CHECK` requires every `running` row to have one. A job is reclaimed only when `lease_expires_at < now()`, so workers with different lease durations (for example a dedicated slow-kind worker) can share the table without stealing each other's healthy jobs. After a crash, the next claim by any worker requeues the expired job (or dead-letters it if that was the final attempt); a lease-expiry dead letter is logged at error level and counted by `jobs_lease_dead_total{kind}`, never by `jobs_dead_total`. The crashed attempt counts. A live worker that loses the lease (a fenced heartbeat matches no row, or heartbeats fail for the whole lease duration) cancels its handler at once with `jobs.ErrLeaseLost`, records no success or failure (the reclaimer's fenced write is authoritative), and counts `jobs_lease_lost_total{kind}`. A handler that ignores cancellation can still overrun, so delivery remains at-least-once. |
 | Fencing | Every outcome write is fenced by `attempts`, so a reclaimed worker's late result is discarded. |
 | Shutdown release | On SIGINT/SIGTERM the worker stops claiming and cancels running handlers inside the shared shutdown budget (see [Graceful shutdown](#graceful-shutdown)). A handler that fails while the worker is stopping is requeued immediately **without consuming its attempt** (`last_error` starts with `jobs: interrupted by worker shutdown`, span outcome `released`), so a drain on the final attempt never dead-letters. A handler that still succeeds is recorded normally. A non-cooperative handler can exceed the window. |
 | Claim errors | Retried in-process with exponential backoff capped at 30s. |
@@ -671,7 +679,12 @@ Never bulk-clear locks, and never requeue `dead` jobs (their payload is gone).
 ### Durable events
 
 `internal/platform/events` publishes metadata-rich events locally and/or as
-jobs. A durable subscription adds one job per event and handler with
+jobs. `PublishTx` only enqueues the durable jobs on the caller's transaction;
+local subscribers are **not** notified inside it, because a `pgx.Tx` has no
+after-commit hook. Use `Publish` or `PublishLocal` after the transaction when
+local delivery is needed. That keeps a rollback from leaving a ghost local
+event and keeps a local handler error from rolling back the business work. A
+durable subscription adds one job per event and handler with
 `jobs.idempotency_key = event:<eventName>:<eventId>:<handler>:<tenantId>`; the
 job payload is the event JSON. Delivery is at-least-once, so handlers must be
 idempotent. Local handler panics are recovered and combined with
@@ -1459,7 +1472,7 @@ When enabled:
 - sanitized pgx client spans for queries under a recording parent, with
   SQLSTATE on failure and no SQL text, arguments, or error messages;
 - one `job.process` consumer span per attempt, as a new root linked to the
-  enqueue trace, with `job.outcome` (`succeeded`/`retried`/`dead`/`released`);
+  enqueue trace, with `job.outcome` (`succeeded`/`retried`/`dead`/`released`/`lease_lost`);
 - `trace_id`/`span_id` on request logs.
 
 | Rule | Behavior |

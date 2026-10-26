@@ -216,10 +216,13 @@ func (b *Bus) Publish(ctx context.Context, event Event) error {
 	return errors.Join(localErr, durableErr)
 }
 
-// PublishTx is Publish using the caller's transaction for every durable job,
-// so an event produced inside a business transaction commits or rolls back
-// atomically. Local handlers run before the transaction commits; keep them
-// side-effect safe or use PublishLocal deliberately.
+// PublishTx enqueues every durable subscription job using the caller's
+// transaction, so an event produced inside a business transaction commits or
+// rolls back atomically. Local subscribers are deliberately not notified:
+// there is no commit hook on a pgx.Tx, so delivering inside the transaction
+// would let a rollback leave a ghost event and would let a local handler error
+// roll back the business work. Use Publish or PublishLocal after the commit
+// when local delivery is needed.
 func (b *Bus) PublishTx(ctx context.Context, tx pgx.Tx, event Event) error {
 	if tx == nil {
 		return ErrNoTx
@@ -230,9 +233,7 @@ func (b *Bus) PublishTx(ctx context.Context, tx pgx.Tx, event Event) error {
 	}
 	metrics.EventsPublishedTotal.WithLabelValues(event.Type, "durable").Inc()
 
-	localErr := b.publishLocal(ctx, event)
-	durableErr := b.enqueueDurable(ctx, tx, event)
-	return errors.Join(localErr, durableErr)
+	return b.enqueueDurable(ctx, tx, event)
 }
 
 func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {

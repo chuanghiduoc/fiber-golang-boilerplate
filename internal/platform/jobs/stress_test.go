@@ -50,13 +50,13 @@ func newStressStore(total int) *stressStore {
 	return store
 }
 
-func (s *stressStore) Claim(_ context.Context, _ string, limit int, _ time.Duration) ([]claimedJob, error) {
+func (s *stressStore) Claim(_ context.Context, _ string, limit int, _ time.Duration) (claimResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.claimCalls++
 	if limit <= 0 || len(s.pending) == 0 {
-		return nil, nil
+		return claimResult{}, nil
 	}
 	if limit > len(s.pending) {
 		limit = len(s.pending)
@@ -67,7 +67,7 @@ func (s *stressStore) Claim(_ context.Context, _ string, limit int, _ time.Durat
 	for _, job := range batch {
 		s.claimed = append(s.claimed, job.ID)
 	}
-	return batch, nil
+	return claimResult{Jobs: batch}, nil
 }
 
 func (s *stressStore) Succeed(_ context.Context, id int64, _ string, _ int) error {

@@ -31,8 +31,10 @@ import (
 // WithExcludeKinds; NULL disables a filter. They only narrow the due CTE: the
 // expired-lease CTE stays global so any worker can recover a crashed job of
 // any kind (it is merely requeued, never executed by the wrong worker). The
-// last column is the queue lag (claim time minus run_at) computed by the
-// database clock, so the metric needs no extra query and no clock-skew math.
+// last two columns are the queue lag (claim time minus run_at) computed by the
+// database clock, so the metric needs no extra query and no clock-skew math,
+// and a lease_dead marker: dead rows from the expired CTE are returned too, so
+// the caller can log and count them instead of leaving them invisible.
 const claimJobsSQL = `
 WITH expired AS (
     UPDATE jobs
@@ -49,7 +51,7 @@ WITH expired AS (
         updated_at = now()
     WHERE status = 'running'
       AND lease_expires_at < now()
-    RETURNING id
+    RETURNING id, tenant_id, kind, status
 ),
 due AS (
     SELECT id
@@ -61,18 +63,27 @@ due AS (
     ORDER BY run_at, id
     FOR UPDATE SKIP LOCKED
     LIMIT $1
+),
+claimed AS (
+    UPDATE jobs AS j
+    SET status = 'running',
+        attempts = j.attempts + 1,
+        locked_at = now(),
+        locked_by = $2,
+        lease_expires_at = now() + make_interval(secs => $3::double precision),
+        updated_at = now()
+    FROM due
+    WHERE j.id = due.id
+    RETURNING j.id, j.tenant_id, j.kind, j.payload::text AS payload, j.attempts, j.max_attempts, j.trace_parent,
+              GREATEST(EXTRACT(EPOCH FROM (now() - j.run_at)), 0)::double precision AS queue_lag,
+              false AS lease_dead
 )
-UPDATE jobs AS j
-SET status = 'running',
-    attempts = j.attempts + 1,
-    locked_at = now(),
-    locked_by = $2,
-    lease_expires_at = now() + make_interval(secs => $3::double precision),
-    updated_at = now()
-FROM due
-WHERE j.id = due.id
-RETURNING j.id, j.tenant_id, j.kind, j.payload, j.attempts, j.max_attempts, j.trace_parent,
-          GREATEST(EXTRACT(EPOCH FROM (now() - j.run_at)), 0)::double precision`
+SELECT id, tenant_id, kind, payload, attempts, max_attempts, trace_parent, queue_lag, lease_dead
+FROM claimed
+UNION ALL
+SELECT id, tenant_id, kind, '{}'::text, 0, 0, NULL::text, 0::double precision, true
+FROM expired
+WHERE status = 'dead'`
 
 // heartbeatJobSQL renews the lease for a job that is still running under the
 // supplied worker and attempt. Matching attempts fences out a stale owner whose
@@ -184,13 +195,15 @@ func newPGStore(db database.DBTX) *pgStore {
 }
 
 // Claim takes up to limit due jobs for workerID and stamps each with a lease
-// deadline of now() + lease. Expired leases of any worker are recovered first.
-func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease time.Duration) ([]claimedJob, error) {
+// deadline of now() + lease. Expired leases of any worker are recovered first;
+// a recovered job on its final attempt is dead-lettered and returned in
+// LeaseDead rather than claimed.
+func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease time.Duration) (claimResult, error) {
 	if s == nil || s.db == nil {
-		return nil, ErrNoPool
+		return claimResult{}, ErrNoPool
 	}
 	if limit <= 0 {
-		return nil, nil
+		return claimResult{}, nil
 	}
 	if lease <= 0 {
 		lease = defaultLeaseDuration
@@ -199,32 +212,41 @@ func (s *pgStore) Claim(ctx context.Context, workerID string, limit int, lease t
 
 	rows, err := s.db.Query(ctx, claimJobsSQL, limit, workerID, lease.Seconds(), s.includeKinds, s.excludeKinds)
 	if err != nil {
-		return nil, fmt.Errorf("jobs: claim: %w", err)
+		return claimResult{}, fmt.Errorf("jobs: claim: %w", err)
 	}
 	defer rows.Close()
 
-	var claimed []claimedJob
+	var result claimResult
 	for rows.Next() {
 		var (
 			job         claimedJob
 			payload     string
 			traceParent *string
 			lagSeconds  float64
+			leaseDead   bool
 		)
-		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts, &traceParent, &lagSeconds); err != nil {
-			return nil, fmt.Errorf("jobs: scan claimed job: %w", err)
+		if err := rows.Scan(&job.ID, &job.TenantID, &job.Kind, &payload, &job.Attempts, &job.MaxAttempts, &traceParent, &lagSeconds, &leaseDead); err != nil {
+			return claimResult{}, fmt.Errorf("jobs: scan claimed job: %w", err)
+		}
+		if leaseDead {
+			result.LeaseDead = append(result.LeaseDead, leaseExpiredJob{
+				ID:       job.ID,
+				TenantID: job.TenantID,
+				Kind:     job.Kind,
+			})
+			continue
 		}
 		job.Payload = json.RawMessage(payload)
 		job.QueueLag = time.Duration(lagSeconds * float64(time.Second))
 		if traceParent != nil {
 			job.TraceParent = *traceParent
 		}
-		claimed = append(claimed, job)
+		result.Jobs = append(result.Jobs, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("jobs: claim rows: %w", err)
+		return claimResult{}, fmt.Errorf("jobs: claim rows: %w", err)
 	}
-	return claimed, nil
+	return result, nil
 }
 
 func (s *pgStore) Succeed(ctx context.Context, id int64, workerID string, attempts int) error {

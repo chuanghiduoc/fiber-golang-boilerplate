@@ -149,7 +149,9 @@ func (s *Scoped) Exec(ctx context.Context, sql string, args ...any) (pgconn.Comm
 }
 
 // Query implements DBTX. The returned rows keep the connection until Close,
-// which reads the COMMIT result and releases it.
+// which reads the COMMIT result and releases it. Close cannot return an error,
+// so callers must check Err (the usual Next/Err loop does) to observe a failed
+// COMMIT.
 func (s *Scoped) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if s == nil || s.pool == nil {
 		return nil, ErrNoPool
@@ -259,12 +261,21 @@ func (r scopedRow) Scan(dest ...any) error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	if !rows.Next() {
+		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
 		return pgx.ErrNoRows
 	}
-	return rows.Scan(dest...)
+	scanErr := rows.Scan(dest...)
+	// Close commits the batch and Err surfaces a failed COMMIT. Reading the
+	// error here matters: a deferred Close alone would let a deferred
+	// constraint violation (or any commit failure) look like a successful
+	// INSERT ... RETURNING.
+	rows.Close()
+	if scanErr != nil {
+		return scanErr
+	}
+	return rows.Err()
 }
