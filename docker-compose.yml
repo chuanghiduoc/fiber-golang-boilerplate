@@ -69,9 +69,6 @@ services:
       STORAGE_S3_USE_SSL: ${STORAGE_S3_USE_SSL:-false}
       CACHE_DRIVER: ${CACHE_DRIVER:-memory}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin123!}
-      ADMIN_NAME: ${ADMIN_NAME:-Admin}
     volumes:
       - uploads_data:/app/uploads
     healthcheck:
@@ -114,6 +111,43 @@ services:
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
     depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # One-shot admin seed, after the schema exists. Account creation is never part
+  # of API startup, so ADMIN_* reach this service only, not the app container.
+  # cmd/seed creates a missing admin and never re-promotes existing accounts, so
+  # re-running it is safe. The app does not wait for it: `docker compose up app`
+  # starts the API without seeding. ADMIN_EMAIL/ADMIN_PASSWORD have no default
+  # here: set them in .env (see .env.example) to seed; unset, the seed exits
+  # with an error and the API keeps running.
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    restart: "no"
+    command: ["./seed"]
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-boilerplate}
+      DB_USERNAME: ${DB_USERNAME:-app}
+      DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
+      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
+      DB_SCHEMA: ${DB_SCHEMA:-public}
+      DB_SSLMODE: ${DB_SSLMODE:-disable}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_NAME: ${ADMIN_NAME:-Admin}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     networks:

@@ -148,10 +148,10 @@ func fromStatus(status int, detail string) *apperror.AppError {
 	return newError(status, code, title, detail)
 }
 
-// requestID mirrors the X-Request-Id set by the correlation middleware.
+// requestID returns the correlation ID installed by the request-ID middleware.
+// It deliberately does not fall back to the client's X-Request-Id header: an
+// error rendered before that middleware ran must not echo an untrusted value
+// into the problem document.
 func requestID(c fiber.Ctx) string {
-	if v := fiber.Locals[string](c, "request_id"); v != "" {
-		return v
-	}
-	return c.Get("X-Request-Id")
+	return fiber.Locals[string](c, "request_id")
 }

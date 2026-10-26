@@ -31,7 +31,7 @@ func enrollmentSecret(t *testing.T, enrollment *service.MFAEnrollment) string {
 // transaction that replaces the password.
 func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reset-mfa@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 
@@ -52,7 +52,7 @@ func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 // enrollment window in the database (the ON CONFLICT branch of the upsert).
 func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reenroll@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 
@@ -96,7 +96,7 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 // A pending enrollment older than the enrollment window cannot be confirmed.
 func TestMFAConfirm_ExpiredEnrollmentInDatabase(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "expired-enrollment@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 
@@ -120,7 +120,7 @@ func TestMFAConfirm_ExpiredEnrollmentInDatabase(t *testing.T) {
 // Tier 1 audit row.
 func TestMFAResetTOTP_PlatformRecovery(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "mfa-reset-acme")
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reset-ok@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})

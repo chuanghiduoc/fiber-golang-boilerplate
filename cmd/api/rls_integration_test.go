@@ -98,6 +98,34 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 		t.Fatalf("table owner checkRLSRole = %v, want an owns-tables refusal", ownerErr)
 	}
 
+	// Being a member of the table-owner role is the same risk: the member can
+	// SET ROLE to the owner and turn FORCE row-level security off, so the
+	// startup check must refuse it in production.
+	exec(`GRANT ` + ident(ownerRole) + ` TO ` + ident(pgtest.AppRole))
+	memberOwnerErr := checkRLSRole(ctx, appPool, schema, "production")
+	if memberOwnerErr == nil || !strings.Contains(memberOwnerErr.Error(), "owns tables") {
+		t.Fatalf("app role granted the owner role checkRLSRole = %v, want an owns-tables refusal", memberOwnerErr)
+	}
+	if err := checkRLSRole(ctx, appPool, schema, "staging"); err != nil {
+		t.Fatalf("a non-production environment must only log the risk: %v", err)
+	}
+	exec(`REVOKE ` + ident(ownerRole) + ` FROM ` + ident(pgtest.AppRole))
+	if err := checkRLSRole(ctx, appPool, schema, "production"); err != nil {
+		t.Fatalf("the app role must be accepted again after the grant is removed: %v", err)
+	}
+
+	// The bypass role has the same escalation path: ownership by membership
+	// lets it SET ROLE and turn FORCE off for every tenant.
+	exec(`GRANT ` + ident(ownerRole) + ` TO ` + ident(pgtest.BypassRole))
+	bypassOwnerErr := checkBypassRLSRole(ctx, pools.Bypass, pools.Primary, schema, "production")
+	if bypassOwnerErr == nil || !strings.Contains(bypassOwnerErr.Error(), "owns tables") {
+		t.Fatalf("bypass role granted the owner role = %v, want an owns-tables refusal", bypassOwnerErr)
+	}
+	exec(`REVOKE ` + ident(ownerRole) + ` FROM ` + ident(pgtest.BypassRole))
+	if err := checkBypassRLSRole(ctx, pools.Bypass, pools.Primary, schema, "production"); err != nil {
+		t.Fatalf("the bypass role must be accepted again after the grant is removed: %v", err)
+	}
+
 	// A member of a BYPASSRLS role can SET ROLE to it, so membership is unsafe.
 	bypassRole := "rls_bypass_" + suffix
 	memberRole := "rls_member_" + suffix

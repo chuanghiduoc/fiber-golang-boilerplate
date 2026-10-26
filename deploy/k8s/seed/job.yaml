@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fiber-boilerplate-seed
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: seed
+spec:
+  # One-shot admin seed. Account creation is a Job, never API startup: the
+  # ADMIN_* credentials live only in fiber-boilerplate-seed-secrets, which the
+  # API and worker pods do not mount. cmd/seed only creates a missing admin and
+  # never re-promotes or re-adds an existing account, so re-running is safe.
+  #
+  # This Job is intentionally NOT part of the app kustomization. Apply it after
+  # the migration Job (the schema must exist) and, optionally, before the app
+  # rollout. The environment overlays under overlays/<env>/seed/ set the
+  # namespace and image tag.
+  #
+  # The Job name is stable. Jobs are immutable, so delete a previous completed
+  # Job before applying a changed manifest. ttlSecondsAfterFinished removes it
+  # automatically after 24h.
+  ttlSecondsAfterFinished: 86400
+  backoffLimit: 2
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fiber-boilerplate
+        app.kubernetes.io/part-of: fiber-boilerplate
+        app.kubernetes.io/component: seed
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      # Private GHCR package? Create ghcr-pull (see README.md) and uncomment.
+      # imagePullSecrets:
+      #   - name: ghcr-pull
+      securityContext:
+        # Match the Docker image user: appuser is UID 100 / GID 101.
+        runAsNonRoot: true
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: seed
+          # The app overlay's images transformer does not update this raw Job;
+          # overlays/<env>/seed/kustomization.yaml does. The deploy workflow
+          # injects the same digest into both before applying either.
+          image: ghcr.io/OWNER/REPO:latest
+          # Mutable placeholder tag: always pull. Switch to IfNotPresent after
+          # pinning an immutable release tag.
+          imagePullPolicy: Always
+          command: ["/app/seed"]
+          envFrom:
+            - configMapRef:
+                name: fiber-boilerplate-config
+            # Database credentials only: cmd/seed validates DB_* and ADMIN_*,
+            # not the JWT/SMTP/storage settings the API also loads.
+            - secretRef:
+                name: fiber-boilerplate-secrets
+            # ADMIN_EMAIL / ADMIN_PASSWORD / ADMIN_NAME only.
+            - secretRef:
+                name: fiber-boilerplate-seed-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

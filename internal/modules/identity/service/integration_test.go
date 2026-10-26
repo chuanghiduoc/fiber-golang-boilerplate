@@ -83,8 +83,8 @@ type env struct {
 
 func newEnv(t *testing.T, recorder audit.TxRecorder) *env {
 	t.Helper()
-	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
+	setupCtx := context.Background()
+	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 	appCache := cache.NewMemoryCache()
@@ -147,7 +147,7 @@ func scalar[T any](t *testing.T, pool *pgxpool.Pool, sql string, args ...any) T 
 // password, and membership roll back together.
 func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	broken := identityrepo.NewTransactor(testutil.NewTxManager(e.pool), nil, nil, nil) // nil recorder fails closed
 	users := service.NewUserService(service.UserDeps{Stores: e.stores, Tx: broken, Cache: cache.NewMemoryCache()})
 
@@ -164,7 +164,7 @@ func TestRegister_RollsBackEverythingWhenAuditFails(t *testing.T) {
 // service checks.
 func TestLastOwnerProtection(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := authz.SystemContext(context.Background())
+	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "owner@example.com", testutil.MemberOptions{Role: "owner"})
 	// The same user is a plain member elsewhere, which must not count.
@@ -192,7 +192,7 @@ func TestLastOwnerProtection(t *testing.T) {
 // the address cannot register into (or be invited to) that tenant again.
 func TestBanSurvivesAccountDeletion(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := authz.SystemContext(context.Background())
+	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
 	testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "admin@example.com", testutil.MemberOptions{Role: "admin"})
 	user, err := e.users.Register(ctx, service.RegisterInput{Email: "banned@example.com", Password: "Password1!2026", Name: "Banned"})
 	require.NoError(t, err)
@@ -220,7 +220,7 @@ func TestBanSurvivesAccountDeletion(t *testing.T) {
 // loser gets the concurrent-refresh code; the shared session stays live.
 func TestRefresh_ConcurrentRotationKeepsFamily(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user, err := e.users.Register(ctx, service.RegisterInput{Email: "race@example.com", Password: "Password1!2026", Name: "Race"})
 	require.NoError(t, err)
 	pair, err := e.sessions.Issue(ctx, user.User.ID, user.User.TokenVersion, nil)
@@ -256,7 +256,7 @@ func TestRefresh_ConcurrentRotationKeepsFamily(t *testing.T) {
 // session in every tenant, and later account changes invalidate older links.
 func TestPasswordReset_IsGlobal(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "acme")
 	user, err := e.users.Register(ctx, service.RegisterInput{Email: "reset@example.com", Password: "Password1!2026", Name: "Reset"})
 	require.NoError(t, err)
@@ -282,7 +282,7 @@ func TestPasswordReset_IsGlobal(t *testing.T) {
 
 func TestEmailVerification_IsPerUser(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user, err := e.users.Register(ctx, service.RegisterInput{Email: "verify@example.com", Password: "Password1!2026", Name: "V"})
 	require.NoError(t, err)
 	require.NoError(t, e.verify.SendVerification(tenant.WithIdentity(ctx, tenant.DefaultID, "default"), user.User.ID, user.User.Email))
@@ -296,7 +296,7 @@ func TestEmailVerification_IsPerUser(t *testing.T) {
 
 func TestTenantService_CreateAndLifecycle(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	tenants := service.NewTenantService(e.stores, e.tx)
 	trialEnd := time.Now().Add(14 * 24 * time.Hour)
 

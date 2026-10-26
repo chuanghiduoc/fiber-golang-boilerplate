@@ -37,7 +37,7 @@ func (testSealer) Open(p []byte) ([]byte, error) {
 
 func enrollSecret(t *testing.T, e *env, userID int64) string {
 	t.Helper()
-	enrollment, err := e.mfa.EnrollTOTP(context.Background(), userID, 0, mfaIntegrationPassword)
+	enrollment, err := e.mfa.EnrollTOTP(tenant.WithID(context.Background(), tenant.DefaultID), userID, 0, mfaIntegrationPassword)
 	require.NoError(t, err)
 	u, err := url.Parse(enrollment.OtpauthURI)
 	require.NoError(t, err)
@@ -58,7 +58,7 @@ func recoveryHash(code string) string {
 // without the attempted code.
 func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "mfa-audit@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
@@ -93,7 +93,7 @@ func TestMFAVerifyFailureIsPersistedInAudit(t *testing.T) {
 
 func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "step@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
@@ -121,7 +121,7 @@ func TestConsumeTOTPStep_ConcurrentUseSucceedsOnce(t *testing.T) {
 // A recovery code is single use under concurrency.
 func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "recovery@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
@@ -151,7 +151,7 @@ func TestUseRecoveryCode_ConcurrentUseSucceedsOnce(t *testing.T) {
 // may consume the step, consume the challenge, and receive a session.
 func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "verify@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 
@@ -200,7 +200,7 @@ func TestMFAVerify_ConcurrentChallengeSucceedsOnce(t *testing.T) {
 // sees the already-confirmed factor and rolls back.
 func TestMFAConfirm_ConcurrentConfirmSucceedsOnce(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "confirm@example.com", testutil.MemberOptions{Password: mfaIntegrationPassword})
 	secret := enrollSecret(t, e, user.UserID)
 

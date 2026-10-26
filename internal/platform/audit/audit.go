@@ -117,6 +117,10 @@ type IDRecorder interface {
 }
 
 // Completion describes the observed outcome of a guarded request.
+//
+// The actor belongs to the intent row: when set here it must repeat the actor
+// recorded at start. The database refuses a completion that swaps, clears, or
+// adds an actor, so the HTTP layer leaves these fields zero.
 type Completion struct {
 	ActorID     int64
 	ActorType   string

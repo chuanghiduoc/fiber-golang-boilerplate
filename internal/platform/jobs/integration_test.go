@@ -32,7 +32,7 @@ import (
 // attempts fence still rejects a stale owner.
 func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
 	pool := setupIntegrationDB(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
@@ -77,7 +77,7 @@ func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
 func TestWorkerIntegrationProcessesJob(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	queue := NewQueue(pgtest.Scoped(pool))
@@ -129,7 +129,7 @@ func TestWorkerIntegrationProcessesJob(t *testing.T) {
 func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	queue := NewQueue(pgtest.Scoped(pool))
@@ -174,7 +174,7 @@ func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
 func TestWorkerIntegrationUnknownKindRetriesThenDeadLetters(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.unregistered"
@@ -230,7 +230,7 @@ func TestWorkerIntegrationUnknownKindRetriesThenDeadLetters(t *testing.T) {
 func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
@@ -276,7 +276,7 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.reclaim"
@@ -358,7 +358,7 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const (
@@ -448,7 +448,7 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.heartbeat"
@@ -515,7 +515,7 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 func TestQueueIntegrationEnqueueTx(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	queue := NewQueue(pgtest.Scoped(pool))
@@ -559,7 +559,7 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
@@ -662,7 +662,7 @@ func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
 func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
@@ -745,7 +745,7 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 func TestPurgeTerminalIntegration(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	insertJob := func(kind, status string, age time.Duration) int64 {
@@ -804,7 +804,7 @@ func TestPurgeTerminalIntegration(t *testing.T) {
 func TestPurgeTerminalIntegrationBatches(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const batchKind = "jobs.integration.retention.batch"
@@ -840,13 +840,89 @@ func TestPurgeTerminalIntegrationBatches(t *testing.T) {
 	assert.True(t, recentExists)
 }
 
+// TestPurgeTenantIntegration proves a deleted tenant's jobs are erased in
+// bounded batches while its running rows (owned by a live worker lease) and
+// every other tenant's rows are retained.
+func TestPurgeTenantIntegration(t *testing.T) {
+	pool := setupIntegrationDB(t)
+
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 30*time.Second)
+	defer cancel()
+
+	var otherTenant int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`INSERT INTO tenants (slug, name) VALUES ('jobs-purge-other', 'Other') RETURNING id`,
+	).Scan(&otherTenant))
+
+	insertJob := func(tenantID int64, status string) int64 {
+		t.Helper()
+		var id int64
+		err := pool.QueryRow(ctx, `
+			INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts, lease_expires_at, locked_by)
+			VALUES ($1, 'email.send.encrypted', '{"sealed":"pii"}'::jsonb, $2, now(), 3,
+			        CASE WHEN $2 = 'running' THEN now() + interval '1 hour' END,
+			        CASE WHEN $2 = 'running' THEN 'live-worker' END)
+			RETURNING id`,
+			tenantID, status,
+		).Scan(&id)
+		require.NoError(t, err)
+		return id
+	}
+
+	queued := insertJob(tenant.DefaultID, "queued")
+	succeeded := insertJob(tenant.DefaultID, "succeeded")
+	failed := insertJob(tenant.DefaultID, "failed")
+	dead := insertJob(tenant.DefaultID, "dead")
+	running := insertJob(tenant.DefaultID, "running")
+	otherQueued := insertJob(otherTenant, "queued")
+
+	// More than one full batch: the purge must loop until the tenant has no
+	// non-running rows left.
+	bulk := purgeBatchSize + 1
+	_, err := pool.Exec(ctx, `
+		INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts)
+		SELECT $1, 'email.send.encrypted', '{"sealed":"pii"}'::jsonb, 'queued', now(), 3
+		FROM generate_series(1, $2::int)`,
+		tenant.DefaultID, bulk,
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pool), tenant.DefaultID))
+
+	exists := func(id int64) bool {
+		t.Helper()
+		var found bool
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, id).Scan(&found))
+		return found
+	}
+	for name, id := range map[string]int64{
+		"queued": queued, "succeeded": succeeded, "failed": failed, "dead": dead,
+	} {
+		assert.False(t, exists(id), "a %s job of the purged tenant must be deleted", name)
+	}
+	assert.True(t, exists(running), "a running job is left to finish")
+	assert.True(t, exists(otherQueued), "another tenant's queued job must be retained")
+
+	var remaining int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE tenant_id = $1 AND status <> 'running'`, tenant.DefaultID,
+	).Scan(&remaining))
+	assert.Zero(t, remaining, "the batch loop must drain every non-running row")
+
+	// Idempotent: a second purge is a successful no-op.
+	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pool), tenant.DefaultID))
+	assert.True(t, exists(running))
+	assert.True(t, exists(otherQueued))
+}
+
 // TestQueuedSenderIntegrationEncryptsEmailPayload verifies that the codec
 // wiring used by cmd/api stores an encrypted envelope instead of the reset
 // link, and that EmailHandler still delivers the decoded message.
 func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	codec, err := NewPayloadCodec("integration-jwt-secret-at-least-32-characters")
@@ -898,7 +974,7 @@ func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	codec, err := NewPayloadCodec("integration-jwt-secret-at-least-32-characters")
@@ -1026,7 +1102,7 @@ func integrationSchema(t *testing.T) ([]integrationMigration, error) {
 func TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.mixed_lease"
@@ -1129,7 +1205,7 @@ func runIntegrationWorker(t *testing.T, worker *Worker) {
 func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 	pool := setupIntegrationDB(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	recorder := tracetest.NewSpanRecorder()

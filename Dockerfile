@@ -21,7 +21,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -trimpath \
     -buildvcs=false \
-    -o migrate ./cmd/migrate
+    -o migrate ./cmd/migrate && \
+    CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags="-s -w" \
+    -trimpath \
+    -buildvcs=false \
+    -o seed ./cmd/seed
 
 # ---- Production stage ----
 FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS prod
@@ -34,6 +39,7 @@ WORKDIR /app
 
 COPY --from=build /app/server ./server
 COPY --from=build /app/migrate ./migrate
+COPY --from=build /app/seed ./seed
 COPY --from=build /app/migrations ./migrations
 COPY --from=build /app/docs ./docs
 

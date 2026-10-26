@@ -365,6 +365,14 @@ func run() error {
 		}
 		return fmt.Errorf("run migrations: %w", err)
 	}
+	// The connect context is cancelled above; use a fresh one for the revoke
+	// so a slow migration cannot turn it into a false failure.
+	revokeCtx, cancelRevoke := context.WithTimeout(context.Background(), schemaCheckTimeout)
+	revokeErr := revokeMigrationTableAccess(revokeCtx, pool)
+	cancelRevoke()
+	if revokeErr != nil {
+		return revokeErr
+	}
 	// Use a fresh timeout: a slow migration must not consume the verification
 	// budget and turn a successful schema change into a false failure.
 	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), schemaCheckTimeout)
@@ -374,6 +382,47 @@ func run() error {
 	}
 
 	slog.Info("migrations completed")
+	return nil
+}
+
+// revokeSchemaMigrationsSQL removes every explicit grant on the migration
+// ledger from roles other than its owner. golang-migrate creates
+// schema_migrations as the schema owner, so database-roles.sql's default
+// privileges hand the runtime roles DML on it; that would let a compromised
+// app role rewrite the recorded version (replaying or skipping DDL).
+//
+// The statement is constant: the dynamic part lives inside the DO block, so a
+// role name from the catalog is always quoted with format(%I). It runs after
+// every migration, which also covers deployments whose role script ran before
+// the table existed.
+const revokeSchemaMigrationsSQL = `
+DO $$
+DECLARE
+    target REGCLASS := to_regclass('schema_migrations');
+    grantee OID;
+BEGIN
+    IF target IS NULL THEN
+        RETURN;
+    END IF;
+    FOR grantee IN
+        SELECT DISTINCT a.grantee
+        FROM pg_class c
+        CROSS JOIN LATERAL aclexplode(c.relacl) a
+        WHERE c.oid = target
+          AND a.grantee <> c.relowner
+          AND a.grantee <> 0
+    LOOP
+        EXECUTE format('REVOKE ALL ON TABLE %s FROM %I', target, grantee::regrole);
+    END LOOP;
+END;
+$$`
+
+// revokeMigrationTableAccess applies revokeSchemaMigrationsSQL. Only the
+// schema owner keeps privileges on schema_migrations after a successful run.
+func revokeMigrationTableAccess(ctx context.Context, pool *pgxpool.Pool) error {
+	if _, err := pool.Exec(ctx, revokeSchemaMigrationsSQL); err != nil {
+		return fmt.Errorf("revoke runtime access to schema_migrations: %w", err)
+	}
 	return nil
 }
 
@@ -750,6 +799,9 @@ func rlsPredicateGaps(definition string) []string {
 	}
 	if !strings.Contains(lowered, "app.tenant_id") {
 		gaps = append(gaps, "app_tenant_visible must compare the row tenant with app.tenant_id")
+	}
+	if strings.Contains(lowered, "set search_path") {
+		gaps = append(gaps, "app_tenant_visible must not SET search_path (it must stay inlinable into every policy)")
 	}
 	return gaps
 }

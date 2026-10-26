@@ -37,14 +37,31 @@ var secretFileVars = []string{
 	"REDIS_URL",
 }
 
+// seedSecretFileVars are the <NAME>_FILE settings cmd/seed may read. The seed
+// Job mounts the application Secret, so it can inherit paths for secrets it
+// never uses (for example JWT_SECRET_FILE); resolving only the database and
+// admin files keeps those irrelevant mounts from failing the seed.
+var seedSecretFileVars = []string{
+	"DB_PASSWORD",
+	"DB_BYPASS_PASSWORD",
+	"ADMIN_PASSWORD",
+}
+
 // loadEnvironment returns the process environment with every <NAME>_FILE
 // secret resolved into <NAME>. Setting both forms is rejected so it is never
 // ambiguous which value is in effect. Trailing line breaks are trimmed
 // because most tools that write secret files add one; other whitespace is
 // preserved as part of the secret.
 func loadEnvironment() (map[string]string, error) {
+	return loadEnvironmentFor(secretFileVars)
+}
+
+// loadEnvironmentFor resolves <NAME>_FILE only for names. A command that needs
+// one configuration section must not fail on a mounted path for a secret it
+// never reads.
+func loadEnvironmentFor(names []string) (map[string]string, error) {
 	environment := env.ToMap(os.Environ())
-	for _, name := range secretFileVars {
+	for _, name := range names {
 		path := strings.TrimSpace(environment[name+secretFileSuffix])
 		if path == "" {
 			continue

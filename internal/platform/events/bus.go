@@ -223,6 +223,11 @@ func (b *Bus) Publish(ctx context.Context, event Event) error {
 // would let a rollback leave a ghost event and would let a local handler error
 // roll back the business work. Use Publish or PublishLocal after the commit
 // when local delivery is needed.
+//
+// The published-events counter moves only after every enqueue succeeds. A
+// later rollback of the caller's transaction can still over-count, because
+// Prometheus counters cannot be rolled back; the metric means "enqueued in a
+// transaction", not "committed".
 func (b *Bus) PublishTx(ctx context.Context, tx pgx.Tx, event Event) error {
 	if tx == nil {
 		return ErrNoTx
@@ -231,9 +236,11 @@ func (b *Bus) PublishTx(ctx context.Context, tx pgx.Tx, event Event) error {
 	if err != nil {
 		return err
 	}
+	if err := b.enqueueDurable(ctx, tx, event); err != nil {
+		return err
+	}
 	metrics.EventsPublishedTotal.WithLabelValues(event.Type, "durable").Inc()
-
-	return b.enqueueDurable(ctx, tx, event)
+	return nil
 }
 
 func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {

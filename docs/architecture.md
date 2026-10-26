@@ -77,7 +77,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 
 | Module | Owns |
 |---|---|
-| `identity` | Auth, global users, memberships, RBAC roles and assignments, invitations, sessions, tokens, data exports/erasure, tenant lifecycle (including platform tenant administration), admin seed (dto/repository/service/handler + adapter + queries/sqlc) |
+| `identity` | Auth, global users, memberships, RBAC roles and assignments, invitations, sessions, tokens, data exports/erasure, tenant lifecycle (including platform tenant administration); dto/repository/service/handler + adapter + queries/sqlc |
 | `files` | Upload, metadata, download, soft delete, restore (+ adapter + queries/sqlc) |
 | `features` | Admin feature-flag catalogue surface (+ queries/sqlc) |
 | `notifications` | In-app feed, channel preferences, durable email channel (+ queries/sqlc) |
@@ -151,7 +151,9 @@ sequenceDiagram
   `tenant_id`/`tenant_slug` in Fiber locals and the request context.
 - The Google OAuth callback is exempt so require-header mode cannot reject it
   before the handler validates the signed `state`; the handler installs the
-  state tenant itself.
+  state tenant itself. Exemption and query-fallback path checks compare the
+  lowercase, trailing-slash-trimmed form, matching Fiber's case-insensitive
+  routing.
 - `JWTAuth` treats the token's `tenant_id` claim as authoritative, rejects a
   non-positive claim (401), and rejects an explicit header that resolves to a
   different tenant (403). It clears `tenant_slug` when the claim overrides a
@@ -279,26 +281,33 @@ normally and its requests return 404.
 | Idempotency | Cache keys include tenant ID/slug, method, path, and caller, so a replayed `201` cannot cross tenants. |
 | Logout | Revokes the refresh token's session by possession, so it works even without the header. A reused refresh token revokes its whole session. |
 
-Repositories derive the tenant from `tenant.EffectiveID(ctx)`; the tenant-1
-fallback is only for jobs, internal callers, and tests. Cross-tenant ids or
-tokens behave as not found. As a second line, every tenant-owned table has
-forced row-level security: `database.TxManager` and `database.Scoped` set the
-transaction-local `app.tenant_id` setting, so a query that forgot its
-predicate still cannot read or write another tenant's rows. Isolation is a
-role property, not a setting: the normal role has no `BYPASSRLS` and cannot
-acquire it, so injected SQL cannot turn the predicate off. The deliberate
-cross-tenant paths (global job work, retention, feature snapshots, webhook
-inbound lookup, global-user operations) set `database.WithRLSBypass`; the
-transaction manager or statement then runs on a separate `BYPASSRLS` role
-pool that the normal role is not a member of. The pool is chosen at `BEGIN`:
-a bypass marker added inside a transaction that began on the normal pool does
-not change its connection, so those statements stay tenant-scoped (mark the
-context before `WithTx`). The scope is narrowed to what needs it: invitation
-accept/sign-up bypass only the possession-based tenant read, then lock the
-invitation and do the membership/audit work under that tenant; credential and
-MFA changes that must revoke every tenant's sessions keep one bypass
-transaction for atomicity and give every tenant-owned statement an explicit
-tenant predicate. Per-tenant limits remain future work.
+Repositories derive the tenant from `tenant.EffectiveID(ctx)` where they must
+name a tenant on a row; the tenant-1 fallback is only for jobs, internal
+callers, and tests. The row-level-security scope is stricter: it comes from
+`tenant.IDFromContext(ctx)` and nowhere else, so a path with no tenant in its
+context sees no tenant-owned rows instead of silently reading or writing the
+compatibility tenant. Background work installs the tenant explicitly (the job
+worker restores the job's `tenant_id` before running the handler), and
+deliberate global work marks the context with `database.WithRLSBypass`.
+Cross-tenant ids or tokens behave as not found. As a second line, every
+tenant-owned table has forced row-level security:
+`database.TxManager` and `database.Scoped` set the transaction-local
+`app.tenant_id` setting, so a query that forgot its predicate still cannot
+read or write another tenant's rows. Isolation is a role property, not a
+setting: the normal role has no `BYPASSRLS` and cannot acquire it, so injected
+SQL cannot turn the predicate off. The deliberate cross-tenant paths (global
+job work, retention, feature snapshots, webhook inbound lookup, global-user
+operations) set `database.WithRLSBypass`; the transaction manager or statement
+then runs on a separate `BYPASSRLS` role pool that the normal role is not a
+member of. The pool is chosen at `BEGIN`: a bypass marker added inside a
+transaction that began on the normal pool does not change its connection, so
+those statements stay tenant-scoped (mark the context before `WithTx`). The
+scope is narrowed to what needs it: invitation accept/sign-up bypass only the
+possession-based tenant read, then lock the invitation and do the
+membership/audit work under that tenant; credential and MFA changes that must
+revoke every tenant's sessions keep one bypass transaction for atomicity and
+give every tenant-owned statement an explicit tenant predicate. Per-tenant
+limits remain future work.
 
 ## Authorization
 
@@ -419,7 +428,7 @@ flowchart TD
     build --> cat["app.RegisterCatalogs<br/>permissions, error codes, flags"]
     cat --> keys["cfg.FeatureFlags.ValidateKnownKeys<br/>unknown FEATURE_FLAGS keys fail here"]
     keys --> i18n["i18n.New(locale, app.LocaleSources)<br/>merge + parity check"]
-    i18n --> startup["Modules.Startup<br/>tenant existence, permission sync, admin seed"]
+    i18n --> startup["Modules.Startup<br/>tenant existence, permission sync"]
     startup --> appnew["app.New + app.Register<br/>routes, jobs, events, schedules"]
     appnew --> run["email.send handlers, scheduler,<br/>worker, Modules.Background, HTTP listen"]
 ```
@@ -442,7 +451,7 @@ flowchart TD
 - `app.Infra` carries process-wide infrastructure and only the shared
   configuration (`Infra.Platform`: App, JWT, Tenant). Module-owned sections
   reach a module only through its `Settings` struct: `bootstrap.Build(cfg,
-  infra)` passes OAuth/admin seed to identity, storage limits to files, and
+  infra)` passes OAuth settings to identity, storage limits to files, and
   webhook delivery plus secret keys to webhooks, so no module reads another's
   settings.
 - `APP_ROLE` selects what the process runs: `all` registers routes and runs

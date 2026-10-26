@@ -70,7 +70,10 @@ func setupIntegrationApp(t *testing.T) (*fiber.App, *pgxpool.Pool) {
 		if err := httpx.BindAndValidate(c, &req); err != nil {
 			return err
 		}
-		user, err := kit.users.Register(c.Context(), identityservice.RegisterInput{
+		// This minimal app has no tenant middleware: the route is the default
+		// tenant by construction, and the RLS resolver is fail-closed.
+		ctx := tenant.WithID(c.Context(), tenant.DefaultID)
+		user, err := kit.users.Register(ctx, identityservice.RegisterInput{
 			Email:    req.Email,
 			Password: req.Password,
 			Name:     req.Name,

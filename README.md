@@ -98,7 +98,7 @@ flowchart TD
     D -->|no| F["make run<br/>(Go 1.27.3+, PostgreSQL)"]
     E --> G["Compose migrate service<br/>applies the schema"]
     F --> H["cmd/migrate<br/>applies the schema"]
-    G --> I["API starts and seeds<br/>the admin user"]
+    G --> I["Compose seed service<br/>creates the bootstrap admin"]
     H --> I
     I --> J["Check /healthz, /readyz, /swagger"]
 ```
@@ -130,6 +130,7 @@ make docker-run
 | Service | Port | Notes |
 |---------|------|-------|
 | API | `:8080` | Starts after the one-shot `migrate` service succeeds |
+| Seed | — | One-shot `cmd/seed` after `migrate`; creates the bootstrap admin and exits |
 | PostgreSQL | `:5432` | `postgres:18-alpine` |
 | Redis | `:6379` | `redis:8-alpine` |
 | SeaweedFS S3 gateway | `:8333` | Optional: `STORAGE_DRIVER=seaweedfs docker compose --profile s3 up` |
@@ -144,15 +145,15 @@ make run
 ```
 
 `make run` applies the schema through `cmd/migrate` before starting the API.
-In both paths the API seeds the admin user (`ADMIN_EMAIL`/`ADMIN_PASSWORD`)
-on startup.
+The admin user is created only by `cmd/seed` (`make seed`, the Compose `seed`
+service, or the Kubernetes seed Job), never by API startup.
 
 
 ## Commands
 
 ```bash
 make run                 # apply the schema, then run the API locally
-make docker-run          # Compose: migrate job, then the API
+make docker-run          # Compose: migrate and seed jobs, then the API
 make check               # vet + lint + architecture tests + unit tests
 make test-integration    # integration tests (testcontainers or TEST_DATABASE_URL)
 make gen module=billing  # scaffold a module (also resource= / command= / query=)

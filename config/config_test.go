@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -84,7 +86,12 @@ func TestCORSConfig_DefaultsIncludeIdempotencyHeaders(t *testing.T) {
 			t.Errorf("default CORS allowed headers = %v, want %s", c.Headers(), header)
 		}
 	}
-	for _, header := range []string{"Location", "ETag", "Idempotent-Replayed", "Content-Language", "API-Version", "Deprecation", "Sunset", "Link"} {
+	for _, header := range []string{
+		"Location", "ETag", "Idempotent-Replayed", "Content-Language", "API-Version", "Deprecation", "Sunset", "Link",
+		"RateLimit", "RateLimit-Policy", "Retry-After",
+		"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset",
+		"X-Request-Id",
+	} {
 		if !contains(c.ExposedHeaders(), header) {
 			t.Errorf("default CORS exposed headers = %v, want %s", c.ExposedHeaders(), header)
 		}
@@ -880,6 +887,134 @@ func TestLoadDatabase_RejectsUnknownEnvironment(t *testing.T) {
 	t.Setenv("DB_MIN_CONNS", "1")
 	if _, err := LoadDatabase(); err == nil {
 		t.Fatal("LoadDatabase() should reject an unknown APP_ENV")
+	}
+}
+
+func TestLoadSeed_IgnoresApplicationSecrets(t *testing.T) {
+	// The seed Job mounts the database credentials and its own ADMIN_* secret;
+	// it must not need JWT/SMTP/metrics/storage secrets the API validates.
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("JWT_SECRET", "")
+	t.Setenv("DATA_ENCRYPTION_KEY", "")
+	t.Setenv("METRICS_AUTH_TOKEN", "")
+	t.Setenv("SMTP_HOST", "")
+	t.Setenv("DB_HOST", "db.internal")
+	t.Setenv("DB_PORT", "5433")
+	t.Setenv("DB_DATABASE", "app")
+	t.Setenv("DB_USERNAME", "seeder")
+	t.Setenv("DB_PASSWORD", strings.Repeat("d", 16))
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", strings.Repeat("b", 16))
+	t.Setenv("ADMIN_NAME", "Seeder")
+
+	cfg, err := LoadSeed()
+	if err != nil {
+		t.Fatalf("LoadSeed() returned error: %v", err)
+	}
+	if cfg.DB.Host != "db.internal" || cfg.DB.Database != "app" {
+		t.Fatalf("unexpected database config: %+v", cfg.DB)
+	}
+	if cfg.Admin.Email != "admin@example.com" || cfg.Admin.Name != "Seeder" {
+		t.Fatalf("unexpected admin config: %+v", cfg.Admin)
+	}
+}
+
+func TestLoadSeed_IgnoresApplicationSecretFiles(t *testing.T) {
+	// The seed Job mounts the application Secret, so it inherits _FILE paths
+	// for secrets cmd/seed never reads. Those must not fail the seed.
+	absent := filepath.Join(t.TempDir(), "not-mounted")
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_HOST", "db.internal")
+	t.Setenv("DB_PORT", "5433")
+	t.Setenv("DB_DATABASE", "app")
+	t.Setenv("DB_USERNAME", "seeder")
+	t.Setenv("DB_PASSWORD", strings.Repeat("d", 16))
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("JWT_SECRET_FILE", absent)
+	t.Setenv("DATA_ENCRYPTION_KEY_FILE", absent)
+	t.Setenv("SMTP_PASSWORD_FILE", absent)
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", strings.Repeat("b", 16))
+
+	cfg, err := LoadSeed()
+	if err != nil {
+		t.Fatalf("LoadSeed() must ignore unneeded _FILE paths: %v", err)
+	}
+	if cfg.Admin.Password != strings.Repeat("b", 16) {
+		t.Fatal("LoadSeed() did not read ADMIN_PASSWORD")
+	}
+}
+
+func TestLoadSeed_ReadsAdminPasswordFile(t *testing.T) {
+	dir := t.TempDir()
+	passwordPath := filepath.Join(dir, "admin-password")
+	password := strings.Repeat("p", 16)
+	if err := os.WriteFile(passwordPath, []byte(password+"\n"), 0o600); err != nil {
+		t.Fatalf("write admin password file: %v", err)
+	}
+
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", "")
+	t.Setenv("ADMIN_PASSWORD_FILE", passwordPath)
+
+	cfg, err := LoadSeed()
+	if err != nil {
+		t.Fatalf("LoadSeed() returned error: %v", err)
+	}
+	if cfg.Admin.Password != password {
+		t.Fatal("LoadSeed() did not resolve ADMIN_PASSWORD_FILE")
+	}
+}
+
+func TestLoadSeed_RejectsWeakProductionAdminPassword(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", "short")
+
+	if _, err := LoadSeed(); err == nil {
+		t.Fatal("LoadSeed() should reject a short ADMIN_PASSWORD in production")
+	}
+}
+
+func TestLoadSeed_RequiresAdminPair(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", "")
+
+	if _, err := LoadSeed(); err == nil {
+		t.Fatal("LoadSeed() should reject ADMIN_EMAIL without ADMIN_PASSWORD")
+	}
+}
+
+func TestLoadSeed_RejectsUnverifiedProductionTransport(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_SSLMODE", "disable")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+
+	if _, err := LoadSeed(); err == nil {
+		t.Fatal("LoadSeed() should reject DB_SSLMODE=disable in production")
 	}
 }
 

@@ -22,13 +22,14 @@ const adminBcryptCost = 12
 // Admin creates the bootstrap admin when ADMIN_EMAIL and ADMIN_PASSWORD are
 // set and no account has that address: a verified global user, its password,
 // an owner membership in the tenant, and the platform_admin assignment, in one
-// transaction. It is safe to call on every startup (idempotent).
+// transaction. It is idempotent, so the one-shot seed Job, `make seed`, and the
+// Compose seed service may all run it safely.
 //
 // The seed only ever creates. When ADMIN_EMAIL already belongs to an account
 // (in any tenant) that is not an active owner of this tenant, or the
 // address is banned in it, that state is an operator decision: the seed logs
 // a warning and skips. It never promotes, adds memberships to, or restores an
-// existing account, and never fails startup over it.
+// existing account, and never fails the run over it.
 //
 // The optional tenant ID selects the tenant of the admin membership. Callers
 // pass the configured default tenant; when omitted, the compatibility tenant
@@ -88,7 +89,7 @@ func Admin(ctx context.Context, cfg config.AdminConfig, stores identityservice.S
 		return tx.Roles.AssignPlatformRole(ctx, user.ID, authz.RolePlatformAdmin)
 	})
 	if err != nil {
-		// Another replica may have won the startup race; its row decides.
+		// Another concurrent seeder may have won the race; its row decides.
 		if errors.Is(err, identityservice.ErrEmailTaken) {
 			if winner, lookupErr := stores.Users.GetByEmail(ctx, email); lookupErr == nil {
 				return keepExisting(ctx, stores, winner, tenantID)

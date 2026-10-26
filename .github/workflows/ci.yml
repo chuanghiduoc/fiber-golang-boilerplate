@@ -142,6 +142,9 @@ jobs:
       - name: Build migrate binary
         run: CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o migrate ./cmd/migrate
 
+      - name: Build seed binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -trimpath -o seed ./cmd/seed
+
   manifests:
     name: Manifests
     runs-on: ubuntu-latest
@@ -151,30 +154,50 @@ jobs:
 
       - name: Install actionlint
         run: |
-          curl -fsSLo actionlint.tar.gz \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-          tar -xzf actionlint.tar.gz
+          set -euo pipefail
+          archive=actionlint_1.7.12_linux_amd64.tar.gz
+          release_url=https://github.com/rhysd/actionlint/releases/download/v1.7.12
+          curl -fsSLo "$archive" "$release_url/$archive"
+          curl -fsSLo actionlint_checksums.txt "$release_url/actionlint_1.7.12_checksums.txt"
+          expected="$(awk -v file="$archive" '$2 == file {print $1}' actionlint_checksums.txt)"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::actionlint checksum mismatch (expected '${expected}', got '${actual}')"
+            exit 1
+          fi
+          tar -xzf "$archive"
           sudo mv actionlint /usr/local/bin/actionlint
-          rm actionlint.tar.gz
+          rm "$archive" actionlint_checksums.txt
 
       - name: Lint workflows
         run: actionlint
 
       - name: Install kustomize
         run: |
-          curl -fsSLo kustomize.tar.gz \
-            https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz
-          tar -xzf kustomize.tar.gz
+          set -euo pipefail
+          archive=kustomize_v5.8.1_linux_amd64.tar.gz
+          release_url=https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1
+          curl -fsSLo "$archive" "$release_url/$archive"
+          curl -fsSLo kustomize_checksums.txt "$release_url/checksums.txt"
+          expected="$(awk -v file="$archive" '$2 == file {print $1}' kustomize_checksums.txt)"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::kustomize checksum mismatch (expected '${expected}', got '${actual}')"
+            exit 1
+          fi
+          tar -xzf "$archive"
           sudo mv kustomize /usr/local/bin/kustomize
-          rm kustomize.tar.gz
+          rm "$archive" kustomize_checksums.txt
 
       - name: Render app manifests
         run: |
+          set -euo pipefail
           kustomize build deploy/k8s > /tmp/app-manifests.yaml
           for env in staging production; do
             kustomize build "deploy/k8s/overlays/$env" > "/tmp/${env}-manifests.yaml"
             kustomize build "deploy/k8s/overlays/$env/prereqs" > "/tmp/${env}-prereqs.yaml"
             kustomize build "deploy/k8s/overlays/$env/migration" > "/tmp/${env}-migration.yaml"
+            kustomize build "deploy/k8s/overlays/$env/seed" > "/tmp/${env}-seed.yaml"
           done
 
       - name: Check excluded resources
@@ -186,6 +209,10 @@ jobs:
             fi
             if grep -q 'name: fiber-boilerplate-migrate' "$file"; then
               echo "::error::migration/job.yaml must be applied separately, not via an app kustomization ($file)"
+              exit 1
+            fi
+            if grep -q 'name: fiber-boilerplate-seed' "$file"; then
+              echo "::error::seed/job.yaml must be applied separately, not via an app kustomization ($file)"
               exit 1
             fi
           done
@@ -204,7 +231,8 @@ jobs:
             for file in \
               "/tmp/${env}-manifests.yaml" \
               "/tmp/${env}-prereqs.yaml" \
-              "/tmp/${env}-migration.yaml"; do
+              "/tmp/${env}-migration.yaml" \
+              "/tmp/${env}-seed.yaml"; do
               if grep -qE '^  namespace: fiber-boilerplate$' "$file"; then
                 echo "::error::$file still contains base-namespace resources"
                 exit 1
@@ -218,11 +246,20 @@ jobs:
 
       - name: Install kubeconform
         run: |
-          curl -fsSLo kubeconform.tar.gz \
-            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
-          tar -xzf kubeconform.tar.gz
+          set -euo pipefail
+          archive=kubeconform-linux-amd64.tar.gz
+          release_url=https://github.com/yannh/kubeconform/releases/download/v0.8.0
+          curl -fsSLo "$archive" "$release_url/$archive"
+          curl -fsSLo kubeconform_CHECKSUMS "$release_url/CHECKSUMS"
+          expected="$(awk -v file="$archive" '$2 == file {print $1}' kubeconform_CHECKSUMS)"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
+            echo "::error::kubeconform checksum mismatch (expected '${expected}', got '${actual}')"
+            exit 1
+          fi
+          tar -xzf "$archive"
           sudo mv kubeconform /usr/local/bin/kubeconform
-          rm kubeconform.tar.gz
+          rm "$archive" kubeconform_CHECKSUMS
 
       - name: Validate manifests
         run: |
@@ -234,9 +271,13 @@ jobs:
             /tmp/production-prereqs.yaml \
             /tmp/staging-migration.yaml \
             /tmp/production-migration.yaml \
+            /tmp/staging-seed.yaml \
+            /tmp/production-seed.yaml \
             deploy/k8s/migration/job.yaml \
+            deploy/k8s/seed/job.yaml \
             deploy/k8s/secret.example.yaml \
-            deploy/k8s/migrate-secret.example.yaml
+            deploy/k8s/migrate-secret.example.yaml \
+            deploy/k8s/seed-secret.example.yaml
 
   migrations:
     name: Migrations
@@ -360,11 +401,39 @@ jobs:
             echo "::error::the app role must not be a member of the bypass role"
             exit 1
           fi
-          guarded=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
-            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE n.nspname = 'public' AND c.relrowsecurity AND c.relforcerowsecurity")
-          if [ "$guarded" -ne 23 ]; then
-            echo "::error::expected 23 tables with forced RLS, found $guarded"
+          # Every table with a tenant_id column must have ENABLE + FORCE row
+          # level security, and every table with forced RLS must have a
+          # tenant_id column. Both sets come from the schema, not a literal, so
+          # adding a correct tenant-owned module does not turn CI red.
+          missing_rls=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT t.tablename FROM pg_tables t
+             JOIN pg_class c ON c.relname = t.tablename
+             JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.schemaname
+             WHERE t.schemaname = 'public'
+               AND EXISTS (SELECT 1 FROM information_schema.columns col
+                           WHERE col.table_schema = t.schemaname
+                             AND col.table_name = t.tablename
+                             AND col.column_name = 'tenant_id')
+               AND NOT (c.relrowsecurity AND c.relforcerowsecurity)
+             ORDER BY t.tablename")
+          if [ -n "$missing_rls" ]; then
+            echo "::error::every table with a tenant_id column must have ENABLE + FORCE row level security:"
+            echo "$missing_rls"
+            exit 1
+          fi
+          extra_rls=$(psql -h "$DB_HOST" -U "$DB_USERNAME" -d "$DB_DATABASE" -tAc \
+            "SELECT c.relname FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+               AND c.relrowsecurity AND c.relforcerowsecurity
+               AND NOT EXISTS (SELECT 1 FROM information_schema.columns col
+                               WHERE col.table_schema = n.nspname
+                                 AND col.table_name = c.relname
+                                 AND col.column_name = 'tenant_id')
+             ORDER BY c.relname")
+          if [ -n "$extra_rls" ]; then
+            echo "::error::a table without a tenant_id column must not use FORCE row level security:"
+            echo "$extra_rls"
             exit 1
           fi
 

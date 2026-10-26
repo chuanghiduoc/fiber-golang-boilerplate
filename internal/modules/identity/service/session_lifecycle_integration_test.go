@@ -21,7 +21,7 @@ import (
 // session. The repository must bypass RLS for this one statement.
 func TestLogout_RevokesTenantBSessionWithoutHeader(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	acmeID := testutil.CreateTenant(t, ctx, e.pool, "logout-acme")
 	user := testutil.CreateMember(t, ctx, e.pool, acmeID, "logout-b@example.com", testutil.MemberOptions{})
 
@@ -39,7 +39,7 @@ func TestLogout_RevokesTenantBSessionWithoutHeader(t *testing.T) {
 // and refresh rejects the session once that instant has passed.
 func TestSessions_AbsoluteLifetimeRejectsRefresh(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "lifetime@example.com", testutil.MemberOptions{})
 
 	pair, err := e.sessions.Issue(ctx, user.UserID, user.TokenVersion, []string{service.AMRPassword})
@@ -60,7 +60,7 @@ func TestSessions_AbsoluteLifetimeRejectsRefresh(t *testing.T) {
 // loser gets the dedicated concurrent code, and the shared session stays live.
 func TestSessions_ConcurrentRefreshOneWinsSessionStaysLive(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "concurrent@example.com", testutil.MemberOptions{})
 
 	pair, err := e.sessions.Issue(ctx, user.UserID, user.TokenVersion, []string{service.AMRPassword})
@@ -108,7 +108,7 @@ func TestSessions_ConcurrentRefreshOneWinsSessionStaysLive(t *testing.T) {
 // Reuse outside the 10-second grace still revokes the whole session.
 func TestSessions_ReuseAfterGraceRevokesSession(t *testing.T) {
 	e := newEnv(t, nil)
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "old-reuse@example.com", testutil.MemberOptions{})
 
 	pair, err := e.sessions.Issue(ctx, user.UserID, user.TokenVersion, []string{service.AMRPassword})

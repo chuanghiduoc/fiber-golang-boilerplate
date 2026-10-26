@@ -1263,6 +1263,9 @@ func TestProcessJobHeartbeatFailureDoesNotFailJob(t *testing.T) {
 		WithLeaseDuration(250*time.Millisecond),
 	)
 	worker.store = fake
+	// Freeze the worker clock: the failure happens well inside the cancel
+	// margin, so it must stay a transient error.
+	worker.now = func() time.Time { return time.Unix(0, 0) }
 	worker.Register("slow", func(context.Context, json.RawMessage) error {
 		require.Eventually(t, func() bool {
 			return fake.heartbeatCount() > 0
@@ -1326,8 +1329,9 @@ func TestProcessJobLeaseLostCancelsHandler(t *testing.T) {
 }
 
 // TestProcessJobHeartbeatDeadlineCancelsHandler proves repeated transient
-// heartbeat failures cancel the handler only once the lease duration has
-// elapsed since the claim or the last successful renewal.
+// heartbeat failures cancel the handler one heartbeat interval and one
+// bookkeeping timeout before the lease can expire, not only once the lease has
+// already elapsed (when another worker may have reclaimed the job).
 func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	t.Parallel()
 
@@ -1335,9 +1339,19 @@ func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	fake := &fakeStore{heartbeatErr: errors.New("database unavailable")}
 	worker := NewWorker(nil, "expired-worker",
 		WithHeartbeatInterval(5*time.Millisecond),
-		WithLeaseDuration(60*time.Millisecond),
+		WithLeaseDuration(10*time.Second),
 	)
 	worker.store = fake
+
+	// lease 10s - interval 5ms - bookkeeping timeout 5s = 4.995s margin. The
+	// fake clock advances one second per read and stops at 5s, so the third
+	// failed heartbeat (elapsed 5s) must cancel the handler. The old rule
+	// (elapsed >= lease duration) would never fire because the clock stops
+	// well below the 10s lease.
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	clock := newFakeClock(base, time.Second, base.Add(5*time.Second))
+	worker.now = clock.Now
+	require.Equal(t, 4995*time.Millisecond, worker.leaseCancelMargin())
 
 	before := metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind))
 	cause := make(chan error, 1)
@@ -1362,11 +1376,56 @@ func TestProcessJobHeartbeatDeadlineCancelsHandler(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("handler was not canceled after the heartbeat deadline")
 	}
-	assert.GreaterOrEqual(t, fake.heartbeatCount(), 2, "transient failures alone must not cancel at once")
+	assert.Equal(t, 3, fake.heartbeatCount(), "must cancel once the margin elapsed, before the lease itself")
 	assert.Empty(t, fake.succeededIDs())
 	assert.Empty(t, fake.failures)
 	assert.Empty(t, fake.releases)
 	assert.Equal(t, before+1, metricValue(t, metrics.JobsLeaseLostTotal.WithLabelValues(kind)))
+}
+
+// TestWorkerLeaseCancelMargin pins the margin formula and its degenerate-lease
+// clamp: cancelling must always happen strictly before the lease expires.
+func TestWorkerLeaseCancelMargin(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		lease    time.Duration
+		interval time.Duration
+		want     time.Duration
+	}{
+		{
+			name:     "defaults subtract one interval and the bookkeeping timeout",
+			lease:    defaultLeaseDuration,
+			interval: defaultHeartbeatInterval,
+			want:     defaultLeaseDuration - defaultHeartbeatInterval - bookkeepingTimeout,
+		},
+		{
+			name:     "short lease clamps to one further heartbeat",
+			lease:    60 * time.Millisecond,
+			interval: 5 * time.Millisecond,
+			want:     5 * time.Millisecond,
+		},
+		{
+			name:     "lease equal to interval plus bookkeeping clamps to the interval",
+			lease:    5*time.Second + time.Millisecond,
+			interval: time.Millisecond,
+			want:     time.Millisecond,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			worker := NewWorker(nil, "margin-worker",
+				WithHeartbeatInterval(tc.interval),
+				WithLeaseDuration(tc.lease),
+			)
+			margin := worker.leaseCancelMargin()
+			assert.Equal(t, tc.want, margin)
+			assert.Positive(t, margin)
+			assert.Less(t, margin, worker.leaseDuration)
+		})
+	}
 }
 
 // TestWorkerCountsLeaseExpiredDeadLetters proves the claim path reports jobs
@@ -1545,6 +1604,31 @@ func (s *streamingStore) Claim(_ context.Context, _ string, limit int, staleAfte
 	batch := append([]claimedJob(nil), s.pending[:limit]...)
 	s.pending = s.pending[limit:]
 	return claimResult{Jobs: batch}, nil
+}
+
+// fakeClock returns a strictly increasing time on every read and stops at max,
+// so a heartbeat test can cross the cancel margin without sleeping for a real
+// lease duration.
+type fakeClock struct {
+	mu      sync.Mutex
+	current time.Time
+	step    time.Duration
+	max     time.Time
+}
+
+func newFakeClock(start time.Time, step time.Duration, stop time.Time) *fakeClock {
+	return &fakeClock{current: start, step: step, max: stop}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.current
+	c.current = c.current.Add(c.step)
+	if !c.max.IsZero() && c.current.After(c.max) {
+		c.current = c.max
+	}
+	return now
 }
 
 // fakeStore records worker outcomes without a database.

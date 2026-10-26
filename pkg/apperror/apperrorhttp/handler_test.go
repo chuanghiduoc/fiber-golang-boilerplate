@@ -129,6 +129,55 @@ func TestFiberErrorHandler_ClientCanceled(t *testing.T) {
 	}
 }
 
+// TestFiberErrorHandler_DoesNotEchoClientRequestID pins the trust boundary: an
+// error rendered before the request-ID middleware ran must not copy the
+// caller-supplied X-Request-Id into the problem document.
+func TestFiberErrorHandler_DoesNotEchoClientRequestID(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: FiberErrorHandler})
+	app.Get("/x", func(fiber.Ctx) error {
+		return apperror.NewBadRequest("bad request test")
+	})
+	req, _ := http.NewRequest("GET", "/x", http.NoBody)
+	req.Header.Set("X-Request-Id", "client-supplied")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if result["requestId"] != "" {
+		t.Fatalf("requestId = %v, want empty (must not echo the client header)", result["requestId"])
+	}
+}
+
+func TestFiberErrorHandler_UsesRequestIDLocal(t *testing.T) {
+	app := fiber.New(fiber.Config{ErrorHandler: FiberErrorHandler})
+	app.Use(func(c fiber.Ctx) error {
+		fiber.Locals[string](c, "request_id", "server-generated")
+		return c.Next()
+	})
+	app.Get("/x", func(fiber.Ctx) error {
+		return apperror.NewBadRequest("bad request test")
+	})
+	req, _ := http.NewRequest("GET", "/x", http.NoBody)
+	req.Header.Set("X-Request-Id", "client-supplied")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	var result map[string]any
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if result["requestId"] != "server-generated" {
+		t.Fatalf("requestId = %v, want the server-generated local", result["requestId"])
+	}
+}
+
 func TestFiberErrorHandler_UnknownError(t *testing.T) {
 	result, status, _ := decodeProblem(t, func(c fiber.Ctx) error {
 		return errors.New("something unexpected")

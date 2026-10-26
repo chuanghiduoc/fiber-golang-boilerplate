@@ -11,12 +11,15 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type fakeTx struct{ pgx.Tx }
@@ -289,6 +292,35 @@ func TestPublishTxRejectsNilTransaction(t *testing.T) {
 	event, err := NewEvent("tenant.created", 1, nil)
 	require.NoError(t, err)
 	assert.ErrorIs(t, bus.PublishTx(context.Background(), nil, event), ErrNoTx)
+}
+
+// TestPublishTxCountsOnlySuccessfulEnqueues pins the metric to the enqueue
+// result: a transactional publish that fails to enqueue must not report a
+// published event.
+func TestPublishTxCountsOnlySuccessfulEnqueues(t *testing.T) {
+	const eventType = "metric.publish.tx"
+	counter := metrics.EventsPublishedTotal.WithLabelValues(eventType, "durable")
+	before := counterValue(t, counter)
+
+	failing := New(&fakeQueue{failWith: errors.New("queue down")})
+	require.NoError(t, failing.SubscribeDurable(eventType, "handler", func(context.Context, Event) error { return nil }))
+	event, err := NewEvent(eventType, 1, nil)
+	require.NoError(t, err)
+	require.Error(t, failing.PublishTx(context.Background(), &fakeTx{}, event))
+	assert.Equal(t, before, counterValue(t, counter), "a failed enqueue must not count as published")
+
+	succeeding := New(&fakeQueue{})
+	require.NoError(t, succeeding.SubscribeDurable(eventType, "handler", func(context.Context, Event) error { return nil }))
+	require.NoError(t, succeeding.PublishTx(context.Background(), &fakeTx{}, event))
+	assert.Equal(t, before+1, counterValue(t, counter), "a successful enqueue must count exactly once")
+}
+
+// counterValue reads a Prometheus counter without pulling in testutil.
+func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	var m dto.Metric
+	require.NoError(t, counter.Write(&m))
+	return m.GetCounter().GetValue()
 }
 
 func TestSubscribeDurableValidation(t *testing.T) {

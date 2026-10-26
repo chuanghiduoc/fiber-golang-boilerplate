@@ -18,7 +18,7 @@ const (
 // and docker-compose fallback) that must never sign tokens outside local/test.
 var sampleJWTSecrets = []string{"", "secret", "your-super-secret-key-change-in-production"}
 
-// sampleAdminPassword is the .env.example and docker-compose ADMIN_PASSWORD.
+// sampleAdminPassword is the .env.example ADMIN_PASSWORD.
 const sampleAdminPassword = "Admin123!" // ggignore: public sample value, rejected in production
 
 type JWTConfig struct {

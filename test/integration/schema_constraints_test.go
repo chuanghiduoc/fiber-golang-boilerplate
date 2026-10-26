@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
@@ -321,6 +322,115 @@ func TestSchemaConstraints(t *testing.T) {
 			 VALUES (1, 'user', 'schema.check', 'schema', '2001:db8::1') RETURNING id`)
 		_, err = pool.Exec(ctx, insertAudit, "user", "203.0.113.7", parentID)
 		require.NoError(t, err)
+	})
+
+	t.Run("audit completion freezes the intent actor and completion codes", func(t *testing.T) {
+		insertIntent := func(statusCode any, errorCode any) int64 {
+			t.Helper()
+			return schemaInsertID(t, pool, `
+				INSERT INTO audit_events
+				    (tenant_id, actor_id, actor_type, actor_role, action, resource,
+				     source, outcome, status_code, error_code)
+				VALUES (1, 42, 'user', 'admin', 'schema.complete', 'schema',
+				        'http', 'started', $1, $2)
+				RETURNING id`, statusCode, errorCode)
+		}
+
+		id := insertIntent(nil, nil)
+		for _, update := range []string{
+			`actor_id = 43`,
+			`actor_type = 'system'`,
+			`actor_role = 'owner'`,
+		} {
+			_, err := pool.Exec(ctx, `
+				UPDATE audit_events
+				SET outcome = 'succeeded', completed_at = now(), `+update+`
+				WHERE id = $1`, id)
+			requireTriggerViolation(t, err, "audit completion may only change completion fields")
+		}
+
+		// Completing with the same actor is allowed and fills status/error once.
+		_, err := pool.Exec(ctx, `
+			UPDATE audit_events
+			SET outcome = 'succeeded', completed_at = now(), status_code = 200, error_code = 'ok'
+			WHERE id = $1`, id)
+		require.NoError(t, err)
+
+		codeID := insertIntent(int16(201), nil)
+		_, err = pool.Exec(ctx, `
+			UPDATE audit_events
+			SET outcome = 'succeeded', completed_at = now(), status_code = 500
+			WHERE id = $1`, codeID)
+		requireTriggerViolation(t, err, "audit completion cannot change status_code")
+
+		errorID := insertIntent(nil, "created")
+		_, err = pool.Exec(ctx, `
+			UPDATE audit_events
+			SET outcome = 'succeeded', completed_at = now(), error_code = 'changed'
+			WHERE id = $1`, errorID)
+		requireTriggerViolation(t, err, "audit completion cannot change error_code")
+	})
+
+	t.Run("a role owned by another tenant cannot receive platform permissions", func(t *testing.T) {
+		tenantE := testutil.CreateTenant(t, ctx, pool, "schema-hidden-role")
+		hiddenRole := schemaInsertID(t, pool,
+			`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'hidden', 'Hidden') RETURNING id`,
+			tenantE)
+
+		app := testutil.Scoped(pool)
+		// The caller's RLS scope is tenant B, so tenant E's role is invisible.
+		_, err := app.Exec(tenant.WithID(ctx, tenantB),
+			`INSERT INTO role_permissions (role_id, permission_key) VALUES ($1, 'platform:tenants:read')`, hiddenRole)
+		requireTriggerViolation(t, err, "role does not exist or is not visible to the caller")
+
+		// The same grant in the role's own tenant is still refused as a
+		// platform permission (the existing rule, not a hidden-row NULL).
+		_, err = app.Exec(tenant.WithID(ctx, tenantE),
+			`INSERT INTO role_permissions (role_id, permission_key) VALUES ($1, 'platform:tenants:read')`, hiddenRole)
+		requireTriggerViolation(t, err, "tenant roles cannot hold platform permissions")
+	})
+
+	t.Run("trigger functions pin search_path while the RLS predicate stays inlinable", func(t *testing.T) {
+		var schema string
+		require.NoError(t, pool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema))
+
+		pinned := []string{
+			"update_updated_at",
+			"validate_role_permission",
+			"validate_membership_role",
+			"validate_platform_role",
+			"protect_last_owner",
+			"audit_events_completion_guard",
+			"audit_events_append_only",
+		}
+		rows, err := pool.Query(ctx, `
+			SELECT p.proname, p.proconfig
+			FROM pg_proc p
+			JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = current_schema()
+			  AND p.proname = ANY($1)`, append(pinned, "app_tenant_visible"))
+		require.NoError(t, err)
+		defer rows.Close()
+
+		seen := 0
+		for rows.Next() {
+			var (
+				name      string
+				proconfig []string
+			)
+			require.NoError(t, rows.Scan(&name, &proconfig))
+			seen++
+			if name == "app_tenant_visible" {
+				assert.Empty(t, proconfig,
+					"app_tenant_visible must stay a plain inlinable SQL function without SET")
+				continue
+			}
+			require.Len(t, proconfig, 1, "%s must pin exactly one search_path", name)
+			assert.Contains(t, proconfig[0], "pg_catalog", "%s must search pg_catalog first", name)
+			assert.Contains(t, proconfig[0], schema, "%s must include the migration schema", name)
+		}
+		require.NoError(t, rows.Err())
+		assert.Equal(t, len(pinned)+1, seen, "every trigger function and the RLS predicate must be inspected")
 	})
 }
 
