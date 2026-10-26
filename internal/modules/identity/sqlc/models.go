@@ -50,6 +50,7 @@ type Membership struct {
 	UserID               int64              `json:"user_id"`
 	Status               string             `json:"status"`
 	BannedAt             pgtype.Timestamptz `json:"banned_at"`
+	BannedEmailHash      pgtype.Text        `json:"banned_email_hash"`
 	RemovedAt            pgtype.Timestamptz `json:"removed_at"`
 	CredentialsRevokedAt pgtype.Timestamptz `json:"credentials_revoked_at"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`

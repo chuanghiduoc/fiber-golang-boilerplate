@@ -5,7 +5,9 @@ package integration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,6 +26,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/bootstrap"
+	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
@@ -144,7 +147,9 @@ func (h *privacyHarness) requestWithAuth(t *testing.T, method, path, authorizati
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", authorization)
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	req.Header.Set(tenant.Header, tenantSlug)
 	req.Header.Set("Idempotency-Key", strconv.FormatInt(time.Now().UnixNano(), 10))
 	resp, err := h.app.Test(req, fiber.TestConfig{Timeout: 10 * time.Second})
@@ -441,31 +446,187 @@ func assertUserErased(t *testing.T, h *privacyHarness, tenantB, userID int64) {
 	}
 }
 
-func TestPrivacy_AdminErasureUpgradesAnAlreadyDeletedAccount(t *testing.T) {
+// An admin erasure is scoped to the request tenant: it removes that
+// membership and that tenant's data, but never the global account or the
+// user's other memberships.
+func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()
-	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-upgrade-admin@example.com", testutil.MemberOptions{Role: "admin"})
-	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-upgrade@example.com", testutil.MemberOptions{Password: "Password1!"})
-	_, err := h.pool.Exec(ctx, `UPDATE users SET status = 'deleted', deleted_at = NOW() WHERE id = $1`, user.UserID)
-	require.NoError(t, err)
+	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-admin-b")
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin@example.com", testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-admin-target@example.com", testutil.MemberOptions{Password: "Password1!"})
+	testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-admin-target@example.com", testutil.MemberOptions{})
+	h.seed(t, tenant.DefaultID, user.UserID)
+	h.seed(t, tenantB, user.UserID)
 	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
 
+	// A user who is only a member of another tenant is a 404, not a hint that
+	// they exist (RLS keeps the lookup scoped even though this route is
+	// tenant-aware rather than global).
+	outsider := testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-admin-outsider@example.com", testutil.MemberOptions{})
 	status, body := h.request(t, http.MethodPost,
+		"/api/v1/admin/users/"+strconv.FormatInt(outsider.UserID, 10)+"/erasure", token, "default", "")
+	require.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
+
+	status, body = h.request(t, http.MethodPost,
 		"/api/v1/admin/users/"+strconv.FormatInt(user.UserID, 10)+"/erasure", token, "default", "")
 	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
+
+	var eraseJobs, finalizers int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = 'privacy.erase' AND payload->>'userId' = $1`,
+		strconv.FormatInt(user.UserID, 10)).Scan(&eraseJobs))
+	assert.Equal(t, 1, eraseJobs, "exactly one erase job for the request tenant")
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM jobs WHERE kind = 'privacy.erase.finalize'`).Scan(&finalizers))
+	assert.Zero(t, finalizers, "admin erasure must not enqueue the global finalizer")
+
 	require.NoError(t, h.runKind(t, "privacy.erase"))
-	require.NoError(t, h.runKind(t, "privacy.erase.finalize"))
+
+	var statusA, statusB string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, user.UserID).Scan(&statusA))
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status FROM memberships WHERE tenant_id = $1 AND user_id = $2`, tenantB, user.UserID).Scan(&statusB))
+	assert.Equal(t, "removed", statusA)
+	assert.Equal(t, "active", statusB, "the other tenant's membership must stay intact")
 
 	var email, name, userStatus string
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`SELECT email, name, status FROM users WHERE id = $1`, user.UserID).Scan(&email, &name, &userStatus))
-	assert.Equal(t, fmt.Sprintf("erased+%d@invalid", user.UserID), email)
-	assert.Empty(t, name)
-	assert.Equal(t, "deleted", userStatus)
-	var passwords int
+	assert.Equal(t, user.Email, email, "the global user must not be anonymized")
+	assert.NotEmpty(t, name)
+	assert.Equal(t, "active", userStatus)
+
+	var tenantBFiles int
 	require.NoError(t, h.pool.QueryRow(ctx,
-		`SELECT count(*) FROM user_passwords WHERE user_id = $1`, user.UserID).Scan(&passwords))
-	assert.Zero(t, passwords)
+		`SELECT count(*) FROM files WHERE tenant_id = $1 AND user_id = $2`, tenantB, user.UserID).Scan(&tenantBFiles))
+	assert.Equal(t, 1, tenantBFiles, "the other tenant's per-user data stays")
+	var tenantAFiles int
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT count(*) FROM files WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, user.UserID).Scan(&tenantAFiles))
+	assert.Zero(t, tenantAFiles)
+}
+
+// A ban recorded before the hash column existed (or by a direct SQL repair)
+// still keeps the address blocked: removal derives the missing hash from the
+// user's current normalized email.
+func TestPrivacy_AdminRemovalBackfillsAMissingBanHash(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-backfill-admin@example.com", testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-backfill@example.com", testutil.MemberOptions{})
+	_, err := h.pool.Exec(ctx,
+		`UPDATE memberships SET status = 'suspended', banned_at = NOW(), credentials_revoked_at = NOW()
+		 WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, user.UserID)
+	require.NoError(t, err)
+	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
+
+	status, body := h.request(t, http.MethodDelete,
+		"/api/v1/users/"+strconv.FormatInt(user.UserID, 10), token, "default", "")
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
+
+	var membershipStatus string
+	var hash *string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&membershipStatus, &hash))
+	assert.Equal(t, "removed", membershipStatus)
+	require.NotNil(t, hash, "removal must derive the marker for a legacy ban")
+	sum := sha256.Sum256([]byte(identityservice.NormalizeEmail(user.Email)))
+	assert.Equal(t, hex.EncodeToString(sum[:]), *hash)
+}
+
+// A tenant ban survives the banned user's self-erasure, so the same address
+// cannot register into that tenant again even though the global account was
+// anonymized (GDPR Art.17(3)(e): the pseudonymous hash defends the ban).
+func TestPrivacy_BanSurvivesSelfErasure(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	tenantB := testutil.CreateTenant(t, ctx, h.pool, "privacy-ban-b")
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-ban-admin@example.com", testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-ban@example.com", testutil.MemberOptions{Password: "Password1!"})
+	memberB := testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-ban@example.com", testutil.MemberOptions{})
+	adminToken := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
+
+	status, body := h.request(t, http.MethodPost,
+		"/api/v1/admin/users/"+strconv.FormatInt(user.UserID, 10)+"/ban", adminToken, "default", "")
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
+
+	var bannedAt *time.Time
+	var hash string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT banned_at, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&bannedAt, &hash))
+	require.NotNil(t, bannedAt)
+	require.Len(t, hash, 64)
+	sum := sha256.Sum256([]byte(identityservice.NormalizeEmail(user.Email)))
+	assert.Equal(t, hex.EncodeToString(sum[:]), hash, "SQL and Go must use the same normalization")
+
+	// The user erases the global account from the tenant where they are not
+	// banned; the banned membership must keep its marker through the removal.
+	bToken := testutil.SessionToken(t, ctx, h.pool, memberB, privacyIntegrationSecret)
+	status, body = h.request(t, http.MethodPost, "/api/v1/me/erasure", bToken, "privacy-ban-b",
+		`{"currentPassword":"Password1!"}`)
+	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
+	require.NoError(t, h.runKind(t, "privacy.erase"))
+	require.NoError(t, h.runKind(t, "privacy.erase.finalize"))
+
+	var membershipStatus string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status, banned_at, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&membershipStatus, &bannedAt, &hash))
+	assert.Equal(t, "removed", membershipStatus)
+	assert.NotNil(t, bannedAt, "the ban timestamp survives erasure")
+	assert.Equal(t, hex.EncodeToString(sum[:]), hash, "the pseudonymous marker survives erasure")
+	assertUserErased(t, h, tenantB, user.UserID)
+
+	// The anonymized account's old address cannot register into the tenant
+	// that banned it, but it is free in the other tenant.
+	status, body = h.requestWithAuth(t, http.MethodPost, "/api/v1/auth/register", "", "default",
+		`{"email":"privacy-ban@example.com","password":"Password1!","name":"Again"}`)
+	assert.Equal(t, fiber.StatusConflict, status, "body: %s", body)
+	status, body = h.requestWithAuth(t, http.MethodPost, "/api/v1/auth/register", "", "privacy-ban-b",
+		`{"email":"privacy-ban@example.com","password":"Password1!","name":"Again"}`)
+	assert.Equal(t, fiber.StatusCreated, status, "body: %s", body)
+}
+
+func TestPrivacy_UnbanClearsThePseudonymousBanMarker(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-unban-admin@example.com", testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-unban@example.com", testutil.MemberOptions{})
+	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
+	path := "/api/v1/admin/users/" + strconv.FormatInt(user.UserID, 10)
+
+	status, body := h.request(t, http.MethodPost, path+"/ban", token, "default", "")
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
+	var bannedAt, hash *string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT banned_at::text, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&bannedAt, &hash))
+	require.NotNil(t, bannedAt)
+	require.NotNil(t, hash)
+
+	status, body = h.request(t, http.MethodPost, path+"/unban", token, "default", "")
+	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT banned_at::text, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&bannedAt, &hash))
+	assert.Nil(t, bannedAt)
+	assert.Nil(t, hash)
+}
+
+func TestPrivacy_BannedEmailHashMatchesGoNormalization(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	inputs := []string{"  Alice@Example.COM  ", "BOB+tag@Sub.Example.TEST", "carol@example.test"}
+	for _, in := range inputs {
+		var sqlHash string
+		require.NoError(t, h.pool.QueryRow(context.Background(),
+			`SELECT encode(sha256(convert_to(lower(btrim($1)), 'UTF8')), 'hex')`, in).Scan(&sqlHash))
+		sum := sha256.Sum256([]byte(identityservice.NormalizeEmail(in)))
+		assert.Equal(t, hex.EncodeToString(sum[:]), sqlHash, "input %q", in)
+	}
 }
 
 func TestPrivacy_AdminErasureRejectsAnAPIKey(t *testing.T) {

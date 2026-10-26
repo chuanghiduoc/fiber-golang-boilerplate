@@ -33,6 +33,7 @@ func toMembership(row identitysqlc.Membership, role string, roles []string) iden
 		Roles:                roles,
 		Status:               identityservice.MembershipStatus(row.Status),
 		BannedAt:             timePtr(row.BannedAt),
+		BannedEmailHash:      row.BannedEmailHash.String,
 		RemovedAt:            timePtr(row.RemovedAt),
 		CredentialsRevokedAt: timePtr(row.CredentialsRevokedAt),
 		CreatedAt:            row.CreatedAt.Time,

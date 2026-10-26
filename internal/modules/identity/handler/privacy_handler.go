@@ -187,8 +187,8 @@ func (h *PrivacyHandler) EraseMe(c fiber.Ctx) error {
 }
 
 // EraseUser godoc
-// @Summary Erase a member and their global account
-// @Description Queue erasure of every tenant membership's data and the global account for a member of the request tenant. The last active admin cannot be erased.
+// @Summary Erase a member from the request tenant
+// @Description Queue erasure of a member's data and membership in the request tenant only. The global account and the user's memberships in other tenants stay intact. The last active owner of the tenant cannot be erased.
 // @Tags Admin
 // @Produce json
 // @Security BearerAuth
