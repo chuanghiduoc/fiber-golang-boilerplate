@@ -252,6 +252,74 @@ func TestLoad_WebhookDefaults(t *testing.T) {
 	}
 }
 
+func TestValidate_APIKeyMaxLifetime(t *testing.T) {
+	for _, lifetime := range []time.Duration{0, -time.Hour} {
+		cfg := baseValidConfig()
+		cfg.APIKeys.MaxLifetime = lifetime
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should reject APIKEYS_MAX_LIFETIME %s", lifetime)
+		}
+	}
+}
+
+func TestLoad_APIKeyDefaults(t *testing.T) {
+	t.Setenv("APIKEYS_MAX_LIFETIME", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	if cfg.APIKeys.MaxLifetime != 8760*time.Hour {
+		t.Errorf("APIKEYS_MAX_LIFETIME = %s, want 8760h", cfg.APIKeys.MaxLifetime)
+	}
+}
+
+func TestValidate_WebhookAllowedPorts(t *testing.T) {
+	cfg := baseValidConfig()
+	cfg.Webhook.AllowedPortsCSV = "8443, 9443"
+	ports, err := cfg.Webhook.AllowedPorts()
+	if err != nil {
+		t.Fatalf("AllowedPorts: %v", err)
+	}
+	if !containsInt(ports, 80) || !containsInt(ports, 443) || !containsInt(ports, 8443) || !containsInt(ports, 9443) {
+		t.Fatalf("ports = %v, want defaults plus configured entries", ports)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected valid ports: %v", err)
+	}
+
+	for _, value := range []string{"0", "65536", "-1", "abc", "80,not-a-port"} {
+		cfg := baseValidConfig()
+		cfg.Webhook.AllowedPortsCSV = value
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should reject WEBHOOK_ALLOWED_PORTS=%q", value)
+		}
+	}
+}
+
+func TestLoad_WebhookAllowedPortDefaults(t *testing.T) {
+	t.Setenv("WEBHOOK_ALLOWED_PORTS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+	ports, err := cfg.Webhook.AllowedPorts()
+	if err != nil {
+		t.Fatalf("AllowedPorts: %v", err)
+	}
+	if len(ports) != 2 || !containsInt(ports, 80) || !containsInt(ports, 443) {
+		t.Fatalf("default ports = %v, want 80 and 443", ports)
+	}
+}
+
+func containsInt(values []int, target int) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestAppConfig_TrustedProxiesList(t *testing.T) {
 	a := AppConfig{TrustedProxies: "10.0.0.1, 192.168.0.0/16 ,"}
 	got := a.TrustedProxiesList()
@@ -275,6 +343,89 @@ func TestDBConfig_DSN(t *testing.T) {
 	expected := "postgres://user:pass@localhost:5432/testdb?search_path=public&sslmode=disable"
 	if dsn != expected {
 		t.Errorf("DSN() = %q, want %q", dsn, expected)
+	}
+}
+
+func TestDBConfig_DSNForUsesOnlyTheCredentials(t *testing.T) {
+	db := DBConfig{
+		Host:     "db.internal",
+		Port:     5433,
+		Database: "app",
+		Username: "app",
+		Password: "app-secret",
+		SSLMode:  "verify-full",
+		Schema:   "tenant",
+	}
+
+	dsn := db.DSNFor("app_bypass", "bypass-secret")
+	for _, want := range []string{
+		"app_bypass:bypass-secret@db.internal:5433/app",
+		"search_path=tenant",
+		"sslmode=verify-full",
+	} {
+		if !strings.Contains(dsn, want) {
+			t.Errorf("DSNFor() = %q, want it to contain %q", dsn, want)
+		}
+	}
+	if strings.Contains(dsn, "app-secret") {
+		t.Errorf("DSNFor() must not leak the normal role password: %q", dsn)
+	}
+}
+
+func TestDBConfig_BypassConfigured(t *testing.T) {
+	if (DBConfig{}).BypassConfigured() {
+		t.Error("an empty bypass username must not be configured")
+	}
+	if !(DBConfig{BypassUsername: " app_bypass "}).BypassConfigured() {
+		t.Error("a non-empty bypass username must be configured")
+	}
+}
+
+func TestDBConfig_ValidateProductionBypassRole(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(*Config)
+		wantErr  bool
+		wantText string
+	}{
+		{
+			name:   "valid",
+			mutate: func(*Config) {},
+		},
+		{
+			name:     "missing username",
+			mutate:   func(c *Config) { c.DB.BypassUsername = "" },
+			wantErr:  true,
+			wantText: "DB_BYPASS_USERNAME is required",
+		},
+		{
+			name:     "missing password",
+			mutate:   func(c *Config) { c.DB.BypassPassword = "" },
+			wantErr:  true,
+			wantText: "DB_BYPASS_PASSWORD is required",
+		},
+		{
+			name: "same as the normal role",
+			mutate: func(c *Config) {
+				c.DB.Username = "app"
+				c.DB.BypassUsername = "app"
+			},
+			wantErr:  true,
+			wantText: "must differ from DB_USERNAME",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := productionValidConfig()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() = %v, want error %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("Validate() = %v, want it to mention %q", err, tc.wantText)
+			}
+		})
 	}
 }
 
@@ -327,6 +478,7 @@ func baseValidConfig() Config {
 			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
 			RetentionDays: 30, TimestampToleranceSeconds: 300,
 		},
+		APIKeys: APIKeysConfig{MaxLifetime: 8760 * time.Hour},
 	}
 }
 
@@ -762,6 +914,8 @@ func productionValidConfig() Config {
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "verify-full"
+	cfg.DB.BypassUsername = "app_bypass"
+	cfg.DB.BypassPassword = "bypass-secret"
 	cfg.Tenant.RequireHeader = true
 	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	return cfg

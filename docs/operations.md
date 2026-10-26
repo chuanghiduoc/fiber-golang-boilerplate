@@ -884,8 +884,10 @@ Outbound endpoint and inbound source secrets (Standard Webhooks
 with AES-256-GCM using
 `WEBHOOK_SECRET_ENCRYPTION_KEY`; outside production an empty key falls back to
 `JWT_SECRET`, while production **requires** a dedicated key of at least 32
-characters. Envelopes (v2) record the sealing key's `kid`; v1 envelopes are
-tried against every configured key.
+characters. Envelopes (v3) record the sealing key's `kid` and bind the
+secret's purpose, tenant, and owning endpoint/source as AAD; v2 envelopes
+(key id only) and v1 envelopes (no key id) remain readable. New seals always
+use v3.
 
 Rotating the encryption key follows the two-phase procedure in
 [Key rotation](#key-rotation) with `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`:
@@ -901,8 +903,9 @@ Rotating the encryption key follows the two-phase procedure in
 4. Remove the old key only when no endpoint, source, or pending delivery
    snapshot is still sealed with it; a row whose key is gone fails decryption.
 
-Workers from before envelope v2 cannot open secrets sealed by an updated
+Workers from before envelope v3 cannot open secrets sealed by an updated
 replica, so finish the rollout before creating or rotating webhook secrets.
+Rows sealed earlier stay readable because Open still accepts v1/v2.
 
 Endpoint secret rotation is safe for in-flight work because queued deliveries
 keep their snapshot. Inbound rotation is immediate: the old secret stops
@@ -915,6 +918,11 @@ IPs, CIDRs, or exact hostnames. The default (empty) blocks private, loopback,
 link-local, multicast, CGNAT, and reserved targets, pins DNS results to vetted
 IPs, disables environment proxies, and never follows redirects. Add the exact
 host/IP/CIDR, never a broad range, and keep the list audited.
+
+`WEBHOOK_ALLOWED_PORTS` extends the outbound destination ports (default 443 and
+80; comma-separated, 1-65535). Endpoint create/update rejects a disallowed port
+with `400 webhook.port_not_allowed`, and the dialer re-checks the port so a
+direct caller cannot bypass the URL check.
 
 ### Retention
 
@@ -931,10 +939,7 @@ only leaves through this purge. The retention indexes are described in
 
 | Response | Cause / check |
 | --- | --- |
-| `404` | Source ID unknown, disabled, or soft-deleted, or its tenant is suspended; verify the configured `receiverUrl`. |
-| `401` `webhook signature is required` | Missing timestamp or signature header. |
-| `401` stale/invalid timestamp | Clock skew beyond `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` (default 300). |
-| `401` invalid signature | Confirm the sender uses Standard Webhooks: `v1,<base64 HMAC-SHA256>` over `<webhook-id>.<webhook-timestamp>.<exact raw body>`, keyed with the base64-decoded active source secret (after `whsec_`), not a rotated one. Senders on the pre-Standard `X-Webhook-*` scheme fail here, and so does every request to a source whose secret predates the `whsec_<base64>` format (logged as `predates Standard Webhooks; rotate it`): rotate it. |
+| `401` `webhook signature is invalid` | Unknown, disabled, or soft-deleted source, or a suspended tenant (deliberately indistinguishable from a bad signature so sequential ids cannot be enumerated); missing/stale/invalid timestamp or signature; or a source secret that predates the `whsec_<base64>` format (logged as `predates Standard Webhooks; rotate it`). Confirm the sender uses Standard Webhooks: `v1,<base64 HMAC-SHA256>` over `<webhook-id>.<webhook-timestamp>.<exact raw body>`, keyed with the base64-decoded active source secret (after `whsec_`), not a rotated one. |
 | `200` `duplicate: true` | The event was already stored for `(source, webhook-id)`; this is success. |
 
 Inbound events are stored under the source tenant and audited as
@@ -1106,44 +1111,63 @@ flowchart TD
 ### Database roles and row-level security
 
 Every tenant-owned table has forced row-level security. The API,
-worker, and `cmd/seed` must connect as a dedicated non-superuser role that
-`BYPASSRLS` does not exempt and that owns no table in the configured schema;
-a superuser or a `BYPASSRLS` role ignores every policy, and a table owner can
-run `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`. A member of a
-superuser/`BYPASSRLS` role is unsafe too, because it can `SET ROLE`. `cmd/api`
-logs an error when it detects any of these and refuses to start when
-`APP_ENV=production`. `cmd/migrate` needs the schema owner instead
-(`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
+worker, and `cmd/seed` connect as two dedicated non-superuser roles:
+
+- the normal role (`DB_USERNAME`/`DB_PASSWORD`) has no `BYPASSRLS`, owns no
+  table in the configured schema, and is not a member of a
+  superuser/`BYPASSRLS` role, so it cannot `SET ROLE` into one;
+- the bypass role (`DB_BYPASS_USERNAME`/`DB_BYPASS_PASSWORD`, e.g.
+  `app_bypass`) has `BYPASSRLS`, is not a superuser, owns nothing, and the
+  normal role is not a member of it. It serves only deliberate cross-tenant
+  work.
+
+`cmd/api` logs an error when either role is misconfigured and refuses to start
+when `APP_ENV=production`. Production also requires both bypass settings and a
+username different from `DB_USERNAME`. `cmd/migrate` needs the schema owner
+instead (`DB_MIGRATE_USERNAME`/`DB_MIGRATE_PASSWORD`, falling back to
 `DB_USERNAME`/`DB_PASSWORD`).
 
-Create the runtime role once, before the first migration:
+Create both runtime roles once, before the first migration:
 
 ```bash
-psql -v app_user=app -v app_password='...' -v owner=postgres -v schema=public \
+psql -v app_user=app -v app_password='...' \
+  -v bypass_user=app_bypass -v bypass_password='...' \
+  -v owner=postgres -v schema=public \
   -f deploy/postgres/database-roles.sql
 ```
 
-The script grants schema access, table/sequence/function privileges, and
-`ALTER DEFAULT PRIVILEGES` for tables later migrations create. It deliberately
-does not grant `TRUNCATE`: truncation ignores RLS, so only the schema owner may
-do it. Docker Compose runs it automatically on a fresh volume
+The script grants both roles the same schema access, table/sequence/function
+privileges, and `ALTER DEFAULT PRIVILEGES` for tables later migrations create,
+and revokes any membership of the bypass role from the app role. It
+deliberately does not grant `TRUNCATE`: truncation ignores RLS, so only the
+schema owner may do it. Docker Compose runs it automatically on a fresh volume
 (`deploy/postgres/init-app-role.sh`).
 
 Scoping is per transaction and never session-level:
-`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true),
-set_config('app.rls_bypass', $2, true)` right after `BEGIN`; a statement
-outside a transaction (`database.Scoped`) runs
+`database.TxManager.WithTx` runs `set_config('app.tenant_id', $1, true)` right
+after `BEGIN`; a statement outside a transaction (`database.Scoped`) runs
 `BEGIN; set_config(...); <statement>; COMMIT` as one pgx Batch. This keeps
 transaction-mode PgBouncer working. A connection with no setting sees no
 tenant-owned rows.
 
-`database.WithRLSBypass(ctx)` marks deliberate cross-tenant work (global job
-claim/lease/purge, retention purges, the feature-flag snapshot, the public
-webhook receiver's source lookup, invitation token acceptance, and identity
-operations on a global user across tenants). Never mark an HTTP path that
-serves one tenant. `cmd/migrate` verifies `relrowsecurity`,
-`relforcerowsecurity`, and the `tenant_isolation` policy on every table with a
-`tenant_id` column.
+`app_tenant_visible(tenant_id)` reads only that transaction-local setting, so
+no SQL the normal role can run can switch isolation off. Setting the old
+application-writable bypass GUC still succeeds (PostgreSQL accepts arbitrary
+GUCs) but changes nothing. `database.WithRLSBypass(ctx)`
+marks deliberate cross-tenant work (global job claim/lease/purge, retention
+purges, the feature-flag snapshot, the public webhook receiver's source
+lookup, invitation token acceptance, and identity operations on a global user
+across tenants); `TxManager` and `Scoped` choose the bypass pool at `BEGIN` /
+per statement from that marker. A transaction cannot switch pools mid-way: a
+bypass context created inside a transaction that began on the normal pool
+does not change its connection, so those statements stay tenant-scoped and see
+no foreign rows. Mark the context before `WithTx`. Never mark an HTTP path that
+serves one tenant. Outside production an unset
+bypass pair falls back to the normal pool with a startup warning; production
+validation rejects that configuration. `cmd/migrate` verifies
+`relrowsecurity`, `relforcerowsecurity`, the `tenant_isolation` policy, and
+that `app_tenant_visible` reads no application-writable bypass setting, on
+every table with a `tenant_id` column.
 
 ### Connection poolers (PgBouncer)
 
@@ -1153,6 +1177,7 @@ The API can run behind a transaction-mode pooler; `cmd/migrate` cannot.
 | --- | --- |
 | `DB_QUERY_EXEC_MODE` | `cache_statement` (default, pgx named prepared statements per connection) needs PgBouncer 1.21+ with `max_prepared_statements > 0` in transaction mode. `cache_describe` and `describe_exec` use unnamed statements and keep server-side parameter types. `exec` and `simple_protocol` are rejected at startup: without described parameter types, `[]byte` values bound to `json`/`jsonb` columns (audit metadata) are sent as `bytea` and the insert fails. |
 | `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` / `DB_MIGRATE_USERNAME` / `DB_MIGRATE_PASSWORD` | Used by `cmd/migrate` only, replacing `DB_HOST`/`DB_PORT`/`DB_USERNAME`/`DB_PASSWORD`; database, schema, and TLS settings are shared. Use the schema owner here and the non-superuser role for the API. golang-migrate holds a session-level advisory lock (`pg_advisory_lock`) for the whole run, which a transaction-mode pooler does not preserve, so point these at PostgreSQL directly or at a session-mode pool. |
+| `DB_MAX_CONNS` / `DB_MIN_CONNS` | Per pool. The API, worker, and seed open both the normal and bypass pools, so budget twice these values per process. |
 | `search_path` | Sent as a startup parameter from `DB_SCHEMA`, never as a `SET` after connect (behind a transaction pooler that `SET` would land on one server connection only). Configure PgBouncer to forward it (`track_extra_parameters = search_path`, on versions that support it) or to ignore it (`ignore_startup_parameters = search_path`) and set it on the role with `ALTER ROLE ... SET search_path`. |
 
 ### Fresh installs vs deployed databases
@@ -1679,7 +1704,9 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (required in production; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
 | `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
 | `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |
-| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
+| `WEBHOOK_ALLOWED_PORTS` | Extra outbound destination ports (default `443,80`; always includes both) |
+| `APIKEYS_MAX_LIFETIME` | Maximum API-key lifetime as a Go duration (default `8760h`); omitted `expiresAt` uses it and later values are rejected |
+| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_BYPASS_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
 
 ## 12. Security guarantees
 
@@ -1692,7 +1719,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
 | Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
 | Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
-| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |
+| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`) and bind the secret's purpose, tenant, and owning endpoint/source as AAD (v3), so a ciphertext copied to another row fails to open; legacy v2/v1 envelopes remain readable. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
 | Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
 | Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |

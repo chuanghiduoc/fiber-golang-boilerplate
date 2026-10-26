@@ -45,9 +45,13 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_DATABASE: ${DB_DATABASE:-boilerplate}
-      # Runtime role: non-superuser, subject to FORCE row-level security.
+      # Runtime roles: the app role is subject to FORCE row-level security;
+      # the bypass role spans tenants for jobs/retention/catalog sync. The app
+      # role is not a member of the bypass role.
       DB_USERNAME: ${DB_USERNAME:-app}
       DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
+      DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
       DB_SCHEMA: ${DB_SCHEMA:-public}
       DB_SSLMODE: ${DB_SSLMODE:-disable}
       JWT_SECRET: ${JWT_SECRET:-your-super-secret-key-change-in-production}
@@ -128,9 +132,11 @@ services:
       # The container superuser owns the schema and runs migrations.
       POSTGRES_USER: ${DB_MIGRATE_USERNAME:-postgres}
       POSTGRES_PASSWORD: ${DB_MIGRATE_PASSWORD:-password}
-      # The init hook below creates this non-superuser role for the app.
+      # The init hook below creates both non-superuser runtime roles.
       APP_DB_USERNAME: ${DB_USERNAME:-app}
       APP_DB_PASSWORD: ${DB_PASSWORD:-app-password}
+      APP_DB_BYPASS_USERNAME: ${DB_BYPASS_USERNAME:-app_bypass}
+      APP_DB_BYPASS_PASSWORD: ${DB_BYPASS_PASSWORD:-app-bypass-password}
       DB_SCHEMA: ${DB_SCHEMA:-public}
     ports:
       - "127.0.0.1:${DB_PORT:-5432}:5432"

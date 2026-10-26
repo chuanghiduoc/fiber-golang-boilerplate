@@ -30,11 +30,10 @@ import (
 // (useful on hosts without Docker). The supplied database must allow CREATE
 // SCHEMA and CREATE ROLE.
 //
-// The returned pool connects as the non-superuser app role, so RLS is
-// enforced. Its sessions default app.rls_bypass to on for fixtures and
-// assertions that use the raw pool: application code always overrides both
-// settings per statement (database.Scoped) or transaction (TxManager), and
-// TestRLS proves the enforcement.
+// The returned pool connects as the dedicated BYPASSRLS fixture role, so
+// fixtures and assertions that use the raw pool see every tenant. Application
+// code goes through pgtest.Scoped/NewTxManager, which resolve the normal app
+// role pool and keep RLS enforced; TestRLS proves it.
 func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 	pool, _, cleanup, err := SetupTestDBWithOwner(ctx)
 	return pool, cleanup, err
@@ -43,7 +42,7 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 // SetupTestDBWithOwner is SetupTestDB plus a second pool connected as the
 // schema owner. Tests that must exercise owner-only DDL (a new table, a
 // policy, TRUNCATE past a trigger) use the owner pool; application assertions
-// keep using the app pool so RLS stays enforced.
+// keep using Scoped/AppPool so RLS stays enforced.
 func SetupTestDBWithOwner(ctx context.Context) (*pgxpool.Pool, *pgxpool.Pool, func(), error) {
 	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
 		return setupExternalDB(ctx, dsn)
@@ -81,7 +80,7 @@ func SetupTestDBWithOwner(ctx context.Context) (*pgxpool.Pool, *pgxpool.Pool, fu
 		return nil, nil, nil, err
 	}
 
-	pool, err := OpenAppPool(ctx, connStr, "public")
+	pools, err := OpenAppPools(ctx, connStr, "public")
 	if err != nil {
 		owner.Close()
 		_ = pgContainer.Terminate(ctx)
@@ -89,12 +88,12 @@ func SetupTestDBWithOwner(ctx context.Context) (*pgxpool.Pool, *pgxpool.Pool, fu
 	}
 
 	cleanup := func() {
-		pool.Close()
+		ClosePools(pools)
 		owner.Close()
 		_ = pgContainer.Terminate(context.Background())
 	}
 
-	return pool, owner, cleanup, nil
+	return pools.Bypass, owner, cleanup, nil
 }
 
 // openOwnerPool connects as the schema owner with search_path set to schema.
@@ -156,7 +155,7 @@ func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, *pgxpool.P
 		return nil, nil, nil, err
 	}
 
-	pool, err := OpenAppPool(ctx, schemaDSN, schema)
+	pools, err := OpenAppPools(ctx, schemaDSN, schema)
 	if err != nil {
 		owner.Close()
 		dropSchema()
@@ -164,11 +163,11 @@ func setupExternalDB(ctx context.Context, dsn string) (*pgxpool.Pool, *pgxpool.P
 	}
 
 	cleanup := func() {
-		pool.Close()
+		ClosePools(pools)
 		owner.Close()
 		dropSchema()
 	}
-	return pool, owner, cleanup, nil
+	return pools.Bypass, owner, cleanup, nil
 }
 
 // migrationsPath resolves the migrations directory relative to this file.

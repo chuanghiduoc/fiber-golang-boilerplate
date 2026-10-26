@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,11 @@ const (
 	maxWebhookTimestampTolerance  = 3600
 	minWebhookEncryptionKeyLength = 32
 )
+
+// defaultWebhookPorts are always allowed for outbound delivery targets. The
+// operator list extends them (a receiver on :8443 can be added); it cannot
+// remove 443/80.
+var defaultWebhookPorts = []int{443, 80}
 
 // WebhookConfig controls outbound delivery, inbound verification, and secret
 // encryption at rest. The signing key is sealed with a key derived from
@@ -40,6 +46,9 @@ type WebhookConfig struct {
 	// Entries are comma-separated IPs, CIDRs, or exact hostnames. Empty keeps
 	// the default deny for every non-public address.
 	SSRFAllowlist string `env:"WEBHOOK_SSRF_ALLOWLIST"`
+	// AllowedPortsCSV extends the always-allowed outbound destinations 443 and
+	// 80 with a comma-separated list of ports (1-65535).
+	AllowedPortsCSV string `env:"WEBHOOK_ALLOWED_PORTS" envDefault:"443,80"`
 }
 
 // ResolvedSecretKey returns the dedicated webhook encryption key, or the JWT
@@ -60,6 +69,26 @@ func (w WebhookConfig) PreviousSecretKeyList() []string {
 // SSRFAllowlistEntries returns the parsed allowlist entries.
 func (w WebhookConfig) SSRFAllowlistEntries() []string {
 	return splitCSV(w.SSRFAllowlist)
+}
+
+// AllowedPorts returns the outbound destination ports: 443 and 80 plus every
+// configured WEBHOOK_ALLOWED_PORTS entry. The zero value therefore keeps the
+// safe default for config literals built in tests.
+func (w WebhookConfig) AllowedPorts() ([]int, error) {
+	ports := append([]int(nil), defaultWebhookPorts...)
+	seen := map[int]struct{}{443: {}, 80: {}}
+	for _, raw := range splitCSV(w.AllowedPortsCSV) {
+		port, err := strconv.Atoi(raw)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid WEBHOOK_ALLOWED_PORTS entry %q: must be an integer between 1 and 65535", raw)
+		}
+		if _, ok := seen[port]; ok {
+			continue
+		}
+		seen[port] = struct{}{}
+		ports = append(ports, port)
+	}
+	return ports, nil
 }
 
 // RequestTimeout returns the per-delivery HTTP timeout.
@@ -105,6 +134,13 @@ func (w WebhookConfig) validate(appEnv, jwtSecret string) error {
 	}
 	if _, err := webhook.NewGuard(w.SSRFAllowlistEntries()); err != nil {
 		return fmt.Errorf("invalid WEBHOOK_SSRF_ALLOWLIST: %w", err)
+	}
+	ports, err := w.AllowedPorts()
+	if err != nil {
+		return err
+	}
+	if _, err := webhook.NewGuardWithPorts(w.SSRFAllowlistEntries(), ports); err != nil {
+		return fmt.Errorf("invalid WEBHOOK_ALLOWED_PORTS: %w", err)
 	}
 	return nil
 }

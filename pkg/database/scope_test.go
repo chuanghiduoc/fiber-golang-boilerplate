@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestScopeArgs(t *testing.T) {
@@ -10,18 +12,16 @@ func TestScopeArgs(t *testing.T) {
 		name       string
 		scope      Scope
 		wantTenant string
-		wantBypass string
 	}{
-		{name: "tenant", scope: Scope{TenantID: 42}, wantTenant: "42", wantBypass: "off"},
-		{name: "bypass", scope: Scope{TenantID: 42, Bypass: true}, wantTenant: "42", wantBypass: "on"},
-		{name: "no tenant fails closed", scope: Scope{}, wantTenant: "", wantBypass: "off"},
-		{name: "negative tenant fails closed", scope: Scope{TenantID: -1}, wantTenant: "", wantBypass: "off"},
+		{name: "tenant", scope: Scope{TenantID: 42}, wantTenant: "42"},
+		{name: "bypass still carries its tenant", scope: Scope{TenantID: 42, Bypass: true}, wantTenant: "42"},
+		{name: "no tenant fails closed", scope: Scope{}, wantTenant: ""},
+		{name: "negative tenant fails closed", scope: Scope{TenantID: -1}, wantTenant: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tenant, bypass := scopeArgs(tc.scope)
-			if tenant != tc.wantTenant || bypass != tc.wantBypass {
-				t.Fatalf("scopeArgs(%+v) = %q/%q, want %q/%q", tc.scope, tenant, bypass, tc.wantTenant, tc.wantBypass)
+			if got := scopeArgs(tc.scope); got != tc.wantTenant {
+				t.Fatalf("scopeArgs(%+v) = %q, want %q", tc.scope, got, tc.wantTenant)
 			}
 		})
 	}
@@ -40,6 +40,24 @@ func TestResolverReadsTenantAndBypass(t *testing.T) {
 	}
 	if got := resolve(WithRLSBypass(ctx)); got.TenantID != 7 || !got.Bypass {
 		t.Fatalf("Resolver(bypass) = %+v, want tenant 7 with bypass", got)
+	}
+}
+
+func TestPoolsForBypass(t *testing.T) {
+	primary := &pgxpool.Pool{}
+	bypass := &pgxpool.Pool{}
+	pools := Pools{Primary: primary, Bypass: bypass}
+
+	if pool, gotBypass := pools.forBypass(false); pool != primary || gotBypass {
+		t.Fatalf("forBypass(false) = %v/%v, want the primary pool", pool, gotBypass)
+	}
+	if pool, gotBypass := pools.forBypass(true); pool != bypass || !gotBypass {
+		t.Fatalf("forBypass(true) = %v/%v, want the bypass pool", pool, gotBypass)
+	}
+
+	fallback := Pools{Primary: primary}
+	if pool, gotBypass := fallback.forBypass(true); pool != primary || gotBypass {
+		t.Fatalf("forBypass(true) without a bypass pool = %v/%v, want the primary pool", pool, gotBypass)
 	}
 }
 

@@ -214,6 +214,7 @@ role that may run DDL or `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`.
 | `<NAME>_FILE` | any secret setting may instead point at a mounted file (for example `JWT_SECRET_FILE=/run/secrets/jwt`); setting both forms fails startup |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` (+ optional `ADMIN_NAME`) | commented out, so no admin is bootstrapped. Uncomment both to create one on API startup; password ≥ 12 characters. Setting only one fails production config validation |
 | `DB_PASSWORD` | Password of the runtime `app` role (`DB_USERNAME`). It must not be a superuser, own tables in the schema, or be a member of a `BYPASSRLS` role; production startup refuses one |
+| `DB_BYPASS_PASSWORD` | Password of `DB_BYPASS_USERNAME=app_bypass`. That role has `BYPASSRLS` for cross-tenant job/retention/catalog work but must not be a superuser, own tables, or be reachable with `SET ROLE` from the app role; production startup refuses it otherwise |
 
 `fiber-boilerplate-migrate-secrets` holds only the schema-owner settings the
 migration Job reads:
@@ -224,10 +225,12 @@ migration Job reads:
 | `DB_MIGRATE_PASSWORD` | Password of that owner; never mounted by API or worker pods |
 | `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | commented out; point the Job directly at PostgreSQL when the API uses a transaction-mode pooler |
 
-Create the runtime role once as the owner before the first migration; the same script is in the repository:
+Create both runtime roles once as the owner before the first migration; the same script is in the repository:
 
 ```bash
-psql -v app_user=app -v app_password='<DB_PASSWORD>' -v owner=postgres -v schema=public \
+psql -v app_user=app -v app_password='<DB_PASSWORD>' \
+  -v bypass_user=app_bypass -v bypass_password='<DB_BYPASS_PASSWORD>' \
+  -v owner=postgres -v schema=public \
   -f deploy/postgres/database-roles.sql
 ```
 
@@ -436,11 +439,11 @@ backups/point-in-time recovery, and private networking.
 
 | Setting | Where / rule |
 | --- | --- |
-| `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_SCHEMA`, `DB_SSLMODE`, `DB_SSLROOTCERT` | ConfigMap |
-| `DB_PASSWORD` | Secret |
+| `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_BYPASS_USERNAME`, `DB_SCHEMA`, `DB_SSLMODE`, `DB_SSLROOTCERT` | ConfigMap |
+| `DB_PASSWORD`, `DB_BYPASS_PASSWORD` | Secret |
 | `DB_MIGRATE_USERNAME`, `DB_MIGRATE_PASSWORD`, `DB_MIGRATE_HOST`, `DB_MIGRATE_PORT` | migration-only Secret (mounted only by the Job) |
 | `DB_SSLMODE=verify-full` | mandatory in production. `require`/`verify-ca` encrypt but do not verify the server, so they are rejected; set `DB_SSLROOTCERT` to a mounted provider CA when the system trust store does not contain it |
-| `DB_MAX_CONNS` | per pod. Production 10 × HPA max 10, so keep the database connection limit above 100; staging 5 × max 4 |
+| `DB_MAX_CONNS` | per pool, and each pod opens two pools (normal + bypass). Production 10 × 2 × HPA max 10 = 200, so keep the database connection limit above that; staging 5 × 2 × max 4 = 40 |
 | `CACHE_DRIVER=redis`, `REDIS_URL` | required for multi-replica session invalidation; use `rediss://` when the provider supports TLS |
 | NetworkPolicy CIDRs | update DB/Redis CIDRs and ports in `base/networkpolicy.yaml` if not private `10.0.0.0/8`; a blocked migration Job fails to connect |
 | PgBouncer (transaction mode) | the API works with `DB_QUERY_EXEC_MODE=cache_statement` on PgBouncer 1.21+ (`max_prepared_statements > 0`) or `cache_describe`/`describe_exec`. Point the migration Job at PostgreSQL directly with `DB_MIGRATE_HOST`/`DB_MIGRATE_PORT` (golang-migrate holds a session advisory lock), and handle `search_path` in PgBouncer: [docs/operations.md](../../docs/operations.md#connection-poolers-pgbouncer) |

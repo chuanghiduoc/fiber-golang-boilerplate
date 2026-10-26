@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -18,33 +19,59 @@ var (
 	// loopback, link-local, or otherwise non-public address that is not on the
 	// operator allowlist. It is permanent and prevents SSRF.
 	ErrBlockedTarget = errors.New("webhook: target address is blocked")
+	// ErrPortNotAllowed is returned when a delivery URL (or the dialed
+	// address) uses a port outside the outbound policy. It is permanent.
+	ErrPortNotAllowed = errors.New("webhook: target port is not allowed")
 )
 
-// Guard validates outbound targets and resolves them to vetted IP addresses.
-// It blocks private, loopback, link-local, multicast, unspecified, and
-// reserved ranges unless the exact hostname, IP, or CIDR is allowlisted.
+// defaultAllowedPorts is the baseline destination policy: HTTPS and HTTP only.
+// Operators may extend it with WEBHOOK_ALLOWED_PORTS.
+var defaultAllowedPorts = []int{443, 80}
+
+// Guard validates outbound targets, their port, and resolves them to vetted IP
+// addresses. It blocks private, loopback, link-local, multicast, unspecified,
+// and reserved ranges unless the exact hostname, IP, or CIDR is allowlisted.
 //
 // Dialing the resolved IP rather than the hostname prevents DNS rebinding
 // between validation and connection establishment.
 type Guard struct {
 	allowedIPs   []*net.IPNet
 	allowedHosts map[string]struct{}
+	allowedPorts map[int]struct{}
 	dialTimeout  time.Duration
 	resolver     *net.Resolver
 }
 
-// NewGuard builds a Guard from operator-supplied allowlist entries. Each entry
-// may be an IP, a CIDR, or a hostname (case-insensitive, trailing dot ignored).
-// Public targets are always allowed; entries only relax the private/blocked
-// check for matching destinations.
+// NewGuard builds a Guard from operator-supplied allowlist entries with the
+// default outbound ports (443 and 80). Each entry may be an IP, a CIDR, or a
+// hostname (case-insensitive, trailing dot ignored). Public targets are always
+// allowed; entries only relax the private/blocked check for matching
+// destinations.
 //
 // The dial timeout defaults to 5s; a Client replaces it with its configured
 // ConnectTimeout.
 func NewGuard(allowlist []string) (*Guard, error) {
+	return NewGuardWithPorts(allowlist, nil)
+}
+
+// NewGuardWithPorts builds a Guard like NewGuard and extends the allowed
+// destination ports with ports. Entries must be 1-65535; 443 and 80 always
+// remain allowed.
+func NewGuardWithPorts(allowlist []string, ports []int) (*Guard, error) {
 	g := &Guard{
 		allowedHosts: make(map[string]struct{}, len(allowlist)),
+		allowedPorts: make(map[int]struct{}, len(ports)+len(defaultAllowedPorts)),
 		dialTimeout:  defaultConnectTimeout,
 		resolver:     net.DefaultResolver,
+	}
+	for _, port := range defaultAllowedPorts {
+		g.allowedPorts[port] = struct{}{}
+	}
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			return nil, fmt.Errorf("%w: port %d must be between 1 and 65535", ErrPortNotAllowed, port)
+		}
+		g.allowedPorts[port] = struct{}{}
 	}
 	for _, raw := range allowlist {
 		if err := g.allow(strings.TrimSpace(raw)); err != nil {
@@ -114,7 +141,44 @@ func (g *Guard) ValidateURL(rawURL string) (*url.URL, error) {
 	if u.User != nil {
 		return nil, fmt.Errorf("%w: userinfo is not allowed", ErrInvalidTarget)
 	}
+	port, err := urlPort(u)
+	if err != nil {
+		return nil, err
+	}
+	if !g.portAllowed(port) {
+		return nil, fmt.Errorf("%w: port %d is not allowed", ErrPortNotAllowed, port)
+	}
 	return u, nil
+}
+
+// urlPort returns the explicit port of u, or the scheme default when the URL
+// omits one. A bare trailing colon is treated as malformed.
+func urlPort(u *url.URL) (int, error) {
+	raw := u.Port()
+	if raw == "" {
+		if strings.HasSuffix(u.Host, ":") {
+			return 0, fmt.Errorf("%w: port is empty", ErrInvalidTarget)
+		}
+		switch u.Scheme {
+		case "http":
+			return 80, nil
+		case "https":
+			return 443, nil
+		default:
+			return 0, fmt.Errorf("%w: scheme must be http or https", ErrInvalidTarget)
+		}
+	}
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("%w: invalid port %q", ErrInvalidTarget, raw)
+	}
+	return port, nil
+}
+
+// portAllowed reports whether port is in the outbound destination policy.
+func (g *Guard) portAllowed(port int) bool {
+	_, ok := g.allowedPorts[port]
+	return ok
 }
 
 // CheckIP reports whether ip may be dialed. Allowlisted IPs/CIDRs bypass the
@@ -180,6 +244,16 @@ func (g *Guard) DialContext(ctx context.Context, network, address string) (net.C
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidTarget, err)
+	}
+	// Defense in depth: Client.Do validates the URL, but the dialer enforces
+	// the port policy again so no caller can bypass it by constructing an
+	// address directly.
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return nil, fmt.Errorf("%w: invalid port %q", ErrInvalidTarget, port)
+	}
+	if !g.portAllowed(portNumber) {
+		return nil, fmt.Errorf("%w: port %d is not allowed", ErrPortNotAllowed, portNumber)
 	}
 	ips, err := g.CheckHost(ctx, host)
 	if err != nil {
@@ -324,4 +398,10 @@ func IsBlocked(err error) bool {
 // IsInvalidTarget reports whether err is a permanently invalid target URL.
 func IsInvalidTarget(err error) bool {
 	return errors.Is(err, ErrInvalidTarget)
+}
+
+// IsPortNotAllowed reports whether err is a permanently disallowed target
+// port.
+func IsPortNotAllowed(err error) bool {
+	return errors.Is(err, ErrPortNotAllowed)
 }

@@ -70,9 +70,12 @@ data:
   DB_HOST: "db.example.com"
   DB_PORT: "5432"
   DB_DATABASE: "boilerplate"
-  # Runtime role: non-superuser, subject to FORCE row-level security. Create it
-  # with deploy/postgres/database-roles.sql before the first migration.
+  # Runtime roles: the app role is subject to FORCE row-level security; the
+  # bypass role spans tenants for jobs/retention/catalog sync. Create both with
+  # deploy/postgres/database-roles.sql before the first migration. The app role
+  # is not a member of the bypass role.
   DB_USERNAME: "app"
+  DB_BYPASS_USERNAME: "app_bypass"
   DB_SCHEMA: "public"
   # verify-full both encrypts and verifies the server certificate against
   # DB_SSLROOTCERT; production rejects require/verify-ca because they accept
@@ -82,8 +85,9 @@ data:
   # provider-specific CA here for RDS/Cloud SQL and point this at the file.
   DB_SSLROOTCERT: "/etc/ssl/certs/ca-certificates.crt"
   DB_CONNECT_TIMEOUT: "10"
-  # Per-pod pool. Keep DB_MAX_CONNS * HPA maxReplicas (10) below the managed
-  # database's connection limit. The defaults here allow at most 100 connections.
+  # Per-pool limit. Each pod opens a normal and a bypass pool, so keep
+  # DB_MAX_CONNS * 2 * HPA maxReplicas (10) below the managed database's
+  # connection limit. The defaults here allow at most 200 connections.
   DB_MAX_CONNS: "10"
   DB_MIN_CONNS: "2"
   DB_MAX_CONN_LIFETIME: "3600"

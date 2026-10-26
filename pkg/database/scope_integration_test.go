@@ -37,12 +37,13 @@ func TestScopedReleasesConnectionsOnEveryPath(t *testing.T) {
 	_, err = pool.Exec(ctx, `INSERT INTO tenant_settings (tenant_id) SELECT id FROM tenants WHERE slug = 'scoped-b'`)
 	require.NoError(t, err)
 
-	scoped := database.NewScoped(pool, database.WithResolver(func(context.Context) database.Scope {
+	appPool := pgtest.AppPool(pool)
+	scoped := database.NewScoped(appPool, database.WithResolver(func(context.Context) database.Scope {
 		return database.Scope{TenantID: 1}
 	}))
 
 	for i := range scopedLoops {
-		// The session default bypass is overridden: only tenant 1 is visible.
+		// Only tenant 1 is visible to the app role.
 		var count int
 		require.NoError(t, scoped.QueryRow(ctx, `SELECT count(*) FROM tenant_settings`).Scan(&count), "loop %d", i)
 		assert.Equal(t, 1, count)
@@ -62,7 +63,7 @@ func TestScopedReleasesConnectionsOnEveryPath(t *testing.T) {
 		err = scoped.QueryRow(ctx, `SELECT 1 WHERE false`).Scan(&none)
 		require.True(t, errors.Is(err, pgx.ErrNoRows), "QueryRow on no rows = %v", err)
 	}
-	assert.LessOrEqual(t, pool.Stat().AcquiredConns(), int32(0), "every connection is back in the pool")
+	assert.LessOrEqual(t, appPool.Stat().AcquiredConns(), int32(0), "every connection is back in the pool")
 }
 
 // TestScopedCommitErrorReachesCaller proves a COMMIT that fails after the
@@ -104,11 +105,11 @@ func TestScopedCommitErrorReachesCaller(t *testing.T) {
 		)`)
 	require.NoError(t, err)
 
-	pool, err := pgtest.OpenAppPool(ctx, dsn, schema)
+	pools, err := pgtest.OpenAppPools(ctx, dsn, schema)
 	require.NoError(t, err)
-	t.Cleanup(pool.Close)
+	t.Cleanup(pools.Close)
 
-	scoped := database.NewScoped(pool, database.WithResolver(func(context.Context) database.Scope {
+	scoped := database.NewScoped(pools.Primary, database.WithResolver(func(context.Context) database.Scope {
 		return database.Scope{TenantID: 1}
 	}))
 

@@ -21,11 +21,12 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	appPool, ownerPool, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
+	fixturePool, ownerPool, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
 	if err != nil {
 		t.Fatalf("setup test db: %v", err)
 	}
 	t.Cleanup(cleanup)
+	appPool := pgtest.AppPool(fixturePool)
 
 	var schema string
 	if err := ownerPool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
@@ -34,6 +35,17 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 
 	if err := checkRLSRole(ctx, appPool, schema, "production"); err != nil {
 		t.Fatalf("the app role must be accepted: %v", err)
+	}
+
+	pools := pgtest.Pools(fixturePool)
+	if err := checkBypassRLSRole(ctx, pools.Bypass, pools.Primary, schema, "production"); err != nil {
+		t.Fatalf("the bypass role must be accepted: %v", err)
+	}
+	if err := checkBypassRLSRole(ctx, nil, appPool, schema, "staging"); err != nil {
+		t.Fatalf("an unset bypass role must only warn outside production: %v", err)
+	}
+	if err := checkBypassRLSRole(ctx, nil, appPool, schema, "production"); err == nil {
+		t.Fatal("production must refuse a missing bypass role")
 	}
 	ownerErr := checkRLSRole(ctx, ownerPool, schema, "production")
 	if ownerErr == nil {
@@ -101,5 +113,28 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 	memberErr := checkRLSRole(ctx, rolePool(memberRole), schema, "production")
 	if memberErr == nil || !strings.Contains(memberErr.Error(), "member") {
 		t.Fatalf("member checkRLSRole = %v, want a membership refusal", memberErr)
+	}
+
+	// The same shape is refused on the bypass side: a bypass role the normal
+	// role can SET ROLE into defeats the separation.
+	bypassMemberErr := checkBypassRLSRole(ctx, rolePool(bypassRole), rolePool(memberRole), schema, "production")
+	if bypassMemberErr == nil || !strings.Contains(bypassMemberErr.Error(), "SET ROLE") {
+		t.Fatalf("member checkBypassRLSRole = %v, want a SET ROLE refusal", bypassMemberErr)
+	}
+
+	// A role without BYPASSRLS cannot serve cross-tenant work.
+	plainRole := "rls_plain_" + suffix
+	exec(`CREATE ROLE ` + ident(plainRole) + ` NOLOGIN NOSUPERUSER NOBYPASSRLS`)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		_, _ = ownerPool.Exec(cleanupCtx, `DROP ROLE IF EXISTS `+ident(plainRole))
+	})
+	plainErr := checkBypassRLSRole(ctx, rolePool(plainRole), appPool, schema, "production")
+	if plainErr == nil || !strings.Contains(plainErr.Error(), "does not have BYPASSRLS") {
+		t.Fatalf("plain checkBypassRLSRole = %v, want a BYPASSRLS refusal", plainErr)
+	}
+	if err := checkBypassRLSRole(ctx, ownerPool, appPool, schema, "production"); err == nil {
+		t.Fatal("the schema owner must not be accepted as the bypass role")
 	}
 }

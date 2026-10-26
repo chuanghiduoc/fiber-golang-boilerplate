@@ -85,7 +85,7 @@ func main() {
 
 	bg, err := rt.startBackground()
 	if err != nil {
-		rt.infra.Pool.Close()
+		rt.closeDatabasePools()
 		exitStartup(err)
 	}
 
@@ -203,8 +203,8 @@ func start(cfg *config.Config) (_ *runtime, err error) {
 
 	rt := &runtime{cfg: cfg}
 	defer func() {
-		if err != nil && rt.infra.Pool != nil {
-			rt.infra.Pool.Close()
+		if err != nil {
+			rt.closeDatabasePools()
 		}
 	}()
 
@@ -251,11 +251,14 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 		return startupFailed("failed to initialize job payload encryption", err)
 	}
 
-	pool, err := rt.connectDatabase(ctx)
+	pools, err := rt.connectDatabase(ctx)
 	if err != nil {
 		return err
 	}
-	if err := checkRLSRole(ctx, pool, cfg.DB.Schema, cfg.App.Env); err != nil {
+	if err := checkRLSRole(ctx, pools.Primary, cfg.DB.Schema, cfg.App.Env); err != nil {
+		return err
+	}
+	if err := checkBypassRLSRole(ctx, pools.Bypass, pools.Primary, cfg.DB.Schema, cfg.App.Env); err != nil {
 		return err
 	}
 
@@ -273,13 +276,13 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 
 	// Every statement runs with the tenant's RLS scope; the resolver is
 	// injected here because pkg/database cannot import internal packages.
-	scoped := database.NewScoped(pool, database.WithResolver(app.RLSResolver))
+	scoped := database.NewScopedPools(pools, database.WithResolver(app.RLSResolver))
 
 	// Feature flags: database defaults/targets are optional. The evaluator
 	// serves environment/compiled defaults when the store is unavailable and
 	// bounds stale snapshots with FEATURE_FLAGS_MAX_STALENESS_SECONDS. The
-	// snapshot covers every tenant, so its reads bypass RLS.
-	flagStoreDB := database.NewScoped(pool, database.WithResolver(func(context.Context) database.Scope {
+	// snapshot covers every tenant, so its reads use the bypass pool.
+	flagStoreDB := database.NewScopedPools(pools, database.WithResolver(func(context.Context) database.Scope {
 		return database.Scope{Bypass: true}
 	}))
 	flagEvaluator := featureflags.NewEvaluator(featureflags.Options{
@@ -296,16 +299,17 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	}
 	slog.Info("email sender initialized", slog.String("driver", cfg.Email.Driver))
 
-	jobQueue := rt.buildDurableWork(pool, scoped)
+	jobQueue := rt.buildDurableWork(pools.Primary, scoped)
 
 	rt.infra = app.Infra{
-		Platform: app.NewPlatformConfig(cfg),
-		Pool:     pool,
-		DB:       scoped,
+		Platform:   app.NewPlatformConfig(cfg),
+		Pool:       pools.Primary,
+		BypassPool: pools.Bypass,
+		DB:         scoped,
 		// Transaction manager and the process-wide audit recorder. Tier 1
 		// services write through the transaction; Tier 2 routes use it for
 		// intent rows.
-		Tx:           database.NewTxManager(pool, database.WithResolver(app.RLSResolver)),
+		Tx:           database.NewTxManagerPools(pools, database.WithResolver(app.RLSResolver)),
 		Cache:        appCache,
 		Audit:        audit.NewPostgresRecorder(scoped),
 		Queue:        jobQueue,
@@ -318,24 +322,26 @@ func (rt *runtime) buildInfrastructure(ctx context.Context) error {
 	return nil
 }
 
-// connectDatabase opens the pool (instrumented when tracing asks for it) and
-// records it in rt.infra so start closes it if a later step fails.
-func (rt *runtime) connectDatabase(ctx context.Context) (*pgxpool.Pool, error) {
+// connectDatabase opens the normal pool and, when configured, the dedicated
+// bypass pool (both instrumented when tracing asks for it) and records them in
+// rt.infra so start closes them if a later step fails.
+func (rt *runtime) connectDatabase(ctx context.Context) (database.Pools, error) {
 	poolOpts := make([]database.PoolOption, 0, 1)
 	if rt.cfg.Tracing.Enabled && rt.cfg.Tracing.InstrumentDB {
 		poolOpts = append(poolOpts, database.WithTracerProvider(rt.trace.TracerProvider()))
 	}
-	pool, err := database.NewPool(ctx, rt.cfg.DB, poolOpts...)
+	pools, err := database.OpenPools(ctx, rt.cfg.DB, poolOpts...)
 	if err != nil {
-		return nil, startupFailed("failed to connect to database", err)
+		return database.Pools{}, startupFailed("failed to connect to database", err)
 	}
-	rt.infra.Pool = pool
-	slog.Info("connected to database")
+	rt.infra.Pool = pools.Primary
+	rt.infra.BypassPool = pools.Bypass
+	slog.Info("connected to database", slog.Bool("bypass_role", pools.Bypass != nil))
 
 	// Schema management is owned by cmd/migrate only. The API never applies
 	// DDL, so replicas can start safely without a migration lock convoy.
 	slog.Info("database schema assumed up to date (run cmd/migrate)")
-	return pool, nil
+	return pools, nil
 }
 
 // buildDurableWork creates the job queue, the worker, the event bus, and the
@@ -627,26 +633,49 @@ func (rt *runtime) closeResources(shutdownDeadline time.Time) {
 	if err := rt.infra.Cache.Close(); err != nil {
 		slog.Error("failed to close cache", slog.Any("error", err))
 	}
-	closePool(rt.infra.Pool, max(time.Until(shutdownDeadline), closeMinimum))
+	closePools(rt.infra.Pool, rt.infra.BypassPool, max(time.Until(shutdownDeadline), closeMinimum))
 }
 
-// closePool closes the database pool without blocking past timeout.
+// closeDatabasePools closes both runtime pools immediately. It is used on
+// startup failure, where there is no shutdown budget to preserve.
+func (rt *runtime) closeDatabasePools() {
+	if rt.infra.BypassPool != nil && rt.infra.BypassPool != rt.infra.Pool {
+		rt.infra.BypassPool.Close()
+	}
+	if rt.infra.Pool != nil {
+		rt.infra.Pool.Close()
+	}
+}
+
+// closePools closes both database pools without blocking past timeout.
 // pgxpool.Close waits for every acquired connection to be released, so a
 // handler or job that ignored cancellation would otherwise hold the process
 // until Kubernetes sends SIGKILL. On timeout the process exits anyway and the
 // server drops the remaining connections.
-func closePool(pool *pgxpool.Pool, timeout time.Duration) {
+func closePools(primary, bypass *pgxpool.Pool, timeout time.Duration) {
+	pools := []*pgxpool.Pool{primary}
+	if bypass != nil && bypass != primary {
+		pools = append(pools, bypass)
+	}
 	done := make(chan struct{})
 	go func() {
-		pool.Close()
+		for _, pool := range pools {
+			if pool != nil {
+				pool.Close()
+			}
+		}
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		slog.Warn("database pool did not close before the shutdown deadline; connections are still checked out",
+		acquired := 0
+		if primary != nil {
+			acquired = int(primary.Stat().AcquiredConns())
+		}
+		slog.Warn("database pools did not close before the shutdown deadline; connections are still checked out",
 			slog.Duration("timeout", timeout),
-			slog.Int("acquired_conns", int(pool.Stat().AcquiredConns())),
+			slog.Int("acquired_conns", acquired),
 		)
 	}
 }

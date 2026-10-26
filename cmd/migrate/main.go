@@ -417,6 +417,7 @@ func verifySchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 		func() ([]string, error) { return checkUniqueIndexes(ctx, pool, schema) },
 		func() ([]string, error) { return checkTenantLeadingIndexes(ctx, pool, schema) },
 		func() ([]string, error) { return checkRLS(ctx, pool, schema) },
+		func() ([]string, error) { return checkRLSPredicate(ctx, pool, schema) },
 		func() ([]string, error) { return checkTriggers(ctx, pool, schema) },
 		func() ([]string, error) { return checkDefaultTenant(ctx, pool, foundTables) },
 	}
@@ -715,6 +716,42 @@ func policyGap(table rlsTable) string {
 		return "tenant_isolation policy on " + table.Table + " WITH CHECK clause must reference app_tenant_visible"
 	}
 	return ""
+}
+
+// checkRLSPredicate reads the installed app_tenant_visible definition. The
+// function is the single policy predicate for every tenant-owned table, so a
+// setting it reads is an isolation escape hatch visible to every role. The
+// bypass role (BYPASSRLS) is the only cross-tenant mechanism; the predicate
+// must not consult app.rls_bypass or any other application-writable setting.
+func checkRLSPredicate(ctx context.Context, pool *pgxpool.Pool, schema string) ([]string, error) {
+	var definition string
+	err := pool.QueryRow(ctx, `
+		SELECT pg_get_functiondef(p.oid)
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		WHERE n.nspname = $1 AND p.proname = 'app_tenant_visible' AND p.pronargs = 1`,
+		schema).Scan(&definition)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []string{"function app_tenant_visible(BIGINT)"}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("verify app_tenant_visible: %w", err)
+	}
+	return rlsPredicateGaps(definition), nil
+}
+
+// rlsPredicateGaps is the pure check behind checkRLSPredicate, so its cases
+// are unit-testable without DDL.
+func rlsPredicateGaps(definition string) []string {
+	lowered := strings.ToLower(definition)
+	var gaps []string
+	if strings.Contains(lowered, "rls_bypass") {
+		gaps = append(gaps, "app_tenant_visible must not read app.rls_bypass (use the dedicated BYPASSRLS role)")
+	}
+	if !strings.Contains(lowered, "app.tenant_id") {
+		gaps = append(gaps, "app_tenant_visible must compare the row tenant with app.tenant_id")
+	}
+	return gaps
 }
 
 // checkTriggers reports required triggers that are absent or disabled.

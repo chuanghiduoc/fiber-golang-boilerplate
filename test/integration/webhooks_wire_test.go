@@ -117,17 +117,17 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue)
 	codec, err := webhookservice.NewSecretCodec("webhook-wire-encryption-key")
 	require.NoError(t, err)
-	ciphertext, err := codec.Seal([]byte(wireSecret))
-	require.NoError(t, err)
 
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
 	endpoint, err := repo.CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
-		URL:              server.URL + "/hook",
-		EventTypes:       []string{"file.*"},
-		Status:           "active",
-		MaxAttempts:      3,
-		TimeoutMS:        2000,
-		SecretCiphertext: ciphertext,
+		URL:         server.URL + "/hook",
+		EventTypes:  []string{"file.*"},
+		Status:      "active",
+		MaxAttempts: 3,
+		TimeoutMS:   2000,
+		SealSecret: func(endpointID int64) (string, error) {
+			return codec.Seal(webhookservice.EndpointSecretBinding(tenant.DefaultID, endpointID), []byte(wireSecret))
+		},
 	})
 	require.NoError(t, err)
 
@@ -146,7 +146,7 @@ func TestWebhookDeliveryWireFormatIsStable(t *testing.T) {
 		tenant.DefaultID, endpoint.ID,
 	).Scan(&deliveryID))
 
-	guard, err := webhook.NewGuard([]string{"127.0.0.1"})
+	guard, err := webhook.NewGuardWithPorts([]string{"127.0.0.1"}, allDynamicPorts())
 	require.NoError(t, err)
 	worker := webhookservice.NewDeliveryWorker(repo, codec,
 		webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second}),

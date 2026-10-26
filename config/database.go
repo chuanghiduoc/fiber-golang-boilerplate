@@ -17,8 +17,17 @@ type DBConfig struct {
 	// Password has no default: credentials always come from the environment
 	// (.env, Compose, or the Kubernetes Secret), never from code.
 	Password string `env:"DB_PASSWORD"`
-	Schema   string `env:"DB_SCHEMA" envDefault:"public"`
-	SSLMode  string `env:"DB_SSLMODE" envDefault:"disable"`
+	// BypassUsername and BypassPassword identify the dedicated BYPASSRLS role
+	// that serves WithRLSBypass paths (global job claim, retention purges,
+	// catalog sync). It is not a superuser, owns nothing, and Username is not
+	// a member of it, so the normal role cannot SET ROLE into it. Production
+	// requires both and a username different from DB_USERNAME; outside
+	// production an unset pair falls back to Username/Password with a startup
+	// warning.
+	BypassUsername string `env:"DB_BYPASS_USERNAME"`
+	BypassPassword string `env:"DB_BYPASS_PASSWORD"`
+	Schema         string `env:"DB_SCHEMA" envDefault:"public"`
+	SSLMode        string `env:"DB_SSLMODE" envDefault:"disable"`
 	// SSLRootCert is an optional path to the CA bundle that verifies the server
 	// certificate. verify-full without it uses the system trust store.
 	SSLRootCert     string `env:"DB_SSLROOTCERT"`
@@ -62,6 +71,11 @@ func (db DBConfig) EffectiveQueryExecMode() string {
 		return "cache_statement"
 	}
 	return db.QueryExecMode
+}
+
+// BypassConfigured reports whether a dedicated BYPASSRLS role is configured.
+func (db DBConfig) BypassConfigured() bool {
+	return strings.TrimSpace(db.BypassUsername) != ""
 }
 
 // ForMigration returns the settings cmd/migrate connects with: DB_MIGRATE_*
@@ -114,6 +128,14 @@ func (db DBConfig) Validate() error {
 // versions that support it) or drop it (ignore_startup_parameters = search_path) and
 // set it on the role (ALTER ROLE ... SET search_path).
 func (db DBConfig) DSN() string {
+	return db.DSNFor(db.Username, db.Password)
+}
+
+// DSNFor builds a DSN with the given credentials and every other setting from
+// the receiver. The bypass pool uses it with DB_BYPASS_USERNAME/DB_BYPASS_PASSWORD,
+// so it shares the normal role's database, host, port, schema, and TLS
+// settings.
+func (db DBConfig) DSNFor(username, password string) string {
 	q := url.Values{}
 	// libpq/pgx compare sslmode case-sensitively; validation accepts
 	// DB_SSLMODE case-insensitively, so normalize before building the DSN.
@@ -125,12 +147,30 @@ func (db DBConfig) DSN() string {
 
 	u := url.URL{
 		Scheme:   "postgres",
-		User:     url.UserPassword(db.Username, db.Password),
+		User:     url.UserPassword(username, password),
 		Host:     net.JoinHostPort(db.Host, strconv.Itoa(db.Port)),
 		Path:     "/" + db.Database,
 		RawQuery: q.Encode(),
 	}
 	return u.String()
+}
+
+// validateProduction requires a dedicated bypass role distinct from the
+// normal one. Without it, cross-tenant work would run on the normal role and
+// silently see no rows (or, worse, force operators to grant BYPASSRLS to the
+// role that serves HTTP).
+func (db DBConfig) validateProduction() error {
+	username := strings.TrimSpace(db.BypassUsername)
+	if username == "" {
+		return fmt.Errorf("DB_BYPASS_USERNAME is required in production")
+	}
+	if db.BypassPassword == "" {
+		return fmt.Errorf("DB_BYPASS_PASSWORD is required in production")
+	}
+	if username == strings.TrimSpace(db.Username) {
+		return fmt.Errorf("DB_BYPASS_USERNAME must differ from DB_USERNAME")
+	}
+	return nil
 }
 
 // validateProductionSSLMode requires certificate verification in production.

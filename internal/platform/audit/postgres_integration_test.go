@@ -358,7 +358,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 // TestAppRoleCannotTruncate keeps the runtime role's grant list honest:
 // TRUNCATE ignores row-level security, so the API/worker role must not have it.
 func TestAppRoleCannotTruncate(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	pool := pgtest.AppPool(setupAuditTestDB(t))
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 

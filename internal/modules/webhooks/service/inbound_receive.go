@@ -21,26 +21,48 @@ const (
 	maxStoredSignatureLen = 255
 )
 
+// errInboundSourceUnavailable covers a missing, disabled, soft-deleted, or
+// suspended-tenant source. The receiver treats all of them like a bad
+// signature so sequential ids cannot be enumerated.
+var errInboundSourceUnavailable = errors.New("webhooks: inbound source is unavailable")
+
+// dummyInboundKey is a valid Standard Webhooks key used to run the HMAC for an
+// unavailable source. Its result is discarded; the work keeps the unknown-id
+// and bad-signature paths comparable in cost.
+var dummyInboundKey = func() []byte {
+	key, err := webhook.DecodeSecret(webhook.SecretPrefix + strings.Repeat("A", 43) + "=")
+	if err != nil {
+		panic("webhooks: invalid built-in dummy inbound key: " + err.Error())
+	}
+	return key
+}()
+
 // ReceiveInbound authenticates a public inbound request. The source ID in the
 // URL identifies the tenant, so X-Tenant-Slug is deliberately ignored. Callers
 // receive the owning tenant in the receipt so the HTTP layer can align Fibers
 // locals (and therefore the audit middleware) with the source tenant.
 //
-// The steps run in a fixed order: validate the body, resolve an active source
-// of an active tenant, validate the event id, verify the signature, validate
-// the event type, then store the event once per (source, webhook-id).
+// The steps run in a fixed order: validate the body and event id, resolve an
+// active source of an active tenant, verify the signature, validate the event
+// type, then store the event once per (source, webhook-id). An unknown,
+// disabled, or deleted source returns the same 401 as a bad signature, so the
+// endpoint does not reveal which sequential ids exist.
 func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*InboundReceipt, error) {
 	if err := validateInboundBody(body); err != nil {
-		return nil, err
-	}
-	source, err := s.activeInboundSource(ctx, sourceID)
-	if err != nil {
 		return nil, err
 	}
 	// The id is part of the signed content, so it is validated before
 	// verification and used verbatim afterwards.
 	externalID, err := inboundEventID(headers)
 	if err != nil {
+		return nil, err
+	}
+	source, err := s.activeInboundSource(ctx, sourceID)
+	if err != nil {
+		if errors.Is(err, errInboundSourceUnavailable) {
+			s.verifyWithDummySecret(headers, body)
+			return nil, inboundAuthError()
+		}
 		return nil, err
 	}
 	if err := s.verifyInboundSignature(source, headers, body); err != nil {
@@ -65,6 +87,18 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 	return receipt, nil
 }
 
+// verifyWithDummySecret performs the same HMAC work as a real verification and
+// discards the outcome.
+func (s *service) verifyWithDummySecret(headers http.Header, body []byte) {
+	_ = webhook.VerifyRequest(dummyInboundKey, headers, body, s.opts.TimestampTolerance, s.now())
+}
+
+// inboundAuthError is the single 401 used for every authentication failure of
+// the public receiver, including unavailable sources.
+func inboundAuthError() error {
+	return apperror.NewUnauthorized("webhook signature is invalid")
+}
+
 func validateInboundBody(body []byte) error {
 	if len(body) == 0 {
 		return apperror.NewBadRequest("request body is required")
@@ -79,18 +113,18 @@ func validateInboundBody(body []byte) error {
 }
 
 // activeInboundSource resolves the source across tenants. A disabled source
-// and a suspended tenant are indistinguishable from a missing source, like
-// every other request for that tenant.
+// and a suspended tenant are indistinguishable from a missing source; all
+// return errInboundSourceUnavailable so the receiver can respond 401.
 func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*InboundSource, error) {
 	source, err := s.inbound.GetInboundSourceByID(ctx, sourceID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
-			return nil, apperror.NewNotFound("inbound source not found")
+			return nil, errInboundSourceUnavailable
 		}
 		return nil, apperror.NewInternal("failed to resolve inbound source")
 	}
 	if source.Status != StatusActive {
-		return nil, apperror.NewNotFound("inbound source not found")
+		return nil, errInboundSourceUnavailable
 	}
 	if s.opts.Tenants == nil {
 		return source, nil
@@ -104,7 +138,7 @@ func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*Inb
 		return nil, apperror.NewInternal("failed to resolve inbound source")
 	}
 	if !active {
-		return nil, apperror.NewNotFound("inbound source not found")
+		return nil, errInboundSourceUnavailable
 	}
 	return source, nil
 }
@@ -124,10 +158,11 @@ func inboundEventID(headers http.Header) (string, error) {
 // verifyInboundSignature checks the Standard Webhooks signature and timestamp
 // with the source's current secret and, while its explicit grace window is
 // open, the immediately previous secret. A sender that has not switched yet
-// therefore keeps working for 24h after a rotation. Each failure class maps to
-// a public 401 detail.
+// therefore keeps working for 24h after a rotation. Every failure maps to the
+// same public 401, so a caller cannot tell which check failed.
 func (s *service) verifyInboundSignature(source *InboundSource, headers http.Header, body []byte) error {
-	key, err := s.openInboundKey(source.SecretCiphertext, source.ID)
+	binding := InboundSourceSecretBinding(source.TenantID, source.ID)
+	key, err := s.openInboundKey(binding, source.SecretCiphertext, source.ID)
 	if err != nil {
 		return err
 	}
@@ -138,9 +173,10 @@ func (s *service) verifyInboundSignature(source *InboundSource, headers http.Hea
 	// Only a signature mismatch can be rescued by the previous secret; a
 	// missing or stale timestamp is the sender's mistake either way.
 	if errors.Is(verifyErr, webhook.ErrInvalidSignature) && source.previousSecretValid(s.now()) {
-		previousKey, err := s.openInboundKey(source.PreviousSecretCiphertext, source.ID)
+		previousKey, err := s.openInboundKey(binding, source.PreviousSecretCiphertext, source.ID)
 		if err != nil {
-			return verifyErr
+			slog.Error("failed to open an inbound source's previous secret", slog.Int64("source_id", source.ID), slog.Any("error", err))
+			return inboundVerifyError(verifyErr)
 		}
 		if previousErr := webhook.VerifyRequest(previousKey, headers, body, s.opts.TimestampTolerance, s.now()); previousErr == nil {
 			return nil
@@ -152,8 +188,8 @@ func (s *service) verifyInboundSignature(source *InboundSource, headers http.Hea
 // openInboundKey opens and decodes one sealed source secret. A source created
 // before Standard Webhooks has a secret no standard sender can sign with; the
 // sender only learns the signature failed.
-func (s *service) openInboundKey(ciphertext string, sourceID int64) ([]byte, error) {
-	secret, err := s.codec.Open(ciphertext)
+func (s *service) openInboundKey(binding SecretBinding, ciphertext string, sourceID int64) ([]byte, error) {
+	secret, err := s.codec.Open(binding, ciphertext)
 	if err != nil {
 		slog.Error("webhooks: failed to open inbound source secret",
 			slog.Int64("source_id", sourceID),
@@ -167,7 +203,7 @@ func (s *service) openInboundKey(ciphertext string, sourceID int64) ([]byte, err
 			slog.Int64("source_id", sourceID),
 			slog.Any("error", err),
 		)
-		return nil, apperror.NewUnauthorized("webhook signature is invalid")
+		return nil, inboundAuthError()
 	}
 	return key, nil
 }
@@ -178,15 +214,11 @@ func (s *InboundSource) previousSecretValid(now time.Time) bool {
 		now.Before(*s.PreviousSecretExpiresAt)
 }
 
-func inboundVerifyError(err error) error {
-	switch {
-	case errors.Is(err, webhook.ErrMissingSignature), errors.Is(err, webhook.ErrMissingTimestamp), errors.Is(err, webhook.ErrMissingID):
-		return apperror.NewUnauthorized("webhook signature is required")
-	case errors.Is(err, webhook.ErrTimestampOutOfRange), errors.Is(err, webhook.ErrInvalidTimestamp):
-		return apperror.NewUnauthorized("webhook timestamp is invalid or expired")
-	default:
-		return apperror.NewUnauthorized("webhook signature is invalid")
-	}
+// inboundVerifyError is the single public authentication failure for the
+// receiver: missing, stale, or invalid signatures all look the same, so a
+// caller cannot distinguish an unknown source from a bad signature.
+func inboundVerifyError(error) error {
+	return inboundAuthError()
 }
 
 // inboundEventType reads the event type from the verified body: Standard

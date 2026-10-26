@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -14,19 +15,37 @@ const (
 	inboundSecretLabel  = "inbound secret"
 )
 
-// newSealedSecret generates a Standard Webhooks "whsec_<base64>" secret (for
+// newSecret generates a Standard Webhooks "whsec_<base64>" secret (for
 // endpoints and inbound sources alike, so the official libraries accept it
-// unchanged) and seals it for storage. The plaintext is returned to the
-// caller exactly once (create or rotate) and is never persisted; label names
-// the secret in public errors.
-func (s *service) newSealedSecret(label string) (secret, ciphertext string, err error) {
-	secret, err = webhook.NewSecret()
+// unchanged). The plaintext is returned to the caller exactly once and is
+// never persisted; label names the secret in public errors.
+func newSecret(label string) (string, error) {
+	secret, err := webhook.NewSecret()
 	if err != nil {
-		return "", "", apperror.NewInternal("failed to generate " + label)
+		return "", apperror.NewInternal("failed to generate " + label)
 	}
-	ciphertext, err = s.codec.Seal([]byte(secret))
+	return secret, nil
+}
+
+// sealSecret seals a generated secret for its purpose, tenant, and owning row.
+func (s *service) sealSecret(label string, binding SecretBinding, secret string) (string, error) {
+	ciphertext, err := s.codec.Seal(binding, []byte(secret))
 	if err != nil {
-		return "", "", apperror.NewInternal("failed to protect " + label)
+		return "", apperror.NewInternal("failed to protect " + label)
+	}
+	return ciphertext, nil
+}
+
+// newSealedSecret generates and seals a secret whose owning row already exists
+// (rotation paths).
+func (s *service) newSealedSecret(binding SecretBinding, label string) (secret, ciphertext string, err error) {
+	secret, err = newSecret(label)
+	if err != nil {
+		return "", "", err
+	}
+	ciphertext, err = s.sealSecret(label, binding, secret)
+	if err != nil {
+		return "", "", err
 	}
 	return secret, ciphertext, nil
 }
@@ -34,7 +53,8 @@ func (s *service) newSealedSecret(label string) (secret, ciphertext string, err 
 // RotateEndpointSecret makes a fresh secret active for new deliveries. The
 // delivery worker keeps dual-signing pending retries during the rotation grace.
 func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (*Endpoint, string, error) {
-	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
+	tenantID := tenant.EffectiveID(ctx)
+	secret, ciphertext, err := s.newSealedSecret(EndpointSecretBinding(tenantID, id), endpointSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}
@@ -51,7 +71,8 @@ func (s *service) RotateEndpointSecret(ctx context.Context, actorID, id int64) (
 
 // RotateInboundSourceSecret replaces the secret the sender signs with.
 func (s *service) RotateInboundSourceSecret(ctx context.Context, actorID, id int64) (*InboundSource, string, error) {
-	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
+	tenantID := tenant.EffectiveID(ctx)
+	secret, ciphertext, err := s.newSealedSecret(InboundSourceSecretBinding(tenantID, id), inboundSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}

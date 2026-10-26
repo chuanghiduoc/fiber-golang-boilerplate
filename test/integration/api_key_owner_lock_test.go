@@ -54,7 +54,7 @@ func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	keyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	return &ownerLockHarness{
 		pool:     pool,
-		keys:     apikeyservice.NewService(keyRepo, principals, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals)),
+		keys:     apikeyservice.NewService(keyRepo, principals, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals), 8760*time.Hour),
 		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil), nil),
 		verifier: apikey.NewVerifier(apikeyadapter.NewVerifierStore(keyRepo), principals),
 		owner:    owner,

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -15,14 +16,17 @@ func (s *service) CreateInboundSource(ctx context.Context, actorID int64, in Cre
 	if err := validateSlug(in.Slug); err != nil {
 		return nil, "", err
 	}
-	secret, ciphertext, err := s.newSealedSecret(inboundSecretLabel)
+	secret, err := newSecret(inboundSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}
+	tenantID := tenant.EffectiveID(ctx)
 	source, err := s.inbound.CreateInboundSource(ctx, InboundSourceDraft{
-		Name:             strings.TrimSpace(in.Name),
-		Slug:             in.Slug,
-		SecretCiphertext: ciphertext,
+		Name: strings.TrimSpace(in.Name),
+		Slug: in.Slug,
+		SealSecret: func(sourceID int64) (string, error) {
+			return s.sealSecret(inboundSecretLabel, InboundSourceSecretBinding(tenantID, sourceID), secret)
+		},
 	})
 	if err != nil {
 		if isConflict(err) {

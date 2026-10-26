@@ -212,7 +212,7 @@ func testCodec(t *testing.T) (codec *SecretCodec, ciphertext string) {
 	if err != nil {
 		t.Fatalf("NewSecretCodec: %v", err)
 	}
-	ciphertext, err = codec.Seal([]byte(testSecret))
+	ciphertext, err = codec.Seal(EndpointSecretBinding(1, 2), []byte(testSecret))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -221,11 +221,24 @@ func testCodec(t *testing.T) (codec *SecretCodec, ciphertext string) {
 
 func loopbackWebhookClient(t *testing.T) *webhook.Client {
 	t.Helper()
-	guard, err := webhook.NewGuard([]string{"127.0.0.1"})
+	// httptest servers listen on random ports; the port policy itself is
+	// covered by pkg/webhook, so the worker tests allow every port.
+	guard, err := webhook.NewGuardWithPorts([]string{"127.0.0.1"}, allTestPorts())
 	if err != nil {
-		t.Fatalf("NewGuard: %v", err)
+		t.Fatalf("NewGuardWithPorts: %v", err)
 	}
 	return webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second})
+}
+
+var testPortsOnce = make([]int, 0, 65535)
+
+func allTestPorts() []int {
+	if len(testPortsOnce) == 0 {
+		for port := 1; port <= 65535; port++ {
+			testPortsOnce = append(testPortsOnce, port)
+		}
+	}
+	return testPortsOnce
 }
 
 func testWorker(store WorkerStore, client *webhook.Client) (*DeliveryWorker, time.Time) {
@@ -376,7 +389,7 @@ func TestDeliveryWorker_RedirectAndBlockedTargetAreDead(t *testing.T) {
 	})
 
 	t.Run("blocked target", func(t *testing.T) {
-		guard, _ := webhook.NewGuard(nil)
+		guard, _ := webhook.NewGuardWithPorts(nil, allTestPorts())
 		client := webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: time.Second})
 		store := &fakeWorkerStore{delivery: fixedDelivery(redirect.URL, ciphertext, 0, 3)}
 		worker, _ := testWorker(store, client)
@@ -566,7 +579,7 @@ func TestDeliveryWorker_StaleOutcomeIsDiscarded(t *testing.T) {
 // secret signs.
 func TestDeliveryWorker_RotationGraceCoSigns(t *testing.T) {
 	codec, oldCiphertext := testCodec(t)
-	newCiphertext, err := codec.Seal([]byte(rotatedSecret))
+	newCiphertext, err := codec.Seal(EndpointSecretBinding(1, 2), []byte(rotatedSecret))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
@@ -690,7 +703,7 @@ func verifyWith(secret string, header http.Header, body []byte, now time.Time) e
 // delivery dead-letters with an actionable reason instead of retrying.
 func TestDeliveryWorker_LegacySecretIsDead(t *testing.T) {
 	codec, _ := testCodec(t)
-	legacy, err := codec.Seal([]byte("whsec_Zm9v-legacy_url_safe"))
+	legacy, err := codec.Seal(EndpointSecretBinding(1, 2), []byte("whsec_Zm9v-legacy_url_safe"))
 	if err != nil {
 		t.Fatal(err)
 	}

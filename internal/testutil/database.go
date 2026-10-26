@@ -32,7 +32,9 @@ func SetupTestDB(ctx context.Context) (*pgxpool.Pool, func(), error) {
 
 // The pgtest helpers, re-exported for module and end-to-end tests.
 var (
-	OpenAppPool  = pgtest.OpenAppPool
+	OpenAppPools = pgtest.OpenAppPools
+	AppPool      = pgtest.AppPool
+	Pools        = pgtest.Pools
 	Scoped       = pgtest.Scoped
 	NewTxManager = pgtest.NewTxManager
 	BypassScoped = pgtest.BypassScoped

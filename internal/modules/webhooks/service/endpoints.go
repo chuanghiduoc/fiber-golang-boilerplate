@@ -7,7 +7,10 @@ import (
 	"sort"
 	"strings"
 
+	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
 // CreateEndpoint validates configuration, seals a fresh signing secret, and
@@ -20,18 +23,21 @@ func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEn
 	if err != nil {
 		return nil, "", err
 	}
-	secret, ciphertext, err := s.newSealedSecret(endpointSecretLabel)
+	secret, err := newSecret(endpointSecretLabel)
 	if err != nil {
 		return nil, "", err
 	}
+	tenantID := tenant.EffectiveID(ctx)
 	endpoint, err := s.endpoints.CreateEndpoint(ctx, CreateEndpointDraft{
-		URL:              in.URL,
-		Description:      in.Description,
-		EventTypes:       eventTypes,
-		Status:           StatusActive,
-		MaxAttempts:      s.maxAttempts(in.MaxAttempts),
-		TimeoutMS:        s.timeoutMS(in.TimeoutMS),
-		SecretCiphertext: ciphertext,
+		URL:         in.URL,
+		Description: in.Description,
+		EventTypes:  eventTypes,
+		Status:      StatusActive,
+		MaxAttempts: s.maxAttempts(in.MaxAttempts),
+		TimeoutMS:   s.timeoutMS(in.TimeoutMS),
+		SealSecret: func(endpointID int64) (string, error) {
+			return s.sealSecret(endpointSecretLabel, EndpointSecretBinding(tenantID, endpointID), secret)
+		},
 	})
 	if err != nil {
 		return nil, "", apperror.NewInternal("failed to create webhook endpoint")
@@ -114,6 +120,10 @@ func (s *service) validateURL(raw string) error {
 		return apperror.NewBadRequest("url must be at most 2048 characters")
 	}
 	if _, err := s.urlGuard.ValidateURL(raw); err != nil {
+		if errors.Is(err, webhook.ErrPortNotAllowed) {
+			return apperror.NewCode(webhookscatalog.CodeWebhookPortNotAllowed,
+				"url port is not allowed for webhook delivery")
+		}
 		return apperror.NewBadRequest("url must be an absolute http(s) URL")
 	}
 	parsed, _ := url.Parse(raw)

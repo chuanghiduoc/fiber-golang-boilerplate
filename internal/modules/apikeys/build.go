@@ -1,6 +1,8 @@
 package apikeys
 
 import (
+	"time"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	apikeyadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/adapter"
@@ -22,13 +24,19 @@ type Provides struct {
 
 // Build constructs the API-key lifecycle surface and the request verifier.
 // The verifier only needs a hash lookup plus the identity principal contract.
-func Build(infra app.Infra, principals identitycontracts.PrincipalReader) (*Module, Provides) {
+func Build(infra app.Infra, principals identitycontracts.PrincipalReader, settings Settings) (*Module, Provides) {
 	repo := apikeyrepo.NewAPIKeyRepository(infra.DB)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(repo), principals)
-	svc := apikeyservice.NewService(repo, principals, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals))
+	svc := apikeyservice.NewService(repo, principals, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals), settings.MaxLifetime)
 	m := New(apikeyhandler.NewHandler(svc))
 	m.privacy = apikeysprivacy.New(apikeyrepo.NewPrivacyStore(infra.DB))
 	return m, Provides{Verifier: verifier}
+}
+
+// Settings are the API-key configuration the composition root passes in.
+type Settings struct {
+	// MaxLifetime caps newly issued credentials (APIKEYS_MAX_LIFETIME).
+	MaxLifetime time.Duration
 }
 
 // Permissions implements app.PermissionProvider.

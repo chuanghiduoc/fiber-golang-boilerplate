@@ -40,6 +40,10 @@ type Options struct {
 	// Tenants gates the public inbound receiver on the source tenant being
 	// active. Nil skips the check (unit tests); production must set it.
 	Tenants TenantChecker
+	// URLGuard validates outbound destination URLs with the configured port
+	// and SSRF policy. Nil keeps the safe defaults (443/80, no private
+	// targets).
+	URLGuard *webhook.Guard
 }
 
 // TenantChecker reports whether a tenant is active. The composition root
@@ -113,7 +117,10 @@ func New(
 	if opts.TimestampTolerance <= 0 {
 		opts.TimestampTolerance = webhook.DefaultTolerance
 	}
-	guard, _ := webhook.NewGuard(nil)
+	guard := opts.URLGuard
+	if guard == nil {
+		guard, _ = webhook.NewGuard(nil)
+	}
 	return &service{
 		endpoints:  endpoints,
 		deliveries: deliveries,

@@ -6,15 +6,23 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
 	"time"
 )
 
 func loopbackClient(t *testing.T, timeout time.Duration) *Client {
 	t.Helper()
-	guard, err := NewGuard([]string{"127.0.0.1", "::1", "localhost"})
+	// httptest servers listen on random ports; the guard's port policy is
+	// covered by TestGuard_PortPolicy, so these client tests allow every port.
+	ports := make([]int, 0, 65535)
+	for port := 1; port <= 65535; port++ {
+		ports = append(ports, port)
+	}
+	guard, err := NewGuardWithPorts([]string{"127.0.0.1", "::1", "localhost"}, ports)
 	if err != nil {
-		t.Fatalf("NewGuard: %v", err)
+		t.Fatalf("NewGuardWithPorts: %v", err)
 	}
 	return NewClient(ClientConfig{Guard: guard, Timeout: timeout, ConnectTimeout: time.Second})
 }
@@ -41,10 +49,21 @@ func TestClient_RejectsPrivateTargetWithoutAllowlist(t *testing.T) {
 	}))
 	defer server.Close()
 
-	guard, _ := NewGuard(nil)
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil {
+		t.Fatalf("parse test server port: %v", err)
+	}
+	guard, err := NewGuardWithPorts(nil, []int{port})
+	if err != nil {
+		t.Fatalf("NewGuardWithPorts: %v", err)
+	}
 	client := NewClient(ClientConfig{Guard: guard, Timeout: time.Second})
 
-	_, err := client.Do(context.Background(), server.URL, nil, []byte(`{}`))
+	_, err = client.Do(context.Background(), server.URL, nil, []byte(`{}`))
 	if !errors.Is(err, ErrBlockedTarget) {
 		t.Fatalf("Do() = %v, want ErrBlockedTarget", err)
 	}
