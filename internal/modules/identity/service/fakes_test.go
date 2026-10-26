@@ -336,7 +336,7 @@ func (r memMemberships) Reactivate(ctx context.Context, userID int64, role strin
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	m, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]
-	if !ok || m.Status != MembershipStatusRemoved || m.BannedEmailHash != "" {
+	if !ok || m.Status != MembershipStatusRemoved || m.BannedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	m.Status, m.RemovedAt, m.Role, m.Roles = MembershipStatusActive, nil, role, []string{role}
@@ -373,7 +373,13 @@ func (r memMemberships) Remove(ctx context.Context, userID int64) (*Membership, 
 		m.Status, m.RemovedAt, m.CredentialsRevokedAt = MembershipStatusRemoved, &now, &now
 		// A ban, and its pseudonymous email marker, survives removal and
 		// erasure; an active member's removal clears the (already empty) fields.
-		if !banned {
+		if banned {
+			if m.BannedEmailHash == "" {
+				if u := r.db.users[userID]; u != nil {
+					m.BannedEmailHash = bannedEmailHash(u.Email)
+				}
+			}
+		} else {
 			m.BannedAt, m.BannedEmailHash = nil, ""
 		}
 	})
@@ -406,11 +412,8 @@ func (r memMemberships) EmailBanned(ctx context.Context, email string) (bool, er
 		if key[0] != tenant.EffectiveID(ctx) {
 			continue
 		}
-		if m.BannedEmailHash != "" {
-			if m.BannedEmailHash == hash {
-				return true, nil
-			}
-			continue
+		if m.BannedEmailHash != "" && m.BannedEmailHash == hash {
+			return true, nil
 		}
 		if u := r.db.users[key[1]]; u != nil && m.Status == MembershipStatusSuspended && u.Email == normalized {
 			return true, nil

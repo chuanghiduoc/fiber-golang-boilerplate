@@ -460,7 +460,15 @@ func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	h.seed(t, tenantB, user.UserID)
 	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
 
+	// A user who is only a member of another tenant is a 404, not a hint that
+	// they exist (RLS keeps the lookup scoped even though this route is
+	// tenant-aware rather than global).
+	outsider := testutil.CreateMember(t, ctx, h.pool, tenantB, "privacy-admin-outsider@example.com", testutil.MemberOptions{})
 	status, body := h.request(t, http.MethodPost,
+		"/api/v1/admin/users/"+strconv.FormatInt(outsider.UserID, 10)+"/erasure", token, "default", "")
+	require.Equal(t, fiber.StatusNotFound, status, "body: %s", body)
+
+	status, body = h.request(t, http.MethodPost,
 		"/api/v1/admin/users/"+strconv.FormatInt(user.UserID, 10)+"/erasure", token, "default", "")
 	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 
@@ -498,6 +506,35 @@ func TestPrivacy_AdminErasureStaysInTheRequestTenant(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`SELECT count(*) FROM files WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, user.UserID).Scan(&tenantAFiles))
 	assert.Zero(t, tenantAFiles)
+}
+
+// A ban recorded before the hash column existed (or by a direct SQL repair)
+// still keeps the address blocked: removal derives the missing hash from the
+// user's current normalized email.
+func TestPrivacy_AdminRemovalBackfillsAMissingBanHash(t *testing.T) {
+	h := setupPrivacyHarness(t)
+	ctx := context.Background()
+	admin := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-backfill-admin@example.com", testutil.MemberOptions{Role: "admin"})
+	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "privacy-backfill@example.com", testutil.MemberOptions{})
+	_, err := h.pool.Exec(ctx,
+		`UPDATE memberships SET status = 'suspended', banned_at = NOW(), credentials_revoked_at = NOW()
+		 WHERE tenant_id = $1 AND user_id = $2`, tenant.DefaultID, user.UserID)
+	require.NoError(t, err)
+	token := testutil.SessionToken(t, ctx, h.pool, admin, privacyIntegrationSecret)
+
+	status, body := h.request(t, http.MethodDelete,
+		"/api/v1/users/"+strconv.FormatInt(user.UserID, 10), token, "default", "")
+	require.Equal(t, fiber.StatusNoContent, status, "body: %s", body)
+
+	var membershipStatus string
+	var hash *string
+	require.NoError(t, h.pool.QueryRow(ctx,
+		`SELECT status, banned_email_hash FROM memberships WHERE tenant_id = $1 AND user_id = $2`,
+		tenant.DefaultID, user.UserID).Scan(&membershipStatus, &hash))
+	assert.Equal(t, "removed", membershipStatus)
+	require.NotNil(t, hash, "removal must derive the marker for a legacy ban")
+	sum := sha256.Sum256([]byte(identityservice.NormalizeEmail(user.Email)))
+	assert.Equal(t, hex.EncodeToString(sum[:]), *hash)
 }
 
 // A tenant ban survives the banned user's self-erasure, so the same address

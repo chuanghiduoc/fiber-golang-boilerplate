@@ -577,24 +577,32 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 	if err := s.refuseLastOwnerErasure(ctx, in.UserID); err != nil {
 		return err
 	}
+	var providers []privacycontracts.Provider
 	if s.registry != nil {
-		providers := s.registry.Providers()
-		for _, provider := range providers {
-			if provider.Name == identityProviderName {
-				continue
-			}
-			if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
-				return fmt.Errorf("erase %s: %w", provider.Name, err)
-			}
+		providers = s.registry.Providers()
+	}
+	identitySeen := false
+	for _, provider := range providers {
+		if provider.Name == identityProviderName {
+			continue
 		}
-		for _, provider := range providers {
-			if provider.Name != identityProviderName {
-				continue
-			}
-			if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
-				return fmt.Errorf("erase %s: %w", provider.Name, err)
-			}
+		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+			return fmt.Errorf("erase %s: %w", provider.Name, err)
 		}
+	}
+	for _, provider := range providers {
+		if provider.Name != identityProviderName {
+			continue
+		}
+		identitySeen = true
+		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+			return fmt.Errorf("erase %s: %w", provider.Name, err)
+		}
+	}
+	if !identitySeen {
+		// Without identity's eraser the membership stays and no finalizer can
+		// make progress; fail loudly instead of reporting a partial erase.
+		return fmt.Errorf("identity privacy eraser is not registered")
 	}
 	return nil
 }

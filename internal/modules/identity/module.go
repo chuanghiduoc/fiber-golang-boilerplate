@@ -188,8 +188,8 @@ func (m *Module) registerPrivacyRoutes(v1 fiber.Router, deps app.Deps, jwtOnly f
 
 	// /admin is shared with the admin module, so middleware stays per route
 	// (a group middleware would run on the other module's admin routes).
-	// Global account erasure is JWT-only, like self-deletion: a tenant-scoped
-	// API key must not end access in every tenant.
+	// The route is JWT-only: a tenant-scoped API key must not trigger a
+	// destructive member erasure (it removes that tenant's membership).
 	admin := v1.Group("/admin")
 	admin.Post("/users/:id/erasure", jwtOnly, rl.Normal, authzhttp.Require(authz.PermissionAdminUsersDelete), deps.Idempotency, m.privacy.EraseUser)
 }

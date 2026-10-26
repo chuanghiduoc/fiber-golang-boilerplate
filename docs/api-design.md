@@ -342,13 +342,15 @@ global user (`erased+<id>@invalid`, empty name, `status: deleted`) only after
 every membership is `removed`, and deletes credentials, identities, sessions,
 and tokens. Admin erasure is tenant-scoped: it removes only the request
 tenant's membership and data, so the global account and other memberships keep
-working. In a tenant erase job identity's own eraser runs last, so a removed
-membership implies every other module's eraser succeeded. Audit rows keep only
-ids and outcomes. A banned membership keeps `banned_at` and a pseudonymous
-`banned_email_hash` (SHA-256 of the normalized address) through removal and
-erasure; the registration, invitation, and email-change checks match that
-hash, so the address cannot rejoin the tenant that banned it (GDPR
-Art.17(3)(e), legitimate interest in defending the ban).
+working. In a tenant erase job identity's own eraser runs last, so within that
+job a removed membership implies every other module's eraser succeeded. Audit
+rows keep only ids and outcomes. A banned membership keeps `banned_at` and a
+pseudonymous `banned_email_hash` (SHA-256 of the normalized address) through
+removal and erasure; the registration, invitation, and email-change checks
+match that hash, so the address cannot rejoin the tenant that banned it (GDPR
+Art.17(3)(e), legitimate interest in defending the ban). The marker of a
+membership removed while banned has no API to clear it; lifting that ban later
+is an audited operator action.
 
 ## Roles and platform administration
 

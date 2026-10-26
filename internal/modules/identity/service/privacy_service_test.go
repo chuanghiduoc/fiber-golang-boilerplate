@@ -455,6 +455,25 @@ func TestEraseJobTakesTheOwnerLockInsideItsTransaction(t *testing.T) {
 	assert.True(t, state.lockedInTx, "the last-owner lock must be taken inside the check transaction")
 }
 
+// The finalizer must never see a removed membership without an identity
+// eraser: without one the admin path would report success and leave the
+// membership, sessions, and exports in place.
+func TestEraseJobFailsWhenTheIdentityEraserIsMissing(t *testing.T) {
+	repo := newFakePrivacyRepo()
+	stores, db := privacyTestStores(repo)
+	registry := privacycontracts.NewRegistry()
+	registry.Register(privacycontracts.Provider{Name: "files", Exporter: fakeExporter{}, Eraser: fakeExporter{}})
+	svc := NewPrivacyService(PrivacyDeps{
+		Stores: stores, Tx: &fakePrivateTx{stores: stores, jobs: &fakeJobs{}},
+		Storage: failingPutStorage{}, Registry: registry,
+	})
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
+
+	err := svc.HandleEraseJob(ctx, mustJSON(eraseJob{UserID: 10}))
+	require.Error(t, err)
+	assert.Equal(t, MembershipStatusActive, db.memberships[[2]int64{tenant.DefaultID, 10}].Status)
+}
+
 func TestErasureJobIsIdempotentAndDeletesExports(t *testing.T) {
 	repo := newFakePrivacyRepo()
 	e, _ := repo.Create(context.Background(), 10)
