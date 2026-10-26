@@ -12,7 +12,7 @@ import (
 )
 
 func newTestUploadService(repo *mockFileRepo, store *mockStorage) UploadService {
-	return NewUploadService(repo, newFakeTx(repo), store)
+	return NewUploadService(repo, newFakeTx(repo), store, UploadOptions{})
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ func TestUpload(t *testing.T) {
 		store := newMockStorage()
 		// Use a special repo that always fails on Create
 		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: fmt.Errorf("db error")}
-		svc := NewUploadService(failRepo, newFakeTx(failRepo), store)
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, UploadOptions{})
 
 		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		requireStatus(t, err, 500)
@@ -83,7 +83,7 @@ func TestUpload(t *testing.T) {
 	t.Run("duplicate storage path is a conflict", func(t *testing.T) {
 		store := newMockStorage()
 		failRepo := &failingFileRepo{mockFileRepo: newMockFileRepo(), createErr: ErrStoragePathTaken}
-		svc := NewUploadService(failRepo, newFakeTx(failRepo), store)
+		svc := NewUploadService(failRepo, newFakeTx(failRepo), store, UploadOptions{})
 
 		_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 		requireStatus(t, err, 409)

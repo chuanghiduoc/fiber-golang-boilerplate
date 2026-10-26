@@ -64,3 +64,16 @@ WHERE tenant_id = @tenant_id::bigint
   AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
+
+-- name: LockFilesQuota :exec
+-- Serializes uploads of one tenant for the rest of the metadata transaction,
+-- so a concurrent upload cannot read the same free space and also pass.
+SELECT pg_advisory_xact_lock(hashtextextended('files.quota:' || @tenant_id::bigint, 0));
+
+-- name: FilesStorageUsage :one
+-- Both quotas count trashed rows: a soft-deleted blob still occupies storage.
+SELECT
+    COALESCE(SUM(size), 0)::bigint AS tenant_bytes,
+    COALESCE(SUM(size) FILTER (WHERE user_id = @user_id::bigint), 0)::bigint AS user_bytes
+FROM files
+WHERE tenant_id = @tenant_id::bigint;

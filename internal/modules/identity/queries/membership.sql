@@ -259,7 +259,13 @@ SELECT u.id, m.tenant_id, u.email, u.name,
            JOIN roles r ON r.id = pra.role_id
            WHERE pra.user_id = m.user_id AND r.scope = 'platform'
        ) AS platform,
-       m.credentials_revoked_at, t.status AS tenant_status
+       m.credentials_revoked_at,
+       CASE
+           WHEN t.status = 'active'
+                OR (t.status = 'trialing' AND t.trial_ends_at > NOW())
+           THEN 'active'
+           ELSE 'suspended'
+       END AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id
@@ -301,10 +307,38 @@ SELECT u.id, m.tenant_id, u.email, u.name,
            JOIN roles r ON r.id = pra.role_id
            WHERE pra.user_id = m.user_id AND r.scope = 'platform'
        ) AS platform,
-       m.credentials_revoked_at, t.status AS tenant_status
+       m.credentials_revoked_at,
+       CASE
+           WHEN t.status = 'active'
+                OR (t.status = 'trialing' AND t.trial_ends_at > NOW())
+           THEN 'active'
+           ELSE 'suspended'
+       END AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id
 WHERE m.tenant_id = $1 AND m.user_id = $2
   AND m.status = 'active' AND u.status = 'active'
 FOR SHARE OF m;
+
+-- name: ListTenantMembershipUserIDs :many
+-- The tenant purge walks every membership, including removed ones, in user-id
+-- batches so a large tenant never loads in one statement. The tenant purge
+-- then runs the privacy erasers for each user before deleting the memberships.
+SELECT user_id FROM memberships
+WHERE tenant_id = @tenant_id::bigint
+  AND user_id > @after_user_id::bigint
+ORDER BY user_id
+LIMIT @row_limit::int;
+
+-- name: DeleteTenantMembershipsBatch :execrows
+-- Runs after every module purger and invitation delete: those rows carry
+-- RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
+-- membership_roles cascade. A deleted tenant is not operational, so the
+-- last-owner trigger permits the delete. One bounded page per statement.
+DELETE FROM memberships
+WHERE id IN (
+    SELECT id FROM memberships
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);

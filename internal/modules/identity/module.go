@@ -9,6 +9,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
@@ -35,10 +36,11 @@ type Module struct {
 
 	// The job, schedule, and startup collaborators are set by Build; a module
 	// built with New (tests) has none.
-	resetSvc    identityservice.PasswordResetService
-	tokenPurger *identityservice.TokenPurger
-	privacySvc  *identityservice.PrivacyService
-	startup     func(ctx context.Context) error
+	resetSvc     identityservice.PasswordResetService
+	tokenPurger  *identityservice.TokenPurger
+	privacySvc   *identityservice.PrivacyService
+	tenantPurger *identityservice.TenantPurgeService
+	startup      func(ctx context.Context) error
 }
 
 var (
@@ -209,6 +211,16 @@ func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
 		return
 	}
 	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: m.privacySvc, Eraser: m.privacySvc})
+}
+
+// RegisterTenantPurge contributes identity's tenant-wide purger to the tenancy
+// registry. It runs last in the purge so the other modules can still reach the
+// memberships their rows reference.
+func (m *Module) RegisterTenantPurge(registry *tenancycontracts.Registry) {
+	if m.tenantPurger == nil {
+		return
+	}
+	registry.Register(tenancycontracts.Provider{Name: "identity", Purger: m.tenantPurger})
 }
 
 // SetNotifier wires the export-ready notification after notifications.Build.

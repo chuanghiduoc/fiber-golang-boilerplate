@@ -3188,8 +3188,20 @@ const docTemplate = `{
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
+                    "422": {
+                        "description": "file.infected when the malware scan matched",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "503": {
+                        "description": "file.scan_unavailable when a configured scanner failed",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }

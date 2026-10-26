@@ -345,7 +345,15 @@ All routes are in the request tenant; another user's or tenant's export id is
 | `POST /admin/users/:id/erasure` | JWT only, `admin:users:delete`, Tier 1 (`admin.user.erasure_requested`) | Erases the member's data and membership in the request tenant only; the global account and the user's memberships in other tenants stay intact. Queues exactly one `privacy.erase` job for the request tenant and no finalizer. `404` for a non-member (including a cross-tenant id), `409 user.last_admin` when the member is the request tenant's last active owner. API keys are refused because this is a destructive admin action. |
 
 The export document is `{userId, tenantId, generatedAt, sections: {identity,
-files, notifications, apikeys, features, webhooks}}`. Files include metadata
+files, notifications, apikeys, features, webhooks}}`. The identity section
+includes the profile, membership, sessions, linked external identities
+(`provider`, `subject`, `linkedAt`; never tokens), MFA configuration
+(`enabled`, `confirmedAt`, `recoveryCodesRemaining`; never the sealed secret or
+recovery-code hashes), the current membership role assignments with grant
+times (role history is not stored), invitations sent and received in the
+tenant, and the user's own `auditEvents` (`action`, `createdAt`, `ip`,
+`userAgent`, `resource`, `resourceId`, `outcome`) capped at 1000 rows, newest
+first. Files include metadata
 plus base64 content up to 64 MiB of blobs per export (the document is built
 in memory); files past that budget carry `contentOmitted: true` and stay
 downloadable through the files API; apikeys include metadata and scopes, never a hash;
@@ -394,7 +402,7 @@ permissions, and every route needs an MFA session (`amr` with `otp` or `rc`, oth
 | `GET /platform/tenants` | `platform:tenants:read` | Cursor list of every tenant in any lifecycle state, newest first (`limit`, `startingAfter`). |
 | `POST /platform/tenants` | `platform:tenants:write`, `Idempotency-Key` | Creates a tenant (default status `active`, or `trialing` with a future `trialEndsAt`) and its settings, and makes the caller its first `owner`. A duplicate slug is `409`. Tier 1 (`tenant.created`). |
 | `GET /platform/tenants/:id` | `platform:tenants:read` | Any tenant by id in any state. |
-| `PATCH /platform/tenants/:id/status` | `platform:tenants:write`, `Idempotency-Key` | Moves a tenant along the lifecycle state machine; an invalid transition is `409`, and the default tenant cannot be deleted. Tier 1 (`tenant.status_changed`). |
+| `PATCH /platform/tenants/:id/status` | `platform:tenants:write`, `Idempotency-Key` | Moves a tenant along the lifecycle state machine; an invalid transition is `409`, and the default tenant cannot be deleted. Tier 1 (`tenant.status_changed`). A `trialing` tenant past `trialEndsAt` is already treated as non-operational (404, sessions 401); the hourly trial-expiry job transitions it to `suspended` with `reason: trial_expired`. |
 | `POST /platform/users/:id/mfa/reset` | `platform:users:mfa_reset` (JWT only), `Idempotency-Key` | Recovery when a user lost the authenticator and recovery codes: delete the confirmed and pending factor plus recovery codes, revoke every session in every tenant, bump `token_version`. `404` for an unknown user. Tier 1 (`admin.user.mfa_reset`). |
 
 Global feature-flag rows (database default, kill switch, delete) require
@@ -420,6 +428,13 @@ targets remain `admin:features:write`.
 
 - Configured via `RATE_LIMIT_*`; tiers are strict/normal/relaxed with separate
   keyspaces. Cache-backed (Redis in production; memory is single-replica only).
+- The window is a sliding approximation (current window plus the previous one
+  weighted by overlap, floored), so a client cannot double its allowance at a
+  boundary. Rejected retries do not advance the counter. Responses carry
+  `RateLimit-Policy` and `RateLimit` (IETF
+  draft-ietf-httpapi-ratelimit-headers) plus the legacy `X-RateLimit-*` headers;
+  `429` also carries `Retry-After`, pointing at the first second the caller fits
+  again.
 - Keyed per API key when authenticated with `ApiKey`, otherwise per user, then
   per IP. `429` is retryable. Rotating a key moves later requests to a new
   bucket.
@@ -470,6 +485,16 @@ targets remain `admin:features:write`.
 
 - `POST /files/upload` accepts multipart `file`, enforces size and a MIME
   allowlist, and stores blobs under `<tenantID>/<userID>/<uuid>.<ext>`.
+- Uploads enforce optional byte quotas (`FILES_TENANT_QUOTA_BYTES`,
+  `FILES_USER_QUOTA_BYTES`; 0 = unlimited) over live plus trashed files. The
+  check runs inside the metadata transaction under a per-tenant advisory lock,
+  so two concurrent uploads cannot both pass; an upload over quota is `413
+  file.quota_exceeded` and its stored blob is removed.
+- With `FILES_SCAN_DRIVER=clamav`, each stored blob is streamed to clamd before
+  the metadata row is committed. A signature match is `422 file.infected`; a
+  scanner failure is fail-closed `503 file.scan_unavailable`. The blob is
+  removed in both cases. `none` (the default) skips scanning and logs a
+  production startup warning.
 - Downloads are authenticated and tenant/ownership checked; there is no public
   `/uploads` tree. Cross-tenant or other-owner ids return `404`, never `403`
   (`authz.TenantPolicy` + `authz.OwnerPolicy`; admin services use the tenant

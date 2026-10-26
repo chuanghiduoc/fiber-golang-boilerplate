@@ -77,6 +77,9 @@ func (p *recordingPublisher) Publish(_ context.Context, event events.Event) erro
 type mockFileRepo struct {
 	files  map[int64]*File
 	nextID int64
+	// quotaLocks counts LockQuota calls; the usage totals are computed from
+	// files, so tests seed rows instead of stubbing them.
+	quotaLocks int
 }
 
 // scoped mirrors the repository's tenant predicate so service tests cannot
@@ -189,6 +192,24 @@ func (m *mockFileRepo) AdminFileStats(ctx context.Context) (FileStats, error) {
 		stats.TotalFileSize += f.Size
 	}
 	return stats, nil
+}
+
+func (m *mockFileRepo) LockQuota(context.Context) error {
+	m.quotaLocks++
+	return nil
+}
+
+func (m *mockFileRepo) StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error) {
+	for _, f := range m.files {
+		if !m.scoped(ctx, f) {
+			continue
+		}
+		tenantBytes += f.Size
+		if f.UserID == userID {
+			userBytes += f.Size
+		}
+	}
+	return tenantBytes, userBytes, nil
 }
 
 // ---------------------------------------------------------------------------

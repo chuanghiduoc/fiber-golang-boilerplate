@@ -114,6 +114,24 @@ func (r *FileRepository) AdminFileStats(ctx context.Context) (filesvc.FileStats,
 	return filesvc.FileStats{TotalFiles: stats.TotalFiles, TotalFileSize: stats.TotalFileSize}, nil
 }
 
+// LockQuota takes the per-tenant advisory lock that serializes uploads. The
+// lock is transaction-scoped: the upload service calls this inside its
+// metadata transaction, and the lock releases with the commit or rollback.
+func (r *FileRepository) LockQuota(ctx context.Context) error {
+	return r.q.LockFilesQuota(ctx, tenantID(ctx))
+}
+
+func (r *FileRepository) StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error) {
+	usage, err := r.q.FilesStorageUsage(ctx, filesqlc.FilesStorageUsageParams{
+		TenantID: tenantID(ctx),
+		UserID:   userID,
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return usage.TenantBytes, usage.UserBytes, nil
+}
+
 // oneFile maps a single-row query result.
 func oneFile(row filesqlc.File, err error) (*filesvc.File, error) {
 	if err != nil {

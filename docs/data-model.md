@@ -111,6 +111,7 @@ erDiagram
         timestamptz status_changed_at
         timestamptz trial_ends_at "required while trialing"
         timestamptz deletion_scheduled_at "set iff pending_deletion or deleted"
+        timestamptz purged_at "set once the deleted-tenant purge completes"
     }
     tenant_settings {
         bigint tenant_id PK, FK
@@ -266,9 +267,15 @@ erDiagram
   (cancelled) | deleted`; `deleted` is terminal. A `pending_deletion` tenant
   cannot become `deleted` before `deletion_scheduled_at` (`409
   tenant.deletion_not_due`, a 30-day grace period). Only `trialing` and
-  `active` tenants serve requests. Tenant 1 can never enter `pending_deletion`
-  or `deleted`. Tenants are never hard-deleted, so every `tenants` reference is
-  `RESTRICT`/`NO ACTION`.
+  `active` tenants serve requests, and a `trialing` tenant stops serving the
+  moment `trial_ends_at` passes (its status is then moved to `suspended` by
+  the hourly audited trial-expiry job). Tenant 1 can never enter
+  `pending_deletion` or `deleted`. Tenants are never hard-deleted, so every
+  `tenants` reference is `RESTRICT`/`NO ACTION`. A `deleted` tenant keeps its
+  row and `audit_events`; the hourly purge erases the memberships' per-user
+  data and every module's tenant-wide rows in bounded 500-row pages (deleting
+  file/export blobs before their rows), then stamps `purged_at` (a
+  `CHECK` allows it only on `deleted`).
 - **Users** are global. `email` is stored normalized (`CHECK (email =
   lower(btrim(email)))`) and the partial unique index `idx_users_email_live`
   allows one live account per address; deleting an account (`status =
@@ -303,7 +310,11 @@ erDiagram
   document key and a 7-day `expires_at`; a failed export is retried only while
   the job has attempts. Expired, failed, and stale (>1 day) queued/running rows
   are removed by `privacy.exports.purge` (blob, then row); erasure removes them
-  immediately.
+  immediately. The export's identity section covers the profile, membership,
+  sessions, linked `user_identities` (no tokens), MFA state (no secret or
+  recovery hashes), current `membership_roles` with grant times, invitations
+  sent/received, and the user's own `audit_events` (capped at 1000, newest
+  first).
 - **RBAC**: `permissions` is the code-owned catalog synchronized at
   API startup (key + registering owner). `roles` holds system roles
   (`tenant_id IS NULL`, seeded: tenant `owner`, `admin`, `member`; platform
@@ -364,6 +375,7 @@ erDiagram
 | Table | Key constraint / index | Why |
 |---|---|---|
 | `users` | partial unique `(email) WHERE status <> 'deleted'` | One live account per address, globally. |
+| `tenants` | partial `(id) WHERE status = 'deleted' AND purged_at IS NULL` | The hourly deleted-tenant purge scans only unfinished deletions. |
 | `data_exports` | partial unique `(tenant_id, user_id) WHERE status IN ('queued','running')`; `(tenant_id, user_id, created_at DESC, id DESC)`; partial `(expires_at)` | One active export per membership; caller list cursor; hourly expiry purge. |
 | `memberships` | unique `(tenant_id, user_id)`; `(user_id)`; `(tenant_id, created_at DESC, user_id DESC)`; partial `(tenant_id, user_id)` for suspended rows | Cross-module FK parent; per-user lookups (login, account deletion); member-list cursor (`joinedAt`, id); ban check. |
 | `roles` | unique `(tenant_id, key) NULLS NOT DISTINCT` | One system role per key, one tenant role per key. |

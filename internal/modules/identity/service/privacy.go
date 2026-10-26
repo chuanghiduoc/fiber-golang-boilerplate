@@ -17,6 +17,7 @@ import (
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -91,6 +92,102 @@ type identityExport struct {
 		RemovedAt *time.Time `json:"removedAt,omitempty"`
 	} `json:"membership"`
 	Sessions []sessionExport `json:"sessions"`
+	// Identities are linked external accounts (provider, subject, linked_at);
+	// no token is ever stored or exported for them.
+	Identities []externalIdentityExport `json:"identities"`
+	// MFA reports configuration state only: never the sealed TOTP secret or a
+	// recovery-code hash.
+	MFA mfaExport `json:"mfa"`
+	// RoleAssignments are the current membership roles in this tenant. Role
+	// changes are not historized, so this is the full role history the data
+	// model keeps.
+	RoleAssignments []roleAssignmentExport `json:"roleAssignments"`
+	// InvitationsSent / InvitationsReceived are the user's invitations in this
+	// tenant (created by them, or addressed to them / accepted by them).
+	InvitationsSent     []invitationExport `json:"invitationsSent"`
+	InvitationsReceived []invitationExport `json:"invitationsReceived"`
+	// AuditEvents is capped at privacyAuditEventLimit, newest first. Only the
+	// user's own rows are included; audit metadata is never exported.
+	AuditEvents []auditEventExport `json:"auditEvents"`
+}
+
+type externalIdentityExport struct {
+	Provider string    `json:"provider"`
+	Subject  string    `json:"subject"`
+	LinkedAt time.Time `json:"linkedAt"`
+}
+
+type mfaExport struct {
+	Enabled                bool       `json:"enabled"`
+	ConfirmedAt            *time.Time `json:"confirmedAt,omitempty"`
+	RecoveryCodesRemaining int64      `json:"recoveryCodesRemaining"`
+}
+
+type roleAssignmentExport struct {
+	Key        string    `json:"key"`
+	AssignedAt time.Time `json:"assignedAt"`
+}
+
+type invitationExport struct {
+	ID         int64      `json:"id"`
+	Email      string     `json:"email"`
+	Role       string     `json:"role"`
+	Status     string     `json:"status"`
+	InvitedBy  int64      `json:"invitedBy"`
+	AcceptedBy *int64     `json:"acceptedBy,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	ExpiresAt  time.Time  `json:"expiresAt"`
+	AcceptedAt *time.Time `json:"acceptedAt,omitempty"`
+}
+
+type auditEventExport struct {
+	Action     string    `json:"action"`
+	CreatedAt  time.Time `json:"createdAt"`
+	IP         string    `json:"ip,omitempty"`
+	UserAgent  string    `json:"userAgent,omitempty"`
+	Resource   string    `json:"resource"`
+	ResourceID string    `json:"resourceId,omitempty"`
+	Outcome    string    `json:"outcome"`
+}
+
+const (
+	// privacyAuditEventLimit bounds the user's own audit rows in one export so
+	// a long-lived account cannot make the document unbounded.
+	privacyAuditEventLimit = 1000
+)
+
+// IdentityExportRepository is the identity-only read side of the export:
+// linked external identities, current role assignments, and invitations.
+type IdentityExportRepository interface {
+	ListExternalIdentities(ctx context.Context, userID int64) ([]ExternalIdentityExport, error)
+	ListRoleAssignments(ctx context.Context, tenantID, userID int64) ([]RoleAssignmentExport, error)
+	ListInvitationsSent(ctx context.Context, tenantID, userID int64) ([]InvitationExport, error)
+	ListInvitationsReceived(ctx context.Context, tenantID, userID int64, email string) ([]InvitationExport, error)
+}
+
+// ExternalIdentityExport is one linked provider account without any token.
+type ExternalIdentityExport struct {
+	Provider string
+	Subject  string
+	LinkedAt time.Time
+}
+
+// RoleAssignmentExport is one current membership role assignment.
+type RoleAssignmentExport struct {
+	Key        string
+	AssignedAt time.Time
+}
+
+// InvitationExport is one invitation the user sent or received.
+type InvitationExport struct {
+	ID         int64
+	Email      string
+	Role       string
+	InvitedBy  int64
+	AcceptedBy *int64
+	CreatedAt  time.Time
+	ExpiresAt  time.Time
+	AcceptedAt *time.Time
 }
 
 type sessionExport struct {
@@ -119,6 +216,11 @@ type PrivacyDeps struct {
 	Notifier     notificationcontracts.Notifier
 	Verifier     PasswordVerifier
 	SessionCache session.Store
+	// ExportStore supplies the identity-only export reads (external
+	// identities, roles, invitations). Nil in fakes that do not exercise them.
+	ExportStore IdentityExportRepository
+	// AuditEvents reads the user's own audit rows; nil exports an empty list.
+	AuditEvents audit.UserEventReader
 }
 
 // PrivacyService owns data exports, the erasure fan-out, and the identity
@@ -130,6 +232,8 @@ type PrivacyService struct {
 	registry     *privacycontracts.Registry
 	verifier     PasswordVerifier
 	sessionCache session.Store
+	exportStore  IdentityExportRepository
+	auditEvents  audit.UserEventReader
 
 	mu       sync.RWMutex
 	notifier notificationcontracts.Notifier
@@ -145,6 +249,8 @@ func NewPrivacyService(deps PrivacyDeps) *PrivacyService {
 		registry:     deps.Registry,
 		verifier:     deps.Verifier,
 		sessionCache: deps.SessionCache,
+		exportStore:  deps.ExportStore,
+		auditEvents:  deps.AuditEvents,
 		notifier:     deps.Notifier,
 	}
 }
@@ -402,11 +508,120 @@ func (s *PrivacyService) Export(ctx context.Context, tenantID, userID int64) (pr
 			RevokedAt: sess.RevokedAt, RevokedReason: string(sess.RevokedReason),
 		}
 	}
+	if s.exportStore != nil {
+		identities, err := s.exportStore.ListExternalIdentities(tctx, userID)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		out.Identities = make([]externalIdentityExport, len(identities))
+		for i, identity := range identities {
+			out.Identities[i] = externalIdentityExport(identity)
+		}
+		roles, err := s.exportStore.ListRoleAssignments(tctx, tenantID, userID)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		out.RoleAssignments = make([]roleAssignmentExport, len(roles))
+		for i, role := range roles {
+			out.RoleAssignments[i] = roleAssignmentExport(role)
+		}
+		sent, err := s.exportStore.ListInvitationsSent(tctx, tenantID, userID)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		out.InvitationsSent = toInvitationExports(sent)
+		received, err := s.exportStore.ListInvitationsReceived(tctx, tenantID, userID, user.Email)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		out.InvitationsReceived = toInvitationExports(received)
+	}
+	if out.Identities == nil {
+		out.Identities = []externalIdentityExport{}
+	}
+	if out.RoleAssignments == nil {
+		out.RoleAssignments = []roleAssignmentExport{}
+	}
+	if out.InvitationsSent == nil {
+		out.InvitationsSent = []invitationExport{}
+	}
+	if out.InvitationsReceived == nil {
+		out.InvitationsReceived = []invitationExport{}
+	}
+
+	mfa, err := s.exportMFAStatus(tctx, userID)
+	if err != nil {
+		return privacycontracts.Section{}, err
+	}
+	out.MFA = mfa
+
+	if s.auditEvents != nil {
+		events, err := s.auditEvents.ListUserEvents(tctx, tenantID, userID, privacyAuditEventLimit)
+		if err != nil {
+			return privacycontracts.Section{}, err
+		}
+		out.AuditEvents = make([]auditEventExport, len(events))
+		for i, event := range events {
+			out.AuditEvents[i] = auditEventExport{
+				Action: event.Action, CreatedAt: event.CreatedAt,
+				IP: event.IP, UserAgent: event.UserAgent,
+				Resource: event.Resource, ResourceID: event.ResourceID, Outcome: event.Outcome,
+			}
+		}
+	}
+	if out.AuditEvents == nil {
+		out.AuditEvents = []auditEventExport{}
+	}
 	data, err := json.Marshal(out)
 	if err != nil {
 		return privacycontracts.Section{}, fmt.Errorf("marshal identity export: %w", err)
 	}
 	return privacycontracts.Section{Name: "identity", Data: data}, nil
+}
+
+// exportMFAStatus reports configuration only: the sealed secret and the
+// recovery-code hashes never enter the document.
+func (s *PrivacyService) exportMFAStatus(ctx context.Context, userID int64) (mfaExport, error) {
+	if s.stores.MFA == nil {
+		return mfaExport{}, nil
+	}
+	factor, err := s.stores.MFA.GetTOTP(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return mfaExport{}, nil
+		}
+		return mfaExport{}, err
+	}
+	remaining, err := s.stores.MFA.CountUnusedRecoveryCodes(ctx, userID)
+	if err != nil {
+		return mfaExport{}, err
+	}
+	return mfaExport{
+		Enabled:                factor.Confirmed(),
+		ConfirmedAt:            factor.ConfirmedAt,
+		RecoveryCodesRemaining: remaining,
+	}, nil
+}
+
+func toInvitationExports(invitations []InvitationExport) []invitationExport {
+	now := time.Now()
+	out := make([]invitationExport, len(invitations))
+	for i, invitation := range invitations {
+		status := "pending"
+		switch {
+		case invitation.AcceptedAt != nil:
+			status = "accepted"
+		case !invitation.ExpiresAt.After(now):
+			status = "expired"
+		}
+		out[i] = invitationExport{
+			ID: invitation.ID, Email: invitation.Email, Role: invitation.Role, Status: status,
+			InvitedBy: invitation.InvitedBy, AcceptedBy: invitation.AcceptedBy,
+			CreatedAt: invitation.CreatedAt, ExpiresAt: invitation.ExpiresAt,
+			AcceptedAt: invitation.AcceptedAt,
+		}
+	}
+	return out
 }
 
 // Erase implements privacy.Eraser for identity's own data: export documents,
@@ -580,6 +795,13 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 	if err := s.refuseLastOwnerErasure(ctx, in.UserID); err != nil {
 		return err
 	}
+	return s.eraseUserInTenant(ctx, tenantID, in.UserID)
+}
+
+// eraseUserInTenant runs every registered tenant eraser for one user, identity
+// last: its eraser removes the membership, so a removed membership proves the
+// other modules finished. The tenant purge reuses it per membership.
+func (s *PrivacyService) eraseUserInTenant(ctx context.Context, tenantID, userID int64) error {
 	var providers []privacycontracts.Provider
 	if s.registry != nil {
 		providers = s.registry.Providers()
@@ -589,7 +811,7 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 		if provider.Name == identityProviderName {
 			continue
 		}
-		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+		if err := provider.Eraser.Erase(ctx, tenantID, userID); err != nil {
 			return fmt.Errorf("erase %s: %w", provider.Name, err)
 		}
 	}
@@ -598,7 +820,7 @@ func (s *PrivacyService) HandleEraseJob(ctx context.Context, payload json.RawMes
 			continue
 		}
 		identitySeen = true
-		if err := provider.Eraser.Erase(ctx, tenantID, in.UserID); err != nil {
+		if err := provider.Eraser.Erase(ctx, tenantID, userID); err != nil {
 			return fmt.Errorf("erase %s: %w", provider.Name, err)
 		}
 	}

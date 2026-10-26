@@ -98,7 +98,13 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 
 const getSessionState = `-- name: GetSessionState :one
 SELECT s.tenant_id, s.revoked_at, s.expires_at, m.status AS membership_status,
-       u.token_version, u.status AS user_status, t.status AS tenant_status,
+       u.token_version, u.status AS user_status,
+       CASE
+           WHEN t.status = 'active'
+                OR (t.status = 'trialing' AND t.trial_ends_at > NOW())
+           THEN 'active'
+           ELSE 'suspended'
+       END AS tenant_status,
        COALESCE((
            SELECT array_agg(r.key ORDER BY
                CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key)

@@ -9,6 +9,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	featurescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/catalog"
 	featureshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/handler"
 	featuresprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/privacy"
@@ -19,8 +20,9 @@ import (
 
 // Module wires the feature-flag admin HTTP surface into the application.
 type Module struct {
-	handler *featureshandler.Handler
-	privacy *featuresprivacy.Provider
+	handler      *featureshandler.Handler
+	privacy      *featuresprivacy.Provider
+	tenantPurger tenancycontracts.Purger
 }
 
 var _ app.PrivacyProvider = (*Module)(nil)

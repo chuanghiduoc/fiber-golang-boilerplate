@@ -71,7 +71,7 @@ module, and `platform`/`pkg` never import modules.
 | `config` | One file per concern; `Config.Validate` runs section validators in a fixed order and reports the first error |
 | `internal/app` | Fiber app, global middleware, module registry, provider hooks, `app.Infra` (shared config only in `Infra.Platform`: App, JWT, Tenant) |
 | `internal/modules/<m>` | `module.go` (Build + providers), `catalog/` (permissions, error codes, flags, locales), dto/handler/service/repository, `queries/` + generated `sqlc/`. Modules: identity, files, features, notifications, admin (contracts-only, no SQL), webhooks, apikeys |
-| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests) |
+| `internal/contracts/<provider>` | Stdlib-only contracts per providing module: identity (admin, principal reader, notification recipient, `user.registered` payload), files (admin, `file.*` event payloads), notifications (notifier), privacy (exporter/eraser registry for GDPR requests), tenancy (tenant-wide `Purger` registry for deleted tenants) |
 | `internal/platform` | authz, audit, events, features, i18n, jobs, requestctx, scheduler, session, tenant, tracing, versioning, middleware |
 | `pkg` | apperror, response, database, cache, storage, email, webhook, ... |
 | `migrations` | one init pair `20260101000000_platform_init_schema` with `-- owner:` sections; later changes are `<UTC ts>_<owner>_<purpose>.{up,down}.sql` |
@@ -205,7 +205,13 @@ migrations) to its owners; keep it current when adding a module.
   `trialing`/`active` serve requests; transitions go through the audited
   identity `TenantService`, exposed on the platform tenant routes;
   `pending_deletion → deleted` is refused (409 `tenant.deletion_not_due`)
-  before `deletion_scheduled_at`.
+  before `deletion_scheduled_at`. The hourly `identity.tenants.purge_deleted`
+  schedule erases a deleted tenant's per-member data through the privacy
+  erasers, then every module's tenant-wide data through the
+  `internal/contracts/tenancy` `Purger` registry (batched, idempotent; audit
+  rows and the `tenants` row stay, `tenants.purged_at` records completion).
+  `identity.tenants.expire_trials` suspends `trialing` tenants past
+  `trial_ends_at`, which also stop serving requests at once.
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
@@ -455,7 +461,12 @@ handler/service/DTO/repository package.
   `APIKEYS_MAX_LIFETIME` (default 8760h) and a later one is 400.
 - **Files:** repositories always pass `tenant.EffectiveID(ctx)`; services also
   compare the row's `TenantID`/`UserID` before exposing it. Uploads reject an
-  invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`.
+  invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`. Optional
+  quotas (`FILES_TENANT_QUOTA_BYTES`, `FILES_USER_QUOTA_BYTES`, 0 =
+  unlimited; trashed files count) are checked in the metadata transaction
+  under a per-tenant advisory lock (`file.quota_exceeded`). `FILES_SCAN_DRIVER`
+  `none|clamav` (`FILES_CLAMAV_ADDR`) scans the stored blob before commit and
+  fails closed (`file.infected` 422, `file.scan_unavailable` 503).
 - **Jobs** (`internal/platform/jobs`, details in `docs/operations.md`):
   - At-least-once; handlers must be idempotent and honor context
     cancellation. Never use `async.Go` for durable work.
@@ -657,7 +668,9 @@ handler/service/DTO/repository package.
   `GET /me/data-exports/:id[/download]`, `POST /me/erasure`, and
   `POST /admin/users/:id/erasure` (`admin:users:delete`). Export jobs write one
   JSON document per tenant/user for 7 days (blobs embedded up to 64 MiB, later
-  files marked `contentOmitted`); self erasure fans out one
+  files marked `contentOmitted`; identity's section also carries linked
+  identities, MFA status, invitations, and the user's own audit events, never
+  secrets or hashes); self erasure fans out one
   `privacy.erase` job per membership plus a retryable finalizer that
   anonymizes the global user only after every membership is `removed`. Admin
   erasure is tenant-scoped: one erase job for the request tenant, no
@@ -705,8 +718,11 @@ handler/service/DTO/repository package.
   unread; chunked bodies read through a limited reader). Only multipart on
   `POST /api/v1/files/upload` (`filesUploadPath` in `internal/app`, keep it in
   sync with the files route) may use `APP_BODY_LIMIT`.
-- **Rate limits:** tiered, cache-backed; authenticated requests keyed per user,
-  unauthenticated per IP.
+- **Rate limits:** tiered, cache-backed sliding window (current + weighted
+  previous window); authenticated requests keyed per user, unauthenticated
+  per IP. Responses carry `RateLimit-Policy`/`RateLimit`
+  (draft-ietf-httpapi-ratelimit-headers) plus legacy `X-RateLimit-*` and
+  `Retry-After`.
 - **Idempotency** (`docs/operations.md` flowchart): opt-in `Idempotency-Key`
   via `deps.Idempotency`, scoped by method/path/tenant ID+slug/caller (user, or
   IP for public routes). 2xx replays for 24h; non-multipart bodies ≤1 MiB are

@@ -88,6 +88,7 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 	})
 	m.retentionDays = int32(cfg.RetentionDays) // #nosec G115 -- validated 1..3650 days
 	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.DB))
+	m.tenantPurger = webhookrepo.NewTenantPurger(infra.DB)
 	return m, nil
 }
 

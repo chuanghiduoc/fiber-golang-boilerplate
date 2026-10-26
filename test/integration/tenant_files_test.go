@@ -106,7 +106,7 @@ func setupTenantFilesHarness(t *testing.T) *tenantFilesHarness {
 	require.NoError(t, err)
 
 	filesTx := filesrepo.NewTransactor(testutil.NewTxManager(pool), audit.NewPostgresRecorder(testutil.Scoped(pool)), nil)
-	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store)
+	uploadSvc := filesvc.NewUploadService(fileRepo, filesTx, store, filesvc.UploadOptions{})
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, 10<<20, []string{"application/pdf"})
 	filesAdmin := adapter.NewAdminFiles(filesvc.NewAdminFileService(fileRepo, filesTx, store))
 	adminHandler := adminhandler.NewHandler(adminservice.NewService(zeroIdentityAdmin{}, filesAdmin))

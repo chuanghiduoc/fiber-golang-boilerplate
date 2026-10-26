@@ -16,6 +16,7 @@ type Config struct {
 	DB           DBConfig
 	JWT          JWTConfig
 	Storage      StorageConfig
+	Files        FilesConfig
 	OAuth        OAuthConfig
 	CORS         CORSConfig
 	RateLimit    RateLimitConfig
@@ -108,6 +109,7 @@ func (cfg *Config) Validate() error {
 		cfg.App.validateBodyLimits,
 		cfg.RateLimit.validate,
 		cfg.Storage.validateMaxFileSize,
+		cfg.Files.validate,
 		cfg.DB.Validate,
 		// Observability: tracing is inert unless explicitly enabled.
 		cfg.Tracing.Validate,

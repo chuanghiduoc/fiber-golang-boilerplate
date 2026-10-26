@@ -9,6 +9,7 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	webhookshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/handler"
 	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
@@ -31,6 +32,7 @@ type Module struct {
 	client         *webhook.Client
 	retentionDays  int32
 	privacy        *webhooksprivacy.Provider
+	tenantPurger   tenancycontracts.Purger
 }
 
 var _ app.PrivacyProvider = (*Module)(nil)

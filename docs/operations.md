@@ -456,7 +456,9 @@ another reset email) instead of updating dead rows back to `queued`.
 ### Tenant lifecycle
 
 Tenant status is `trialing | active | suspended | pending_deletion |
-deleted`; only `trialing` and `active` serve requests. Transitions go through
+deleted`; only `trialing` and `active` serve requests, and a `trialing` tenant
+stops serving as soon as `trial_ends_at` passes (resolved as not found before
+the hourly job writes `suspended`). Transitions go through
 the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
 which enforces the state machine (`trialing → active | suspended |
 pending_deletion`, `active ↔ suspended`, `active | suspended →
@@ -467,7 +469,9 @@ deleted (also a `CHECK`). Platform admins use `PATCH
 /platform/tenants/:id/status`; operator tooling must call the service rather
 than raw `UPDATE`s, which skip the audit row. A
 non-operational tenant returns `404` on tenant resolution after the resolver
-cache TTL (30s) and `401` for existing sessions and API keys.
+cache TTL (30s) and `401` for existing sessions and API keys. A `deleted`
+tenant's data is erased by the hourly purge (below); the `tenants` row and its
+audit trail remain.
 
 ### Data retention overview
 
@@ -486,12 +490,16 @@ loops run in every worker process regardless.
 | Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
+| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers, then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, 100 memberships per page, 500-row batches per tenant table (files/export blobs before their rows); every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (id) WHERE status = 'deleted' AND purged_at IS NULL` |
+| Expired trials | A `trialing` tenant whose `trial_ends_at` has passed is not operational immediately (404) and is transitioned to `suspended` through the audited tenant service | `identity.tenants.expire_trials`, hourly (scheduler) | 100 tenants per run, re-checked under the row lock; an admin transition wins and is a no-op | — |
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
 indefinitely, notifications are never deleted, expired export documents stay in
-storage, and expired tokens and scheduler ledger rows accumulate. The Kubernetes
-ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
+storage, expired tokens and scheduler ledger rows accumulate, expired trials
+keep their `trialing` status (though their requests already return 404), and
+deleted tenants keep their data (the `tenants` row is never removed). The
+Kubernetes ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
 (`APP_ROLE=all` or `worker`); `cmd/api` logs a production warning when a
 worker-capable process starts with it off. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
@@ -547,6 +555,42 @@ of the normalized address, kept with `banned_at` solely to enforce the
 tenant's ban (GDPR Art.17(3)(e) legitimate interest). An unban of a suspended
 membership clears both; a removed membership keeps them for the tenant's
 records.
+
+The identity section of the export includes the profile, membership, sessions,
+linked external identities (`provider`, `subject`, `linkedAt` — never a
+token), MFA configuration (`enabled`, `confirmedAt`, `recoveryCodesRemaining`;
+never the sealed secret or a recovery-code hash), the current membership role
+assignments with their grant times (role history is not stored), invitations
+the user sent and received in the tenant, and the user's own `audit_events`
+rows (`action`, `createdAt`, `ip`, `userAgent`, `resource`, `resourceId`,
+`outcome`). The audit list is capped at 1000 rows, newest first; audit metadata
+is never exported.
+
+#### Deleted tenants
+
+`status = 'deleted'` is terminal, but the row itself is never removed: it is
+the tenant's identity for audit and incident review. The hourly
+`identity.tenants.purge_deleted` job lists deleted tenants with `purged_at IS
+NULL` and, per tenant, runs the same registered privacy erasers as a tenant
+erase job for every membership (including removed ones; no global finalizer),
+then asks every module's `tenancy.Purger` to remove its tenant-wide rows
+(webhook endpoints/events/deliveries/inbound sources, tenant roles,
+`feature_flag_targets`, invitations, API keys, files and blobs, notifications,
+data exports). Identity's purger runs last: it deletes the memberships (and
+their sessions, refresh tokens, and role assignments), the tenant's custom
+roles, and `tenant_settings`. Every table is drained in bounded 500-row pages
+(and every files/export page deletes its blobs before its rows), so a large
+tenant never loads its whole table or blob list into memory. Only after every
+phase succeeds does it write `tenants.purged_at` and a
+`tenant.purged` audit row in one transaction. Each phase is idempotent, so a
+failure or worker restart retries the same tenant; no phase accepts a tenant
+id other than the job's explicit tenant scope, and RLS backs that.
+
+`audit_events` is append-only and is never touched by the purge. A tenant whose
+trial has ended is already not operational (its resolution and every session
+check return 404/401), and the hourly `identity.tenants.expire_trials` job
+moves it to `suspended` through the audited `TenantService` path
+(`tenant.status_changed` with `reason: trial_expired`, system actor).
 
 #### Files trash purge
 
@@ -1019,9 +1063,9 @@ the handler, so a retry that races the owner's completion still replays.
 
 | Rule | Behavior |
 | --- | --- |
-| Algorithm | Fixed windows aligned to epoch multiples of the tier window. One atomic `INCR` (+`PEXPIRE` on first hit) per request on `ratelimit:<tier>:<apikey\|user\|ip>:<id>:<windowStart>`, so replicas sharing Redis cannot race. A client can send up to twice the limit across a window boundary. |
-| Headers | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429`. |
-| `auth` tier | Protected routes pass a per-client-IP tier (`RATE_LIMIT_AUTH_MAX`, default 300 per `RATE_LIMIT_AUTH_WINDOW_SECS`, default 60) inside `Deps.Authenticate()`, **before** the token or API key is checked; otherwise a flood of bogus `Authorization: ApiKey ...` headers would cost one database lookup each. Clients behind a shared NAT share it; raise it rather than remove it. It sets only `Retry-After` on `429`. |
+| Algorithm | Sliding-window approximation: `floor(previous * (1 - elapsed/window)) + current`, where each window is aligned to an epoch multiple of the tier window. The current counter is advanced atomically only while the result stays within the limit (`INCR` only when below the cap, `PEXPIRE` on first admission), so a rejected retry never consumes a slot or extends the block. The key is `ratelimit:<tier>:<apikey\|user\|ip>:<id>:<windowStart>`, so replicas sharing Redis cannot race. Filling one window no longer doubles the allowance at the next boundary; capacity returns gradually as the previous window ages out. |
+| Headers | IETF draft `RateLimit-Policy: "<tier>";q=<limit>;w=<window>` and `RateLimit: "<tier>";r=<remaining>;t=<seconds to window reset>`, plus the legacy `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on `429` (all set on allowed and rejected responses). `Retry-After` is the first second at which the caller fits again, so it may be one second past the window boundary when the current window is full. |
+| `auth` tier | Protected routes pass a per-client-IP sliding window (`RATE_LIMIT_AUTH_MAX`, default 300 per `RATE_LIMIT_AUTH_WINDOW_SECS`, default 60) inside `Deps.Authenticate()`, **before** the token or API key is checked; otherwise a flood of bogus `Authorization: ApiKey ...` headers would cost one database lookup each. Clients behind a shared NAT share it; raise it rather than remove it. It sets only `Retry-After` on `429`. |
 | Cache errors | Fail open: the request is allowed, a warning is logged, and `rate_limit_errors_total{tier}` increments. Login lockouts are separate and fail closed. |
 
 ### Fail-fast bounds
@@ -1031,7 +1075,7 @@ second per request:
 
 | Operation | Bound |
 | --- | --- |
-| Rate-limit increment | 250ms |
+| Rate-limit counter operations | 250ms (previous-window read and bounded increment share one budget) |
 | Idempotency lookup / lock claim | 250ms |
 | Idempotency response write and lock release | 500ms |
 | `REDIS_DIAL_TIMEOUT_MS` | 2000 |
@@ -1695,6 +1739,8 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
 | `SCHEDULER_RETENTION_DAYS` | `scheduler_runs` retention (default 30) |
 | `FILES_TRASH_RETENTION_DAYS` / `NOTIFICATIONS_RETENTION_DAYS` | Days a soft-deleted file stays restorable before its blob and row are purged (default 30), and days a read notification is kept after being read (default 180; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
+| `FILES_TENANT_QUOTA_BYTES` / `FILES_USER_QUOTA_BYTES` | Total stored-byte quotas for one tenant and one user within it (live plus trash; 0 = unlimited, default 0). Uploads over quota are refused with `413 file.quota_exceeded`; the per-tenant advisory lock makes concurrent uploads serializable |
+| `FILES_SCAN_DRIVER` / `FILES_CLAMAV_ADDR` / `FILES_CLAMAV_TIMEOUT_SECS` | Upload malware scanner: `none` (default) or `clamav` (clamd INSTREAM over TCP; address required, timeout default 10s). A configured scanner fails closed: infected is `422 file.infected`, scanner errors are `503 file.scan_unavailable`, and the blob is removed either way. Production warns at startup when scanning is off |
 | `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
 | `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
 | `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |
@@ -1717,7 +1763,7 @@ See [.env.example](../.env.example) for every option and default. Key settings:
 | Tenant claim | A conflicting explicit `X-Tenant-Slug` returns `403`; a missing/zero/negative claim `401`. Unknown or suspended tenants are rejected with `404` before authentication; a cached suspended snapshot returns `401` until the 5-second TTL expires. |
 | Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
 | Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
-| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
+| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. Upload quotas are enforced transactionally per tenant, and an optional clamd scan runs before metadata commits (infected/unknown fails closed and removes the blob). |
 | Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
 | Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`) and bind the secret's purpose, tenant, and owning endpoint/source as AAD (v3), so a ciphertext copied to another row fails to open; legacy v2/v1 envelopes remain readable. |
 | Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |

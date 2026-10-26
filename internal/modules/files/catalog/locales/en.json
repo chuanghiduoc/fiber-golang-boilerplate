@@ -2,5 +2,8 @@
   "errors.file.not_found.title": "File not found",
   "errors.file.too_large.title": "File too large",
   "errors.file.unsupported_type.title": "Unsupported file type",
-  "errors.file.not_deleted.title": "File was not deleted"
+  "errors.file.not_deleted.title": "File was not deleted",
+  "errors.file.quota_exceeded.title": "Storage quota exceeded",
+  "errors.file.infected.title": "File failed the malware scan",
+  "errors.file.scan_unavailable.title": "File scanning is unavailable"
 }
