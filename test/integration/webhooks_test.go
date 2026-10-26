@@ -46,6 +46,16 @@ import (
 
 const webhookIntegrationSecret = "webhook-integration-signing-secret"
 
+// allDynamicPorts lets integration receivers listen on ephemeral ports. The
+// outbound port policy itself is unit-tested in pkg/webhook.
+func allDynamicPorts() []int {
+	ports := make([]int, 0, 65535)
+	for port := 1; port <= 65535; port++ {
+		ports = append(ports, port)
+	}
+	return ports
+}
+
 type webhookHarness struct {
 	app        *fiber.App
 	pool       *pgxpool.Pool
@@ -138,10 +148,15 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	codec, err := webhookservice.NewSecretCodec("webhook-integration-encryption-key")
 	require.NoError(t, err)
 	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
+	// httptest receivers listen on random ports; this harness exercises
+	// delivery behavior, not the port policy (covered by pkg/webhook).
+	guard, err := webhook.NewGuardWithPorts([]string{"127.0.0.1"}, allDynamicPorts())
+	require.NoError(t, err)
 	svc := webhookservice.New(repo, repo, repo, codec, recorder, webhookservice.Options{
 		DefaultMaxAttempts: 3,
 		DefaultTimeoutMS:   2000,
 		TimestampTolerance: 5 * time.Minute,
+		URLGuard:           guard,
 		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id int64) (bool, error) {
 			if _, err := tenantRepo.GetOperationalByID(ctx, id); err != nil {
 				if errors.Is(err, apperror.ErrNotFound) {
@@ -154,8 +169,6 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	})
 	handler := webhookshandler.New(svc)
 	dispatcher := webhookservice.NewDispatcher(repo)
-	guard, err := webhook.NewGuard([]string{"127.0.0.1"})
-	require.NoError(t, err)
 	client := webhook.NewClient(webhook.ClientConfig{Guard: guard, Timeout: 2 * time.Second})
 	worker := webhookservice.NewDeliveryWorker(repo, codec, client, webhookservice.WorkerOptions{
 		RetryBase: 5 * time.Second,
@@ -681,11 +694,12 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			signFor(rotated.Secret, "evt_in_pattern", patternBody))
 		assert.Equal(t, fiber.StatusBadRequest, status)
 
-		// A suspended source tenant behaves like a missing source.
+		// A suspended source tenant behaves like a missing source: the same
+		// 401 as a bad signature, so ids cannot be enumerated.
 		_, err := h.pool.Exec(ctx, `UPDATE tenants SET status = 'suspended' WHERE id = $1`, h.tenantB)
 		require.NoError(t, err)
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceB.ReceiverURL, payload, headers(sourceB.Secret, "evt_in_b_suspended"))
-		assert.Equal(t, fiber.StatusNotFound, status)
+		assert.Equal(t, fiber.StatusUnauthorized, status)
 		_, err = h.pool.Exec(ctx, `UPDATE tenants SET status = 'active' WHERE id = $1`, h.tenantB)
 		require.NoError(t, err)
 	})

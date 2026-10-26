@@ -123,7 +123,7 @@ func TestGuard_InvalidAllowlist(t *testing.T) {
 
 func TestGuard_ValidateURL(t *testing.T) {
 	guard, _ := NewGuard(nil)
-	valid := []string{"https://example.com/hook", "http://example.com:8080/hook?x=1"}
+	valid := []string{"https://example.com/hook", "http://example.com/hook", "https://example.com:443/hook", "http://example.com:80/hook?x=1"}
 	for _, raw := range valid {
 		if _, err := guard.ValidateURL(raw); err != nil {
 			t.Errorf("ValidateURL(%q) rejected: %v", raw, err)
@@ -135,6 +135,61 @@ func TestGuard_ValidateURL(t *testing.T) {
 		if _, err := guard.ValidateURL(raw); !errors.Is(err, ErrInvalidTarget) {
 			t.Errorf("ValidateURL(%q) error = %v, want ErrInvalidTarget", raw, err)
 		}
+	}
+}
+
+func TestGuard_PortPolicy(t *testing.T) {
+	guard, err := NewGuard(nil)
+	if err != nil {
+		t.Fatalf("NewGuard: %v", err)
+	}
+
+	// The explicit Redis port is rejected, and so is any other non-443/80
+	// port; an implicit port resolves to the scheme default and stays valid.
+	for _, raw := range []string{
+		"https://receiver.example:6379/hook",
+		"http://receiver.example:6379/hook",
+		"https://receiver.example:22/hook",
+		"https://receiver.example:/hook",
+	} {
+		if _, err := guard.ValidateURL(raw); !errors.Is(err, ErrPortNotAllowed) && !errors.Is(err, ErrInvalidTarget) {
+			t.Errorf("ValidateURL(%q) error = %v, want ErrPortNotAllowed or ErrInvalidTarget", raw, err)
+		}
+	}
+	if _, err := guard.ValidateURL("https://receiver.example/hook"); err != nil {
+		t.Fatalf("implicit-port https URL rejected: %v", err)
+	}
+	if _, err := guard.ValidateURL("http://receiver.example/hook"); err != nil {
+		t.Fatalf("implicit-port http URL rejected: %v", err)
+	}
+
+	// WEBHOOK_ALLOWED_PORTS extends the baseline; it cannot remove 443/80.
+	extended, err := NewGuardWithPorts(nil, []int{8443})
+	if err != nil {
+		t.Fatalf("NewGuardWithPorts: %v", err)
+	}
+	for _, raw := range []string{"https://receiver.example:8443/hook", "https://receiver.example/hook", "http://receiver.example/hook"} {
+		if _, err := extended.ValidateURL(raw); err != nil {
+			t.Errorf("extended ValidateURL(%q) rejected: %v", raw, err)
+		}
+	}
+	if _, err := extended.ValidateURL("https://receiver.example:6379/hook"); !errors.Is(err, ErrPortNotAllowed) {
+		t.Fatalf("port 6379 error = %v, want ErrPortNotAllowed", err)
+	}
+	if _, err := NewGuardWithPorts(nil, []int{0}); !errors.Is(err, ErrPortNotAllowed) {
+		t.Fatalf("port 0 construction error = %v, want ErrPortNotAllowed", err)
+	}
+}
+
+func TestGuard_DialEnforcesPortPolicy(t *testing.T) {
+	guard, _ := NewGuard([]string{"127.0.0.1"})
+	// The check runs before DNS/dial, so a disallowed port fails even for an
+	// otherwise allowlisted host.
+	if _, err := guard.DialContext(context.Background(), "tcp", "127.0.0.1:6379"); !errors.Is(err, ErrPortNotAllowed) {
+		t.Fatalf("DialContext(:6379) error = %v, want ErrPortNotAllowed", err)
+	}
+	if _, err := guard.DialContext(context.Background(), "tcp", "127.0.0.1:notaport"); !errors.Is(err, ErrInvalidTarget) {
+		t.Fatalf("DialContext(notaport) error = %v, want ErrInvalidTarget", err)
 	}
 }
 

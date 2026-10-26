@@ -342,7 +342,7 @@ whose snapshot is older than that previous secret is signed with the current
 
 | Field | Meaning |
 |---|---|
-| `url` | Absolute `http(s)` URL, snapshotted per delivery. Updating it (or `timeoutMs`) also repoints that endpoint's `pending` deliveries in the same transaction, so a retry follows the move; `succeeded`/`dead` rows keep their snapshot. |
+| `url` | Absolute `http(s)` URL, snapshotted per delivery. Only ports 443 and 80 are allowed by default; `WEBHOOK_ALLOWED_PORTS` extends the list. Updating it (or `timeoutMs`) also repoints that endpoint's `pending` deliveries in the same transaction, so a retry follows the move; `succeeded`/`dead` rows keep their snapshot. |
 | `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. Stored as a set and returned sorted. |
 | `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried. |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
@@ -359,6 +359,7 @@ matching and returns `404` for reads.
 | Control | Behavior |
 |---|---|
 | URL shape | Absolute `http(s)` only, no userinfo. |
+| Destination port | Only 443 and 80 by default; `WEBHOOK_ALLOWED_PORTS` extends the set. Endpoint create/update returns `400 webhook.port_not_allowed`, and the dialer enforces the same policy again (so a direct caller cannot bypass it). An implicit port uses the scheme default (80/443) and is allowed. |
 | Address checks | Resolves the hostname itself; rejects private, loopback, link-local, multicast, unspecified, CGNAT, and reserved/documentation ranges. |
 | IPv6 transition | NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, IPv4-compatible `::/96`, and IPv4-translated `::ffff:0:0:0/96` are re-checked against the embedded IPv4; local-use NAT64 `64:ff9b:1::/48`, Teredo `2001::/32`, and site-local `fec0::/10` are blocked outright. |
 | DNS rebinding | Dials the vetted IP while keeping the hostname for `Host`/TLS SNI. |
@@ -404,10 +405,9 @@ sequenceDiagram
     S->>H: POST /webhooks/inbound/:id
     H->>SV: ReceiveInbound(sourceID, headers, raw body)
     SV->>SV: body non-empty, <= 1 MiB, valid JSON (else 400)
-    SV->>DB: load source (not soft-deleted)
-    Note over SV: missing / disabled source -> 404
-    SV->>SV: source tenant active? (suspended -> 404)
     SV->>SV: webhook-id present and well-formed (else 400)
+    SV->>DB: load source (not soft-deleted)
+    Note over SV: missing / disabled / suspended source<br/>-> dummy HMAC, then 401
     SV->>SV: open sealed current secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
     SV->>SV: headers present, timestamp parses,<br/>inside tolerance window (else 401)
     SV->>SV: constant-time HMAC over id.timestamp.body<br/>(current, else unexpired previous; else 401)
@@ -428,8 +428,8 @@ sequenceDiagram
 |---|---|
 | New event | `202 Accepted` with `{id, tenantId, sourceId, eventId, eventType, receivedAt, duplicate: false}`. |
 | Repeated `(source, webhook-id)` | `200 OK`, `duplicate: true`, and the original row. The body is stored once. |
-| Unknown, disabled, soft-deleted source, or suspended tenant | `404`. |
-| Missing/invalid signature, stale timestamp, or a source secret that predates Standard Webhooks | `401`. |
+| Unknown, disabled, soft-deleted source, or suspended tenant | `401`, the same problem as a bad signature. The receiver still runs the HMAC against a dummy secret so the unknown-id path is not a cheap oracle. |
+| Missing/invalid signature, stale timestamp, or a source secret that predates Standard Webhooks | `401 webhook signature is invalid`. |
 | Malformed body, id, or body `type` | `400`. |
 
 The stored row keeps the signature and payload but does not echo them back.
@@ -457,8 +457,12 @@ Both are sealed with AES-256-GCM using HKDF-SHA256 domain separation from
 `WEBHOOK_SECRET_ENCRYPTION_KEY`. Outside production an empty dedicated key
 falls back to `JWT_SECRET`; **production requires the dedicated key** (at
 least 32 characters). Only ciphertext is stored; plaintext is returned exactly
-once on create or rotate. The stored envelope (v2) records the sealing key's
-`kid`; v1 envelopes without one are tried against every configured key.
+once on create or rotate. The current envelope (v3) records the sealing key's
+`kid` and authenticates the secret's purpose, tenant, and owning endpoint or
+source id as AAD, so a ciphertext copied to another row by someone with
+database write access fails to open. Delivery snapshots are copies of the
+endpoint secret and use the endpoint binding. Legacy v2 envelopes (key id only)
+and v1 envelopes (no key id) still open; newly sealed rows always use v3.
 
 | Rotation | Behavior |
 |---|---|
@@ -478,6 +482,7 @@ once on create or rotate. The stored envelope (v2) records the sealing key's
 | `WEBHOOK_RETENTION_DAYS` | `30` | Terminal delivery/inbound-event retention. |
 | `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | `300` | Inbound signature clock skew. |
 | `WEBHOOK_SSRF_ALLOWLIST` | empty | Trusted private IPs/CIDRs/hosts. |
+| `WEBHOOK_ALLOWED_PORTS` | `443,80` | Additional outbound destination ports (comma-separated, 1-65535); 443 and 80 always stay allowed. |
 
 ## Permissions and audit
 

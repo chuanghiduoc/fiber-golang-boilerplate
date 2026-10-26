@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
@@ -54,11 +55,18 @@ func (r *Postgres) CreateEndpoint(ctx context.Context, draft webhooksvc.CreateEn
 		}); err != nil {
 			return err
 		}
+		if draft.SealSecret == nil {
+			return fmt.Errorf("webhooks: create endpoint: secret sealer is required")
+		}
+		ciphertext, err := draft.SealSecret(created.ID)
+		if err != nil {
+			return err
+		}
 		if _, err := q.CreateWebhookEndpointSecret(ctx, webhooksqlc.CreateWebhookEndpointSecretParams{
 			TenantID:         tid,
 			EndpointID:       created.ID,
 			Version:          1,
-			SecretCiphertext: draft.SecretCiphertext,
+			SecretCiphertext: ciphertext,
 		}); err != nil {
 			return err
 		}

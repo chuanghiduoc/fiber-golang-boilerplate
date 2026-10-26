@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -55,6 +56,8 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(server.Close)
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
 
 	// Infrastructure and the webhooks module, built like cmd/api does.
 	const encryptionKey = "webhook-e2e-encryption-key"
@@ -74,6 +77,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 			RetentionDays:             30,
 			TimestampToleranceSeconds: 300,
 			SSRFAllowlist:             "127.0.0.1",
+			AllowedPortsCSV:           serverURL.Port(),
 		},
 		SecretKey: encryptionKey,
 	}, nil)
@@ -87,16 +91,16 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	// A tenant endpoint subscribed to file events, with a known secret.
 	codec, err := webhookservice.NewSecretCodec(encryptionKey)
 	require.NoError(t, err)
-	ciphertext, err := codec.Seal([]byte(wireSecret))
-	require.NoError(t, err)
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
 	_, err = webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue).CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
-		URL:              server.URL + "/hook",
-		EventTypes:       []string{"file.*"},
-		Status:           "active",
-		MaxAttempts:      3,
-		TimeoutMS:        2000,
-		SecretCiphertext: ciphertext,
+		URL:         server.URL + "/hook",
+		EventTypes:  []string{"file.*"},
+		Status:      "active",
+		MaxAttempts: 3,
+		TimeoutMS:   2000,
+		SealSecret: func(endpointID int64) (string, error) {
+			return codec.Seal(webhookservice.EndpointSecretBinding(tenant.DefaultID, endpointID), []byte(wireSecret))
+		},
 	})
 	require.NoError(t, err)
 

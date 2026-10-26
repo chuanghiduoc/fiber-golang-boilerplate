@@ -3,6 +3,8 @@
 package webhooks
 
 import (
+	"io/fs"
+
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
@@ -13,6 +15,7 @@ import (
 	webhookservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
 
@@ -39,6 +42,12 @@ func New(handler *webhookshandler.Handler) *Module {
 
 // Name identifies the module in the registry.
 func (m *Module) Name() string { return webhookscatalog.Owner }
+
+// ErrorCodes implements app.ErrorProvider.
+func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return webhookscatalog.ErrorCodes() }
+
+// Locales implements app.LocaleProvider.
+func (m *Module) Locales() fs.FS { return webhookscatalog.Locales() }
 
 // RegisterPrivacy implements app.PrivacyProvider: stored event history can
 // name a user even though endpoint configuration is tenant-wide.

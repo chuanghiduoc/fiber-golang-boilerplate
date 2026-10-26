@@ -72,7 +72,7 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(testutil.Scoped(pool))
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(testutil.NewTxManager(pool), audit.Noop{}, principalReader))
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, apikeyrepo.NewTransactor(testutil.NewTxManager(pool), audit.Noop{}, principalReader), 8760*time.Hour)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(

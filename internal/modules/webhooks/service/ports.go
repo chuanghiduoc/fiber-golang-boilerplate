@@ -175,15 +175,17 @@ type UpdateEndpointInput struct {
 	TimeoutMS   *int
 }
 
-// CreateEndpointDraft is a newly created endpoint plus its first sealed secret.
+// CreateEndpointDraft is a newly created endpoint configuration. SealSecret
+// runs inside the create transaction with the row's generated id, so the
+// secret's AAD is bound to the endpoint that owns it.
 type CreateEndpointDraft struct {
-	URL              string
-	Description      string
-	EventTypes       []string
-	Status           string
-	MaxAttempts      int32
-	TimeoutMS        int32
-	SecretCiphertext string
+	URL         string
+	Description string
+	EventTypes  []string
+	Status      string
+	MaxAttempts int32
+	TimeoutMS   int32
+	SealSecret  func(endpointID int64) (string, error)
 }
 
 // UpdateEndpointDraft replaces the mutable endpoint configuration.
@@ -262,11 +264,12 @@ type UpdateInboundSourceInput struct {
 	Status string
 }
 
-// InboundSourceDraft creates a tenant-owned inbound source.
+// InboundSourceDraft creates a tenant-owned inbound source. SealSecret runs
+// inside the create transaction with the row's generated id.
 type InboundSourceDraft struct {
-	Name             string
-	Slug             string
-	SecretCiphertext string
+	Name       string
+	Slug       string
+	SealSecret func(sourceID int64) (string, error)
 }
 
 // UpdateInboundSourceDraft replaces the mutable source configuration.

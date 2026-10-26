@@ -290,7 +290,7 @@ func ClassifyError(err error) Outcome {
 	if err == nil {
 		return OutcomeSuccess
 	}
-	if IsBlocked(err) || IsInvalidTarget(err) || errors.Is(err, ErrEmptySecret) {
+	if IsBlocked(err) || IsInvalidTarget(err) || IsPortNotAllowed(err) || errors.Is(err, ErrEmptySecret) {
 		return OutcomePermanent
 	}
 	return OutcomeRetry

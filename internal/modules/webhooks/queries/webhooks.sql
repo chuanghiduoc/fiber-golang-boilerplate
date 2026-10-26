@@ -354,8 +354,17 @@ INSERT INTO webhook_inbound_sources (
     tenant_id, name, slug, secret_ciphertext, status
 )
 VALUES (
-    @tenant_id, @name, @slug, @secret_ciphertext, 'active'
+    @tenant_id, @name, @slug, '', 'active'
 )
+RETURNING *;
+
+-- name: SetWebhookInboundSourceSecret :one
+-- A new source is inserted with an empty placeholder and sealed immediately
+-- in the same transaction, once the generated id is known (the secret's AAD
+-- binds that id).
+UPDATE webhook_inbound_sources
+SET secret_ciphertext = @secret_ciphertext
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
 RETURNING *;
 
 -- name: GetWebhookInboundSource :one

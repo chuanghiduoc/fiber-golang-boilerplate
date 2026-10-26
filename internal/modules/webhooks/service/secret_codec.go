@@ -18,10 +18,48 @@ const (
 	secretKeyInfo = "fiber-golang-boilerplate/webhooks/secret/v1"
 	// legacySecretEnvelopeVer envelopes carry no key id; Open tries every key.
 	legacySecretEnvelopeVer = 1
-	// secretEnvelopeVer is written by Seal: it names the sealing key and
-	// binds the id into the AAD.
-	secretEnvelopeVer = 2
+	// keyedSecretEnvelopeVer binds the key id into the AAD but not the entity,
+	// so a ciphertext could be swapped between rows with database write access.
+	keyedSecretEnvelopeVer = 2
+	// secretEnvelopeVer is written by Seal: it names the sealing key and binds
+	// the purpose, tenant, and owning entity into the AAD.
+	secretEnvelopeVer = 3
 )
+
+// SecretPurpose domain-separates endpoint secrets from inbound-source secrets.
+type SecretPurpose string
+
+const (
+	// PurposeEndpointSecret seals outbound endpoint signing secrets and their
+	// delivery snapshots.
+	PurposeEndpointSecret SecretPurpose = "endpoint"
+	// PurposeInboundSourceSecret seals inbound receiver verification secrets.
+	PurposeInboundSourceSecret SecretPurpose = "inbound_source"
+)
+
+// SecretBinding is the authenticated associated data of a sealed webhook
+// secret. It prevents a ciphertext from being swapped to another endpoint,
+// source, or tenant by someone with database write access.
+type SecretBinding struct {
+	Purpose  SecretPurpose
+	TenantID int64
+	EntityID int64
+}
+
+// EndpointSecretBinding binds a secret to one tenant-owned endpoint. Delivery
+// snapshots are copies of the endpoint secret, so they use the same binding.
+func EndpointSecretBinding(tenantID, endpointID int64) SecretBinding {
+	return SecretBinding{Purpose: PurposeEndpointSecret, TenantID: tenantID, EntityID: endpointID}
+}
+
+// InboundSourceSecretBinding binds a secret to one tenant-owned inbound source.
+func InboundSourceSecretBinding(tenantID, sourceID int64) SecretBinding {
+	return SecretBinding{Purpose: PurposeInboundSourceSecret, TenantID: tenantID, EntityID: sourceID}
+}
+
+func (b SecretBinding) valid() bool {
+	return b.Purpose != "" && b.TenantID > 0 && b.EntityID > 0
+}
 
 var (
 	// ErrSecretKeyRequired is returned when the codec is created without a key.
@@ -31,9 +69,12 @@ var (
 	// ErrInvalidSecretEnvelope is returned for malformed or unsupported
 	// ciphertext envelopes.
 	ErrInvalidSecretEnvelope = errors.New("webhooks: invalid secret envelope")
+	// ErrInvalidSecretBinding is returned when a new envelope is sealed without
+	// a complete purpose/tenant/entity binding.
+	ErrInvalidSecretBinding = errors.New("webhooks: invalid secret binding")
 	// ErrSecretDecryption is returned when the envelope cannot be
 	// authenticated with any configured key, including an envelope whose key
-	// id is not configured.
+	// id is not configured or whose binding does not match.
 	ErrSecretDecryption = errors.New("webhooks: secret decryption failed")
 )
 
@@ -67,20 +108,29 @@ func NewSecretCodec(secret string, previous ...string) (*SecretCodec, error) {
 	return &SecretCodec{ring: ring}, nil
 }
 
-// secretAAD binds the envelope version and key id to the ciphertext. Legacy
-// envelopes used the bare domain string.
-func secretAAD(version int, keyID string) []byte {
-	if version == legacySecretEnvelopeVer {
+// secretAAD binds the envelope version, key id, and (for the current version)
+// the secret's purpose, tenant, and owning entity to the ciphertext. Legacy
+// envelopes used the bare domain string (v1) or version+key id (v2).
+func secretAAD(version int, keyID string, binding SecretBinding) []byte {
+	switch version {
+	case legacySecretEnvelopeVer:
 		return []byte(secretKeyInfo)
+	case keyedSecretEnvelopeVer:
+		return []byte(fmt.Sprintf("%s|v%d|%s", secretKeyInfo, version, keyID))
+	default:
+		return []byte(fmt.Sprintf("%s|v%d|%s|%s|%d|%d",
+			secretKeyInfo, version, keyID, binding.Purpose, binding.TenantID, binding.EntityID))
 	}
-	return []byte(fmt.Sprintf("%s|v%d|%s", secretKeyInfo, version, keyID))
 }
 
 // Seal encrypts plaintext with the active key and returns a versioned JSON
-// envelope naming the key.
-func (c *SecretCodec) Seal(plaintext []byte) (string, error) {
+// envelope naming the key and authenticating binding.
+func (c *SecretCodec) Seal(binding SecretBinding, plaintext []byte) (string, error) {
 	if c == nil || c.ring == nil {
 		return "", ErrNilSecretCodec
+	}
+	if !binding.valid() {
+		return "", ErrInvalidSecretBinding
 	}
 	key := c.ring.Active()
 	nonce := make([]byte, key.AEAD.NonceSize())
@@ -91,7 +141,7 @@ func (c *SecretCodec) Seal(plaintext []byte) (string, error) {
 		Version: secretEnvelopeVer,
 		KeyID:   key.ID,
 		Nonce:   base64.RawURLEncoding.EncodeToString(nonce),
-		Data:    base64.RawURLEncoding.EncodeToString(key.AEAD.Seal(nil, nonce, plaintext, secretAAD(secretEnvelopeVer, key.ID))),
+		Data:    base64.RawURLEncoding.EncodeToString(key.AEAD.Seal(nil, nonce, plaintext, secretAAD(secretEnvelopeVer, key.ID, binding))),
 	})
 	if err != nil {
 		return "", fmt.Errorf("webhooks: encode secret envelope: %w", err)
@@ -99,15 +149,20 @@ func (c *SecretCodec) Seal(plaintext []byte) (string, error) {
 	return string(sealed), nil
 }
 
-// Open decrypts a secret envelope: version 2 with the key its id names,
-// version 1 (no id) by trying every configured key.
-func (c *SecretCodec) Open(ciphertext string) ([]byte, error) {
+// Open decrypts a secret envelope. Version 3 requires the binding it was
+// sealed with; version 2 with the key its id names; version 1 (no id) by trying
+// every configured key. Versions 1 and 2 are legacy and remain readable so an
+// upgrade does not invalidate stored secrets.
+func (c *SecretCodec) Open(binding SecretBinding, ciphertext string) ([]byte, error) {
 	if c == nil || c.ring == nil {
 		return nil, ErrNilSecretCodec
 	}
 	var envelope secretEnvelope
 	if err := json.Unmarshal([]byte(ciphertext), &envelope); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidSecretEnvelope, err)
+	}
+	if envelope.Version == secretEnvelopeVer && !binding.valid() {
+		return nil, fmt.Errorf("%w: missing binding", ErrInvalidSecretEnvelope)
 	}
 	keys, err := c.envelopeKeys(envelope)
 	if err != nil {
@@ -122,7 +177,7 @@ func (c *SecretCodec) Open(ciphertext string) ([]byte, error) {
 	if err != nil || len(data) < aead.Overhead() {
 		return nil, fmt.Errorf("%w: invalid data", ErrInvalidSecretEnvelope)
 	}
-	aad := secretAAD(envelope.Version, envelope.KeyID)
+	aad := secretAAD(envelope.Version, envelope.KeyID, binding)
 	var openErr error
 	for _, key := range keys {
 		plaintext, err := key.Open(nil, nonce, data, aad)
@@ -143,7 +198,7 @@ func (c *SecretCodec) envelopeKeys(envelope secretEnvelope) ([]cipher.AEAD, erro
 			keys = append(keys, key.AEAD)
 		}
 		return keys, nil
-	case secretEnvelopeVer:
+	case keyedSecretEnvelopeVer, secretEnvelopeVer:
 		if envelope.KeyID == "" {
 			return nil, fmt.Errorf("%w: missing key id", ErrInvalidSecretEnvelope)
 		}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	apikeyscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -25,8 +26,11 @@ const (
 	// RotationGrace is how long a rotated key remains valid after its successor
 	// is issued. Revoking the old key explicitly always wins.
 	RotationGrace = 24 * time.Hour
-	maxNameRunes  = 255
-	maxScopes     = 100
+	// defaultMaxLifetime matches APIKEYS_MAX_LIFETIME's default when the
+	// service is constructed without configuration (tests).
+	defaultMaxLifetime = 8760 * time.Hour
+	maxNameRunes       = 255
+	maxScopes          = 100
 )
 
 // Service is the API-key administration surface consumed by the HTTP handler.
@@ -40,21 +44,28 @@ type Service interface {
 }
 
 type service struct {
-	keys       APIKeyRepository
-	principals identitycontracts.PrincipalReader
-	tx         Transactor
-	now        func() time.Time
+	keys        APIKeyRepository
+	principals  identitycontracts.PrincipalReader
+	tx          Transactor
+	now         func() time.Time
+	maxLifetime time.Duration
 }
 
 // NewService builds the API-key service. Every lifecycle mutation is Tier 1
 // audited: the audit row is written in the mutation's transaction, so a
 // failed audit write rolls the change back (503 system.audit_unavailable).
-func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, tx Transactor) Service {
+// maxLifetime caps every newly issued key; a non-positive value falls back to
+// the documented default for tests and minimal deployments.
+func NewService(keys APIKeyRepository, principals identitycontracts.PrincipalReader, tx Transactor, maxLifetime time.Duration) Service {
+	if maxLifetime <= 0 {
+		maxLifetime = defaultMaxLifetime
+	}
 	return &service{
-		keys:       keys,
-		principals: principals,
-		tx:         tx,
-		now:        time.Now,
+		keys:        keys,
+		principals:  principals,
+		tx:          tx,
+		now:         time.Now,
+		maxLifetime: maxLifetime,
 	}
 }
 
@@ -122,7 +133,7 @@ func (s *service) Create(ctx context.Context, callerUserID int64, in CreateInput
 		return nil, apperror.NewBadRequest("authenticated user is required")
 	}
 
-	expiresAt, err := validateExpiry(in.ExpiresAt, s.now())
+	expiresAt, err := s.expiry(in.ExpiresAt, s.now())
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +356,7 @@ func (s *service) rotate(ctx context.Context, tx TxRepos, callerUserID, id int64
 		Prefix:    credentials.Prefix,
 		Hash:      credentials.Hash,
 		Scopes:    rotated.Scopes,
-		ExpiresAt: rotated.ExpiresAt,
+		ExpiresAt: s.rotationExpiry(rotated.ExpiresAt, s.now()),
 	})
 	if err != nil {
 		return nil, apperror.NewInternal("failed to create rotated API key")
@@ -514,15 +525,34 @@ func ensureCallerCanGrant(ctx context.Context, scopes []authz.Permission) error 
 	return nil
 }
 
-func validateExpiry(expiresAt *time.Time, now time.Time) (*time.Time, error) {
-	if expiresAt == nil {
-		return nil, nil
+// expiry applies APIKEYS_MAX_LIFETIME to a new key: an omitted expiresAt
+// becomes now + max, a later one is rejected, and an earlier one is preserved.
+func (s *service) expiry(requested *time.Time, now time.Time) (*time.Time, error) {
+	now = now.UTC()
+	latest := now.Add(s.maxLifetime)
+	if requested == nil {
+		return &latest, nil
 	}
-	value := expiresAt.UTC()
-	if !value.After(now.UTC()) {
+	value := requested.UTC()
+	if !value.After(now) {
 		return nil, apperror.NewBadRequest("expiresAt must be in the future")
 	}
+	if value.After(latest) {
+		return nil, apperror.NewCode(apikeyscatalog.CodeAPIKeyExpiryExceedsMaxLifetime,
+			"expiresAt exceeds APIKEYS_MAX_LIFETIME")
+	}
 	return &value, nil
+}
+
+// rotationExpiry never extends a successor beyond the original key's expiry or
+// the configured maximum. A legacy key with NULL expiry gets now + max.
+func (s *service) rotationExpiry(original *time.Time, now time.Time) *time.Time {
+	latest := now.UTC().Add(s.maxLifetime)
+	if original == nil || original.After(latest) {
+		return &latest
+	}
+	value := original.UTC()
+	return &value
 }
 
 func buildCursor(limit int, startingAfter string) (cur pagination.DBCursor, pageSize int, err error) {

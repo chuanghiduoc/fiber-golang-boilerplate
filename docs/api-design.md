@@ -489,7 +489,7 @@ targets remain `admin:features:write`.
 | Outbound requests | At-least-once [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Headers `webhook-id` (event id, dedupe key), `webhook-timestamp`, `webhook-signature: v1,<base64>` (space-separated during rotation). HMAC-SHA256 over `<webhook-id>.<webhook-timestamp>.<raw-body>` with the decoded `whsec_` key. Body: the versioned envelope `{id, type, dataVersion, occurredAt, tenantId, actor, data}`. |
 | Event payloads | Contract structs in `internal/contracts/<producer>`, never REST DTOs. Additive changes keep `dataVersion`; breaking ones get a new `dataVersion` or type. |
 | Retries | `408`, `425`, `429`, `5xx` retry; other `3xx`/`4xx` are `dead`. `Retry-After` (seconds or HTTP date) is honored, capped by config. Targets are SSRF-checked at dial time (private/loopback/link-local need `WEBHOOK_SSRF_ALLOWLIST`); redirects are never followed. |
-| Inbound | `POST /api/v1/webhooks/inbound/{id}` is public: no JWT, tenant header, or idempotency middleware. Requires `webhook-id`, `webhook-timestamp`, `webhook-signature` (Standard Webhooks, signed with the source's `whsec_` secret); the event type is the body's `type`. Unknown/disabled source `404`, bad/stale signature `401`, malformed JSON/IDs/type `400`, new event `202`, repeat `(source, webhook-id)` `200` with `duplicate: true`. |
+| Inbound | `POST /api/v1/webhooks/inbound/{id}` is public: no JWT, tenant header, or idempotency middleware. Requires `webhook-id`, `webhook-timestamp`, `webhook-signature` (Standard Webhooks, signed with the source's `whsec_` secret); the event type is the body's `type`. Unknown/disabled/deleted sources and bad/stale signatures all return the same `401` problem (so sequential ids cannot be enumerated), malformed JSON/IDs/type `400`, new event `202`, repeat `(source, webhook-id)` `200` with `duplicate: true`. |
 
 Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
 
@@ -499,6 +499,18 @@ Full signing, retry, secret, and operations contract: [Webhooks](webhooks.md).
   The owner is always the authenticated caller (the request has no `userId`
   field); name, scopes, and optional `expiresAt` are recorded. Scopes must be
   known permissions within the caller's own role or key.
+- Key format is `fgb_<43 base62 chars of 32 random bytes><6 base62 chars of a
+  CRC32 checksum>`. The checksum is verified before the key hash lookup, so a
+  mistyped or invented key is `401 invalid API key` without touching the
+  database. Keys issued before the checksum (`fgb_<32-byte base64url secret>`)
+  still verify but are deprecated; rotate them to get the current format.
+  Prefix and SHA-256 hash storage are unchanged.
+- `APIKEYS_MAX_LIFETIME` (Go duration, default `8760h`) caps every issued key.
+  An omitted `expiresAt` defaults to now + the maximum, and a later value is
+  `400 api_key.expiry_exceeds_max_lifetime`. Rotation inherits
+  `min(original expiry, now + maximum)`; a legacy row with NULL expiry keeps
+  working until it is rotated (the successor then gets now + maximum) or
+  revoked.
 - `PUT /admin/api-keys/:id` updates name/scopes; `DELETE /admin/api-keys/:id`
   or `POST /admin/api-keys/:id/revoke` revokes immediately (idempotent);
   `POST /admin/api-keys/:id/rotate` issues a new secret while the old one stays
