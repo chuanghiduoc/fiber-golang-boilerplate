@@ -13,7 +13,7 @@ flowchart LR
 ```
 
 `main` is protected. CI must pass: Lint, Build, Manifests, Migrations, Test,
-Integration, Security, and Docker. [`.github/CODEOWNERS`](.github/CODEOWNERS)
+Integration, Security, Docker, and (on PRs) API compatibility. [`.github/CODEOWNERS`](.github/CODEOWNERS)
 assigns reviewers per platform area and per module (code, contracts, and
 migrations); add your module's paths there when you create one.
 
@@ -38,131 +38,27 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/):
 ```bash
 make check               # go vet + golangci-lint + arch tests + unit tests
 make test-race           # go test -race; required before merging
-make test-integration    # Docker/Testcontainers, or set TEST_DATABASE_URL
-go build ./cmd/migrate   # DDL entrypoint, also built by CI
+make test-integration    # testcontainers, or set TEST_DATABASE_URL
 ```
 
-Integration packages skip cleanly when `TEST_DATABASE_URL` is unset. Against a
-local server, point it at a disposable database and apply the schema first
-(`make migrate-run` with matching `DB_*` settings); some platform integration
-tests use that database as-is:
+Against a local server, point `TEST_DATABASE_URL` at a disposable database
+and apply the schema first (`make migrate-run`). Run the integration suite
+with parallel packages as CI does; serial runs hide cross-package races:
 
 ```bash
 TEST_DATABASE_URL="postgres://${DB_USERNAME}:${DB_PASSWORD}@127.0.0.1:5432/apptest?sslmode=disable" \
   go test -tags=integration -race -count=1 ./...
 ```
 
-CI's `Migrations` job applies the baseline up/down on a fresh PostgreSQL
-service, then runs `cmd/migrate` twice. Reproduce it against a disposable
-database (`make migrate-run`, then `make migrate-down CONFIRM=yes`, which
-drops the whole schema).
+Migrations, legacy upgrades, and adding a module are covered in
+[docs/operations.md](docs/operations.md#7-migrations-and-legacy-upgrade) and
+[docs/module-template.md](docs/module-template.md).
 
 ## Changelog
 
-Update `CHANGELOG.md` in your PR:
-
-```markdown
-## [Unreleased]
-
-### Added
-- Short description of new feature (#PR)
-
-### Fixed
-- Short description of bug fix (#PR)
-
-### Changed
-- Short description of change (#PR)
-
-### Removed
-- Short description of removal (#PR)
-```
-
-When releasing, move `[Unreleased]` entries under a version header such as
-`## [1.1.0] - 2026-02-23`.
-
-## Database & Migrations
-
-| Rule | Detail |
-|------|--------|
-| One DDL entrypoint | Only `cmd/migrate` applies DDL. `make migrate-run` runs it, `make run`/`make seed` migrate first, Compose runs `migrate` before `app`. `cmd/api`/`cmd/seed` assume the schema exists, so replicas never race. |
-| Migrate config | `config.LoadDatabase` needs only `DB_*`; `DB_SSLMODE=disable\|allow\|prefer` is rejected in production. It verifies required tables, indexes, and triggers after migrating. |
-| Fresh installs | The single init: `migrations/20260101000000_platform_init_schema.{up,down}.sql`, one `-- owner:` section per owner (see `docs/data-model.md`). |
-| Deployed databases | Never edit a shipped migration. Add one with `make migrate-create module=<owner> name=<purpose>` → `<UTC YYYYMMDDHHMMSS>_<owner>_<purpose>.{up,down}.sql`; `test/arch` rejects duplicate versions, missing up/down pairs, non-timestamp versions, and tables created outside their owner. |
-| Ownership | One module owns each table; cross-module access goes through a contract or read model, never another module's repository. |
-| Tenancy | Every tenant-owned table has `tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants(id)` and `tenant_id`-leading indexes. Tenant 1 (`default`) serves header-less local/test requests; production requires `X-Tenant-Slug` (`TENANT_REQUIRE_HEADER=true`). Users are global: emails and Google subjects are unique across tenants, and a user joins a tenant through `memberships`. |
-| Last admin | The `memberships` last-admin trigger is per tenant; application checks must use the same scope. |
-| Scoped queries | Repositories derive the tenant from `tenant.EffectiveID(ctx)` (tenant-1 fallback is for jobs/internal/tests only, never a substitute for HTTP resolution). Public auth flows resolve the tenant, Google `state` carries it, reset/verify links carry `?tenant=<slug>`, uploads use `<tenantID>/<userID>/<uuid>.<ext>`, idempotency keys include the tenant, and logout revokes by possession. RLS and per-tenant limits are future work; do not describe the application as fully isolated. |
-
-### Upgrading an existing database
-
-The init migration (`20260101000000`) is a
-fresh-install baseline that replaces the old `000001`–`000003` files and the
-former consolidated `000001`. Never run it against a database recorded at one
-of those sequential versions, and never reset `schema_migrations` to force it.
-Do **not** restore the old sequential files: `test/arch/migrations_test.go`
-rejects every non-timestamp version.
-
-The supported upgrade is a one-time, reviewed manual step (full DDL checklist in
-the README's [Upgrading an existing database](README.md#upgrading-an-existing-database)):
-
-1. Take a verified backup/PITR snapshot.
-2. Apply the missing DDL with `psql` in one transaction so the schema matches
-   the init (tenants and default tenant, `tenant_id` columns,
-   tenant-leading indexes, per-tenant last-admin trigger, API-key scope,
-   feature-flag, notification, and webhook tables, every `ON CONFLICT` unique
-   index, audit triggers).
-3. Only after the schema matches, record the baseline:
-   `migrate -path migrations -database "$DSN" force 20260101000000`. This
-   rewrites the version, not the schema; never use it to skip DDL that was not
-   applied.
-4. Run `cmd/migrate`. It applies newer timestamped migrations and verifies the
-   schema, listing anything step 2 missed.
-
-A fresh schema created out-of-band that already matches the baseline can be
-baselined the same way (`force 20260101000000` after verification) instead of
-re-running the files.
-
-After the upgrade, legacy access tokens without `tenant_id` are rejected (users
-log in again) and old token rows stay on tenant 1. Existing files keep their
-`<user>/<uuid>` storage keys; only new uploads use `<tenantID>/<userID>/<uuid>`.
-If you copy blobs, update `files.storage_path` atomically.
-
-## Adding a New Module
-
-Run `make gen module=<name>` (the Go generator `cmd/gen`; `scripts/new-module.sh
-<name>` is a wrapper for it) and follow
-[`docs/module-template.md`](docs/module-template.md); runtime behavior is
-covered by [`docs/operations.md`](docs/operations.md).
-
-1. The generator creates `module.go`, `build.go` (`Build(infra, Settings)
-   (*Module, Provides, error)`), `catalog/` (permissions, error codes, en/vi
-   strings), the service/repository/handler layers with `service/ports.go`, `queries/`, the
-   module's own `sqlc.yaml`, tests, a `<UTC ts>_<name>_init` migration pair,
-   and the `internal/bootstrap/modules.go` entry, then builds, vets, and tests
-   (rolling everything back on failure). Keep everything in that directory.
-2. Add slices with `make gen resource=<r> module=<name>` (tenant-scoped CRUD
-   with migration, queries, routes, permissions, and unit + integration tests)
-   and `make gen command=<Name> module=<name>` / `query=<Name>`. Add
-   `dry_run=1` to preview a diff.
-3. Adjust `catalog/permissions.go` (generated permissions are admin-only) and
-   protect every route with `authzhttp.Require(...)` (`test/arch` enforces
-   it). Do not copy the
-   [legacy exceptions](docs/module-template.md#legacy-exceptions-do-not-copy).
-4. Other schema changes: `make migrate-create module=<name> name=<purpose>`,
-   then `make sqlc-generate` (runs every `internal/modules/*/sqlc.yaml`).
-5. Pass module-owned configuration as the module's `Settings`, filled in
-   `internal/bootstrap/modules.go`.
-6. Add unit tests plus an integration test; `test/arch` rejects cross-module
-   imports, Fiber in `service`/`repository` packages, and new
-    layering violations (never add
-   lines to `test/arch/layering_allowlist.txt`; delete the ones you fix).
-7. Run `make swagger`, `make check`, and `go test -race ./...`.
-8. Update `CHANGELOG.md`.
-
-Each module with SQL owns its DTOs, repositories, services, handlers, and
-generated `sqlc/` package (`admin` is contract-only and reaches identity/files
-through `internal/contracts`). Never import another module's internals or sqlc
-types.
+Add a line under `## [Unreleased]` in `CHANGELOG.md` (`Added`, `Changed`,
+`Fixed`, `Removed`, or `Breaking`) with the PR number. When releasing, move
+the entries under a version header.
 
 ## Code Style
 

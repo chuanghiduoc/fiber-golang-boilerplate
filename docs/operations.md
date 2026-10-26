@@ -21,7 +21,9 @@ line, or an error message.
 [6. Idempotency and Redis](#6-idempotency-rate-limits-and-redis) ·
 [7. Migrations](#7-migrations-and-legacy-upgrade) ·
 [8. Kubernetes](#8-kubernetes-deployment-notes) ·
-[9. Tracing](#9-distributed-tracing) · [10. Incidents](#10-incident-checklist)
+[9. Tracing](#9-distributed-tracing) · [10. Incidents](#10-incident-checklist) ·
+[11. Configuration](#11-configuration-reference) ·
+[12. Security](#12-security-guarantees)
 
 ## 1. Health and readiness
 
@@ -1574,3 +1576,59 @@ timeouts/5xx, receivers reporting duplicate or missing events.
   raw queue depth.
 - Update this runbook and the module README if a module caused the incident.
 - Add a regression test for any code or migration fix.
+
+## 11. Configuration reference
+
+See [.env.example](../.env.example) for every option and default. Key settings:
+
+| Variable | Purpose |
+|----------|---------|
+| `APP_ENV` | `local` \| `test` \| `development` \| `staging` \| `production` (log format and production safety checks) |
+| `APP_ROLE` | `all` (default: API + job worker + scheduler) \| `api` (HTTP only; jobs are enqueued but not processed) \| `worker` (job worker, scheduler, background loops; only `/healthz`, `/readyz`, `/metrics`) |
+| `JOBS_WORKER_KINDS` / `JOBS_WORKER_EXCLUDE_KINDS` | Comma-separated job kinds this process claims / skips (bulkhead workers); every kind must be claimed by some worker, and a kind in both lists fails startup |
+| `APP_BODY_LIMIT` | Must exceed `STORAGE_MAX_FILE_SIZE` (multipart overhead) |
+| `DB_CONNECT_TIMEOUT` | Database connect timeout in seconds (default 10) |
+| `DB_SSLMODE` | `disable`, `allow`, `prefer` rejected in production; use `require` or `verify-full` |
+| `DB_QUERY_EXEC_MODE` | pgx execution mode: `cache_statement` (default; behind a transaction-mode PgBouncer needs 1.21+ with `max_prepared_statements > 0`), `cache_describe`, or `describe_exec`; `exec`/`simple_protocol` are rejected (json parameters break) |
+| `DB_MIGRATE_HOST` / `DB_MIGRATE_PORT` | `cmd/migrate` only: connect here instead of `DB_HOST`/`DB_PORT`, so migrations (which hold a session advisory lock) bypass a transaction-mode pooler. See [docs/operations.md](#connection-poolers-pgbouncer) |
+| `JWT_SECRET` / `JWT_PREVIOUS_SECRETS` | Active signing key (32+ chars outside local/test; tokens carry its derived `kid`) and comma-separated verify-only retired keys |
+| `DATA_ENCRYPTION_KEY` / `DATA_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for email/password-reset job payloads (32+ chars; required in production and must differ from `JWT_SECRET`; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
+| `REQUIRE_EMAIL_VERIFICATION` | Require a verified email before login/refresh |
+| `TENANT_DEFAULT_SLUG` | Tenant for header-less requests in compatibility mode (default `default`) |
+| `TENANT_REQUIRE_HEADER` | Require `X-Tenant-Slug` on `/api/v1`/`/api/v2` (default `false`; **must be `true` in production**, recommended in staging) |
+| `I18N_DEFAULT_LOCALE` | Fallback locale, `en` or `vi` (default `en`; unsupported values fail startup) |
+| `FEATURE_FLAGS` | Comma-separated `key=true\|false` overrides; a bare key means true (unknown keys fail startup) |
+| `FEATURE_FLAGS_FORCE_OFF` | Keys that always evaluate false, even during a database outage |
+| `FEATURE_FLAGS_CACHE_TTL_SECONDS` / `FEATURE_FLAGS_MAX_STALENESS_SECONDS` | Snapshot freshness and stale-serving bounds (defaults 30/300) |
+| `SCHEDULER_ENABLED` | Run the optional PostgreSQL-leader scheduler (default `false`) |
+| `SCHEDULER_LEASE_TTL_SECS` / `SCHEDULER_HEARTBEAT_SECS` / `SCHEDULER_POLL_SECS` | Leader lease, renewal, and evaluation timings (defaults 30/10/15) |
+| `SCHEDULER_CATCHUP` / `SCHEDULER_CATCHUP_LIMIT` | `none` \| `latest` \| `all` (default `latest`); limit bounds `all` per pass |
+| `SCHEDULER_RETENTION_DAYS` | `scheduler_runs` retention (default 30) |
+| `FILES_TRASH_RETENTION_DAYS` / `NOTIFICATIONS_RETENTION_DAYS` | Days a soft-deleted file stays restorable before its blob and row are purged (default 30), and days a read notification is kept after being read (default 180; unread are kept). Purged hourly only when `SCHEDULER_ENABLED=true` |
+| `STORAGE_DRIVER` | `local` \| `s3` \| `seaweedfs` |
+| `CACHE_DRIVER` | `memory` \| `redis` (Redis shares rate limits, login lockouts, session invalidation, and idempotency across replicas) |
+| `EMAIL_DRIVER` | `console` \| `smtp` (`console` rejected in production) |
+| `METRICS_AUTH_TOKEN` | Required in production; sent as `Authorization: Bearer <token>` |
+| `OTEL_ENABLED` | Enable tracing (default `false`); `OTEL_TRACES_EXPORTER` is `otlp` or `none`; `OTEL_EXPORTER_OTLP_ENDPOINT` defaults to `localhost:4317` |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Admin seeded on API startup (also `make seed`); password 12+ chars in production |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` / `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | AES-256-GCM key for stored webhook secrets (required in production; outside production empty falls back to `JWT_SECRET`) and decrypt-only previous keys |
+| `WEBHOOK_*_TIMEOUT_SECS`, `WEBHOOK_RETRY_*_SECS`, `WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_RETENTION_DAYS`, `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | Delivery and verification bounds |
+| `WEBHOOK_SSRF_ALLOWLIST` | Private IPs/CIDRs/hosts permitted as delivery targets; empty keeps SSRF protection on |
+| `<NAME>_FILE` | Read a secret from a file (Docker/Kubernetes secret mounts) for `JWT_SECRET`, `JWT_PREVIOUS_SECRETS`, `DB_PASSWORD`, `DB_MIGRATE_PASSWORD`, `DATA_ENCRYPTION_KEY`, `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`, `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`, `STORAGE_S3_SECRET_KEY`, `REDIS_URL`; a trailing newline is trimmed, and setting both `<NAME>` and `<NAME>_FILE` fails startup |
+
+## 12. Security guarantees
+
+| Area | Guarantee |
+|------|-----------|
+| Refresh tokens | Hashed, atomic single-use, bound to their session and the user's token version, rotated on every refresh. Reusing a rotated token revokes the whole session (RFC 9700). |
+| Access tokens | Carry `sid`, `token_version`, and `amr` (no role; permissions come from the session snapshot); password change/reset, email change, logout-all, session revocation, ban, removal, and role change invalidate them immediately. Validated against the session, membership, user, and tenant through a generation-keyed session cache (use Redis in production so invalidation is shared). |
+| Tenant claim | A conflicting explicit `X-Tenant-Slug` returns `403`; a missing/zero/negative claim `401`. Unknown or suspended tenants are rejected with `404` before authentication; a cached suspended snapshot returns `401` until the 5-second TTL expires. |
+| Emails | Normalized and unique case-insensitively among live accounts globally. Email changes require the current password, reset verification, revoke sessions, and send a fresh link. An email banned in a tenant cannot re-register or be invited there, even after the banned account deleted itself; otherwise a self-deleted address can re-register. |
+| Logout | `POST /auth/logout` revokes one session by possession of its refresh token; `/auth/logout-all` revokes every session in every tenant and bumps the token version. |
+| Files | Never served from a public directory; downloads require authentication and ownership (or admin). Metadata and blob keys are tenant-scoped; another tenant's id returns `404`. |
+| Outbound webhooks | SSRF-checked at dial time: private, loopback, link-local, multicast, CGNAT, and reserved ranges blocked unless allowlisted in `WEBHOOK_SSRF_ALLOWLIST`; DNS resolved once and pinned; proxies and redirects disabled. Standard Webhooks HMAC-SHA256 signing (`webhook-signature: v1,<base64>` over `id.timestamp.body`) with a per-endpoint `whsec_` secret; receivers deduplicate on `webhook-id`. |
+| Webhook secrets | AES-256-GCM at rest with `WEBHOOK_SECRET_ENCRYPTION_KEY` (required in production); plaintext only on create/rotate. Envelopes name their key (`kid`), so the encryption key rotates in two phases through `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` without making stored secrets unreadable. |
+| Signing and encryption keys | JWTs carry a `kid`; `JWT_PREVIOUS_SECRETS` keeps retired keys verify-only. Job payloads use a dedicated `DATA_ENCRYPTION_KEY`, so signing and encryption keys rotate independently. Procedure: [key rotation](#key-rotation). |
+| Authorization | `authz.Authorize` is the single service-level path and fails closed: a call with neither a subject nor an explicit `authz.SystemContext` (job handlers, admin seed) is `403`. |
+| Idempotency | Cache scope includes tenant ID and slug, so a key/body from one IP cannot replay across tenants. |
+| Production startup | Rejects the sample JWT secret and default admin password, a missing `DATA_ENCRYPTION_KEY` or one equal to `JWT_SECRET`, console email, wildcard CORS, insecure frontend/OAuth URLs, missing metrics auth, `DB_SSLMODE=disable`, `TENANT_REQUIRE_HEADER=false`, and a body limit smaller than the upload size. |
