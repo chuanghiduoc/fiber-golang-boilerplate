@@ -108,3 +108,35 @@ DELETE FROM user_passwords WHERE user_id = @user_id::bigint;
 
 -- name: DeleteUserIdentities :exec
 DELETE FROM user_identities WHERE user_id = @user_id::bigint;
+
+-- name: ListTenantDataExports :many
+-- Tenant purge: every export of the tenant (including rows of memberships
+-- already erased) so their blobs can be deleted before the rows.
+SELECT * FROM data_exports WHERE tenant_id = $1 ORDER BY id;
+
+-- name: DeleteTenantDataExports :exec
+DELETE FROM data_exports WHERE tenant_id = $1;
+
+-- name: ListUserExternalIdentities :many
+-- Export: linked external accounts, without any token material (none is
+-- stored). The subject identifies the account at the provider.
+SELECT provider, subject, created_at
+FROM user_identities
+WHERE user_id = $1
+ORDER BY provider, created_at, subject;
+
+-- name: ListUserInvitationsSent :many
+-- Export: invitations the user created in this tenant.
+SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
+FROM invitations
+WHERE tenant_id = @tenant_id::bigint AND invited_by = @user_id::bigint
+ORDER BY created_at DESC, id DESC;
+
+-- name: ListUserInvitationsReceived :many
+-- Export: invitations addressed to the user's current address or accepted by
+-- the user in this tenant.
+SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
+FROM invitations
+WHERE tenant_id = @tenant_id::bigint
+  AND (accepted_by = @user_id::bigint OR email_normalized = @email::varchar)
+ORDER BY created_at DESC, id DESC;

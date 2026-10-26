@@ -78,11 +78,16 @@ CREATE TABLE IF NOT EXISTS tenants (
     status_changed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     trial_ends_at TIMESTAMP WITH TIME ZONE,
     deletion_scheduled_at TIMESTAMP WITH TIME ZONE,
+    -- Set by identity.tenants.purge_deleted once every membership's per-user
+    -- data and every module's tenant-wide rows are gone. The tenants row and
+    -- its audit trail stay forever; this marker keeps the job idempotent.
+    purged_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_tenants_trial_ends CHECK (status <> 'trialing' OR trial_ends_at IS NOT NULL),
     CONSTRAINT chk_tenants_deletion_scheduled
         CHECK ((status IN ('pending_deletion', 'deleted')) = (deletion_scheduled_at IS NOT NULL)),
+    CONSTRAINT chk_tenants_purged CHECK (status = 'deleted' OR purged_at IS NULL),
     -- The compatibility tenant backs every tenant_id DEFAULT 1 column.
     CONSTRAINT chk_tenants_default_not_deleted
         CHECK (id <> 1 OR status NOT IN ('pending_deletion', 'deleted'))
@@ -98,6 +103,10 @@ SELECT setval(pg_get_serial_sequence('tenants', 'id'), (SELECT max(id) FROM tena
 -- Platform tenant listing (cursor pagination by creation time).
 CREATE INDEX IF NOT EXISTS idx_tenants_created_at_id
     ON tenants (created_at DESC, id DESC);
+-- The deleted-tenant purge scans only unfinished deletions.
+CREATE INDEX IF NOT EXISTS idx_tenants_deleted_unpurged
+    ON tenants (id)
+    WHERE status = 'deleted' AND purged_at IS NULL;
 
 DROP TRIGGER IF EXISTS trigger_tenants_updated_at ON tenants;
 CREATE TRIGGER trigger_tenants_updated_at

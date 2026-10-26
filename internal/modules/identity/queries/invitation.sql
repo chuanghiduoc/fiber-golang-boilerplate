@@ -53,3 +53,8 @@ WITH batch AS (
 DELETE FROM invitations AS t
 USING batch
 WHERE t.id = batch.id;
+
+-- name: DeleteTenantInvitations :exec
+-- Tenant purge: invitations reference memberships through invited_by and
+-- accepted_by (RESTRICT), so they must go before the memberships.
+DELETE FROM invitations WHERE tenant_id = $1;

@@ -105,6 +105,15 @@ func (q *Queries) DeleteDataExportsForUser(ctx context.Context, arg DeleteDataEx
 	return err
 }
 
+const deleteTenantDataExports = `-- name: DeleteTenantDataExports :exec
+DELETE FROM data_exports WHERE tenant_id = $1
+`
+
+func (q *Queries) DeleteTenantDataExports(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, deleteTenantDataExports, tenantID)
+	return err
+}
+
 const deleteTenantUserSessions = `-- name: DeleteTenantUserSessions :exec
 DELETE FROM sessions
 WHERE tenant_id = $1::bigint AND user_id = $2::bigint
@@ -340,6 +349,185 @@ func (q *Queries) ListPurgeableDataExports(ctx context.Context, batchSize int32)
 			&i.ExpiresAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTenantDataExports = `-- name: ListTenantDataExports :many
+SELECT id, tenant_id, user_id, status, storage_path, expires_at, created_at, updated_at FROM data_exports WHERE tenant_id = $1 ORDER BY id
+`
+
+// Tenant purge: every export of the tenant (including rows of memberships
+// already erased) so their blobs can be deleted before the rows.
+func (q *Queries) ListTenantDataExports(ctx context.Context, tenantID int64) ([]DataExport, error) {
+	rows, err := q.db.Query(ctx, listTenantDataExports, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []DataExport{}
+	for rows.Next() {
+		var i DataExport
+		if err := rows.Scan(
+			&i.ID,
+			&i.TenantID,
+			&i.UserID,
+			&i.Status,
+			&i.StoragePath,
+			&i.ExpiresAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserExternalIdentities = `-- name: ListUserExternalIdentities :many
+SELECT provider, subject, created_at
+FROM user_identities
+WHERE user_id = $1
+ORDER BY provider, created_at, subject
+`
+
+type ListUserExternalIdentitiesRow struct {
+	Provider  string             `json:"provider"`
+	Subject   string             `json:"subject"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Export: linked external accounts, without any token material (none is
+// stored). The subject identifies the account at the provider.
+func (q *Queries) ListUserExternalIdentities(ctx context.Context, userID int64) ([]ListUserExternalIdentitiesRow, error) {
+	rows, err := q.db.Query(ctx, listUserExternalIdentities, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserExternalIdentitiesRow{}
+	for rows.Next() {
+		var i ListUserExternalIdentitiesRow
+		if err := rows.Scan(&i.Provider, &i.Subject, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserInvitationsReceived = `-- name: ListUserInvitationsReceived :many
+SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
+FROM invitations
+WHERE tenant_id = $1::bigint
+  AND (accepted_by = $2::bigint OR email_normalized = $3::varchar)
+ORDER BY created_at DESC, id DESC
+`
+
+type ListUserInvitationsReceivedParams struct {
+	TenantID int64  `json:"tenant_id"`
+	UserID   int64  `json:"user_id"`
+	Email    string `json:"email"`
+}
+
+type ListUserInvitationsReceivedRow struct {
+	ID              int64              `json:"id"`
+	EmailNormalized string             `json:"email_normalized"`
+	Role            string             `json:"role"`
+	InvitedBy       int64              `json:"invited_by"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
+	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+// Export: invitations addressed to the user's current address or accepted by
+// the user in this tenant.
+func (q *Queries) ListUserInvitationsReceived(ctx context.Context, arg ListUserInvitationsReceivedParams) ([]ListUserInvitationsReceivedRow, error) {
+	rows, err := q.db.Query(ctx, listUserInvitationsReceived, arg.TenantID, arg.UserID, arg.Email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserInvitationsReceivedRow{}
+	for rows.Next() {
+		var i ListUserInvitationsReceivedRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EmailNormalized,
+			&i.Role,
+			&i.InvitedBy,
+			&i.ExpiresAt,
+			&i.AcceptedAt,
+			&i.AcceptedBy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserInvitationsSent = `-- name: ListUserInvitationsSent :many
+SELECT id, email_normalized, role, invited_by, expires_at, accepted_at, accepted_by, created_at
+FROM invitations
+WHERE tenant_id = $1::bigint AND invited_by = $2::bigint
+ORDER BY created_at DESC, id DESC
+`
+
+type ListUserInvitationsSentParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+type ListUserInvitationsSentRow struct {
+	ID              int64              `json:"id"`
+	EmailNormalized string             `json:"email_normalized"`
+	Role            string             `json:"role"`
+	InvitedBy       int64              `json:"invited_by"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	AcceptedAt      pgtype.Timestamptz `json:"accepted_at"`
+	AcceptedBy      pgtype.Int8        `json:"accepted_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+// Export: invitations the user created in this tenant.
+func (q *Queries) ListUserInvitationsSent(ctx context.Context, arg ListUserInvitationsSentParams) ([]ListUserInvitationsSentRow, error) {
+	rows, err := q.db.Query(ctx, listUserInvitationsSent, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserInvitationsSentRow{}
+	for rows.Next() {
+		var i ListUserInvitationsSentRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EmailNormalized,
+			&i.Role,
+			&i.InvitedBy,
+			&i.ExpiresAt,
+			&i.AcceptedAt,
+			&i.AcceptedBy,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

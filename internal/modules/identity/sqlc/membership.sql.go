@@ -99,6 +99,19 @@ func (q *Queries) CreateMembership(ctx context.Context, arg CreateMembershipPara
 	return i, err
 }
 
+const deleteTenantMemberships = `-- name: DeleteTenantMemberships :exec
+DELETE FROM memberships WHERE tenant_id = $1
+`
+
+// Runs after every module purger and invitation delete: those rows carry
+// RESTRICT foreign keys to the membership. Sessions, refresh tokens, and
+// membership_roles cascade. A deleted tenant is not operational, so the
+// last-owner trigger permits the delete.
+func (q *Queries) DeleteTenantMemberships(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, deleteTenantMemberships, tenantID)
+	return err
+}
+
 const emailBannedInTenant = `-- name: EmailBannedInTenant :one
 SELECT EXISTS (
     SELECT 1 FROM memberships m
@@ -300,7 +313,13 @@ SELECT u.id, m.tenant_id, u.email, u.name,
            JOIN roles r ON r.id = pra.role_id
            WHERE pra.user_id = m.user_id AND r.scope = 'platform'
        ) AS platform,
-       m.credentials_revoked_at, t.status AS tenant_status
+       m.credentials_revoked_at,
+       CASE
+           WHEN t.status = 'active'
+                OR (t.status = 'trialing' AND t.trial_ends_at > NOW())
+           THEN 'active'
+           ELSE 'suspended'
+       END AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id
@@ -526,6 +545,43 @@ func (q *Queries) ListMembersCursor(ctx context.Context, arg ListMembersCursorPa
 	return items, nil
 }
 
+const listTenantMembershipUserIDs = `-- name: ListTenantMembershipUserIDs :many
+SELECT user_id FROM memberships
+WHERE tenant_id = $1::bigint
+  AND user_id > $2::bigint
+ORDER BY user_id
+LIMIT $3::int
+`
+
+type ListTenantMembershipUserIDsParams struct {
+	TenantID    int64 `json:"tenant_id"`
+	AfterUserID int64 `json:"after_user_id"`
+	RowLimit    int32 `json:"row_limit"`
+}
+
+// The tenant purge walks every membership, including removed ones, in user-id
+// batches so a large tenant never loads in one statement. The tenant purge
+// then runs the privacy erasers for each user before deleting the memberships.
+func (q *Queries) ListTenantMembershipUserIDs(ctx context.Context, arg ListTenantMembershipUserIDsParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, listTenantMembershipUserIDs, arg.TenantID, arg.AfterUserID, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var user_id int64
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserMemberships = `-- name: ListUserMemberships :many
 SELECT m.id, m.tenant_id, m.user_id, m.status, m.banned_at, m.banned_email_hash, m.removed_at, m.credentials_revoked_at, m.created_at, m.updated_at,
        COALESCE((
@@ -617,7 +673,13 @@ SELECT u.id, m.tenant_id, u.email, u.name,
            JOIN roles r ON r.id = pra.role_id
            WHERE pra.user_id = m.user_id AND r.scope = 'platform'
        ) AS platform,
-       m.credentials_revoked_at, t.status AS tenant_status
+       m.credentials_revoked_at,
+       CASE
+           WHEN t.status = 'active'
+                OR (t.status = 'trialing' AND t.trial_ends_at > NOW())
+           THEN 'active'
+           ELSE 'suspended'
+       END AS tenant_status
 FROM memberships m
 JOIN users u ON u.id = m.user_id
 JOIN tenants t ON t.id = m.tenant_id

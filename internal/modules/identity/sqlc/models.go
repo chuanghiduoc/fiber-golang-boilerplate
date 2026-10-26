@@ -120,6 +120,7 @@ type Tenant struct {
 	StatusChangedAt     pgtype.Timestamptz `json:"status_changed_at"`
 	TrialEndsAt         pgtype.Timestamptz `json:"trial_ends_at"`
 	DeletionScheduledAt pgtype.Timestamptz `json:"deletion_scheduled_at"`
+	PurgedAt            pgtype.Timestamptz `json:"purged_at"`
 	CreatedAt           pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
 }

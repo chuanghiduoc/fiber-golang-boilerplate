@@ -14,7 +14,7 @@ import (
 const createTenant = `-- name: CreateTenant :one
 INSERT INTO tenants (slug, name, status, trial_ends_at)
 VALUES ($1, $2, $3, $4)
-RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at
 `
 
 type CreateTenantParams struct {
@@ -40,6 +40,7 @@ func (q *Queries) CreateTenant(ctx context.Context, arg CreateTenantParams) (Ten
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -62,10 +63,21 @@ func (q *Queries) CreateTenantSettings(ctx context.Context, arg CreateTenantSett
 	return err
 }
 
+const deleteTenantSettings = `-- name: DeleteTenantSettings :exec
+DELETE FROM tenant_settings WHERE tenant_id = $1
+`
+
+// Tenant purge: the deleted tenant's configuration has no reader left. The
+// tenants row itself is kept for audit and incident review.
+func (q *Queries) DeleteTenantSettings(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, deleteTenantSettings, tenantID)
+	return err
+}
+
 const getOperationalTenantByID = `-- name: GetOperationalTenantByID :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE id = $1
-  AND status IN ('trialing', 'active')
+  AND (status = 'active' OR (status = 'trialing' AND trial_ends_at > NOW()))
 `
 
 func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenant, error) {
@@ -79,6 +91,7 @@ func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenan
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -87,12 +100,14 @@ func (q *Queries) GetOperationalTenantByID(ctx context.Context, id int64) (Tenan
 
 const getOperationalTenantBySlug = `-- name: GetOperationalTenantBySlug :one
 
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE slug = $1
-  AND status IN ('trialing', 'active')
+  AND (status = 'active' OR (status = 'trialing' AND trial_ends_at > NOW()))
 `
 
-// Only trialing and active tenants serve requests ("operational").
+// Only trialing and active tenants serve requests ("operational"). A trialing
+// tenant stops serving the moment trial_ends_at passes, before the hourly
+// expire-trials job changes its status.
 func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (Tenant, error) {
 	row := q.db.QueryRow(ctx, getOperationalTenantBySlug, slug)
 	var i Tenant
@@ -104,6 +119,7 @@ func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -111,7 +127,7 @@ func (q *Queries) GetOperationalTenantBySlug(ctx context.Context, slug string) (
 }
 
 const getTenantByID = `-- name: GetTenantByID :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE id = $1
 `
 
@@ -128,6 +144,7 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -135,7 +152,7 @@ func (q *Queries) GetTenantByID(ctx context.Context, id int64) (Tenant, error) {
 }
 
 const getTenantByIDForUpdate = `-- name: GetTenantByIDForUpdate :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE id = $1
 FOR UPDATE
 `
@@ -151,6 +168,7 @@ func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant,
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -158,7 +176,7 @@ func (q *Queries) GetTenantByIDForUpdate(ctx context.Context, id int64) (Tenant,
 }
 
 const getTenantBySlug = `-- name: GetTenantBySlug :one
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE slug = $1
 `
 
@@ -173,6 +191,7 @@ func (q *Queries) GetTenantBySlug(ctx context.Context, slug string) (Tenant, err
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -197,8 +216,78 @@ func (q *Queries) GetTenantSettings(ctx context.Context, tenantID int64) (Tenant
 	return i, err
 }
 
+const listDeletedUnpurgedTenants = `-- name: ListDeletedUnpurgedTenants :many
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
+WHERE status = 'deleted'
+  AND purged_at IS NULL
+ORDER BY id
+LIMIT $1::int
+`
+
+// The deleted-tenant purge only considers rows that have not completed yet.
+func (q *Queries) ListDeletedUnpurgedTenants(ctx context.Context, rowLimit int32) ([]Tenant, error) {
+	rows, err := q.db.Query(ctx, listDeletedUnpurgedTenants, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Tenant{}
+	for rows.Next() {
+		var i Tenant
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.Status,
+			&i.StatusChangedAt,
+			&i.TrialEndsAt,
+			&i.DeletionScheduledAt,
+			&i.PurgedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listExpiredTrialTenantIDs = `-- name: ListExpiredTrialTenantIDs :many
+SELECT id FROM tenants
+WHERE status = 'trialing'
+  AND trial_ends_at <= NOW()
+ORDER BY id
+LIMIT $1::int
+`
+
+// The hourly trial-expiry job moves these to suspended through the audited
+// tenant service. Bounded so one pass cannot scan an unbounded backlog.
+func (q *Queries) ListExpiredTrialTenantIDs(ctx context.Context, rowLimit int32) ([]int64, error) {
+	rows, err := q.db.Query(ctx, listExpiredTrialTenantIDs, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTenantsCursor = `-- name: ListTenantsCursor :many
-SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at FROM tenants
+SELECT id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at FROM tenants
 WHERE (created_at, id) < ($1::timestamptz, $2::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT $3::int
@@ -228,6 +317,7 @@ func (q *Queries) ListTenantsCursor(ctx context.Context, arg ListTenantsCursorPa
 			&i.StatusChangedAt,
 			&i.TrialEndsAt,
 			&i.DeletionScheduledAt,
+			&i.PurgedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {
@@ -241,13 +331,31 @@ func (q *Queries) ListTenantsCursor(ctx context.Context, arg ListTenantsCursorPa
 	return items, nil
 }
 
+const markTenantPurged = `-- name: MarkTenantPurged :execrows
+UPDATE tenants
+SET purged_at = NOW()
+WHERE id = $1::bigint
+  AND status = 'deleted'
+  AND purged_at IS NULL
+`
+
+// Completion marker. The status check makes a concurrent status change a
+// no-op instead of marking an operational tenant purged.
+func (q *Queries) MarkTenantPurged(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, markTenantPurged, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateTenantStatus = `-- name: UpdateTenantStatus :one
 UPDATE tenants
 SET status = $1,
     status_changed_at = NOW(),
     deletion_scheduled_at = $2
 WHERE id = $3
-RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, created_at, updated_at
+RETURNING id, slug, name, status, status_changed_at, trial_ends_at, deletion_scheduled_at, purged_at, created_at, updated_at
 `
 
 type UpdateTenantStatusParams struct {
@@ -267,6 +375,7 @@ func (q *Queries) UpdateTenantStatus(ctx context.Context, arg UpdateTenantStatus
 		&i.StatusChangedAt,
 		&i.TrialEndsAt,
 		&i.DeletionScheduledAt,
+		&i.PurgedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)

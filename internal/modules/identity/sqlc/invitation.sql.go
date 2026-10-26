@@ -49,6 +49,17 @@ func (q *Queries) DeletePendingInvitationsByInviter(ctx context.Context, arg Del
 	return result.RowsAffected(), nil
 }
 
+const deleteTenantInvitations = `-- name: DeleteTenantInvitations :exec
+DELETE FROM invitations WHERE tenant_id = $1
+`
+
+// Tenant purge: invitations reference memberships through invited_by and
+// accepted_by (RESTRICT), so they must go before the memberships.
+func (q *Queries) DeleteTenantInvitations(ctx context.Context, tenantID int64) error {
+	_, err := q.db.Exec(ctx, deleteTenantInvitations, tenantID)
+	return err
+}
+
 const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one
 SELECT id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at FROM invitations
 WHERE token_hash = $1
