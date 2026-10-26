@@ -14,12 +14,12 @@ import (
 	"testing"
 )
 
-// tableOwners maps every table referenced by module or platform SQL to its
-// one owner: a module name, or "platform/<package>" for a platform table. A
-// table that is not listed is owned by the module whose name it equals or
-// prefixes with "_" (orders, orders_items -> orders), so a new module that
-// follows the naming convention needs no edit here; anything else must be
-// added explicitly.
+// tableOwners maps every table referenced by module, platform, pkg, or cmd SQL
+// to its one owner: a module name, or "platform/<package>", "pkg/<package>",
+// or "cmd/<command>". A table that is not listed is owned by the module whose
+// name it equals or prefixes with "_" (orders, orders_items -> orders), so a new
+// module that follows the naming convention needs no edit here; anything else
+// must be added explicitly.
 var tableOwners = map[string]string{
 	"tenants":                        "identity",
 	"tenant_settings":                "identity",
@@ -61,6 +61,9 @@ var tableOwners = map[string]string{
 	"audit_events":     "platform/audit",
 	"scheduler_leases": "platform/scheduler",
 	"scheduler_runs":   "platform/scheduler",
+	// The migration command reads its own bookkeeping table during schema
+	// verification; no application package may query it.
+	"schema_migrations": "cmd/migrate",
 }
 
 // crossModuleReads are deliberate, reviewed exceptions: "<owner>:<table>",
@@ -73,6 +76,10 @@ var crossModuleReads = map[string]string{
 	// read-only SELECT of the tables the features module administers.
 	"platform/features:feature_flags":        "flag snapshot load (read-only)",
 	"platform/features:feature_flag_targets": "flag snapshot load (read-only)",
+	// The migration command verifies the schema it owns, including the
+	// compatibility tenant row and its id. It never serves requests or exposes
+	// tenant data.
+	"cmd/migrate:tenants": "schema verification and default-tenant check",
 }
 
 // sqlNotTables are words that follow FROM/JOIN/INTO/UPDATE but are not tables
@@ -97,6 +104,11 @@ var sqlClauseEnd = map[string]bool{
 // sqlFromInFunc are functions whose argument syntax uses FROM for something
 // other than a table: EXTRACT(EPOCH FROM ts), SUBSTRING(s FROM 2), ...
 var sqlFromInFunc = map[string]bool{"extract": true, "substring": true, "trim": true, "overlay": true}
+
+// sqlSystemSchemas hold catalog views, not application tables. A qualified
+// reference there is schema metadata (cmd/migrate verifies it) and must not be
+// treated as a table with an owner.
+var sqlSystemSchemas = map[string]bool{"information_schema": true, "pg_catalog": true}
 
 // sqlSubqueryStart are tokens that, directly after "(", start a subquery
 // rather than a parenthesized join.
@@ -299,6 +311,10 @@ func sqlTables(sql string) (tables, ctes []string) {
 				if listVerb && next < len(toks) && toks[next].is("(") {
 					break // FROM unnest(...): a function call; "(" is handled below
 				}
+				if isSystemCatalogTable(toks, i, next, name) {
+					i = next - 1
+					continue
+				}
 				qualified := next > i+1
 				i = next - 1
 				if !qualified && stmtCTEs[name.text] {
@@ -409,6 +425,16 @@ func qualifiedName(toks []sqlTok, i int) (name sqlTok, next int) {
 	return name, next
 }
 
+// isSystemCatalogTable reports whether the name at toks[start:next] is a
+// PostgreSQL catalog object or an information_schema/pg_catalog view. The pg_
+// prefix is reserved by PostgreSQL, so it cannot hide an application table.
+func isSystemCatalogTable(toks []sqlTok, start, next int, name sqlTok) bool {
+	if strings.HasPrefix(name.text, "pg_") {
+		return true
+	}
+	return next > start+1 && toks[start+1].is(".") && sqlSystemSchemas[toks[start].text]
+}
+
 // skipParens returns the index after the balanced group opening at i.
 func skipParens(toks []sqlTok, i int) int {
 	depth := 0
@@ -489,8 +515,8 @@ func goSQLLiterals(fset *token.FileSet, file string, src []byte) ([]sqlSource, e
 
 // codeSQLSources returns the module query files (internal/modules/*/queries)
 // and every SQL-looking string literal in non-test, non-generated Go under
-// internal/modules (owner: the module) and internal/platform (owner:
-// platform/<package>).
+// internal/modules, internal/platform, pkg, and cmd. The owner is the module,
+// platform/<package>, pkg/<package>, or cmd/<command> whose code it is.
 func codeSQLSources(t *testing.T, root string) []sqlSource {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join(root, "internal", "modules", "*", "queries", "*.sql"))
@@ -513,8 +539,9 @@ func codeSQLSources(t *testing.T, root string) []sqlSource {
 
 	fset := token.NewFileSet()
 	goLiterals := 0
-	for _, area := range []string{"modules", "platform"} {
-		err := filepath.WalkDir(filepath.Join(root, "internal", area), func(path string, d fs.DirEntry, err error) error {
+	goFiles := map[string]int{}
+	for _, area := range []string{"internal/modules", "internal/platform", "pkg", "cmd"} {
+		err := filepath.WalkDir(filepath.Join(root, area), func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
@@ -529,13 +556,9 @@ func codeSQLSources(t *testing.T, root string) []sqlSource {
 			}
 			rel, _ := filepath.Rel(root, path)
 			rel = filepath.ToSlash(rel)
-			parts := strings.Split(rel, "/")
-			if len(parts) < 4 {
-				return nil // a file directly under internal/modules or internal/platform
-			}
-			owner := parts[2]
-			if area == "platform" {
-				owner = "platform/" + parts[2]
+			owner, ok := sqlSourceOwner(rel)
+			if !ok {
+				return nil
 			}
 			src, err := os.ReadFile(path)
 			if err != nil {
@@ -550,16 +573,41 @@ func codeSQLSources(t *testing.T, root string) []sqlSource {
 				out = append(out, literal)
 			}
 			goLiterals += len(literals)
+			goFiles[area]++
 			return nil
 		})
 		if err != nil {
-			t.Fatalf("scan internal/%s: %v", area, err)
+			t.Fatalf("scan %s: %v", area, err)
 		}
 	}
 	if goLiterals == 0 {
-		t.Fatal("no inline SQL found in internal/platform; the Go literal scan is broken")
+		t.Fatal("no inline SQL found in the scanned tree; the Go literal scan is broken")
+	}
+	for _, area := range []string{"internal/modules", "internal/platform", "pkg", "cmd"} {
+		if goFiles[area] == 0 {
+			t.Fatalf("no Go files scanned under %s; the scan is broken", area)
+		}
 	}
 	return out
+}
+
+// sqlSourceOwner maps a repository-relative Go path to the table-owner name
+// used by tableOwners, or false for a file that sits directly in a scanned
+// root and belongs to no specific package.
+func sqlSourceOwner(rel string) (string, bool) {
+	parts := strings.Split(rel, "/")
+	switch {
+	case len(parts) >= 4 && parts[0] == "internal" && parts[1] == "modules":
+		return parts[2], true
+	case len(parts) >= 4 && parts[0] == "internal" && parts[1] == "platform":
+		return "platform/" + parts[2], true
+	case len(parts) >= 3 && parts[0] == "pkg":
+		return "pkg/" + parts[1], true
+	case len(parts) >= 3 && parts[0] == "cmd":
+		return "cmd/" + parts[1], true
+	default:
+		return "", false
+	}
 }
 
 // TestCodeSQLOnlyTouchesOwnedTables fails when module SQL (query files or
@@ -684,6 +732,10 @@ SELECT * FROM unnest($1::bigint[]) AS u(id) /* JOIN tenants */;`
 			sql:  `TABLE users`,
 			want: "users",
 		},
+		"system catalogs are not application tables": {
+			sql:  `SELECT * FROM information_schema.tables t JOIN pg_catalog.pg_class c ON true JOIN pg_roles r ON true, tenants`,
+			want: "tenants",
+		},
 		"escape string with escaped quote": {
 			sql:  `SELECT E'\'' AS a FROM users WHERE b = 'x'`,
 			want: "users",
@@ -737,5 +789,31 @@ func TestGoSQLLiterals(t *testing.T) {
 	want := []string{"p.go:3 SELECT id FROM jobs WHERE id = $1", "p.go:4 UPDATE users SET name = $1"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("goSQLLiterals = %q, want %q", got, want)
+	}
+}
+
+func TestSQLSourceOwner(t *testing.T) {
+	cases := map[string]struct {
+		path  string
+		owner string
+		ok    bool
+	}{
+		"module service":        {"internal/modules/orders/service/create.go", "orders", true},
+		"platform package":      {"internal/platform/jobs/worker.go", "platform/jobs", true},
+		"pkg package":           {"pkg/database/scope.go", "pkg/database", true},
+		"cmd command":           {"cmd/migrate/main.go", "cmd/migrate", true},
+		"module queries file":   {"internal/modules/orders/queries/q.sql", "orders", true},
+		"root internal package": {"internal/app/app.go", "", false},
+		"file directly in pkg":  {"pkg/doc.go", "", false},
+		"other tree is not SQL": {"test/arch/table_ownership_test.go", "", false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			owner, ok := sqlSourceOwner(tc.path)
+			if owner != tc.owner || ok != tc.ok {
+				t.Errorf("sqlSourceOwner(%q) = (%q, %v), want (%q, %v)",
+					tc.path, owner, ok, tc.owner, tc.ok)
+			}
+		})
 	}
 }

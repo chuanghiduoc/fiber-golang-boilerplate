@@ -511,17 +511,26 @@ another owner's table (a CTE must not shadow it):
 | Source | Owner |
 | --- | --- |
 | `internal/modules/*/queries/*.sql` | the module |
-| Inline SQL string literals in non-test Go under `internal/modules/**` and `internal/platform/**` (`sqlc/` and `testdata/` skipped) | the module, or `platform/<pkg>` |
+| Inline SQL string literals in non-test Go under `internal/modules/**`, `internal/platform/**`, `pkg/**`, and `cmd/**` (`sqlc/` and `testdata/` skipped) | the module, `platform/<pkg>`, `pkg/<pkg>`, or `cmd/<command>` |
 
 Inline SQL is detected by UPPERCASE keywords (`FROM`, `JOIN`, `INSERT INTO`,
 `DELETE FROM`, `UPDATE ... SET`, ...) followed by an identifier, so write
 inline SQL keywords in uppercase or the scan misses it. Platform tables
 (`jobs`, `audit_events`, `scheduler_*`) belong to their `platform/<pkg>`.
-Reviewed exceptions go in `crossModuleReads`; the only one is
-`platform/features` reading `feature_flags`/`feature_flag_targets` for the
-flag snapshot (modules have none: tenants/users are read through
+`information_schema` and `pg_*` catalog references are metadata, not
+application tables. Reviewed exceptions go in `crossModuleReads`:
+`platform/features` reads `feature_flags`/`feature_flag_targets` for its
+snapshot, and `cmd/migrate` reads `tenants` while verifying the baseline;
+modules have none (tenants/users are read through
 `internal/contracts/identity`). Never read or write another module's table,
 even in a JOIN; use a contract/read model or a job.
+
+`TestSQLCallsUseConstantStrings` (`test/arch/sql_literals_test.go`) type-checks
+`internal/`, `pkg/`, and `cmd/` and rejects any `Exec`/`Query`/`QueryRow`
+(DBTX-shaped) or `pgx.Batch.Queue` whose SQL argument is not a compile-time
+constant. The only reviewed dynamic sites are listed in `dynamicSQLAllowlist`
+with a reason; the list may not grow without raising its reviewed ceiling, and
+an entry that no longer matches a call fails the test so it is removed.
 
 ### Schema conventions
 
