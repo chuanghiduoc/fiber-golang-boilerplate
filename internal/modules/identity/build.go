@@ -11,11 +11,13 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityrepository "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
@@ -51,7 +53,7 @@ type Settings struct {
 
 // Build constructs identity's repositories, services, and handlers from infra.
 // It performs no I/O; call Module.Startup for the tenant/admin-seed checks.
-func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts.Registry) (*Module, Provides, error) {
+func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts.Registry, tenancyRegistry *tenancycontracts.Registry) (*Module, Provides, error) {
 	cfg := infra.Platform
 
 	var googleOAuth *oauth.GoogleOAuth
@@ -159,8 +161,17 @@ func Build(infra app.Infra, settings Settings, privacyRegistry *privacycontracts
 		Registry:     privacyRegistry,
 		Verifier:     userSvc,
 		SessionCache: sessionStore,
+		ExportStore:  identityrepository.NewPrivacyExportRepository(infra.DB),
+		AuditEvents:  audit.NewUserEventReader(infra.DB),
 	})
 	m.privacy = identityhandler.NewPrivacyHandler(m.privacySvc)
+	m.tenantPurger = identityservice.NewTenantPurgeService(identityservice.TenantPurgeDeps{
+		Repo:     identityrepository.NewTenantPurgeRepository(infra.DB, infra.Tx, infra.Audit),
+		Privacy:  m.privacySvc,
+		Tenants:  tenantSvc,
+		Registry: tenancyRegistry,
+		Storage:  infra.Storage,
+	})
 	m.startup = func(ctx context.Context) error {
 		return startup(ctx, infra.Platform, settings.Admin, stores, transactor, sessionStore)
 	}
@@ -223,6 +234,10 @@ func (m *Module) RegisterJobs(registrar jobs.Registrar) {
 		registrar.Register(identityservice.JobKindEraseFinalize, m.privacySvc.HandleFinalizeJob)
 		registrar.Register(identityservice.JobKindExportPurge, m.privacySvc.HandlePurgeJob)
 	}
+	if m.tenantPurger != nil {
+		registrar.Register(identityservice.TenantPurgeJobKind, m.tenantPurger.HandlePurgeJob)
+		registrar.Register(identityservice.TrialExpiryJobKind, m.tenantPurger.HandleTrialExpiryJob)
+	}
 }
 
 // tokenPurgeSchedule enqueues the expired-token purge. The scheduler is
@@ -241,6 +256,20 @@ var exportPurgeSchedule = scheduler.Spec{
 	Kind:     identityservice.JobKindExportPurge,
 }
 
+// tenantPurgeSchedule erases tenants whose deletion completed.
+var tenantPurgeSchedule = scheduler.Spec{
+	Name:     identityservice.TenantPurgeJobKind,
+	Interval: identityservice.TenantPurgeInterval,
+	Kind:     identityservice.TenantPurgeJobKind,
+}
+
+// trialExpirySchedule suspends trialing tenants whose trial_ends_at passed.
+var trialExpirySchedule = scheduler.Spec{
+	Name:     identityservice.TrialExpiryJobKind,
+	Interval: identityservice.TrialExpiryInterval,
+	Kind:     identityservice.TrialExpiryJobKind,
+}
+
 // RegisterSchedules implements app.ScheduleProvider. The spec is a constant,
 // so a registration error is a programming error and fails startup loudly.
 func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
@@ -252,6 +281,13 @@ func (m *Module) RegisterSchedules(registry *scheduler.Registry) {
 	if m.privacySvc != nil {
 		if err := registry.Register(exportPurgeSchedule); err != nil {
 			panic(fmt.Sprintf("identity: register %s schedule: %v", exportPurgeSchedule.Name, err))
+		}
+	}
+	if m.tenantPurger != nil {
+		for _, spec := range []scheduler.Spec{tenantPurgeSchedule, trialExpirySchedule} {
+			if err := registry.Register(spec); err != nil {
+				panic(fmt.Sprintf("identity: register %s schedule: %v", spec.Name, err))
+			}
 		}
 	}
 }

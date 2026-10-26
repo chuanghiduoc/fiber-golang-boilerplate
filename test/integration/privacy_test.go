@@ -65,6 +65,7 @@ type privacyHarness struct {
 	pool    *pgxpool.Pool
 	store   storage.Storage
 	jobs    *privacyJobs
+	modules *bootstrap.Modules
 	records map[string]string
 }
 
@@ -128,7 +129,7 @@ func setupPrivacyHarness(t *testing.T) *privacyHarness {
 	})
 	application.Register(modules.List...)
 
-	return &privacyHarness{app: application.Fiber(), pool: pool, store: store, jobs: registrar, records: map[string]string{}}
+	return &privacyHarness{app: application.Fiber(), pool: pool, store: store, jobs: registrar, modules: modules, records: map[string]string{}}
 }
 
 func (h *privacyHarness) request(t *testing.T, method, path, token, tenantSlug, body string) (status int, payload []byte) {

@@ -80,6 +80,7 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	if settings.TrashRetentionDays > 0 {
 		m.trashPurger = filesvc.NewTrashPurger(filesrepo.NewTrashRepository(infra.Tx), infra.Storage, settings.TrashRetentionDays)
 	}
+	m.tenantPurger = filesrepo.NewTenantPurger(infra.DB, infra.Storage)
 	return m, Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}, nil
 }
 

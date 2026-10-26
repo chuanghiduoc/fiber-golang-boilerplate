@@ -34,6 +34,7 @@ func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLo
 	m := New(notificationshandler.New(svc))
 	m.notifier = svc
 	m.privacy = notificationsprivacy.New(notificationsrepo.NewPrivacyStore(infra.DB))
+	m.tenantPurger = notificationsrepo.NewTenantPurger(infra.DB)
 	if settings.RetentionDays > 0 {
 		m.retentionPurger = notificationsservice.NewRetentionPurger(
 			notificationsrepo.NewRetentionRepository(infra.DB), settings.RetentionDays)

@@ -106,6 +106,31 @@ func (q *Queries) DeleteRole(ctx context.Context, arg DeleteRoleParams) (int64, 
 	return result.RowsAffected(), nil
 }
 
+const deleteTenantRolesBatch = `-- name: DeleteTenantRolesBatch :execrows
+DELETE FROM roles
+WHERE id IN (
+    SELECT id FROM roles
+    WHERE tenant_id = $1::bigint
+    LIMIT $2::int
+)
+`
+
+type DeleteTenantRolesBatchParams struct {
+	TenantID  int64 `json:"tenant_id"`
+	BatchSize int32 `json:"batch_size"`
+}
+
+// Tenant purge: custom roles of the tenant, one bounded id page per statement.
+// role_permissions cascade, and the memberships (with their membership_roles)
+// were deleted first.
+func (q *Queries) DeleteTenantRolesBatch(ctx context.Context, arg DeleteTenantRolesBatchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteTenantRolesBatch, arg.TenantID, arg.BatchSize)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getRole = `-- name: GetRole :one
 SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        ARRAY(
@@ -277,6 +302,49 @@ func (q *Queries) ListRolesCursor(ctx context.Context, arg ListRolesCursorParams
 			&i.UpdatedAt,
 			&i.Permissions,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserRoleAssignments = `-- name: ListUserRoleAssignments :many
+SELECT r.key, mr.created_at
+FROM membership_roles mr
+JOIN roles r ON r.id = mr.role_id
+WHERE mr.tenant_id = $1::bigint
+  AND mr.user_id = $2::bigint
+  AND r.scope = 'tenant'
+ORDER BY mr.created_at, r.key
+`
+
+type ListUserRoleAssignmentsParams struct {
+	TenantID int64 `json:"tenant_id"`
+	UserID   int64 `json:"user_id"`
+}
+
+type ListUserRoleAssignmentsRow struct {
+	Key       string             `json:"key"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// Export: the user's current membership role assignments in the request
+// tenant. Role changes are not historized, so created_at is when the current
+// assignment was granted.
+func (q *Queries) ListUserRoleAssignments(ctx context.Context, arg ListUserRoleAssignmentsParams) ([]ListUserRoleAssignmentsRow, error) {
+	rows, err := q.db.Query(ctx, listUserRoleAssignments, arg.TenantID, arg.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListUserRoleAssignmentsRow{}
+	for rows.Next() {
+		var i ListUserRoleAssignmentsRow
+		if err := rows.Scan(&i.Key, &i.CreatedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

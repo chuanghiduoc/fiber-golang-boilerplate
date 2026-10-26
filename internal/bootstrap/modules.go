@@ -14,6 +14,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/admin"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features"
@@ -38,6 +39,8 @@ type Modules struct {
 	APIKeyVerifier *apikey.Verifier
 	// Privacy is the registry modules register their exporters/erasers into.
 	Privacy *privacycontracts.Registry
+	// Tenancy is the registry modules register their tenant-wide purgers into.
+	Tenancy *tenancycontracts.Registry
 
 	// Startup runs one-time checks that need the database (tenant
 	// existence, admin seed) inside the caller's startup deadline.
@@ -56,10 +59,11 @@ type Modules struct {
 // and its own settings) and append it to List.
 func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	privacyRegistry := privacycontracts.NewRegistry()
+	tenancyRegistry := tenancycontracts.NewRegistry()
 	identityModule, identityProvides, err := identity.Build(infra, identity.Settings{
 		OAuth: cfg.OAuth,
 		Admin: cfg.Admin,
-	}, privacyRegistry)
+	}, privacyRegistry, tenancyRegistry)
 	if err != nil {
 		return nil, err
 	}
@@ -103,12 +107,23 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	})
 	identityModule.SetNotifier(notificationsModule.Notifier())
 
+	// Tenant purgers are registered after every module is built, non-identity
+	// first and identity last: only identity deletes memberships, so every
+	// other module can still reach the rows its foreign keys reference.
+	filesModule.RegisterTenantPurge(tenancyRegistry)
+	apikeysModule.RegisterTenantPurge(tenancyRegistry)
+	featuresModule := features.Build(infra)
+	featuresModule.RegisterTenantPurge(tenancyRegistry)
+	webhooksModule.RegisterTenantPurge(tenancyRegistry)
+	notificationsModule.RegisterTenantPurge(tenancyRegistry)
+	identityModule.RegisterTenantPurge(tenancyRegistry)
+
 	return &Modules{
 		List: []app.Module{
 			identityModule,
 			filesModule,
 			admin.Build(identityProvides.Admin, filesProvides.Admin),
-			features.Build(infra),
+			featuresModule,
 			webhooksModule,
 			apikeysModule,
 			notificationsModule,
@@ -118,6 +133,7 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 		TenantResolver: identityProvides.TenantResolver,
 		APIKeyVerifier: apikeysProvides.Verifier,
 		Privacy:        privacyRegistry,
+		Tenancy:        tenancyRegistry,
 		Startup:        identityModule.Startup,
 		Background:     []func(context.Context){webhooksModule.RunRetention},
 		Close:          []func(){webhooksModule.Close},

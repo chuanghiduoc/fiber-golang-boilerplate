@@ -123,3 +123,26 @@ INSERT INTO roles (tenant_id, scope, key, name)
 VALUES (NULL, @scope, @key, @name)
 ON CONFLICT (tenant_id, key) DO UPDATE SET scope = EXCLUDED.scope, name = EXCLUDED.name
 RETURNING *;
+
+-- name: DeleteTenantRolesBatch :execrows
+-- Tenant purge: custom roles of the tenant, one bounded id page per statement.
+-- role_permissions cascade, and the memberships (with their membership_roles)
+-- were deleted first.
+DELETE FROM roles
+WHERE id IN (
+    SELECT id FROM roles
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);
+
+-- name: ListUserRoleAssignments :many
+-- Export: the user's current membership role assignments in the request
+-- tenant. Role changes are not historized, so created_at is when the current
+-- assignment was granted.
+SELECT r.key, mr.created_at
+FROM membership_roles mr
+JOIN roles r ON r.id = mr.role_id
+WHERE mr.tenant_id = @tenant_id::bigint
+  AND mr.user_id = @user_id::bigint
+  AND r.scope = 'tenant'
+ORDER BY mr.created_at, r.key;

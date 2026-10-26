@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 )
 
 func TestTenantStatusTransitions(t *testing.T) {
@@ -84,6 +85,36 @@ func TestTenantTransition_RefusesDeletionBeforeGrace(t *testing.T) {
 	deleted, err := svc.Transition(ctx, 2, TenantStatusDeleted)
 	require.NoError(t, err)
 	assert.Equal(t, TenantStatusDeleted, deleted.Status)
+}
+
+func TestTenantExpireTrialSuspendsOnlyPastDue(t *testing.T) {
+	db := newMemDB()
+	svc := NewTenantService(db.stores(), memTx{db})
+	ctx := context.Background()
+	past := time.Now().Add(-time.Minute)
+	future := time.Now().Add(time.Hour)
+	db.tenants[2].Status = TenantStatusTrialing
+	db.tenants[2].TrialEndsAt = &past
+	db.tenants[3] = &Tenant{ID: 3, Slug: "live", Name: "Live", Status: TenantStatusTrialing, TrialEndsAt: &future}
+
+	changed, err := svc.ExpireTrial(ctx, 2)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, TenantStatusSuspended, db.tenants[2].Status)
+	require.Len(t, db.audits, 1)
+	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
+	assert.Equal(t, audit.ActorTypeSystem, db.audits[0].ActorType)
+	assert.Equal(t, "trial_expired", db.audits[0].Metadata["reason"])
+
+	changed, err = svc.ExpireTrial(ctx, 2)
+	require.NoError(t, err)
+	assert.False(t, changed, "a retry after suspension is a no-op")
+	assert.Len(t, db.audits, 1, "a no-op writes no audit row")
+
+	changed, err = svc.ExpireTrial(ctx, 3)
+	require.NoError(t, err)
+	assert.False(t, changed, "a live trial stays trialing")
+	assert.Equal(t, TenantStatusTrialing, db.tenants[3].Status)
 }
 
 func TestNormalizeNewTenant(t *testing.T) {

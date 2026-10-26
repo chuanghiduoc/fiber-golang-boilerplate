@@ -119,7 +119,9 @@ func (s *TenantService) Create(ctx context.Context, in NewTenant) (*Tenant, erro
 	}
 
 	var created *Tenant
-	ctx = database.WithRLSBypass(ctx) // A new tenant's settings and audit row are not the caller's tenant.
+	// Deliberate RLS bypass: the new tenant and its settings/audit row are not
+	// the caller's request tenant, so no single app.tenant_id can cover them.
+	ctx = database.WithRLSBypass(ctx)
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		t, err := tx.Tenants.Create(ctx, in)
 		if err != nil {
@@ -176,7 +178,9 @@ func normalizeNewTenant(in *NewTenant) error {
 // sessions.
 func (s *TenantService) Transition(ctx context.Context, id int64, to TenantStatus) (*Tenant, error) {
 	var updated *Tenant
-	ctx = database.WithRLSBypass(ctx) // Platform tenant lifecycle targets a tenant other than the caller's.
+	// Deliberate RLS bypass: the platform transition targets a tenant other
+	// than the caller's (the tenants table is platform-wide lifecycle data).
+	ctx = database.WithRLSBypass(ctx)
 	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		current, err := tx.Tenants.GetByIDForUpdate(ctx, id)
 		if err != nil {
@@ -207,6 +211,40 @@ func (s *TenantService) Transition(ctx context.Context, id int64, to TenantStatu
 	return updated, err
 }
 
+// ExpireTrial moves a trialing tenant whose trial_ends_at has passed to
+// suspended. It is the system-actor path used by the hourly schedule: the
+// status is re-checked under the row lock, a concurrent admin transition is a
+// no-op, and the change is audited as tenant.status_changed with a
+// reason=trial_expired metadata entry.
+func (s *TenantService) ExpireTrial(ctx context.Context, id int64) (bool, error) {
+	ctx = tenant.WithID(ctx, id)
+	var changed bool
+	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+		current, err := tx.Tenants.GetByIDForUpdate(ctx, id)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return nil
+			}
+			return apperror.NewInternal("failed to load tenant")
+		}
+		if current.Status != TenantStatusTrialing || current.TrialEndsAt == nil ||
+			current.TrialEndsAt.After(time.Now()) {
+			return nil
+		}
+		t, err := tx.Tenants.UpdateStatus(ctx, id, TenantStatusSuspended, nil)
+		if err != nil {
+			return apperror.NewInternal("failed to suspend expired trial")
+		}
+		changed = true
+		event := tenantEvent(ctx, "tenant.status_changed", t,
+			map[string]any{"from": string(TenantStatusTrialing), "to": string(TenantStatusSuspended), "reason": "trial_expired"})
+		event.ActorType = audit.ActorTypeSystem
+		event.Source = audit.SourceSystem
+		return checkAudit(tx.Audit.RecordTx(ctx, event))
+	})
+	return changed, err
+}
+
 // deletionSchedule returns deletion_scheduled_at for the new state: set when
 // entering pending_deletion, kept when it is finally deleted, cleared
 // otherwise.
@@ -226,7 +264,9 @@ func deletionSchedule(current *Tenant, to TenantStatus) *time.Time {
 
 // Settings returns a tenant's typed settings.
 func (s *TenantService) Settings(ctx context.Context, id int64) (*TenantSettings, error) {
-	ctx = database.WithRLSBypass(ctx) // Platform lookup of another tenant's settings.
+	// Deliberate RLS bypass: platform administration reads another tenant's
+	// settings, which the tenant's own scope would hide.
+	ctx = database.WithRLSBypass(ctx)
 	settings, err := s.stores.Tenants.Settings(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {

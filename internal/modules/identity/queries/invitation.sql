@@ -53,3 +53,14 @@ WITH batch AS (
 DELETE FROM invitations AS t
 USING batch
 WHERE t.id = batch.id;
+
+-- name: DeleteTenantInvitationsBatch :execrows
+-- Tenant purge: invitations reference memberships through invited_by and
+-- accepted_by (RESTRICT), so they must go before the memberships. One bounded
+-- page per statement keeps a large tenant from loading everything at once.
+DELETE FROM invitations
+WHERE id IN (
+    SELECT id FROM invitations
+    WHERE tenant_id = @tenant_id::bigint
+    LIMIT @batch_size::int
+);

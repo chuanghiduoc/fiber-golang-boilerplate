@@ -30,6 +30,7 @@ func Build(infra app.Infra, principals identitycontracts.PrincipalReader, settin
 	svc := apikeyservice.NewService(repo, principals, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals), settings.MaxLifetime)
 	m := New(apikeyhandler.NewHandler(svc))
 	m.privacy = apikeysprivacy.New(apikeyrepo.NewPrivacyStore(infra.DB))
+	m.tenantPurger = apikeyrepo.NewTenantPurger(infra.DB)
 	return m, Provides{Verifier: verifier}
 }
 

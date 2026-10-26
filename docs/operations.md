@@ -456,7 +456,9 @@ another reset email) instead of updating dead rows back to `queued`.
 ### Tenant lifecycle
 
 Tenant status is `trialing | active | suspended | pending_deletion |
-deleted`; only `trialing` and `active` serve requests. Transitions go through
+deleted`; only `trialing` and `active` serve requests, and a `trialing` tenant
+stops serving as soon as `trial_ends_at` passes (resolved as not found before
+the hourly job writes `suspended`). Transitions go through
 the identity `TenantService` (`internal/modules/identity/service/tenants.go`),
 which enforces the state machine (`trialing → active | suspended |
 pending_deletion`, `active ↔ suspended`, `active | suspended →
@@ -467,7 +469,9 @@ deleted (also a `CHECK`). Platform admins use `PATCH
 /platform/tenants/:id/status`; operator tooling must call the service rather
 than raw `UPDATE`s, which skip the audit row. A
 non-operational tenant returns `404` on tenant resolution after the resolver
-cache TTL (30s) and `401` for existing sessions and API keys.
+cache TTL (30s) and `401` for existing sessions and API keys. A `deleted`
+tenant's data is erased by the hourly purge (below); the `tenants` row and its
+audit trail remain.
 
 ### Data retention overview
 
@@ -486,12 +490,16 @@ loops run in every worker process regardless.
 | Trashed files | Soft-deleted more than `FILES_TRASH_RETENTION_DAYS` (30) ago: blob, then row; a failed blob is retried after a per-row backoff | `files.trash.purge`, hourly (scheduler) | 100-row claimed batches, 1 min per run | Partial `idx_files_deleted_at ON files (deleted_at) WHERE deleted_at IS NOT NULL` |
 | Notifications | **Read** more than `NOTIFICATIONS_RETENTION_DAYS` (180) ago (by `read_at`); unread rows are kept at any age | `notifications.retention.purge`, hourly (scheduler) | 1,000-row batches, 1 min per run | Partial `idx_notifications_read_at ON notifications (read_at) WHERE read_at IS NOT NULL` |
 | Data exports | `expires_at` reached, erased (`status = 'expired'`), failed, or queued/running for more than a day (stuck job) | `privacy.exports.purge`, hourly (scheduler) | 100-row batches, 1 min per run; blob, then row | Partial `idx_data_exports_expires_at ON data_exports (expires_at) WHERE expires_at IS NOT NULL` |
+| Deleted tenants | `status = 'deleted'` and `purged_at IS NULL`: every membership's per-user data through the privacy erasers, then every module's tenant-wide rows, then `purged_at` and one `tenant.purged` audit row | `identity.tenants.purge_deleted`, hourly (scheduler) | 25 tenants per run, 100 memberships per page, 500-row batches per tenant table (files/export blobs before their rows); every phase is idempotent and retried; the `tenants` row and `audit_events` stay | Partial `idx_tenants_deleted_unpurged ON tenants (id) WHERE status = 'deleted' AND purged_at IS NULL` |
+| Expired trials | A `trialing` tenant whose `trial_ends_at` has passed is not operational immediately (404) and is transitioned to `suspended` through the audited tenant service | `identity.tenants.expire_trials`, hourly (scheduler) | 100 tenants per run, re-checked under the row lock; an admin transition wins and is a no-op | — |
 | `memberships` ban record | `banned_at` + pseudonymous `banned_email_hash` of a banned membership, kept through removal/erasure | Unban while the membership is still suspended (admin action); no automatic purge | One 64-char hash per banned membership | Partial `idx_memberships_tenant_banned_email_hash ON memberships (tenant_id, banned_email_hash) WHERE banned_email_hash IS NOT NULL` |
 
 Without the scheduler, trashed files keep their blobs and stay restorable
 indefinitely, notifications are never deleted, expired export documents stay in
-storage, and expired tokens and scheduler ledger rows accumulate. The Kubernetes
-ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
+storage, expired tokens and scheduler ledger rows accumulate, expired trials
+keep their `trialing` status (though their requests already return 404), and
+deleted tenants keep their data (the `tenants` row is never removed). The
+Kubernetes ConfigMap sets `SCHEDULER_ENABLED=true` on the job-running process
 (`APP_ROLE=all` or `worker`); `cmd/api` logs a production warning when a
 worker-capable process starts with it off. The retention indexes
 lead with their age column rather than `tenant_id` because the purges scan
@@ -547,6 +555,42 @@ of the normalized address, kept with `banned_at` solely to enforce the
 tenant's ban (GDPR Art.17(3)(e) legitimate interest). An unban of a suspended
 membership clears both; a removed membership keeps them for the tenant's
 records.
+
+The identity section of the export includes the profile, membership, sessions,
+linked external identities (`provider`, `subject`, `linkedAt` — never a
+token), MFA configuration (`enabled`, `confirmedAt`, `recoveryCodesRemaining`;
+never the sealed secret or a recovery-code hash), the current membership role
+assignments with their grant times (role history is not stored), invitations
+the user sent and received in the tenant, and the user's own `audit_events`
+rows (`action`, `createdAt`, `ip`, `userAgent`, `resource`, `resourceId`,
+`outcome`). The audit list is capped at 1000 rows, newest first; audit metadata
+is never exported.
+
+#### Deleted tenants
+
+`status = 'deleted'` is terminal, but the row itself is never removed: it is
+the tenant's identity for audit and incident review. The hourly
+`identity.tenants.purge_deleted` job lists deleted tenants with `purged_at IS
+NULL` and, per tenant, runs the same registered privacy erasers as a tenant
+erase job for every membership (including removed ones; no global finalizer),
+then asks every module's `tenancy.Purger` to remove its tenant-wide rows
+(webhook endpoints/events/deliveries/inbound sources, tenant roles,
+`feature_flag_targets`, invitations, API keys, files and blobs, notifications,
+data exports). Identity's purger runs last: it deletes the memberships (and
+their sessions, refresh tokens, and role assignments), the tenant's custom
+roles, and `tenant_settings`. Every table is drained in bounded 500-row pages
+(and every files/export page deletes its blobs before its rows), so a large
+tenant never loads its whole table or blob list into memory. Only after every
+phase succeeds does it write `tenants.purged_at` and a
+`tenant.purged` audit row in one transaction. Each phase is idempotent, so a
+failure or worker restart retries the same tenant; no phase accepts a tenant
+id other than the job's explicit tenant scope, and RLS backs that.
+
+`audit_events` is append-only and is never touched by the purge. A tenant whose
+trial has ended is already not operational (its resolution and every session
+check return 404/401), and the hourly `identity.tenants.expire_trials` job
+moves it to `suspended` through the audited `TenantService` path
+(`tenant.status_changed` with `reason: trial_expired`, system actor).
 
 #### Files trash purge
 
