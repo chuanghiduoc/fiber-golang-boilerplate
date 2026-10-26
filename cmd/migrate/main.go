@@ -127,15 +127,18 @@ var requiredColumns = map[string][]string{
 	},
 	"webhook_endpoints":              {"tenant_id", "url", "status", "max_attempts", "timeout_ms", "deleted_at"},
 	"webhook_endpoint_subscriptions": {"tenant_id", "endpoint_id", "pattern"},
-	"webhook_endpoint_secrets":       {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active"},
+	"webhook_endpoint_secrets":       {"tenant_id", "endpoint_id", "version", "secret_ciphertext", "active", "grace_expires_at"},
 	"webhook_events":                 {"tenant_id", "event_id", "event_type", "occurred_at", "payload", "created_at"},
 	"webhook_deliveries": {
 		"tenant_id", "endpoint_id", "event_id", "url",
-		"secret_ciphertext", "status", "attempts", "max_attempts", "timeout_ms", "next_attempt_at",
+		"secret_ciphertext", "status", "attempts", "max_attempts", "timeout_ms", "next_attempt_at", "is_replay",
 	},
 	"webhook_delivery_attempts": {"tenant_id", "delivery_id", "attempt", "status_code", "duration_ms"},
-	"webhook_inbound_sources":   {"tenant_id", "name", "slug", "secret_ciphertext", "status", "deleted_at"},
-	"webhook_inbound_events":    {"tenant_id", "source_id", "external_event_id", "signature", "payload"},
+	"webhook_inbound_sources": {
+		"tenant_id", "name", "slug", "secret_ciphertext", "previous_secret_ciphertext",
+		"previous_secret_expires_at", "status", "deleted_at",
+	},
+	"webhook_inbound_events": {"tenant_id", "source_id", "external_event_id", "signature", "payload"},
 }
 
 // requiredUniqueIndexes are the constraints that prevent duplicate live reset

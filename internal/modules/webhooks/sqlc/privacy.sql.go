@@ -49,7 +49,7 @@ func (q *Queries) DeleteUserWebhookEvents(ctx context.Context, arg DeleteUserWeb
 }
 
 const listUserWebhookDeliveries = `-- name: ListUserWebhookDeliveries :many
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at FROM webhook_deliveries d
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at FROM webhook_deliveries d
 JOIN webhook_events e ON e.tenant_id = d.tenant_id AND e.event_id = d.event_id
 WHERE d.tenant_id = $1::bigint
   AND ((e.actor_type = 'user' AND e.actor_id = $2::text)
@@ -88,6 +88,7 @@ func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWeb
 			&i.LastError,
 			&i.DeliveredAt,
 			&i.ReplayedFromID,
+			&i.IsReplay,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 		); err != nil {

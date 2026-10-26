@@ -15,15 +15,17 @@ import (
 
 func toInboundSource(row webhooksqlc.WebhookInboundSource) webhooksvc.InboundSource {
 	return webhooksvc.InboundSource{
-		ID:               row.ID,
-		TenantID:         row.TenantID,
-		Name:             row.Name,
-		Slug:             row.Slug,
-		SecretCiphertext: row.SecretCiphertext,
-		Status:           row.Status,
-		CreatedAt:        row.CreatedAt.Time,
-		UpdatedAt:        row.UpdatedAt.Time,
-		DeletedAt:        timePtr(row.DeletedAt),
+		ID:                       row.ID,
+		TenantID:                 row.TenantID,
+		Name:                     row.Name,
+		Slug:                     row.Slug,
+		SecretCiphertext:         row.SecretCiphertext,
+		PreviousSecretCiphertext: row.PreviousSecretCiphertext.String,
+		PreviousSecretExpiresAt:  timePtr(row.PreviousSecretExpiresAt),
+		Status:                   row.Status,
+		CreatedAt:                row.CreatedAt.Time,
+		UpdatedAt:                row.UpdatedAt.Time,
+		DeletedAt:                timePtr(row.DeletedAt),
 	}
 }
 
@@ -150,6 +152,7 @@ func (r *Postgres) RotateInboundSourceSecret(ctx context.Context, id int64, ciph
 	}
 	row, err := r.q.RotateWebhookInboundSourceSecret(ctx, webhooksqlc.RotateWebhookInboundSourceSecretParams{
 		SecretCiphertext: ciphertext,
+		GraceSeconds:     webhooksvc.SecretRotationGrace.Seconds(),
 		ID:               id,
 		TenantID:         tenantID(ctx),
 	})

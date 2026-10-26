@@ -30,7 +30,7 @@ WHERE webhook_deliveries.id = $2
         AND e.status = 'active'
         AND e.deleted_at IS NULL
   )
-RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.data_version, ev.actor_type,
+RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.is_replay, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.data_version, ev.actor_type,
           ev.actor_id, ev.occurred_at, ev.payload
 `
 
@@ -56,6 +56,7 @@ type ClaimWebhookDeliveryRow struct {
 	LastError        pgtype.Text        `json:"last_error"`
 	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
 	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
+	IsReplay         bool               `json:"is_replay"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	EventType        string             `json:"event_type"`
@@ -88,6 +89,7 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 		&i.LastError,
 		&i.DeliveredAt,
 		&i.ReplayedFromID,
+		&i.IsReplay,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.EventType,
@@ -104,14 +106,14 @@ const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
 INSERT INTO webhook_deliveries (
     tenant_id, endpoint_id, event_id,
     url, secret_ciphertext, status, max_attempts, timeout_ms,
-    next_attempt_at, replayed_from_id
+    next_attempt_at, replayed_from_id, is_replay
 )
 VALUES (
     $1, $2, $3,
     $4, $5, 'pending', $6, $7,
-    NOW(), $8
+    NOW(), $8, $9
 )
-ON CONFLICT (tenant_id, endpoint_id, event_id) DO NOTHING
+ON CONFLICT (tenant_id, endpoint_id, event_id) WHERE NOT is_replay DO NOTHING
 RETURNING id
 `
 
@@ -124,6 +126,7 @@ type CreateWebhookDeliveryParams struct {
 	MaxAttempts      int32       `json:"max_attempts"`
 	TimeoutMs        int32       `json:"timeout_ms"`
 	ReplayedFromID   pgtype.Int8 `json:"replayed_from_id"`
+	IsReplay         bool        `json:"is_replay"`
 }
 
 func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (int64, error) {
@@ -136,6 +139,7 @@ func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDe
 		arg.MaxAttempts,
 		arg.TimeoutMs,
 		arg.ReplayedFromID,
+		arg.IsReplay,
 	)
 	var id int64
 	err := row.Scan(&id)
@@ -234,7 +238,7 @@ INSERT INTO webhook_endpoint_secrets (
 VALUES (
     $1, $2, $3, $4, TRUE
 )
-RETURNING id, tenant_id, endpoint_id, version, secret_ciphertext, active, created_at
+RETURNING id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at
 `
 
 type CreateWebhookEndpointSecretParams struct {
@@ -259,6 +263,7 @@ func (q *Queries) CreateWebhookEndpointSecret(ctx context.Context, arg CreateWeb
 		&i.Version,
 		&i.SecretCiphertext,
 		&i.Active,
+		&i.GraceExpiresAt,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -365,7 +370,7 @@ INSERT INTO webhook_inbound_sources (
 VALUES (
     $1, $2, $3, $4, 'active'
 )
-RETURNING id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
 `
 
 type CreateWebhookInboundSourceParams struct {
@@ -390,6 +395,8 @@ func (q *Queries) CreateWebhookInboundSource(ctx context.Context, arg CreateWebh
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -400,17 +407,21 @@ func (q *Queries) CreateWebhookInboundSource(ctx context.Context, arg CreateWebh
 
 const deactivateWebhookEndpointSecrets = `-- name: DeactivateWebhookEndpointSecrets :exec
 UPDATE webhook_endpoint_secrets
-SET active = FALSE
-WHERE tenant_id = $1 AND endpoint_id = $2 AND active
+SET active = FALSE,
+    grace_expires_at = NOW() + make_interval(secs => $1::double precision)
+WHERE tenant_id = $2 AND endpoint_id = $3 AND active
 `
 
 type DeactivateWebhookEndpointSecretsParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	EndpointID int64 `json:"endpoint_id"`
+	GraceSeconds float64 `json:"grace_seconds"`
+	TenantID     int64   `json:"tenant_id"`
+	EndpointID   int64   `json:"endpoint_id"`
 }
 
+// Retires the active secret but keeps it usable for dual-signing until its
+// explicit grace expiry.
 func (q *Queries) DeactivateWebhookEndpointSecrets(ctx context.Context, arg DeactivateWebhookEndpointSecretsParams) error {
-	_, err := q.db.Exec(ctx, deactivateWebhookEndpointSecrets, arg.TenantID, arg.EndpointID)
+	_, err := q.db.Exec(ctx, deactivateWebhookEndpointSecrets, arg.GraceSeconds, arg.TenantID, arg.EndpointID)
 	return err
 }
 
@@ -452,7 +463,7 @@ const deleteWebhookInboundSource = `-- name: DeleteWebhookInboundSource :one
 UPDATE webhook_inbound_sources
 SET status = 'disabled', deleted_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
 `
 
 type DeleteWebhookInboundSourceParams struct {
@@ -469,12 +480,35 @@ func (q *Queries) DeleteWebhookInboundSource(ctx context.Context, arg DeleteWebh
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const expireOlderWebhookEndpointSecrets = `-- name: ExpireOlderWebhookEndpointSecrets :exec
+UPDATE webhook_endpoint_secrets
+SET grace_expires_at = NOW()
+WHERE tenant_id = $1
+  AND endpoint_id = $2
+  AND NOT active
+  AND grace_expires_at > NOW()
+`
+
+type ExpireOlderWebhookEndpointSecretsParams struct {
+	TenantID   int64 `json:"tenant_id"`
+	EndpointID int64 `json:"endpoint_id"`
+}
+
+// A second rotation inside the grace window drops the older retired secret:
+// only the immediately previous secret may co-sign deliveries.
+func (q *Queries) ExpireOlderWebhookEndpointSecrets(ctx context.Context, arg ExpireOlderWebhookEndpointSecretsParams) error {
+	_, err := q.db.Exec(ctx, expireOlderWebhookEndpointSecrets, arg.TenantID, arg.EndpointID)
+	return err
 }
 
 const expireUnclaimableWebhookDelivery = `-- name: ExpireUnclaimableWebhookDelivery :execrows
@@ -519,7 +553,7 @@ func (q *Queries) ExpireUnclaimableWebhookDelivery(ctx context.Context, arg Expi
 }
 
 const getActiveWebhookEndpointSecret = `-- name: GetActiveWebhookEndpointSecret :one
-SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, created_at FROM webhook_endpoint_secrets
+SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at FROM webhook_endpoint_secrets
 WHERE tenant_id = $1 AND endpoint_id = $2 AND active
 LIMIT 1
 `
@@ -539,13 +573,14 @@ func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetAct
 		&i.Version,
 		&i.SecretCiphertext,
 		&i.Active,
+		&i.GraceExpiresAt,
 		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
        ev.occurred_at, ev.payload
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
@@ -586,6 +621,7 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDelivery
 		&i.WebhookDelivery.LastError,
 		&i.WebhookDelivery.DeliveredAt,
 		&i.WebhookDelivery.ReplayedFromID,
+		&i.WebhookDelivery.IsReplay,
 		&i.WebhookDelivery.CreatedAt,
 		&i.WebhookDelivery.UpdatedAt,
 		&i.EventType,
@@ -636,6 +672,36 @@ func (q *Queries) GetWebhookEndpoint(ctx context.Context, arg GetWebhookEndpoint
 	return i, err
 }
 
+const getWebhookEndpointSigningSecrets = `-- name: GetWebhookEndpointSigningSecrets :one
+SELECT
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_endpoint_secrets s
+      WHERE s.tenant_id = $1 AND s.endpoint_id = $2 AND s.active
+      ORDER BY s.version DESC LIMIT 1), '')::text AS current_ciphertext,
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_endpoint_secrets s
+      WHERE s.tenant_id = $1 AND s.endpoint_id = $2
+        AND NOT s.active AND s.grace_expires_at > NOW()
+      ORDER BY s.version DESC LIMIT 1), '')::text AS previous_ciphertext
+`
+
+type GetWebhookEndpointSigningSecretsParams struct {
+	TenantID   int64 `json:"tenant_id"`
+	EndpointID int64 `json:"endpoint_id"`
+}
+
+type GetWebhookEndpointSigningSecretsRow struct {
+	CurrentCiphertext  string `json:"current_ciphertext"`
+	PreviousCiphertext string `json:"previous_ciphertext"`
+}
+
+// The delivery worker signs with the current secret first and, while its
+// explicit grace expiry is still open, the immediately previous one too.
+func (q *Queries) GetWebhookEndpointSigningSecrets(ctx context.Context, arg GetWebhookEndpointSigningSecretsParams) (GetWebhookEndpointSigningSecretsRow, error) {
+	row := q.db.QueryRow(ctx, getWebhookEndpointSigningSecrets, arg.TenantID, arg.EndpointID)
+	var i GetWebhookEndpointSigningSecretsRow
+	err := row.Scan(&i.CurrentCiphertext, &i.PreviousCiphertext)
+	return i, err
+}
+
 const getWebhookInboundEventByExternalID = `-- name: GetWebhookInboundEventByExternalID :one
 SELECT id, tenant_id, source_id, external_event_id, event_type, signature, payload, received_at FROM webhook_inbound_events
 WHERE tenant_id = $1
@@ -666,7 +732,7 @@ func (q *Queries) GetWebhookInboundEventByExternalID(ctx context.Context, arg Ge
 }
 
 const getWebhookInboundSource = `-- name: GetWebhookInboundSource :one
-SELECT id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 `
 
@@ -684,6 +750,8 @@ func (q *Queries) GetWebhookInboundSource(ctx context.Context, arg GetWebhookInb
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -693,7 +761,7 @@ func (q *Queries) GetWebhookInboundSource(ctx context.Context, arg GetWebhookInb
 }
 
 const getWebhookInboundSourceByID = `-- name: GetWebhookInboundSourceByID :one
-SELECT id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE id = $1 AND deleted_at IS NULL
 `
 
@@ -706,6 +774,8 @@ func (q *Queries) GetWebhookInboundSourceByID(ctx context.Context, id int64) (We
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -773,7 +843,7 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 }
 
 const listWebhookDeliveries = `-- name: ListWebhookDeliveries :many
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.created_at, d.updated_at, ev.event_type, ev.occurred_at
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.occurred_at
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
 WHERE d.tenant_id = $1
@@ -832,6 +902,7 @@ func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeli
 			&i.WebhookDelivery.LastError,
 			&i.WebhookDelivery.DeliveredAt,
 			&i.WebhookDelivery.ReplayedFromID,
+			&i.WebhookDelivery.IsReplay,
 			&i.WebhookDelivery.CreatedAt,
 			&i.WebhookDelivery.UpdatedAt,
 			&i.EventType,
@@ -1001,7 +1072,7 @@ func (q *Queries) ListWebhookInboundEvents(ctx context.Context, arg ListWebhookI
 }
 
 const listWebhookInboundSources = `-- name: ListWebhookInboundSources :many
-SELECT id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE tenant_id = $1
   AND deleted_at IS NULL
   AND (created_at, id) < ($2::timestamptz, $3::bigint)
@@ -1036,6 +1107,8 @@ func (q *Queries) ListWebhookInboundSources(ctx context.Context, arg ListWebhook
 			&i.Name,
 			&i.Slug,
 			&i.SecretCiphertext,
+			&i.PreviousSecretCiphertext,
+			&i.PreviousSecretExpiresAt,
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -1331,19 +1404,29 @@ func (q *Queries) RescheduleWebhookDelivery(ctx context.Context, arg RescheduleW
 
 const rotateWebhookInboundSourceSecret = `-- name: RotateWebhookInboundSourceSecret :one
 UPDATE webhook_inbound_sources
-SET secret_ciphertext = $1
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at
+SET previous_secret_ciphertext = secret_ciphertext,
+    previous_secret_expires_at = NOW() + make_interval(secs => $1::double precision),
+    secret_ciphertext = $2
+WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
 `
 
 type RotateWebhookInboundSourceSecretParams struct {
-	SecretCiphertext string `json:"secret_ciphertext"`
-	ID               int64  `json:"id"`
-	TenantID         int64  `json:"tenant_id"`
+	GraceSeconds     float64 `json:"grace_seconds"`
+	SecretCiphertext string  `json:"secret_ciphertext"`
+	ID               int64   `json:"id"`
+	TenantID         int64   `json:"tenant_id"`
 }
 
+// The replaced secret stays valid for the grace window. A second rotation
+// overwrites it, so only the immediately previous secret is accepted.
 func (q *Queries) RotateWebhookInboundSourceSecret(ctx context.Context, arg RotateWebhookInboundSourceSecretParams) (WebhookInboundSource, error) {
-	row := q.db.QueryRow(ctx, rotateWebhookInboundSourceSecret, arg.SecretCiphertext, arg.ID, arg.TenantID)
+	row := q.db.QueryRow(ctx, rotateWebhookInboundSourceSecret,
+		arg.GraceSeconds,
+		arg.SecretCiphertext,
+		arg.ID,
+		arg.TenantID,
+	)
 	var i WebhookInboundSource
 	err := row.Scan(
 		&i.ID,
@@ -1351,12 +1434,43 @@ func (q *Queries) RotateWebhookInboundSourceSecret(ctx context.Context, arg Rota
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const updateWebhookDeliveryEndpointSnapshot = `-- name: UpdateWebhookDeliveryEndpointSnapshot :exec
+UPDATE webhook_deliveries
+SET url = $1,
+    timeout_ms = $2
+WHERE tenant_id = $3
+  AND endpoint_id = $4
+  AND status = 'pending'
+`
+
+type UpdateWebhookDeliveryEndpointSnapshotParams struct {
+	Url        string `json:"url"`
+	TimeoutMs  int32  `json:"timeout_ms"`
+	TenantID   int64  `json:"tenant_id"`
+	EndpointID int64  `json:"endpoint_id"`
+}
+
+// Runs in the endpoint update transaction: a queued delivery must follow the
+// endpoint's new URL/timeout instead of retrying the old receiver. Terminal
+// (succeeded/dead) rows keep the snapshot they were sent with.
+func (q *Queries) UpdateWebhookDeliveryEndpointSnapshot(ctx context.Context, arg UpdateWebhookDeliveryEndpointSnapshotParams) error {
+	_, err := q.db.Exec(ctx, updateWebhookDeliveryEndpointSnapshot,
+		arg.Url,
+		arg.TimeoutMs,
+		arg.TenantID,
+		arg.EndpointID,
+	)
+	return err
 }
 
 const updateWebhookEndpoint = `-- name: UpdateWebhookEndpoint :one
@@ -1410,7 +1524,7 @@ const updateWebhookInboundSource = `-- name: UpdateWebhookInboundSource :one
 UPDATE webhook_inbound_sources
 SET name = $1, slug = $2, status = $3
 WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
 `
 
 type UpdateWebhookInboundSourceParams struct {
@@ -1436,6 +1550,8 @@ func (q *Queries) UpdateWebhookInboundSource(ctx context.Context, arg UpdateWebh
 		&i.Name,
 		&i.Slug,
 		&i.SecretCiphertext,
+		&i.PreviousSecretCiphertext,
+		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,

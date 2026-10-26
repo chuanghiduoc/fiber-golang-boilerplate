@@ -175,13 +175,26 @@ func normalizeEventTypes(types []string) ([]string, error) {
 }
 
 // endpointAuditMetadata is the non-secret configuration recorded when an
-// endpoint is created or updated.
+// endpoint is created or updated. The URL is reduced to its origin because
+// receivers such as Slack embed bearer tokens in the path or query, and the
+// audit log is append-only.
 func endpointAuditMetadata(endpoint *Endpoint) map[string]any {
 	return map[string]any{
-		"url":         endpoint.URL,
+		"url":         urlOrigin(endpoint.URL),
 		"eventTypes":  endpoint.EventTypes,
 		"status":      endpoint.Status,
 		"maxAttempts": endpoint.MaxAttempts,
 		"timeoutMs":   endpoint.TimeoutMS,
 	}
+}
+
+// urlOrigin returns scheme://host[:port] and nothing else. Validation rejects
+// malformed URLs, so an unparsable value is recorded as empty rather than
+// risking a token in the audit log.
+func urlOrigin(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
 }
