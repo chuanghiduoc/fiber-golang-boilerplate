@@ -38,7 +38,8 @@ findings (oasdiff v1.33.0); an intentional break is acknowledged by editing
 `docs/api-breaking-changes.md` in the same PR. Reproduce the fresh-DB check
 against a disposable database before merging. Kubernetes: follow
 `deploy/k8s/README.md` (migration Job first, then the app kustomization);
-`.github/workflows/release.yml` builds multi-arch GHCR images on `v*` tags.
+`.github/workflows/release.yml` builds multi-arch GHCR images on `v*` tags,
+after a Trivy scan (CRITICAL/HIGH with fixes fail) of the image it builds.
 
 ## Architecture
 
@@ -235,10 +236,19 @@ migrations) to its owners; keep it current when adding a module.
   `ENABLE`+`FORCE ROW LEVEL SECURITY` and one `tenant_isolation` policy calling
   `app_tenant_visible(tenant_id)` (`roles` also exposes the shared system roles,
   `tenant_id IS NULL`, to every tenant; writing one needs the bypass, as the
-  startup catalog sync does). `database.TxManager` sets
-  `app.tenant_id`/`app.rls_bypass` with transaction-local `set_config` right
-  after `BEGIN`; `database.Scoped` does the same for one statement in a single
-  pgx Batch (`BEGIN; set_config; statement; COMMIT`). Repositories are wired
+  startup catalog sync does). `app_tenant_visible` reads only
+  `app.tenant_id`; there is no application-writable bypass setting.
+  `database.TxManager` sets `app.tenant_id` with a transaction-local
+  `set_config` right after `BEGIN`; `database.Scoped` does the same for one
+  statement in a single pgx Batch (`BEGIN; set_config; statement; COMMIT`).
+  Bypass is a role property: `database.Pools` holds the normal pool and a
+  pool for a dedicated `BYPASSRLS` role (`DB_BYPASS_USERNAME`/
+  `DB_BYPASS_PASSWORD`, required in production, distinct from `DB_USERNAME`;
+  outside production an unset pair reuses the normal pool with a warning).
+  The pool is chosen at `BEGIN` (or per `Scoped` statement) from
+  `database.WithRLSBypass(ctx)`; a bypass marker inside a transaction that
+  began on the normal pool stays tenant-scoped, so mark the context before
+  `WithTx`. `DB_MAX_CONNS`/`DB_MIN_CONNS` apply per pool. Repositories are wired
   with `app.Infra.DB` (the Scoped handle), never the raw pool. A query without
   a tenant setting sees no rows. `database.WithRLSBypass(ctx)` marks a
   deliberate cross-tenant path (global job claim/lease/purge, retention
@@ -246,8 +256,11 @@ migrations) to its owners; keep it current when adding a module.
   identity operations, tenant lifecycle, and the possession statements by
   token hash: API key `GetByHash` and `RevokeByRefreshToken` (logout), each
   for that one statement; refresh rotation stays tenant-scoped) and must
-  never appear on an HTTP path serving one tenant otherwise. The API/worker/seed connect as a non-superuser
-  role without `BYPASSRLS` (`cmd/api` refuses production startup otherwise);
+  never appear on an HTTP path serving one tenant otherwise. The
+  API/worker/seed connect as a non-superuser role without `BYPASSRLS`, and
+  `cmd/api` refuses production startup unless the bypass role has
+  `BYPASSRLS`, is not superuser, owns no tables, and the normal role is not a
+  member of it;
   `cmd/migrate` uses the owner role via `DB_MIGRATE_*`. Per-tenant limits
   remain future work; do not claim whole-application isolation.
 
@@ -436,7 +449,10 @@ handler/service/DTO/repository package.
   apikeys `ensureCallerCanGrant` and identity `authorizeGrant` follow the
   same rule. API keys are created and rotated only by their owner (no
   `userId` field; another member's key rotates as 404); admins may still
-  list and revoke them.
+  list and revoke them. Keys are `fgb_<base62 random><base62 CRC32>`; a bad
+  checksum is rejected before any lookup (legacy base64url keys still
+  verify). Every key expires: an omitted `expiresAt` defaults to now +
+  `APIKEYS_MAX_LIFETIME` (default 8760h) and a later one is 400.
 - **Files:** repositories always pass `tenant.EffectiveID(ctx)`; services also
   compare the row's `TenantID`/`UserID` before exposing it. Uploads reject an
   invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`.
@@ -530,6 +546,7 @@ handler/service/DTO/repository package.
   `DATA_ENCRYPTION_PREVIOUS_KEYS`, `WEBHOOK_SECRET_ENCRYPTION_KEY`,
   `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS`, `SMTP_PASSWORD`,
   `GOOGLE_CLIENT_SECRET`, `ADMIN_PASSWORD`, `METRICS_AUTH_TOKEN`,
+  `DB_BYPASS_PASSWORD`,
   `STORAGE_S3_SECRET_KEY`, `REDIS_URL`); setting both forms is an error.
 - **Database connections:** `DB_QUERY_EXEC_MODE` is `cache_statement`
   (default; behind a transaction-mode PgBouncer needs 1.21+ with
@@ -567,15 +584,18 @@ handler/service/DTO/repository package.
   change in the same transaction; audit metadata and `last_error` never hold
   the endpoint URL path/query. It
   sends via `pkg/webhook.Client` (private/loopback/link-local blocked unless
-  allowlisted, no redirects, no proxy, DNS pinned), records every attempt, and
+  allowlisted, no redirects, no proxy, DNS pinned, ports 443/80 plus
+  `WEBHOOK_ALLOWED_PORTS` at validation and dial time), records every attempt, and
   retries 408/425/429/5xx with backoff or `Retry-After`; other 3xx/4xx are
   dead. Secrets are `whsec_<base64 32 bytes>` (HMAC key = decoded bytes;
   pre-Standard secrets must be rotated), sealed with
   `WEBHOOK_SECRET_ENCRYPTION_KEY` (JWT fallback locally; dedicated key in
-  production) and returned only on create/rotate. `POST /webhooks/inbound/:id`
-  verifies the same scheme with the source secret (or, for 24h after a
-  rotation, the previous one), takes the type from the body, and deduplicates
-  `(source, webhook-id)`.
+  production; the AAD binds purpose, tenant, and endpoint/source id, legacy
+  seals still open) and returned only on create/rotate.
+  `POST /webhooks/inbound/:id` verifies the same scheme with the source
+  secret (or, for 24h after a rotation, the previous one), answers unknown,
+  disabled, or deleted sources with the same 401 as a bad signature, takes
+  the type from the body, and deduplicates `(source, webhook-id)`.
 - **Events**: typed bus over one versioned envelope `events.Event`
   {`id` UUIDv7, `type`, `dataVersion`, `occurredAt`, `tenantId`, `actor`
   {type user|service|system, id}, `data`} (1:1 with CloudEvents attributes;
