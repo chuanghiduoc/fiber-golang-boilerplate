@@ -25,7 +25,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "List the request tenant's API keys, including revoked and rotated keys. Secrets are never returned.",
+                "description": "List the request tenant's API keys, including other members', revoked and rotated keys. Secrets are never returned.",
                 "produces": [
                     "application/json"
                 ],
@@ -99,7 +99,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Create a tenant-scoped API key. The plaintext key is returned once and never stored.",
+                "description": "Create an API key owned by the authenticated caller. The plaintext key is returned once and never stored.",
                 "consumes": [
                     "application/json"
                 ],
@@ -423,7 +423,7 @@ const docTemplate = `{
                         "ApiKeyAuth": []
                     }
                 ],
-                "description": "Issue a replacement key. The previous key remains valid for the rotation grace window unless revoked.",
+                "description": "Issue a replacement key for an API key owned by the authenticated caller. Another member's key id returns 404. The previous key remains valid for the rotation grace window unless revoked.",
                 "produces": [
                     "application/json"
                 ],
@@ -1578,14 +1578,14 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Queue erasure of every tenant membership's data and the global account for a member of the request tenant. The last active admin cannot be erased.",
+                "description": "Queue erasure of a member's data and membership in the request tenant only. The global account and the user's memberships in other tenants stay intact. The last active owner of the tenant cannot be erased.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "Admin"
                 ],
-                "summary": "Erase a member and their global account",
+                "summary": "Erase a member from the request tenant",
                 "parameters": [
                     {
                         "type": "string",
@@ -1999,6 +1999,12 @@ const docTemplate = `{
                     },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "502": {
+                        "description": "auth.oauth_upstream_unavailable",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -2432,7 +2438,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. This is the only time the recovery codes are shown.",
+                "description": "Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2445,7 +2451,7 @@ const docTemplate = `{
                 "summary": "Confirm TOTP enrollment",
                 "parameters": [
                     {
-                        "description": "TOTP code",
+                        "description": "TOTP code and re-authentication proof",
                         "name": "request",
                         "in": "body",
                         "required": true,
@@ -2461,6 +2467,12 @@ const docTemplate = `{
                             "$ref": "#/definitions/dto.MFARecoveryCodesResponse"
                         }
                     },
+                    "400": {
+                        "description": "current password is incorrect",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
                     "401": {
                         "description": "Unauthorized",
                         "schema": {
@@ -2468,13 +2480,19 @@ const docTemplate = `{
                         }
                     },
                     "403": {
-                        "description": "Forbidden",
+                        "description": "auth.mfa_reauth_required",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
                     "409": {
-                        "description": "Conflict",
+                        "description": "auth.mfa_already_enabled\" or \"auth.mfa_enrollment_expired",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -2495,7 +2513,10 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Generate a TOTP secret and return its otpauth provisioning URI. The secret is never returned again; re-enrolling before confirmation replaces it.",
+                "description": "Generate a fresh TOTP secret and return its otpauth provisioning URI. Requires re-authentication: the current password (accounts with a local password) or a session created within the last 15 minutes (Google-only). Re-enrolling before confirmation replaces the pending secret, and a pending enrollment older than 15 minutes cannot be confirmed.",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
@@ -2503,11 +2524,28 @@ const docTemplate = `{
                     "Auth"
                 ],
                 "summary": "Start TOTP enrollment",
+                "parameters": [
+                    {
+                        "description": "Re-authentication proof",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/dto.MFAEnrollRequest"
+                        }
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/dto.MFAEnrollResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "current password is incorrect",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
                     "401": {
@@ -2517,13 +2555,19 @@ const docTemplate = `{
                         }
                     },
                     "403": {
-                        "description": "Forbidden",
+                        "description": "auth.mfa_reauth_required",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
                     },
                     "409": {
                         "description": "auth.mfa_already_enabled",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
                         "schema": {
                             "$ref": "#/definitions/apperror.ProblemDetails"
                         }
@@ -4556,6 +4600,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/platform/users/{id}/mfa/reset": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Remove the confirmed and pending TOTP factor and recovery codes, revoke every session of the user in every tenant, and bump the token version, so the account can enroll a new authenticator (platform permission).",
+                "tags": [
+                    "Platform"
+                ],
+                "summary": "Reset a user's MFA (platform)",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/apperror.ProblemDetails"
+                        }
+                    }
+                }
+            }
+        },
         "/users": {
             "get": {
                 "security": [
@@ -6342,9 +6444,6 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
-                },
-                "userId": {
-                    "type": "integer"
                 }
             }
         },
@@ -7162,6 +7261,11 @@ const docTemplate = `{
                 "code": {
                     "type": "string",
                     "maxLength": 64
+                },
+                "currentPassword": {
+                    "description": "CurrentPassword re-authenticates the caller (password accounts).",
+                    "type": "string",
+                    "maxLength": 128
                 }
             }
         },
@@ -7174,6 +7278,15 @@ const docTemplate = `{
                 "code": {
                     "type": "string",
                     "maxLength": 64
+                }
+            }
+        },
+        "dto.MFAEnrollRequest": {
+            "type": "object",
+            "properties": {
+                "currentPassword": {
+                    "type": "string",
+                    "maxLength": 128
                 }
             }
         },

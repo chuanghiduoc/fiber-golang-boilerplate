@@ -120,8 +120,6 @@ definitions:
         maxItems: 100
         minItems: 1
         type: array
-      userId:
-        type: integer
     required:
     - name
     - scopes
@@ -678,6 +676,10 @@ definitions:
       code:
         maxLength: 64
         type: string
+      currentPassword:
+        description: CurrentPassword re-authenticates the caller (password accounts).
+        maxLength: 128
+        type: string
     required:
     - code
     type: object
@@ -688,6 +690,12 @@ definitions:
         type: string
     required:
     - code
+    type: object
+  dto.MFAEnrollRequest:
+    properties:
+      currentPassword:
+        maxLength: 128
+        type: string
     type: object
   dto.MFAEnrollResponse:
     properties:
@@ -1174,8 +1182,8 @@ info:
 paths:
   /admin/api-keys:
     get:
-      description: List the request tenant's API keys, including revoked and rotated
-        keys. Secrets are never returned.
+      description: List the request tenant's API keys, including other members', revoked
+        and rotated keys. Secrets are never returned.
       parameters:
       - default: 20
         description: Max items to return
@@ -1221,8 +1229,8 @@ paths:
     post:
       consumes:
       - application/json
-      description: Create a tenant-scoped API key. The plaintext key is returned once
-        and never stored.
+      description: Create an API key owned by the authenticated caller. The plaintext
+        key is returned once and never stored.
       parameters:
       - description: API key creation request
         in: body
@@ -1424,8 +1432,9 @@ paths:
       - Admin API Keys
   /admin/api-keys/{id}/rotate:
     post:
-      description: Issue a replacement key. The previous key remains valid for the
-        rotation grace window unless revoked.
+      description: Issue a replacement key for an API key owned by the authenticated
+        caller. Another member's key id returns 404. The previous key remains valid
+        for the rotation grace window unless revoked.
       parameters:
       - description: API key ID
         in: path
@@ -2162,9 +2171,9 @@ paths:
       - Admin
   /admin/users/{id}/erasure:
     post:
-      description: Queue erasure of every tenant membership's data and the global
-        account for a member of the request tenant. The last active admin cannot be
-        erased.
+      description: Queue erasure of a member's data and membership in the request
+        tenant only. The global account and the user's memberships in other tenants
+        stay intact. The last active owner of the tenant cannot be erased.
       parameters:
       - description: Idempotency key
         in: header
@@ -2204,7 +2213,7 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
       security:
       - BearerAuth: []
-      summary: Erase a member and their global account
+      summary: Erase a member from the request tenant
       tags:
       - Admin
   /admin/users/{id}/role:
@@ -2446,6 +2455,10 @@ paths:
             $ref: '#/definitions/apperror.ProblemDetails'
         "500":
           description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "502":
+          description: auth.oauth_upstream_unavailable
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
       summary: Google OAuth callback
@@ -2735,9 +2748,11 @@ paths:
       consumes:
       - application/json
       description: Verify the first TOTP code, enable the factor, and return ten single-use
-        recovery codes. This is the only time the recovery codes are shown.
+        recovery codes. Requires re-authentication with the current password (or a
+        recent sign-in for Google-only accounts). This is the only time the recovery
+        codes are shown.
       parameters:
-      - description: TOTP code
+      - description: TOTP code and re-authentication proof
         in: body
         name: request
         required: true
@@ -2750,16 +2765,24 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/dto.MFARecoveryCodesResponse'
+        "400":
+          description: current password is incorrect
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "403":
-          description: Forbidden
+          description: auth.mfa_reauth_required
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "409":
-          description: Conflict
+          description: auth.mfa_already_enabled" or "auth.mfa_enrollment_expired
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "500":
@@ -2773,9 +2796,20 @@ paths:
       - Auth
   /auth/mfa/totp/enroll:
     post:
-      description: Generate a TOTP secret and return its otpauth provisioning URI.
-        The secret is never returned again; re-enrolling before confirmation replaces
-        it.
+      consumes:
+      - application/json
+      description: 'Generate a fresh TOTP secret and return its otpauth provisioning
+        URI. Requires re-authentication: the current password (accounts with a local
+        password) or a session created within the last 15 minutes (Google-only). Re-enrolling
+        before confirmation replaces the pending secret, and a pending enrollment
+        older than 15 minutes cannot be confirmed.'
+      parameters:
+      - description: Re-authentication proof
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.MFAEnrollRequest'
       produces:
       - application/json
       responses:
@@ -2783,16 +2817,24 @@ paths:
           description: OK
           schema:
             $ref: '#/definitions/dto.MFAEnrollResponse'
+        "400":
+          description: current password is incorrect
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
         "401":
           description: Unauthorized
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "403":
-          description: Forbidden
+          description: auth.mfa_reauth_required
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "409":
           description: auth.mfa_already_enabled
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
           schema:
             $ref: '#/definitions/apperror.ProblemDetails'
         "500":
@@ -4095,6 +4137,45 @@ paths:
       security:
       - BearerAuth: []
       summary: Update a tenant's status (platform)
+      tags:
+      - Platform
+  /platform/users/{id}/mfa/reset:
+    post:
+      description: Remove the confirmed and pending TOTP factor and recovery codes,
+        revoke every session of the user in every tenant, and bump the token version,
+        so the account can enroll a new authenticator (platform permission).
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      responses:
+        "204":
+          description: No Content
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "403":
+          description: Forbidden
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "429":
+          description: Too Many Requests
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/apperror.ProblemDetails'
+      security:
+      - BearerAuth: []
+      summary: Reset a user's MFA (platform)
       tags:
       - Platform
   /users:

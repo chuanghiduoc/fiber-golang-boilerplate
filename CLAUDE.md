@@ -192,7 +192,9 @@ migrations) to its owners; keep it current when adding a module.
   The platform tenant create endpoint makes the caller its first owner.
   Tenant status is `trialing|active|suspended|pending_deletion|deleted`; only
   `trialing`/`active` serve requests; transitions go through the audited
-  identity `TenantService`, exposed on the platform tenant routes.
+  identity `TenantService`, exposed on the platform tenant routes;
+  `pending_deletion → deleted` is refused (409 `tenant.deletion_not_due`)
+  before `deletion_scheduled_at`.
 
 **Tenancy invariants**
 - Identity, files, webhooks, apikeys, and notifications are tenant-isolated;
@@ -231,8 +233,10 @@ migrations) to its owners; keep it current when adding a module.
   a tenant setting sees no rows. `database.WithRLSBypass(ctx)` marks a
   deliberate cross-tenant path (global job claim/lease/purge, retention
   purges, feature snapshot, webhook inbound source lookup, global-user
-  identity operations, tenant lifecycle) and must never appear on an HTTP
-  path serving one tenant. The API/worker/seed connect as a non-superuser
+  identity operations, tenant lifecycle, and the possession statements by
+  token hash: API key `GetByHash` and `RevokeByRefreshToken` (logout), each
+  for that one statement; refresh rotation stays tenant-scoped) and must
+  never appear on an HTTP path serving one tenant otherwise. The API/worker/seed connect as a non-superuser
   role without `BYPASSRLS` (`cmd/api` refuses production startup otherwise);
   `cmd/migrate` uses the owner role via `DB_MIGRATE_*`. Per-tenant limits
   remain future work; do not claim whole-application isolation.
@@ -310,7 +314,10 @@ handler/service/DTO/repository package.
   `JWT_PREVIOUS_SECRETS`) picks the key by `kid` (unknown `kid` rejected;
   tokens without one verify against the active secret only). A session is the
   RFC 9700 refresh-token family: refresh tokens are atomic single-use,
-  tenant-scoped, and version-bound; presenting a used token revokes the whole
+  tenant-scoped, and version-bound; a session has an absolute
+  `sessions.expires_at` (`SESSION_MAX_LIFETIME`, default 720h) that rotation
+  never extends (refresh tokens expire at the earlier of the refresh TTL and
+  it), and access tokens default to 1h (`JWT_EXPIRE_HOUR`); presenting a used token revokes the whole
   session (`refresh_reuse`) and returns 401; logout revokes the session by
   possession; logout-all revokes every session in every tenant and bumps
   `token_version`; refresh with an inactive member returns 401. Login lockout
@@ -355,14 +362,21 @@ handler/service/DTO/repository package.
   per global user, not per tenant. `mfa_factors` keeps at most one confirmed
   factor and one pending enrollment; the secret is sealed with
   `infra.PayloadCodec` (`DATA_ENCRYPTION_KEY`, previous keys decrypt) and is
-  returned only inside the enrollment `otpauth://` URI. Confirmation and
-  disable require a current TOTP/recovery code; confirmation issues ten
+  returned only inside the enrollment `otpauth://` URI. Enroll and confirm
+  re-authenticate (`currentPassword`, counted against the second-factor
+  budget; a passwordless account needs a session created within 15 minutes);
+  every enroll stores a fresh secret, a pending enrollment expires after 15
+  minutes (`auth.mfa_enrollment_expired`), and a password change/reset deletes
+  it. Confirmation and disable require a current TOTP/recovery code; confirmation issues ten
   single-use recovery codes (SHA-256 hashes, shown once). `mfa_recovery_codes.used_at`
   and `mfa_factors.last_used_step` are claimed with conditional UPDATEs, so
   concurrent uses cannot both pass. Routes: `GET /auth/mfa/status`,
   `POST /auth/mfa/totp/{enroll,confirm}`, `POST /auth/mfa/disable`,
   `POST /auth/mfa/recovery-codes/regenerate` (JWT-only, `mfa:read|write`,
-  Tier 1; no Idempotency-Key on secret-returning endpoints). With a confirmed
+  Tier 1; no Idempotency-Key on secret-returning endpoints). The recovery path
+  for a lost factor is `POST /platform/users/:id/mfa/reset`
+  (`platform:users:mfa_reset`, JWT-only, Tier 1): it deletes the factors and
+  recovery codes, revokes every session, and bumps `token_version`. With a confirmed
   factor, password login and Google sign-in return `mfaRequired` plus a
   five-minute, single-use, tenant-bound challenge sealed with the same codec
   (no tokens) that also pins the token version, so a password change or
@@ -379,9 +393,19 @@ handler/service/DTO/repository package.
 - **Authz:** module permissions live in `catalog/permissions.go`, registered
   via `app.PermissionProvider` (`authz.Grant{Permission, Roles, Platform}`).
   The system tenant roles are `owner`, `admin`, and `member`; owner and admin
-  receive every tenant permission, member receives the listed grants. Platform
-  permissions (`platform:tenants:*`, `platform:features:write`) go to
-  `platform_admin` only and are the only cross-tenant access. Only permissions
+  receive every tenant permission, member receives the listed grants. A rank
+  (`service/role_hierarchy.go`: owner 3 > admin 2 > member/tenant roles 1)
+  gates member management: granting or inviting a role needs a rank ≥ that
+  role plus all its permissions; changing, demoting, banning, unbanning,
+  removing, or erasing a member needs a strictly higher rank (owners may
+  manage co-owners), checked in the mutation transaction with the target
+  membership locked (403 `role.insufficient_rank`). Accepting an invitation
+  re-checks that the inviter can still grant its role
+  (`invitation.inviter_ineligible`); banning or removing a member revokes
+  their pending invitations. Platform
+  permissions (`platform:tenants:*`, `platform:features:write`,
+  `platform:users:mfa_reset`) go to `platform_admin` only and are the only
+  cross-tenant access. Only permissions
   shared by several modules (`admin:users:*`, `admin:files:*`,
   `admin:stats:read`, the platform ones) stay in `platform/authz`. The catalog
   is synchronized into `permissions`/system-role grants at API startup;
@@ -399,7 +423,10 @@ handler/service/DTO/repository package.
   over the marker. Job handlers registered through `JobProvider` and durable
   event handlers run under `SystemContext` (`internal/app/system_jobs.go`), as
   does the admin seed; never derive a system context from an HTTP request.
-  apikeys `ensureCallerCanGrant` follows the same rule.
+  apikeys `ensureCallerCanGrant` and identity `authorizeGrant` follow the
+  same rule. API keys are created and rotated only by their owner (no
+  `userId` field; another member's key rotates as 404); admins may still
+  list and revoke them.
 - **Files:** repositories always pass `tenant.EffectiveID(ctx)`; services also
   compare the row's `TenantID`/`UserID` before exposing it. Uploads reject an
   invalid tenant; blobs go under `<tenantID>/<userID>/<uuid>.<ext>`.
@@ -579,9 +606,15 @@ handler/service/DTO/repository package.
   `GET /me/data-exports/:id[/download]`, `POST /me/erasure`, and
   `POST /admin/users/:id/erasure` (`admin:users:delete`). Export jobs write one
   JSON document per tenant/user for 7 days (blobs embedded up to 64 MiB, later
-  files marked `contentOmitted`); erasure fans out one
+  files marked `contentOmitted`); self erasure fans out one
   `privacy.erase` job per membership plus a retryable finalizer that
-  anonymizes the global user only after every membership is `removed`. Self
+  anonymizes the global user only after every membership is `removed`. Admin
+  erasure is tenant-scoped: one erase job for the request tenant, no
+  finalizer, other memberships and the account untouched, and the role
+  hierarchy applies. An erase job runs identity's eraser last, so a removed
+  membership proves every other module's eraser succeeded. A banned
+  membership keeps `banned_at` and a SHA-256 `banned_email_hash` through
+  removal/erasure, so re-registering with the old email is still refused. Self
   erasure re-authenticates with the current password (an MFA user's session
   already passed the second factor); the finalizer also deletes the MFA factor
   and recovery codes; both
