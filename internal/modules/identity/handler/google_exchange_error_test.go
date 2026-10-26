@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"testing"
 
@@ -99,4 +101,43 @@ func TestGoogleCallback_ExchangeErrorClassification(t *testing.T) {
 			assert.NotContains(t, string(body), "secret-code", "the authorization code must never be echoed")
 		})
 	}
+}
+
+// The error log must carry only the class and upstream status; a provider
+// error's message (which may embed the code or a response body) must not leak.
+func TestGoogleCallback_ExchangeErrorLogOmitsSecrets(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	provider := &errorGoogleOAuth{err: &oauth2.RetrieveError{
+		Response:         &http.Response{StatusCode: http.StatusServiceUnavailable},
+		ErrorCode:        "invalid_grant",
+		ErrorDescription: "super-secret-code was rejected",
+	}}
+	tenants := &fakeTenantRepository{
+		tenant: service.Tenant{ID: 1, Slug: "default", Name: "Default", Status: "active"},
+	}
+	authHandler := newTestAuthHandler(
+		newMockService(), &mockSessions{}, &mockPasswordResetService{},
+		&mockEmailVerificationService{}, "test-secret", 24, false, provider, tenants,
+	)
+	authHandler.SetFeatureFlags(googleOAuthEnabled())
+	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
+	app.Get("/auth/google/callback", authHandler.GoogleCallback)
+
+	state := encodeOAuthState(oauthStateKey("test-secret"), "nonce", 1)
+	req, err := http.NewRequest(http.MethodGet, "/auth/google/callback?state="+state+"&code=super-secret-code", http.NoBody)
+	require.NoError(t, err)
+	req.AddCookie(&http.Cookie{Name: oauthStateCookieName, Value: state})
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	out := logs.String()
+	assert.Contains(t, out, "error_type=oauth2.RetrieveError")
+	assert.Contains(t, out, "upstream_status=503")
+	assert.NotContains(t, out, "super-secret-code")
+	assert.NotContains(t, out, "invalid_grant")
 }

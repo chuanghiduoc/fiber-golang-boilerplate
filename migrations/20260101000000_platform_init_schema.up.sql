@@ -642,9 +642,12 @@ CREATE INDEX IF NOT EXISTS idx_sessions_tenant_user_created_at
 CREATE INDEX IF NOT EXISTS idx_sessions_user_live
     ON sessions (user_id)
     WHERE revoked_at IS NULL;
--- The session purge (revoked or idle sessions without live refresh tokens).
+-- The session purge (revoked, expired, or idle sessions without live refresh
+-- tokens).
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at
     ON sessions (last_used_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
+    ON sessions (expires_at);
 
 DROP TRIGGER IF EXISTS trigger_sessions_updated_at ON sessions;
 CREATE TRIGGER trigger_sessions_updated_at

@@ -415,7 +415,8 @@ flowchart TD
   `rate_limit.exceeded`, `api.version_unsupported`, `system.*`, generic status
   titles, validation messages, the shared back-office permissions
   (`admin:users:*`, `admin:files:*`, `admin:stats:read`), and the platform
-  permissions (`platform:tenants:*`, `platform:features:write`).
+  permissions (`platform:tenants:*`, `platform:features:write`,
+  `platform:users:mfa_reset`).
 - `internal/bootstrap` is the only non-`cmd` package that imports several
   modules. `test/arch` uses the same `bootstrap.Build`, so route authorization,
   audit coverage, group-middleware overlap, and SQL table ownership are

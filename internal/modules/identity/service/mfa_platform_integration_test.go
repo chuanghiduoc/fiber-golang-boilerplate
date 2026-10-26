@@ -4,6 +4,7 @@ package service_test
 
 import (
 	"context"
+	"net/url"
 	"strconv"
 	"testing"
 	"time"
@@ -16,6 +17,15 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
 )
+
+func enrollmentSecret(t *testing.T, enrollment *service.MFAEnrollment) string {
+	t.Helper()
+	u, err := url.Parse(enrollment.OtpauthURI)
+	require.NoError(t, err)
+	secret := u.Query().Get("secret")
+	require.NotEmpty(t, secret)
+	return secret
+}
 
 // A password reset removes a pending (unconfirmed) enrollment in the same
 // transaction that replaces the password.
@@ -36,6 +46,73 @@ func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 
 	assert.Zero(t, scalar[int64](t, e.pool,
 		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NULL`, user.UserID))
+}
+
+// A re-enrollment must replace the stored pending secret and reset the
+// enrollment window in the database (the ON CONFLICT branch of the upsert).
+func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reenroll@example.com",
+		testutil.MemberOptions{Password: mfaIntegrationPassword})
+
+	first, err := e.mfa.EnrollTOTP(ctx, user.UserID, 0, mfaIntegrationPassword)
+	require.NoError(t, err)
+	firstSecret := enrollmentSecret(t, first)
+
+	// Put back a pending row with a stale secret and an old timestamp (an
+	// INSERT is not touched by the update trigger), then enroll again.
+	_, err = e.pool.Exec(ctx, `DELETE FROM mfa_factors WHERE user_id = $1`, user.UserID)
+	require.NoError(t, err)
+	_, err = e.pool.Exec(ctx, `
+		INSERT INTO mfa_factors (user_id, type, secret_ciphertext, updated_at)
+		VALUES ($1, 'totp', 'sealed:stale-secret', NOW() - INTERVAL '16 minutes')`, user.UserID)
+	require.NoError(t, err)
+
+	second, err := e.mfa.EnrollTOTP(ctx, user.UserID, 0, mfaIntegrationPassword)
+	require.NoError(t, err)
+	secondSecret := enrollmentSecret(t, second)
+	require.NotEqual(t, firstSecret, secondSecret, "re-enrollment must generate a new pending secret")
+	assert.NotEqual(t, "stale-secret", secondSecret)
+	assert.Equal(t, "sealed:"+secondSecret, scalar[string](t, e.pool,
+		`SELECT secret_ciphertext FROM mfa_factors WHERE user_id = $1`, user.UserID),
+		"the stored pending secret must be the one from the latest enrollment")
+	assert.WithinDuration(t, time.Now(), scalar[time.Time](t, e.pool,
+		`SELECT updated_at FROM mfa_factors WHERE user_id = $1`, user.UserID), time.Minute,
+		"re-enrollment must reset the enrollment timestamp")
+
+	firstCode, err := totp.Code(firstSecret, time.Now())
+	require.NoError(t, err)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, firstCode)
+	require.Error(t, err, "the replaced secret must no longer confirm")
+	assert.Equal(t, "auth.mfa_invalid_code", appCode(err))
+
+	secondCode, err := totp.Code(secondSecret, time.Now())
+	require.NoError(t, err)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, secondCode)
+	require.NoError(t, err)
+}
+
+// A pending enrollment older than the enrollment window cannot be confirmed.
+func TestMFAConfirm_ExpiredEnrollmentInDatabase(t *testing.T) {
+	e := newEnv(t, nil)
+	ctx := context.Background()
+	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "expired-enrollment@example.com",
+		testutil.MemberOptions{Password: mfaIntegrationPassword})
+
+	secret, err := totp.GenerateSecret()
+	require.NoError(t, err)
+	_, err = e.pool.Exec(ctx, `
+		INSERT INTO mfa_factors (user_id, type, secret_ciphertext, updated_at)
+		VALUES ($1, 'totp', $2, NOW() - INTERVAL '16 minutes')`,
+		user.UserID, "sealed:"+secret)
+	require.NoError(t, err)
+
+	code, err := totp.Code(secret, time.Now())
+	require.NoError(t, err)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	require.Error(t, err)
+	assert.Equal(t, "auth.mfa_enrollment_expired", appCode(err))
 }
 
 // The platform recovery path removes both factors and recovery codes, ends

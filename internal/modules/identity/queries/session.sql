@@ -19,6 +19,7 @@ WHERE tenant_id = $1 AND id = $2;
 SELECT * FROM sessions
 WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint
   AND revoked_at IS NULL
+  AND expires_at > NOW()
   AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
@@ -114,6 +115,7 @@ WHERE s.id = $1 AND s.user_id = $2;
 WITH batch AS (
     SELECT s.id FROM sessions s
     WHERE (s.revoked_at IS NOT NULL AND s.revoked_at < @revoked_before::timestamptz)
+       OR s.expires_at < NOW()
        OR (s.last_used_at < @idle_before::timestamptz
            AND NOT EXISTS (
                SELECT 1 FROM refresh_tokens r

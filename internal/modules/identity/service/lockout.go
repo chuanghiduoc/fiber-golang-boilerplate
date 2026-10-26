@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -29,12 +28,22 @@ const (
 	// password reset the TOTP guessing budget at will.
 	maxMFAAttempts   = 5
 	mfaAttemptPrefix = "mfa_attempts:"
+
+	// mfaReauthAttemptPrefix bounds password guesses made to re-authenticate
+	// for MFA enrollment management. It is a separate per-user budget so a
+	// successful re-authentication can clear the password failures without
+	// touching the TOTP/ recovery-code budget.
+	mfaReauthAttemptPrefix = "mfa_reauth_attempts:"
 )
 
-// reserveMFAAttempt counts one second-factor attempt for userID and rejects
-// it once the budget is spent. Only a successful verification clears it.
-func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
-	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
+func mfaReauthAttemptKey(userID int64) string {
+	return fmt.Sprintf("%s%d", mfaReauthAttemptPrefix, userID)
+}
+
+// reserveReauthAttempt atomically spends one password guess before the bcrypt
+// comparison, so parallel requests cannot all pass a read-only budget check.
+func reserveReauthAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+	attempts, err := store.Increment(ctx, mfaReauthAttemptKey(userID), lockoutDuration)
 	if err != nil {
 		return loginLockoutUnavailable(err)
 	}
@@ -44,31 +53,15 @@ func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) err
 	return nil
 }
 
-// checkMFAAttemptBudget rejects a second-factor attempt once the per-user
-// budget is spent, without spending another attempt itself. Re-authentication
-// uses it so a correct password does not consume the TOTP budget.
-func checkMFAAttemptBudget(ctx context.Context, store cache.Cache, userID int64) error {
-	raw, err := store.Get(ctx, mfaAttemptKey(userID))
-	if err != nil {
-		return loginLockoutUnavailable(err)
+func clearReauthAttempts(ctx context.Context, store cache.Cache, userID int64) {
+	if err := store.Delete(ctx, mfaReauthAttemptKey(userID)); err != nil {
+		slog.Warn("cache error clearing MFA re-authentication attempts", slog.Any("error", err))
 	}
-	attempts := 0
-	if len(raw) > 0 {
-		if attempts, err = strconv.Atoi(string(raw)); err != nil {
-			// An unreadable counter is treated as spent: fail closed rather
-			// than hand out unlimited guesses.
-			return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
-		}
-	}
-	if attempts >= maxMFAAttempts {
-		return apperror.NewTooManyRequests(fmt.Sprintf("too many MFA attempts, try again in %d minutes", int(lockoutDuration.Minutes())))
-	}
-	return nil
 }
 
-// recordFailedMFAAttempt spends one attempt after a failed re-authentication
-// proof and rejects the next request once the budget is exceeded.
-func recordFailedMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
+// reserveMFAAttempt counts one second-factor attempt for userID and rejects
+// it once the budget is spent. Only a successful verification clears it.
+func reserveMFAAttempt(ctx context.Context, store cache.Cache, userID int64) error {
 	attempts, err := store.Increment(ctx, mfaAttemptKey(userID), lockoutDuration)
 	if err != nil {
 		return loginLockoutUnavailable(err)

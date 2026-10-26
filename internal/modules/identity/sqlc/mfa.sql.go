@@ -155,11 +155,14 @@ func (q *Queries) GetMFAFactor(ctx context.Context, userID int64) (MfaFactor, er
 const getMFAFactorForUpdate = `-- name: GetMFAFactorForUpdate :one
 SELECT id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, created_at, updated_at FROM mfa_factors
 WHERE user_id = $1 AND type = 'totp'
+ORDER BY confirmed_at ASC NULLS LAST, id DESC
+LIMIT 1
 FOR UPDATE
 `
 
 // Confirmation locks the pending factor so a concurrent enrollment cannot
-// replace the secret between verification and the confirm update.
+// replace the secret between verification and the confirm update. A confirmed
+// row (if one coexists) wins so the caller reports "already enabled".
 func (q *Queries) GetMFAFactorForUpdate(ctx context.Context, userID int64) (MfaFactor, error) {
 	row := q.db.QueryRow(ctx, getMFAFactorForUpdate, userID)
 	var i MfaFactor

@@ -531,8 +531,9 @@ type SessionRepository interface {
 // RefreshTokenRepository stores refresh-token hashes.
 type RefreshTokenRepository interface {
 	Create(ctx context.Context, sessionID int64, tokenHash string, expiresAt time.Time) error
-	// GetByHash is possession-based (no tenant predicate); the caller compares
-	// RefreshToken.TenantID with the request tenant.
+	// GetByHash is tenant-scoped (RLS plus the caller's explicit tenant
+	// comparison): a refresh token is only usable in the tenant that issued
+	// it. The caller compares RefreshToken.TenantID with the request tenant.
 	GetByHash(ctx context.Context, tokenHash string) (*RefreshToken, error)
 	// MarkUsed reports whether this call consumed the token.
 	MarkUsed(ctx context.Context, tenantID, id int64) (bool, error)

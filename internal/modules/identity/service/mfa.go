@@ -264,11 +264,12 @@ func (s *mfaService) ConfirmTOTP(ctx context.Context, userID, sessionID int64, c
 }
 
 // reauthenticate proves the caller may change the account's second factor.
-// A local password is checked against the bcrypt hash and a mismatch spends
-// the per-user second-factor budget (a correct password does not clear it).
-// A passwordless account instead needs an interactive sign-in no older than
-// mfaReauthSessionMaxAge: a stolen access token alone must not bind a new
-// authenticator.
+// A local password is checked against the bcrypt hash; every attempt spends
+// the per-user re-authentication budget before the comparison, so parallel
+// guesses cannot bypass it. A correct password clears that password budget
+// (but never the TOTP/recovery-code budget). A passwordless account instead
+// needs an interactive sign-in no older than mfaReauthSessionMaxAge: a stolen
+// access token alone must not bind a new authenticator.
 func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID int64, currentPassword string) error {
 	user, err := s.Stores.Users.GetByID(ctx, userID)
 	if err != nil {
@@ -283,7 +284,11 @@ func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID int64
 	if s.Cache == nil {
 		return loginLockoutUnavailable(errors.New("MFA attempt store is not configured"))
 	}
-	if err := checkMFAAttemptBudget(ctx, s.Cache, userID); err != nil {
+	// Reserve atomically before the bcrypt comparison so parallel guesses
+	// cannot each pass a read-only budget check. This budget is separate from
+	// the TOTP/recovery-code budget; a success clears it and leaves the TOTP
+	// budget untouched.
+	if err := reserveReauthAttempt(ctx, s.Cache, userID); err != nil {
 		return err
 	}
 	hash, err := s.Stores.Users.PasswordHash(ctx, userID)
@@ -294,11 +299,9 @@ func (s *mfaService) reauthenticate(ctx context.Context, userID, sessionID int64
 		return apperror.NewInternal("failed to get user")
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(currentPassword)) != nil {
-		if err := recordFailedMFAAttempt(ctx, s.Cache, userID); err != nil {
-			return err
-		}
 		return currentPasswordIncorrect()
 	}
+	clearReauthAttempts(ctx, s.Cache, userID)
 	return nil
 }
 

@@ -20,9 +20,12 @@ RETURNING *;
 
 -- name: GetMFAFactorForUpdate :one
 -- Confirmation locks the pending factor so a concurrent enrollment cannot
--- replace the secret between verification and the confirm update.
+-- replace the secret between verification and the confirm update. A confirmed
+-- row (if one coexists) wins so the caller reports "already enabled".
 SELECT * FROM mfa_factors
 WHERE user_id = @user_id AND type = 'totp'
+ORDER BY confirmed_at ASC NULLS LAST, id DESC
+LIMIT 1
 FOR UPDATE;
 
 -- name: ConfirmMFAFactor :execrows

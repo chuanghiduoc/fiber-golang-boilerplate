@@ -179,6 +179,7 @@ const listLiveSessionsCursor = `-- name: ListLiveSessionsCursor :many
 SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
 WHERE tenant_id = $1::bigint AND user_id = $2::bigint
   AND revoked_at IS NULL
+  AND expires_at > NOW()
   AND (created_at, id) < ($3::timestamptz, $4::bigint)
 ORDER BY created_at DESC, id DESC
 LIMIT $5::int
@@ -236,6 +237,7 @@ const purgeStaleSessions = `-- name: PurgeStaleSessions :execrows
 WITH batch AS (
     SELECT s.id FROM sessions s
     WHERE (s.revoked_at IS NOT NULL AND s.revoked_at < $1::timestamptz)
+       OR s.expires_at < NOW()
        OR (s.last_used_at < $2::timestamptz
            AND NOT EXISTS (
                SELECT 1 FROM refresh_tokens r

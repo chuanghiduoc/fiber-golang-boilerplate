@@ -608,6 +608,7 @@ func (h *AuthHandler) GoogleRedirect(c fiber.Ctx) error {
 // @Failure 404 {object} apperror.ProblemDetails
 // @Failure 429 {object} apperror.ProblemDetails
 // @Failure 500 {object} apperror.ProblemDetails
+// @Failure 502 {object} apperror.ProblemDetails "auth.oauth_upstream_unavailable"
 // @Router /auth/google/callback [get]
 func (h *AuthHandler) GoogleCallback(c fiber.Ctx) error {
 	if h.googleOAuth == nil {

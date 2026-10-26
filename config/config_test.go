@@ -907,6 +907,19 @@ func TestLoad_DefaultsIncludePatchAndFitShutdown(t *testing.T) {
 	}
 }
 
+func TestLoad_JWTDefaults(t *testing.T) {
+	var parsed struct{ JWT JWTConfig }
+	if err := env.Parse(&parsed); err != nil {
+		t.Fatalf("parse defaults: %v", err)
+	}
+	if parsed.JWT.ExpireHour != 1 {
+		t.Errorf("default JWT_EXPIRE_HOUR = %d, want 1", parsed.JWT.ExpireHour)
+	}
+	if parsed.JWT.SessionMaxLifetime != 720*time.Hour {
+		t.Errorf("default SESSION_MAX_LIFETIME = %s, want 720h", parsed.JWT.SessionMaxLifetime)
+	}
+}
+
 func TestValidate_StagingRejectsKnownDefaults(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.App.Env = "staging"

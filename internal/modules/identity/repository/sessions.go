@@ -214,11 +214,10 @@ func (r *RefreshTokenRepository) Create(ctx context.Context, sessionID int64, to
 }
 
 func (r *RefreshTokenRepository) GetByHash(ctx context.Context, tokenHash string) (*identityservice.RefreshToken, error) {
-	// Possession-based lookup: the caller compares TenantID with the request
-	// tenant. Without the bypass, RLS would hide a token issued by another
-	// tenant and turn the comparison into an accidental 401 for a token that
-	// should be recognized (and, for a used token, revoke its family).
-	ctx = database.WithRLSBypass(ctx)
+	// Intentionally tenant-scoped: a refresh token is usable only in the
+	// tenant that issued it, and RLS is a second line behind the explicit
+	// tenant comparison in SessionService.loadRefreshSession. Unlike logout,
+	// this lookup has no cross-tenant possession semantics.
 	row, err := r.q.GetRefreshTokenByHash(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
