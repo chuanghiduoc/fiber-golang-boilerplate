@@ -1,210 +1,155 @@
 package handler
 
 import (
-	"github.com/gofiber/fiber/v3"
+	"context"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpx"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/response"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
 // MFAHandler serves the authenticated MFA management endpoints and the public
 // two-step login verification.
 type MFAHandler struct {
-	mfa service.MFAService
+	mfa           service.MFAService
+	keyring       *token.Keyring
+	refreshCookie RefreshCookieConfig
 }
 
 func NewMFAHandler(mfa service.MFAService) *MFAHandler {
 	return &MFAHandler{mfa: mfa}
 }
 
-// Enroll godoc
-// @Summary Start TOTP enrollment
-// @Description Generate a fresh TOTP secret and return its otpauth provisioning URI. Requires re-authentication: the current password (accounts with a local password) or a session created within the last 15 minutes (Google-only). Re-enrolling before confirmation replaces the pending secret, and a pending enrollment older than 15 minutes cannot be confirmed.
-// @Tags Auth
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param request body dto.MFAEnrollRequest true "Re-authentication proof"
-// @Success 200 {object} dto.MFAEnrollResponse
-// @Failure 400 {object} apperror.ProblemDetails "current password is incorrect"
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails "auth.mfa_reauth_required"
-// @Failure 409 {object} apperror.ProblemDetails "auth.mfa_already_enabled"
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/totp/enroll [post]
-func (h *MFAHandler) Enroll(c fiber.Ctx) error {
-	var req dto.MFAEnrollRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	enrollment, err := h.mfa.EnrollTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword)
-	if err != nil {
-		return err
-	}
-	return response.Success(c, dto.MFAEnrollResponse{Type: service.MFAFactorTOTP, OtpauthURI: enrollment.OtpauthURI})
+// SetJWTKeyring installs the keyring used to recover the current session id.
+func (h *MFAHandler) SetJWTKeyring(keyring *token.Keyring) { h.keyring = keyring }
+
+type mfaStatusInput struct {
+	Authorization string `header:"Authorization"`
 }
 
-// Confirm godoc
-// @Summary Confirm TOTP enrollment
-// @Description Verify the first TOTP code, enable the factor, and return ten single-use recovery codes. Requires re-authentication with the current password (or a recent sign-in for Google-only accounts). This is the only time the recovery codes are shown. Confirmation invalidates every older session everywhere, so the response also carries a re-issued access and refresh token pair for the session that confirmed the factor.
-// @Tags Auth
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param request body dto.MFAConfirmRequest true "TOTP code and re-authentication proof"
-// @Success 200 {object} dto.MFAConfirmResponse
-// @Failure 400 {object} apperror.ProblemDetails "current password is incorrect"
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails "auth.mfa_reauth_required"
-// @Failure 409 {object} apperror.ProblemDetails "auth.mfa_already_enabled" or "auth.mfa_enrollment_expired"
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/totp/confirm [post]
-func (h *MFAHandler) Confirm(c fiber.Ctx) error {
-	var req dto.MFAConfirmRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	result, err := h.mfa.ConfirmTOTP(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.CurrentPassword, req.Code)
-	if err != nil {
-		return err
-	}
-	return response.Success(c, dto.MFAConfirmResponse{
-		RecoveryCodes: result.RecoveryCodes,
-		AccessToken:   result.Tokens.AccessToken,
-		RefreshToken:  result.Tokens.RefreshToken,
-	})
+type mfaEnrollInput struct {
+	Authorization string `header:"Authorization"`
+	Body          dto.MFAEnrollRequest
 }
 
-// PlatformReset godoc
-// @Summary Reset a user's MFA (platform)
-// @Description Remove the confirmed and pending TOTP factor and recovery codes, revoke every session of the user in every tenant, and bump the token version, so the account can enroll a new authenticator (platform permission).
-// @Tags Platform
-// @Security BearerAuth
-// @Param id path int true "User ID"
-// @Success 204
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /platform/users/{id}/mfa/reset [post]
-func (h *MFAHandler) PlatformReset(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
-	if err != nil {
-		return err
-	}
-	if err := h.mfa.ResetTOTP(c.Context(), id); err != nil {
-		return err
-	}
-	return response.NoContent(c)
+type mfaConfirmInput struct {
+	FactorID      string `path:"factorId" format:"uuid"`
+	Authorization string `header:"Authorization"`
+	Body          dto.MFAConfirmRequest
 }
 
-// Disable godoc
-// @Summary Disable MFA
-// @Description Remove the TOTP factor and recovery codes after proving a current TOTP or recovery code. The user's other sessions are revoked.
-// @Tags Auth
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param request body dto.MFADisableRequest true "TOTP or recovery code"
-// @Success 204
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails "auth.mfa_not_enabled"
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/disable [post]
-func (h *MFAHandler) Disable(c fiber.Ctx) error {
-	var req dto.MFADisableRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	if err := h.mfa.Disable(c.Context(), httpx.AuthUserID(c), fiber.Locals[int64](c, middleware.LocalSessionID), req.Code); err != nil {
-		return err
-	}
-	return response.NoContent(c)
+type mfaDisableInput struct {
+	FactorID      string `path:"factorId" format:"uuid"`
+	Authorization string `header:"Authorization"`
+	Body          dto.MFADisableRequest
 }
 
-// Regenerate godoc
-// @Summary Regenerate recovery codes
-// @Description Replace all recovery codes after proving a current TOTP or recovery code. The new codes are returned once and the old set stops working.
-// @Tags Auth
-// @Security BearerAuth
-// @Accept json
-// @Produce json
-// @Param request body dto.MFARegenerateRequest true "TOTP or recovery code"
-// @Success 200 {object} dto.MFARecoveryCodesResponse
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 409 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/recovery-codes/regenerate [post]
-func (h *MFAHandler) Regenerate(c fiber.Ctx) error {
-	var req dto.MFARegenerateRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	codes, err := h.mfa.RegenerateRecoveryCodes(c.Context(), httpx.AuthUserID(c), req.Code)
-	if err != nil {
-		return err
-	}
-	return response.Success(c, dto.MFARecoveryCodesResponse{RecoveryCodes: codes})
+type mfaRegenerateInput struct {
+	Authorization string `header:"Authorization"`
+	Body          dto.MFARegenerateRequest
 }
 
-// Status godoc
-// @Summary MFA status
-// @Description Return whether TOTP is enabled and how many recovery codes are unused.
-// @Tags Auth
-// @Security BearerAuth
-// @Produce json
-// @Success 200 {object} dto.MFAStatusResponse
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/status [get]
-func (h *MFAHandler) Status(c fiber.Ctx) error {
-	status, err := h.mfa.Status(c.Context(), httpx.AuthUserID(c))
+type mfaVerifyInput struct {
+	Body dto.MFAVerifyRequest
+}
+
+type platformResetMFAInput struct {
+	UserID string `path:"userId" format:"uuid"`
+}
+
+// Enroll starts or restarts a TOTP enrollment.
+func (h *MFAHandler) Enroll(ctx context.Context, input *mfaEnrollInput) (*httpapi.Created[dto.MFAEnrollResponse], error) {
+	enrollment, err := h.mfa.EnrollTOTP(ctx, actorID(ctx), sessionIDFromBearer(h.keyring, input.Authorization), input.Body.CurrentPassword)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return response.Success(c, dto.MFAStatusResponse{
+	location := "/api/v1/me/mfa/totp/" + enrollment.FactorID.String()
+	return httpapi.NewCreated(location, dto.MFAEnrollResponse{
+		FactorID:   enrollment.FactorID,
+		Type:       service.MFAFactorTOTP,
+		OtpauthURI: enrollment.OtpauthURI,
+	}), nil
+}
+
+// Confirm verifies the first code and enables the factor.
+func (h *MFAHandler) Confirm(ctx context.Context, input *mfaConfirmInput) (*mfaConfirmOutput, error) {
+	if _, err := parseUUID(input.FactorID, "factorId"); err != nil {
+		return nil, err
+	}
+	result, err := h.mfa.ConfirmTOTP(ctx, actorID(ctx), sessionIDFromBearer(h.keyring, input.Authorization), input.Body.CurrentPassword, input.Body.Code)
+	if err != nil {
+		return nil, err
+	}
+	return &mfaConfirmOutput{
+		SetCookie: h.refreshCookie.cookieHeader(result.Tokens.RefreshToken),
+		Body: dto.MFAConfirmResponse{
+			RecoveryCodes: result.RecoveryCodes,
+			AccessToken:   result.Tokens.AccessToken,
+			RefreshToken:  h.refreshCookie.jsonRefreshToken(result.Tokens.RefreshToken),
+		},
+	}, nil
+}
+
+// Disable removes the factor after a code proof.
+func (h *MFAHandler) Disable(ctx context.Context, input *mfaDisableInput) (*httpapi.Empty, error) {
+	if _, err := parseUUID(input.FactorID, "factorId"); err != nil {
+		return nil, err
+	}
+	if err := h.mfa.Disable(ctx, actorID(ctx), sessionIDFromBearer(h.keyring, input.Authorization), input.Body.Code); err != nil {
+		return nil, err
+	}
+	return &httpapi.Empty{}, nil
+}
+
+// Regenerate replaces the recovery codes after a code proof.
+func (h *MFAHandler) Regenerate(ctx context.Context, input *mfaRegenerateInput) (*httpapi.Created[dto.MFARecoveryCodesResponse], error) {
+	codes, err := h.mfa.RegenerateRecoveryCodes(ctx, actorID(ctx), input.Body.Code)
+	if err != nil {
+		return nil, err
+	}
+	return httpapi.NewCreated("", dto.MFARecoveryCodesResponse{RecoveryCodes: codes}), nil
+}
+
+// Status returns whether TOTP is enabled and how many recovery codes remain.
+func (h *MFAHandler) Status(ctx context.Context, _ *mfaStatusInput) (*httpapi.Output[dto.MFAStatusResponse], error) {
+	status, err := h.mfa.Status(ctx, actorID(ctx))
+	if err != nil {
+		return nil, err
+	}
+	return &httpapi.Output[dto.MFAStatusResponse]{Body: dto.MFAStatusResponse{
 		Enabled:                status.Enabled,
 		ConfirmedAt:            status.ConfirmedAt,
 		RecoveryCodesRemaining: status.RecoveryCodesRemaining,
-	})
+	}}, nil
 }
 
-// Verify godoc
-// @Summary Complete MFA login
-// @Description Exchange a two-step login challenge plus a TOTP or recovery code for the normal access and refresh token pair.
-// @Tags Auth
-// @Accept json
-// @Produce json
-// @Param request body dto.MFAVerifyRequest true "Challenge and MFA code"
-// @Success 200 {object} dto.LoginResponse
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Failure 429 {object} apperror.ProblemDetails
-// @Failure 500 {object} apperror.ProblemDetails
-// @Router /auth/mfa/verify [post]
-func (h *MFAHandler) Verify(c fiber.Ctx) error {
-	var req dto.MFAVerifyRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	result, err := h.mfa.Verify(withClient(c), req.Challenge, req.Code)
+// PlatformReset removes a user's MFA as a platform administrator.
+func (h *MFAHandler) PlatformReset(ctx context.Context, input *platformResetMFAInput) (*httpapi.Empty, error) {
+	id, err := parseUUID(input.UserID, "userId")
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if err := h.mfa.ResetTOTP(ctx, id); err != nil {
+		return nil, err
+	}
+	return &httpapi.Empty{}, nil
+}
+
+// Verify completes a two-step sign-in.
+func (h *MFAHandler) Verify(ctx context.Context, input *mfaVerifyInput) (*loginOutput, error) {
+	result, err := h.mfa.Verify(withClientMetadata(ctx), input.Body.Challenge, input.Body.Code)
+	if err != nil {
+		return nil, err
 	}
 	user := toUserResponse(result.Member)
-	fiber.Locals(c, "user_id", user.ID)
-	return response.Success(c, dto.LoginResponse{
-		AccessToken:  result.Tokens.AccessToken,
-		RefreshToken: result.Tokens.RefreshToken,
-		User:         user,
-	})
+	auditActor(ctx, user.ID)
+	return &loginOutput{
+		SetCookie: h.refreshCookie.cookieHeader(result.Tokens.RefreshToken),
+		Body: dto.LoginResponse{
+			AccessToken:  result.Tokens.AccessToken,
+			RefreshToken: h.refreshCookie.jsonRefreshToken(result.Tokens.RefreshToken),
+			User:         user,
+		},
+	}, nil
 }

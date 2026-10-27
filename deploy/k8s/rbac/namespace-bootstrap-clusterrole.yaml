@@ -1,0 +1,33 @@
+# The minimum cluster-scoped permission the deploy workflow needs, because its
+# prereqs render includes the Namespace object (deploy/k8s/prereqs/namespace.yaml)
+# and `kubectl apply` reads (and, on the first apply, patches the
+# last-applied-configuration annotation onto) it.
+#
+# It is restricted with resourceNames to the two environments and grants no
+# create/delete. Create the namespaces once as an administrator (with the
+# pod-security labels and exactly the manifest's metadata so no update is
+# needed). Bind this ClusterRole once, alongside the namespace-scoped
+# deployer Role:
+#
+#   kubectl apply -f deploy/k8s/rbac/namespace-bootstrap-clusterrole.yaml
+#   kubectl create clusterrolebinding fiber-boilerplate-namespace-bootstrap \
+#     --clusterrole=fiber-boilerplate-namespace-bootstrap \
+#     --user=arn:aws:iam::123456789012:role/gha-deploy   # or the GCP/AKS identity
+#
+# If you prefer the workflow to create namespaces, add `create` to this rule;
+# Kubernetes cannot restrict create by resourceName, so that is a broader
+# grant. Do not grant delete: a typo in a render must never remove a namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fiber-boilerplate-namespace-bootstrap
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    resourceNames:
+      - fiber-boilerplate-staging
+      - fiber-boilerplate-production
+    verbs: ["get", "patch"]

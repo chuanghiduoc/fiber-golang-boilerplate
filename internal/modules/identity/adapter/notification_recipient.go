@@ -7,6 +7,7 @@ import (
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
 // NotificationRecipient adapts identity memberships to the notifications
@@ -23,7 +24,7 @@ func NewNotificationRecipient(memberships identityservice.MembershipRepository) 
 	return &NotificationRecipient{memberships: memberships}
 }
 
-func (a *NotificationRecipient) NotificationRecipient(ctx context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
+func (a *NotificationRecipient) NotificationRecipient(ctx context.Context, userID uuid.UUID) (identitycontracts.NotificationRecipient, error) {
 	member, err := a.memberships.GetActive(ctx, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {

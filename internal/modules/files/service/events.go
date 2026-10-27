@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/google/uuid"
+
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 )
@@ -45,7 +47,7 @@ func fileRestored(file *File) filescontracts.FileRestored {
 // publishEvent publishes one domain event through the transaction, so the
 // event (and every durable subscriber job, such as webhook fan-out) commits
 // or rolls back with the mutation. The actor and request id come from ctx.
-func publishEvent(ctx context.Context, publisher EventPublisher, eventType string, dataVersion int, tenantID int64, data any) error {
+func publishEvent(ctx context.Context, publisher EventPublisher, eventType string, dataVersion int, tenantID uuid.UUID, data any) error {
 	event, err := events.NewEvent(eventType, dataVersion, data)
 	if err != nil {
 		return fmt.Errorf("build %s event: %w", eventType, err)

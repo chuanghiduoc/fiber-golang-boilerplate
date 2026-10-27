@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const claimTrashedFiles = `-- name: ClaimTrashedFiles :many
@@ -30,9 +32,9 @@ type ClaimTrashedFilesParams struct {
 }
 
 type ClaimTrashedFilesRow struct {
-	ID          int64  `json:"id"`
-	TenantID    int64  `json:"tenant_id"`
-	StoragePath string `json:"storage_path"`
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	StoragePath string    `json:"storage_path"`
 }
 
 // Trash retention (files.trash.purge). These are the only files queries
@@ -66,14 +68,14 @@ const failTrashedFiles = `-- name: FailTrashedFiles :execrows
 UPDATE files
 SET purge_attempts = purge_attempts + 1,
     purge_retry_after = now() + make_interval(hours => LEAST(24, 1 << LEAST(purge_attempts, 5)))
-WHERE id = ANY($1::bigint[])
+WHERE id = ANY($1::uuid[])
   AND purge_started_at IS NOT NULL
 `
 
 // A blob delete failed: keep the claim (the row is never restorable after the
 // first delete attempt), count the attempt, and defer the next try with a
 // capped exponential backoff. Only the blob delete is retried.
-func (q *Queries) FailTrashedFiles(ctx context.Context, ids []int64) (int64, error) {
+func (q *Queries) FailTrashedFiles(ctx context.Context, ids []uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, failTrashedFiles, ids)
 	if err != nil {
 		return 0, err
@@ -83,12 +85,12 @@ func (q *Queries) FailTrashedFiles(ctx context.Context, ids []int64) (int64, err
 
 const hardDeleteTrashedFiles = `-- name: HardDeleteTrashedFiles :execrows
 DELETE FROM files
-WHERE id = ANY($1::bigint[])
+WHERE id = ANY($1::uuid[])
   AND deleted_at IS NOT NULL
   AND purge_started_at IS NOT NULL
 `
 
-func (q *Queries) HardDeleteTrashedFiles(ctx context.Context, ids []int64) (int64, error) {
+func (q *Queries) HardDeleteTrashedFiles(ctx context.Context, ids []uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, hardDeleteTrashedFiles, ids)
 	if err != nil {
 		return 0, err

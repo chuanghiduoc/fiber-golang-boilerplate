@@ -9,11 +9,12 @@ current: it is the first file the next team reads.
 | Item | Value |
 | --- | --- |
 | Tables | `{{.M.Name}}` / `{{.M.Name}}_*` (test/arch rejects SQL on another module's tables) |
+| Identifiers | `UUID DEFAULT uuidv7()` primary keys and `UUID` foreign keys; Go code uses `uuid.UUID` and `uuid.NewV7()` when it needs the id before insert |
 | Migrations | `migrations/<UTC timestamp>_{{.M.Name}}_<purpose>.{up,down}.sql` |
 | Permissions | `{{.M.Name}}:read`, `{{.M.Name}}:write` (admin-only until granted) |
 | Error codes | `{{.M.Name}}.not_implemented` |
 | Jobs / events / schedules | none |
-| Tenant purge | `RegisterTenantPurge` (generated resources append their purger in `build.go`; bootstrap calls it at the `gen:module-purge` marker) |
+| Tenant purge | `TenantPurgers` (generated resources append their purger in `build.go`; bootstrap calls it at the `gen:module-purge` marker) |
 | Privacy | none until a generated table stores per-user rows (then add `RegisterPrivacy`) |
 | Contracts | none (add `internal/contracts/{{.M.Name}}/` when another module needs this one) |
 

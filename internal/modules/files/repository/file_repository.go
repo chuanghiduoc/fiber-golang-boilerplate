@@ -2,17 +2,13 @@ package repository
 
 import (
 	"context"
-	"errors"
-	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -31,18 +27,14 @@ func NewFileRepository(db filesqlc.DBTX) *FileRepository {
 	return &FileRepository{q: filesqlc.New(db)}
 }
 
-// tenantID returns the request tenant every repository query must scope to.
-// EffectiveID falls back to the default tenant only for background jobs,
-// internal callers, and tests; HTTP requests resolve an explicit tenant (and
-// production requires X-Tenant-Slug).
-func tenantID(ctx context.Context) int64 {
-	return tenant.EffectiveID(ctx)
-}
-
 func (r *FileRepository) Create(ctx context.Context, file filesvc.NewFile) (*filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// The request tenant is authoritative; the input has no tenant field.
 	row, err := r.q.CreateFile(ctx, filesqlc.CreateFileParams{
-		TenantID:     tenantID(ctx),
+		TenantID:     tenantID,
 		UserID:       file.UserID,
 		OriginalName: file.OriginalName,
 		StoragePath:  file.StoragePath,
@@ -58,23 +50,35 @@ func (r *FileRepository) Create(ctx context.Context, file filesvc.NewFile) (*fil
 	return toFile(row), nil
 }
 
-func (r *FileRepository) GetByID(ctx context.Context, id int64) (*filesvc.File, error) {
+func (r *FileRepository) GetByID(ctx context.Context, id uuid.UUID) (*filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return oneFile(r.q.GetFileByID(ctx, filesqlc.GetFileByIDParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 	}))
 }
 
-func (r *FileRepository) GetByIDIncludingDeleted(ctx context.Context, id int64) (*filesvc.File, error) {
+func (r *FileRepository) GetByIDIncludingDeleted(ctx context.Context, id uuid.UUID) (*filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return oneFile(r.q.GetFileByIDIncludingDeleted(ctx, filesqlc.GetFileByIDIncludingDeletedParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 	}))
 }
 
-func (r *FileRepository) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]filesvc.File, error) {
+func (r *FileRepository) ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, includeDeleted bool) ([]filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return manyFiles(r.q.ListFilesByUserCursor(ctx, filesqlc.ListFilesByUserCursorParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		UserID:          userID,
 		IncludeDeleted:  includeDeleted,
 		CursorCreatedAt: cur.CreatedAtParam(),
@@ -84,30 +88,60 @@ func (r *FileRepository) ListByUserCursor(ctx context.Context, userID int64, cur
 }
 
 func (r *FileRepository) AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return manyFiles(r.q.AdminListFilesCursor(ctx, filesqlc.AdminListFilesCursorParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
 	}))
 }
 
-func (r *FileRepository) Delete(ctx context.Context, id int64) (*filesvc.File, error) {
-	return oneFile(r.q.DeleteFile(ctx, filesqlc.DeleteFileParams{
-		ID:       id,
-		TenantID: tenantID(ctx),
+func (r *FileRepository) ListCursor(ctx context.Context, cur pagination.DBCursor, includeDeleted bool) ([]filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return manyFiles(r.q.ListFilesCursor(ctx, filesqlc.ListFilesCursorParams{
+		TenantID:        tenantID,
+		IncludeDeleted:  includeDeleted,
+		CursorCreatedAt: cur.CreatedAtParam(),
+		CursorID:        cur.IDParam(),
+		RowLimit:        cur.Limit,
 	}))
 }
 
-func (r *FileRepository) Restore(ctx context.Context, id int64) (*filesvc.File, error) {
+func (r *FileRepository) Delete(ctx context.Context, id uuid.UUID) (*filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return oneFile(r.q.DeleteFile(ctx, filesqlc.DeleteFileParams{
+		ID:       id,
+		TenantID: tenantID,
+	}))
+}
+
+func (r *FileRepository) Restore(ctx context.Context, id uuid.UUID) (*filesvc.File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return oneFile(r.q.RestoreFile(ctx, filesqlc.RestoreFileParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 	}))
 }
 
 func (r *FileRepository) AdminFileStats(ctx context.Context) (filesvc.FileStats, error) {
-	stats, err := r.q.AdminFileStats(ctx, tenantID(ctx))
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return filesvc.FileStats{}, err
+	}
+	stats, err := r.q.AdminFileStats(ctx, tenantID)
 	if err != nil {
 		return filesvc.FileStats{}, err
 	}
@@ -118,12 +152,20 @@ func (r *FileRepository) AdminFileStats(ctx context.Context) (filesvc.FileStats,
 // lock is transaction-scoped: the upload service calls this inside its
 // metadata transaction, and the lock releases with the commit or rollback.
 func (r *FileRepository) LockQuota(ctx context.Context) error {
-	return r.q.LockFilesQuota(ctx, tenantID(ctx))
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return err
+	}
+	return r.q.LockFilesQuota(ctx, tenantID)
 }
 
-func (r *FileRepository) StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error) {
+func (r *FileRepository) StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
 	usage, err := r.q.FilesStorageUsage(ctx, filesqlc.FilesStorageUsageParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -135,8 +177,12 @@ func (r *FileRepository) StorageUsage(ctx context.Context, userID int64) (tenant
 // ExistingStoragePaths returns which of paths have a metadata row in the
 // request tenant. The orphan sweep calls it once per tenant batch.
 func (r *FileRepository) ExistingStoragePaths(ctx context.Context, paths []string) (map[string]struct{}, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListFileStoragePaths(ctx, filesqlc.ListFileStoragePathsParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		Paths:    paths,
 	})
 	if err != nil {
@@ -180,23 +226,15 @@ func toFile(row filesqlc.File) *filesvc.File {
 		MimeType:     row.MimeType,
 		Size:         row.Size,
 		CreatedAt:    row.CreatedAt.Time,
-		DeletedAt:    timePtr(row.DeletedAt),
+		DeletedAt:    database.TimePtr(row.DeletedAt),
 	}
-}
-
-func timePtr(ts pgtype.Timestamptz) *time.Time {
-	if !ts.Valid {
-		return nil
-	}
-	t := ts.Time
-	return &t
 }
 
 // wrapErr translates pgx errors to app-level sentinel errors without pulling
 // in a shared repository package.
 func wrapErr(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apperror.ErrNotFound
+	if mapped := database.MapError(err); mapped != err {
+		return mapped
 	}
 	return err
 }

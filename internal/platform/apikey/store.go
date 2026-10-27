@@ -4,18 +4,20 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 )
 
 // Key is the verifier's view of a stored API key. Hash is included for
 // completeness but is never exposed outside the platform/module boundary.
 type Key struct {
-	ID                 int64
-	TenantID           int64
-	UserID             int64
+	ID                 uuid.UUID
+	TenantID           uuid.UUID
+	UserID             uuid.UUID
 	Name               string
 	Prefix             string
-	Hash               string
+	Hash               []byte
 	Scopes             []authz.Permission
 	ExpiresAt          *time.Time
 	RevokedAt          *time.Time
@@ -31,8 +33,8 @@ type Key struct {
 type Store interface {
 	// FindByHash returns the key with the supplied SHA-256 hash. Implementations
 	// must return apperror.ErrNotFound (or a wrapped error) when no row exists.
-	FindByHash(ctx context.Context, hash string) (Key, error)
+	FindByHash(ctx context.Context, hash []byte) (Key, error)
 	// TouchLastUsed records a successful authentication. Implementations should
 	// treat a missing row as a no-op.
-	TouchLastUsed(ctx context.Context, id int64, at time.Time) error
+	TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error
 }

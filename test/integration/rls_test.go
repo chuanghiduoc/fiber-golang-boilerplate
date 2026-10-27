@@ -6,6 +6,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 
@@ -19,23 +20,22 @@ import (
 // database.Scoped handle the API uses.
 func TestRLSTenantIsolation(t *testing.T) {
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	tenantA := testutil.CreateTenant(t, ctx, pool, "rls-a")
 	tenantB := testutil.CreateTenant(t, ctx, pool, "rls-b")
 	userA := testutil.CreateMember(t, ctx, pool, tenantA, "rls-a@example.test", testutil.MemberOptions{})
 	userB := testutil.CreateMember(t, ctx, pool, tenantB, "rls-b@example.test", testutil.MemberOptions{})
 
-	appPool := testutil.AppPool(pool)
+	appPool := fx.App
 	var unsafe bool
 	require.NoError(t, appPool.QueryRow(ctx,
 		`SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user`).Scan(&unsafe))
 	require.False(t, unsafe, "application assertions must run as a role RLS applies to")
 
-	scoped := testutil.Scoped(pool)
-	insert := func(tenantID, userID int64, path string) {
+	scoped := fx.Scoped()
+	insert := func(tenantID, userID uuid.UUID, path string) {
 		t.Helper()
 		_, err := scoped.Exec(tenant.WithID(ctx, tenantID),
 			`INSERT INTO files (tenant_id, user_id, original_name, storage_path, mime_type, size)
@@ -61,7 +61,7 @@ func TestRLSTenantIsolation(t *testing.T) {
 	require.Equal(t, []string{"a.txt"}, paths)
 
 	// A transaction gets the same scope from its context.
-	require.NoError(t, testutil.NewTxManager(pool).WithTx(ctxA, func(tx pgx.Tx) error {
+	require.NoError(t, fx.Tx().WithTx(ctxA, func(tx pgx.Tx) error {
 		var count int
 		require.NoError(t, tx.QueryRow(ctxA, `SELECT COUNT(*) FROM files`).Scan(&count))
 		require.Equal(t, 1, count)
@@ -86,7 +86,7 @@ func TestRLSTenantIsolation(t *testing.T) {
 	require.Zero(t, unset, "a connection without a tenant must see no rows")
 
 	// Bypass sees every tenant, for the deliberate cross-tenant job paths.
-	bypass := testutil.BypassScoped(pool)
+	bypass := fx.BypassScoped()
 	var all int
 	require.NoError(t, bypass.QueryRow(ctx, `SELECT COUNT(*) FROM files`).Scan(&all))
 	require.Equal(t, 2, all)

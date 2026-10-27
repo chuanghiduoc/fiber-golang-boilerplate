@@ -15,60 +15,61 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
+	"github.com/google/uuid"
 )
 
 type fakeTenantPurgeRepo struct {
 	tenants     []PurgeTenant
-	members     []int64
+	members     []uuid.UUID
 	dataExports []DataExport
 	invitations int64
 	memberships int64
 	roles       int64
-	purged      []int64
+	purged      []uuid.UUID
 	events      []audit.Event
 	batchSizes  []int32
 	marked      bool
 	listErr     error
 	deleteErr   error
 	// Cursor tracking for the resumable purge.
-	cursors       map[int64]int64
-	deletedMember []int64
-	dueDeletions  []int64
+	cursors       map[uuid.UUID]uuid.UUID
+	deletedMember []uuid.UUID
+	dueDeletions  []uuid.UUID
 	// membersByTenant overrides members for a multi-tenant run.
-	membersByTenant map[int64][]int64
+	membersByTenant map[uuid.UUID][]uuid.UUID
 }
 
 func (r *fakeTenantPurgeRepo) ListDeletedTenants(context.Context, int32) ([]PurgeTenant, error) {
 	return r.tenants, r.listErr
 }
 
-func (r *fakeTenantPurgeRepo) ListDueDeletionTenantIDs(context.Context, int32) ([]int64, error) {
+func (r *fakeTenantPurgeRepo) ListDueDeletionTenantIDs(context.Context, int32) ([]uuid.UUID, error) {
 	return r.dueDeletions, nil
 }
 
-func (r *fakeTenantPurgeRepo) ListExpiredTrialTenantIDs(context.Context, int32) ([]int64, error) {
+func (r *fakeTenantPurgeRepo) ListExpiredTrialTenantIDs(context.Context, int32) ([]uuid.UUID, error) {
 	return nil, nil
 }
 
-func (r *fakeTenantPurgeRepo) ListMembershipUserIDs(_ context.Context, tenantID, after int64, _ int32) ([]int64, error) {
+func (r *fakeTenantPurgeRepo) ListMembershipUserIDs(_ context.Context, tenantID, after uuid.UUID, _ int32) ([]uuid.UUID, error) {
 	members := r.members
 	if r.membersByTenant != nil {
 		members = r.membersByTenant[tenantID]
 	}
-	var out []int64
+	var out []uuid.UUID
 	for _, id := range members {
-		if id > after {
+		if id.String() > after.String() {
 			out = append(out, id)
 		}
 	}
 	return out, nil
 }
 
-func (r *fakeTenantPurgeRepo) DeleteMemberInvitations(context.Context, int64, int64) (int64, error) {
+func (r *fakeTenantPurgeRepo) DeleteMemberInvitations(context.Context, uuid.UUID, uuid.UUID) (int64, error) {
 	return 0, nil
 }
 
-func (r *fakeTenantPurgeRepo) DeleteMembership(_ context.Context, tenantID, userID int64) error {
+func (r *fakeTenantPurgeRepo) DeleteMembership(_ context.Context, tenantID, userID uuid.UUID) error {
 	if r.deleteErr != nil {
 		return r.deleteErr
 	}
@@ -92,15 +93,15 @@ func (r *fakeTenantPurgeRepo) DeleteMembership(_ context.Context, tenantID, user
 	return nil
 }
 
-func (r *fakeTenantPurgeRepo) AdvancePurgeCursor(_ context.Context, tenantID, cursor int64) error {
+func (r *fakeTenantPurgeRepo) AdvancePurgeCursor(_ context.Context, tenantID, cursor uuid.UUID) error {
 	if r.cursors == nil {
-		r.cursors = map[int64]int64{}
+		r.cursors = map[uuid.UUID]uuid.UUID{}
 	}
 	r.cursors[tenantID] = cursor
 	return nil
 }
 
-func (r *fakeTenantPurgeRepo) ListDataExports(_ context.Context, _ int64, limit int32) ([]DataExport, error) {
+func (r *fakeTenantPurgeRepo) ListDataExports(_ context.Context, _ uuid.UUID, limit int32) ([]DataExport, error) {
 	if len(r.dataExports) == 0 {
 		return nil, nil
 	}
@@ -111,7 +112,7 @@ func (r *fakeTenantPurgeRepo) ListDataExports(_ context.Context, _ int64, limit 
 	return r.dataExports[:n], nil
 }
 
-func (r *fakeTenantPurgeRepo) DeleteDataExports(_ context.Context, _ int64, ids []int64) error {
+func (r *fakeTenantPurgeRepo) DeleteDataExports(_ context.Context, _ uuid.UUID, ids []uuid.UUID) error {
 	if r.deleteErr != nil {
 		return r.deleteErr
 	}
@@ -120,19 +121,19 @@ func (r *fakeTenantPurgeRepo) DeleteDataExports(_ context.Context, _ int64, ids 
 	return nil
 }
 
-func (r *fakeTenantPurgeRepo) DeleteInvitationsBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+func (r *fakeTenantPurgeRepo) DeleteInvitationsBatch(_ context.Context, _ uuid.UUID, limit int32) (int64, error) {
 	return r.batchDelete(&r.invitations, limit)
 }
 
-func (r *fakeTenantPurgeRepo) DeleteMembershipsBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+func (r *fakeTenantPurgeRepo) DeleteMembershipsBatch(_ context.Context, _ uuid.UUID, limit int32) (int64, error) {
 	return r.batchDelete(&r.memberships, limit)
 }
 
-func (r *fakeTenantPurgeRepo) DeleteTenantRolesBatch(_ context.Context, _ int64, limit int32) (int64, error) {
+func (r *fakeTenantPurgeRepo) DeleteTenantRolesBatch(_ context.Context, _ uuid.UUID, limit int32) (int64, error) {
 	return r.batchDelete(&r.roles, limit)
 }
 
-func (r *fakeTenantPurgeRepo) DeleteTenantSettings(context.Context, int64) error {
+func (r *fakeTenantPurgeRepo) DeleteTenantSettings(context.Context, uuid.UUID) error {
 	return nil
 }
 
@@ -149,7 +150,7 @@ func (r *fakeTenantPurgeRepo) batchDelete(remaining *int64, limit int32) (int64,
 	return deleted, nil
 }
 
-func (r *fakeTenantPurgeRepo) MarkPurged(_ context.Context, tenantID int64, event audit.Event) (bool, error) {
+func (r *fakeTenantPurgeRepo) MarkPurged(_ context.Context, tenantID uuid.UUID, event audit.Event) (bool, error) {
 	if r.marked {
 		return false, nil
 	}
@@ -161,13 +162,13 @@ func (r *fakeTenantPurgeRepo) MarkPurged(_ context.Context, tenantID int64, even
 
 type fakePurger struct {
 	name     string
-	tenantID int64
+	tenantID uuid.UUID
 	calls    int
 	err      error
 	log      *[]string
 }
 
-func (p *fakePurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *fakePurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	p.calls++
 	p.tenantID = tenantID
 	if p.log != nil {
@@ -177,16 +178,16 @@ func (p *fakePurger) PurgeTenant(ctx context.Context, tenantID int64) error {
 }
 
 type fakeEraser struct {
-	userID int64
+	userID uuid.UUID
 	log    *[]string
 	name   string
 }
 
-func (e *fakeEraser) Export(context.Context, int64, int64) (privacycontracts.Section, error) {
+func (e *fakeEraser) Export(context.Context, uuid.UUID, uuid.UUID) (privacycontracts.Section, error) {
 	return privacycontracts.Section{}, nil
 }
 
-func (e *fakeEraser) Erase(_ context.Context, _, userID int64) error {
+func (e *fakeEraser) Erase(_ context.Context, _, userID uuid.UUID) error {
 	e.userID = userID
 	if e.log != nil {
 		*e.log = append(*e.log, "erase:"+e.name)
@@ -194,7 +195,7 @@ func (e *fakeEraser) Erase(_ context.Context, _, userID int64) error {
 	return nil
 }
 
-func newPurgeTestService(t *testing.T) (*TenantPurgeService, *fakeTenantPurgeRepo, *[]string) {
+func newPurgeTestService(t *testing.T) (purgeSvc *TenantPurgeService, purgeRepo *fakeTenantPurgeRepo, purgeOrder *[]string) {
 	t.Helper()
 	var order []string
 	privacyRegistry := privacycontracts.NewRegistry()
@@ -208,10 +209,10 @@ func newPurgeTestService(t *testing.T) (*TenantPurgeService, *fakeTenantPurgeRep
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "files", Purger: &fakePurger{name: "files", log: &order}})
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: &fakePurger{name: "identity", log: &order}})
 
-	repo := &fakeTenantPurgeRepo{tenants: []PurgeTenant{{ID: 7, Slug: "gone"}}, members: []int64{10, 11}}
+	repo := &fakeTenantPurgeRepo{tenants: []PurgeTenant{{ID: testID(7), Slug: "gone"}}, members: []uuid.UUID{testID(10), testID(11)}}
 	svc := NewTenantPurgeService(TenantPurgeDeps{
 		Repo:     repo,
-		Privacy:  &PrivacyService{registry: privacyRegistry},
+		Privacy:  NewPrivacyServiceWithRegistry(privacyRegistry),
 		Registry: tenancyRegistry,
 	})
 	return svc, repo, &order
@@ -219,15 +220,15 @@ func newPurgeTestService(t *testing.T) (*TenantPurgeService, *fakeTenantPurgeRep
 
 func TestTenantPurgeErasesMembersThenModulesThenIdentity(t *testing.T) {
 	svc, repo, order := newPurgeTestService(t)
-	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
+	require.NoError(t, svc.HandlePurgeJob(testTenantCtx(), nil))
 
 	require.Len(t, *order, 6, "two members, files first, identity last")
 	assert.Equal(t, []string{"erase:files", "erase:identity", "erase:files", "erase:identity", "files", "identity"}, *order)
-	assert.Equal(t, []int64{7}, repo.purged)
+	assert.Equal(t, []uuid.UUID{testID(7)}, repo.purged)
 	require.Len(t, repo.events, 1)
 	assert.Equal(t, "tenant.purged", repo.events[0].Action)
 	assert.Equal(t, audit.ActorTypeSystem, repo.events[0].ActorType)
-	assert.Equal(t, int64(7), repo.events[0].TenantID)
+	assert.Equal(t, testID(7), repo.events[0].TenantID)
 }
 
 // TestTenantPurgeDrainsTenantWideRowsInBoundedBatches proves identity's own
@@ -243,14 +244,14 @@ func TestTenantPurgeDrainsTenantWideRowsInBoundedBatches(t *testing.T) {
 	repo.dataExports = make([]DataExport, total)
 	for i := range repo.dataExports {
 		repo.dataExports[i] = DataExport{
-			ID: int64(i + 1), TenantID: 9,
+			ID: testID(uint64(i + 1)), TenantID: testID(9),
 			StoragePath: fmt.Sprintf("9/exports/%d.json", i+1),
 		}
 	}
 	store := &purgeBlobStore{}
 	svc := NewTenantPurgeService(TenantPurgeDeps{Repo: repo, Storage: store})
 
-	require.NoError(t, svc.PurgeTenant(context.Background(), 9))
+	require.NoError(t, svc.PurgeTenant(testTenantCtx(), testID(9)))
 
 	assert.Empty(t, repo.dataExports)
 	assert.Zero(t, repo.invitations)
@@ -287,14 +288,14 @@ func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
 type budgetEraser struct {
 	clock    *fakeClock
 	by       time.Duration
-	tenantID int64
+	tenantID uuid.UUID
 }
 
-func (e *budgetEraser) Export(context.Context, int64, int64) (privacycontracts.Section, error) {
+func (e *budgetEraser) Export(context.Context, uuid.UUID, uuid.UUID) (privacycontracts.Section, error) {
 	return privacycontracts.Section{}, nil
 }
 
-func (e *budgetEraser) Erase(_ context.Context, tenantID, _ int64) error {
+func (e *budgetEraser) Erase(_ context.Context, tenantID, _ uuid.UUID) error {
 	if tenantID == e.tenantID {
 		e.clock.Advance(e.by)
 	}
@@ -310,59 +311,59 @@ func TestTenantPurgeResumesFromThePersistedCursor(t *testing.T) {
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "files", Purger: &fakePurger{name: "files"}})
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: &fakePurger{name: "identity"}})
 	repo := &fakeTenantPurgeRepo{
-		tenants: []PurgeTenant{{ID: 7, Slug: "gone", Cursor: 5}},
-		members: []int64{4, 6, 7},
+		tenants: []PurgeTenant{{ID: testID(7), Slug: "gone", Cursor: testID(5)}},
+		members: []uuid.UUID{testID(4), testID(6), testID(7)},
 	}
 	svc := NewTenantPurgeService(TenantPurgeDeps{
-		Repo: repo, Privacy: &PrivacyService{registry: privacyRegistry}, Registry: tenancyRegistry,
+		Repo: repo, Privacy: NewPrivacyServiceWithRegistry(privacyRegistry), Registry: tenancyRegistry,
 	})
 
-	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
+	require.NoError(t, svc.HandlePurgeJob(testTenantCtx(), nil))
 
-	assert.Equal(t, []int64{6, 7}, repo.deletedMember, "users at or below the cursor are not revisited")
-	assert.Equal(t, int64(7), repo.cursors[7])
-	assert.Equal(t, []int64{7}, repo.purged)
+	assert.Equal(t, []uuid.UUID{testID(6), testID(7)}, repo.deletedMember, "users at or below the cursor are not revisited")
+	assert.Equal(t, testID(7), repo.cursors[testID(7)])
+	assert.Equal(t, []uuid.UUID{testID(7)}, repo.purged)
 }
 
 func TestTenantPurgeTenantBudgetLetsTheNextTenantRun(t *testing.T) {
 	clock := &fakeClock{now: time.Now()}
 	privacyRegistry := privacycontracts.NewRegistry()
-	slow := &budgetEraser{clock: clock, by: 3 * time.Minute, tenantID: 1}
+	slow := &budgetEraser{clock: clock, by: 3 * time.Minute, tenantID: testID(1)}
 	privacyRegistry.Register(privacycontracts.Provider{Name: "files", Exporter: slow, Eraser: slow})
 	privacyRegistry.Register(privacycontracts.Provider{Name: "identity", Exporter: &fakeEraser{name: "identity"}, Eraser: &fakeEraser{name: "identity"}})
 	tenancyRegistry := tenancycontracts.NewRegistry()
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "files", Purger: &fakePurger{name: "files"}})
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: &fakePurger{name: "identity"}})
 	repo := &fakeTenantPurgeRepo{
-		tenants:         []PurgeTenant{{ID: 1, Slug: "slow"}, {ID: 2, Slug: "fast"}},
-		membersByTenant: map[int64][]int64{1: {10}, 2: {20}},
+		tenants:         []PurgeTenant{{ID: testID(1), Slug: "slow"}, {ID: testID(2), Slug: "fast"}},
+		membersByTenant: map[uuid.UUID][]uuid.UUID{testID(1): {testID(10)}, testID(2): {testID(20)}},
 	}
 	svc := NewTenantPurgeService(TenantPurgeDeps{
-		Repo: repo, Privacy: &PrivacyService{registry: privacyRegistry}, Registry: tenancyRegistry,
+		Repo: repo, Privacy: NewPrivacyServiceWithRegistry(privacyRegistry), Registry: tenancyRegistry,
 	})
-	svc.now = clock.Now
+	svc.SetNow(clock.Now)
 
-	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
+	require.NoError(t, svc.HandlePurgeJob(testTenantCtx(), nil))
 
-	assert.Equal(t, []int64{2}, repo.purged, "the fast tenant is not starved by the slow one")
-	assert.Equal(t, int64(10), repo.cursors[1], "the slow tenant keeps the progress it made")
-	assert.Equal(t, int64(20), repo.cursors[2])
-	assert.Equal(t, []int64{10, 20}, repo.deletedMember)
+	assert.Equal(t, []uuid.UUID{testID(2)}, repo.purged, "the fast tenant is not starved by the slow one")
+	assert.Equal(t, testID(10), repo.cursors[testID(1)], "the slow tenant keeps the progress it made")
+	assert.Equal(t, testID(20), repo.cursors[testID(2)])
+	assert.Equal(t, []uuid.UUID{testID(10), testID(20)}, repo.deletedMember)
 }
 
 func TestTenantDeletionJobFinalizesDueTenantsThroughTheService(t *testing.T) {
 	db := newMemDB()
 	past := time.Now().Add(-time.Minute)
-	db.tenants[2].Status = TenantStatusPendingDeletion
-	db.tenants[2].DeletionScheduledAt = &past
-	repo := &fakeTenantPurgeRepo{dueDeletions: []int64{2}}
+	db.tenants[testID(2)].Status = TenantStatusPendingDeletion
+	db.tenants[testID(2)].DeletionScheduledAt = &past
+	repo := &fakeTenantPurgeRepo{dueDeletions: []uuid.UUID{testID(2)}}
 	svc := NewTenantPurgeService(TenantPurgeDeps{
 		Repo:    repo,
 		Tenants: NewTenantService(db.stores(), memTx{db}),
 	})
 
-	require.NoError(t, svc.HandleDeletionJob(context.Background(), nil))
-	assert.Equal(t, TenantStatusDeleted, db.tenants[2].Status)
+	require.NoError(t, svc.HandleDeletionJob(testTenantCtx(), nil))
+	assert.Equal(t, TenantStatusDeleted, db.tenants[testID(2)].Status)
 	require.Len(t, db.audits, 1)
 	assert.Equal(t, "tenant.status_changed", db.audits[0].Action)
 	assert.Equal(t, audit.ActorTypeSystem, db.audits[0].ActorType)
@@ -372,25 +373,25 @@ func TestTenantDeletionJobFinalizesDueTenantsThroughTheService(t *testing.T) {
 func TestTenantPurgeFailureLeavesTheTenantUnmarkedAndRetries(t *testing.T) {
 	svc, repo, _ := newPurgeTestService(t)
 	// Fail the first module purger so the completion marker is never written.
-	providers := svc.registry.Providers()
+	providers := svc.Registry().Providers()
 	providers[0].Purger.(*fakePurger).err = errors.New("storage unavailable")
-	svc.registry = tenancycontracts.NewRegistry()
+	svc.SetRegistry(tenancycontracts.NewRegistry())
 	for _, provider := range providers {
-		svc.registry.Register(provider)
+		svc.Registry().Register(provider)
 	}
 
-	err := svc.HandlePurgeJob(context.Background(), nil)
+	err := svc.HandlePurgeJob(testTenantCtx(), nil)
 	require.Error(t, err)
 	assert.Empty(t, repo.purged, "a failed run must not mark the tenant purged")
 
 	// The next delivery sees no work after a successful retry.
 	providers[0].Purger.(*fakePurger).err = nil
-	svc.registry = tenancycontracts.NewRegistry()
+	svc.SetRegistry(tenancycontracts.NewRegistry())
 	for _, provider := range providers {
-		svc.registry.Register(provider)
+		svc.Registry().Register(provider)
 	}
-	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
-	assert.Equal(t, []int64{7}, repo.purged)
+	require.NoError(t, svc.HandlePurgeJob(testTenantCtx(), nil))
+	assert.Equal(t, []uuid.UUID{testID(7)}, repo.purged)
 }
 
 func TestTenantPurgeNeverTouchesAnotherTenant(t *testing.T) {
@@ -400,30 +401,30 @@ func TestTenantPurgeNeverTouchesAnotherTenant(t *testing.T) {
 	tenancyRegistry := tenancycontracts.NewRegistry()
 	purger := &tenantRecorderPurger{}
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "identity", Purger: purger})
-	repo := &fakeTenantPurgeRepo{tenants: []PurgeTenant{{ID: 42, Slug: "gone"}}, members: []int64{5}}
+	repo := &fakeTenantPurgeRepo{tenants: []PurgeTenant{{ID: testID(42), Slug: "gone"}}, members: []uuid.UUID{testID(5)}}
 	svc := NewTenantPurgeService(TenantPurgeDeps{
-		Repo: repo, Privacy: &PrivacyService{registry: privacyRegistry}, Registry: tenancyRegistry,
+		Repo: repo, Privacy: NewPrivacyServiceWithRegistry(privacyRegistry), Registry: tenancyRegistry,
 	})
 
-	require.NoError(t, svc.HandlePurgeJob(context.Background(), nil))
-	assert.Equal(t, []int64{42}, eraser.tenants)
-	assert.Equal(t, []int64{42}, purger.tenants)
+	require.NoError(t, svc.HandlePurgeJob(testTenantCtx(), nil))
+	assert.Equal(t, []uuid.UUID{testID(42)}, eraser.tenants)
+	assert.Equal(t, []uuid.UUID{testID(42)}, purger.tenants)
 }
 
-type tenantRecorderEraser struct{ tenants []int64 }
+type tenantRecorderEraser struct{ tenants []uuid.UUID }
 
-func (e *tenantRecorderEraser) Export(context.Context, int64, int64) (privacycontracts.Section, error) {
+func (e *tenantRecorderEraser) Export(context.Context, uuid.UUID, uuid.UUID) (privacycontracts.Section, error) {
 	return privacycontracts.Section{}, nil
 }
 
-func (e *tenantRecorderEraser) Erase(ctx context.Context, tenantID, _ int64) error {
-	e.tenants = append(e.tenants, tenant.EffectiveID(ctx))
+func (e *tenantRecorderEraser) Erase(ctx context.Context, tenantID, _ uuid.UUID) error {
+	e.tenants = append(e.tenants, tenant.IDFromContext(ctx))
 	return nil
 }
 
-type tenantRecorderPurger struct{ tenants []int64 }
+type tenantRecorderPurger struct{ tenants []uuid.UUID }
 
-func (p *tenantRecorderPurger) PurgeTenant(ctx context.Context, _ int64) error {
-	p.tenants = append(p.tenants, tenant.EffectiveID(ctx))
+func (p *tenantRecorderPurger) PurgeTenant(ctx context.Context, _ uuid.UUID) error {
+	p.tenants = append(p.tenants, tenant.IDFromContext(ctx))
 	return nil
 }

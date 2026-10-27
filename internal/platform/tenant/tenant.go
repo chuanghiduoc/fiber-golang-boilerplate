@@ -6,8 +6,12 @@ package tenant
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // Header selects the tenant for public auth/registration requests.
@@ -17,27 +21,28 @@ const Header = "X-Tenant-Slug"
 // browser cannot send Header (Google OAuth start, reset/verification links).
 const QueryParam = "tenant"
 
-// DefaultSlug identifies the tenant that preserves pre-multi-tenant behavior.
+// DefaultSlug identifies the seeded default tenant.
 const DefaultSlug = "default"
 
 type contextKey struct{}
 type contextSlugKey struct{}
 
-// DefaultID is the tenant used by pre-multi-tenant rows, background jobs, and
-// tests that do not install tenant middleware. HTTP requests always resolve an
-// explicit tenant; production requires Header so a missing tenant can never
-// silently write to this compatibility tenant.
-const DefaultID int64 = 1
+// DefaultID is the id of the seeded default tenant (slug "default"). It is a
+// real tenant row, not a compatibility fallback: a missing tenant is an error.
+// The same UUIDv7 constant is hard-coded in the init migration's seed.
+var DefaultID = uuid.MustParse("0192c9b0-7e4a-7000-8000-000000000001")
+
+// ErrMissingTenant is returned by Require when a tenant-owned read or write
+// runs without a tenant in its context. HTTP requests resolve one in
+// tenanthttp.Middleware and background work must install the job's tenant
+// explicitly; there is no compatibility fallback.
+var ErrMissingTenant = errors.New("tenant: no tenant in context")
 
 // WithID stores the tenant ID in a context so services and repositories can
-// scope queries without threading a parameter through every signature. A zero
-// ID means "unset": EffectiveID applies the compatibility fallback for row
-// parameters, while the row-level-security resolver
-// (app.RLSResolver/tenant.IDFromContext) fails closed and sees no tenant rows.
-// Negative IDs are preserved so validation boundaries can reject them instead
-// of silently writing to the default tenant; tenant resolution never produces
-// one.
-func WithID(ctx context.Context, id int64) context.Context {
+// scope queries without threading a parameter through every signature. The
+// zero UUID means "unset" and is an error for tenant-owned work (see Require);
+// the row-level-security resolver also fails closed and sees no tenant rows.
+func WithID(ctx context.Context, id uuid.UUID) context.Context {
 	return context.WithValue(ctx, contextKey{}, id)
 }
 
@@ -49,16 +54,16 @@ func WithSlug(ctx context.Context, slug string) context.Context {
 }
 
 // WithIdentity stores both the tenant ID and slug in one context.
-func WithIdentity(ctx context.Context, id int64, slug string) context.Context {
+func WithIdentity(ctx context.Context, id uuid.UUID, slug string) context.Context {
 	return WithSlug(WithID(ctx, id), slug)
 }
 
-// IDFromContext returns the tenant ID stored by WithID, or 0.
-func IDFromContext(ctx context.Context) int64 {
-	if id, ok := ctx.Value(contextKey{}).(int64); ok {
+// IDFromContext returns the tenant ID stored by WithID, or uuid.Nil.
+func IDFromContext(ctx context.Context) uuid.UUID {
+	if id, ok := ctx.Value(contextKey{}).(uuid.UUID); ok {
 		return id
 	}
-	return 0
+	return uuid.Nil
 }
 
 // SlugFromContext returns the tenant slug stored by WithSlug, or "".
@@ -67,24 +72,23 @@ func SlugFromContext(ctx context.Context) string {
 	return slug
 }
 
-// EffectiveID returns the context tenant, falling back to DefaultID only when
-// no tenant was stored. Background jobs, internal callers, and tests rely on
-// that compatibility fallback. HTTP request paths must not rely on it: tenant
-// middleware resolves the tenant and production requires Header
-// (TENANT_REQUIRE_HEADER). A negative stored ID is returned unchanged so
-// validation boundaries reject it rather than silently using tenant 1.
-func EffectiveID(ctx context.Context) int64 {
-	if id := IDFromContext(ctx); id != 0 {
-		return id
+// Require returns the context tenant or ErrMissingTenant. Repositories and
+// services that read or write tenant-owned rows must use it instead of a
+// fallback: a zero tenant would make the row invisible under RLS or violate
+// the tenant_id foreign key, so failing loudly is the only correct behaviour.
+func Require(ctx context.Context) (uuid.UUID, error) {
+	id := IDFromContext(ctx)
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("%w (tenant id %s)", ErrMissingTenant, id)
 	}
-	return DefaultID
+	return id, nil
 }
 
 var slugPattern = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
 
 // Tenant is the minimal tenant identity needed by request handling.
 type Tenant struct {
-	ID   int64
+	ID   uuid.UUID
 	Slug string
 	Name string
 }

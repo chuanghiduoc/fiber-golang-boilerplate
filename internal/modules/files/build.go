@@ -10,6 +10,7 @@ import (
 	fileshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/handler"
 	filesrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/repository"
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage/scan"
@@ -22,7 +23,7 @@ type Provides struct {
 
 // Settings are the upload limits files owns (STORAGE_MAX_FILE_SIZE,
 // STORAGE_ALLOWED_MIME_TYPES, FILES_* quotas and scanner) and the trash
-// retention (FILES_TRASH_RETENTION_DAYS). The storage driver itself is
+// retention (FILES_TRASH_RETENTION). The storage driver itself is
 // platform infrastructure (infra.Storage).
 type Settings struct {
 	MaxFileSize  int64
@@ -47,14 +48,17 @@ type Settings struct {
 // (file.uploaded/deleted/restored, internal/contracts/files) on infra.Events
 // inside the mutation's transaction; subscribers such as webhooks never
 // appear here.
-func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
+// Deps are the contracts files consumes from other modules (none today).
+type Deps struct{}
+
+func Build(infra app.Infra, settings Settings, _ Deps) (*Module, error) {
 	scanner, err := scan.New(scan.Config{
 		Driver:     settings.ScanDriver,
 		ClamAVAddr: settings.ClamAVAddr,
 		Timeout:    settings.ClamAVTimeout,
 	})
 	if err != nil {
-		return nil, Provides{}, err
+		return nil, err
 	}
 	// The none driver is not a real scan, so leave the hook nil: the upload
 	// service then skips the extra storage read.
@@ -65,13 +69,13 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	fileRepo := filesrepo.NewFileRepository(infra.DB)
 	tx := filesrepo.NewTransactor(infra.Tx, infra.Audit, infra.Events)
 
-	uploadSvc := filesvc.NewUploadService(fileRepo, tx, infra.Storage, filesvc.UploadOptions{
+	uploadSvc := filesvc.NewUploadService(fileRepo, tx, infra.Storage, authz.NewAuthorizer(infra.Catalogs.Permissions), filesvc.UploadOptions{
 		TenantQuotaBytes: settings.TenantQuotaBytes,
 		UserQuotaBytes:   settings.UserQuotaBytes,
 		Scanner:          scanner,
 	})
 	uploadHandler := fileshandler.NewUploadHandler(uploadSvc, settings.MaxFileSize, settings.AllowedTypes)
-	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, tx, infra.Storage)
+	filesAdminSvc := filesvc.NewAdminFileService(fileRepo, tx, infra.Storage, authz.NewAuthorizer(infra.Catalogs.Permissions))
 
 	m := New(uploadHandler)
 	privacyRepo := filesrepo.NewPrivacyRepository(infra.DB)
@@ -82,7 +86,8 @@ func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
 	}
 	m.orphanSweeper = filesvc.NewOrphanSweeper(fileRepo, infra.Storage)
 	m.tenantPurger = filesrepo.NewTenantPurger(infra.DB, infra.Storage)
-	return m, Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}, nil
+	m.provides = Provides{Admin: filesadapter.NewAdminFiles(filesAdminSvc)}
+	return m, nil
 }
 
 // RegisterJobs implements app.JobProvider: the worker runs the trash purge and

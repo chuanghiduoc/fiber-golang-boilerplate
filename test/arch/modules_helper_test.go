@@ -1,195 +1,111 @@
 package arch_test
 
 import (
-	"reflect"
-	"runtime"
-	"strings"
+	"context"
+	"encoding/base64"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"testing"
+	"time"
 
-	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/bootstrap"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 )
 
 const archTestSecret = "arch-route-coverage-secret-0123456789"
 
-// testIdempotency is a named marker so the coverage tests can find the
-// idempotency position in a handler chain.
-func testIdempotency(c fiber.Ctx) error { return c.Next() }
+var (
+	archDataKey    = archKey(1)
+	archWebhookKey = archKey(2)
+)
 
-func passthrough(c fiber.Ctx) error { return c.Next() }
-
-// finalHandler stands in for a route's endpoint in synthetic route tests.
-func finalHandler(fiber.Ctx) error { return nil }
-
-func handlerName(handler fiber.Handler) string {
-	if handler == nil {
-		return ""
-	}
-	fn := runtime.FuncForPC(reflect.ValueOf(handler).Pointer())
-	if fn == nil {
-		return ""
-	}
-	return fn.Name()
-}
+// modulePath is the Go module path used by the import-boundary checks.
+const modulePath = "github.com/chuanghiduoc/fiber-golang-boilerplate"
 
 // productionBootstrap builds the same ordered module set cmd/api uses
 // (internal/bootstrap). Tests that inspect composition-root wiring (the
-// tenancy registry) use this directly; productionModules keeps the route-test
-// signature.
-func productionBootstrap(t *testing.T) *bootstrap.Modules {
+// tenancy registry) use this directly.
+func productionBootstrap(t *testing.T) (*bootstrap.Modules, app.Catalogs) {
 	t.Helper()
-	cfg := &config.Config{
-		JWT: config.JWTConfig{Secret: archTestSecret, ExpireHour: 1, RefreshExpireDays: 1},
-	}
-	modules, err := bootstrap.Build(cfg, app.Infra{Platform: app.NewPlatformConfig(cfg)})
+	catalogs := app.NewCatalogs()
+	modules, err := bootstrap.Build(archConfig(), app.Infra{
+		Platform: app.NewPlatformConfig(archConfig()),
+		Email:    jobs.NewQueuedSender(jobs.NewQueue(nil), nil),
+		Catalogs: catalogs,
+	})
 	if err != nil {
 		t.Fatalf("bootstrap.Build: %v", err)
 	}
-	if err := app.RegisterCatalogs(modules.List...); err != nil {
+	if err := catalogs.Register(modules.List...); err != nil {
 		t.Fatalf("RegisterCatalogs: %v", err)
 	}
-	return modules
+	return modules, catalogs
 }
 
 // productionModules builds every module from the same ordered list cmd/api
 // uses (internal/bootstrap). Construction performs no I/O, so nil
-// infrastructure is enough to mount and inspect the route tables. A module
-// added to bootstrap is covered by every route test automatically.
+// infrastructure is enough to mount and inspect the operation tables.
 func productionModules(t *testing.T) ([]app.Module, app.Deps) {
 	t.Helper()
-	modules := productionBootstrap(t)
-	cfg := &config.Config{
-		JWT: config.JWTConfig{Secret: archTestSecret, ExpireHour: 1, RefreshExpireDays: 1},
-	}
-	deps := app.Deps{
-		Config: cfg,
-		Limiters: app.Limiters{
-			Strict:  passthrough,
-			Normal:  passthrough,
-			Relaxed: passthrough,
-		},
-		Idempotency: testIdempotency,
-		Audit:       audit.Noop{},
-	}
-	return modules.List, deps
+	modules, catalogs := productionBootstrap(t)
+	return modules.List, archDeps(catalogs)
 }
 
-// mountedRoute is one route as registered by one module.
-type mountedRoute struct {
-	module string
-	route  fiber.Route
-}
-
-// apiPrefixes are the versioned groups app.Register mounts modules under.
-var apiPrefixes = []string{"/api/v1", "/api/v2"}
-
-// underAPIPrefix reports whether path is below a versioned API group.
-func underAPIPrefix(path string) bool {
-	for _, prefix := range apiPrefixes {
-		if strings.HasPrefix(path, prefix+"/") {
-			return true
-		}
+func archConfig() *config.Config {
+	return &config.Config{
+		App:            config.AppConfig{Env: "test", BodyLimit: 1 << 20, RequestTimeout: 12 * time.Second},
+		CORS:           config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit:      config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+		JWT:            config.JWTConfig{Secret: archTestSecret, AccessTTL: 15 * time.Minute, RefreshTTL: time.Hour},
+		DataEncryption: config.DataEncryptionConfig{Key: archDataKey},
+		Webhook:        config.WebhookConfig{SecretEncryptionKey: archWebhookKey},
+		Tenant:         config.TenantConfig{DefaultSlug: "default"},
 	}
-	return false
 }
 
-// moduleRoutes mounts each module on its own Fiber app under /api/v1 (and,
-// for app.V2Module implementations, /api/v2, exactly like app.Register) so
-// every route (and every middleware-bearing group prefix) is attributed to
-// the module that registered it.
-func moduleRoutes(t *testing.T) (endpoints, groupMiddleware []mountedRoute) {
+func archDeps(catalogs app.Catalogs) app.Deps {
+	cfg := archConfig()
+	return app.Deps{
+		Config:   app.ModuleSettings{JWT: cfg.JWT, MFA: cfg.MFA, CORS: cfg.CORS, Tenant: cfg.Tenant},
+		Audit:    audit.Noop{},
+		Sessions: archSessions{},
+		Catalogs: catalogs,
+	}
+}
+
+// archOperations returns the operations of the REAL module set built from
+// internal/bootstrap. There is no stub fixture: every rule is enforced against
+// the same operations the server mounts.
+func archOperations(t *testing.T) []httpapi.OperationInfo {
 	t.Helper()
 	modules, deps := productionModules(t)
-	for _, m := range modules {
-		fiberApp := fiber.New()
-		m.RegisterRoutes(fiberApp.Group("/api/v1"), deps)
-		if v2, ok := m.(app.V2Module); ok {
-			v2.RegisterV2Routes(fiberApp.Group("/api/v2"), deps)
-		}
+	application := app.New(archConfig(), deps)
+	application.Register(modules...)
+	return application.HTTP().Operations()
+}
 
-		// GetRoutes(false) additionally lists Use() registrations, which is
-		// how Fiber mounts group middleware (Group(prefix, handlers...)).
-		// Subtracting the endpoint multiset leaves exactly those entries.
-		endpointCount := map[string]int{}
-		for _, route := range fiberApp.GetRoutes(true) {
-			endpointCount[routeKey(route)]++
-			endpoints = append(endpoints, mountedRoute{module: m.Name(), route: route})
-		}
-		seenUse := map[string]bool{}
-		for _, route := range fiberApp.GetRoutes(false) {
-			key := routeKey(route)
-			if endpointCount[key] > 0 {
-				endpointCount[key]--
-				continue
-			}
-			if seenUse[route.Path] {
-				continue
-			}
-			seenUse[route.Path] = true
-			groupMiddleware = append(groupMiddleware, mountedRoute{module: m.Name(), route: route})
-		}
+// archSessions is a permissive session store: arch tests inspect route
+// registration, not session validation, but JWT authentication always needs
+// a wired store.
+type archSessions struct{}
+
+func (archSessions) Validate(context.Context, session.Claims) (session.State, error) {
+	return session.State{Active: true, TenantActive: true}, nil
+}
+
+func (archSessions) Invalidate(context.Context, uuid.UUID) error { return nil }
+func (archSessions) InvalidatePermissions(context.Context) error { return nil }
+
+// archKey builds base64 key material at runtime; tests commit no key values.
+func archKey(seed byte) string {
+	buf := make([]byte, 32)
+	for i := range buf {
+		buf[i] = seed
 	}
-	return endpoints, groupMiddleware
-}
-
-// routeKey identifies a registration by method, path, and handler chain.
-func routeKey(route fiber.Route) string {
-	key := route.Method + " " + route.Path
-	for _, handler := range route.Handlers {
-		key += " " + handlerName(handler)
-	}
-	return key
-}
-
-// modulePath is the Go module path; handler names are matched by full import
-// path so a local package that happens to be named authz or audit cannot
-// satisfy a check.
-const modulePath = "github.com/chuanghiduoc/fiber-golang-boilerplate"
-
-// isPlatformFunc reports whether a runtime function name is fn (or one of its
-// closures) in pkg, e.g. isPlatformFunc(name, "internal/platform/authz/authzhttp",
-// "Require") matches ".../internal/platform/authz/authzhttp.Require.func1".
-func isPlatformFunc(name, pkg, fn string) bool {
-	full := modulePath + "/" + pkg + "." + fn
-	return name == full || strings.HasPrefix(name, full+".")
-}
-
-// handlerChainHas reports whether any handler in the chain is fn in pkg.
-func handlerChainHas(route fiber.Route, pkg string, fns ...string) bool {
-	return handlerIndex(route, pkg, fns...) >= 0
-}
-
-// handlerBeforeFinal reports whether fn in pkg appears in the chain before
-// the route's last handler (index < len(Handlers)-1). Fiber runs the chain in
-// order and the last handler is the endpoint, so middleware after it never
-// guards it.
-func handlerBeforeFinal(route fiber.Route, pkg string, fns ...string) bool {
-	for i := 0; i < len(route.Handlers)-1; i++ {
-		name := handlerName(route.Handlers[i])
-		for _, fn := range fns {
-			if isPlatformFunc(name, pkg, fn) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// handlerIndex returns the position of the last handler that is fn in pkg,
-// or -1.
-func handlerIndex(route fiber.Route, pkg string, fns ...string) int {
-	index := -1
-	for i, handler := range route.Handlers {
-		name := handlerName(handler)
-		for _, fn := range fns {
-			if isPlatformFunc(name, pkg, fn) {
-				index = i
-			}
-		}
-	}
-	return index
+	return base64.StdEncoding.EncodeToString(buf)
 }

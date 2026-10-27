@@ -34,6 +34,7 @@ patches:
         value: fiber-boilerplate-production
   - path: hpa-patch.yaml
   - path: deployment-patch.yaml
+  - path: worker-patch.yaml
   - target:
       kind: Ingress
       name: fiber-boilerplate

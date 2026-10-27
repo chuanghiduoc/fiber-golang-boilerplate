@@ -3,12 +3,13 @@ package repository
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // Transactor implements service.Transactor: InTx binds the key repository, the
@@ -45,7 +46,7 @@ func (t *Transactor) InTx(ctx context.Context, fn func(ctx context.Context, tx a
 // principalLocker is the transactional side of the identity principal reader
 // (identity's adapter implements it).
 type principalLocker interface {
-	LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (identitycontracts.Principal, error)
+	LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID uuid.UUID) (identitycontracts.Principal, error)
 }
 
 // txPrincipals exposes the owner lock without leaking pgx.Tx to the service.
@@ -54,7 +55,7 @@ type txPrincipals struct {
 	tx     pgx.Tx
 }
 
-func (p txPrincipals) LockPrincipal(ctx context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
+func (p txPrincipals) LockPrincipal(ctx context.Context, tenantID, userID uuid.UUID) (identitycontracts.Principal, error) {
 	return p.locker.LockPrincipalTx(ctx, p.tx, tenantID, userID)
 }
 

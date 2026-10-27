@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 // Section is one module's contribution to a data export. Name is the module
@@ -23,13 +25,13 @@ type Section struct {
 // must scope every lookup to (tenantID, userID) and never return credentials,
 // hashes, or another tenant's rows.
 type Exporter interface {
-	Export(ctx context.Context, tenantID, userID int64) (Section, error)
+	Export(ctx context.Context, tenantID, userID uuid.UUID) (Section, error)
 }
 
 // Eraser deletes or anonymizes the module's data for one user in one tenant.
 // It is idempotent: a repeated call after a successful one succeeds.
 type Eraser interface {
-	Erase(ctx context.Context, tenantID, userID int64) error
+	Erase(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
 // Provider is one module's privacy implementation. Both interfaces are

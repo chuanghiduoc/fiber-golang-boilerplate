@@ -11,6 +11,7 @@ import (
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
 // PrincipalReader adapts identity memberships to
@@ -28,7 +29,7 @@ func NewPrincipalReader(memberships identityservice.MembershipRepository) *Princ
 	return &PrincipalReader{memberships: memberships}
 }
 
-func (r *PrincipalReader) GetPrincipal(ctx context.Context, tenantID, userID int64) (identitycontracts.Principal, error) {
+func (r *PrincipalReader) GetPrincipal(ctx context.Context, tenantID, userID uuid.UUID) (identitycontracts.Principal, error) {
 	principal, err := r.memberships.GetPrincipal(tenant.WithID(ctx, tenantID), userID)
 	return toPrincipal(principal, err)
 }
@@ -40,7 +41,7 @@ func (r *PrincipalReader) GetPrincipal(ctx context.Context, tenantID, userID int
 // membership is not active. The method takes a pgx.Tx, so it cannot be part
 // of the stdlib-only contracts package; the apikeys service discovers it by
 // type assertion.
-func (r *PrincipalReader) LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (identitycontracts.Principal, error) {
+func (r *PrincipalReader) LockPrincipalTx(ctx context.Context, tx pgx.Tx, tenantID, userID uuid.UUID) (identitycontracts.Principal, error) {
 	principal, err := identityrepository.NewMembershipRepository(tx).LockPrincipal(tenant.WithID(ctx, tenantID), userID)
 	return toPrincipal(principal, err)
 }

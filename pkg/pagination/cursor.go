@@ -3,11 +3,10 @@ package pagination
 import (
 	"encoding/base64"
 	"fmt"
-	"math"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -25,7 +24,7 @@ const (
 type DBCursor struct {
 	HasCursor bool
 	CreatedAt time.Time
-	ID        int64
+	ID        uuid.UUID
 	Limit     int32
 }
 
@@ -33,7 +32,7 @@ type DBCursor struct {
 // @cursor_id)` instead of `NOT @has_cursor OR ...`: under a generic plan the
 // OR form can only filter, so deep pages scanned every newer row, while the
 // plain row comparison is an index condition. The first page therefore binds
-// an upper bound above every row: ('infinity', MaxInt64).
+// an upper bound above every row: ('infinity', MaxUUID).
 
 // CreatedAtParam returns the cursor timestamp, or +infinity on the first page.
 func (c DBCursor) CreatedAtParam() pgtype.Timestamptz {
@@ -43,10 +42,14 @@ func (c DBCursor) CreatedAtParam() pgtype.Timestamptz {
 	return pgtype.Timestamptz{Time: c.CreatedAt, Valid: true}
 }
 
-// IDParam returns the cursor id, or math.MaxInt64 on the first page.
-func (c DBCursor) IDParam() int64 {
+// MaxUUID sorts after every UUID, so a first page binds an upper bound the
+// row comparison can always use as an index condition.
+var MaxUUID = uuid.MustParse("ffffffff-ffff-ffff-ffff-ffffffffffff")
+
+// IDParam returns the cursor id, or MaxUUID on the first page.
+func (c DBCursor) IDParam() uuid.UUID {
 	if !c.HasCursor {
-		return math.MaxInt64
+		return MaxUUID
 	}
 	return c.ID
 }
@@ -71,15 +74,15 @@ func RowLimit(n int) int32 {
 // EncodeCursor produces an opaque, URL-safe cursor from the sort key
 // (created_at) and its monotonic tie-breaker (id). Two rows with the same
 // created_at still yield distinct cursors because id is unique.
-func EncodeCursor(createdAt time.Time, id int64) string {
-	raw := createdAt.UTC().Format(time.RFC3339Nano) + ":" + strconv.FormatInt(id, 10)
+func EncodeCursor(createdAt time.Time, id uuid.UUID) string {
+	raw := createdAt.UTC().Format(time.RFC3339Nano) + ":" + id.String()
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
 // NextCursor returns the opaque startingAfter cursor for the page following
 // items, built from the last item's sort key and id, or "" for an empty page.
 // key extracts (created_at, id), or the list's equivalent sort timestamp.
-func NextCursor[T any](items []T, key func(T) (time.Time, int64)) string {
+func NextCursor[T any](items []T, key func(T) (time.Time, uuid.UUID)) string {
 	if len(items) == 0 {
 		return ""
 	}
@@ -89,27 +92,27 @@ func NextCursor[T any](items []T, key func(T) (time.Time, int64)) string {
 
 // DecodeCursor reverses EncodeCursor. The timestamp itself contains colons, so
 // the id is taken from after the final colon.
-func DecodeCursor(cursor string) (time.Time, int64, error) {
+func DecodeCursor(cursor string) (time.Time, uuid.UUID, error) {
 	// Bound attacker-controlled input before allocating the decoded buffer.
 	if cursor == "" || len(cursor) > 512 {
-		return time.Time{}, 0, fmt.Errorf("invalid cursor length")
+		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor length")
 	}
 	b, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("invalid cursor encoding")
+		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor encoding")
 	}
 	raw := string(b)
 	i := strings.LastIndex(raw, ":")
 	if i < 0 {
-		return time.Time{}, 0, fmt.Errorf("malformed cursor")
+		return time.Time{}, uuid.Nil, fmt.Errorf("malformed cursor")
 	}
 	ts, err := time.Parse(time.RFC3339Nano, raw[:i])
 	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("invalid cursor timestamp")
+		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor timestamp")
 	}
-	id, err := strconv.ParseInt(raw[i+1:], 10, 64)
+	id, err := uuid.Parse(raw[i+1:])
 	if err != nil {
-		return time.Time{}, 0, fmt.Errorf("invalid cursor id")
+		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor id")
 	}
 	return ts, id, nil
 }

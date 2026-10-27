@@ -21,12 +21,9 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	fixturePool, ownerPool, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
-	if err != nil {
-		t.Fatalf("setup test db: %v", err)
-	}
-	t.Cleanup(cleanup)
-	appPool := pgtest.AppPool(fixturePool)
+	fx := pgtest.New(t)
+	ownerPool := fx.Owner
+	appPool := fx.App
 
 	var schema string
 	if err := ownerPool.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
@@ -37,7 +34,7 @@ func TestCheckRLSRoleIntegration(t *testing.T) {
 		t.Fatalf("the app role must be accepted: %v", err)
 	}
 
-	pools := pgtest.Pools(fixturePool)
+	pools := fx.Pools
 	if err := checkBypassRLSRole(ctx, pools.Bypass, pools.Primary, schema, "production"); err != nil {
 		t.Fatalf("the bypass role must be accepted: %v", err)
 	}

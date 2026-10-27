@@ -8,10 +8,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -45,10 +46,7 @@ UPDATE audit_events
 SET outcome = $2,
     status_code = $3,
     error_code = $4,
-    completed_at = $5,
-    actor_id = COALESCE($6, actor_id),
-    actor_type = COALESCE(NULLIF($7, ''), actor_type),
-    actor_role = COALESCE(NULLIF($8, ''), actor_role)
+    completed_at = $5
 WHERE id = $1
   AND source = 'http'
   AND outcome = 'started'`
@@ -72,9 +70,9 @@ func NewPostgresRecorder(db database.DBTX) *PostgresRecorder {
 }
 
 type eventValues struct {
-	tenantID   int64
-	parentID   *int64
-	actorID    *int64
+	tenantID   uuid.UUID
+	parentID   *uuid.UUID
+	actorID    *uuid.UUID
 	actorType  string
 	actorRole  *string
 	metadata   []byte
@@ -86,7 +84,7 @@ type eventValues struct {
 	outcome    string
 	statusCode *int16
 	errorCode  *string
-	idemHash   *string
+	idemHash   *[]byte
 	completed  *time.Time
 	createdAt  time.Time
 }
@@ -103,17 +101,18 @@ func (r *PostgresRecorder) values(ctx context.Context, event Event) (eventValues
 	}
 
 	tenantID := event.TenantID
-	if tenantID == 0 {
-		tenantID = tenant.EffectiveID(ctx)
-	}
-	if tenantID <= 0 {
-		tenantID = tenant.DefaultID
+	if tenantID == uuid.Nil {
+		required, err := tenant.Require(ctx)
+		if err != nil {
+			return eventValues{}, fmt.Errorf("audit: event has no tenant: %w", err)
+		}
+		tenantID = required
 	}
 
 	return eventValues{
 		tenantID:   tenantID,
-		parentID:   nullableInt64(event.ParentID),
-		actorID:    nullableInt64(event.ActorID),
+		parentID:   nullableUUID(event.ParentID),
+		actorID:    nullableUUID(event.ActorID),
 		actorType:  pgText(event.EffectiveActorType()),
 		actorRole:  nullableString(event.ActorRole),
 		metadata:   metadata,
@@ -125,7 +124,7 @@ func (r *PostgresRecorder) values(ctx context.Context, event Event) (eventValues
 		outcome:    event.EffectiveOutcome(),
 		statusCode: nullableStatusCode(event.StatusCode),
 		errorCode:  nullableString(event.ErrorCode),
-		idemHash:   nullableString(event.IdempotencyKeyHash),
+		idemHash:   nullableBytes(event.IdempotencyKeyHash),
 		completed:  nullableTime(event.CompletedAt),
 		createdAt:  createdAt,
 	}, nil
@@ -174,19 +173,19 @@ func (r *PostgresRecorder) RecordTx(ctx context.Context, tx pgx.Tx, event Event)
 
 // RecordID inserts a pre-write intent row (source=http, outcome=started) and
 // returns its ID. It is used by [Guard] before a Tier 2 handler runs.
-func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (int64, error) {
+func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (uuid.UUID, error) {
 	if err := event.validateIntent(); err != nil {
-		return 0, err
+		return uuid.Nil, err
 	}
 	event.Outcome = OutcomeStarted
 	values, err := r.values(ctx, event)
 	if err != nil {
-		return 0, err
+		return uuid.Nil, err
 	}
-	var id int64
+	var id uuid.UUID
 	if err := r.db.QueryRow(ctx, insertEventSQL+`
  RETURNING id`, insertArgs(event, values)...).Scan(&id); err != nil {
-		return 0, fmt.Errorf("audit: insert intent event: %w", err)
+		return uuid.Nil, fmt.Errorf("audit: insert intent event: %w", err)
 	}
 	return id, nil
 }
@@ -194,8 +193,8 @@ func (r *PostgresRecorder) RecordID(ctx context.Context, event Event) (int64, er
 // Complete transitions a started HTTP intent row to a terminal outcome. Rows
 // that are already completed, were not started, or are not HTTP events return
 // [ErrAlreadyCompleted]; completions are immutable and happen at most once.
-func (r *PostgresRecorder) Complete(ctx context.Context, id int64, completion Completion) error {
-	if id <= 0 {
+func (r *PostgresRecorder) Complete(ctx context.Context, id uuid.UUID, completion Completion) error {
+	if id == uuid.Nil {
 		return fmt.Errorf("%w: invalid event id", ErrInvalidEvent)
 	}
 	if err := completion.Validate(); err != nil {
@@ -214,9 +213,6 @@ func (r *PostgresRecorder) Complete(ctx context.Context, id int64, completion Co
 		nullableStatusCode(completion.StatusCode),
 		nullableString(completion.ErrorCode),
 		completedAt,
-		nullableInt64(completion.ActorID),
-		pgText(completion.ActorType),
-		pgText(completion.ActorRole),
 	)
 	if err != nil {
 		return fmt.Errorf("audit: complete event: %w", err)
@@ -251,8 +247,16 @@ func insertArgs(event Event, values eventValues) []any {
 	}
 }
 
-func nullableInt64(value int64) *int64 {
-	if value == 0 {
+func nullableUUID(value uuid.UUID) *uuid.UUID {
+	if value == uuid.Nil {
+		return nil
+	}
+	return &value
+}
+
+// nullableBytes stores an empty digest as NULL.
+func nullableBytes(value []byte) *[]byte {
+	if len(value) == 0 {
 		return nil
 	}
 	return &value

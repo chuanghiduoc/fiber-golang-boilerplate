@@ -18,9 +18,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 var errStubCache = errors.New("stub cache failure")
@@ -329,7 +332,7 @@ func TestIdempotency_SlowHandlerSingleExecution(t *testing.T) {
 		key         = "slow-key"
 		concurrency = 5
 	)
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/slow", 0, "", "0.0.0.0", key))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/slow", uuid.Nil, "", "0.0.0.0", key))
 
 	var calls atomic.Int32
 	started := make(chan struct{})
@@ -553,7 +556,7 @@ func TestIdempotency_ClaimAppliedButReplyLostRunsOnce(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("handler calls = %d, want 1", got)
 	}
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "lost-reply"))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", uuid.Nil, "", "0.0.0.0", "lost-reply"))
 	if held, _ := mem.Exists(context.Background(), lockKey); held {
 		t.Fatal("lock survived after the owning request finished")
 	}
@@ -563,7 +566,7 @@ func TestIdempotency_ClaimAppliedButReplyLostRunsOnce(t *testing.T) {
 func TestIdempotency_ClaimReplyLostWhileHeldConflicts(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "held-key"))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", uuid.Nil, "", "0.0.0.0", "held-key"))
 	if err := mem.Set(context.Background(), lockKey, []byte("other-owner"), 30*time.Second); err != nil {
 		t.Fatalf("prime lock: %v", err)
 	}
@@ -588,7 +591,7 @@ func TestIdempotency_ConcurrentClaimConflict(t *testing.T) {
 	mem := cache.NewMemoryCache()
 	t.Cleanup(func() { _ = mem.Close() })
 
-	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", 0, "", "0.0.0.0", "busy-key"))
+	lockKey := idempotencyLockKey(idempotencyScope(http.MethodPost, "/test", uuid.Nil, "", "0.0.0.0", "busy-key"))
 	if err := mem.Set(context.Background(), lockKey, []byte("other-owner"), 30*time.Second); err != nil {
 		t.Fatalf("prime lock: %v", err)
 	}
@@ -735,7 +738,7 @@ func TestIdempotency_ScopesByUserPathAndMethod(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			fiber.Locals[int64](c, "user_id", id)
+			c.SetContext(requestctx.WithActorID(c.Context(), testID(int(id))))
 		}
 		return c.Next()
 	}
@@ -810,11 +813,11 @@ func TestIdempotency_ScopesByTenant(t *testing.T) {
 		// Idempotency-Key must not collide across tenants.
 		switch c.Get("X-Test-Tenant") {
 		case "acme":
-			fiber.Locals[int64](c, "tenant_id", int64(2))
-			fiber.Locals[string](c, "tenant_slug", "acme")
+			c.SetContext(tenant.WithID(c.Context(), testID(2)))
+			c.SetContext(tenant.WithSlug(c.Context(), "acme"))
 		default:
-			fiber.Locals[int64](c, "tenant_id", int64(1))
-			fiber.Locals[string](c, "tenant_slug", "default")
+			c.SetContext(tenant.WithID(c.Context(), testID(1)))
+			c.SetContext(tenant.WithSlug(c.Context(), "default"))
 		}
 		return c.Next()
 	}
@@ -972,7 +975,7 @@ func TestIdempotency_KeysDoNotContainBodyOrPassword(t *testing.T) {
 				t.Errorf("cache key %q contains request data %q", key, secret)
 			}
 		}
-		if !strings.HasPrefix(key, "idempotency:POST:/test:tenant=0::0.0.0.0:") {
+		if !strings.HasPrefix(key, "idempotency:POST:/test:tenant="+uuid.Nil.String()+"::0.0.0.0:") {
 			t.Errorf("cache key %q is not scoped by method, path, tenant, and identity", key)
 		}
 	}

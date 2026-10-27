@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,8 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
@@ -38,15 +41,15 @@ type apiKeyHarness struct {
 	app    *fiber.App
 	pool   *pgxpool.Pool
 	svc    apikeyservice.Service
-	tenant int64
-	other  int64
-	user   int64
-	userB  int64
+	tenant uuid.UUID
+	other  uuid.UUID
+	user   uuid.UUID
+	userB  uuid.UUID
 }
 
 // systemTenantCtx is a trusted system-caller context for tenantID; these
 // tests drive the API-key service directly, without an HTTP subject.
-func systemTenantCtx(tenantID int64) context.Context {
+func systemTenantCtx(tenantID uuid.UUID) context.Context {
 	return authz.SystemContext(tenant.WithID(context.Background(), tenantID))
 }
 
@@ -54,28 +57,27 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 	t.Helper()
 	ctx := context.Background()
 
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	tenantB := testutil.CreateTenant(t, ctx, pool, "apikey-acme")
 
-	insertUser := func(tenantID int64, email string) int64 {
+	insertUser := func(tenantID uuid.UUID, email string) uuid.UUID {
 		t.Helper()
 		return testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	userA := insertUser(tenant.DefaultID, "apikey-a@test.com")
 	userB := insertUser(tenantB, "apikey-b@test.com")
 
-	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	stores := identityrepo.NewStores(fx.Scoped())
 	// Production wires every repository to the Scoped handle, so the verifier's
 	// hash lookup and last-used update run under RLS exactly as in the API.
-	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(testutil.Scoped(pool))
+	apiKeyRepo := apikeyrepo.NewAPIKeyRepository(fx.Scoped())
 	principalReader := identityadapter.NewPrincipalReader(stores.Memberships)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(apiKeyRepo), principalReader)
-	txManager := testutil.NewTxManager(pool)
+	txManager := fx.Tx()
 	ranks := identityadapter.NewMemberRank(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil))
-	svc := apikeyservice.NewService(apiKeyRepo, principalReader, ranks, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principalReader), 8760*time.Hour)
+	svc := apikeyservice.NewService(apiKeyRepo, principalReader, ranks, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principalReader), authz.NewAuthorizer(integrationCatalogs().Permissions), 8760*time.Hour)
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(
@@ -83,15 +85,16 @@ func setupAPIKeyHarness(t *testing.T) *apiKeyHarness {
 		tenant.DefaultSlug,
 	))
 	protected := api.Group("/protected", apikeyhttp.Authenticate(
-		middleware.JWTAuth(apiKeyIntegrationSecret),
+		middleware.JWTAuth(apiKeyIntegrationSecret, apiKeyTestSessions{}),
 		verifier,
+		integrationCatalogs().Permissions,
 	))
 	protected.Get("/", func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"userID":     fiber.Locals[int64](c, "user_id"),
-			"tenantID":   fiber.Locals[int64](c, "tenant_id"),
-			"apiKeyID":   fiber.Locals[int64](c, apikey.LocalAPIKeyID),
-			"authMethod": fiber.Locals[string](c, apikey.LocalAuthMethod),
+			"userID":     requestctx.ActorID(c.Context()),
+			"tenantID":   tenant.IDFromContext(c.Context()),
+			"apiKeyID":   apikey.APIKeyIDFromContext(c.Context()),
+			"authMethod": apikey.AuthMethodFromContext(c.Context()),
 		})
 	})
 
@@ -134,10 +137,10 @@ func TestIntegration_APIKeyAuthenticationLifecycle(t *testing.T) {
 	resp, body := h.request(t, created.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 	var payload struct {
-		UserID     int64  `json:"userID"`
-		TenantID   int64  `json:"tenantID"`
-		APIKeyID   int64  `json:"apiKeyID"`
-		AuthMethod string `json:"authMethod"`
+		UserID     uuid.UUID `json:"userID"`
+		TenantID   uuid.UUID `json:"tenantID"`
+		APIKeyID   uuid.UUID `json:"apiKeyID"`
+		AuthMethod string    `json:"authMethod"`
 	}
 	require.NoError(t, json.Unmarshal(body, &payload))
 	assert.Equal(t, h.user, payload.UserID)
@@ -190,7 +193,7 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 	resp, body := h.request(t, keyB.Secret, "")
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", body)
 	var payload struct {
-		TenantID int64 `json:"tenantID"`
+		TenantID uuid.UUID `json:"tenantID"`
 	}
 	require.NoError(t, json.Unmarshal(body, &payload))
 	assert.Equal(t, h.other, payload.TenantID)
@@ -209,7 +212,7 @@ func TestIntegration_APIKeyTenantBinding(t *testing.T) {
 
 // memberSubjectCtx is a request context for a member of tenantID with the given
 // role and permissions, as the authenticate middleware would build it.
-func memberSubjectCtx(tenantID, userID int64, role string, permissions ...authz.Permission) context.Context {
+func memberSubjectCtx(tenantID, userID uuid.UUID, role string, permissions ...authz.Permission) context.Context {
 	return authz.WithSubject(
 		tenant.WithID(context.Background(), tenantID),
 		authz.NewSubjectWithPermissions(userID, tenantID, role, permissions...),
@@ -220,7 +223,7 @@ func requireAPIKeyStatus(t *testing.T, err error, status int) {
 	t.Helper()
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
-	require.Equal(t, status, appErr.Status, "error: %v", err)
+	require.Equal(t, status, resolvedStatus(appErr), "error: %v", err)
 }
 
 // TestIntegration_APIKeyManagementRespectsMemberRank proves the apikeys to
@@ -262,3 +265,14 @@ func TestIntegration_APIKeyManagementRespectsMemberRank(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, updated.Scopes, 2)
 }
+
+// apiKeyTestSessions is a permissive session store: this harness authenticates
+// with API keys, so the JWT branch only needs a wired store.
+type apiKeyTestSessions struct{}
+
+func (apiKeyTestSessions) Validate(context.Context, session.Claims) (session.State, error) {
+	return session.State{Active: true, TenantActive: true}, nil
+}
+
+func (apiKeyTestSessions) Invalidate(context.Context, uuid.UUID) error { return nil }
+func (apiKeyTestSessions) InvalidatePermissions(context.Context) error { return nil }

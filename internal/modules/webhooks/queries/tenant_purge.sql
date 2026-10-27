@@ -7,16 +7,16 @@
 DELETE FROM webhook_deliveries
 WHERE id IN (
     SELECT id FROM webhook_deliveries
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );
 
 -- name: DeleteTenantWebhookEventsBatch :execrows
 DELETE FROM webhook_events
-WHERE tenant_id = @tenant_id::bigint
+WHERE tenant_id = @tenant_id::uuid
   AND event_id IN (
       SELECT event_id FROM webhook_events
-      WHERE tenant_id = @tenant_id::bigint
+      WHERE tenant_id = @tenant_id::uuid
       LIMIT @batch_size::int
   );
 
@@ -24,7 +24,7 @@ WHERE tenant_id = @tenant_id::bigint
 DELETE FROM webhook_endpoints
 WHERE id IN (
     SELECT id FROM webhook_endpoints
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );
 
@@ -32,7 +32,7 @@ WHERE id IN (
 DELETE FROM webhook_inbound_events
 WHERE id IN (
     SELECT id FROM webhook_inbound_events
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );
 
@@ -40,6 +40,6 @@ WHERE id IN (
 DELETE FROM webhook_inbound_sources
 WHERE id IN (
     SELECT id FROM webhook_inbound_sources
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );

@@ -24,8 +24,9 @@ func TestValidatePassword(t *testing.T) {
 		{"11 runes", "abcdefghijk", true},
 		{"exactly 64 runes", "abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789", false}, // ggignore: test fixture, not a credential
 		{"65 runes", "abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789!", true},         // ggignore: test fixture, not a credential
-		{"72 bytes accepted", twoBytePassword(36), false},
-		{"73 bytes rejected", twoBytePassword(37), true},
+		{"multibyte outside the old byte ceiling accepted", twoBytePassword(37), false},
+		{"64 multibyte runes accepted", twoBytePassword(64), false},
+		{"65 multibyte runes rejected", twoBytePassword(65), true},
 		{"common password", "unbelievable", true},
 		{"common password case-insensitive", "UNBELIEVABLE", true},
 		{"trivially short", "Ab1!", true},

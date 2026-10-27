@@ -7,7 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -47,7 +48,7 @@ var dummyInboundKey = func() []byte {
 // type, then store the event once per (source, webhook-id). An unknown,
 // disabled, or deleted source returns the same 401 as a bad signature, so the
 // endpoint does not reveal which sequential ids exist.
-func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers http.Header, body []byte) (*InboundReceipt, error) {
+func (s *service) ReceiveInbound(ctx context.Context, sourceID uuid.UUID, headers http.Header, body []byte) (*InboundReceipt, error) {
 	if err := validateInboundBody(body); err != nil {
 		return nil, err
 	}
@@ -65,7 +66,10 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 		}
 		return nil, err
 	}
-	if err := s.verifyInboundSignature(source, headers, body); err != nil {
+	// The source owns the tenant. Install it before reading the source's
+	// versioned secret rows so every lookup stays tenant-scoped.
+	ctx = tenant.WithID(ctx, source.TenantID)
+	if err := s.verifyInboundSignature(ctx, source, headers, body); err != nil {
 		return nil, err
 	}
 	eventType, err := inboundEventType(body)
@@ -73,17 +77,18 @@ func (s *service) ReceiveInbound(ctx context.Context, sourceID int64, headers ht
 		return nil, err
 	}
 
-	ctx = tenant.WithID(ctx, source.TenantID)
 	receipt, err := s.storeInboundEvent(ctx, source, externalID, eventType, headers, body)
 	if err != nil {
 		return nil, err
 	}
-	s.recordAudit(ctx, 0, "webhook.inbound.received", "webhook_inbound_event", receipt.ID, map[string]any{
-		"sourceId":  source.ID,
-		"eventId":   externalID,
-		"type":      receipt.EventType,
-		"duplicate": receipt.Duplicate,
-	})
+	if _, audited := s.inbound.(auditedInboundStore); !audited {
+		s.recordAudit(ctx, uuid.Nil, "webhook.received", "webhook_inbound_event", receipt.ID, map[string]any{
+			"sourceId":  source.ID,
+			"eventId":   externalID,
+			"type":      receipt.EventType,
+			"duplicate": receipt.Duplicate,
+		})
+	}
 	return receipt, nil
 }
 
@@ -98,7 +103,7 @@ func (s *service) verifyWithDummySecret(headers http.Header, body []byte) {
 // AES-GCM open of a valid envelope, and the HMAC verification. Without it,
 // sequential source ids could be probed by response latency. tenantChecked
 // reports whether activeInboundSource already ran the tenant lookup.
-func (s *service) performDummyInboundWork(ctx context.Context, sourceID int64, source *InboundSource, tenantChecked bool, headers http.Header, body []byte) {
+func (s *service) performDummyInboundWork(ctx context.Context, sourceID uuid.UUID, source *InboundSource, tenantChecked bool, headers http.Header, body []byte) {
 	if s.opts.Tenants != nil && !tenantChecked {
 		tenantID := sourceID
 		if source != nil {
@@ -106,14 +111,14 @@ func (s *service) performDummyInboundWork(ctx context.Context, sourceID int64, s
 		}
 		if _, err := s.opts.Tenants.TenantActive(ctx, tenantID); err != nil {
 			slog.Error("webhooks: failed to check inbound source tenant",
-				slog.Int64("source_id", sourceID),
+				slog.String("source_id", sourceID.String()),
 				slog.Any("error", err),
 			)
 		}
 	}
 	if s.codec != nil && s.dummyInboundCiphertext != "" {
 		// The binding is deliberately wrong; only the AES-GCM work matters.
-		_, _ = s.codec.Open(InboundSourceSecretBinding(1, sourceID), s.dummyInboundCiphertext)
+		_, _ = s.codec.Open(InboundSourceSecretBinding(tenant.DefaultID, sourceID), s.dummyInboundCiphertext)
 	}
 	s.verifyWithDummySecret(headers, body)
 }
@@ -143,13 +148,13 @@ func validateInboundBody(body []byte) error {
 // source is returned alongside the error when it was loaded, and tenantChecked
 // reports whether the tenant lookup ran (so the caller can spend it only when
 // the real path did not).
-func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*InboundSource, bool, error) {
+func (s *service) activeInboundSource(ctx context.Context, sourceID uuid.UUID) (*InboundSource, bool, error) {
 	source, err := s.inbound.GetInboundSourceByID(ctx, sourceID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, false, errInboundSourceUnavailable
 		}
-		return nil, false, apperror.NewInternal("failed to resolve inbound source")
+		return nil, false, apperror.Internal(err, "failed to resolve inbound source")
 	}
 	if source.Status != StatusActive {
 		return source, false, errInboundSourceUnavailable
@@ -160,7 +165,7 @@ func (s *service) activeInboundSource(ctx context.Context, sourceID int64) (*Inb
 	active, err := s.opts.Tenants.TenantActive(ctx, source.TenantID)
 	if err != nil {
 		slog.Error("webhooks: failed to check inbound source tenant",
-			slog.Int64("source_id", source.ID),
+			slog.String("source_id", source.ID.String()),
 			slog.Any("error", err),
 		)
 		return source, true, errInboundSourceUnavailable
@@ -188,9 +193,22 @@ func inboundEventID(headers http.Header) (string, error) {
 // open, the immediately previous secret. A sender that has not switched yet
 // therefore keeps working for 24h after a rotation. Every failure maps to the
 // same public 401, so a caller cannot tell which check failed.
-func (s *service) verifyInboundSignature(source *InboundSource, headers http.Header, body []byte) error {
+func (s *service) verifyInboundSignature(ctx context.Context, source *InboundSource, headers http.Header, body []byte) error {
 	binding := InboundSourceSecretBinding(source.TenantID, source.ID)
-	key, err := s.openInboundKey(binding, source.SecretCiphertext, source.ID)
+	secrets, err := s.inbound.InboundSigningSecrets(ctx, source.ID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			// An active source without a secret row cannot authenticate
+			// anything; answer like a bad signature, never with a 500.
+			return inboundAuthError()
+		}
+		slog.Error("webhooks: failed to load inbound source signing secrets",
+			slog.String("source_id", source.ID.String()),
+			slog.Any("error", err),
+		)
+		return apperror.Internal(err, "failed to verify inbound signature")
+	}
+	key, err := s.openInboundKey(binding, secrets.CurrentCiphertext, source.ID)
 	if err != nil {
 		return err
 	}
@@ -200,10 +218,10 @@ func (s *service) verifyInboundSignature(source *InboundSource, headers http.Hea
 	}
 	// Only a signature mismatch can be rescued by the previous secret; a
 	// missing or stale timestamp is the sender's mistake either way.
-	if errors.Is(verifyErr, webhook.ErrInvalidSignature) && source.previousSecretValid(s.now()) {
-		previousKey, err := s.openInboundKey(binding, source.PreviousSecretCiphertext, source.ID)
+	if errors.Is(verifyErr, webhook.ErrInvalidSignature) && secrets.PreviousCiphertext != "" {
+		previousKey, err := s.openInboundKey(binding, secrets.PreviousCiphertext, source.ID)
 		if err != nil {
-			slog.Error("failed to open an inbound source's previous secret", slog.Int64("source_id", source.ID), slog.Any("error", err))
+			slog.Error("failed to open an inbound source's previous secret", slog.String("source_id", source.ID.String()), slog.Any("error", err))
 			return inboundVerifyError(verifyErr)
 		}
 		if previousErr := webhook.VerifyRequest(previousKey, headers, body, s.opts.TimestampTolerance, s.now()); previousErr == nil {
@@ -213,33 +231,27 @@ func (s *service) verifyInboundSignature(source *InboundSource, headers http.Hea
 	return inboundVerifyError(verifyErr)
 }
 
-// openInboundKey opens and decodes one sealed source secret. A source created
-// before Standard Webhooks has a secret no standard sender can sign with; the
-// sender only learns the signature failed.
-func (s *service) openInboundKey(binding SecretBinding, ciphertext string, sourceID int64) ([]byte, error) {
+// openInboundKey opens and decodes one sealed source secret. Every stored
+// secret is a Standard Webhooks "whsec_" value; anything else is a structural
+// error, and the sender only learns the signature failed.
+func (s *service) openInboundKey(binding SecretBinding, ciphertext string, sourceID uuid.UUID) ([]byte, error) {
 	secret, err := s.codec.Open(binding, ciphertext)
 	if err != nil {
 		slog.Error("webhooks: failed to open inbound source secret",
-			slog.Int64("source_id", sourceID),
+			slog.String("source_id", sourceID.String()),
 			slog.Any("error", err),
 		)
-		return nil, apperror.NewInternal("failed to verify inbound signature")
+		return nil, apperror.Internal(err, "failed to verify inbound signature")
 	}
 	key, err := webhook.DecodeSecret(string(secret))
 	if err != nil {
-		slog.Error("webhooks: inbound source secret predates Standard Webhooks; rotate it",
-			slog.Int64("source_id", sourceID),
+		slog.Error("webhooks: inbound source secret is not a Standard Webhooks secret",
+			slog.String("source_id", sourceID.String()),
 			slog.Any("error", err),
 		)
 		return nil, inboundAuthError()
 	}
 	return key, nil
-}
-
-func (s *InboundSource) previousSecretValid(now time.Time) bool {
-	return s.PreviousSecretCiphertext != "" &&
-		s.PreviousSecretExpiresAt != nil &&
-		now.Before(*s.PreviousSecretExpiresAt)
 }
 
 // inboundVerifyError is the single public authentication failure for the
@@ -277,15 +289,29 @@ func (s *service) storeInboundEvent(ctx context.Context, source *InboundSource, 
 	if len(signature) > maxStoredSignatureLen {
 		signature = signature[:maxStoredSignatureLen]
 	}
-	eventID, created, err := s.inbound.CreateInboundEvent(ctx, InboundEventDraft{
+	draft := InboundEventDraft{
 		SourceID:        source.ID,
 		ExternalEventID: externalID,
 		EventType:       eventType,
 		Signature:       signature,
 		Payload:         json.RawMessage(body),
-	})
+	}
+	var (
+		eventID uuid.UUID
+		created bool
+		err     error
+	)
+	if audited, ok := s.inbound.(auditedInboundStore); ok {
+		eventID, created, err = audited.CreateInboundEventAudited(ctx, draft, source.TenantID, map[string]any{
+			"sourceId": source.ID,
+			"eventId":  externalID,
+			"type":     eventType,
+		})
+	} else {
+		eventID, created, err = s.inbound.CreateInboundEvent(ctx, draft)
+	}
 	if err != nil {
-		return nil, apperror.NewInternal("failed to store inbound event")
+		return nil, apperror.Internal(err, "failed to store inbound event")
 	}
 
 	receipt := &InboundReceipt{
@@ -302,7 +328,7 @@ func (s *service) storeInboundEvent(ctx context.Context, source *InboundSource, 
 	}
 	existing, err := s.inbound.GetInboundEventByExternalID(ctx, source.ID, externalID)
 	if err != nil {
-		return nil, apperror.NewInternal("failed to load duplicate inbound event")
+		return nil, apperror.Internal(err, "failed to load duplicate inbound event")
 	}
 	receipt.ID = existing.ID
 	receipt.EventType = existing.EventType
@@ -311,12 +337,12 @@ func (s *service) storeInboundEvent(ctx context.Context, source *InboundSource, 
 }
 
 // ListInboundEvents pages through the events received by one source.
-func (s *service) ListInboundEvents(ctx context.Context, sourceID int64, limit int, startingAfter string) ([]InboundEvent, bool, error) {
+func (s *service) ListInboundEvents(ctx context.Context, sourceID uuid.UUID, limit int, startingAfter string) ([]InboundEvent, bool, error) {
 	if _, err := s.inbound.GetInboundSource(ctx, sourceID); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, false, apperror.NewNotFound("inbound source not found")
 		}
-		return nil, false, apperror.NewInternal("failed to get inbound source")
+		return nil, false, apperror.Internal(err, "failed to get inbound source")
 	}
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
@@ -324,7 +350,7 @@ func (s *service) ListInboundEvents(ctx context.Context, sourceID int64, limit i
 	}
 	events, err := s.inbound.ListInboundEvents(ctx, sourceID, cur)
 	if err != nil {
-		return nil, false, apperror.NewInternal("failed to list inbound events")
+		return nil, false, apperror.Internal(err, "failed to list inbound events")
 	}
 	hasMore := len(events) > pageSize
 	if hasMore {
@@ -340,4 +366,17 @@ func hasControl(value string) bool {
 		}
 	}
 	return false
+}
+
+// auditedInboundStore is the optional transactional audit extension the
+// PostgreSQL store implements. A public receiver has no tenant middleware, so
+// the event row and its Tier 1 audit row must commit together with the source
+// tenant; test doubles keep the post-hoc recorder path.
+type auditedInboundStore interface {
+	CreateInboundEventAudited(
+		ctx context.Context,
+		draft InboundEventDraft,
+		tenantID uuid.UUID,
+		metadata map[string]any,
+	) (uuid.UUID, bool, error)
 }

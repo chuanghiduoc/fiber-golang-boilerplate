@@ -3,9 +3,9 @@ package repository
 import (
 	"context"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 )
 
 // RetentionRepository implements service.RetentionRepository. It is the only

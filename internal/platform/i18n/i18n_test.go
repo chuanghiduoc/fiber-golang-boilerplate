@@ -73,8 +73,8 @@ func TestNegotiate(t *testing.T) {
 		{"wildcard honors custom default", vietnamese, "fr, *;q=0.5", "vi"},
 		{"zero q excluded", bundle, "vi;q=0, en;q=0.5", "en"},
 		{"all zero falls back", bundle, "vi;q=0, en;q=0", "en"},
-		{"invalid q skipped", bundle, "vi;q=bogus, en;q=0.5", "en"},
-		{"out of range q skipped", bundle, "vi;q=2, en;q=0.5", "en"},
+		{"invalid q falls back", bundle, "vi;q=bogus, en;q=0.5", "en"},
+		{"q outside the RFC range is an x/text weight", bundle, "vi;q=2, en;q=0.5", "vi"},
 		{"unknown only falls back", bundle, "de-DE", "en"},
 		{"empty ranges ignored", bundle, ",, vi ,", "vi"},
 	}
@@ -192,7 +192,7 @@ func TestCatalogsCoverErrorCatalog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, code := range apperror.AllCodes() {
+	for _, code := range apperror.NewCatalog().Codes() {
 		key := "errors." + string(code) + ".title"
 		for _, locale := range bundle.SupportedLocales() {
 			if !bundle.Has(locale, key) {

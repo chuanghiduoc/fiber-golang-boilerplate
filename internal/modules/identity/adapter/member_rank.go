@@ -5,6 +5,7 @@ import (
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
+	"github.com/google/uuid"
 )
 
 // MemberRank applies identity's tenant role hierarchy to a caller managing
@@ -22,7 +23,7 @@ func NewMemberRank(stores identityservice.Stores, tx identityservice.Transactor)
 
 // CanManageMember runs identity's rank check in its own transaction so the
 // target membership row is locked for the duration of the check.
-func (m *MemberRank) CanManageMember(ctx context.Context, targetUserID int64) error {
+func (m *MemberRank) CanManageMember(ctx context.Context, targetUserID uuid.UUID) error {
 	return m.tx.InTx(ctx, func(ctx context.Context, tx identityservice.TxRepos) error {
 		return identityservice.EnsureCanManageMember(ctx, tx.Stores, targetUserID)
 	})

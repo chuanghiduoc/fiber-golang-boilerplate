@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	webhookssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -25,7 +27,7 @@ func NewTenantPurger(db webhookssqlc.DBTX) *TenantPurger {
 }
 
 // PurgeTenant drains every owned table in bounded pages, in foreign-key order.
-func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	steps := []struct {
 		name  string

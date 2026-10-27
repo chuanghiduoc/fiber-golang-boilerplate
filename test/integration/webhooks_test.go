@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 	"io"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +29,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks"
@@ -40,7 +43,6 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -60,95 +62,95 @@ func allDynamicPorts() []int {
 type webhookHarness struct {
 	app        *fiber.App
 	pool       *pgxpool.Pool
+	fx         *pgtest.Fixture
 	repo       *webhookrepo.Postgres
 	service    webhookservice.Service
 	dispatcher *webhookservice.Dispatcher
 	worker     *webhookservice.DeliveryWorker
 	codec      *webhookservice.SecretCodec
-	tenantA    int64
-	tenantB    int64
+	tenantA    uuid.UUID
+	tenantB    uuid.UUID
 	tokenA     string
 	tokenB     string
 	tokenUser  string
 	// endpointID/endpointSecret are shared between sequential subtests.
-	endpointID     int64
+	endpointID     uuid.UUID
 	endpointSecret string
 }
 
 type endpointDTO struct {
-	ID          int64    `json:"id"`
-	TenantID    int64    `json:"tenantId"`
-	URL         string   `json:"url"`
-	EventTypes  []string `json:"eventTypes"`
-	Status      string   `json:"status"`
-	Secret      string   `json:"secret"`
-	MaxAttempts int32    `json:"maxAttempts"`
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenantId"`
+	URL         string    `json:"url"`
+	EventTypes  []string  `json:"eventTypes"`
+	Status      string    `json:"status"`
+	Secret      string    `json:"secret"`
+	MaxAttempts int32     `json:"maxAttempts"`
 }
 
 type sourceDTO struct {
-	ID          int64  `json:"id"`
-	TenantID    int64  `json:"tenantId"`
-	Name        string `json:"name"`
-	Slug        string `json:"slug"`
-	Status      string `json:"status"`
-	Secret      string `json:"secret"`
-	ReceiverURL string `json:"receiverUrl"`
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenantId"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Status      string    `json:"status"`
+	Secret      string    `json:"secret"`
+	ReceiverURL string    `json:"receiverUrl"`
 }
 
 type deliveryDTO struct {
-	ID           int64  `json:"id"`
-	TenantID     int64  `json:"tenantId"`
-	EndpointID   int64  `json:"endpointId"`
-	EventID      string `json:"eventId"`
-	EventType    string `json:"eventType"`
-	Status       string `json:"status"`
-	Attempts     int32  `json:"attempts"`
-	MaxAttempts  int32  `json:"maxAttempts"`
-	LastError    string `json:"lastError"`
-	ReplayedFrom *int64 `json:"replayedFromId"`
+	ID           uuid.UUID  `json:"id"`
+	TenantID     uuid.UUID  `json:"tenantId"`
+	EndpointID   uuid.UUID  `json:"endpointId"`
+	EventID      string     `json:"eventId"`
+	EventType    string     `json:"eventType"`
+	Status       string     `json:"status"`
+	Attempts     int32      `json:"attempts"`
+	MaxAttempts  int32      `json:"maxAttempts"`
+	LastError    string     `json:"lastError"`
+	ReplayedFrom *uuid.UUID `json:"replayedFromId"`
 }
 
 type receiptDTO struct {
-	ID        int64  `json:"id"`
-	TenantID  int64  `json:"tenantId"`
-	SourceID  int64  `json:"sourceId"`
-	EventID   string `json:"eventId"`
-	Duplicate bool   `json:"duplicate"`
+	ID        uuid.UUID `json:"id"`
+	TenantID  uuid.UUID `json:"tenantId"`
+	SourceID  uuid.UUID `json:"sourceId"`
+	EventID   string    `json:"eventId"`
+	Duplicate bool      `json:"duplicate"`
 }
 
 func setupWebhookHarness(t *testing.T) *webhookHarness {
 	t.Helper()
 	ctx := context.Background()
 
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	tenantB := testutil.CreateTenant(t, ctx, pool, "webhooks-acme")
 
 	// The session store validates every token against a live session row.
-	sessionToken := func(tenantID int64, email, role string) string {
+	sessionToken := func(tenantID uuid.UUID, email, role string) string {
 		t.Helper()
 		member := testutil.CreateMember(t, ctx, pool, tenantID, email, testutil.MemberOptions{Role: role})
 		return testutil.SessionToken(t, ctx, pool, member, webhookIntegrationSecret)
 	}
 	tokenA := sessionToken(tenant.DefaultID, "webhooks-a@test.com", "admin")
 	tokenB := sessionToken(tenantB, "webhooks-b@test.com", "admin")
-	tokenUser := sessionToken(tenant.DefaultID, "webhooks-user@test.com", "user")
+	tokenUser := sessionToken(tenant.DefaultID, "webhooks-user@test.com", "member")
 
 	appCache, err := cache.NewCache(config.CacheConfig{Driver: "memory"})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = appCache.Close() })
 
-	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	stores := identityrepo.NewStores(fx.Scoped())
 	tenantRepo := stores.Tenants
 	resolver := identityadapter.NewTenantResolver(tenantRepo)
 	sessionStore := session.NewStore(identityadapter.NewSessionStateReader(stores.Sessions), appCache)
-	jobQueue := jobs.NewQueue(testutil.Scoped(pool))
-	repo := webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), jobQueue)
+	jobQueue := jobs.NewQueue(fx.Scoped())
+	recorder := audit.NewPostgresRecorder(fx.Scoped())
+	repo := webhookrepo.New(fx.Scoped(), fx.Tx(), jobQueue, recorder)
 	codec, err := webhookservice.NewSecretCodec("webhook-integration-encryption-key")
 	require.NoError(t, err)
-	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
 	// httptest receivers listen on random ports; this harness exercises
 	// delivery behavior, not the port policy (covered by pkg/webhook).
 	guard, err := webhook.NewGuardWithPorts([]string{"127.0.0.1"}, allDynamicPorts())
@@ -167,7 +169,7 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 		DefaultTimeoutMS:   2000,
 		TimestampTolerance: 5 * time.Minute,
 		URLGuard:           guard,
-		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id int64) (bool, error) {
+		Tenants: webhookservice.TenantCheckerFunc(func(ctx context.Context, id uuid.UUID) (bool, error) {
 			if _, err := tenantRepo.GetOperationalByID(ctx, id); err != nil {
 				if errors.Is(err, apperror.ErrNotFound) {
 					return false, nil
@@ -186,13 +188,14 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	})
 
 	cfg := &config.Config{
-		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 10},
-		JWT:       config.JWTConfig{Secret: webhookIntegrationSecret, ExpireHour: 24, RefreshExpireDays: 30},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 1000, StrictWindow: 60, NormalMax: 1000, NormalWindow: 60, RelaxedMax: 1000, RelaxedWindow: 60},
+		App:       config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 10 * time.Second},
+		JWT:       config.JWTConfig{Secret: webhookIntegrationSecret, AccessTTL: 15 * time.Minute, RefreshTTL: 720 * time.Hour},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 1000, StrictWindow: 60 * time.Second, NormalMax: 1000, NormalWindow: 60 * time.Second, RelaxedMax: 1000, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
 	application := app.New(cfg, app.Deps{
+		Catalogs:       integrationCatalogs(),
 		Cache:          appCache,
 		Sessions:       sessionStore,
 		Audit:          recorder,
@@ -203,6 +206,7 @@ func setupWebhookHarness(t *testing.T) *webhookHarness {
 	return &webhookHarness{
 		app:        application.Fiber(),
 		pool:       pool,
+		fx:         fx,
 		repo:       repo,
 		service:    svc,
 		dispatcher: dispatcher,
@@ -277,28 +281,28 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		).Scan(&ciphertext))
 		assert.NotEqual(t, endpointA.Secret, ciphertext, "plaintext secret must not be stored")
 
-		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/endpoints/%d", endpointA.ID), h.tokenA, nil, nil)
+		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/endpoints/%s", endpointA.ID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		assert.NotContains(t, string(body), "\"secret\"")
 		assert.NotContains(t, string(body), endpointA.Secret)
 
 		// Another tenant cannot read or rotate the endpoint.
-		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/endpoints/%d", endpointA.ID), h.tokenB, nil, nil)
+		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/endpoints/%s", endpointA.ID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
-		status, _, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenB, nil, nil)
+		status, _, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%s/rotate-secret", endpointA.ID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
 
 		// Rotation is never served from the idempotency cache (the plaintext
 		// secret must not be stored there): a repeated key rotates again and
 		// the database still has exactly one active secret.
 		key := "rotate-endpoint-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%s/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		rotated := decodeJSON[endpointDTO](t, body)
 		require.NotEmpty(t, rotated.Secret)
 		assert.NotEqual(t, endpointA.Secret, rotated.Secret)
 
-		status, retryBody, retryHeaders := h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		status, retryBody, retryHeaders := h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/endpoints/%s/rotate-secret", endpointA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", retryBody)
 		retried := decodeJSON[endpointDTO](t, retryBody)
 		require.NotEmpty(t, retried.Secret)
@@ -328,7 +332,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		var auditCount int
 		require.NoError(t, h.pool.QueryRow(ctx,
 			`SELECT count(*)::int FROM audit_events WHERE tenant_id = $1 AND action = 'webhook.endpoint.created' AND resource_id = $2`,
-			h.tenantA, strconv.FormatInt(endpointA.ID, 10),
+			h.tenantA, endpointA.ID.String(),
 		).Scan(&auditCount))
 		assert.Equal(t, 1, auditCount)
 
@@ -360,7 +364,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("dispatcher fanout, dedupe, and delivery isolation", func(t *testing.T) {
 		endpoint2 := h.createEndpoint(t, h.tokenA, "https://receiver.example/users", "user.registered")
-		event := testEnvelope("evt_file_integration_1", "file.uploaded", h.tenantA)
+		event := testEnvelope(testEventID(1), "file.uploaded", h.tenantA)
 		event.Data = json.RawMessage(`{"fileId":77}`)
 		created, err := h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), event)
 		require.NoError(t, err)
@@ -371,7 +375,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Zero(t, created, "re-dispatching the same event must not create deliveries")
 
 		created, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA),
-			testEnvelope("evt_user_integration_1", "user.registered", h.tenantA))
+			testEnvelope(testEventID(2), "user.registered", h.tenantA))
 		require.NoError(t, err)
 		assert.Equal(t, 1, created)
 		assert.NotZero(t, endpoint2.ID)
@@ -399,24 +403,24 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.NoError(t, json.Unmarshal(body, &page))
 		assert.Empty(t, page.Data)
 
-		var deliveryID int64
+		var deliveryID uuid.UUID
 		require.NoError(t, h.pool.QueryRow(ctx,
 			`SELECT id FROM webhook_deliveries WHERE tenant_id = $1 AND event_id = $2`,
-			h.tenantA, "evt_file_integration_1",
+			h.tenantA, event.ID,
 		).Scan(&deliveryID))
-		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", deliveryID), h.tokenB, nil, nil)
+		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%s", deliveryID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
 
 		// Replay creates a new retained delivery rather than reusing event ID.
-		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/deliveries/%d/replay", deliveryID), h.tokenA, nil, nil)
-		require.Equal(t, fiber.StatusCreated, status, "body: %s", body)
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/deliveries/%s/replay", deliveryID), h.tokenA, nil, nil)
+		require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 		replayed := decodeJSON[deliveryDTO](t, body)
 		assert.NotEqual(t, deliveryID, replayed.ID)
 		require.NotNil(t, replayed.ReplayedFrom)
 		assert.Equal(t, deliveryID, *replayed.ReplayedFrom)
 
 		// Pagination cursor is opaque but works for the tenant's list.
-		cursor := pagination.EncodeCursor(time.Now().UTC().Add(time.Hour), 1<<40)
+		cursor := pagination.EncodeCursor(time.Now().UTC().Add(time.Hour), pagination.MaxUUID)
 		status, body, _ = h.do(t, http.MethodGet, "/api/v1/webhooks/deliveries?startingAfter="+cursor, h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
 		require.NoError(t, json.Unmarshal(body, &page))
@@ -464,7 +468,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		// its own secret for signature verification.
 		h.endpointSecret = successEndpoint.Secret
 
-		successEvent := testEnvelope("evt_worker_success", "worker.success", h.tenantA)
+		successEvent := testEnvelope(testEventID(3), "worker.success", h.tenantA)
 		created, err := h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), successEvent)
 		require.NoError(t, err)
 		require.Equal(t, 1, created)
@@ -472,7 +476,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		deliveryID := h.deliveryID(t, successEvent.ID)
 		payload, _ := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
-		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", deliveryID), h.tokenA, nil, nil)
+		status, body, _ := h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%s", deliveryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		success := decodeJSON[deliveryDTO](t, body)
 		assert.Equal(t, "succeeded", success.Status)
@@ -489,7 +493,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Equal(t, 1, attemptCount)
 		assert.Equal(t, http.StatusNoContent, attemptStatus)
 
-		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d/attempts", deliveryID), h.tokenA, nil, nil)
+		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%s/attempts", deliveryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		var attemptsPage struct {
 			Data []struct {
@@ -506,13 +510,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		badEndpoint := h.createEndpoint(t, h.tokenA, server.URL+"/bad", "worker.permanent")
 		_ = badEndpoint
-		badEvent := testEnvelope("evt_worker_bad", "worker.permanent", h.tenantA)
+		badEvent := testEnvelope(testEventID(4), "worker.permanent", h.tenantA)
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), badEvent)
 		require.NoError(t, err)
 		badID := h.deliveryID(t, badEvent.ID)
 		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: badID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
-		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", badID), h.tokenA, nil, nil)
+		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%s", badID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
 		bad := decodeJSON[deliveryDTO](t, body)
 		assert.Equal(t, "dead", bad.Status)
@@ -520,13 +524,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		retryEndpoint := h.createEndpoint(t, h.tokenA, server.URL+"/retry", "worker.retry")
 		_ = retryEndpoint
-		retryEvent := testEnvelope("evt_worker_retry", "worker.retry", h.tenantA)
+		retryEvent := testEnvelope(testEventID(5), "worker.retry", h.tenantA)
 		_, err = h.dispatcher.Dispatch(tenant.WithID(ctx, h.tenantA), retryEvent)
 		require.NoError(t, err)
 		retryID := h.deliveryID(t, retryEvent.ID)
 		payload, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: retryID})
 		require.NoError(t, h.worker.Handle(tenant.WithID(ctx, h.tenantA), payload))
-		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%d", retryID), h.tokenA, nil, nil)
+		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/deliveries/%s", retryID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status)
 		retryDelivery := decodeJSON[deliveryDTO](t, body)
 		assert.Equal(t, "pending", retryDelivery.Status)
@@ -544,7 +548,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		var retryJobs int
 		require.NoError(t, h.pool.QueryRow(ctx,
 			`SELECT count(*)::int FROM jobs WHERE tenant_id = $1 AND kind = $2 AND payload->>'deliveryId' = $3`,
-			h.tenantA, webhookservice.DeliveryJobKind, strconv.FormatInt(retryID, 10),
+			h.tenantA, webhookservice.DeliveryJobKind, retryID.String(),
 		).Scan(&retryJobs))
 		assert.GreaterOrEqual(t, retryJobs, 2, "original job plus scheduled retry")
 	})
@@ -558,7 +562,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		require.NotEmpty(t, sourceA.Secret)
 		assert.Contains(t, sourceA.ReceiverURL, "/api/v1/webhooks/inbound/")
 
-		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d", sourceA.ID), h.tokenB, nil, nil)
+		status, _, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%s", sourceA.ID), h.tokenB, nil, nil)
 		assert.Equal(t, fiber.StatusNotFound, status)
 
 		// Standard Webhooks senders put the event type in the signed body.
@@ -602,7 +606,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		).Scan(&eventCount))
 		assert.Equal(t, 1, eventCount)
 
-		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d/events", sourceA.ID), h.tokenA, nil, nil)
+		status, body, _ = h.do(t, http.MethodGet, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%s/events", sourceA.ID), h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		var page struct {
 			Data []struct {
@@ -622,7 +626,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		// Rotation keeps the previous secret valid for the grace window, so
 		// senders that have not switched yet keep working.
 		key := "rotate-source-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%s/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		rotated := decodeJSON[sourceDTO](t, body)
 		require.NotEmpty(t, rotated.Secret)
@@ -630,8 +634,10 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		var previousExpiry *time.Time
 		var previousCiphertext *string
 		require.NoError(t, h.pool.QueryRow(ctx,
-			`SELECT previous_secret_ciphertext, previous_secret_expires_at
-			 FROM webhook_inbound_sources WHERE id = $1 AND tenant_id = $2`,
+			`SELECT secret_ciphertext, grace_expires_at
+			 FROM webhook_inbound_source_secrets
+			 WHERE source_id = $1 AND tenant_id = $2 AND NOT active
+			 ORDER BY version DESC LIMIT 1`,
 			sourceA.ID, h.tenantA,
 		).Scan(&previousCiphertext, &previousExpiry))
 		require.NotNil(t, previousCiphertext, "the rotated-away secret must be kept for the grace window")
@@ -647,7 +653,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		// previous secret: the first one stops verifying.
 		previousRotated := rotated
 		key = "rotate-source-again-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%d/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
+		status, body, _ = h.do(t, http.MethodPost, fmt.Sprintf("/api/v1/webhooks/inbound-sources/%s/rotate-secret", sourceA.ID), h.tokenA, nil, map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		rotatedAgain := decodeJSON[sourceDTO](t, body)
 		require.NotEmpty(t, rotatedAgain.Secret)
@@ -659,7 +665,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		// After the explicit expiry only the current secret verifies.
 		_, execErr := h.pool.Exec(ctx,
-			`UPDATE webhook_inbound_sources SET previous_secret_expires_at = now() - interval '1 second' WHERE id = $1 AND tenant_id = $2`,
+			`UPDATE webhook_inbound_source_secrets SET grace_expires_at = now() - interval '1 second' WHERE source_id = $1 AND tenant_id = $2 AND NOT active`,
 			sourceA.ID, h.tenantA)
 		require.NoError(t, execErr)
 		status, _, _ = h.doBytes(t, http.MethodPost, sourceA.ReceiverURL, payload, headers(previousRotated.Secret, "evt_in_expired"))
@@ -682,7 +688,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 		var auditB int
 		require.NoError(t, h.pool.QueryRow(ctx,
-			`SELECT count(*)::int FROM audit_events WHERE tenant_id = $1 AND action = 'webhook.inbound.received'`,
+			`SELECT count(*)::int FROM audit_events WHERE tenant_id = $1 AND action = 'webhook.received'`,
 			h.tenantB,
 		).Scan(&auditB))
 		assert.Equal(t, 1, auditB)
@@ -716,7 +722,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("transactional publish commits with the producer", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/tx", "tx.*")
-		bus := events.New(jobs.NewQueue(testutil.Scoped(h.pool)))
+		bus := events.New(jobs.NewQueue(h.fx.Scoped()))
 		for _, eventType := range []string{"tx.rolled_back", "tx.committed"} {
 			require.NoError(t, bus.SubscribeDurable(eventType, "webhooks", h.dispatcher.HandleEvent))
 		}
@@ -736,13 +742,13 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		// A rolled-back producer transaction leaves no subscriber job behind.
 		tx, err := h.pool.Begin(ctx)
 		require.NoError(t, err)
-		require.NoError(t, bus.PublishTx(ctx, tx, testEnvelope("", "tx.rolled_back", h.tenantA)))
+		require.NoError(t, bus.PublishTx(ctx, tx, testEnvelope(uuid.Nil, "tx.rolled_back", h.tenantA)))
 		require.NoError(t, tx.Rollback(ctx))
 		assert.Equal(t, before, countJobs())
 
 		tx, err = h.pool.Begin(ctx)
 		require.NoError(t, err)
-		committed := testEnvelope("evt_tx_1", "tx.committed", h.tenantA)
+		committed := testEnvelope(testEventID(6), "tx.committed", h.tenantA)
 		committed.Data = json.RawMessage(`{"n":1}`)
 		require.NoError(t, bus.PublishTx(ctx, tx, committed))
 		require.NoError(t, tx.Commit(ctx))
@@ -760,8 +766,8 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		var deliveries int
 		var timeoutMS int32
 		require.NoError(t, h.pool.QueryRow(ctx,
-			`SELECT count(*)::int, max(timeout_ms) FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2 AND event_id = 'evt_tx_1'`,
-			h.tenantA, endpoint.ID,
+			`SELECT count(*)::int, max(timeout_ms) FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2 AND event_id = $3`,
+			h.tenantA, endpoint.ID, committed.ID,
 		).Scan(&deliveries, &timeoutMS))
 		assert.Equal(t, 1, deliveries)
 		assert.Equal(t, int32(2000), timeoutMS, "the endpoint timeout is snapshotted on the delivery")
@@ -770,12 +776,12 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 	t.Run("unclaimable pending deliveries are dead-lettered", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/stuck", "stuck.*")
 		tenantCtx := tenant.WithID(ctx, h.tenantA)
-		for id, eventType := range map[string]string{"evt_stuck_exhausted": "stuck.one", "evt_stuck_disabled": "stuck.two"} {
+		for id, eventType := range map[uuid.UUID]string{testEventID(7): "stuck.one", testEventID(8): "stuck.two"} {
 			_, err := h.dispatcher.Dispatch(tenantCtx, testEnvelope(id, eventType, h.tenantA))
 			require.NoError(t, err)
 		}
-		exhausted := h.deliveryID(t, "evt_stuck_exhausted")
-		disabled := h.deliveryID(t, "evt_stuck_disabled")
+		exhausted := h.deliveryID(t, testEventID(7))
+		disabled := h.deliveryID(t, testEventID(8))
 
 		// Simulate a final attempt whose bookkeeping write was lost.
 		_, err := h.pool.Exec(ctx,
@@ -791,7 +797,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		job, _ = json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: disabled})
 		require.NoError(t, h.worker.Handle(tenantCtx, job))
 
-		for id, reason := range map[int64]string{
+		for id, reason := range map[uuid.UUID]string{
 			exhausted: "delivery attempts exhausted",
 			disabled:  "endpoint is disabled or deleted",
 		} {
@@ -800,8 +806,8 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			require.NoError(t, h.pool.QueryRow(ctx,
 				`SELECT status, COALESCE(last_error, ''), attempts FROM webhook_deliveries WHERE id = $1`, id,
 			).Scan(&status, &lastError, &attempts))
-			assert.Equal(t, "dead", status, "delivery %d", id)
-			assert.Equal(t, reason, lastError, "delivery %d", id)
+			assert.Equal(t, "dead", status, "delivery %s", id)
+			assert.Equal(t, reason, lastError, "delivery %s", id)
 		}
 		var disabledAttempts int
 		require.NoError(t, h.pool.QueryRow(ctx,
@@ -858,14 +864,14 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 	t.Run("subscriptions are a sorted set replaced on update", func(t *testing.T) {
 		created := h.createEndpoint(t, h.tokenA, "https://receiver.example/subs", "file.uploaded", "account.*", "file.uploaded")
 		assert.Equal(t, []string{"account.*", "file.uploaded"}, created.EventTypes)
-		path := fmt.Sprintf("/api/v1/webhooks/endpoints/%d", created.ID)
+		path := fmt.Sprintf("/api/v1/webhooks/endpoints/%s", created.ID)
 		status, body, _ := h.do(t, http.MethodGet, path, h.tokenA, nil, nil)
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		assert.Equal(t, []string{"account.*", "file.uploaded"}, decodeJSON[endpointDTO](t, body).EventTypes)
 
-		status, body, _ = h.do(t, http.MethodPut, path, h.tokenA, map[string]any{
+		status, body, _ = h.do(t, http.MethodPatch, path, h.tokenA, map[string]any{
 			"url": "https://receiver.example/subs", "status": "active", "eventTypes": []string{"user.*"},
-		}, nil)
+		}, map[string]string{"Content-Type": "application/merge-patch+json"})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 		assert.Equal(t, []string{"user.*"}, decodeJSON[endpointDTO](t, body).EventTypes)
 		status, body, _ = h.do(t, http.MethodGet, path, h.tokenA, nil, nil)
@@ -891,40 +897,46 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 
 	t.Run("retention purges terminal rows and then unreferenced events in batches", func(t *testing.T) {
 		endpoint := h.createEndpoint(t, h.tokenA, "https://receiver.example/purge", "purge.*")
+		var secretID uuid.UUID
+		require.NoError(t, h.pool.QueryRow(ctx,
+			`SELECT id FROM webhook_endpoint_secrets WHERE tenant_id = $1 AND endpoint_id = $2 AND active`,
+			h.tenantA, endpoint.ID).Scan(&secretID))
 		_, err := h.pool.Exec(ctx, `
 			INSERT INTO webhook_events (tenant_id, event_id, event_type, data_version, actor_type, occurred_at, payload, created_at)
-			SELECT $1::bigint, 'evt_purge_' || g, 'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
+			SELECT $1::uuid, ('0192c9b0-7e4a-7000-8001-' || lpad(g::text, 12, '0'))::uuid,
+			       'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
 			FROM generate_series(1, 1500) AS g
 			UNION ALL
-			SELECT $1::bigint, 'evt_purge_pending', 'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
+			SELECT $1::uuid, $2, 'purge.old', 1, 'system', now(), '{}'::jsonb, now() - interval '40 days'
 			UNION ALL
-			SELECT $1::bigint, 'evt_purge_fresh', 'purge.old', 1, 'system', now(), '{}'::jsonb, now()`,
-			h.tenantA)
+			SELECT $1::uuid, $3, 'purge.old', 1, 'system', now(), '{}'::jsonb, now()`,
+			h.tenantA, purgePending, purgeFresh)
 		require.NoError(t, err)
 		// Insert terminal rows already old: the updated_at trigger only fires on
 		// UPDATE, and the app role must not need table ownership for DDL.
 		_, err = h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
-			    url, secret_ciphertext, status, max_attempts, updated_at)
-			SELECT $1, $2, 'evt_purge_' || g, 'https://receiver.example/purge',
-			       'sealed', CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3,
-			       now() - interval '40 days'
+			    secret_id, url, status, max_attempts, updated_at, delivered_at)
+			SELECT $1, $2, ('0192c9b0-7e4a-7000-8001-' || lpad(g::text, 12, '0'))::uuid, $3, 'https://receiver.example/purge',
+			       CASE WHEN g % 2 = 0 THEN 'succeeded' ELSE 'dead' END, 3,
+			       now() - interval '40 days',
+			       CASE WHEN g % 2 = 0 THEN now() - interval '40 days' ELSE NULL END
 			FROM generate_series(1, 1500) AS g`,
-			h.tenantA, endpoint.ID)
+			h.tenantA, endpoint.ID, secretID)
 		require.NoError(t, err)
 		_, err = h.pool.Exec(ctx, `
 			INSERT INTO webhook_deliveries (tenant_id, endpoint_id, event_id,
-			    url, secret_ciphertext, status, max_attempts)
-			VALUES ($1, $2, 'evt_purge_pending', 'https://receiver.example/purge', 'sealed', 'pending', 3)`,
-			h.tenantA, endpoint.ID)
+			    secret_id, url, status, max_attempts)
+			VALUES ($1, $2, $3, $4, 'https://receiver.example/purge', 'pending', 3)`,
+			h.tenantA, endpoint.ID, purgePending, secretID)
 		require.NoError(t, err)
 		purged, err := h.repo.PurgeDeliveries(ctx, 30)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1500), purged, "every terminal row is purged across batches")
 		var pending int
 		require.NoError(t, h.pool.QueryRow(ctx,
-			`SELECT count(*)::int FROM webhook_deliveries WHERE event_id LIKE 'evt_purge_%'`,
-		).Scan(&pending))
+			`SELECT count(*)::int FROM webhook_deliveries WHERE tenant_id = $1 AND endpoint_id = $2`,
+			h.tenantA, endpoint.ID).Scan(&pending))
 		assert.Equal(t, 1, pending, "pending deliveries are never purged")
 
 		purgedEvents, err := h.repo.PurgeOrphanEvents(ctx, 30)
@@ -932,7 +944,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 		assert.Equal(t, int64(1500), purgedEvents, "every unreferenced old event is purged across batches")
 		var left []string
 		rows, err := h.pool.Query(ctx,
-			`SELECT event_id FROM webhook_events WHERE event_id LIKE 'evt_purge_%' ORDER BY event_id`)
+			`SELECT event_id::text FROM webhook_events WHERE event_type = 'purge.old' AND tenant_id = $1 ORDER BY event_id`, h.tenantA)
 		require.NoError(t, err)
 		defer rows.Close()
 		for rows.Next() {
@@ -941,7 +953,7 @@ func TestWebhooks_EndToEnd(t *testing.T) {
 			left = append(left, id)
 		}
 		require.NoError(t, rows.Err())
-		assert.Equal(t, []string{"evt_purge_fresh", "evt_purge_pending"}, left,
+		assert.Equal(t, []string{purgePending.String(), purgeFresh.String()}, left,
 			"a referenced event and an event younger than the window are kept")
 	})
 }
@@ -962,9 +974,9 @@ func (h *webhookHarness) doBytes(t *testing.T, method, path string, body []byte,
 	return resp.StatusCode, respBody, resp.Header.Clone()
 }
 
-func (h *webhookHarness) deliveryID(t *testing.T, eventID string) int64 {
+func (h *webhookHarness) deliveryID(t *testing.T, eventID uuid.UUID) uuid.UUID {
 	t.Helper()
-	var id int64
+	var id uuid.UUID
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT id FROM webhook_deliveries WHERE tenant_id = $1 AND event_id = $2`,
 		h.tenantA, eventID,
@@ -980,7 +992,7 @@ func TestWebhooks_OutcomeWritesAreFencedByAttempt(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), h.tenantA)
 	h.createEndpoint(t, h.tokenA, "http://127.0.0.1:9/hook", "fence.test")
 
-	event := testEnvelope("evt_fence", "fence.test", h.tenantA)
+	event := testEnvelope(testEventID(9), "fence.test", h.tenantA)
 	created, err := h.dispatcher.Dispatch(ctx, event)
 	require.NoError(t, err)
 	require.Equal(t, 1, created)
@@ -1037,7 +1049,7 @@ func TestWebhooks_EndpointSecretRotationGraceRows(t *testing.T) {
 		t.Helper()
 		key := "rotate-grace-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 		status, body, _ := h.do(t, http.MethodPost,
-			fmt.Sprintf("/api/v1/webhooks/endpoints/%d/rotate-secret", endpoint.ID), h.tokenA, nil,
+			fmt.Sprintf("/api/v1/webhooks/endpoints/%s/rotate-secret", endpoint.ID), h.tokenA, nil,
 			map[string]string{"Idempotency-Key": key})
 		require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 	}
@@ -1097,8 +1109,8 @@ func TestWebhooks_EndpointUpdateRepointsPendingDeliveries(t *testing.T) {
 	oldURL := "https://receiver.example/old-hook"
 	endpoint := h.createEndpoint(t, h.tokenA, oldURL, "move.event")
 
-	pendingEvent := testEnvelope("evt_move_pending", "move.event", h.tenantA)
-	doneEvent := testEnvelope("evt_move_done", "move.event", h.tenantA)
+	pendingEvent := testEnvelope(testEventID(10), "move.event", h.tenantA)
+	doneEvent := testEnvelope(testEventID(11), "move.event", h.tenantA)
 	for _, event := range []events.Event{pendingEvent, doneEvent} {
 		created, err := h.dispatcher.Dispatch(ctx, event)
 		require.NoError(t, err)
@@ -1111,10 +1123,10 @@ func TestWebhooks_EndpointUpdateRepointsPendingDeliveries(t *testing.T) {
 	require.NoError(t, err)
 
 	newURL := "https://receiver.example/new-hook"
-	status, body, _ := h.do(t, http.MethodPut,
-		fmt.Sprintf("/api/v1/webhooks/endpoints/%d", endpoint.ID), h.tokenA, map[string]any{
+	status, body, _ := h.do(t, http.MethodPatch,
+		fmt.Sprintf("/api/v1/webhooks/endpoints/%s", endpoint.ID), h.tokenA, map[string]any{
 			"url": newURL, "status": "active", "eventTypes": []string{"move.event"}, "timeoutMs": 5000,
-		}, nil)
+		}, map[string]string{"Content-Type": "application/merge-patch+json"})
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 
 	var pendingURL, doneURL string
@@ -1156,13 +1168,13 @@ func TestWebhooks_ReplayKeepsOriginalWebhookID(t *testing.T) {
 	defer server.Close()
 
 	h.createEndpoint(t, h.tokenA, server.URL, "replay.event")
-	event := testEnvelope("evt_replay_original", "replay.event", h.tenantA)
+	event := testEnvelope(testEventID(12), "replay.event", h.tenantA)
 	created, err := h.dispatcher.Dispatch(ctx, event)
 	require.NoError(t, err)
 	require.Equal(t, 1, created)
 	originalID := h.deliveryID(t, event.ID)
 
-	run := func(deliveryID int64) {
+	run := func(deliveryID uuid.UUID) {
 		t.Helper()
 		payload, err := json.Marshal(webhookservice.DeliveryJobPayload{DeliveryID: deliveryID})
 		require.NoError(t, err)
@@ -1171,11 +1183,11 @@ func TestWebhooks_ReplayKeepsOriginalWebhookID(t *testing.T) {
 	run(originalID)
 
 	status, body, _ := h.do(t, http.MethodPost,
-		fmt.Sprintf("/api/v1/webhooks/deliveries/%d/replay", originalID), h.tokenA, nil, nil)
-	require.Equal(t, fiber.StatusCreated, status, "body: %s", body)
+		fmt.Sprintf("/api/v1/webhooks/deliveries/%s/replay", originalID), h.tokenA, nil, nil)
+	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 	replayed := decodeJSON[deliveryDTO](t, body)
 	assert.NotEqual(t, originalID, replayed.ID)
-	assert.Equal(t, "evt_replay_original", replayed.EventID,
+	assert.Equal(t, event.ID.String(), replayed.EventID,
 		"a replay references the original event so webhook-id stays stable")
 	run(replayed.ID)
 
@@ -1183,14 +1195,28 @@ func TestWebhooks_ReplayKeepsOriginalWebhookID(t *testing.T) {
 	defer mu.Unlock()
 	require.Len(t, deliveries, 2)
 	for i, delivery := range deliveries {
-		assert.Equal(t, "evt_replay_original", delivery.id, "delivery %d webhook-id", i)
-		assert.Equal(t, "evt_replay_original", delivery.body["id"], "delivery %d body id", i)
+		assert.Equal(t, event.ID.String(), delivery.id, "delivery %d webhook-id", i)
+		assert.Equal(t, event.ID.String(), delivery.body["id"], "delivery %d body id", i)
 	}
 }
 
 // testEnvelope is a minimal valid event envelope for dispatcher tests. An
 // empty id is filled in by the bus on publish.
-func testEnvelope(id, eventType string, tenantID int64) events.Event {
+
+// purgePending and purgeFresh are the two unreferenced/live rows the retention
+// test expects to survive the purge.
+var (
+	purgePending = testEventID(1501)
+	purgeFresh   = testEventID(1502)
+)
+
+// testEventID builds a fixed UUID for an outbound test event: envelope ids and
+// webhook_events.event_id are UUIDs now.
+func testEventID(n uint64) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
+}
+
+func testEnvelope(id uuid.UUID, eventType string, tenantID uuid.UUID) events.Event {
 	return events.Event{
 		ID:          id,
 		Type:        eventType,

@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 const (
@@ -25,9 +27,9 @@ const (
 // Claims are the access-token claims the validator checks. Tokens minted
 // before tenant-scoped RBAC may still carry a role claim; it is ignored.
 type Claims struct {
-	UserID       int64
-	TenantID     int64
-	SessionID    int64
+	UserID       uuid.UUID
+	TenantID     uuid.UUID
+	SessionID    uuid.UUID
 	TokenVersion int32
 }
 
@@ -35,7 +37,7 @@ type Claims struct {
 // the identity module (see StateReader).
 type State struct {
 	// TenantID is the session's tenant; it must equal the token's claim.
-	TenantID     int64
+	TenantID     uuid.UUID
 	Role         string
 	Permissions  []string
 	Platform     bool
@@ -47,6 +49,10 @@ type State struct {
 	// login or step-up); the zero time means never. AAL2-gated routes compare
 	// it with MFA_MAX_AGE.
 	MFAVerifiedAt time.Time
+	// AMR is the session's current authentication-method set. It is
+	// authoritative for step-up: a passkey step-up adds hwk/swk to the live
+	// session, and the validator unions it with the token snapshot.
+	AMR []string
 	// Active is true when the session is not revoked, the membership is
 	// active, and the user is active.
 	Active bool
@@ -59,7 +65,7 @@ type State struct {
 // generated SQL types. Implementations return apperror.ErrNotFound for an
 // unknown session or a session of another user.
 type StateReader interface {
-	SessionState(ctx context.Context, sessionID, userID int64) (State, error)
+	SessionState(ctx context.Context, sessionID, userID uuid.UUID) (State, error)
 }
 
 // Store validates a token against its session and returns the current state,
@@ -67,19 +73,20 @@ type StateReader interface {
 type Store interface {
 	Validate(ctx context.Context, claims Claims) (State, error)
 	// Invalidate drops every cached snapshot of the user's sessions.
-	Invalidate(ctx context.Context, userID int64) error
+	Invalidate(ctx context.Context, userID uuid.UUID) error
 	// InvalidatePermissions drops every cached permission snapshot.
 	InvalidatePermissions(ctx context.Context) error
 }
 
 type snapshot struct {
-	TenantID      int64     `json:"tenantId"`
+	TenantID      uuid.UUID `json:"tenantId"`
 	Role          string    `json:"role"`
 	Permissions   []string  `json:"permissions"`
 	Platform      bool      `json:"platform"`
 	TokenVersion  int32     `json:"tokenVersion"`
 	ExpiresAt     time.Time `json:"expiresAt"`
 	MFAVerifiedAt time.Time `json:"mfaVerifiedAt"`
+	AMR           []string  `json:"amr,omitempty"`
 	Active        bool      `json:"active"`
 	TenantActive  bool      `json:"tenantActive"`
 }
@@ -95,14 +102,14 @@ func NewStore(states StateReader, appCache cache.Cache) Store {
 	return &store{states: states, cache: appCache}
 }
 
-func generationKey(userID int64) string {
-	return fmt.Sprintf("session:generation:%d", userID)
+func generationKey(userID uuid.UUID) string {
+	return "session:generation:" + userID.String()
 }
 
 const permissionsGenerationKey = "session:permissions_generation"
 
-func snapshotKey(userID, generation, permissionGeneration, sessionID int64) string {
-	return fmt.Sprintf("session:user:%d:%d:%d:%d", userID, generation, permissionGeneration, sessionID)
+func snapshotKey(userID uuid.UUID, generation, permissionGeneration int64, sessionID uuid.UUID) string {
+	return fmt.Sprintf("session:user:%s:%d:%d:%s", userID, generation, permissionGeneration, sessionID)
 }
 
 // currentGeneration reads a monotonically increasing counter. A snapshot is
@@ -125,10 +132,10 @@ func (s *store) currentGeneration(ctx context.Context, key string) int64 {
 }
 
 func (s *store) Validate(ctx context.Context, claims Claims) (State, error) {
-	if claims.TenantID <= 0 {
+	if claims.TenantID == uuid.Nil {
 		return State{}, apperror.NewUnauthorized("token is missing tenant")
 	}
-	if claims.SessionID <= 0 {
+	if claims.SessionID == uuid.Nil {
 		return State{}, apperror.NewUnauthorized("token is missing session")
 	}
 	generation := s.currentGeneration(ctx, generationKey(claims.UserID))
@@ -157,7 +164,7 @@ func (s *store) Validate(ctx context.Context, claims Claims) (State, error) {
 		if data, err := json.Marshal(snap); err == nil {
 			if err := s.cache.Set(ctx, key, data, cacheTTL); err != nil {
 				slog.Warn("failed to cache session snapshot",
-					slog.Int64("user_id", claims.UserID),
+					slog.String("user_id", claims.UserID.String()),
 					slog.Any("error", err),
 				)
 			}
@@ -188,7 +195,7 @@ func stateOf(snap snapshot, claims Claims) (State, error) {
 	return state, nil
 }
 
-func (s *store) Invalidate(ctx context.Context, userID int64) error {
+func (s *store) Invalidate(ctx context.Context, userID uuid.UUID) error {
 	return s.bump(ctx, generationKey(userID))
 }
 

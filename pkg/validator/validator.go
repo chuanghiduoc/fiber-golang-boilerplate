@@ -16,12 +16,11 @@ import (
 )
 
 // Password policy bounds (NIST SP 800-63B): length in runes, never
-// composition rules. The byte ceiling is bcrypt's 72-byte input limit; a
-// longer password would be silently truncated by bcrypt.
+// composition rules. Argon2id has no bcrypt-style input truncation, so there
+// is no separate byte ceiling.
 const (
 	MinPasswordRunes = 12
 	MaxPasswordRunes = 64
-	MaxPasswordBytes = 72
 	// minEmailLocalPartRunes ignores a one- or two-character local part: it
 	// would match almost any password and make the check unusable.
 	minEmailLocalPartRunes = 3
@@ -81,9 +80,9 @@ func instance() *validator.Validate {
 // operation: NFKC folds compatibility variants (ligatures, full-width forms,
 // combined marks) to one representation, so a password set and offered with
 // two visually identical spellings compares equal. It is applied to both the
-// stored input (bcrypt) and the offered one. There is no deployed database, so
-// this intentionally changes the hashing input; any hash created before this
-// change would have to be re-set.
+// stored input (Argon2id) and the offered one. There is no deployed database,
+// so this intentionally changes the hashing input; any hash created before
+// this change would have to be re-set.
 func NormalizePassword(password string) string {
 	return norm.NFKC.String(password)
 }
@@ -98,8 +97,6 @@ func PasswordWeakness(password string) string {
 	case utf8.RuneCountInString(normalized) < MinPasswordRunes:
 		return CodeWeakPassword
 	case utf8.RuneCountInString(normalized) > MaxPasswordRunes:
-		return CodeWeakPassword
-	case len(normalized) > MaxPasswordBytes:
 		return CodeWeakPassword
 	case isRepetitivePassword(normalized):
 		return CodePasswordRepeated
@@ -340,7 +337,7 @@ func formatError(fe validator.FieldError, path string) string {
 	case "max":
 		return fmt.Sprintf("%s must be at most %s characters", path, fe.Param())
 	case "password":
-		return fmt.Sprintf("%s must be 12-64 characters (at most 72 bytes, the bcrypt limit) and must not be a commonly used password", path)
+		return fmt.Sprintf("%s must be 12-64 characters and must not be a commonly used password", path)
 	case "notblank":
 		return fmt.Sprintf("%s must not be blank", path)
 	default:

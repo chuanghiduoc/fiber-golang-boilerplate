@@ -7,16 +7,18 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
+
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 )
 
 // Key is one API key's non-secret metadata.
 type Key struct {
-	ID                 int64
+	ID                 uuid.UUID
 	Name               string
 	Prefix             string
 	Scopes             []string
-	ExpiresAt          *time.Time
+	ExpiresAt          time.Time
 	RevokedAt          *time.Time
 	RotatedAt          *time.Time
 	RotationGraceUntil *time.Time
@@ -27,8 +29,8 @@ type Key struct {
 
 // Store is the module's privacy persistence port.
 type Store interface {
-	List(ctx context.Context, tenantID, userID int64) ([]Key, error)
-	DeleteAll(ctx context.Context, tenantID, userID int64) error
+	List(ctx context.Context, tenantID, userID uuid.UUID) ([]Key, error)
+	DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error
 }
 
 // Provider implements privacy.Exporter and privacy.Eraser.
@@ -38,17 +40,17 @@ type Provider struct {
 
 func New(store Store) *Provider { return &Provider{store: store} }
 
-func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacycontracts.Section, error) {
+func (p *Provider) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	keys, err := p.store.List(ctx, tenantID, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
 	}
 	type keyExport struct {
-		ID                 int64      `json:"id"`
+		ID                 uuid.UUID  `json:"id"`
 		Name               string     `json:"name"`
 		Prefix             string     `json:"prefix"`
 		Scopes             []string   `json:"scopes"`
-		ExpiresAt          *time.Time `json:"expiresAt,omitempty"`
+		ExpiresAt          time.Time  `json:"expiresAt"`
 		RevokedAt          *time.Time `json:"revokedAt,omitempty"`
 		RotatedAt          *time.Time `json:"rotatedAt,omitempty"`
 		RotationGraceUntil *time.Time `json:"rotationGraceUntil,omitempty"`
@@ -72,6 +74,6 @@ func (p *Provider) Export(ctx context.Context, tenantID, userID int64) (privacyc
 	return privacycontracts.Section{Name: "apikeys", Data: raw}, nil
 }
 
-func (p *Provider) Erase(ctx context.Context, tenantID, userID int64) error {
+func (p *Provider) Erase(ctx context.Context, tenantID, userID uuid.UUID) error {
 	return p.store.DeleteAll(ctx, tenantID, userID)
 }

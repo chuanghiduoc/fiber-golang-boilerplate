@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const createUser = `-- name: CreateUser :one
@@ -45,10 +47,10 @@ VALUES ($1, $2, $3, $4)
 `
 
 type CreateUserIdentityParams struct {
-	UserID   int64  `json:"user_id"`
-	Provider string `json:"provider"`
-	Subject  string `json:"subject"`
-	Email    string `json:"email"`
+	UserID   uuid.UUID `json:"user_id"`
+	Provider string    `json:"provider"`
+	Subject  string    `json:"subject"`
+	Email    string    `json:"email"`
 }
 
 func (q *Queries) CreateUserIdentity(ctx context.Context, arg CreateUserIdentityParams) error {
@@ -67,8 +69,8 @@ VALUES ($1, $2)
 `
 
 type CreateUserPasswordParams struct {
-	UserID       int64  `json:"user_id"`
-	PasswordHash string `json:"password_hash"`
+	UserID       uuid.UUID `json:"user_id"`
+	PasswordHash string    `json:"password_hash"`
 }
 
 func (q *Queries) CreateUserPassword(ctx context.Context, arg CreateUserPasswordParams) error {
@@ -125,7 +127,7 @@ type GetUserByIDRow struct {
 // Global user identities. These queries are deliberately not
 // tenant-scoped: a user exists once across tenants. Tenant-facing reads go
 // through membership.sql, which always filters by tenant_id.
-func (q *Queries) GetUserByID(ctx context.Context, id int64) (GetUserByIDRow, error) {
+func (q *Queries) GetUserByID(ctx context.Context, id uuid.UUID) (GetUserByIDRow, error) {
 	row := q.db.QueryRow(ctx, getUserByID, id)
 	var i GetUserByIDRow
 	err := row.Scan(
@@ -188,7 +190,7 @@ JOIN users u ON u.id = p.user_id
 WHERE p.user_id = $1 AND u.status <> 'deleted'
 `
 
-func (q *Queries) GetUserPasswordHash(ctx context.Context, userID int64) (string, error) {
+func (q *Queries) GetUserPasswordHash(ctx context.Context, userID uuid.UUID) (string, error) {
 	row := q.db.QueryRow(ctx, getUserPasswordHash, userID)
 	var password_hash string
 	err := row.Scan(&password_hash)
@@ -203,7 +205,7 @@ WHERE id = $1 AND status <> 'deleted'
 RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
-func (q *Queries) MarkUserDeleted(ctx context.Context, id int64) (User, error) {
+func (q *Queries) MarkUserDeleted(ctx context.Context, id uuid.UUID) (User, error) {
 	row := q.db.QueryRow(ctx, markUserDeleted, id)
 	var i User
 	err := row.Scan(
@@ -231,7 +233,7 @@ RETURNING id, email, name, email_verified_at, status, token_version, credentials
 
 // A password set/reset ends every access token and session of the user in
 // every tenant and invalidates reset links issued before it.
-func (q *Queries) RecordUserCredentialChange(ctx context.Context, id int64) (User, error) {
+func (q *Queries) RecordUserCredentialChange(ctx context.Context, id uuid.UUID) (User, error) {
 	row := q.db.QueryRow(ctx, recordUserCredentialChange, id)
 	var i User
 	err := row.Scan(
@@ -249,6 +251,30 @@ func (q *Queries) RecordUserCredentialChange(ctx context.Context, id int64) (Use
 	return i, err
 }
 
+const rehashUserPassword = `-- name: RehashUserPassword :execrows
+UPDATE user_passwords
+SET password_hash = $1
+WHERE user_id = $2 AND password_hash = $3
+`
+
+type RehashUserPasswordParams struct {
+	NewHash     string    `json:"new_hash"`
+	UserID      uuid.UUID `json:"user_id"`
+	CurrentHash string    `json:"current_hash"`
+}
+
+// A successful sign-in may upgrade a hash written under older cost parameters
+// without a credential change (no token_version bump). It is conditional on
+// the hash that verified, so a concurrent password change wins and the stale
+// upgrade never overwrites the new credential.
+func (q *Queries) RehashUserPassword(ctx context.Context, arg RehashUserPasswordParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rehashUserPassword, arg.NewHash, arg.UserID, arg.CurrentHash)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeUserTokens = `-- name: RevokeUserTokens :one
 UPDATE users
 SET token_version = token_version + 1
@@ -256,7 +282,7 @@ WHERE id = $1 AND status <> 'deleted'
 RETURNING id, email, name, email_verified_at, status, token_version, credentials_changed_at, created_at, updated_at, deleted_at
 `
 
-func (q *Queries) RevokeUserTokens(ctx context.Context, id int64) (User, error) {
+func (q *Queries) RevokeUserTokens(ctx context.Context, id uuid.UUID) (User, error) {
 	row := q.db.QueryRow(ctx, revokeUserTokens, id)
 	var i User
 	err := row.Scan(
@@ -298,10 +324,10 @@ RETURNING id, email, name, email_verified_at, status, token_version, credentials
 `
 
 type UpdateUserProfileParams struct {
-	Name        string `json:"name"`
-	UpdateEmail bool   `json:"update_email"`
-	Email       string `json:"email"`
-	ID          int64  `json:"id"`
+	Name        string    `json:"name"`
+	UpdateEmail bool      `json:"update_email"`
+	Email       string    `json:"email"`
+	ID          uuid.UUID `json:"id"`
 }
 
 func (q *Queries) UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (User, error) {
@@ -332,12 +358,12 @@ INSERT INTO user_passwords (user_id, password_hash)
 VALUES ($1, $2)
 ON CONFLICT (user_id) DO UPDATE
 SET password_hash = EXCLUDED.password_hash,
-    changed_at = NOW()
+    updated_at = NOW()
 `
 
 type UpsertUserPasswordParams struct {
-	UserID       int64  `json:"user_id"`
-	PasswordHash string `json:"password_hash"`
+	UserID       uuid.UUID `json:"user_id"`
+	PasswordHash string    `json:"password_hash"`
 }
 
 func (q *Queries) UpsertUserPassword(ctx context.Context, arg UpsertUserPasswordParams) error {
@@ -352,8 +378,8 @@ RETURNING id, email, name, email_verified_at, status, token_version, credentials
 `
 
 type VerifyUserEmailParams struct {
-	ID    int64  `json:"id"`
-	Email string `json:"email"`
+	ID    uuid.UUID `json:"id"`
+	Email string    `json:"email"`
 }
 
 func (q *Queries) VerifyUserEmail(ctx context.Context, arg VerifyUserEmailParams) (User, error) {

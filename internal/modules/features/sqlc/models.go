@@ -5,6 +5,7 @@
 package sqlc
 
 import (
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -18,10 +19,10 @@ type FeatureFlag struct {
 }
 
 type FeatureFlagTarget struct {
-	ID        int64              `json:"id"`
+	ID        uuid.UUID          `json:"id"`
 	FlagKey   string             `json:"flag_key"`
-	TenantID  int64              `json:"tenant_id"`
-	UserID    pgtype.Int8        `json:"user_id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	UserID    uuid.NullUUID      `json:"user_id"`
 	Enabled   bool               `json:"enabled"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt pgtype.Timestamptz `json:"updated_at"`

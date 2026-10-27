@@ -2,8 +2,9 @@ package repository
 
 import (
 	"context"
-	"strconv"
 	"time"
+
+	"github.com/google/uuid"
 
 	webhooksprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/privacy"
 	webhookssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/sqlc"
@@ -20,9 +21,9 @@ func NewPrivacyStore(db webhookssqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: webhookssqlc.New(db)}
 }
 
-func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID int64) ([]webhooksprivacy.Event, error) {
+func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID uuid.UUID) ([]webhooksprivacy.Event, error) {
 	rows, err := s.q.ListUserWebhookEvents(ctx, webhookssqlc.ListUserWebhookEventsParams{
-		TenantID: tenantID, UserID: strconv.FormatInt(userID, 10),
+		TenantID: tenantID, UserID: userID,
 	})
 	if err != nil {
 		return nil, err
@@ -31,7 +32,7 @@ func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID int64) (
 	for i, row := range rows {
 		out[i] = webhooksprivacy.Event{
 			ID: row.EventID, Type: row.EventType, DataVersion: row.DataVersion,
-			ActorType: row.ActorType, ActorID: row.ActorID.String,
+			ActorType: row.ActorType, ActorID: uuidString(row.ActorID),
 			OccurredAt: row.OccurredAt.Time, Payload: row.Payload,
 			CreatedAt: row.CreatedAt.Time,
 		}
@@ -39,9 +40,9 @@ func (s *PrivacyStore) ListEvents(ctx context.Context, tenantID, userID int64) (
 	return out, nil
 }
 
-func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID int64) ([]webhooksprivacy.Delivery, error) {
+func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID uuid.UUID) ([]webhooksprivacy.Delivery, error) {
 	rows, err := s.q.ListUserWebhookDeliveries(ctx, webhookssqlc.ListUserWebhookDeliveriesParams{
-		TenantID: tenantID, UserID: strconv.FormatInt(userID, 10),
+		TenantID: tenantID, UserID: userID,
 	})
 	if err != nil {
 		return nil, err
@@ -64,15 +65,14 @@ func (s *PrivacyStore) ListDeliveries(ctx context.Context, tenantID, userID int6
 	return out, nil
 }
 
-func (s *PrivacyStore) DeleteEvents(ctx context.Context, tenantID, userID int64) error {
-	user := strconv.FormatInt(userID, 10)
+func (s *PrivacyStore) DeleteEvents(ctx context.Context, tenantID, userID uuid.UUID) error {
 	if err := s.q.DeleteUserWebhookDeliveries(ctx, webhookssqlc.DeleteUserWebhookDeliveriesParams{
-		TenantID: tenantID, UserID: user,
+		TenantID: tenantID, UserID: userID,
 	}); err != nil {
 		return err
 	}
 	return s.q.DeleteUserWebhookEvents(ctx, webhookssqlc.DeleteUserWebhookEventsParams{
-		TenantID: tenantID, UserID: user,
+		TenantID: tenantID, UserID: userID,
 	})
 }
 

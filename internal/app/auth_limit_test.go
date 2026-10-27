@@ -8,12 +8,15 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -21,35 +24,39 @@ import (
 // flood of bogus credentials against the real store.
 type countingKeyStore struct{ lookups atomic.Int32 }
 
-func (s *countingKeyStore) FindByHash(context.Context, string) (apikey.Key, error) {
+func (s *countingKeyStore) FindByHash(context.Context, []byte) (apikey.Key, error) {
 	s.lookups.Add(1)
 	return apikey.Key{}, apperror.ErrNotFound
 }
 
-func (*countingKeyStore) TouchLastUsed(context.Context, int64, time.Time) error { return nil }
+func (*countingKeyStore) TouchLastUsed(context.Context, uuid.UUID, time.Time) error { return nil }
 
 type protectedModule struct{}
 
 func (protectedModule) Name() string { return "protected" }
-func (protectedModule) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	group := v1.Group("/protected", deps.Authenticate(), deps.Limiters.Normal)
-	group.Get("/", func(c fiber.Ctx) error { return c.SendString("ok") })
+func (protectedModule) RegisterRoutes(api *httpapi.API, _ app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/protected", OperationID: "getProtected",
+		Tags: []string{"test"}, Summary: "Protected",
+	}, httpapi.Policy{Permission: authz.PermissionAdminUsersRead}, func(context.Context, *struct{}) (*struct{}, error) {
+		return &struct{}{}, nil
+	})
 }
 
 func TestAuthenticateLimitsPerIPBeforeVerifying(t *testing.T) {
 	const authMax = 3
 	store := &countingKeyStore{}
 	cfg := &config.Config{
-		App:  config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5},
-		CORS: config.CORSConfig{AllowOrigins: "*"},
+		App:  config.AppConfig{Env: "production", BodyLimit: 1 << 20, RequestTimeout: 5 * time.Second},
+		CORS: config.CORSConfig{AllowOrigins: []string{"*"}},
 		RateLimit: config.RateLimitConfig{
-			StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60,
+			StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second,
 			// A long window keeps a boundary crossing out of this short test.
-			AuthMax: authMax, AuthWindow: 3600,
+			AuthMax: authMax, AuthWindow: 3600 * time.Second,
 		},
 		Tenant: config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{APIKeyVerifier: apikey.NewVerifier(store, nil)})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}, APIKeyVerifier: apikey.NewVerifier(store, nil)})
 	application.Register(protectedModule{})
 
 	creds, err := apikey.Generate()

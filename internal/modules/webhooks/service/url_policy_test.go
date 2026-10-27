@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/webhook"
 )
@@ -28,14 +29,14 @@ func (s *recordingEndpointStore) CreateEndpoint(_ context.Context, draft CreateE
 	if draft.SealSecret == nil {
 		return nil, errors.New("missing secret sealer")
 	}
-	ciphertext, err := draft.SealSecret(9)
+	ciphertext, err := draft.SealSecret(testID(9))
 	if err != nil {
 		return nil, err
 	}
 	if ciphertext == "" {
 		return nil, errors.New("empty secret ciphertext")
 	}
-	return &Endpoint{ID: 9, URL: draft.URL, EventTypes: draft.EventTypes, Status: draft.Status}, nil
+	return &Endpoint{ID: testID(9), URL: draft.URL, EventTypes: draft.EventTypes, Status: draft.Status}, nil
 }
 
 func (s *recordingEndpointStore) UpdateEndpoint(_ context.Context, draft UpdateEndpointDraft) (*Endpoint, error) {
@@ -55,15 +56,15 @@ func TestService_EndpointURLPortPolicy(t *testing.T) {
 	guard = guard.WithLookupIP(publicLookup)
 	store := &recordingEndpointStore{}
 	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard})
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
 	for _, raw := range []string{
 		"https://receiver.example:6379/hook",
 		"http://receiver.example:6379/hook",
 	} {
-		_, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: raw})
+		_, _, err := svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: raw})
 		var appErr *apperror.AppError
-		if !errors.As(err, &appErr) || appErr.Status != 400 {
+		if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 			t.Fatalf("CreateEndpoint(%q) error = %v, want 400", raw, err)
 		}
 		if appErr.Code != string(webhookscatalog.CodeWebhookPortNotAllowed) {
@@ -77,7 +78,7 @@ func TestService_EndpointURLPortPolicy(t *testing.T) {
 	// Implicit ports use the scheme default (443/80) and are allowed, as is
 	// the configured extension port.
 	for _, raw := range []string{"https://receiver.example/hook", "http://receiver.example/hook", "https://receiver.example:8443/hook"} {
-		if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: raw}); err != nil {
+		if _, _, err := svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: raw}); err != nil {
 			t.Fatalf("CreateEndpoint(%q) rejected: %v", raw, err)
 		}
 	}
@@ -85,7 +86,7 @@ func TestService_EndpointURLPortPolicy(t *testing.T) {
 		t.Fatalf("created = %d, want 3", store.created)
 	}
 
-	_, err = svc.UpdateEndpoint(ctx, 1, 9, UpdateEndpointInput{URL: "https://receiver.example:6379/hook", EventTypes: []string{"*"}, Status: StatusActive})
+	_, err = svc.UpdateEndpoint(ctx, testID(1), testID(9), UpdateEndpointInput{URL: "https://receiver.example:6379/hook", EventTypes: []string{"*"}, Status: StatusActive})
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Code != string(webhookscatalog.CodeWebhookPortNotAllowed) {
 		t.Fatalf("UpdateEndpoint port error = %v, want %q", err, webhookscatalog.CodeWebhookPortNotAllowed)
@@ -111,31 +112,31 @@ func TestService_EndpointURLDNSValidated(t *testing.T) {
 		if host == "internal.example" {
 			return []net.IPAddr{{IP: net.ParseIP("10.0.0.5")}}, nil
 		}
-		return publicLookup(context.Background(), host)
+		return publicLookup(tenant.WithID(context.Background(), tenant.DefaultID), host)
 	})
 	store := &recordingEndpointStore{}
 	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard})
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, _, err = svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://internal.example/hook"})
+	_, _, err = svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: "https://internal.example/hook"})
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("internal target error = %v, want 400", err)
 	}
 	if store.created != 0 {
 		t.Fatal("a blocked target must not reach the store")
 	}
-	_, err = svc.UpdateEndpoint(ctx, 1, 9, UpdateEndpointInput{
+	_, err = svc.UpdateEndpoint(ctx, testID(1), testID(9), UpdateEndpointInput{
 		URL: "https://internal.example/hook", EventTypes: []string{"*"}, Status: StatusActive,
 	})
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("internal update error = %v, want 400", err)
 	}
 	if store.updated != 0 {
 		t.Fatal("a blocked update must not reach the store")
 	}
 
-	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
+	if _, _, err := svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
 		t.Fatalf("public target rejected: %v", err)
 	}
 }
@@ -152,21 +153,21 @@ func TestService_RequireHTTPSSetting(t *testing.T) {
 	guard = guard.WithLookupIP(publicLookup)
 	store := &recordingEndpointStore{}
 	svc := New(store, nil, nil, codec, nil, Options{URLGuard: guard, RequireHTTPS: true})
-	ctx := context.Background()
+	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
-	_, _, err = svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "http://receiver.example/hook"})
+	_, _, err = svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: "http://receiver.example/hook"})
 	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || appErr.Status != 400 {
+	if !errors.As(err, &appErr) || resolvedStatus(appErr) != 400 {
 		t.Fatalf("http target error = %v, want 400", err)
 	}
-	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
+	if _, _, err := svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: "https://receiver.example/hook"}); err != nil {
 		t.Fatalf("https target rejected: %v", err)
 	}
 
 	// The default keeps http available outside production.
 	store = &recordingEndpointStore{}
 	svc = New(store, nil, nil, codec, nil, Options{URLGuard: guard})
-	if _, _, err := svc.CreateEndpoint(ctx, 1, CreateEndpointInput{URL: "http://receiver.example/hook"}); err != nil {
+	if _, _, err := svc.CreateEndpoint(ctx, testID(1), CreateEndpointInput{URL: "http://receiver.example/hook"}); err != nil {
 		t.Fatalf("default policy rejected http: %v", err)
 	}
 }

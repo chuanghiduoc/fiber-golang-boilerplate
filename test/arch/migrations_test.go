@@ -72,6 +72,9 @@ func TestMigrationFilesArePairedAndUnique(t *testing.T) {
 			t.Errorf("migrations/%s: subdirectories are not migrations", entry.Name())
 			continue
 		}
+		if entry.Name() == "schema.snapshot.sql" {
+			continue // committed catalog snapshot, not a migration
+		}
 		names = append(names, entry.Name())
 	}
 	for _, problem := range migrationProblems(names, migrationOwnerSet(t, root)) {

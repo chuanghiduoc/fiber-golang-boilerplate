@@ -18,7 +18,7 @@ import (
 // Settings are the configuration notifications owns.
 type Settings struct {
 	// RetentionDays is how long a read notification is kept after it was
-	// read (NOTIFICATIONS_RETENTION_DAYS). Zero disables the purge (tests);
+	// read (NOTIFICATIONS_RETENTION). Zero disables the purge (tests);
 	// config validates 1..3650.
 	RetentionDays int32
 }
@@ -27,7 +27,13 @@ type Settings struct {
 // Identity supplies the email recipient through the contract, and the queued
 // sender writes the email job into the shared outbox in the same transaction
 // as the in-app row.
-func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLookup, settings Settings) *Module {
+// Deps are the contracts notifications consumes from identity.
+type Deps struct {
+	Recipients identitycontracts.NotificationRecipientLookup
+}
+
+func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
+	recipients := deps.Recipients
 	repo := notificationsrepo.NewNotificationRepository(infra.DB)
 	svc := notificationsservice.NewNotificationService(
 		repo, recipients, infra.Email, notificationsrepo.NewTransactor(infra.Tx, infra.Email))
@@ -39,7 +45,7 @@ func Build(infra app.Infra, recipients identitycontracts.NotificationRecipientLo
 		m.retentionPurger = notificationsservice.NewRetentionPurger(
 			notificationsrepo.NewRetentionRepository(infra.DB), settings.RetentionDays)
 	}
-	return m
+	return m, nil
 }
 
 // Permissions implements app.PermissionProvider.

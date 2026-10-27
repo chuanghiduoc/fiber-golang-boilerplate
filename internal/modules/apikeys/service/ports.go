@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -13,14 +15,14 @@ import (
 // APIKey is the module's persistence-neutral representation. Hash never leaves
 // the module/platform boundary and is never serialized to HTTP clients.
 type APIKey struct {
-	ID                 int64
-	TenantID           int64
-	UserID             int64
+	ID                 uuid.UUID
+	TenantID           uuid.UUID
+	UserID             uuid.UUID
 	Name               string
 	Prefix             string
-	Hash               string
+	Hash               []byte
 	Scopes             []authz.Permission
-	ExpiresAt          *time.Time
+	ExpiresAt          time.Time
 	RevokedAt          *time.Time
 	RotatedAt          *time.Time
 	RotationGraceUntil *time.Time
@@ -30,14 +32,15 @@ type APIKey struct {
 }
 
 // NewKey is the input for creating a key row. The owning tenant is not a
-// field: the repository always takes it from the request context.
+// field: the repository always takes it from the request context. Expiry is
+// required: every key expires.
 type NewKey struct {
-	UserID    int64
+	UserID    uuid.UUID
 	Name      string
 	Prefix    string
-	Hash      string
+	Hash      []byte
 	Scopes    []authz.Permission
-	ExpiresAt *time.Time
+	ExpiresAt time.Time
 }
 
 // CreateInput asks for a new key. The owner is always the authenticated
@@ -64,23 +67,24 @@ type CreatedKey struct {
 // predecessor.
 type RotatedKey struct {
 	CreatedKey
-	PreviousKeyID         int64
+	PreviousKeyID         uuid.UUID
 	PreviousKeyValidUntil time.Time
 }
 
 // APIKeyRepository is the key persistence port. Implementations scope every
-// tenant-facing query to the request tenant (tenant.EffectiveID(ctx)) and
-// return apperror.ErrNotFound when no row matches. GetByHash is the deliberate
+// tenant-facing query to the request tenant (tenant.Require(ctx)) and return
+// apperror.ErrNotFound when no row matches. GetByHash is the deliberate
 // exception: it is the pre-tenant possession lookup.
 type APIKeyRepository interface {
 	Create(ctx context.Context, key NewKey) (*APIKey, error)
-	GetByID(ctx context.Context, id int64) (*APIKey, error)
-	GetByHash(ctx context.Context, hash string) (*APIKey, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*APIKey, error)
+	GetByHash(ctx context.Context, hash []byte) (*APIKey, error)
 	ListCursor(ctx context.Context, cur pagination.DBCursor) ([]APIKey, error)
-	Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*APIKey, error)
-	Revoke(ctx context.Context, id int64) (*APIKey, error)
-	MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*APIKey, error)
-	TouchLastUsed(ctx context.Context, id int64, at time.Time) error
+	ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]APIKey, error)
+	Update(ctx context.Context, id uuid.UUID, name string, scopes []authz.Permission) (*APIKey, error)
+	Revoke(ctx context.Context, id uuid.UUID) (*APIKey, error)
+	MarkRotated(ctx context.Context, id uuid.UUID, graceSeconds int32) (*APIKey, error)
+	TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction, so the
@@ -92,7 +96,7 @@ type AuditWriter interface {
 // PrincipalLocker loads an API-key owner inside the transaction and locks the
 // membership row until the key write commits.
 type PrincipalLocker interface {
-	LockPrincipal(ctx context.Context, tenantID, userID int64) (identitycontracts.Principal, error)
+	LockPrincipal(ctx context.Context, tenantID, userID uuid.UUID) (identitycontracts.Principal, error)
 }
 
 // TxRepos are the collaborators bound to one transaction. Principals is nil

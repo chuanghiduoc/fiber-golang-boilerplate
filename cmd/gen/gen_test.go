@@ -29,7 +29,9 @@ func Build(infra app.Infra) ([]app.Module, error) {
 	// gen:module-build
 
 	_ = admin.Build()
-	// gen:module-purge
+	registerTenantPurgers(tenancyRegistry,
+		// gen:module-purge
+	)
 
 	return []app.Module{
 		admin.Build(),
@@ -182,10 +184,14 @@ func TestRegisterInBootstrapIsIdempotent(t *testing.T) {
 	if once != twice {
 		t.Fatal("a second registration must not change the file")
 	}
-	for _, want := range []string{`"example.com/app/internal/modules/billing"`, "billingModule, _, err := billing.Build(infra, billing.Settings{})", "billingModule.RegisterTenantPurge(tenancyRegistry)", "\t\tbillingModule,\n"} {
+	for _, want := range []string{`"example.com/app/internal/modules/billing"`, "billingModule, err := billing.Build(infra, billing.Settings{}, billing.Deps{})"} {
 		if strings.Count(once, want) != 1 {
 			t.Errorf("want exactly one %q in:\n%s", want, once)
 		}
+	}
+	// Once in the module list and once in the non-identity purger list.
+	if strings.Count(once, "\t\tbillingModule,\n") != 2 {
+		t.Errorf("want billingModule in the module and purger lists:\n%s", once)
 	}
 }
 
@@ -253,13 +259,53 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 	}
 	// gofmt aligns struct fields, so compare with whitespace collapsed.
 	module := strings.Join(strings.Fields(files["internal/modules/billing/module.go"]), " ")
-	for _, want := range []string{"Invoices *billinghandler.InvoiceHandler", "m.registerInvoiceRoutes(group, deps)", "m.registerIssueInvoiceRoute(group, deps)"} {
+	for _, want := range []string{"Invoices *billinghandler.InvoiceHandler", "m.registerInvoiceRoutes(api)", "m.registerIssueInvoiceRoute(api)"} {
 		if !strings.Contains(module, want) {
 			t.Errorf("module.go is missing %q", want)
 		}
 	}
 	if !strings.Contains(files["internal/modules/billing/catalog/locales/vi.json"], "errors.billing.invoice_not_found.title") {
 		t.Error("vi.json is missing the resource error title")
+	}
+	if health := files["internal/modules/billing/service/health_test.go"]; strings.Contains(health, "Context(1)") {
+		t.Error("generated service tests must pass a tenant UUID, not an integer id")
+	}
+	sqlcConfig := files["internal/modules/billing/sqlc.yaml"]
+	if !strings.Contains(sqlcConfig, `schema: ["../../../migrations/*.up.sql"]`) {
+		t.Error("sqlc.yaml must include every up migration so generated resource tables are visible")
+	}
+	for _, want := range []string{`db_type: "uuid"`, `go_type: "github.com/google/uuid.UUID"`, `db_type: "bytea"`} {
+		if !strings.Contains(sqlcConfig, want) {
+			t.Errorf("sqlc.yaml is missing %q:\n%s", want, sqlcConfig)
+		}
+	}
+	for _, path := range []string{
+		"internal/modules/billing/service/invoice.go",
+		"internal/modules/billing/service/invoice_test.go",
+		"internal/modules/billing/repository/invoice.go",
+		"internal/modules/billing/handler/invoice.go",
+		"internal/modules/billing/dto/invoice.go",
+		"internal/modules/billing/invoice_integration_test.go",
+	} {
+		src := files[path]
+		if !strings.Contains(src, "uuid.UUID") {
+			t.Errorf("%s must use uuid.UUID ids", path)
+		}
+		if strings.Contains(src, "int64") {
+			t.Errorf("%s must not use int64 ids", path)
+		}
+		if strings.Contains(src, "id <= 0") {
+			t.Errorf("%s must compare ids with uuid.Nil, not a numeric zero", path)
+		}
+		if strings.Contains(src, "item.ID >=") {
+			t.Errorf("%s must compare UUID ids through String(), not with >=", path)
+		}
+	}
+	if integ := files["internal/modules/billing/invoice_integration_test.go"]; !strings.Contains(integ, "Sessions: integrationSessions{}") {
+		t.Error("generated integration test must wire a session store so authz has the caller's permissions")
+	}
+	if migration := files["migrations/20261025010204_billing_create_invoices.up.sql"]; !strings.Contains(migration, "id UUID PRIMARY KEY DEFAULT uuidv7()") {
+		t.Error("resource migration must use a UUIDv7 primary key")
 	}
 	if !strings.Contains(files["internal/modules/billing/service/ports.go"], `"example.com/app/pkg/pagination"`) {
 		t.Error("ports.go must import pagination for the resource port")
@@ -298,17 +344,17 @@ func TestGenerateEverySliceAndVerify(t *testing.T) {
 		!strings.Contains(purge, "tenancycontracts.PurgeBatchSize") {
 		t.Error("resource repository must include a bounded Tenancy Purger")
 	}
-	if module := files["internal/modules/billing/tenant_purge.go"]; !strings.Contains(module, "RegisterTenantPurge") ||
+	if module := files["internal/modules/billing/tenant_purge.go"]; !strings.Contains(module, "TenantPurgers") ||
 		!strings.Contains(module, "tenancycontracts.Provider") {
-		t.Error("module must register its composite tenant purger")
+		t.Error("module must expose its composite tenant purger")
 	}
-	if bootstrapSrc := files[bootstrapFile]; strings.Count(bootstrapSrc, "billingModule.RegisterTenantPurge(tenancyRegistry)") != 1 {
-		t.Errorf("bootstrap must register exactly one billing purger:\n%s", bootstrapSrc)
+	if bootstrapSrc := files[bootstrapFile]; !strings.Contains(bootstrapSrc, "\t\tbillingModule,\n") {
+		t.Errorf("bootstrap must register the billing module's purgers:\n%s", bootstrapSrc)
 	}
 
 	// Partial update: PATCH (not PUT) with a pointer patch input.
 	routes := files["internal/modules/billing/routes_invoice.go"]
-	if !strings.Contains(routes, `group.Patch("/invoices/:id"`) || strings.Contains(routes, `group.Put("/invoices/:id"`) {
+	if !strings.Contains(routes, "Method: http.MethodPatch") || strings.Contains(routes, "Method: http.MethodPut") {
 		t.Errorf("resource must mount PATCH, not PUT:\n%s", routes)
 	}
 	if service := files["internal/modules/billing/service/invoice.go"]; !strings.Contains(service, "type InvoicePatch struct") ||

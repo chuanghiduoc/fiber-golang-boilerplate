@@ -3,7 +3,7 @@ package arch_test
 import (
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -16,12 +16,13 @@ var frameworkImports = []string{"github.com/gofiber/", "github.com/valyala/fasth
 // TestCoreAndServicesAreFrameworkFree walks the repository-local import graph
 // (non-test files) of every module service/repository package and the core
 // platform packages, and fails if any of them transitively imports Fiber.
-// The AWS SDK is likewise confined to pkg/storage/s3store.
+// The AWS SDK is likewise confined to internal/storage/s3store.
 func TestCoreAndServicesAreFrameworkFree(t *testing.T) {
 	root := repoRoot(t)
 	pkgs := []string{
 		"pkg/apperror",
 		"pkg/storage",
+		"internal/database",
 		"internal/platform/authz",
 		"internal/platform/tenant",
 		"internal/platform/audit",
@@ -56,7 +57,7 @@ func TestCoreAndServicesAreFrameworkFree(t *testing.T) {
 	for _, pkg := range []string{"pkg/storage", "internal/modules/files/service"} {
 		for _, imp := range transitiveExternalImports(t, root, pkg) {
 			if strings.HasPrefix(imp, "github.com/aws/") {
-				t.Errorf("%s transitively imports %s; only pkg/storage/s3store may link the AWS SDK", pkg, imp)
+				t.Errorf("%s transitively imports %s; only internal/storage/s3store may link the AWS SDK", pkg, imp)
 			}
 		}
 	}
@@ -88,7 +89,7 @@ func transitiveExternalImports(t *testing.T, root, pkg string) []string {
 	for imp := range external {
 		out = append(out, imp)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 

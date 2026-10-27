@@ -7,21 +7,23 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteUserWebhookDeliveries = `-- name: DeleteUserWebhookDeliveries :exec
 DELETE FROM webhook_deliveries d
 USING webhook_events e
-WHERE d.tenant_id = $1::bigint
+WHERE d.tenant_id = $1::uuid
   AND e.tenant_id = d.tenant_id AND e.event_id = d.event_id
-  AND ((e.actor_type = 'user' AND e.actor_id = $2::text)
+  AND ((e.actor_type = 'user' AND e.actor_id = $2::uuid)
        OR e.payload->>'userId' = $2::text
        OR e.payload->>'ownerId' = $2::text)
 `
 
 type DeleteUserWebhookDeliveriesParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   string `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Attempts cascade; deleting deliveries first satisfies the event RESTRICT FK.
@@ -32,15 +34,15 @@ func (q *Queries) DeleteUserWebhookDeliveries(ctx context.Context, arg DeleteUse
 
 const deleteUserWebhookEvents = `-- name: DeleteUserWebhookEvents :exec
 DELETE FROM webhook_events
-WHERE tenant_id = $1::bigint
-  AND ((actor_type = 'user' AND actor_id = $2::text)
+WHERE tenant_id = $1::uuid
+  AND ((actor_type = 'user' AND actor_id = $2::uuid)
        OR payload->>'userId' = $2::text
        OR payload->>'ownerId' = $2::text)
 `
 
 type DeleteUserWebhookEventsParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   string `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteUserWebhookEvents(ctx context.Context, arg DeleteUserWebhookEventsParams) error {
@@ -49,18 +51,18 @@ func (q *Queries) DeleteUserWebhookEvents(ctx context.Context, arg DeleteUserWeb
 }
 
 const listUserWebhookDeliveries = `-- name: ListUserWebhookDeliveries :many
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at FROM webhook_deliveries d
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at FROM webhook_deliveries d
 JOIN webhook_events e ON e.tenant_id = d.tenant_id AND e.event_id = d.event_id
-WHERE d.tenant_id = $1::bigint
-  AND ((e.actor_type = 'user' AND e.actor_id = $2::text)
+WHERE d.tenant_id = $1::uuid
+  AND ((e.actor_type = 'user' AND e.actor_id = $2::uuid)
        OR e.payload->>'userId' = $2::text
        OR e.payload->>'ownerId' = $2::text)
 ORDER BY d.created_at DESC, d.id DESC
 `
 
 type ListUserWebhookDeliveriesParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   string `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWebhookDeliveriesParams) ([]WebhookDelivery, error) {
@@ -77,8 +79,8 @@ func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWeb
 			&i.TenantID,
 			&i.EndpointID,
 			&i.EventID,
+			&i.SecretID,
 			&i.Url,
-			&i.SecretCiphertext,
 			&i.Status,
 			&i.Attempts,
 			&i.MaxAttempts,
@@ -105,16 +107,16 @@ func (q *Queries) ListUserWebhookDeliveries(ctx context.Context, arg ListUserWeb
 const listUserWebhookEvents = `-- name: ListUserWebhookEvents :many
 
 SELECT tenant_id, event_id, event_type, data_version, actor_type, actor_id, occurred_at, payload, created_at FROM webhook_events
-WHERE tenant_id = $1::bigint
-  AND ((actor_type = 'user' AND actor_id = $2::text)
+WHERE tenant_id = $1::uuid
+  AND ((actor_type = 'user' AND actor_id = $2::uuid)
        OR payload->>'userId' = $2::text
        OR payload->>'ownerId' = $2::text)
 ORDER BY occurred_at DESC, event_id
 `
 
 type ListUserWebhookEventsParams struct {
-	TenantID int64  `json:"tenant_id"`
-	UserID   string `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Privacy export/erasure for stored webhook event history attributed to one

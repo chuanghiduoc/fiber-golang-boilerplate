@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// Flags are owned by modules and registered at startup. The platform tests
-// register stand-ins with the same keys and defaults so they stay independent
-// of any business module.
+// Flags are owned by modules and contributed at the composition root. The
+// platform tests build a stand-in catalog with the same keys and defaults so
+// they stay independent of any business module.
 const (
 	KeyUserRegistration  Key = "user_registration"
 	KeyEmailVerification Key = "email_verification"
@@ -15,11 +15,29 @@ const (
 	KeyFileUploads       Key = "file_uploads"
 )
 
-func TestRegisterRejectsConflicts(t *testing.T) {
-	if err := Register("featurestest",
-		Definition{Key: KeyUserRegistration, Description: "test", Default: true},
-	); err != nil {
-		t.Fatalf("identical re-registration must be a no-op: %v", err)
+var testCatalog = newTestCatalog()
+
+func newTestCatalog() *Catalog {
+	catalog := NewCatalog()
+	if err := catalog.Add(Provider{Owner: "featurestest", Definitions: []Definition{
+		{Key: KeyUserRegistration, Description: "test", Default: true},
+		{Key: KeyEmailVerification, Description: "test", Default: false},
+		{Key: KeyGoogleOAuth, Description: "test", Default: true},
+		{Key: KeyFileUploads, Description: "test", Default: true},
+	}}); err != nil {
+		panic(err)
+	}
+	catalog.Seal()
+	return catalog
+}
+
+func TestAddRejectsConflicts(t *testing.T) {
+	provider := Provider{Owner: "featurestest", Definitions: []Definition{
+		{Key: KeyUserRegistration, Description: "test", Default: true},
+	}}
+	catalog := newTestCatalogWithoutSeal()
+	if err := catalog.Add(provider); err != nil {
+		t.Fatalf("identical re-add must be a no-op: %v", err)
 	}
 	cases := map[string]struct {
 		owner string
@@ -35,27 +53,29 @@ func TestRegisterRejectsConflicts(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := Register(tc.owner, tc.defs...)
+			err := catalog.Add(Provider{Owner: tc.owner, Definitions: tc.defs})
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("Register error = %v, want containing %q", err, tc.want)
+				t.Fatalf("Add error = %v, want containing %q", err, tc.want)
 			}
 		})
 	}
-	if IsKnown("x_twice") {
-		t.Fatal("a rejected registration must not be applied")
+	if catalog.IsKnown("x_twice") {
+		t.Fatal("a rejected addition must not be applied")
 	}
-	if owner, _ := OwnerOf(KeyFileUploads); owner != "featurestest" {
+	if owner, _ := catalog.OwnerOf(KeyFileUploads); owner != "featurestest" {
 		t.Fatalf("OwnerOf = %q", owner)
 	}
 }
 
-func init() {
-	if err := Register("featurestest",
-		Definition{Key: KeyUserRegistration, Description: "test", Default: true},
-		Definition{Key: KeyEmailVerification, Description: "test", Default: false},
-		Definition{Key: KeyGoogleOAuth, Description: "test", Default: true},
-		Definition{Key: KeyFileUploads, Description: "test", Default: true},
-	); err != nil {
+func newTestCatalogWithoutSeal() *Catalog {
+	catalog := NewCatalog()
+	if err := catalog.Add(Provider{Owner: "featurestest", Definitions: []Definition{
+		{Key: KeyUserRegistration, Description: "test", Default: true},
+		{Key: KeyEmailVerification, Description: "test", Default: false},
+		{Key: KeyGoogleOAuth, Description: "test", Default: true},
+		{Key: KeyFileUploads, Description: "test", Default: true},
+	}}); err != nil {
 		panic(err)
 	}
+	return catalog
 }

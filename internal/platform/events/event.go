@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -62,7 +61,6 @@ var (
 	// typePattern validates event types: lowercase, dotted, header- and
 	// pattern-safe (webhook endpoint subscriptions match on it).
 	typePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
-	idPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
 // Actor identifies who caused an event.
@@ -72,8 +70,8 @@ type Actor struct {
 }
 
 // UserActor returns the actor for user id.
-func UserActor(id int64) Actor {
-	return Actor{Type: ActorUser, ID: strconv.FormatInt(id, 10)}
+func UserActor(id uuid.UUID) Actor {
+	return Actor{Type: ActorUser, ID: id.String()}
 }
 
 // Event is the versioned envelope delivered to local and durable handlers and,
@@ -81,11 +79,11 @@ func UserActor(id int64) Actor {
 // RequestID are populated from the publishing context unless the caller set
 // them explicitly.
 type Event struct {
-	ID          string          `json:"id"`
+	ID          uuid.UUID       `json:"id"`
 	Type        string          `json:"type"`
 	DataVersion int             `json:"dataVersion"`
 	OccurredAt  time.Time       `json:"occurredAt"`
-	TenantID    int64           `json:"tenantId"`
+	TenantID    uuid.UUID       `json:"tenantId"`
 	Actor       Actor           `json:"actor"`
 	Data        json.RawMessage `json:"data"`
 	// RequestID correlates durable handling with the publishing request. It
@@ -135,12 +133,12 @@ func NewEvent(eventType string, dataVersion int, data any) (Event, error) {
 
 // newID returns a UUIDv7: time-ordered, so ids sort by creation and index
 // well, and still unique across processes.
-func newID() (string, error) {
+func newID() (uuid.UUID, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
-		return "", fmt.Errorf("events: generate event id: %w", err)
+		return uuid.Nil, fmt.Errorf("events: generate event id: %w", err)
 	}
-	return id.String(), nil
+	return id, nil
 }
 
 // Validate checks the envelope. An empty ID or actor is allowed here because
@@ -151,12 +149,6 @@ func (e Event) Validate() error {
 	}
 	if e.DataVersion < 1 {
 		return fmt.Errorf("%w: %s dataVersion must be >= 1", ErrInvalidEvent, e.Type)
-	}
-	if e.ID != "" && !idPattern.MatchString(e.ID) {
-		return fmt.Errorf("%w: id %q must match %s", ErrInvalidEvent, e.ID, idPattern)
-	}
-	if e.TenantID < 0 {
-		return fmt.Errorf("%w: tenant id must not be negative", ErrInvalidEvent)
 	}
 	if err := e.Actor.validate(); err != nil {
 		return err
@@ -188,13 +180,13 @@ func (a Actor) validate() error {
 }
 
 // userID returns the actor's user id, or 0 when it is not a user actor.
-func (a Actor) userID() int64 {
+func (a Actor) userID() uuid.UUID {
 	if a.Type != ActorUser {
-		return 0
+		return uuid.Nil
 	}
-	id, err := strconv.ParseInt(a.ID, 10, 64)
-	if err != nil || id < 0 {
-		return 0
+	id, err := uuid.Parse(a.ID)
+	if err != nil {
+		return uuid.Nil
 	}
 	return id
 }

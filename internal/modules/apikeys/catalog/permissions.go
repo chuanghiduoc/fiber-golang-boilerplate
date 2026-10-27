@@ -6,10 +6,21 @@ package catalog
 
 import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
-// Permissions owned by API-key administration. All are admin-only.
+// Self-service permissions for the caller's own keys under /me/api-keys. Every
+// member receives them: the routes never reach another member's key.
+const (
+	PermissionAPIKeysRead   authz.Permission = "api_keys:read"
+	PermissionAPIKeysCreate authz.Permission = "api_keys:create"
+	PermissionAPIKeysUpdate authz.Permission = "api_keys:update"
+	PermissionAPIKeysRevoke authz.Permission = "api_keys:revoke"
+	PermissionAPIKeysRotate authz.Permission = "api_keys:rotate"
+)
+
+// Permissions for managing another member's keys under
+// /members/{memberId}/api-keys. Owner and admin receive every tenant
+// permission by construction; members do not.
 const (
 	PermissionAdminAPIKeysRead   authz.Permission = "admin:api_keys:read"
 	PermissionAdminAPIKeysCreate authz.Permission = "admin:api_keys:create"
@@ -21,20 +32,17 @@ const (
 // Owner is the module name (Module.Name()) that owns these entries.
 const Owner = "apikeys"
 
-// Register adds the module's permissions and error codes to the process-wide
-// catalogs. app.RegisterCatalogs does the same through the module provider
-// hooks; module unit tests that mount routes without the app call it directly.
-// Repeating it is a no-op.
-func Register() error {
-	if err := authz.Register(Owner, Permissions()...); err != nil {
-		return err
-	}
-	return apperror.Register(Owner, ErrorCodes())
-}
-
 // Permissions returns the apikeys grants for app.PermissionProvider.
 func Permissions() []authz.Grant {
 	return []authz.Grant{
+		{Permission: PermissionAPIKeysRead, Roles: []string{authz.RoleMember}},
+		{Permission: PermissionAPIKeysCreate, Roles: []string{authz.RoleMember}},
+		{Permission: PermissionAPIKeysUpdate, Roles: []string{authz.RoleMember}},
+		{Permission: PermissionAPIKeysRevoke, Roles: []string{authz.RoleMember}},
+		{Permission: PermissionAPIKeysRotate, Roles: []string{authz.RoleMember}},
+		// admin:api_keys:create and admin:api_keys:rotate stay registered even
+		// though no route uses them now: permission values are stable API-key
+		// scopes, and a released scope must keep resolving in the catalog.
 		{Permission: PermissionAdminAPIKeysRead},
 		{Permission: PermissionAdminAPIKeysCreate},
 		{Permission: PermissionAdminAPIKeysUpdate},

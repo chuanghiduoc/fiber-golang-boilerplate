@@ -10,7 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -42,6 +42,7 @@ var tableOwners = map[string]string{
 	"password_reset_tokens":          "identity",
 	"email_verification_tokens":      "identity",
 	"mfa_factors":                    "identity",
+	"webauthn_credentials":           "identity",
 	"mfa_recovery_codes":             "identity",
 	"data_exports":                   "identity",
 	"files":                          "files",
@@ -56,6 +57,7 @@ var tableOwners = map[string]string{
 	"webhook_deliveries":             "webhooks",
 	"webhook_delivery_attempts":      "webhooks",
 	"webhook_inbound_sources":        "webhooks",
+	"webhook_inbound_source_secrets": "webhooks",
 	"webhook_inbound_events":         "webhooks",
 	"api_keys":                       "apikeys",
 	"api_key_scopes":                 "apikeys",
@@ -81,9 +83,8 @@ var crossModuleReads = map[string]string{
 	"platform/features:feature_flags":        "flag snapshot load (read-only)",
 	"platform/features:feature_flag_targets": "flag snapshot load (read-only)",
 	// The migration command verifies the schema it owns, including the
-	// compatibility tenant row and its id. It never serves requests or exposes
+	// seeded default tenant row and its id. It never serves requests or exposes
 	// tenant data.
-	"cmd/migrate:tenants": "schema verification and default-tenant check",
 }
 
 // sqlNotTables are words that follow FROM/JOIN/INTO/UPDATE but are not tables
@@ -461,7 +462,7 @@ func sortedKeys(set map[string]bool) []string {
 	for key := range set {
 		out = append(out, key)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out
 }
 
@@ -991,7 +992,7 @@ func TestSQLSourceOwner(t *testing.T) {
 	}{
 		"module service":        {"internal/modules/orders/service/create.go", "orders", true},
 		"platform package":      {"internal/platform/jobs/worker.go", "platform/jobs", true},
-		"pkg package":           {"pkg/database/scope.go", "pkg/database", true},
+		"pkg package":           {"pkg/storage/local.go", "pkg/storage", true},
 		"cmd command":           {"cmd/migrate/main.go", "cmd/migrate", true},
 		"module queries file":   {"internal/modules/orders/queries/q.sql", "orders", true},
 		"root internal package": {"internal/app/app.go", "", false},

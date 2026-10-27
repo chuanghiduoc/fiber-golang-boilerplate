@@ -13,21 +13,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"math"
 	"path"
-	"sort"
-	"strconv"
+	"slices"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"golang.org/x/text/language"
 )
 
 // DefaultLocale is used when the request has no acceptable language and when
 // no explicit default is configured.
 const DefaultLocale = "en"
-
-// LocaleLocalKey stores the negotiated locale in Fiber locals.
-const LocaleLocalKey = "locale"
 
 const messagesDir = "locales"
 
@@ -42,6 +38,7 @@ type Bundle struct {
 	defaultLocale string
 	catalogs      map[string]localeCatalog
 	locales       []string
+	matcher       language.Matcher
 }
 
 type contextKey struct{}
@@ -61,7 +58,7 @@ func LocaleFromContext(ctx context.Context) string {
 
 // Locale returns the locale negotiated by Middleware for this request, or "".
 func Locale(c fiber.Ctx) string {
-	return fiber.Locals[string](c, LocaleLocalKey)
+	return LocaleFromContext(c.Context())
 }
 
 // Source is a module-owned set of catalogs merged into the platform catalogs.
@@ -112,7 +109,7 @@ func New(defaultLocale string, sources ...Source) (*Bundle, error) {
 		catalogs[locale] = messages
 		locales = append(locales, locale)
 	}
-	sort.Strings(locales)
+	slices.Sort(locales)
 
 	for _, source := range sources {
 		if err := mergeSource(catalogs, locales, source); err != nil {
@@ -135,10 +132,21 @@ func New(defaultLocale string, sources ...Source) (*Bundle, error) {
 			defaultLocale, strings.Join(locales, ", "))
 	}
 
+	// The matcher's default is its first tag, so the bundle default leads and
+	// every other supported locale follows in stable order.
+	tags := make([]language.Tag, 0, len(locales))
+	tags = append(tags, language.Make(defaultLocale))
+	for _, locale := range locales {
+		if locale != defaultLocale {
+			tags = append(tags, language.Make(locale))
+		}
+	}
+
 	return &Bundle{
 		defaultLocale: defaultLocale,
 		catalogs:      catalogs,
 		locales:       locales,
+		matcher:       language.NewMatcher(tags),
 	}, nil
 }
 
@@ -207,17 +215,17 @@ func (b *Bundle) Localize(c fiber.Ctx, key string, params map[string]any) string
 	return ""
 }
 
-// Negotiate chooses the best supported locale from an Accept-Language header.
-// It understands q-values, wildcards, case-insensitive tags, and truncation
-// (vi-VN -> vi), and falls back to the bundle default when nothing matches.
+// Negotiate chooses the best supported locale from an Accept-Language header
+// using the golang.org/x/text language matcher (q-values, wildcards,
+// case-insensitive tags, and truncation such as vi-VN -> vi), and falls back
+// to the bundle default when nothing matches.
 func (b *Bundle) Negotiate(acceptLanguage string) string {
 	if b == nil {
 		return DefaultLocale
 	}
-	for _, pref := range parseAcceptLanguage(acceptLanguage) {
-		if locale, ok := b.match(pref.tag); ok {
-			return locale
-		}
+	tag, _ := language.MatchStrings(b.matcher, acceptLanguage)
+	if locale, ok := b.match(tag.String()); ok {
+		return locale
 	}
 	return b.defaultLocale
 }
@@ -236,7 +244,6 @@ func Middleware(b *Bundle) fiber.Handler {
 	}
 	return func(c fiber.Ctx) error {
 		locale := b.Negotiate(c.Get(fiber.HeaderAcceptLanguage))
-		fiber.Locals[string](c, LocaleLocalKey, locale)
 		c.SetContext(WithLocale(c.Context(), locale))
 		c.Set(fiber.HeaderContentLanguage, locale)
 		c.Vary(fiber.HeaderAcceptLanguage)
@@ -285,49 +292,6 @@ func matchCatalog(catalogs map[string]localeCatalog, locale string) (string, boo
 			return locale, true
 		}
 	}
-}
-
-type languagePref struct {
-	tag string
-	q   float64
-}
-
-// parseAcceptLanguage parses language ranges and orders them by descending
-// q-value. Equal q-values keep their header order. Invalid q-values are treated
-// as unacceptable (q=0), matching the RFC's range [0,1].
-func parseAcceptLanguage(header string) []languagePref {
-	parts := strings.Split(header, ",")
-	prefs := make([]languagePref, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		fields := strings.Split(part, ";")
-		tag := normalizeLocale(fields[0])
-		if tag == "" {
-			continue
-		}
-		q := 1.0
-		for _, param := range fields[1:] {
-			name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
-			if !ok || !strings.EqualFold(strings.TrimSpace(name), "q") {
-				continue
-			}
-			parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-			if err != nil || math.IsNaN(parsed) || parsed < 0 || parsed > 1 {
-				q = 0
-				break
-			}
-			q = parsed
-		}
-		if q == 0 {
-			continue
-		}
-		prefs = append(prefs, languagePref{tag: tag, q: q})
-	}
-	sort.SliceStable(prefs, func(i, j int) bool { return prefs[i].q > prefs[j].q })
-	return prefs
 }
 
 func normalizeLocale(locale string) string {
@@ -448,8 +412,8 @@ func diffKeys(reference, candidate localeCatalog) (missing, extra []string) {
 			extra = append(extra, key)
 		}
 	}
-	sort.Strings(missing)
-	sort.Strings(extra)
+	slices.Sort(missing)
+	slices.Sort(extra)
 	return missing, extra
 }
 
@@ -476,7 +440,7 @@ func placeholders(message string) []string {
 	for name := range seen {
 		names = append(names, name)
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 

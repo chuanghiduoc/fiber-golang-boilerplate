@@ -11,13 +11,14 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // decodeProblem runs a handler and returns the parsed problem document + response.
 func decodeProblem(t *testing.T, h fiber.Handler) (body map[string]any, status int, contentType string) {
 	t.Helper()
-	app := fiber.New(fiber.Config{ErrorHandler: FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: New(testCatalog, nil)})
 	app.Get("/x", h)
 	req, _ := http.NewRequest("GET", "/x", http.NoBody)
 	resp, err := app.Test(req)
@@ -42,11 +43,11 @@ func TestFiberErrorHandler_AppError(t *testing.T) {
 	if ctype != "application/problem+json" {
 		t.Errorf("content-type = %q, want application/problem+json", ctype)
 	}
-	if result["code"] != "bad_request" {
+	if result["code"] != "request.invalid" {
 		t.Errorf("code = %v, want bad_request", result["code"])
 	}
-	if result["type"] != "/errors/bad-request" {
-		t.Errorf("type = %v, want /errors/bad-request", result["type"])
+	if result["type"] != "/errors/request-invalid" {
+		t.Errorf("type = %v, want /errors/request-invalid", result["type"])
 	}
 	if result["instance"] != "/x" {
 		t.Errorf("instance = %v, want /x", result["instance"])
@@ -95,7 +96,7 @@ func TestFiberErrorHandler_FiberError(t *testing.T) {
 	if status != 404 {
 		t.Errorf("status = %d, want 404", status)
 	}
-	if result["code"] != "not_found" {
+	if result["code"] != "resource.not_found" {
 		t.Errorf("code = %v, want not_found", result["code"])
 	}
 }
@@ -104,15 +105,15 @@ func TestFiberErrorHandler_BodyLimitUsesPayloadTooLargeCode(t *testing.T) {
 	// Fiber's server error handler passes fiber.ErrRequestEntityTooLarge to the
 	// configured ErrorHandler when a body exceeds Config.BodyLimit.
 	result, status, _ := decodeProblem(t, func(fiber.Ctx) error { return fiber.ErrRequestEntityTooLarge })
-	if status != fiber.StatusRequestEntityTooLarge || result["code"] != "payload_too_large" ||
-		result["type"] != "/errors/payload-too-large" || result["detail"] != "request body too large" {
+	if status != fiber.StatusRequestEntityTooLarge || result["code"] != "request.payload_too_large" ||
+		result["type"] != "/errors/request-payload-too-large" || result["detail"] != "request body too large" {
 		t.Fatalf("fiber.ErrRequestEntityTooLarge rendered %d %v", status, result)
 	}
 
 	result, _, _ = decodeProblem(t, func(fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusRequestEntityTooLarge, "upload exceeds 10 MiB")
 	})
-	if result["code"] != "payload_too_large" || result["detail"] != "upload exceeds 10 MiB" {
+	if result["code"] != "request.payload_too_large" || result["detail"] != "upload exceeds 10 MiB" {
 		t.Fatalf("custom 413 rendered %v, want payload_too_large with its detail", result)
 	}
 }
@@ -124,7 +125,7 @@ func TestFiberErrorHandler_ClientCanceled(t *testing.T) {
 	if status != apperror.StatusClientClosedRequest {
 		t.Errorf("status = %d, want 499", status)
 	}
-	if result["code"] != "client_closed_request" {
+	if result["code"] != "request.canceled" {
 		t.Errorf("code = %v, want client_closed_request", result["code"])
 	}
 }
@@ -133,7 +134,7 @@ func TestFiberErrorHandler_ClientCanceled(t *testing.T) {
 // error rendered before the request-ID middleware ran must not copy the
 // caller-supplied X-Request-Id into the problem document.
 func TestFiberErrorHandler_DoesNotEchoClientRequestID(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: New(testCatalog, nil)})
 	app.Get("/x", func(fiber.Ctx) error {
 		return apperror.NewBadRequest("bad request test")
 	})
@@ -154,9 +155,9 @@ func TestFiberErrorHandler_DoesNotEchoClientRequestID(t *testing.T) {
 }
 
 func TestFiberErrorHandler_UsesRequestIDLocal(t *testing.T) {
-	app := fiber.New(fiber.Config{ErrorHandler: FiberErrorHandler})
+	app := fiber.New(fiber.Config{ErrorHandler: New(testCatalog, nil)})
 	app.Use(func(c fiber.Ctx) error {
-		fiber.Locals[string](c, "request_id", "server-generated")
+		c.SetContext(requestctx.WithRequestID(c.Context(), "server-generated"))
 		return c.Next()
 	})
 	app.Get("/x", func(fiber.Ctx) error {
@@ -185,7 +186,7 @@ func TestFiberErrorHandler_UnknownError(t *testing.T) {
 	if status != 500 {
 		t.Errorf("status = %d, want 500", status)
 	}
-	if result["code"] != "internal_error" {
+	if result["code"] != "system.internal" {
 		t.Errorf("code = %v, want internal_error", result["code"])
 	}
 }

@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 )
 
 const (
@@ -25,14 +24,6 @@ const (
 	bypassPassword = "app_bypass"
 )
 
-// poolsRegistry maps each pool handed to a test to the pair of runtime pools
-// for its schema. SetupTestDB returns the bypass pool as the fixture pool
-// (tests insert and assert across tenants with it), while Scoped and
-// NewTxManager resolve the normal app pool for tenant-scoped application
-// code. Keeping the mapping here avoids threading a second pool through every
-// existing test helper.
-var poolsRegistry sync.Map
-
 // OpenAppPools creates (or refreshes) both runtime roles, grants them the same
 // DML privileges, and returns a pool pair connected as them. adminDSN is the
 // privileged DSN that owns the schema.
@@ -42,13 +33,9 @@ var poolsRegistry sync.Map
 // assertions through Scoped/NewTxManager (or pools.Primary) so RLS stays
 // enforced; a bypass pool proves nothing about row-level security.
 func OpenAppPools(ctx context.Context, adminDSN, schema string) (database.Pools, error) {
-	adminCfg, err := pgxpool.ParseConfig(adminDSN)
+	admin, err := openAdminPool(ctx, adminDSN)
 	if err != nil {
-		return database.Pools{}, fmt.Errorf("parse admin pool config: %w", err)
-	}
-	admin, err := pgxpool.NewWithConfig(ctx, adminCfg)
-	if err != nil {
-		return database.Pools{}, fmt.Errorf("connect as schema owner: %w", err)
+		return database.Pools{}, err
 	}
 	defer admin.Close()
 
@@ -68,42 +55,15 @@ func OpenAppPools(ctx context.Context, adminDSN, schema string) (database.Pools,
 		appPool.Close()
 		return database.Pools{}, err
 	}
-	pools := database.Pools{Primary: appPool, Bypass: bypassPool}
-	poolsRegistry.Store(appPool, pools)
-	poolsRegistry.Store(bypassPool, pools)
-	return pools, nil
+	return database.Pools{Primary: appPool, Bypass: bypassPool}, nil
 }
 
-// AppPool returns the normal role pool paired with pool, or pool itself when
-// it was not created by OpenAppPools (a single-role test database).
-func AppPool(pool *pgxpool.Pool) *pgxpool.Pool {
-	return poolsFor(pool).Primary
-}
+// AppPool returns the normal application pool from an explicit pool pair.
+func AppPool(pools database.Pools) *pgxpool.Pool { return pools.Primary }
 
-// Pools returns the normal and bypass pools paired with pool.
-func Pools(pool *pgxpool.Pool) database.Pools {
-	return poolsFor(pool)
-}
-
-func poolsFor(pool *pgxpool.Pool) database.Pools {
-	if value, ok := poolsRegistry.Load(pool); ok {
-		return value.(database.Pools)
-	}
-	return database.Pools{Primary: pool}
-}
-
-func forgetPools(pools database.Pools) {
-	if pools.Primary != nil {
-		poolsRegistry.Delete(pools.Primary)
-	}
-	if pools.Bypass != nil {
-		poolsRegistry.Delete(pools.Bypass)
-	}
-}
-
-// ClosePools forgets the registry entry and closes both pools.
+// ClosePools closes both runtime pools. It is a plain close: pools are passed
+// explicitly, so there is no registry to forget.
 func ClosePools(pools database.Pools) {
-	forgetPools(pools)
 	pools.Close()
 }
 
@@ -195,4 +155,22 @@ func OpenAppPool(ctx context.Context, admin *pgxpool.Pool, schema string) error 
 		return fmt.Errorf("grant runtime roles: %w", err)
 	}
 	return nil
+}
+
+// openAdminPool connects as the privileged schema owner. It is shared by the
+// fixture and by OpenAppPools so both resolve the same DSN rules.
+func openAdminPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse TEST_DATABASE_URL pool config: %w", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("connect to TEST_DATABASE_URL: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping TEST_DATABASE_URL: %w", err)
+	}
+	return pool, nil
 }

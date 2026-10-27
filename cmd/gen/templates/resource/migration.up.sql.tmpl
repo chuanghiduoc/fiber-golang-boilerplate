@@ -1,9 +1,9 @@
 -- {{.R.Table}}: tenant-scoped {{.R.HumanPlural}} owned by the {{.M.Name}} module.
 CREATE TABLE IF NOT EXISTS {{.R.Table}} (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuidv7(),
     -- tenants is the only cross-module foreign key a module may declare
     --. RESTRICT: a tenant with {{.R.HumanPlural}} cannot be deleted.
-    tenant_id BIGINT NOT NULL DEFAULT 1 REFERENCES tenants (id) ON DELETE RESTRICT,
+    tenant_id UUID NOT NULL REFERENCES tenants (id) ON DELETE RESTRICT,
     name VARCHAR(255) NOT NULL CHECK (btrim(name) <> ''),
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()

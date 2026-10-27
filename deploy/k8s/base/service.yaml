@@ -13,6 +13,7 @@ spec:
   selector:
     app.kubernetes.io/name: fiber-boilerplate
     app.kubernetes.io/instance: fiber-boilerplate
+    app.kubernetes.io/component: api
   ports:
     - name: http
       port: 8080

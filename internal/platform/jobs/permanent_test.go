@@ -10,7 +10,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 )
 
 func TestPermanentWrapsAndClassifies(t *testing.T) {
@@ -37,7 +38,8 @@ func TestProcessJobDeadLettersPermanentFailureImmediately(t *testing.T) {
 	})
 
 	require.NoError(t, worker.processJob(context.Background(), claimedJob{
-		ID:          11,
+		TenantID:    tenant.DefaultID,
+		ID:          testID(11),
 		Kind:        "bad",
 		Payload:     json.RawMessage(`{}`),
 		Attempts:    1,
@@ -66,14 +68,19 @@ func TestEmailHandlerPermanentAndRetryableFailures(t *testing.T) {
 	foreign, err := otherKey.Seal([]byte(`{"To":["a@example.com"]}`))
 	require.NoError(t, err)
 
+	undecodable, err := codec.Seal([]byte(`{"To":"not-a-list"}`))
+	require.NoError(t, err)
+	noRecipients, err := codec.Seal([]byte(`{"Subject":"hi"}`))
+	require.NoError(t, err)
+
 	tests := []struct {
 		name      string
 		payload   string
 		permanent bool
 	}{
-		{name: "malformed envelope", payload: `{"v":1,"nonce":"***","data":"x"}`, permanent: true},
-		{name: "undecodable message", payload: `{"To":"not-a-list"}`, permanent: true},
-		{name: "no recipients", payload: `{"Subject":"hi"}`, permanent: true},
+		{name: "unsupported envelope version", payload: `{"v":1,"nonce":"***","data":"x"}`, permanent: true},
+		{name: "undecodable message", payload: string(undecodable), permanent: true},
+		{name: "no recipients", payload: string(noRecipients), permanent: true},
 		// The sealing key may still be rolling out to this worker.
 		{name: "unknown key", payload: string(foreign), permanent: false},
 	}
@@ -81,7 +88,7 @@ func TestEmailHandlerPermanentAndRetryableFailures(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			sender := &countingSender{}
-			handler := EmailHandler(sender, WithEmailPayloadCodec(codec))
+			handler := EmailHandler(sender, codec)
 			err := handler(context.Background(), json.RawMessage(tt.payload))
 			require.Error(t, err)
 			assert.Equal(t, tt.permanent, IsPermanent(err), "error: %v", err)

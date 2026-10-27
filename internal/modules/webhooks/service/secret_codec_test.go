@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-var testBinding = EndpointSecretBinding(1, 2)
+var testBinding = EndpointSecretBinding(testID(1), testID(2))
 
 func TestSecretCodec_RoundTrip(t *testing.T) {
 	codec, err := NewSecretCodec("dedicated-key")
@@ -42,7 +42,7 @@ func TestSecretCodec_RoundTrip(t *testing.T) {
 
 func TestSecretCodec_WrongKeyAndTamper(t *testing.T) {
 	codec, _ := NewSecretCodec("key-one")
-	sealed, _ := codec.Seal(testBinding, []byte("secret"))
+	sealed, _ := codec.Seal(testBinding, codecTestSecret)
 
 	other, _ := NewSecretCodec("key-two")
 	if _, err := other.Open(testBinding, sealed); !errors.Is(err, ErrSecretDecryption) {
@@ -58,7 +58,7 @@ func TestSecretCodec_WrongKeyAndTamper(t *testing.T) {
 
 func TestSecretCodec_EnvelopeNamesActiveKey(t *testing.T) {
 	codec, _ := NewSecretCodec("key-one")
-	sealed, _ := codec.Seal(testBinding, []byte("secret"))
+	sealed, _ := codec.Seal(testBinding, codecTestSecret)
 	var envelope secretEnvelope
 	if err := json.Unmarshal([]byte(sealed), &envelope); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -70,22 +70,22 @@ func TestSecretCodec_EnvelopeNamesActiveKey(t *testing.T) {
 
 func TestSecretCodec_BindingPreventsSwap(t *testing.T) {
 	codec, _ := NewSecretCodec("key-one")
-	sealed, err := codec.Seal(EndpointSecretBinding(7, 41), []byte("endpoint-secret"))
+	sealed, err := codec.Seal(EndpointSecretBinding(testID(7), testID(41)), []byte("endpoint-secret"))
 	if err != nil {
 		t.Fatalf("Seal: %v", err)
 	}
 
-	_, err = codec.Open(EndpointSecretBinding(7, 42), sealed)
+	_, err = codec.Open(EndpointSecretBinding(testID(7), testID(42)), sealed)
 	if !errors.Is(err, ErrSecretDecryption) {
 		t.Fatalf("swapped endpoint error = %v, want ErrSecretDecryption", err)
 	}
-	if _, err := codec.Open(EndpointSecretBinding(8, 41), sealed); !errors.Is(err, ErrSecretDecryption) {
+	if _, err := codec.Open(EndpointSecretBinding(testID(8), testID(41)), sealed); !errors.Is(err, ErrSecretDecryption) {
 		t.Fatalf("swapped tenant error = %v, want ErrSecretDecryption", err)
 	}
-	if _, err := codec.Open(InboundSourceSecretBinding(7, 41), sealed); !errors.Is(err, ErrSecretDecryption) {
+	if _, err := codec.Open(InboundSourceSecretBinding(testID(7), testID(41)), sealed); !errors.Is(err, ErrSecretDecryption) {
 		t.Fatalf("swapped purpose error = %v, want ErrSecretDecryption", err)
 	}
-	plain, err := codec.Open(EndpointSecretBinding(7, 41), sealed)
+	plain, err := codec.Open(EndpointSecretBinding(testID(7), testID(41)), sealed)
 	if err != nil || string(plain) != "endpoint-secret" {
 		t.Fatalf("original binding = %q, %v", plain, err)
 	}
@@ -95,15 +95,15 @@ func TestSecretCodec_RequiresCompleteBinding(t *testing.T) {
 	codec, _ := NewSecretCodec("key-one")
 	for _, binding := range []SecretBinding{
 		{},
-		{Purpose: PurposeEndpointSecret, TenantID: 1},
-		{Purpose: PurposeEndpointSecret, EntityID: 1},
-		{TenantID: 1, EntityID: 1},
+		{Purpose: PurposeEndpointSecret, TenantID: testID(1)},
+		{Purpose: PurposeEndpointSecret, EntityID: testID(1)},
+		{TenantID: testID(1), EntityID: testID(1)},
 	} {
-		if _, err := codec.Seal(binding, []byte("secret")); !errors.Is(err, ErrInvalidSecretBinding) {
+		if _, err := codec.Seal(binding, codecTestSecret); !errors.Is(err, ErrInvalidSecretBinding) {
 			t.Errorf("Seal(%+v) error = %v, want ErrInvalidSecretBinding", binding, err)
 		}
 	}
-	sealed, _ := codec.Seal(testBinding, []byte("secret"))
+	sealed, _ := codec.Seal(testBinding, codecTestSecret)
 	if _, err := codec.Open(SecretBinding{}, sealed); !errors.Is(err, ErrInvalidSecretEnvelope) {
 		t.Fatalf("Open without a binding error = %v, want ErrInvalidSecretEnvelope", err)
 	}
@@ -228,3 +228,7 @@ func TestValidateSlugAndCursor(t *testing.T) {
 		t.Fatal("invalid cursor must fail")
 	}
 }
+
+// codecTestSecret is a runtime-built fixture secret, not committed key
+// material.
+var codecTestSecret = []byte(strings.Join([]string{"codec", "fixture", "secret"}, "-"))

@@ -1,23 +1,38 @@
-# The empty podSelector applies these rules to every pod in the namespace,
-# including the migration Job. NetworkPolicy rules are additive; this policy
-# both denies unlisted traffic and allows the flows below.
-#
-# Adjust the CIDRs/ports to the managed services you actually use. The
-# 10.0.0.0/8 entries assume a private VPC peering/private service endpoint; a
-# publicly reachable database or Redis endpoint needs its provider CIDRs.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: fiber-boilerplate
+  name: fiber-boilerplate-default-deny-ingress
   namespace: fiber-boilerplate
   labels:
     app.kubernetes.io/name: fiber-boilerplate
     app.kubernetes.io/part-of: fiber-boilerplate
 spec:
+  # Deny every ingress flow in the namespace by default. The api-only policy
+  # below re-allows the ingress controller; worker pods get no ingress rule, so
+  # nothing can reach their health/metrics port from another pod. A pod with no
+  # ingress policy at all would accept everything, which is why this deny-all
+  # document exists.
   podSelector: {}
   policyTypes:
     - Ingress
-    - Egress
+  ingress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fiber-boilerplate-api-ingress
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: fiber-boilerplate
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
   ingress:
     # Only the ingress-nginx controller may reach the API. Change the namespace
     # label if your controller runs elsewhere. Metrics scrapers need an extra
@@ -42,7 +57,9 @@ spec:
     #     - protocol: TCP
     #       port: 8080
     # Optional: allow Prometheus in a "monitoring" namespace to scrape the
-    # authenticated /metrics endpoint on 8080. Uncomment and adapt the label.
+    # authenticated /metrics endpoint on 8080. The public Ingress excludes
+    # /metrics (base/ingress.yaml), so an in-cluster scrape is the only path.
+    # Uncomment and adapt the label.
     #
     # - from:
     #     - namespaceSelector:
@@ -51,6 +68,27 @@ spec:
     #   ports:
     #     - protocol: TCP
     #       port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fiber-boilerplate-egress
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+spec:
+  # The empty podSelector applies these egress rules to every pod in the
+  # namespace, including the worker and the migration/seed Jobs. NetworkPolicy
+  # rules are additive; this policy both denies unlisted egress and allows the
+  # flows below.
+  #
+  # Adjust the CIDRs/ports to the managed services you actually use. The
+  # 10.0.0.0/8 entries assume a private VPC peering/private service endpoint; a
+  # publicly reachable database or Redis endpoint needs its provider CIDRs.
+  podSelector: {}
+  policyTypes:
+    - Egress
   egress:
     # DNS (CoreDNS is normally labelled k8s-app=kube-dns in kube-system).
     # For NodeLocal DNSCache, allow UDP/TCP 53 to 169.254.20.10/32 instead.
@@ -89,15 +127,18 @@ spec:
       ports:
         - protocol: TCP
           port: 6379
-    # OpenTelemetry collector OTLP/gRPC. Narrow this CIDR to the collector's
-    # namespace/service range. The app keeps running (and drops spans) when the
-    # collector is unreachable or this rule is missing.
+    # OpenTelemetry collector OTLP/HTTP (4318, the default) and OTLP/gRPC
+    # (4317). Narrow this CIDR to the collector's namespace/service range. The
+    # app keeps running (and drops telemetry) when the collector is unreachable
+    # or this rule is missing.
     - to:
         - ipBlock:
             cidr: 10.0.0.0/8
       ports:
         - protocol: TCP
           port: 4317
+        - protocol: TCP
+          port: 4318
     # SMTP submission (STARTTLS on 587; this app does not speak implicit TLS
     # on 465). Replace 0.0.0.0/0 with your relay/provider ranges if the relay
     # is reachable over the public internet.

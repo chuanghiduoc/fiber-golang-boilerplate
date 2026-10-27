@@ -65,9 +65,9 @@ SELECT sqlc.embed(u), sqlc.embed(m),
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
-WHERE m.tenant_id = @tenant_id::bigint
+WHERE m.tenant_id = @tenant_id::uuid
   AND m.status = 'active' AND u.status = 'active'
-  AND (m.created_at, m.user_id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (m.created_at, m.user_id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY m.created_at DESC, m.user_id DESC
 LIMIT @row_limit::int;
 
@@ -91,8 +91,39 @@ SELECT sqlc.embed(u), sqlc.embed(m),
        EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
 FROM memberships m
 JOIN users u ON u.id = m.user_id
-WHERE m.tenant_id = @tenant_id::bigint
-  AND (m.created_at, m.user_id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+WHERE m.tenant_id = @tenant_id::uuid
+  AND (m.created_at, m.user_id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
+ORDER BY m.created_at DESC, m.user_id DESC
+LIMIT @row_limit::int;
+
+-- name: ListMembersFilteredCursor :many
+-- Admin view with optional membership-status and role-key filters.
+SELECT sqlc.embed(u), sqlc.embed(m),
+       COALESCE((
+           SELECT r.key FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id
+             AND r.scope = 'tenant' AND r.tenant_id IS NULL
+           ORDER BY CASE r.key WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, r.key
+           LIMIT 1
+       ), 'member')::text AS role,
+       COALESCE((
+           SELECT array_agg(r.key ORDER BY r.key)
+           FROM membership_roles mr
+           JOIN roles r ON r.id = mr.role_id
+           WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.scope = 'tenant'
+       ), '{}'::text[])::text[] AS roles,
+       EXISTS (SELECT 1 FROM user_passwords p WHERE p.user_id = u.id)::boolean AS has_password
+FROM memberships m
+JOIN users u ON u.id = m.user_id
+WHERE m.tenant_id = @tenant_id::uuid
+  AND (sqlc.narg('status')::text IS NULL OR m.status = sqlc.narg('status')::text)
+  AND (sqlc.narg('role')::text IS NULL OR EXISTS (
+      SELECT 1 FROM membership_roles mr
+      JOIN roles r ON r.id = mr.role_id
+      WHERE mr.tenant_id = m.tenant_id AND mr.user_id = m.user_id AND r.key = sqlc.narg('role')::text
+  ))
+  AND (m.created_at, m.user_id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY m.created_at DESC, m.user_id DESC
 LIMIT @row_limit::int;
 
@@ -148,26 +179,26 @@ WHERE tenant_id = $1 AND user_id = $2
 -- name: BanMembership :one
 UPDATE memberships AS m
 SET status = 'suspended', banned_at = NOW(),
-    -- Pseudonymous marker so EmailBannedInTenant still refuses the address
-    -- after erasure rewrites users.email. users.email is stored normalized
-    -- (chk_users_email_normalized), exactly Go's NormalizeEmail output.
-    banned_email_hash = encode(sha256(convert_to(u.email, 'UTF8')), 'hex'),
+    -- Keyed marker (HMAC-SHA256 under a key derived from the data-encryption
+    -- key set), computed in Go: a database reader cannot confirm or
+    -- dictionary-recover the address. The key id records which key wrote it.
+    banned_email_hash = @banned_email_hash::bytea,
+    banned_email_hash_kid = @banned_email_hash_kid::text,
     -- Kept by UnbanMembership, so API keys issued before the ban stay dead.
     -- clock_timestamp(), not NOW(): an API-key insert holding the membership
     -- row FOR SHARE (LockMemberPrincipal) makes this UPDATE wait, and that
     -- key's created_at (its transaction start) must still compare at or
     -- before the revocation, which NOW() does not guarantee.
     credentials_revoked_at = clock_timestamp()
-FROM users AS u
-WHERE u.id = m.user_id
-  AND m.tenant_id = $1 AND m.user_id = $2 AND m.status = 'active'
+WHERE m.tenant_id = $1 AND m.user_id = $2 AND m.status = 'active'
 RETURNING m.*;
 
 -- name: UnbanMembership :one
 -- Only a real ban is lifted. A membership suspended for a pending erasure
 -- matches no row, so an unban can never resurrect it.
 UPDATE memberships
-SET status = 'active', banned_at = NULL, banned_email_hash = NULL
+SET status = 'active', banned_at = NULL, banned_email_hash = NULL,
+    banned_email_hash_kid = NULL
 WHERE tenant_id = $1 AND user_id = $2 AND status = 'suspended'
   AND banned_at IS NOT NULL AND erasure_requested_at IS NULL
 RETURNING *;
@@ -175,20 +206,21 @@ RETURNING *;
 -- name: RemoveMembership :one
 UPDATE memberships AS m
 SET status = 'removed', removed_at = NOW(),
-    -- A ban (and its pseudonymous email marker) survives removal and erasure,
-    -- so the address cannot re-register in this tenant. A ban recorded before
-    -- the hash existed derives it here from the still-intact users.email; an
-    -- erasure reservation (no banned_at) must not create one.
+    -- A ban (and its keyed marker) survives removal and erasure, so the
+    -- address cannot re-register in this tenant. A ban recorded before the
+    -- keyed marker existed gets one backfilled by Go (the caller passes it);
+    -- an erasure reservation (no banned_at) must not create one.
     banned_at = m.banned_at,
     banned_email_hash = CASE
         WHEN m.banned_email_hash IS NOT NULL THEN m.banned_email_hash
-        WHEN m.banned_at IS NOT NULL THEN encode(sha256(convert_to(u.email, 'UTF8')), 'hex')
-        ELSE NULL
+        ELSE NULLIF(@banned_email_hash::bytea, ''::bytea)
+    END,
+    banned_email_hash_kid = CASE
+        WHEN m.banned_email_hash IS NOT NULL THEN m.banned_email_hash_kid
+        ELSE NULLIF(@banned_email_hash_kid::text, '')
     END,
     credentials_revoked_at = clock_timestamp()
-FROM users AS u
-WHERE u.id = m.user_id
-  AND m.tenant_id = $1 AND m.user_id = $2 AND m.status <> 'removed'
+WHERE m.tenant_id = $1 AND m.user_id = $2 AND m.status <> 'removed'
 RETURNING m.*;
 
 -- name: LockMembership :execrows
@@ -213,7 +245,7 @@ WHERE mr.tenant_id = $1
 -- Serializes owner demotion/ban/removal per tenant for the rest of the
 -- transaction. It uses the same advisory key as the protect_last_owner
 -- trigger, so concurrent changes cannot both observe a surviving owner.
-SELECT pg_advisory_xact_lock(hashtextextended('identity.last_owner', @tenant_id::bigint));
+SELECT pg_advisory_xact_lock(hashtextextended('identity.last_owner:' || @tenant_id::uuid, 0));
 
 -- name: MembershipStats :one
 SELECT
@@ -224,23 +256,29 @@ JOIN users u ON u.id = m.user_id
 WHERE m.tenant_id = $1;
 
 -- name: EmailBannedInTenant :one
--- Public registration, invitation acceptance, and email changes refuse an
--- address whose account (live or deleted) is banned in the tenant. The
--- pseudonymous hash keeps blocking after erasure removed the membership and
--- anonymized the user, so a ban survives the banned user deleting and
--- re-creating the account. Served by idx_memberships_tenant_suspended and
+-- Public registration, invitation acceptance, sign-in account creation, and
+-- email changes refuse an address whose tenant membership retains a matching
+-- keyed ban marker. The caller passes the marker under the active key and
+-- every configured previous key, so a ban survives a rotation while the key
+-- that wrote it remains configured, and keeps blocking after erasure removed
+-- the membership and anonymized the user. Served by
 -- idx_memberships_tenant_banned_email_hash (bans are few per tenant).
 SELECT EXISTS (
     SELECT 1 FROM memberships m
-    JOIN users u ON u.id = m.user_id
-    WHERE m.tenant_id = @tenant_id::bigint
-      AND (
-          (m.status = 'suspended' AND u.email = @email::varchar)
-          OR m.banned_email_hash = encode(
-              sha256(convert_to(lower(btrim(@email::text)), 'UTF8')), 'hex'
-          )
-      )
+    WHERE m.tenant_id = @tenant_id::uuid
+      AND m.banned_email_hash = ANY(@email_hashes::bytea[])
 )::boolean;
+
+-- name: CountBannedMarkers :many
+-- Startup check: retained ban markers per key id across every tenant, so an
+-- operator is warned that markers written with a no-longer-configured key can
+-- no longer match (they cannot be re-hashed after erasure).
+SELECT COALESCE(banned_email_hash_kid, '')::text AS banned_email_hash_kid,
+       count(*)::bigint AS bans
+FROM memberships
+WHERE banned_email_hash IS NOT NULL
+GROUP BY banned_email_hash_kid
+ORDER BY banned_email_hash_kid;
 
 -- name: GetMemberPrincipal :one
 -- API-key authentication needs the owner's current role and effective
@@ -344,8 +382,8 @@ FOR SHARE OF m;
 -- batches so a large tenant never loads in one statement. The tenant purge
 -- then runs the privacy erasers for each user before deleting the memberships.
 SELECT user_id FROM memberships
-WHERE tenant_id = @tenant_id::bigint
-  AND user_id > @after_user_id::bigint
+WHERE tenant_id = @tenant_id::uuid
+  AND user_id > @after_user_id::uuid
 ORDER BY user_id
 LIMIT @row_limit::int;
 
@@ -354,7 +392,7 @@ LIMIT @row_limit::int;
 -- succeeded. Its sessions, refresh tokens, and role assignments cascade; the
 -- per-member invitations are deleted first to release the RESTRICT FKs.
 DELETE FROM memberships
-WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint;
+WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid;
 
 -- name: DeleteTenantMembershipsBatch :execrows
 -- Final sweep after every module purger and invitation delete. A deleted
@@ -363,6 +401,16 @@ WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint;
 DELETE FROM memberships
 WHERE id IN (
     SELECT id FROM memberships
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );
+
+-- name: TouchMembershipIfUnchanged :execrows
+-- The optimistic-concurrency gate for the memberships ETag. Two writers that
+-- read the same updated_at cannot both win: the first commits a new value and
+-- the second re-evaluates the predicate to 0 rows.
+UPDATE memberships
+SET updated_at = NOW()
+WHERE tenant_id = @tenant_id
+  AND user_id = @user_id
+  AND updated_at = @expected_updated_at;

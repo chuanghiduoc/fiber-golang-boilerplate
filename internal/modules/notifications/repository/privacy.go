@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 )
@@ -19,7 +21,7 @@ func NewPrivacyStore(db notificationsqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: notificationsqlc.New(db)}
 }
 
-func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID int64) ([]notificationsprivacy.Notification, error) {
+func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID uuid.UUID) ([]notificationsprivacy.Notification, error) {
 	rows, err := s.q.ListNotificationsForPrivacy(ctx, notificationsqlc.ListNotificationsForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})
@@ -37,7 +39,7 @@ func (s *PrivacyStore) ListNotifications(ctx context.Context, tenantID, userID i
 	return out, nil
 }
 
-func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID int64) ([]notificationsprivacy.Preference, error) {
+func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID uuid.UUID) ([]notificationsprivacy.Preference, error) {
 	rows, err := s.q.ListPreferencesForPrivacy(ctx, notificationsqlc.ListPreferencesForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})
@@ -53,7 +55,7 @@ func (s *PrivacyStore) ListPreferences(ctx context.Context, tenantID, userID int
 	return out, nil
 }
 
-func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID int64) error {
+func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error {
 	if err := s.q.DeleteNotificationPreferencesForPrivacy(ctx, notificationsqlc.DeleteNotificationPreferencesForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	}); err != nil {

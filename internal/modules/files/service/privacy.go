@@ -9,6 +9,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/google/uuid"
+
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
@@ -21,8 +23,8 @@ const exportInlineLimit = 64 << 20
 
 // PrivacyRepository is the files side of data export/erasure.
 type PrivacyRepository interface {
-	ListForUser(ctx context.Context, tenantID, userID int64) ([]File, error)
-	HardDelete(ctx context.Context, tenantID, userID, id int64) error
+	ListForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]File, error)
+	HardDelete(ctx context.Context, tenantID, userID, id uuid.UUID) error
 }
 
 // PrivacyExporter returns file metadata and, within exportInlineLimit, blob
@@ -37,13 +39,13 @@ func NewPrivacyExporter(repo PrivacyRepository, store storage.Storage) *PrivacyE
 	return &PrivacyExporter{inlineLimit: exportInlineLimit, repo: repo, storage: store}
 }
 
-func (e *PrivacyExporter) Export(ctx context.Context, tenantID, userID int64) (privacycontracts.Section, error) {
+func (e *PrivacyExporter) Export(ctx context.Context, tenantID, userID uuid.UUID) (privacycontracts.Section, error) {
 	files, err := e.repo.ListForUser(ctx, tenantID, userID)
 	if err != nil {
 		return privacycontracts.Section{}, err
 	}
 	type exportedFile struct {
-		ID             int64      `json:"id"`
+		ID             uuid.UUID  `json:"id"`
 		Name           string     `json:"name"`
 		MimeType       string     `json:"mimeType"`
 		Size           int64      `json:"size"`
@@ -67,7 +69,7 @@ func (e *PrivacyExporter) Export(ctx context.Context, tenantID, userID int64) (p
 		case errors.Is(err, storage.ErrNotFound):
 			item.ContentMissing = true
 		case err != nil:
-			return privacycontracts.Section{}, fmt.Errorf("read file %d: %w", file.ID, err)
+			return privacycontracts.Section{}, fmt.Errorf("read file %s: %w", file.ID, err)
 		case !fits:
 			item.ContentOmitted = true
 		default:
@@ -115,17 +117,17 @@ func NewPrivacyEraser(repo PrivacyRepository, store storage.Storage) *PrivacyEra
 	return &PrivacyEraser{repo: repo, storage: store}
 }
 
-func (e *PrivacyEraser) Erase(ctx context.Context, tenantID, userID int64) error {
+func (e *PrivacyEraser) Erase(ctx context.Context, tenantID, userID uuid.UUID) error {
 	files, err := e.repo.ListForUser(ctx, tenantID, userID)
 	if err != nil {
 		return err
 	}
 	for _, file := range files {
 		if err := e.storage.Delete(ctx, file.StoragePath); err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return fmt.Errorf("delete file blob %d: %w", file.ID, err)
+			return fmt.Errorf("delete file blob %s: %w", file.ID, err)
 		}
 		if err := e.repo.HardDelete(ctx, tenantID, userID, file.ID); err != nil {
-			return fmt.Errorf("delete file row %d: %w", file.ID, err)
+			return fmt.Errorf("delete file row %s: %w", file.ID, err)
 		}
 	}
 	return nil

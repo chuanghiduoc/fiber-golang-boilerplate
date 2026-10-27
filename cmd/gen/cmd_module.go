@@ -52,8 +52,9 @@ func (g *generator) generateModule(ctx context.Context, name string) error {
 	return g.execute(ctx, p, verifySteps(name, true), []string{
 		"Add a resource: make gen resource=<name> module=" + name,
 		"Apply the migration locally: make migrate-run",
-		"Refresh the API spec: make swagger",
+		"Refresh the API spec: make openapi",
 		"Grant roles deliberately in internal/modules/" + name + "/catalog/permissions.go (admin-only by default)",
+		"Generated routes are huma operations with their policy; extend them at the gen: markers (see docs/module-template.md#3-route-wiring)",
 	})
 }
 
@@ -116,11 +117,11 @@ func registerInBootstrap(src, modulePath, name string) (string, error) {
 		return "", err
 	}
 	variable := camel(name) + "Module"
-	build := fmt.Sprintf("%s, _, err := %s.Build(infra, %s.Settings{})\nif err != nil {\n\treturn nil, err\n}", variable, name, name)
+	build := fmt.Sprintf("%s, err := %s.Build(infra, %s.Settings{}, %s.Deps{})\nif err != nil {\n\treturn nil, err\n}", variable, name, name, name)
 	if out, err = insertAtMarker(bootstrapFile, out, markerBootstrapBuild, build); err != nil {
 		return "", err
 	}
-	if out, err = insertAtMarker(bootstrapFile, out, markerBootstrapPurge, variable+".RegisterTenantPurge(tenancyRegistry)"); err != nil {
+	if out, err = insertAtMarker(bootstrapFile, out, markerBootstrapPurge, variable+","); err != nil {
 		return "", err
 	}
 	return insertAtMarker(bootstrapFile, out, markerBootstrapList, variable+",")

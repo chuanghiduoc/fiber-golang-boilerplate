@@ -1,7 +1,6 @@
 package service
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,9 +8,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 func statusOf(err error) int {
@@ -20,7 +19,7 @@ func statusOf(err error) int {
 	}
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
-		return appErr.Status
+		return resolvedStatus(appErr)
 	}
 	return -1
 }
@@ -30,10 +29,10 @@ func newTestUserService(db *memDB) UserService {
 }
 
 // Parallel wrong-password attempts must not all pass a stale "not locked yet"
-// read: the counter is reserved atomically before the bcrypt comparison.
+// read: the counter is reserved atomically before the Argon2id comparison.
 func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: "race@example.com", Password: testPassphrase, Name: "Race",
 	}); err != nil {
@@ -47,7 +46,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: "Wrong!"})
+			_, err := svc.Authenticate(ctx, LoginInput{Email: "race@example.com", Password: testWrongPassword})
 			statuses <- statusOf(err)
 		}()
 	}
@@ -78,7 +77,7 @@ func TestAuthenticate_ConcurrentAttemptsCannotExceedLockout(t *testing.T) {
 // A lockout response must look the same whether or not the address exists.
 func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: "known@example.com", Password: testPassphrase, Name: "Known",
 	}); err != nil {
@@ -87,12 +86,12 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 
 	for _, addr := range []string{"known@example.com", "unknown@example.com"} {
 		for i := range maxLoginAttempts {
-			_, err := svc.Authenticate(ctx, LoginInput{Email: addr, Password: "Wrong!"})
+			_, err := svc.Authenticate(ctx, LoginInput{Email: addr, Password: testWrongPassword})
 			if statusOf(err) != http.StatusUnauthorized {
 				t.Fatalf("%s attempt %d: err = %v, want 401", addr, i+1, err)
 			}
 		}
-		_, err := svc.Authenticate(ctx, LoginInput{Email: addr, Password: "Wrong!"})
+		_, err := svc.Authenticate(ctx, LoginInput{Email: addr, Password: testWrongPassword})
 		if statusOf(err) != http.StatusTooManyRequests {
 			t.Fatalf("%s: err = %v, want 429 after %d failures", addr, err, maxLoginAttempts)
 		}
@@ -103,12 +102,12 @@ func TestAuthenticate_LockoutDoesNotRevealExistence(t *testing.T) {
 // tenant count against the same account in another.
 func TestAuthenticate_LockoutIsGlobalAcrossTenants(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	if _, err := svc.Register(ctx, RegisterInput{Email: "g@example.com", Password: testPassphrase, Name: "G"}); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	for range maxLoginAttempts {
-		_, _ = svc.Authenticate(tenant.WithID(ctx, 2), LoginInput{Email: "g@example.com", Password: "Wrong!"})
+		_, _ = svc.Authenticate(tenant.WithID(ctx, testID(2)), LoginInput{Email: "g@example.com", Password: testWrongPassword}) // ggignore: test fixture, not a credential
 	}
 	if _, err := svc.Authenticate(ctx, LoginInput{Email: "g@example.com", Password: testPassphrase}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("login in tenant 1 after failures in tenant 2: err = %v, want 429", err)
@@ -119,9 +118,9 @@ func TestAuthenticate_LockoutIsGlobalAcrossTenants(t *testing.T) {
 // so pre-locking an unregistered address cannot lock out its future owner.
 func TestRegister_ClearsPreexistingLockout(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	for range maxLoginAttempts + 1 {
-		_, _ = svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: "Wrong!"})
+		_, _ = svc.Authenticate(ctx, LoginInput{Email: "future@example.com", Password: testWrongPassword})
 	}
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: "future@example.com", Password: testPassphrase, Name: "Future",
@@ -137,7 +136,7 @@ func TestRegister_ClearsPreexistingLockout(t *testing.T) {
 // rev4 caps the account-wide budget at 100 consecutive failures.
 func TestAuthenticate_FiveSourcesDoNotLockTheAccount(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	const email = "budget@example.com"
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: email, Password: testPassphrase, Name: "Budget",
@@ -148,7 +147,7 @@ func TestAuthenticate_FiveSourcesDoNotLockTheAccount(t *testing.T) {
 	for i := range 5 {
 		source := WithClientIP(ctx, fmt.Sprintf("203.0.113.%d", i))
 		for range maxLoginAttempts {
-			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: testWrongPassword}); statusOf(err) != http.StatusUnauthorized {
 				t.Fatalf("source %d failure: err = %v, want 401", i, err)
 			}
 		}
@@ -166,7 +165,7 @@ func TestAuthenticate_FiveSourcesDoNotLockTheAccount(t *testing.T) {
 // after its own budget, so reaching the ceiling takes 20 addresses.
 func TestAuthenticate_AccountBudgetCapsAtOneHundred(t *testing.T) {
 	svc := newTestUserService(newMemDB())
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	const email = "ceiling@example.com"
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: email, Password: testPassphrase, Name: "Ceiling",
@@ -177,12 +176,12 @@ func TestAuthenticate_AccountBudgetCapsAtOneHundred(t *testing.T) {
 	for i := range maxAccountLoginFailures / maxLoginAttempts {
 		source := WithClientIP(ctx, fmt.Sprintf("203.0.113.%d", i))
 		for range maxLoginAttempts {
-			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+			if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: testWrongPassword}); statusOf(err) != http.StatusUnauthorized {
 				t.Fatalf("source %d failure: err = %v, want 401", i, err)
 			}
 		}
 	}
-	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.2"), LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusTooManyRequests {
+	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.2"), LoginInput{Email: email, Password: testWrongPassword}); statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("first failure past the account budget: err = %v, want 429", err)
 	}
 	if _, err := svc.Authenticate(WithClientIP(ctx, "198.51.100.3"), LoginInput{Email: email, Password: testPassphrase}); statusOf(err) != http.StatusTooManyRequests {
@@ -196,7 +195,7 @@ func TestAuthenticate_SuccessClearsOnlyTheSourceCounter(t *testing.T) {
 	db := newMemDB()
 	store := cache.NewMemoryCache()
 	svc := NewUserService(UserDeps{Stores: db.stores(), Tx: memTx{db}, Cache: store})
-	ctx := context.Background()
+	ctx := testTenantCtx()
 	const email = "source-only@example.com"
 	if _, err := svc.Register(ctx, RegisterInput{
 		Email: email, Password: testPassphrase, Name: "Source",
@@ -205,7 +204,7 @@ func TestAuthenticate_SuccessClearsOnlyTheSourceCounter(t *testing.T) {
 	}
 	source := WithClientIP(ctx, "203.0.113.10")
 	for range 3 {
-		if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: "wrong password"}); statusOf(err) != http.StatusUnauthorized {
+		if _, err := svc.Authenticate(source, LoginInput{Email: email, Password: testWrongPassword}); statusOf(err) != http.StatusUnauthorized {
 			t.Fatalf("failure: err = %v, want 401", err)
 		}
 	}
@@ -233,7 +232,7 @@ func TestAuthenticate_SuccessClearsOnlyTheSourceCounter(t *testing.T) {
 // Lockout keys must not carry the raw address (PII in the cache), yet every
 // spelling of one normalized address must share its counters.
 func TestLoginAttemptKeysHashTheEmail(t *testing.T) {
-	ctx := WithClientIP(context.Background(), "203.0.113.7")
+	ctx := WithClientIP(testTenantCtx(), "203.0.113.7")
 	source, account := loginAttemptKeys(ctx, "Victim@Example.com")
 	for _, key := range []string{source, account} {
 		if strings.Contains(strings.ToLower(key), "victim") || strings.Contains(key, "@") {

@@ -17,17 +17,20 @@ type Settings struct{}
 // this module's capability.
 type Provides struct{}
 
+// Deps are the contracts {{.M.Name}} consumes from modules built before it.
+// Add fields when this module needs another module's internal/contracts value.
+type Deps struct{}
+
 // Build constructs the repositories, services, and handlers from the shared
 // infrastructure. It performs no I/O. Another module's capability arrives only
-// as an internal/contracts parameter wired in internal/bootstrap/modules.go.
-// The error result is for construction that can fail (for example parsing a
-// key from settings).
-func Build(infra app.Infra, settings Settings) (*Module, Provides, error) {
+// through Deps, wired in internal/bootstrap/modules.go. The error result is for
+// construction that can fail (for example parsing a key from settings).
+func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
 	handlers := Handlers{
-		Health: {{.M.Ident}}handler.NewHealthHandler({{.M.Ident}}service.NewHealthService({{.M.Ident}}repository.NewHealthRepository(infra.Pool))),
+		Health: {{.M.Ident}}handler.NewHealthHandler({{.M.Ident}}service.NewHealthService({{.M.Ident}}repository.NewHealthRepository(infra.DB))),
 		// gen:build
 	}
 	m := New(handlers)
 	// gen:purge
-	return m, Provides{}, nil
+	return m, nil
 }

@@ -8,74 +8,46 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	identityadapter "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/adapter"
 	identitydto "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/dto"
+	identityrepo "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
 )
 
-const integrationTenantSecret = "tenant-integration-secret"
+const integrationTenantSecret = "integration-app-secret-0123456789"
 
 type tenantHarness struct {
 	app       *fiber.App
 	pool      *pgxpool.Pool
 	stores    identityservice.Stores
 	adminSvc  identityservice.AdminUserService
-	tenantOne int64
-	tenantTwo int64
+	tenantOne uuid.UUID
+	tenantTwo uuid.UUID
 }
 
 func setupTenantHarness(t *testing.T) *tenantHarness {
 	t.Helper()
 	ctx := context.Background()
-
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
-
-	tenantTwo := testutil.CreateTenant(t, ctx, pool, "acme")
-
-	appCache := cache.NewMemoryCache()
-	t.Cleanup(func() { _ = appCache.Close() })
-	kit := newIdentityKit(pool, appCache, audit.NewPostgresRecorder(testutil.Scoped(pool)), integrationTenantSecret, nil)
-
-	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
-	api := app.Group("/api/v1", tenanthttp.Middleware(identityadapter.NewTenantResolver(kit.stores.Tenants), "default"))
-	api.Post("/auth/register", kit.auth.Register)
-	api.Post("/auth/login", kit.auth.Login)
-	api.Post("/auth/refresh", kit.auth.Refresh)
-
-	users := api.Group("/users", middleware.JWTAuth(integrationTenantSecret, kit.sessions))
-	users.Get("/me", kit.userHandler.GetMe)
-	users.Get("/:id", kit.userHandler.GetByID)
-	users.Put("/:id", kit.userHandler.Update)
-	users.Delete("/:id", kit.userHandler.Delete)
-	users.Get("/", authzhttp.Require(authz.PermissionAdminUsersRead), kit.userHandler.List)
-
+	full := newIntegrationApp(t, "test")
+	tenantTwo := testutil.CreateTenant(t, ctx, full.pool, "acme")
+	stores := identityrepo.NewStores(full.fx.Scoped())
 	return &tenantHarness{
-		app:       app,
-		pool:      pool,
-		stores:    kit.stores,
-		adminSvc:  kit.admin,
+		app:       full.app,
+		pool:      full.pool,
+		stores:    stores,
+		adminSvc:  identityservice.NewAdminUserService(stores, nil, nil),
 		tenantOne: tenant.DefaultID,
 		tenantTwo: tenantTwo,
 	}
@@ -83,10 +55,18 @@ func setupTenantHarness(t *testing.T) *tenantHarness {
 
 func tenantRequest(t *testing.T, app *fiber.App, method, path, slug string, body []byte, bearer string) (resp *http.Response, respBody []byte) {
 	t.Helper()
-	req, err := http.NewRequest(method, path, bytes.NewReader(body))
+	var reader io.Reader = http.NoBody
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, path, reader)
 	require.NoError(t, err)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		contentType := "application/json"
+		if method == http.MethodPatch {
+			contentType = "application/merge-patch+json"
+		}
+		req.Header.Set("Content-Type", contentType)
 	}
 	if slug != "" {
 		req.Header.Set(tenant.Header, slug)
@@ -124,7 +104,7 @@ func loginTenantUser(t *testing.T, h *tenantHarness, slug, email, password strin
 	return login
 }
 
-func (h *tenantHarness) tenantCtx(id int64) context.Context {
+func (h *tenantHarness) tenantCtx(id uuid.UUID) context.Context {
 	return tenant.WithID(context.Background(), id)
 }
 
@@ -178,34 +158,26 @@ func TestTenantIdentity_RegistrationLoginAndTokenClaim(t *testing.T) {
 func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	h := setupTenantHarness(t)
 
-	adminA := registerTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!2026", "Admin A")
-	userB := registerTenantUser(t, h, "acme", "user-b@example.com", "UserPass1!2026", "User B")
+	adminA := registerTenantUser(t, h, "default", "admin-a@example.com", testPassphrase, "Admin A")
+	userB := registerTenantUser(t, h, "acme", "user-b@example.com", testPassphrase, "User B")
 
 	_, err := h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantOne), adminA.ID, identitydto.RoleOwner)
 	require.NoError(t, err)
-	loginAdmin := loginTenantUser(t, h, "default", "admin-a@example.com", "AdminPass1!2026")
+	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantTwo), userB.ID, identitydto.RoleOwner)
+	require.NoError(t, err)
+	loginAdmin := loginTenantUser(t, h, "default", "admin-a@example.com", testPassphrase)
 
 	// A tenant-one admin cannot read or remove a tenant-two user: the user has
 	// no membership here, which is not found (not forbidden).
-	pathB := "/api/v1/users/" + strconv.FormatInt(userB.ID, 10)
+	pathB := "/api/v1/members/" + userB.ID.String()
 	resp, _ := tenantRequest(t, h.app, http.MethodGet, pathB, "", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 
 	resp, _ = tenantRequest(t, h.app, http.MethodDelete, pathB, "", nil, loginAdmin.AccessToken)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
 
-	// Profiles are global and only editable by their owner, so another
-	// user's profile is forbidden for every caller, including admins.
-	nameBody, _ := json.Marshal(identitydto.UpdateUserRequest{Name: stringPtr("Hijacked")})
-	resp, respBody := tenantRequest(t, h.app, http.MethodPut, pathB, "", nameBody, loginAdmin.AccessToken)
-	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
-	assert.Contains(t, string(respBody), string(apperror.CodePermissionDenied))
-	var name string
-	require.NoError(t, h.pool.QueryRow(context.Background(), `SELECT name FROM users WHERE id = $1`, userB.ID).Scan(&name))
-	assert.Equal(t, "User B", name)
-
 	// Listing only returns the admin's own tenant.
-	resp, listBody := tenantRequest(t, h.app, http.MethodGet, "/api/v1/users", "", nil, loginAdmin.AccessToken)
+	resp, listBody := tenantRequest(t, h.app, http.MethodGet, "/api/v1/members", "", nil, loginAdmin.AccessToken)
 	require.Equal(t, fiber.StatusOK, resp.StatusCode, "body: %s", listBody)
 	var page struct {
 		Data []identitydto.UserResponse `json:"data"`
@@ -215,13 +187,14 @@ func TestTenantIdentity_CrossTenantUserAccess(t *testing.T) {
 	assert.Equal(t, adminA.ID, page.Data[0].ID)
 	assert.Equal(t, h.tenantOne, page.Data[0].TenantID)
 
-	// An explicit header from another tenant conflicts with the JWT claim.
-	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, loginAdmin.AccessToken)
-	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+	// The profile is the caller's own; there is no route to edit another user.
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "", nil, loginAdmin.AccessToken)
+	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "acme", nil, loginAdmin.AccessToken)
+	assert.Equal(t, fiber.StatusForbidden, resp.StatusCode,
+		"an explicit header from another tenant conflicts with the JWT claim")
 
 	// Tenant two's owner count is independent of tenant one.
-	_, err = h.stores.Memberships.UpdateRole(h.tenantCtx(h.tenantTwo), userB.ID, identitydto.RoleOwner)
-	require.NoError(t, err)
 	countA, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantOne))
 	require.NoError(t, err)
 	countB, err := h.stores.Memberships.CountActiveOwners(h.tenantCtx(h.tenantTwo))
@@ -267,25 +240,25 @@ func TestTenantIdentity_RefreshTokenTenantMismatch(t *testing.T) {
 
 func TestTenantIdentity_SuspendedTenantAndLegacyToken(t *testing.T) {
 	h := setupTenantHarness(t)
-	registerTenantUser(t, h, "acme", "suspended@example.com", testPassphrase, "Suspended User")
-	login := loginTenantUser(t, h, "acme", "suspended@example.com", testPassphrase)
+	member := testutil.CreateMember(t, context.Background(), h.pool, h.tenantTwo, "suspended@example.com",
+		testutil.MemberOptions{Password: testPassphrase})
+	login := identitydto.LoginResponse{
+		User:        identitydto.UserResponse{ID: member.UserID, TenantID: member.TenantID},
+		AccessToken: testutil.SessionToken(t, context.Background(), h.pool, member, integrationTenantSecret),
+	}
 
 	// A legacy token without tenant_id is rejected fail-closed.
-	legacy, err := token.Generate(login.User.ID, login.User.Email, login.User.Role, integrationTenantSecret, 24)
+	legacy, err := token.Generate(login.User.ID, integrationTenantSecret, 24*time.Hour)
 	require.NoError(t, err)
-	resp, _ := tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "", nil, legacy)
+	resp, _ := tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "", nil, legacy)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
 	// A tenant-bound token without a session id is rejected too.
-	sessionless, err := token.GenerateWithVersionAndTenant(login.User.ID, h.tenantTwo, login.User.Email,
-		login.User.Role, 0, integrationTenantSecret, 24)
+	sessionless, err := token.GenerateWithVersionAndTenant(login.User.ID, h.tenantTwo, 0, integrationTenantSecret, 24*time.Hour)
 	require.NoError(t, err)
-	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, sessionless)
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "", nil, sessionless)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 
-	// Suspend the tenant after the session was issued. (No request validates
-	// the token first: the validator caches session snapshots, and this raw
-	// UPDATE bypasses the identity service's cache invalidation.)
 	h.suspendTenant(t, "acme")
 
 	// The middleware refuses to resolve a suspended tenant for public auth.
@@ -296,9 +269,9 @@ func TestTenantIdentity_SuspendedTenantAndLegacyToken(t *testing.T) {
 	// An already-issued access token is rejected by the session validator even
 	// when the header would otherwise resolve the default tenant; with the
 	// suspended slug the middleware already returns 404.
-	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "acme", nil, login.AccessToken)
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "acme", nil, login.AccessToken)
 	assert.Equal(t, fiber.StatusNotFound, resp.StatusCode)
-	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/users/me", "", nil, login.AccessToken)
+	resp, _ = tenantRequest(t, h.app, http.MethodGet, "/api/v1/me/profile", "", nil, login.AccessToken)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 }
 
@@ -309,5 +282,3 @@ func (h *tenantHarness) suspendTenant(t *testing.T, slug string) {
 	)
 	require.NoError(t, err)
 }
-
-func stringPtr(v string) *string { return &v }

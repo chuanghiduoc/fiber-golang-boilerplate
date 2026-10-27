@@ -52,7 +52,7 @@ func TestTokenPurgerDrainsEveryTableInBatches(t *testing.T) {
 		"invitations":  tokenPurgeBatchSize + 1,
 		"sessions":     5,
 	}}
-	if err := NewTokenPurger(repo).HandleJob(context.Background(), nil); err != nil {
+	if err := NewTokenPurger(repo).HandleJob(testTenantCtx(), nil); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
 	for table, left := range repo.backlog {
@@ -64,7 +64,7 @@ func TestTokenPurgerDrainsEveryTableInBatches(t *testing.T) {
 
 func TestTokenPurgerReturnsDatabaseErrors(t *testing.T) {
 	boom := errors.New("connection reset")
-	err := NewTokenPurger(&fakeTokenPurgeRepo{err: boom}).HandleJob(context.Background(), nil)
+	err := NewTokenPurger(&fakeTokenPurgeRepo{err: boom}).HandleJob(testTenantCtx(), nil)
 	if !errors.Is(err, boom) {
 		t.Fatalf("expected the database error so the job retries, got %v", err)
 	}

@@ -30,13 +30,13 @@ func TestOversizedJSONRejectedWithoutReadingIt(t *testing.T) {
 			Env:            "production",
 			BodyLimit:      12 << 20,
 			JSONBodyLimit:  1 << 20,
-			RequestTimeout: 5,
+			RequestTimeout: 5 * time.Second,
 		},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
 	application.Register(pingModule{})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -72,21 +72,6 @@ func TestOversizedJSONRejectedWithoutReadingIt(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
 }
 
-// uploadPathModule stands in for the files module at the one path registered
-// with the larger multipart limit.
-type uploadPathModule struct{}
-
-func (uploadPathModule) Name() string { return "upload" }
-func (uploadPathModule) RegisterRoutes(v1 fiber.Router, _ app.Deps) {
-	v1.Post("/files/upload", func(c fiber.Ctx) error {
-		header, err := c.FormFile("file")
-		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, err.Error())
-		}
-		return c.SendString(fmt.Sprintf("%d", header.Size))
-	})
-}
-
 // TestUploadPathAcceptsMultipartAboveJSONLimit proves the upload route keeps
 // APP_BODY_LIMIT for multipart after the global cap dropped to the JSON limit,
 // and that lazy multipart parsing sees the whole file while streaming.
@@ -96,14 +81,23 @@ func TestUploadPathAcceptsMultipartAboveJSONLimit(t *testing.T) {
 			Env:            "production",
 			BodyLimit:      12 << 20,
 			JSONBodyLimit:  1 << 20,
-			RequestTimeout: 5,
+			RequestTimeout: 5 * time.Second,
 		},
-		CORS:      config.CORSConfig{AllowOrigins: "*"},
-		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
+		CORS:      config.CORSConfig{AllowOrigins: []string{"*"}},
+		RateLimit: config.RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
 		Tenant:    config.TenantConfig{DefaultSlug: "default"},
 	}
-	application := app.New(cfg, app.Deps{})
-	application.Register(uploadPathModule{})
+	application := app.New(cfg, app.Deps{Sessions: allowAllSessions{}})
+	// The files module will register POST /api/v1/files through httpapi; this
+	// test exercises the global body-limit exception without depending on the
+	// module's multipart DTO conversion.
+	application.Fiber().Post("/api/v1/files", func(c fiber.Ctx) error {
+		header, err := c.FormFile("file")
+		if err != nil {
+			return fiber.NewError(fiber.StatusBadRequest, err.Error())
+		}
+		return c.SendString(fmt.Sprintf("%d", header.Size))
+	})
 
 	const fileSize = 2 << 20
 	body := &bytes.Buffer{}
@@ -114,7 +108,7 @@ func TestUploadPathAcceptsMultipartAboveJSONLimit(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, writer.Close())
 
-	req, err := http.NewRequest(http.MethodPost, "/api/v1/files/upload", body)
+	req, err := http.NewRequest(http.MethodPost, "/api/v1/files", body)
 	require.NoError(t, err)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 

@@ -5,9 +5,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 )
 
 // Transactor implements service.Transactor: InTx binds the notification
@@ -42,7 +42,7 @@ type txEmailSender interface {
 	SendTx(ctx context.Context, tx pgx.Tx, msg email.Message) error
 }
 
-// txMail enqueues the email.send job through the open transaction when the
+// txMail enqueues the email.send.encrypted job through the open transaction when the
 // sender supports it, otherwise it sends while the transaction is open.
 type txMail struct {
 	sender email.Sender

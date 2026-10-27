@@ -45,9 +45,8 @@ import (
 // Standard Webhooks headers, signature, and envelope body independently.
 func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
 	captured := make(chan capturedRequest, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -61,30 +60,30 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 
 	// Infrastructure and the webhooks module, built like cmd/api does.
 	const encryptionKey = "webhook-e2e-encryption-key"
-	queue := jobs.NewQueue(testutil.Scoped(pool))
+	queue := jobs.NewQueue(fx.Scoped())
 	bus := events.New(queue)
-	recorder := audit.NewPostgresRecorder(testutil.Scoped(pool))
+	recorder := audit.NewPostgresRecorder(fx.Scoped())
 	module, err := webhooks.Build(app.Infra{
-		Pool: pool, DB: testutil.Scoped(pool), Tx: testutil.NewTxManager(pool),
+		DB: fx.Scoped(), Tx: fx.Tx(),
 		Queue: queue, Audit: recorder, Events: bus,
 	}, webhooks.Settings{
 		Webhook: config.WebhookConfig{
-			ConnectTimeoutSeconds:     2,
-			RequestTimeoutSeconds:     5,
-			RetryBaseSeconds:          1,
-			RetryMaxSeconds:           5,
-			MaxAttempts:               3,
-			RetentionDays:             30,
-			TimestampToleranceSeconds: 300,
-			SSRFAllowlist:             "127.0.0.1",
-			AllowedPortsCSV:           serverURL.Port(),
+			ConnectTimeout:     2 * time.Second,
+			RequestTimeout:     5 * time.Second,
+			RetryBase:          time.Second,
+			RetryMax:           5 * time.Second,
+			MaxAttempts:        3,
+			Retention:          720 * time.Hour,
+			TimestampTolerance: 300 * time.Second,
+			SSRFAllowlist:      []string{"127.0.0.1"},
+			AllowedPorts:       []string{serverURL.Port()},
 		},
 		SecretKey: encryptionKey,
-	}, nil)
+	}, webhooks.Deps{})
 	require.NoError(t, err)
 	t.Cleanup(module.Close)
 	module.RegisterEvents(bus)
-	worker := jobs.NewWorker(testutil.Scoped(pool), "webhooks-e2e", jobs.WithPollInterval(50*time.Millisecond))
+	worker := jobs.NewWorker(fx.Scoped(), "webhooks-e2e", jobs.WithPollInterval(50*time.Millisecond))
 	module.RegisterJobs(worker)
 	require.NoError(t, bus.RegisterJobs(worker))
 
@@ -92,13 +91,13 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	codec, err := webhookservice.NewSecretCodec(encryptionKey)
 	require.NoError(t, err)
 	tenantCtx := tenant.WithID(ctx, tenant.DefaultID)
-	_, err = webhookrepo.New(testutil.Scoped(pool), testutil.NewTxManager(pool), queue).CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
+	_, err = webhookrepo.New(fx.Scoped(), fx.Tx(), queue).CreateEndpoint(tenantCtx, webhookservice.CreateEndpointDraft{
 		URL:         server.URL + "/hook",
 		EventTypes:  []string{"file.*"},
 		Status:      "active",
 		MaxAttempts: 3,
 		TimeoutMS:   2000,
-		SealSecret: func(endpointID int64) (string, error) {
+		SealSecret: func(endpointID uuid.UUID) (string, error) {
 			return codec.Seal(webhookservice.EndpointSecretBinding(tenant.DefaultID, endpointID), []byte(wireSecret))
 		},
 	})
@@ -108,9 +107,9 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 	userID := testutil.CreateMember(t, ctx, pool, tenant.DefaultID, "e2e@test.com", testutil.MemberOptions{}).UserID
 	store, err := storage.NewLocalStorage(t.TempDir())
 	require.NoError(t, err)
-	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(testutil.Scoped(pool)),
-		filesrepo.NewTransactor(testutil.NewTxManager(pool), recorder, bus), store, filesvc.UploadOptions{})
-	userCtx := requestctx.WithActorID(authz.WithSubject(tenantCtx, authz.NewSubject(userID, tenant.DefaultID, "user")), userID)
+	uploads := filesvc.NewUploadService(filesrepo.NewFileRepository(fx.Scoped()),
+		filesrepo.NewTransactor(fx.Tx(), recorder, bus), store, authz.NewAuthorizer(integrationCatalogs().Permissions), filesvc.UploadOptions{})
+	userCtx := requestctx.WithActorID(authz.WithSubject(tenantCtx, authz.NewSubjectWithPermissions(userID, tenant.DefaultID, "member", authz.Permission("files:read"), authz.Permission("files:write"))), userID)
 	file, err := uploads.Upload(userCtx, userID, "report.pdf", strings.NewReader("%PDF-1"), 6, "application/pdf")
 	require.NoError(t, err)
 
@@ -154,7 +153,7 @@ func TestWebhooks_FileUploadEndToEnd(t *testing.T) {
 		Type        string                      `json:"type"`
 		DataVersion int                         `json:"dataVersion"`
 		OccurredAt  time.Time                   `json:"occurredAt"`
-		TenantID    int64                       `json:"tenantId"`
+		TenantID    uuid.UUID                   `json:"tenantId"`
 		Actor       events.Actor                `json:"actor"`
 		Data        filescontracts.FileUploaded `json:"data"`
 		RequestID   *string                     `json:"requestId"`

@@ -5,7 +5,6 @@ package service_test
 import (
 	"context"
 	"net/url"
-	"strconv"
 	"testing"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/totp"
+	"github.com/google/uuid"
 )
 
 func enrollmentSecret(t *testing.T, enrollment *service.MFAEnrollment) string {
@@ -35,14 +35,14 @@ func TestPasswordReset_DeletesPendingMFAEnrollment(t *testing.T) {
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reset-mfa@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 
-	_, err := e.mfa.EnrollTOTP(ctx, user.UserID, 0, mfaIntegrationPassword)
+	_, err := e.mfa.EnrollTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), scalar[int64](t, e.pool,
 		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NULL`, user.UserID))
 
 	require.NoError(t, e.resets.ForgotPassword(ctx, service.ForgotPasswordInput{Email: user.Email}))
 	token := e.mail.tokenFor(t, user.Email)
-	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: token, Password: "NewPassword1!2026"}))
+	require.NoError(t, e.resets.ResetPassword(ctx, service.ResetPasswordInput{Token: token, Password: testNewPassword}))
 
 	assert.Zero(t, scalar[int64](t, e.pool,
 		`SELECT count(*) FROM mfa_factors WHERE user_id = $1 AND confirmed_at IS NULL`, user.UserID))
@@ -56,7 +56,7 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 	user := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "reenroll@example.com",
 		testutil.MemberOptions{Password: mfaIntegrationPassword})
 
-	first, err := e.mfa.EnrollTOTP(ctx, user.UserID, 0, mfaIntegrationPassword)
+	first, err := e.mfa.EnrollTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword)
 	require.NoError(t, err)
 	firstSecret := enrollmentSecret(t, first)
 
@@ -69,7 +69,7 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 		VALUES ($1, 'totp', 'sealed:stale-secret', NOW() - INTERVAL '16 minutes')`, user.UserID)
 	require.NoError(t, err)
 
-	second, err := e.mfa.EnrollTOTP(ctx, user.UserID, 0, mfaIntegrationPassword)
+	second, err := e.mfa.EnrollTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword)
 	require.NoError(t, err)
 	secondSecret := enrollmentSecret(t, second)
 	require.NotEqual(t, firstSecret, secondSecret, "re-enrollment must generate a new pending secret")
@@ -83,13 +83,13 @@ func TestMFAEnroll_ReplacesPendingSecretInDatabase(t *testing.T) {
 
 	firstCode, err := totp.Code(firstSecret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, firstCode)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, firstCode)
 	require.Error(t, err, "the replaced secret must no longer confirm")
 	assert.Equal(t, "auth.mfa_invalid_code", appCode(err))
 
 	secondCode, err := totp.Code(secondSecret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, secondCode)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, secondCode)
 	require.NoError(t, err)
 }
 
@@ -110,7 +110,7 @@ func TestMFAConfirm_ExpiredEnrollmentInDatabase(t *testing.T) {
 
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.Error(t, err)
 	assert.Equal(t, "auth.mfa_enrollment_expired", appCode(err))
 }
@@ -135,7 +135,7 @@ func TestMFAResetTOTP_PlatformRecovery(t *testing.T) {
 	secret := enrollSecret(t, e, user.UserID)
 	code, err := totp.Code(secret, time.Now())
 	require.NoError(t, err)
-	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, 0, mfaIntegrationPassword, code)
+	_, err = e.mfa.ConfirmTOTP(ctx, user.UserID, uuid.Nil, mfaIntegrationPassword, code)
 	require.NoError(t, err)
 
 	// Confirmation bumped the token version; both post-enable sessions carry
@@ -156,5 +156,5 @@ func TestMFAResetTOTP_PlatformRecovery(t *testing.T) {
 	assert.Greater(t, scalar[int32](t, e.pool, `SELECT token_version FROM users WHERE id = $1`, user.UserID), user.TokenVersion)
 	assert.Equal(t, int64(1), scalar[int64](t, e.pool,
 		`SELECT count(*) FROM audit_events WHERE action = 'admin.user.mfa_reset' AND resource_id = $1`,
-		strconv.FormatInt(user.UserID, 10)))
+		user.UserID.String()))
 }

@@ -5,9 +5,11 @@ package integration_test
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -30,7 +33,7 @@ type ownerLockHarness struct {
 	keys     apikeyservice.Service
 	admin    identityservice.AdminUserService
 	verifier *apikey.Verifier
-	owner    int64
+	owner    uuid.UUID
 }
 
 // setupOwnerLockHarness wires the production identity adapter and real
@@ -38,24 +41,23 @@ type ownerLockHarness struct {
 func setupOwnerLockHarness(t *testing.T) *ownerLockHarness {
 	t.Helper()
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
-	insertAdmin := func(email string) int64 {
+	insertAdmin := func(email string) uuid.UUID {
 		return testutil.CreateMember(t, ctx, pool, tenant.DefaultID, email, testutil.MemberOptions{Role: "admin"}).UserID
 	}
 	owner := insertAdmin("lock-owner@test.com")
 	insertAdmin("lock-other-admin@test.com") // the owner is not the last owner
 
-	txManager := testutil.NewTxManager(pool)
-	stores := identityrepo.NewStores(testutil.Scoped(pool))
+	txManager := fx.Tx()
+	stores := identityrepo.NewStores(fx.Scoped(), testutil.BanHasher(t))
 	principals := identityadapter.NewPrincipalReader(stores.Memberships)
 	keyRepo := apikeyrepo.NewAPIKeyRepository(pool)
 	return &ownerLockHarness{
 		pool:     pool,
-		keys:     apikeyservice.NewService(keyRepo, principals, nil, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals), 8760*time.Hour),
-		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil), nil),
+		keys:     apikeyservice.NewService(keyRepo, principals, nil, apikeyrepo.NewTransactor(txManager, audit.Noop{}, principals), authz.NewAuthorizer(integrationCatalogs().Permissions), 8760*time.Hour),
+		admin:    identityservice.NewAdminUserService(stores, identityrepo.NewTransactor(txManager, audit.Noop{}, nil, nil, testutil.BanHasher(t)), nil),
 		verifier: apikey.NewVerifier(apikeyadapter.NewVerifierStore(keyRepo), principals),
 		owner:    owner,
 	}
@@ -97,7 +99,7 @@ func TestAPIKeyCreateWaitsForInFlightBan(t *testing.T) {
 	createErr := <-done
 	var appErr *apperror.AppError
 	require.ErrorAs(t, createErr, &appErr)
-	require.Equal(t, http.StatusNotFound, appErr.Status)
+	require.Equal(t, http.StatusNotFound, resolvedStatus(appErr))
 
 	var keys int64
 	require.NoError(t, h.pool.QueryRow(ctx, `SELECT count(*) FROM api_keys WHERE user_id = $1`, h.owner).Scan(&keys))
@@ -130,12 +132,17 @@ func TestAPIKeyCreatedDuringBanStaysRevokedAfterUnban(t *testing.T) {
 	require.NoError(t, err)
 	_, err = apikeyrepo.NewAPIKeyRepository(keyTx).Create(ctx, apikeyservice.NewKey{
 		UserID: h.owner, Name: "racing", Prefix: credentials.Prefix, Hash: credentials.Hash,
+		ExpiresAt: time.Now().Add(time.Hour),
 	})
 	require.NoError(t, err)
 
+	banHasher, err := banhash.New(strings.Join([]string{"owner", "lock", "ban", "pepper"}, "-"))
+	require.NoError(t, err)
+	banHash, banKid := banHasher.Marker("owner-lock-ban@example.com")
+
 	banned := make(chan error, 1)
 	go func() {
-		_, banErr := identityrepo.NewMembershipRepository(banTx).Ban(ctx, h.owner)
+		_, banErr := identityrepo.NewMembershipRepository(banTx).Ban(ctx, h.owner, identityservice.BanMarker{Hash: banHash, KeyID: banKid})
 		banned <- banErr
 	}()
 	time.Sleep(300 * time.Millisecond) // the ban UPDATE is now blocked on the owner row
@@ -164,7 +171,7 @@ func TestAPIKeyRotateRefusesKeyRevokedByBan(t *testing.T) {
 	_, err = h.keys.Rotate(ctx, h.owner, created.ID)
 	var appErr *apperror.AppError
 	require.ErrorAs(t, err, &appErr)
-	require.Equal(t, http.StatusConflict, appErr.Status)
+	require.Equal(t, http.StatusConflict, resolvedStatus(appErr))
 
 	// A key created after the unban is unaffected.
 	fresh, err := h.createKey(ctx)

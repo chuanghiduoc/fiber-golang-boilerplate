@@ -29,6 +29,7 @@ var secretFileVars = []string{
 	"DATA_ENCRYPTION_PREVIOUS_KEYS",
 	"WEBHOOK_SECRET_ENCRYPTION_KEY",
 	"WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS",
+	"OAUTH_STATE_KEY",
 	"SMTP_PASSWORD",
 	"GOOGLE_CLIENT_SECRET",
 	"ADMIN_PASSWORD",
@@ -39,12 +40,15 @@ var secretFileVars = []string{
 
 // seedSecretFileVars are the <NAME>_FILE settings cmd/seed may read. The seed
 // Job mounts the application Secret, so it can inherit paths for secrets it
-// never uses (for example JWT_SECRET_FILE); resolving only the database and
-// admin files keeps those irrelevant mounts from failing the seed.
+// never uses (for example JWT_SECRET_FILE); resolving only the database,
+// admin, and ban-marker key files keeps those irrelevant mounts from failing
+// the seed.
 var seedSecretFileVars = []string{
 	"DB_PASSWORD",
 	"DB_BYPASS_PASSWORD",
 	"ADMIN_PASSWORD",
+	"DATA_ENCRYPTION_KEY",
+	"DATA_ENCRYPTION_PREVIOUS_KEYS",
 }
 
 // loadEnvironment returns the process environment with every <NAME>_FILE

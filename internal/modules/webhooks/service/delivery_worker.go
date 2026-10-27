@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -35,13 +37,17 @@ type WorkerOptions struct {
 
 // WorkerStore is the narrow persistence surface for delivery attempts.
 type WorkerStore interface {
-	ClaimDelivery(ctx context.Context, id int64, lease time.Duration) (*Delivery, error)
-	GetDelivery(ctx context.Context, id int64) (*Delivery, error)
-	MarkDeliverySucceeded(ctx context.Context, id int64, attempt int32, statusCode int) error
-	MarkDeliveryDead(ctx context.Context, id int64, attempt int32, statusCode int, reason string) error
-	ReleaseDeliveryClaim(ctx context.Context, id int64, attempt int32) error
-	SigningSecrets(ctx context.Context, endpointID int64) (*SigningSecrets, error)
-	ExpireUnclaimableDelivery(ctx context.Context, id int64) (bool, error)
+	ClaimDelivery(ctx context.Context, id uuid.UUID, lease time.Duration) (*Delivery, error)
+	GetDelivery(ctx context.Context, id uuid.UUID) (*Delivery, error)
+	MarkDeliverySucceeded(ctx context.Context, id uuid.UUID, attempt int32, statusCode int) error
+	MarkDeliveryDead(ctx context.Context, id uuid.UUID, attempt int32, statusCode int, reason string) error
+	ReleaseDeliveryClaim(ctx context.Context, id uuid.UUID, attempt int32) error
+	SigningSecrets(ctx context.Context, endpointID uuid.UUID) (*SigningSecrets, error)
+	// SnapshotSecret reads the sealed secret row a delivery references. It is
+	// the delivery's snapshot; the worker never trusts a ciphertext copied
+	// onto the delivery row.
+	SnapshotSecret(ctx context.Context, secretID uuid.UUID) (string, error)
+	ExpireUnclaimableDelivery(ctx context.Context, id uuid.UUID) (bool, error)
 	RescheduleDeliveryWithJob(ctx context.Context, draft RetryDraft) error
 	CreateDeliveryAttempt(ctx context.Context, draft AttemptDraft) error
 }
@@ -96,7 +102,7 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	if err := json.Unmarshal(payload, &job); err != nil {
 		return jobs.Permanent(fmt.Errorf("webhooks: invalid delivery job payload: %w", err))
 	}
-	if job.DeliveryID <= 0 {
+	if job.DeliveryID == uuid.Nil {
 		return jobs.Permanent(errors.New("webhooks: invalid delivery job payload: missing delivery id"))
 	}
 
@@ -105,7 +111,7 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		return w.handleNotClaimable(ctx, job.DeliveryID)
 	}
 	if err != nil {
-		return fmt.Errorf("webhooks: claim delivery %d: %w", job.DeliveryID, err)
+		return fmt.Errorf("webhooks: claim delivery %s: %w", job.DeliveryID, err)
 	}
 
 	// Bookkeeping runs detached from job cancellation: an attempt that could
@@ -114,7 +120,7 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
 	defer cancel()
 
-	key, body, failure := w.prepare(delivery)
+	body, failure := w.prepare(ctx, delivery)
 	if failure != nil {
 		attempt := attemptResult{outcome: webhook.OutcomePermanent, reason: failure.reason}
 		if failure.retryable {
@@ -129,7 +135,7 @@ func (w *DeliveryWorker) Handle(ctx context.Context, payload json.RawMessage) er
 		return w.finish(writeCtx, delivery, attempt)
 	}
 
-	headers, err := w.requestHeaders(ctx, delivery, key, body)
+	headers, err := w.requestHeaders(ctx, delivery, body)
 	if err != nil {
 		if ctx.Err() != nil {
 			// The worker is shutting down (or the job timed out) before the
@@ -173,32 +179,41 @@ func (w *DeliveryWorker) checkConfigured() error {
 	return nil
 }
 
-// prepare opens the snapshotted secret, derives its Standard Webhooks HMAC
-// key, and builds the signed body. A non-nil failure says the request could not
-// be built; retryable distinguishes a transient decryption gap (a replica
-// during a key rollout) from a structurally invalid envelope or pre-Standard
-// secret, which retrying cannot fix.
-func (w *DeliveryWorker) prepare(delivery *Delivery) (key, body []byte, failure *prepareFailure) {
-	key, err := w.signingKey(EndpointSecretBinding(delivery.TenantID, delivery.EndpointID), delivery.SecretCiphertext)
+// prepare validates the delivery's snapshot secret and builds the signed
+// body. A non-nil failure says the request could not be built; retryable
+// distinguishes a transient decryption or lookup gap (a replica during a key
+// rollout) from a structurally invalid envelope or a stored value that is not
+// a Standard Webhooks secret, which retrying cannot fix.
+func (w *DeliveryWorker) prepare(ctx context.Context, delivery *Delivery) (body []byte, failure *prepareFailure) {
+	ciphertext, err := w.store.SnapshotSecret(ctx, delivery.SecretID)
+	if err != nil {
+		slog.Error("webhooks: delivery snapshot secret is unavailable",
+			slog.String("delivery_id", delivery.ID.String()),
+			slog.String("secret_id", delivery.SecretID.String()),
+			slog.Any("error", err),
+		)
+		return nil, &prepareFailure{reason: "secret snapshot could not be loaded", retryable: true}
+	}
+	_, err = w.signingKey(EndpointSecretBinding(delivery.TenantID, delivery.EndpointID), ciphertext)
 	if err != nil {
 		slog.Error("webhooks: delivery secret is unusable",
-			slog.Int64("delivery_id", delivery.ID),
+			slog.String("delivery_id", delivery.ID.String()),
 			slog.Any("error", err),
 		)
 		switch {
 		case errors.Is(err, webhook.ErrInvalidSecret):
-			return nil, nil, &prepareFailure{reason: "endpoint secret predates Standard Webhooks; rotate it"}
+			return nil, &prepareFailure{reason: "secret snapshot is not a Standard Webhooks secret"}
 		case errors.Is(err, ErrInvalidSecretEnvelope):
-			return nil, nil, &prepareFailure{reason: "secret snapshot is not a valid envelope"}
+			return nil, &prepareFailure{reason: "secret snapshot is not a valid envelope"}
 		default:
-			return nil, nil, &prepareFailure{reason: "secret snapshot could not be decrypted", retryable: true}
+			return nil, &prepareFailure{reason: "secret snapshot could not be decrypted", retryable: true}
 		}
 	}
 	body, err = deliveryBody(delivery)
 	if err != nil {
-		return nil, nil, &prepareFailure{reason: "delivery payload is not valid JSON"}
+		return nil, &prepareFailure{reason: "delivery payload is not valid JSON"}
 	}
-	return key, body, nil
+	return body, nil
 }
 
 // prepareFailure is why one delivery attempt could not even be built.
@@ -234,14 +249,14 @@ func deliveryBody(delivery *Delivery) ([]byte, error) {
 // requestHeaders builds the Standard Webhooks headers: webhook-id is the event
 // id (stable across retries, the receiver's deduplication key) and the
 // signature covers "<id>.<timestamp>.<exact body sent>".
-func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *Delivery, key, body []byte) (http.Header, error) {
+func (w *DeliveryWorker) requestHeaders(ctx context.Context, delivery *Delivery, body []byte) (http.Header, error) {
 	timestamp := w.now()
-	signature, err := w.signatureHeader(ctx, delivery, key, timestamp, body)
+	signature, err := w.signatureHeader(ctx, delivery, timestamp, body)
 	if err != nil {
 		return nil, err
 	}
 	headers := http.Header{}
-	headers.Set(webhook.HeaderID, delivery.EventID)
+	headers.Set(webhook.HeaderID, delivery.EventID.String())
 	headers.Set(webhook.HeaderTimestamp, strconv.FormatInt(timestamp.Unix(), 10))
 	headers.Set(webhook.HeaderSignature, signature)
 	headers.Set("Content-Type", "application/json")
@@ -276,14 +291,14 @@ type sentRequest struct {
 func (w *DeliveryWorker) releaseInterrupted(ctx context.Context, delivery *Delivery, jobErr error) error {
 	if err := w.store.ReleaseDeliveryClaim(ctx, delivery.ID, delivery.Attempts); err != nil {
 		if !errors.Is(err, ErrDeliveryLeaseLost) {
-			return fmt.Errorf("webhooks: release interrupted delivery %d: %w", delivery.ID, err)
+			return fmt.Errorf("webhooks: release interrupted delivery %s: %w", delivery.ID, err)
 		}
 		slog.Warn("webhooks: interrupted delivery claim was already superseded",
-			slog.Int64("delivery_id", delivery.ID),
+			slog.String("delivery_id", delivery.ID.String()),
 			slog.Int("attempt", int(delivery.Attempts)),
 		)
 	}
-	return fmt.Errorf("webhooks: delivery %d interrupted before a response: %w", delivery.ID, jobErr)
+	return fmt.Errorf("webhooks: delivery %s interrupted before a response: %w", delivery.ID, jobErr)
 }
 
 // attemptResult is the classified outcome of one delivery attempt.
@@ -384,7 +399,7 @@ func (w *DeliveryWorker) finish(ctx context.Context, delivery *Delivery, attempt
 func (w *DeliveryWorker) fenced(delivery *Delivery, action string, err error) error {
 	if errors.Is(err, ErrDeliveryLeaseLost) {
 		slog.Warn("webhooks: discarded stale delivery outcome; claim lease lost",
-			slog.Int64("delivery_id", delivery.ID),
+			slog.String("delivery_id", delivery.ID.String()),
 			slog.Int("attempt", int(delivery.Attempts)),
 			slog.String("action", action),
 		)
@@ -402,41 +417,37 @@ func (w *DeliveryWorker) fenced(delivery *Delivery, action string, err error) er
 // either, so they can switch secrets at any point inside the 24h window; a
 // delivery sent after it (or after a second rotation) carries only the
 // current signature. A failed lookup or an unusable current secret is returned
-// as an error so the attempt retries: signing with the snapshot can be wrong
-// once the endpoint rotated and the snapshot's grace closed.
-func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery, snapshot []byte, timestamp time.Time, body []byte) (string, error) {
+// as an error so the attempt retries.
+func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery, timestamp time.Time, body []byte) (string, error) {
 	sign := func(key []byte) string {
-		return webhook.Sign(key, delivery.EventID, timestamp, body)
+		return webhook.Sign(key, delivery.EventID.String(), timestamp, body)
 	}
 	secrets, err := w.store.SigningSecrets(ctx, delivery.EndpointID)
 	if err != nil {
 		slog.Error("webhooks: load endpoint signing secrets",
-			slog.Int64("delivery_id", delivery.ID),
-			slog.Int64("endpoint_id", delivery.EndpointID),
+			slog.String("delivery_id", delivery.ID.String()),
+			slog.String("endpoint_id", delivery.EndpointID.String()),
 			slog.Any("error", err),
 		)
 		return "", fmt.Errorf("load signing secrets: %w", err)
 	}
 	binding := EndpointSecretBinding(delivery.TenantID, delivery.EndpointID)
-	currentKey := snapshot
-	if secrets.CurrentCiphertext != delivery.SecretCiphertext {
-		currentKey, err = w.signingKey(binding, secrets.CurrentCiphertext)
-		if err != nil {
-			slog.Error("webhooks: current endpoint secret is unusable",
-				slog.Int64("delivery_id", delivery.ID),
-				slog.Int64("endpoint_id", delivery.EndpointID),
-				slog.Any("error", err),
-			)
-			return "", fmt.Errorf("open current signing secret: %w", err)
-		}
+	currentKey, err := w.signingKey(binding, secrets.CurrentCiphertext)
+	if err != nil {
+		slog.Error("webhooks: current endpoint secret is unusable",
+			slog.String("delivery_id", delivery.ID.String()),
+			slog.String("endpoint_id", delivery.EndpointID.String()),
+			slog.Any("error", err),
+		)
+		return "", fmt.Errorf("open current signing secret: %w", err)
 	}
 	signatures := []string{sign(currentKey)}
 	if secrets.PreviousCiphertext != "" && secrets.PreviousCiphertext != secrets.CurrentCiphertext {
 		previousKey, err := w.signingKey(binding, secrets.PreviousCiphertext)
 		if err != nil {
 			slog.Error("webhooks: previous endpoint secret is unusable; co-signing without it",
-				slog.Int64("delivery_id", delivery.ID),
-				slog.Int64("endpoint_id", delivery.EndpointID),
+				slog.String("delivery_id", delivery.ID.String()),
+				slog.String("endpoint_id", delivery.EndpointID.String()),
 				slog.Any("error", err),
 			)
 		} else {
@@ -450,14 +461,14 @@ func (w *DeliveryWorker) signatureHeader(ctx context.Context, delivery *Delivery
 // do) from a pending delivery whose claim lease is still held. The latter
 // returns an error so the platform job retries after the lease expires; that
 // is the crash-recovery path after a process dies mid-attempt.
-func (w *DeliveryWorker) handleNotClaimable(ctx context.Context, id int64) error {
+func (w *DeliveryWorker) handleNotClaimable(ctx context.Context, id uuid.UUID) error {
 	delivery, err := w.store.GetDelivery(ctx, id)
 	if err != nil {
 		// A missing row may have been purged by retention; the job is done.
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil
 		}
-		return fmt.Errorf("webhooks: load delivery %d: %w", id, err)
+		return fmt.Errorf("webhooks: load delivery %s: %w", id, err)
 	}
 	if delivery.Status != "pending" {
 		return nil
@@ -467,13 +478,13 @@ func (w *DeliveryWorker) handleNotClaimable(ctx context.Context, id int64) error
 	// otherwise stay pending forever once this job dead-letters.
 	expired, err := w.store.ExpireUnclaimableDelivery(ctx, id)
 	if err != nil {
-		return fmt.Errorf("webhooks: expire delivery %d: %w", id, err)
+		return fmt.Errorf("webhooks: expire delivery %s: %w", id, err)
 	}
 	if expired {
-		slog.Warn("webhooks: dead-lettered unclaimable delivery", slog.Int64("delivery_id", id))
+		slog.Warn("webhooks: dead-lettered unclaimable delivery", slog.String("delivery_id", id.String()))
 		return nil
 	}
-	return fmt.Errorf("webhooks: delivery %d claim is busy", id)
+	return fmt.Errorf("webhooks: delivery %s claim is busy", id)
 }
 
 // deliveryTimeout converts a snapshotted endpoint timeout, falling back to the

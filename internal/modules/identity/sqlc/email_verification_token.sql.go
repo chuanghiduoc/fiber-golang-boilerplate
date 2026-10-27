@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -17,7 +18,7 @@ WHERE token_hash = $1
 RETURNING id, user_id, email, token_hash, expires_at, created_at
 `
 
-func (q *Queries) ConsumeEmailVerificationToken(ctx context.Context, tokenHash string) (EmailVerificationToken, error) {
+func (q *Queries) ConsumeEmailVerificationToken(ctx context.Context, tokenHash []byte) (EmailVerificationToken, error) {
 	row := q.db.QueryRow(ctx, consumeEmailVerificationToken, tokenHash)
 	var i EmailVerificationToken
 	err := row.Scan(
@@ -47,9 +48,9 @@ RETURNING id, user_id, email, token_hash, expires_at, created_at
 
 type CreateEmailVerificationTokenParams struct {
 	Email     string             `json:"email"`
-	TokenHash string             `json:"token_hash"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
-	UserID    int64              `json:"user_id"`
+	UserID    uuid.UUID          `json:"user_id"`
 }
 
 // Verification tokens are per user and bound to the address they were sent to.
@@ -77,7 +78,7 @@ DELETE FROM email_verification_tokens
 WHERE user_id = $1
 `
 
-func (q *Queries) DeleteEmailVerificationTokensByUserID(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteEmailVerificationTokensByUserID(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteEmailVerificationTokensByUserID, userID)
 	return err
 }

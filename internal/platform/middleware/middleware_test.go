@@ -13,7 +13,11 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
@@ -26,13 +30,25 @@ func newTestApp() *fiber.App {
 	})
 }
 
+// stubRoleSessions is a session store that reports one role for every token,
+// so RequireRole tests exercise the snapshot path rather than a token claim.
+type stubRoleSessions struct{ role string }
+
+func (s stubRoleSessions) Validate(context.Context, session.Claims) (session.State, error) {
+	return session.State{Role: s.role, Active: true, TenantActive: true}, nil
+}
+
+func (stubRoleSessions) Invalidate(context.Context, uuid.UUID) error { return nil }
+
+func (stubRoleSessions) InvalidatePermissions(context.Context) error { return nil }
+
 // ---------------------------------------------------------------------------
 // JWTAuth tests
 // ---------------------------------------------------------------------------
 
 func TestJWTAuth_MissingHeader(t *testing.T) {
 	app := newTestApp()
-	app.Get("/protected", JWTAuth("secret"), func(c fiber.Ctx) error {
+	app.Get("/protected", JWTAuth("secret", stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -48,7 +64,7 @@ func TestJWTAuth_MissingHeader(t *testing.T) {
 
 func TestJWTAuth_InvalidFormat(t *testing.T) {
 	app := newTestApp()
-	app.Get("/protected", JWTAuth("secret"), func(c fiber.Ctx) error {
+	app.Get("/protected", JWTAuth("secret", stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -66,7 +82,7 @@ func TestJWTAuth_InvalidFormat(t *testing.T) {
 
 func TestJWTAuth_InvalidToken(t *testing.T) {
 	app := newTestApp()
-	app.Get("/protected", JWTAuth("secret"), func(c fiber.Ctx) error {
+	app.Get("/protected", JWTAuth("secret", stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -85,25 +101,21 @@ func TestJWTAuth_InvalidToken(t *testing.T) {
 func TestJWTAuth_ValidToken(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", JWTAuth(secret), func(c fiber.Ctx) error {
-		userID := fiber.Locals[int64](c, "user_id")
-		role := fiber.Locals[string](c, "role")
-		email := fiber.Locals[string](c, "email")
+	app.Get("/protected", JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
+		userID := requestctx.ActorID(c.Context())
+		role := requestRoleForTest(c)
 
-		if userID != 1 {
-			t.Errorf("user_id = %d, want 1", userID)
+		if userID != testID(1) {
+			t.Errorf("user_id = %s, want %s", userID, testID(1))
 		}
-		if role != "user" {
-			t.Errorf("role = %q, want user", role)
-		}
-		if email != "test@example.com" {
-			t.Errorf("email = %q, want test@example.com", email)
+		if role != "" {
+			t.Errorf("role = %q, want empty without a session store", role)
 		}
 
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(testID(1), testID(1), secret, 24*time.Hour)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -119,11 +131,11 @@ func TestJWTAuth_ValidToken(t *testing.T) {
 
 func TestJWTAuth_WrongSecret(t *testing.T) {
 	app := newTestApp()
-	app.Get("/protected", JWTAuth("correct-secret"), func(c fiber.Ctx) error {
+	app.Get("/protected", JWTAuth("correct-secret", stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 1, "test@example.com", "user", "wrong-secret", 24)
+	accessToken, _ := token.GenerateWithTenant(testID(1), testID(1), "wrong-secret", 24*time.Hour)
 
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -139,9 +151,9 @@ func TestJWTAuth_WrongSecret(t *testing.T) {
 
 // tenantLocal simulates the global tenant middleware's resolution so JWT
 // behavior can be tested without a resolver/database.
-func tenantLocal(id int64, slug string) fiber.Handler {
+func tenantLocal(id uuid.UUID, slug string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		fiber.Locals[int64](c, "tenant_id", id)
+		c.SetContext(tenant.WithID(c.Context(), id))
 		fiber.Locals[string](c, "tenant_slug", slug)
 		return c.Next()
 	}
@@ -150,14 +162,14 @@ func tenantLocal(id int64, slug string) fiber.Handler {
 func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
+	app.Get("/protected", tenantLocal(testID(1), "default"), JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"tenant_id":   fiber.Locals[int64](c, "tenant_id"),
-			"tenant_slug": fiber.Locals[string](c, "tenant_slug"),
+			"tenant_id":   tenant.IDFromContext(c.Context()),
+			"tenant_slug": tenant.SlugFromContext(c.Context()),
 		})
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(testID(1), testID(2), secret, 24*time.Hour)
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
@@ -169,7 +181,7 @@ func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `"tenant_id":2`) {
+	if !strings.Contains(string(body), `"tenant_id":"`+testID(2).String()+`"`) {
 		t.Fatalf("body = %s, want tenant_id 2", body)
 	}
 	// The request resolved the default tenant before JWTAuth. Once the claim
@@ -182,15 +194,13 @@ func TestJWTAuth_TenantFromClaimOverridesDefault(t *testing.T) {
 func TestJWTAuth_NegativeTenantRejected(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", tenantLocal(1, "default"), JWTAuth(secret), func(c fiber.Ctx) error {
+	app.Get("/protected", tenantLocal(testID(1), "default"), JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
 	claims := token.Claims{
-		UserID:   1,
-		TenantID: -1,
-		Email:    "user@example.com",
-		Role:     "user",
+		UserID:   testID(1),
+		TenantID: uuid.Nil,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -198,7 +208,9 @@ func TestJWTAuth_NegativeTenantRejected(t *testing.T) {
 			Audience:  jwt.ClaimStrings{"fiber-golang-boilerplate-api"},
 		},
 	}
-	accessToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+	unsigned := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	unsigned.Header["kid"] = token.KeyID(secret)
+	accessToken, err := unsigned.SignedString([]byte(secret))
 	if err != nil {
 		t.Fatalf("sign token: %v", err)
 	}
@@ -217,11 +229,11 @@ func TestJWTAuth_NegativeTenantRejected(t *testing.T) {
 func TestJWTAuth_TenantHeaderMismatchRejected(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", tenantLocal(3, "other"), JWTAuth(secret), func(c fiber.Ctx) error {
+	app.Get("/protected", tenantLocal(testID(3), "other"), JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(testID(1), testID(2), secret, 24*time.Hour)
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set(tenant.Header, "other")
@@ -242,11 +254,11 @@ func TestJWTAuth_TenantHeaderMismatchRejected(t *testing.T) {
 func TestJWTAuth_TenantHeaderMatchAccepted(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", tenantLocal(2, "acme"), JWTAuth(secret), func(c fiber.Ctx) error {
+	app.Get("/protected", tenantLocal(testID(2), "acme"), JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 2, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.GenerateWithTenant(testID(1), testID(2), secret, 24*time.Hour)
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set(tenant.Header, "acme")
@@ -263,11 +275,11 @@ func TestJWTAuth_TenantHeaderMatchAccepted(t *testing.T) {
 func TestJWTAuth_LegacyTokenWithoutTenantRejected(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/protected", tenantLocal(3, "other"), JWTAuth(secret), func(c fiber.Ctx) error {
-		return c.JSON(fiber.Map{"tenant_id": fiber.Locals[int64](c, "tenant_id")})
+	app.Get("/protected", tenantLocal(testID(3), "other"), JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
+		return c.JSON(fiber.Map{"tenant_id": tenant.IDFromContext(c.Context())})
 	})
 
-	accessToken, _ := token.Generate(1, "user@example.com", "user", secret, 24)
+	accessToken, _ := token.Generate(testID(1), secret, 24*time.Hour)
 	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set(tenant.Header, "other")
@@ -281,70 +293,39 @@ func TestJWTAuth_LegacyTokenWithoutTenantRejected(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// RequireRole tests
-// ---------------------------------------------------------------------------
-
-func TestRequireRole_Allowed(t *testing.T) {
+func TestJWTAuth_RejectsTokenWithoutKeyID(t *testing.T) {
 	secret := "test-secret"
 	app := newTestApp()
-	app.Get("/admin", JWTAuth(secret), RequireRole("admin"), func(c fiber.Ctx) error {
+	app.Get("/protected", JWTAuth(secret, stubRoleSessions{}), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
-	accessToken, _ := token.GenerateWithTenant(1, 1, "admin@example.com", "admin", secret, 24)
+	// Signed with the right secret but without the kid header that every
+	// current token carries.
+	unsigned := jwt.NewWithClaims(jwt.SigningMethodHS256, token.Claims{
+		UserID:   testID(1),
+		TenantID: testID(1),
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    "fiber-golang-boilerplate",
+			Audience:  jwt.ClaimStrings{"fiber-golang-boilerplate-api"},
+		},
+	})
+	accessToken, err := unsigned.SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
 
-	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
+	req, _ := http.NewRequest("GET", "/protected", http.NoBody)
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := app.Test(req)
 	if err != nil {
 		t.Fatalf("app.Test failed: %v", err)
 	}
-	if resp.StatusCode != 200 {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
-	}
-}
-
-func TestRequireRole_Forbidden(t *testing.T) {
-	secret := "test-secret"
-	app := newTestApp()
-	app.Get("/admin", JWTAuth(secret), RequireRole("admin"), func(c fiber.Ctx) error {
-		return c.SendString("ok")
-	})
-
-	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
-
-	req, _ := http.NewRequest("GET", "/admin", http.NoBody)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("app.Test failed: %v", err)
-	}
-	if resp.StatusCode != 403 {
-		t.Errorf("status = %d, want 403", resp.StatusCode)
-	}
-}
-
-func TestRequireRole_MultipleRoles(t *testing.T) {
-	secret := "test-secret"
-	app := newTestApp()
-	app.Get("/shared", JWTAuth(secret), RequireRole("admin", "user"), func(c fiber.Ctx) error {
-		return c.SendString("ok")
-	})
-
-	accessToken, _ := token.GenerateWithTenant(1, 1, "user@example.com", "user", secret, 24)
-
-	req, _ := http.NewRequest("GET", "/shared", http.NoBody)
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-
-	resp, err := app.Test(req)
-	if err != nil {
-		t.Fatalf("app.Test failed: %v", err)
-	}
-	if resp.StatusCode != 200 {
-		t.Errorf("status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a token without kid", resp.StatusCode)
 	}
 }
 
@@ -407,7 +388,7 @@ func TestRequestID_IgnoresUntrustedClientHeader(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			app := fiber.New(cfg)
 			app.Get("/test", RequestID(), func(c fiber.Ctx) error {
-				return c.SendString(fiber.Locals[string](c, "request_id"))
+				return c.SendString(requestctx.RequestID(c.Context()))
 			})
 
 			req, _ := http.NewRequest("GET", "/test", http.NoBody)
@@ -442,12 +423,14 @@ func TestSecurityHeaders_Production(t *testing.T) {
 	}
 
 	expected := map[string]string{
-		"X-Content-Type-Options":    "nosniff",
-		"X-Frame-Options":           "DENY",
-		"X-XSS-Protection":          "1; mode=block",
-		"Referrer-Policy":           "strict-origin-when-cross-origin",
-		"Permissions-Policy":        "camera=(), microphone=(), geolocation=()",
-		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+		"X-Content-Type-Options":       "nosniff",
+		"X-Frame-Options":              "DENY",
+		"X-XSS-Protection":             "0",
+		"Referrer-Policy":              "no-referrer",
+		"Cross-Origin-Resource-Policy": "same-origin",
+		"Content-Security-Policy":      "default-src 'none'; frame-ancestors 'none'",
+		"Permissions-Policy":           "camera=(), microphone=(), geolocation=()",
+		"Strict-Transport-Security":    "max-age=31536000; includeSubDomains",
 	}
 
 	for header, want := range expected {
@@ -523,7 +506,7 @@ func TestRecovery_PanicRecovered(t *testing.T) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
-	if result["code"] != "internal_error" {
+	if result["code"] != "system.internal" {
 		t.Errorf("code = %v, want internal_error", result["code"])
 	}
 }
@@ -554,7 +537,7 @@ func TestRecovery_NormalPassthrough(t *testing.T) {
 
 func TestLogger_Passthrough(t *testing.T) {
 	app := newTestApp()
-	app.Get("/test", Logger(), func(c fiber.Ctx) error {
+	app.Get("/test", Logger(nil), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -570,7 +553,7 @@ func TestLogger_Passthrough(t *testing.T) {
 
 func TestLogger_ErrorRoute(t *testing.T) {
 	app := newTestApp()
-	app.Get("/error", Logger(), func(c fiber.Ctx) error {
+	app.Get("/error", Logger(nil), func(c fiber.Ctx) error {
 		return apperror.NewInternal("server error")
 	})
 
@@ -586,7 +569,7 @@ func TestLogger_ErrorRoute(t *testing.T) {
 
 func TestLogger_NotFoundRoute(t *testing.T) {
 	app := newTestApp()
-	app.Get("/missing", Logger(), func(c fiber.Ctx) error {
+	app.Get("/missing", Logger(nil), func(c fiber.Ctx) error {
 		return apperror.NewNotFound("not found")
 	})
 
@@ -606,7 +589,7 @@ func TestLogger_NotFoundRoute(t *testing.T) {
 
 func TestMetrics_Passthrough(t *testing.T) {
 	app := newTestApp()
-	app.Get("/test", Metrics(), func(c fiber.Ctx) error {
+	app.Get("/test", Metrics(nil), func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
@@ -681,19 +664,19 @@ func TestTimeout_SetsContext(t *testing.T) {
 }
 
 func TestEffectiveStatus(t *testing.T) {
-	if got := effectiveStatus(nil, apperror.NewBadRequest("bad")); got != fiber.StatusBadRequest {
+	if got := effectiveStatus(nil, nil, apperror.NewBadRequest("bad")); got != fiber.StatusBadRequest {
 		t.Errorf("AppError status = %d, want 400", got)
 	}
-	if got := effectiveStatus(nil, fiber.NewError(fiber.StatusTeapot, "teapot")); got != fiber.StatusTeapot {
+	if got := effectiveStatus(nil, nil, fiber.NewError(fiber.StatusTeapot, "teapot")); got != fiber.StatusTeapot {
 		t.Errorf("fiber.Error status = %d, want 418", got)
 	}
-	if got := effectiveStatus(nil, context.DeadlineExceeded); got != fiber.StatusGatewayTimeout {
+	if got := effectiveStatus(nil, nil, context.DeadlineExceeded); got != fiber.StatusGatewayTimeout {
 		t.Errorf("deadline status = %d, want 504", got)
 	}
-	if got := effectiveStatus(nil, fmt.Errorf("query: %w", context.Canceled)); got != apperror.StatusClientClosedRequest {
+	if got := effectiveStatus(nil, nil, fmt.Errorf("query: %w", context.Canceled)); got != apperror.StatusClientClosedRequest {
 		t.Errorf("canceled status = %d, want 499", got)
 	}
-	if got := effectiveStatus(nil, errors.New("generic")); got != fiber.StatusInternalServerError {
+	if got := effectiveStatus(nil, nil, errors.New("generic")); got != fiber.StatusInternalServerError {
 		t.Errorf("generic error status = %d, want 500", got)
 	}
 }
@@ -723,4 +706,12 @@ func TestValidRequestID(t *testing.T) {
 			t.Errorf("validRequestID(%q) = true, want false", v)
 		}
 	}
+}
+
+func requestRoleForTest(c fiber.Ctx) string {
+	subject, ok := authz.SubjectFromContext(c.Context())
+	if !ok {
+		return ""
+	}
+	return subject.Role
 }

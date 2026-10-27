@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -69,14 +70,15 @@ const (
 // Event describes a single auditable action.
 //
 // TenantID is the owning tenant. A zero value is resolved from the recording
-// context (falling back to the compatibility default tenant). ActorID is the
+// context; if neither names a tenant the write fails, because there is no
+// compatibility tenant. ActorID is the
 // acting user, or 0 for anonymous/system actions. Metadata must be
 // JSON-marshalable and is sanitized before storage. CreatedAt defaults to the
 // time the event is recorded when left zero.
 type Event struct {
-	TenantID           int64
-	ParentID           int64
-	ActorID            int64
+	TenantID           uuid.UUID
+	ParentID           uuid.UUID
+	ActorID            uuid.UUID
 	ActorType          string
 	ActorRole          string
 	Action             string
@@ -90,7 +92,7 @@ type Event struct {
 	Outcome            string
 	StatusCode         int
 	ErrorCode          string
-	IdempotencyKeyHash string
+	IdempotencyKeyHash []byte
 	CompletedAt        time.Time
 	CreatedAt          time.Time
 }
@@ -113,18 +115,14 @@ type TxRecorder interface {
 
 // IDRecorder persists a pre-write intent event and returns its row ID.
 type IDRecorder interface {
-	RecordID(ctx context.Context, event Event) (int64, error)
+	RecordID(ctx context.Context, event Event) (uuid.UUID, error)
 }
 
 // Completion describes the observed outcome of a guarded request.
 //
-// The actor belongs to the intent row: when set here it must repeat the actor
-// recorded at start. The database refuses a completion that swaps, clears, or
-// adds an actor, so the HTTP layer leaves these fields zero.
+// The actor is part of the intent row and never changes on completion (the
+// database trigger enforces it), so a completion carries only its outcome.
 type Completion struct {
-	ActorID     int64
-	ActorType   string
-	ActorRole   string
 	Outcome     string
 	StatusCode  int
 	ErrorCode   string
@@ -133,7 +131,7 @@ type Completion struct {
 
 // CompletionRecorder completes a started HTTP intent row.
 type CompletionRecorder interface {
-	Complete(ctx context.Context, id int64, completion Completion) error
+	Complete(ctx context.Context, id uuid.UUID, completion Completion) error
 }
 
 // MetadataLocalKey is the Fiber locals key handlers may set to a
@@ -255,9 +253,6 @@ func (c Completion) Validate() error {
 	}
 	if c.StatusCode != 0 && (c.StatusCode < 100 || c.StatusCode > 599) {
 		return fmt.Errorf("%w: status code %d is out of range", ErrInvalidEvent, c.StatusCode)
-	}
-	if actorType := c.ActorType; actorType != "" && !validActorType(actorType) {
-		return fmt.Errorf("%w: unknown actor type %q", ErrInvalidEvent, actorType)
 	}
 	return nil
 }

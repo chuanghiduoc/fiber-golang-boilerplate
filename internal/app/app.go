@@ -1,6 +1,7 @@
 // Package app is the application composition root. It owns the Fiber instance,
-// global middleware, infrastructure routes, and the module registry. Business
-// capabilities live under internal/modules and register their own routes.
+// the huma API, global middleware, infrastructure routes, and the module
+// registry. Business capabilities live under internal/modules and register
+// their own operations through internal/platform/httpapi.
 package app
 
 import (
@@ -9,16 +10,18 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"time"
 
-	"github.com/gofiber/contrib/v3/swagger"
+	"github.com/danielgtaylor/huma/v2"
 	"github.com/gofiber/fiber/v3"
-	"github.com/gofiber/fiber/v3/middleware/adaptor"
 	"github.com/gofiber/fiber/v3/middleware/cors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
+	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey/apikeyhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
@@ -26,38 +29,39 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx/requestctxhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/scheduler"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/versioning"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/health"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // Module is implemented by every business capability. Modules own their route
 // table and must not import another module's internals.
 type Module interface {
 	Name() string
-	RegisterRoutes(v1 fiber.Router, deps Deps)
 }
 
-// V2Module is optionally implemented by modules with a second API surface.
-// Modules that do not implement it are mounted only under /api/v1, and the
-// /api/v2 group is not created unless at least one module opts in.
-type V2Module interface {
+// RouteProvider is the single HTTP registration capability. It is separate from
+// Module only so the foundation can land before per-module conversion: a module
+// that has not implemented it yet still builds and keeps its catalogs, jobs,
+// and events, but mounts no HTTP operations. The conversion removes the
+// module's old Fiber RegisterRoutes method.
+type RouteProvider interface {
 	Module
-	RegisterV2Routes(v2 fiber.Router, deps Deps)
+	RegisterRoutes(api *httpapi.API, deps Deps)
 }
 
 // EventProvider is an optional module capability. RegisterEvents runs after
-// the module's routes are mounted and before the bus registers durable job
+// the module's operations are mounted and before the bus registers durable job
 // handlers, so modules may subscribe immediately or durably. A module without
 // events simply does not implement it.
 type EventProvider interface {
@@ -84,6 +88,13 @@ type PrivacyProvider interface {
 	RegisterPrivacy(registry *privacycontracts.Registry)
 }
 
+// TenantPurgeProvider is an optional module capability contributing the
+// module's tenant-wide purgers. Registration order is the purge order; the
+// composition root registers non-identity purgers first and identity last.
+type TenantPurgeProvider interface {
+	TenantPurgers() []tenancycontracts.Provider
+}
+
 // PermissionProvider is an optional module capability declaring the
 // permissions the module owns and which built-in roles receive them (admins
 // receive every permission implicitly). Permissions checked by more than one
@@ -95,7 +106,7 @@ type PermissionProvider interface {
 // ErrorProvider is an optional module capability declaring the module's
 // stable error codes. Platform-wide codes stay in pkg/apperror.
 type ErrorProvider interface {
-	ErrorCodes() map[apperror.Code]apperror.Spec
+	Errors() []apperror.Spec
 }
 
 // LocaleProvider is an optional module capability supplying en.json/vi.json
@@ -111,15 +122,34 @@ type FlagProvider interface {
 	FeatureFlags() []features.Definition
 }
 
-// RegisterCatalogs registers every module's permissions, error codes, and
-// feature flags in the process-wide catalogs, owned by Module.Name(). It
-// fails on duplicate module names and on any key another owner already
-// registered. Call it once modules are constructed and before anything
-// validates against the catalogs: FEATURE_FLAGS key validation, the i18n
-// bundle (built from LocaleSources), and serving requests (API-key scope
-// validation, permission checks, error rendering). Re-registering the same
-// modules is a no-op, so Register can call it again safely.
-func RegisterCatalogs(modules ...Module) error {
+// Catalogs are the injected, instance-scoped capability catalogs. The
+// composition root creates them once, registers every module provider, seals
+// them, and injects them into services, transports, and validation. They are
+// never package-level mutable registries.
+type Catalogs struct {
+	Errors      *apperror.Catalog
+	Permissions *authz.Catalog
+	Features    *features.Catalog
+}
+
+// NewCatalogs returns empty catalogs pre-populated with the platform-owned
+// entries. Register adds every module provider and seals the result.
+func NewCatalogs() Catalogs {
+	return Catalogs{
+		Errors:      apperror.NewCatalog(),
+		Permissions: authz.NewCatalog(),
+		Features:    features.NewCatalog(),
+	}
+}
+
+// Register adds every module's permissions, error codes, and feature flags,
+// owned by Module.Name(), then seals the catalogs. It fails on duplicate module
+// names and on any entry another owner already registered. Call it once
+// modules are constructed and before anything validates against the catalogs.
+func (c Catalogs) Register(modules ...Module) error {
+	if c.Errors == nil || c.Permissions == nil || c.Features == nil {
+		return fmt.Errorf("app: catalogs are not initialized")
+	}
 	seen := make(map[string]struct{}, len(modules))
 	for _, m := range modules {
 		owner := m.Name()
@@ -130,24 +160,40 @@ func RegisterCatalogs(modules ...Module) error {
 			return fmt.Errorf("app: module name %q is registered twice", owner)
 		}
 		seen[owner] = struct{}{}
+	}
 
+	for _, m := range modules {
+		owner := m.Name()
 		if p, ok := m.(PermissionProvider); ok {
-			if err := authz.Register(owner, p.Permissions()...); err != nil {
+			if err := c.Permissions.Add(authz.Provider{Owner: owner, Grants: p.Permissions()}); err != nil {
 				return err
 			}
 		}
 		if p, ok := m.(ErrorProvider); ok {
-			if err := apperror.Register(owner, p.ErrorCodes()); err != nil {
+			if err := c.Errors.Add(apperror.Provider{Owner: owner, Specs: p.Errors()}); err != nil {
 				return err
 			}
 		}
 		if p, ok := m.(FlagProvider); ok {
-			if err := features.Register(owner, p.FeatureFlags()...); err != nil {
+			if err := c.Features.Add(features.Provider{Owner: owner, Definitions: p.FeatureFlags()}); err != nil {
 				return err
 			}
 		}
 	}
+	c.Errors.Seal()
+	c.Permissions.Seal()
+	c.Features.Seal()
 	return nil
+}
+
+// BuildCatalogs is the test/composition helper: it creates catalogs from the
+// given modules in one call.
+func BuildCatalogs(modules ...Module) (Catalogs, error) {
+	catalogs := NewCatalogs()
+	if err := catalogs.Register(modules...); err != nil {
+		return Catalogs{}, err
+	}
+	return catalogs, nil
 }
 
 // LocaleSources returns the module catalogs to pass to i18n.New. Building
@@ -163,16 +209,22 @@ func LocaleSources(modules ...Module) []i18n.Source {
 }
 
 // Limiters carries the tiered rate limiters so modules do not rebuild them.
-type Limiters struct {
-	Strict  fiber.Handler
-	Normal  fiber.Handler
-	Relaxed fiber.Handler
+type Limiters = httpapi.Limiters
+
+// ModuleSettings is the process configuration modules may read. It is a
+// deliberate subset of config.Config: the HTTP layer needs the JWT keyring and
+// lifetime, the MFA freshness bound, and tenant resolution, and nothing else.
+type ModuleSettings struct {
+	JWT    config.JWTConfig
+	MFA    config.MFAConfig
+	CORS   config.CORSConfig
+	Tenant config.TenantConfig
 }
 
 // Deps carries process-wide dependencies shared by modules. Keep this small;
 // module-specific dependencies should be captured by the module constructor.
 type Deps struct {
-	Config      *config.Config
+	Config      ModuleSettings
 	Cache       cache.Cache
 	Sessions    session.Store
 	Health      *health.Checker
@@ -188,9 +240,10 @@ type Deps struct {
 	// I18n negotiates Accept-Language and localizes error responses. Nil
 	// disables negotiation and preserves the default English behavior.
 	I18n *i18n.Bundle
-	// Versioning configures deprecation/sunset metadata for API groups. Nil is
-	// equivalent to v1, current, with no deprecation headers.
-	Versioning *versioning.Config
+	// Catalogs are the injected capability catalogs built by the composition
+	// root. Error rendering and feature evaluation use them; a zero value falls
+	// back to the platform-only catalogs so minimal tests still start.
+	Catalogs Catalogs
 	// Flags evaluates compile-time feature flags. It is optional for minimal
 	// deployments and tests; New replaces nil with an evaluator backed by
 	// FEATURE_FLAGS/FEATURE_FLAGS_FORCE_OFF and compiled defaults, so modules
@@ -221,17 +274,33 @@ type Deps struct {
 const authLimiterTier = "auth"
 
 // Authenticate returns the standard authentication chain for protected module
-// routes: `Authorization: ApiKey` is verified by APIKeyVerifier and everything
-// else by the JWT/session middleware. A nil verifier keeps JWT behavior and
-// rejects API-key attempts with 401. Route permissions still come from
-// authzhttp.Require, which sees an API key's scopes as the subject permissions.
+// operations: `Authorization: ApiKey` is verified by APIKeyVerifier and
+// everything else by the JWT/session middleware. A nil verifier keeps JWT
+// behavior and rejects API-key attempts with 401. The route permission is
+// checked by httpapi after this middleware.
 //
 // A per-client-IP limit (RATE_LIMIT_AUTH_*) runs first, because the caller
-// is unknown until authentication succeeds and the per-user tiers mounted
-// after it cannot throttle floods of bogus credentials, each of which would
+// is unknown until authentication succeeds and the per-operation tier mounted
+// ahead of it cannot throttle floods of bogus credentials, each of which would
 // otherwise cost an API-key lookup or session check.
 func (d Deps) Authenticate() fiber.Handler {
-	authenticate := apikeyhttp.Authenticate(middleware.JWTAuthKeys(d.Config.JWT.Keyring(), d.Sessions), d.APIKeyVerifier)
+	authenticate := apikeyhttp.Authenticate(middleware.JWTAuthKeys(d.Config.JWT.Keyring(), d.Sessions), d.APIKeyVerifier, d.Catalogs.Permissions)
+	guard := d.authGuard
+	if guard == nil {
+		return authenticate
+	}
+	return func(c fiber.Ctx) error {
+		if err := guard(c); err != nil {
+			return err
+		}
+		return authenticate(c)
+	}
+}
+
+// AuthenticateJWT is the JWT-only chain for session, identity, and destructive
+// self-service operations. It still applies the per-IP auth limiter.
+func (d Deps) AuthenticateJWT() fiber.Handler {
+	authenticate := middleware.JWTAuthKeys(d.Config.JWT.Keyring(), d.Sessions)
 	guard := d.authGuard
 	if guard == nil {
 		return authenticate
@@ -247,21 +316,41 @@ func (d Deps) Authenticate() fiber.Handler {
 type App struct {
 	cfg     *config.Config
 	fiber   *fiber.App
+	http    *httpapi.API
 	deps    Deps
 	modules []Module
 }
 
-// New builds the Fiber app and global middleware. Routes are registered later
-// through Register so the composition root can decide which modules are active.
+// New builds the Fiber app, the huma API, and global middleware. Operations
+// are registered later through Register so the composition root can decide
+// which modules are active.
 func New(cfg *config.Config, deps Deps) *App {
-	deps.Config = cfg
+	deps.Config = ModuleSettings{JWT: cfg.JWT, MFA: cfg.MFA, CORS: cfg.CORS, Tenant: cfg.Tenant}
+	if deps.Catalogs.Errors == nil {
+		deps.Catalogs.Errors = apperror.PlatformCatalog()
+	}
+	if deps.Catalogs.Permissions == nil {
+		deps.Catalogs.Permissions = authz.NewCatalog()
+		deps.Catalogs.Permissions.Seal()
+	}
+	if deps.Catalogs.Features == nil {
+		deps.Catalogs.Features = features.NewCatalog()
+		deps.Catalogs.Features.Seal()
+	}
 	if deps.Flags == nil {
 		deps.Flags = features.NewEvaluator(features.Options{
+			Catalog:      deps.Catalogs.Features,
 			Env:          cfg.FeatureFlags.EnvValues(),
 			ForceOff:     cfg.FeatureFlags.ForceOffValues(),
-			CacheTTL:     cfg.FeatureFlags.CacheTTL(),
-			MaxStaleness: cfg.FeatureFlags.MaxStaleness(),
+			CacheTTL:     cfg.FeatureFlags.EffectiveCacheTTL(),
+			MaxStaleness: cfg.FeatureFlags.EffectiveMaxStaleness(),
 		})
+	}
+	if deps.Health == nil {
+		deps.Health = health.NewChecker(nil, nil)
+	}
+	if deps.Audit == nil {
+		deps.Audit = audit.Noop{}
 	}
 	deps.Limiters = buildLimiters(cfg, deps.Cache)
 	deps.authGuard = buildAuthGuard(cfg, deps.Cache)
@@ -269,7 +358,7 @@ func New(cfg *config.Config, deps Deps) *App {
 
 	fiberCfg := fiber.Config{
 		AppName:      "fiber-golang-boilerplate",
-		ErrorHandler: apperrorhttp.FiberErrorHandlerWithLocalizer(deps.I18n),
+		ErrorHandler: apperrorhttp.New(deps.Catalogs.Errors, deps.I18n),
 		BodyLimit:    cfg.App.BodyLimit,
 		// Stream the request body so a middleware can reject an oversized
 		// Content-Length without buffering it, and so the JSON cap is enforced
@@ -296,6 +385,7 @@ func New(cfg *config.Config, deps Deps) *App {
 		deps:  deps,
 	}
 	a.setupGlobalMiddleware()
+	a.setupHTTPAPI()
 	a.setupInfrastructureRoutes()
 	return a
 }
@@ -308,9 +398,9 @@ func buildLimiters(cfg *config.Config, appCache cache.Cache) Limiters {
 		appCache = cache.NewMemoryCache()
 	}
 	return Limiters{
-		Strict:  middleware.NewLimiter(rl.StrictMax, rl.StrictWindow, "strict", appCache),
-		Normal:  middleware.NewLimiter(rl.NormalMax, rl.NormalWindow, "normal", appCache),
-		Relaxed: middleware.NewLimiter(rl.RelaxedMax, rl.RelaxedWindow, "relaxed", appCache),
+		Strict:  middleware.NewLimiter(rl.StrictMax, int(rl.StrictWindow/time.Second), "strict", appCache),
+		Normal:  middleware.NewLimiter(rl.NormalMax, int(rl.NormalWindow/time.Second), "normal", appCache),
+		Relaxed: middleware.NewLimiter(rl.RelaxedMax, int(rl.RelaxedWindow/time.Second), "relaxed", appCache),
 	}
 }
 
@@ -318,6 +408,33 @@ func buildAuthGuard(cfg *config.Config, appCache cache.Cache) func(fiber.Ctx) er
 	maxRequests, windowSecs := cfg.RateLimit.EffectiveAuth()
 	// A nil cache falls back to a process-local counter inside NewIPGuard.
 	return middleware.NewIPGuard(maxRequests, windowSecs, authLimiterTier, appCache)
+}
+
+func (a *App) setupHTTPAPI() {
+	defaultSlug := a.cfg.Tenant.DefaultSlug
+	if a.cfg.Tenant.RequireHeader {
+		defaultSlug = ""
+	}
+	a.http = httpapi.New(a.fiber, a.fiber,
+		httpapi.DefaultConfig(
+			"Fiber Golang Boilerplate API",
+			"1.0.0",
+			"REST API boilerplate built with Go, huma (OpenAPI 3.1), PostgreSQL, and sqlc.",
+		),
+		httpapi.Deps{
+			Limiters:        a.deps.Limiters,
+			Authenticate:    a.deps.Authenticate(),
+			AuthenticateJWT: a.deps.AuthenticateJWT(),
+			Idempotency:     a.deps.Idempotency,
+			Audit:           a.deps.Audit,
+			MFAMaxAge:       a.cfg.MFA.EffectiveMaxAge(),
+			I18n:            a.deps.I18n,
+			Flags:           a.deps.Flags,
+			ErrorCatalog:    a.deps.Catalogs.Errors,
+			TenantResolver:  a.deps.TenantResolver,
+			DefaultSlug:     defaultSlug,
+		},
+	)
 }
 
 func (a *App) setupGlobalMiddleware() {
@@ -331,14 +448,15 @@ func (a *App) setupGlobalMiddleware() {
 		AllowMethods:     a.cfg.CORS.Methods(),
 		AllowHeaders:     a.cfg.CORS.Headers(),
 		ExposeHeaders:    a.cfg.CORS.ExposedHeaders(),
-		AllowCredentials: a.cfg.CORS.AllowCredentials,
+		AllowCredentials: a.cfg.JWT.RefreshCookie,
 	}))
 	a.fiber.Use(middleware.SecurityHeaders(a.cfg.App.Env))
 	a.fiber.Use(middleware.RequestID())
+	a.fiber.Use(requestctxhttp.Middleware())
 	a.fiber.Use(i18n.Middleware(a.deps.I18n))
-	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths(), a.cfg.Tracing.TrustIncoming))
-	a.fiber.Use(middleware.Metrics())
-	a.fiber.Use(middleware.Logger())
+	a.fiber.Use(middleware.Tracing(a.deps.Tracing.TracerProvider(), a.cfg.Tracing.ExcludedPaths(), a.cfg.Tracing.TrustIncoming, a.deps.Catalogs.Errors))
+	a.fiber.Use(middleware.Metrics(a.deps.Catalogs.Errors))
+	a.fiber.Use(middleware.Logger(a.deps.Catalogs.Errors))
 	a.fiber.Use(middleware.Recovery(a.cfg.App.Env))
 	// Fiber's BodyLimit is the multipart upload ceiling. Every non-multipart
 	// body, and multipart bodies on routes outside the upload path, are capped
@@ -349,7 +467,7 @@ func (a *App) setupGlobalMiddleware() {
 		middleware.WithUploadLimit(a.cfg.App.BodyLimit, filesUploadPath),
 	))
 	a.fiber.Use(audithttp.Middleware(a.deps.Audit))
-	requestTimeout := time.Duration(a.cfg.App.RequestTimeout) * time.Second
+	requestTimeout := a.cfg.App.RequestTimeout
 	if drain := config.ShutdownBudget - config.ShutdownReserve; requestTimeout+PostHandlerBudget > drain {
 		slog.Warn("APP_REQUEST_TIMEOUT plus post-handler work exceeds the shutdown drain window; in-flight requests may be cut off on shutdown",
 			slog.Duration("request_timeout", requestTimeout),
@@ -371,128 +489,129 @@ const PostHandlerBudget = audit.WriteTimeout + middleware.IdempotencyPostHandler
 
 // filesUploadPath is the one route allowed to parse a multipart body larger
 // than APP_JSON_BODY_LIMIT, up to APP_BODY_LIMIT. Keep it in sync with the
-// files module's POST /files/upload registration.
-const filesUploadPath = "/api/v1/files/upload"
+// files module's POST /files route.
+const filesUploadPath = "/api/v1/files"
 
-func (a *App) setupInfrastructureRoutes() {
-	a.fiber.Get("/healthz", func(c fiber.Ctx) error {
-		return c.JSON(a.deps.Health.Liveness())
-	})
-	readiness := func(c fiber.Ctx) error {
-		st := a.deps.Health.Readiness(c.Context())
-		// Degraded (cache down, DB pool saturated) stays 200 so a shared
-		// dependency blip does not pull every replica out of rotation at once.
-		if st.Status == health.StatusDown {
-			return c.Status(fiber.StatusServiceUnavailable).JSON(st)
-		}
-		return c.JSON(st)
-	}
-	a.fiber.Get("/readyz", readiness)
-	a.fiber.Get("/health", readiness)
+// infrastructureTag groups the platform-owned probe operations in the spec.
+const infrastructureTag = "platform"
 
-	metricsHandler := adaptor.HTTPHandler(promhttp.Handler())
-	if token := a.cfg.App.MetricsAuthToken; token != "" {
-		expected := []byte("Bearer " + token)
-		a.fiber.Get("/metrics", func(c fiber.Ctx) error {
-			got := []byte(c.Get(fiber.HeaderAuthorization))
-			if subtle.ConstantTimeCompare(got, expected) != 1 {
-				return fiber.NewError(fiber.StatusUnauthorized, "unauthorized")
-			}
-			return metricsHandler(c)
-		})
-	} else {
-		a.fiber.Get("/metrics", metricsHandler)
-	}
-
-	if a.cfg.App.Env != "production" {
-		swaggerHandler := swagger.New(swagger.Config{
-			BasePath: "/",
-			FilePath: "./docs/swagger.json",
-			Path:     "swagger",
-		})
-		swaggerCSP := func(c fiber.Ctx) error {
-			c.Set("Content-Security-Policy",
-				"default-src 'self'; script-src 'self' https://unpkg.com 'unsafe-inline'; style-src 'self' https://unpkg.com 'unsafe-inline'; img-src 'self' data:; font-src 'self' https://unpkg.com; frame-ancestors 'none'")
-			return c.Next()
-		}
-		a.fiber.Get("/swagger*", swaggerCSP, swaggerHandler)
-		a.fiber.Get("/docs/*", swaggerCSP, swaggerHandler)
-	}
+type healthOutput struct {
+	Status int
+	Body   health.Status
 }
 
-// Register mounts every module under /api/v1. Modules that implement V2Module
-// are also mounted under /api/v2; the v2 group is created only when at least
-// one module opts in. Callers must register before Listen; duplicate paths are
-// a programming error caught by Fiber's router.
-//
-// Register first (re-)registers the module catalogs. The composition root
-// calls RegisterCatalogs earlier to fail with an error and to validate config
-// against the complete catalog; this call is then a no-op. A catalog conflict
-// reaching this point is a programming error and panics, like a duplicate
-// route.
-func (a *App) Register(modules ...Module) {
-	if err := RegisterCatalogs(modules...); err != nil {
-		panic(fmt.Sprintf("app: register module catalogs: %v", err))
-	}
-	supported := []versioning.Version{versioning.V1}
-	hasV2 := false
-	for _, m := range modules {
-		if _, ok := m.(V2Module); ok {
-			hasV2 = true
-			break
+type metricsInput struct {
+	Authorization string `header:"Authorization"`
+}
+
+type metricsOutput struct {
+	ContentType string `header:"Content-Type"`
+	Body        prometheusBody
+}
+
+// prometheusBody makes huma document and serve the scrape payload as text/plain.
+type prometheusBody []byte
+
+func (prometheusBody) ContentType(string) string { return "text/plain; version=0.0.4; charset=utf-8" }
+
+// setupInfrastructureRoutes registers the platform-owned operations through the
+// same helper modules use. They are outside /api/v1 and therefore have no
+// tenant resolution.
+func (a *App) setupInfrastructureRoutes() {
+	httpapi.Register(a.http, httpapi.Op{
+		Method:         http.MethodGet,
+		Path:           "/healthz",
+		OperationID:    "getLiveness",
+		Infrastructure: true,
+		Tags:           []string{infrastructureTag},
+		Summary:        "Liveness probe",
+		Description:    "Reports that the process is running. It checks no dependency.",
+	}, httpapi.Policy{Public: true}, func(context.Context, *struct{}) (*healthOutput, error) {
+		return &healthOutput{Status: http.StatusOK, Body: a.deps.Health.Liveness()}, nil
+	})
+
+	readiness := func(ctx context.Context, _ *struct{}) (*healthOutput, error) {
+		st := a.deps.Health.Readiness(ctx)
+		status := http.StatusOK
+		if st.Status == health.StatusDown {
+			status = http.StatusServiceUnavailable
 		}
+		return &healthOutput{Status: status, Body: st}, nil
 	}
-	if hasV2 {
-		supported = append(supported, versioning.V2)
-	}
-	// Reject /api/v3/... before routing so an unknown version is a 406
-	// contract error rather than a generic 404.
-	a.fiber.Use("/api", versioning.Guard(supported...))
+	httpapi.Register(a.http, httpapi.Op{
+		Method:         http.MethodGet,
+		Path:           "/readyz",
+		OperationID:    "getReadiness",
+		Infrastructure: true,
+		Tags:           []string{infrastructureTag},
+		Summary:        "Readiness probe",
+		Description:    "Checks the database and cache. Degraded dependencies stay 200; only a down database is 503.",
+		Errors:         []int{http.StatusServiceUnavailable},
+	}, httpapi.Policy{Public: true}, readiness)
+	httpapi.Register(a.http, httpapi.Op{
+		Method:         http.MethodGet,
+		Path:           "/health",
+		OperationID:    "getHealth",
+		Infrastructure: true,
+		Tags:           []string{infrastructureTag},
+		Summary:        "Health probe alias",
+		Description:    "Alias of /readyz.",
+		Errors:         []int{http.StatusServiceUnavailable},
+	}, httpapi.Policy{Public: true}, readiness)
 
-	// Tenant resolution is API-only: health and metrics probes must not depend
-	// on the tenants table. It runs before every module's JWT middleware so a
-	// conflicting X-Tenant-Slug can be rejected after the token is parsed. The
-	// middleware itself exempts the OAuth callback, whose signed state is the
-	// tenant source.
-	defaultSlug := a.cfg.Tenant.DefaultSlug
-	if a.cfg.Tenant.RequireHeader {
-		defaultSlug = ""
-	}
-	tenantMiddleware := tenanthttp.Middleware(a.deps.TenantResolver, defaultSlug)
+	httpapi.Register(a.http, httpapi.Op{
+		Method:         http.MethodGet,
+		Path:           "/metrics",
+		OperationID:    "getMetrics",
+		Infrastructure: true,
+		Tags:           []string{infrastructureTag},
+		Summary:        "Prometheus metrics",
+		Description:    "Prometheus text exposition. Requires `Authorization: Bearer <METRICS_AUTH_TOKEN>` when a token is configured.",
+		Errors:         []int{http.StatusUnauthorized},
+	}, httpapi.Policy{Public: true}, func(_ context.Context, input *metricsInput) (*metricsOutput, error) {
+		if token := a.cfg.App.MetricsAuthToken; token != "" {
+			expected := []byte("Bearer " + token)
+			if subtle.ConstantTimeCompare([]byte(input.Authorization), expected) != 1 {
+				return nil, apperror.NewUnauthorized("unauthorized")
+			}
+		}
+		recorder := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodGet, "/metrics", http.NoBody)
+		if err != nil {
+			return nil, apperror.Internal(err, "Internal Server Error")
+		}
+		metrics.Handler().ServeHTTP(recorder, req)
+		return &metricsOutput{
+			// Huma negotiates on this exact media type; the exporter may add
+			// parameters such as escaping=underscores that Huma rejects.
+			ContentType: "text/plain; version=0.0.4; charset=utf-8",
+			Body:        prometheusBody(recorder.Body.Bytes()),
+		}, nil
+	})
+}
 
-	v1 := a.fiber.Group("/api/v1",
-		versioning.Middleware(versioning.V1, a.deps.Versioning),
-		tenantMiddleware,
-	)
+// Register mounts the huma operations of every module that serves HTTP
+// (RouteProvider is optional: a contracts-only module has no routes) and runs
+// every module's catalog and provider hooks.
+//
+// Callers must register before Listen; duplicate operations are a programming
+// error caught by httpapi.Register.
+func (a *App) Register(modules ...Module) {
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
-		m.RegisterRoutes(v1, a.deps)
+		if provider, ok := m.(RouteProvider); ok {
+			provider.RegisterRoutes(a.http, a.deps)
+		}
 		a.registerProviders(m)
 	}
 	a.registerDurableEvents()
-
-	if !hasV2 {
-		return
-	}
-	v2 := a.fiber.Group("/api/v2",
-		versioning.Middleware(versioning.V2, a.deps.Versioning),
-		tenantMiddleware,
-	)
-	for _, m := range modules {
-		if v2Module, ok := m.(V2Module); ok {
-			v2Module.RegisterV2Routes(v2, a.deps)
-		}
-	}
 }
 
 // RegisterBackground registers module catalogs and the schedule, event, and
-// job providers without mounting any /api route. APP_ROLE=worker uses it:
+// job providers without mounting any API route. APP_ROLE=worker uses it:
 // the process serves only the infrastructure routes (health, metrics) while
 // its worker runs every module's handlers. Call it instead of Register.
 func (a *App) RegisterBackground(modules ...Module) {
-	if err := RegisterCatalogs(modules...); err != nil {
-		panic(fmt.Sprintf("app: register module catalogs: %v", err))
-	}
 	for _, m := range modules {
 		a.modules = append(a.modules, m)
 		a.registerProviders(m)
@@ -530,7 +649,18 @@ func (a *App) registerDurableEvents() {
 	}
 }
 
+// Fiber returns the underlying Fiber app.
 func (a *App) Fiber() *fiber.App { return a.fiber }
+
+// Deps returns the assembled dependencies, for module tests that mount one
+// module's operations directly; production code goes through Register.
+func (a *App) Deps() Deps { return a.deps }
+
+// HTTP returns the huma operation registry (used by cmd/openapi and test/arch).
+func (a *App) HTTP() *httpapi.API { return a.http }
+
+// Huma returns the underlying huma API.
+func (a *App) Huma() huma.API { return a.http.Huma() }
 
 func (a *App) Listen(addr string) error { return a.fiber.Listen(addr) }
 

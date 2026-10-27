@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"net/http"
 	"testing"
 
 	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
@@ -17,15 +16,12 @@ func (f *fake{{.U.Name}}) Handle(context.Context, {{.M.Ident}}service.{{.U.Name}
 
 func Test{{.U.Name}}HTTP(t *testing.T) {
 	fake := &fake{{.U.Name}}{}
-	app := newTestApp()
 {{- if .U.IsCommand}}
-	app.Post("/{{.U.Route}}", New{{.U.Name}}HTTP(fake).Handle)
-	status, body := do(t, app, http.MethodPost, "/{{.U.Route}}", `{}`)
+	out, err := New{{.U.Name}}HTTP(fake).Handle(context.Background(), &{{.U.Camel}}Input{})
 {{- else}}
-	app.Get("/{{.U.Route}}", New{{.U.Name}}HTTP(fake).Handle)
-	status, body := do(t, app, http.MethodGet, "/{{.U.Route}}", "")
+	out, err := New{{.U.Name}}HTTP(fake).Handle(context.Background(), &struct{}{})
 {{- end}}
-	if status != http.StatusOK || fake.calls != 1 {
-		t.Fatalf("{{.U.Route}} = %d %s (calls=%d), want 200 and one call", status, body, fake.calls)
+	if err != nil || out == nil || fake.calls != 1 {
+		t.Fatalf("Handle = %v, %v (calls=%d), want one result", out, err, fake.calls)
 	}
 }

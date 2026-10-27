@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
@@ -32,8 +33,8 @@ var (
 
 // Queue is the durable jobs surface used by the bus. *jobs.Queue implements it.
 type Queue interface {
-	EnqueueOnce(ctx context.Context, job jobs.Job) (int64, bool, error)
-	EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (int64, bool, error)
+	EnqueueOnce(ctx context.Context, job jobs.Job) (uuid.UUID, bool, error)
+	EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job jobs.Job) (uuid.UUID, bool, error)
 }
 
 // Handler processes one event. Returning an error is reported to the
@@ -247,7 +248,7 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 	if b == nil {
 		return Event{}, errors.New("events: bus is nil")
 	}
-	if event.ID == "" {
+	if event.ID == uuid.Nil {
 		id, err := newID()
 		if err != nil {
 			return Event{}, err
@@ -259,8 +260,8 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 	} else {
 		event.OccurredAt = event.OccurredAt.UTC()
 	}
-	if event.TenantID == 0 {
-		event.TenantID = tenant.EffectiveID(ctx)
+	if event.TenantID == uuid.Nil {
+		event.TenantID = tenant.IDFromContext(ctx)
 	}
 	if event.RequestID == "" {
 		event.RequestID = requestctx.RequestID(ctx)
@@ -280,7 +281,7 @@ func (b *Bus) prepare(ctx context.Context, event Event) (Event, error) {
 // actorFromContext attributes an event to the request's authenticated user,
 // or to the system when there is none (jobs, schedules, maintenance).
 func actorFromContext(ctx context.Context) Actor {
-	if id := requestctx.ActorID(ctx); id > 0 {
+	if id := requestctx.ActorID(ctx); id != uuid.Nil {
 		return UserActor(id)
 	}
 	return Actor{Type: ActorSystem}
@@ -347,7 +348,7 @@ func (b *Bus) enqueueDurable(ctx context.Context, tx pgx.Tx, event Event) error 
 }
 
 func durableIdempotencyKey(event Event, sub durableSubscription) string {
-	return fmt.Sprintf("event:%s:%s:%s:%d", event.Type, event.ID, sub.Handler, event.TenantID)
+	return fmt.Sprintf("event:%s:%s:%s:%s", event.Type, event.ID, sub.Handler, event.TenantID)
 }
 
 func (b *Bus) jobHandler(sub durableSubscription) jobs.Handler {
@@ -365,11 +366,11 @@ func (b *Bus) jobHandler(sub durableSubscription) jobs.Handler {
 			return jobs.Permanent(fmt.Errorf("events: durable %q payload has event %q, want %q", sub.Kind, event.Type, sub.Event))
 		}
 
-		if event.TenantID > 0 {
+		if event.TenantID != uuid.Nil {
 			ctx = tenant.WithID(ctx, event.TenantID)
 		}
 		ctx = requestctx.WithRequestID(ctx, event.RequestID)
-		if actorID := event.Actor.userID(); actorID > 0 {
+		if actorID := event.Actor.userID(); actorID != uuid.Nil {
 			ctx = requestctx.WithActorID(ctx, actorID)
 		}
 		if err := invoke(ctx, sub.Fn, event, sub.Handler); err != nil {

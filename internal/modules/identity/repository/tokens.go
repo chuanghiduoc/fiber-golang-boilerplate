@@ -4,9 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/google/uuid"
 )
 
 // PasswordResetRepository implements service.PasswordResetRepository. Reset
@@ -30,12 +31,12 @@ func toResetToken(row identitysqlc.PasswordResetToken) *identityservice.Password
 	}
 }
 
-func (r *PasswordResetRepository) Create(ctx context.Context, userID int64, email, tokenHash string, expiresAt time.Time) (bool, error) {
+func (r *PasswordResetRepository) Create(ctx context.Context, userID uuid.UUID, email string, tokenHash []byte, expiresAt time.Time) (bool, error) {
 	_, err := r.q.CreatePasswordResetToken(ctx, identitysqlc.CreatePasswordResetTokenParams{
 		UserID:    userID,
 		Email:     email,
 		TokenHash: tokenHash,
-		ExpiresAt: timestamptz(expiresAt),
+		ExpiresAt: database.Timestamptz(expiresAt),
 	})
 	if err != nil {
 		if err = wrapErr(err); isNotFound(err) {
@@ -46,7 +47,7 @@ func (r *PasswordResetRepository) Create(ctx context.Context, userID int64, emai
 	return true, nil
 }
 
-func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash string) (*identityservice.PasswordResetToken, error) {
+func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash []byte) (*identityservice.PasswordResetToken, error) {
 	row, err := r.q.GetPasswordResetTokenByHash(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -54,7 +55,7 @@ func (r *PasswordResetRepository) GetByHash(ctx context.Context, tokenHash strin
 	return toResetToken(row), nil
 }
 
-func (r *PasswordResetRepository) Consume(ctx context.Context, tokenHash string) (*identityservice.PasswordResetToken, error) {
+func (r *PasswordResetRepository) Consume(ctx context.Context, tokenHash []byte) (*identityservice.PasswordResetToken, error) {
 	row, err := r.q.ConsumePasswordResetToken(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -62,11 +63,11 @@ func (r *PasswordResetRepository) Consume(ctx context.Context, tokenHash string)
 	return toResetToken(row), nil
 }
 
-func (r *PasswordResetRepository) Delete(ctx context.Context, tokenHash string) error {
+func (r *PasswordResetRepository) Delete(ctx context.Context, tokenHash []byte) error {
 	return wrapErr(r.q.DeletePasswordResetToken(ctx, tokenHash))
 }
 
-func (r *PasswordResetRepository) DeleteByUser(ctx context.Context, userID int64) error {
+func (r *PasswordResetRepository) DeleteByUser(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeletePasswordResetTokensByUserID(ctx, userID))
 }
 
@@ -81,17 +82,17 @@ func NewVerificationRepository(db identitysqlc.DBTX) *VerificationRepository {
 	return &VerificationRepository{q: identitysqlc.New(db)}
 }
 
-func (r *VerificationRepository) Create(ctx context.Context, userID int64, email, tokenHash string, expiresAt time.Time) error {
+func (r *VerificationRepository) Create(ctx context.Context, userID uuid.UUID, email string, tokenHash []byte, expiresAt time.Time) error {
 	_, err := r.q.CreateEmailVerificationToken(ctx, identitysqlc.CreateEmailVerificationTokenParams{
 		UserID:    userID,
 		Email:     email,
 		TokenHash: tokenHash,
-		ExpiresAt: timestamptz(expiresAt),
+		ExpiresAt: database.Timestamptz(expiresAt),
 	})
 	return wrapErr(err)
 }
 
-func (r *VerificationRepository) Consume(ctx context.Context, tokenHash string) (*identityservice.VerificationToken, error) {
+func (r *VerificationRepository) Consume(ctx context.Context, tokenHash []byte) (*identityservice.VerificationToken, error) {
 	row, err := r.q.ConsumeEmailVerificationToken(ctx, tokenHash)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -105,7 +106,7 @@ func (r *VerificationRepository) Consume(ctx context.Context, tokenHash string) 
 	}, nil
 }
 
-func (r *VerificationRepository) DeleteByUser(ctx context.Context, userID int64) error {
+func (r *VerificationRepository) DeleteByUser(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeleteEmailVerificationTokensByUserID(ctx, userID))
 }
 
@@ -143,8 +144,8 @@ func (r *TokenPurgeRepository) PurgeExpiredInvitations(ctx context.Context, batc
 func (r *TokenPurgeRepository) PurgeStaleSessions(ctx context.Context, revokedBefore, idleBefore time.Time, batchSize int32) (int64, error) {
 	ctx = database.WithRLSBypass(ctx) // Retention spans every tenant.
 	return r.q.PurgeStaleSessions(ctx, identitysqlc.PurgeStaleSessionsParams{
-		RevokedBefore: timestamptz(revokedBefore),
-		IdleBefore:    timestamptz(idleBefore),
+		RevokedBefore: database.Timestamptz(revokedBefore),
+		IdleBefore:    database.Timestamptz(idleBefore),
 		BatchSize:     batchSize,
 	})
 }

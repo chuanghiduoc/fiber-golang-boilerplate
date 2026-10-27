@@ -7,6 +7,8 @@ package identity
 import (
 	"context"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // User is the identity module's cross-module view of a global user as a
@@ -15,7 +17,7 @@ import (
 // the membership; the rest is the global identity. It deliberately omits
 // credentials, token versions, and other internal fields.
 type User struct {
-	ID    int64
+	ID    uuid.UUID
 	Email string
 	Name  string
 	Role  string
@@ -49,8 +51,8 @@ type UserStats struct {
 // behalf of an API key's owner: an active membership with its effective
 // permissions. It intentionally excludes credentials and session fields.
 type Principal struct {
-	ID       int64
-	TenantID int64
+	ID       uuid.UUID
+	TenantID uuid.UUID
 	Email    string
 	Name     string
 	Role     string
@@ -77,7 +79,7 @@ const TenantStatusActive = "active"
 // effect immediately. Implementations must return apperror.ErrNotFound (or a
 // wrapped error) when the account is not active.
 type PrincipalReader interface {
-	GetPrincipal(ctx context.Context, tenantID, userID int64) (Principal, error)
+	GetPrincipal(ctx context.Context, tenantID, userID uuid.UUID) (Principal, error)
 }
 
 // MemberRankChecker applies identity's tenant role hierarchy to a caller acting
@@ -86,15 +88,15 @@ type PrincipalReader interface {
 // the target is not an active member of that tenant. A caller without a
 // subject is allowed only under authz.SystemContext.
 type MemberRankChecker interface {
-	CanManageMember(ctx context.Context, targetUserID int64) error
+	CanManageMember(ctx context.Context, targetUserID uuid.UUID) error
 }
 
 // IdentityAdmin is the back-office surface identity exposes to admin.
 type IdentityAdmin interface {
 	ListUsers(ctx context.Context, limit int, startingAfter string) (UserPage, error)
-	UpdateRole(ctx context.Context, id int64, role string) (User, error)
-	BanUser(ctx context.Context, id int64) error
-	UnbanUser(ctx context.Context, id int64) (User, error)
+	UpdateRole(ctx context.Context, id uuid.UUID, role string) (User, error)
+	BanUser(ctx context.Context, id uuid.UUID) error
+	UnbanUser(ctx context.Context, id uuid.UUID) (User, error)
 	GetUserStats(ctx context.Context) (UserStats, error)
 }
 
@@ -102,7 +104,7 @@ type IdentityAdmin interface {
 // notifications module never reads the users table directly; identity owns
 // that data and implements NotificationRecipientLookup.
 type NotificationRecipient struct {
-	UserID int64
+	UserID uuid.UUID
 	Email  string
 	Name   string
 }
@@ -111,5 +113,5 @@ type NotificationRecipient struct {
 // channel. Implementations must scope the lookup to the context tenant and
 // return apperror.ErrNotFound for a deleted or cross-tenant user.
 type NotificationRecipientLookup interface {
-	NotificationRecipient(ctx context.Context, userID int64) (NotificationRecipient, error)
+	NotificationRecipient(ctx context.Context, userID uuid.UUID) (NotificationRecipient, error)
 }

@@ -1,8 +1,10 @@
 package apikeyhttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
@@ -28,17 +31,17 @@ type fakeStore struct {
 	touched []time.Time
 }
 
-func (s *fakeStore) FindByHash(_ context.Context, hash string) (apikey.Key, error) {
+func (s *fakeStore) FindByHash(_ context.Context, hash []byte) (apikey.Key, error) {
 	if s.findErr != nil {
 		return apikey.Key{}, s.findErr
 	}
-	if hash != s.key.Hash {
+	if !bytes.Equal(hash, s.key.Hash) {
 		return apikey.Key{}, apperror.ErrNotFound
 	}
 	return s.key, nil
 }
 
-func (s *fakeStore) TouchLastUsed(_ context.Context, id int64, at time.Time) error {
+func (s *fakeStore) TouchLastUsed(_ context.Context, id uuid.UUID, at time.Time) error {
 	if id != s.key.ID {
 		return apperror.ErrNotFound
 	}
@@ -53,7 +56,7 @@ type fakePrincipals struct {
 	err       error
 }
 
-func (p fakePrincipals) GetPrincipal(context.Context, int64, int64) (identitycontracts.Principal, error) {
+func (p fakePrincipals) GetPrincipal(context.Context, uuid.UUID, uuid.UUID) (identitycontracts.Principal, error) {
 	return p.principal, p.err
 }
 
@@ -64,9 +67,9 @@ func newTestKey(t *testing.T) (apikey.Credentials, apikey.Key) {
 		t.Fatalf("generate: %v", err)
 	}
 	return credentials, apikey.Key{
-		ID:        7,
-		TenantID:  1,
-		UserID:    42,
+		ID:        testID(7),
+		TenantID:  testID(1),
+		UserID:    testID(42),
 		Name:      "ci",
 		Prefix:    credentials.Prefix,
 		Hash:      credentials.Hash,
@@ -87,7 +90,7 @@ func TestEffectiveScopes_CurrentRoleBoundsKey(t *testing.T) {
 	}
 	got := effectiveScopes(identitycontracts.Principal{
 		Role: authz.RoleMember, Permissions: []string{string(testScopeRead)},
-	}, scopes)
+	}, scopes, testAuthorizer())
 	if len(got) != 1 || got[0] != testScopeRead {
 		t.Fatalf("effective scopes = %v, want only apikeytest:read after demotion", got)
 	}
@@ -96,45 +99,44 @@ func TestEffectiveScopes_CurrentRoleBoundsKey(t *testing.T) {
 		Role: authz.RoleAdmin, Permissions: []string{
 			string(authz.PermissionAdminUsersRead), string(testScopeRead),
 		},
-	}, scopes)
+	}, scopes, testAuthorizer())
 	if len(got) != 2 {
 		t.Fatalf("effective scopes = %v, want both scopes for admin", got)
 	}
 
-	if got := effectiveScopes(identitycontracts.Principal{}, scopes); len(got) != 2 {
+	if got := effectiveScopes(identitycontracts.Principal{}, scopes, testAuthorizer()); len(got) != 2 {
 		t.Fatalf("effective scopes without a principal = %v, want scopes unchanged", got)
 	}
 }
 
-func TestAuthenticate_DelegatesJWTsAndSetsAPIKeyLocals(t *testing.T) {
+func TestAuthenticate_DelegatesJWTsAndSetsAPIKeyContext(t *testing.T) {
 	credentials, key := newTestKey(t)
 	now := time.Unix(1_700_000_100, 0).UTC()
 	store := &fakeStore{key: key}
 	verifier := apikey.NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-		ID: 42, TenantID: 1, Email: "owner@test.com", Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
+		ID: testID(42), TenantID: testID(1), Email: "owner@test.com", Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
 	}}, fixedClock(now))
 
 	jwtCalled := false
 	jwt := func(c fiber.Ctx) error {
 		jwtCalled = true
-		fiber.Locals[string](c, apikey.LocalAuthMethod, apikey.AuthMethodJWT)
+		c.SetContext(apikey.WithAuthMethod(c.Context(), apikey.AuthMethodJWT))
 		return c.SendString("jwt")
 	}
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		if slug := c.Get(tenant.Header); slug == "other" {
-			fiber.Locals[int64](c, "tenant_id", 2)
-			fiber.Locals[string](c, "tenant_slug", "other")
+			c.SetContext(tenant.WithIdentity(c.Context(), testID(2), "other"))
 		}
 		return c.Next()
 	})
-	app.Get("/me", Authenticate(jwt, verifier), func(c fiber.Ctx) error {
+	app.Get("/me", Authenticate(jwt, verifier, testCatalog), func(c fiber.Ctx) error {
 		return c.JSON(fiber.Map{
-			"userID":     fiber.Locals[int64](c, "user_id"),
-			"tenantID":   fiber.Locals[int64](c, "tenant_id"),
-			"apiKeyID":   fiber.Locals[int64](c, apikey.LocalAPIKeyID),
-			"authMethod": fiber.Locals[string](c, apikey.LocalAuthMethod),
+			"userID":     requestctx.ActorID(c.Context()),
+			"tenantID":   tenant.IDFromContext(c.Context()),
+			"apiKeyID":   apikey.APIKeyIDFromContext(c.Context()),
+			"authMethod": apikey.AuthMethodFromContext(c.Context()),
 		})
 	})
 
@@ -173,10 +175,10 @@ func TestAuthenticate_DelegatesJWTsAndSetsAPIKeyLocals(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if payload["userID"].(float64) != 42 || payload["tenantID"].(float64) != 1 {
+	if payload["userID"] != testID(42).String() || payload["tenantID"] != testID(1).String() {
 		t.Fatalf("payload = %+v, want user 42 tenant 1", payload)
 	}
-	if payload["apiKeyID"].(float64) != 7 || payload["authMethod"] != apikey.AuthMethodAPIKey {
+	if payload["apiKeyID"] != testID(7).String() || payload["authMethod"] != apikey.AuthMethodAPIKey {
 		t.Fatalf("payload = %+v, want key 7 auth_method api_key", payload)
 	}
 
@@ -196,7 +198,7 @@ func TestAuthenticate_DelegatesJWTsAndSetsAPIKeyLocals(t *testing.T) {
 
 func TestAuthenticate_NilVerifierRejectsApiKey(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
-	app.Get("/me", Authenticate(nil, nil), func(c fiber.Ctx) error { return c.SendString("ok") })
+	app.Get("/me", Authenticate(nil, nil, testCatalog), func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	req, _ := http.NewRequest(http.MethodGet, "/me", http.NoBody)
 	req.Header.Set(fiber.HeaderAuthorization, apikey.APIKeyScheme+" fgb_"+strings.Repeat("a", 43))
@@ -212,23 +214,23 @@ func TestAuthenticate_NilVerifierRejectsApiKey(t *testing.T) {
 
 func TestAuthenticate_InstallsActorContextAndClearsOverriddenSlug(t *testing.T) {
 	credentials, key := newTestKey(t)
-	key.TenantID = 3
+	key.TenantID = testID(3)
 	store := &fakeStore{key: key}
 	verifier := apikey.NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-		ID: 42, TenantID: 3, Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
+		ID: testID(42), TenantID: testID(3), Role: authz.RoleAdmin, TenantStatus: identitycontracts.TenantStatusActive,
 	}})
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
 		// Simulate the tenant middleware resolving a header-less request to
 		// the default tenant.
-		fiber.Locals[string](c, "request_id", "req-1")
-		fiber.Locals[int64](c, "tenant_id", 1)
-		fiber.Locals[string](c, "tenant_slug", "default")
-		c.SetContext(tenant.WithIdentity(c.Context(), 1, "default"))
+		c.SetContext(requestctx.WithRequestID(c.Context(), "req-1"))
+		c.SetContext(tenant.WithID(c.Context(), testID(1)))
+		c.SetContext(tenant.WithSlug(c.Context(), "default"))
+		c.SetContext(tenant.WithIdentity(c.Context(), testID(1), "default"))
 		return c.Next()
 	})
-	app.Get("/me", Authenticate(nil, verifier), func(c fiber.Ctx) error {
+	app.Get("/me", Authenticate(nil, verifier, testCatalog), func(c fiber.Ctx) error {
 		ctx := c.Context()
 		info := audit.RequestInfoFromContext(ctx)
 		if info == nil {
@@ -260,11 +262,16 @@ func TestAuthenticate_InstallsActorContextAndClearsOverriddenSlug(t *testing.T) 
 	if err := json.Unmarshal(body, &payload); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if payload["actor"].(float64) != 42 || payload["auditActor"].(float64) != 42 ||
+	if payload["actor"] != testID(42).String() || payload["auditActor"] != testID(42).String() ||
 		payload["auditRole"] != authz.RoleAdmin || payload["requestID"] != "req-1" {
 		t.Fatalf("actor context = %+v, want actor 42/admin with request id", payload)
 	}
-	if payload["localSlug"] != "" || payload["ctxSlug"] != "" || payload["ctxTenant"].(float64) != 3 {
+	if payload["localSlug"] != "" || payload["ctxSlug"] != "" || payload["ctxTenant"] != testID(3).String() {
 		t.Fatalf("tenant = %+v, want key tenant 3 with cleared slug", payload)
 	}
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

@@ -63,26 +63,3 @@ func ParseForceOff(raw string) (map[Key]struct{}, error) {
 	}
 	return out, nil
 }
-
-// KnownKeysError returns a descriptive error when parsed contains a key that
-// is not in the compile-time catalog. It is shared by config validation and
-// tests.
-func KnownKeysError(parsed map[Key]bool) error {
-	for key := range parsed {
-		if !IsKnown(key) {
-			return fmt.Errorf("unknown feature flag %q", key)
-		}
-	}
-	return nil
-}
-
-// KnownForceOffError returns a descriptive error when forceOff contains a key
-// that is not in the compile-time catalog.
-func KnownForceOffError(forceOff map[Key]struct{}) error {
-	for key := range forceOff {
-		if !IsKnown(key) {
-			return fmt.Errorf("unknown force-off feature flag %q", key)
-		}
-	}
-	return nil
-}

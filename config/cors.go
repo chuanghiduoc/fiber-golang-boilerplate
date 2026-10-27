@@ -1,37 +1,40 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // corsWildcardOrigin allows every origin; it cannot be combined with
 // credentials and is rejected in production.
 const corsWildcardOrigin = "*"
 
 type CORSConfig struct {
-	AllowOrigins     string `env:"CORS_ALLOW_ORIGINS" envDefault:"*"`
-	AllowMethods     string `env:"CORS_ALLOW_METHODS" envDefault:"GET,POST,PUT,PATCH,DELETE,OPTIONS"`
-	AllowHeaders     string `env:"CORS_ALLOW_HEADERS" envDefault:"Origin,Content-Type,Accept,Accept-Language,Accept-Version,Authorization,Idempotency-Key,X-Tenant-Slug"`
-	ExposeHeaders    string `env:"CORS_EXPOSE_HEADERS" envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,API-Version,Deprecation,Sunset,Link,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"`
-	AllowCredentials bool   `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
+	AllowOrigins     []string `env:"CORS_ALLOW_ORIGINS" envSeparator:"," envDefault:"*"`
+	AllowMethods     []string `env:"CORS_ALLOW_METHODS" envSeparator:"," envDefault:"GET,POST,PUT,PATCH,DELETE,OPTIONS"`
+	AllowHeaders     []string `env:"CORS_ALLOW_HEADERS" envSeparator:"," envDefault:"Origin,Content-Type,Accept,Accept-Language,Authorization,Idempotency-Key,X-Tenant-Slug,X-CSRF-Token"`
+	ExposeHeaders    []string `env:"CORS_EXPOSE_HEADERS" envSeparator:"," envDefault:"Location,ETag,Idempotent-Replayed,Content-Language,RateLimit,RateLimit-Policy,Retry-After,X-RateLimit-Limit,X-RateLimit-Remaining,X-RateLimit-Reset,X-Request-Id"`
+	AllowCredentials bool     `env:"CORS_ALLOW_CREDENTIALS" envDefault:"false"`
 }
 
 // Origins returns the list of allowed CORS origins.
 func (c CORSConfig) Origins() []string {
-	return splitCSV(c.AllowOrigins)
+	return trimmedList(c.AllowOrigins)
 }
 
 // Methods returns the list of allowed CORS methods.
 func (c CORSConfig) Methods() []string {
-	return splitCSV(c.AllowMethods)
+	return trimmedList(c.AllowMethods)
 }
 
 // Headers returns the list of allowed CORS request headers.
 func (c CORSConfig) Headers() []string {
-	return splitCSV(c.AllowHeaders)
+	return trimmedList(c.AllowHeaders)
 }
 
 // ExposedHeaders returns the response headers browser clients may read.
 func (c CORSConfig) ExposedHeaders() []string {
-	return splitCSV(c.ExposeHeaders)
+	return trimmedList(c.ExposeHeaders)
 }
 
 // validate checks every origin explicitly: Fiber treats an empty origin list
@@ -51,6 +54,23 @@ func (c CORSConfig) validate() error {
 		if !isAbsoluteHTTPURL(origin) {
 			return fmt.Errorf("CORS_ALLOW_ORIGINS contains invalid origin %q", origin)
 		}
+	}
+	return nil
+}
+
+// validateSessionMode ties CORS credentials to the refresh-cookie mode: the
+// browser sends cookies only for trusted origins, so cookie mode requires
+// explicit origins and credentials, while JSON mode must not advertise
+// credentials at all.
+func (c CORSConfig) validateSessionMode(cookieMode bool) error {
+	if cookieMode {
+		if slices.Contains(c.Origins(), corsWildcardOrigin) {
+			return fmt.Errorf("CORS_ALLOW_ORIGINS must list explicit origins when AUTH_REFRESH_COOKIE=true")
+		}
+		return nil
+	}
+	if c.AllowCredentials {
+		return fmt.Errorf("CORS_ALLOW_CREDENTIALS requires AUTH_REFRESH_COOKIE=true")
 	}
 	return nil
 }

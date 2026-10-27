@@ -15,7 +15,7 @@ func TestSpecValidate(t *testing.T) {
 	validInterval := Spec{Name: "cleanup", Interval: 5 * time.Minute, Kind: "maintenance.cleanup"}
 	require.NoError(t, validInterval.Validate())
 
-	validCron := Spec{Name: "report", Cron: "@daily", Kind: "reports.daily", TenantID: 2}
+	validCron := Spec{Name: "report", Cron: "@daily", Kind: "reports.daily", TenantID: testID(2)}
 	require.NoError(t, validCron.Validate())
 
 	invalid := []Spec{
@@ -26,7 +26,6 @@ func TestSpecValidate(t *testing.T) {
 		{Name: "ok", Interval: time.Minute, Cron: "@daily", Kind: "k"},
 		{Name: "ok", Interval: 500 * time.Millisecond, Kind: "k"},
 		{Name: "ok", Interval: 1500 * time.Millisecond, Kind: "k"},
-		{Name: "ok", Interval: time.Minute, Kind: "k", TenantID: -1},
 		{Name: "ok", Interval: time.Minute, Kind: "k", MaxAttempts: -1},
 		{Name: "ok", Interval: time.Minute, Kind: "k", Payload: json.RawMessage(`{`)},
 		{Name: "ok", Cron: "not cron", Kind: "k"},

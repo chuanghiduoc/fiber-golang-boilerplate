@@ -27,7 +27,7 @@ func TestTenantPurgerDrainsNotificationsInBoundedBatches(t *testing.T) {
 		}
 		require.NotEmpty(t, table, "unexpected SQL: %s", sql)
 		require.Len(t, args, 2)
-		require.Equal(t, int64(7), args[0])
+		require.Equal(t, testID(7), args[0])
 		require.Equal(t, tenancycontracts.PurgeBatchSize, args[1])
 		calls[table]++
 		if calls[table] == 1 {
@@ -36,7 +36,7 @@ func TestTenantPurgerDrainsNotificationsInBoundedBatches(t *testing.T) {
 		return fakedb.Deleted(0), nil
 	}
 
-	require.NoError(t, notificationsrepo.NewTenantPurger(db).PurgeTenant(context.Background(), 7))
+	require.NoError(t, notificationsrepo.NewTenantPurger(db).PurgeTenant(context.Background(), testID(7)))
 	assert.Equal(t, 2, calls["preferences"])
 	assert.Equal(t, 2, calls["notifications"])
 }

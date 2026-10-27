@@ -13,10 +13,11 @@ const (
 	CodeWebhookPortNotAllowed apperror.Code = "webhook.port_not_allowed"
 )
 
-// ErrorCodes returns the webhooks error catalog for app.ErrorProvider.
-func ErrorCodes() map[apperror.Code]apperror.Spec {
-	return map[apperror.Code]apperror.Spec{
-		CodeWebhookPortNotAllowed: {
+// Errors returns the webhooks error catalog for app.ErrorProvider.
+func Errors() []apperror.Spec {
+	return []apperror.Spec{
+		{
+			Code:    CodeWebhookPortNotAllowed,
 			Status:  http.StatusBadRequest,
 			Title:   "Webhook destination port is not allowed",
 			DocPath: "/errors/webhook-port-not-allowed",

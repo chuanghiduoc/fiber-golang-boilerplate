@@ -30,7 +30,7 @@ FOR UPDATE;
 -- name: ListTenantsCursor :many
 -- Platform administration: every tenant, newest first.
 SELECT * FROM tenants
-WHERE (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+WHERE (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -48,6 +48,12 @@ UPDATE tenants
 SET status = @status,
     status_changed_at = NOW(),
     deletion_scheduled_at = @deletion_scheduled_at
+WHERE id = @id
+RETURNING *;
+
+-- name: UpdateTenantName :one
+UPDATE tenants
+SET name = @name
 WHERE id = @id
 RETURNING *;
 
@@ -78,12 +84,12 @@ LIMIT @row_limit::int;
 -- Records the highest membership user id whose erasers succeeded. It only
 -- moves forward and only for an unfinished deleted tenant.
 UPDATE tenants
-SET purge_cursor = @purge_cursor::bigint,
+SET purge_cursor = @purge_cursor::uuid,
     purge_progress_at = NOW()
-WHERE id = @id::bigint
+WHERE id = @id::uuid
   AND status = 'deleted'
   AND purged_at IS NULL
-  AND purge_cursor < @purge_cursor::bigint;
+  AND purge_cursor < @purge_cursor::uuid;
 
 -- name: ListDueDeletionTenantIDs :many
 -- The hourly finalize job moves tenants whose pending_deletion grace ended to
@@ -99,7 +105,7 @@ LIMIT @row_limit::int;
 -- no-op instead of marking an operational tenant purged.
 UPDATE tenants
 SET purged_at = NOW()
-WHERE id = @id::bigint
+WHERE id = @id::uuid
   AND status = 'deleted'
   AND purged_at IS NULL;
 
@@ -108,3 +114,12 @@ WHERE id = @id::bigint
 -- primary key is tenant_id, so this affects at most one row and needs no
 -- batching. The tenants row itself is kept for audit and incident review.
 DELETE FROM tenant_settings WHERE tenant_id = $1;
+
+-- name: TouchTenantIfUnchanged :execrows
+-- The optimistic-concurrency gate for the tenants ETag. The row update and the
+-- status/name change commit in one transaction, so exactly one concurrent
+-- writer holding the same validator succeeds.
+UPDATE tenants
+SET updated_at = NOW()
+WHERE id = @id
+  AND updated_at = @expected_updated_at;

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	tenancycontracts "{{.M.ModulePath}}/internal/contracts/tenancy"
 	{{.M.Ident}}sqlc "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/sqlc"
 	"{{.M.ModulePath}}/internal/platform/tenant"
@@ -27,7 +29,7 @@ func New{{.R.Pascal}}TenantPurger(db {{.M.Ident}}sqlc.DBTX) *{{.R.Pascal}}Tenant
 // PurgeTenant deletes one bounded page at a time until none remain. Re-running
 // after a partial failure is safe: deleted pages are gone and the rest is
 // selected again.
-func (p *{{.R.Pascal}}TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *{{.R.Pascal}}TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
 		deleted, err := p.q.DeleteTenant{{.R.Pascal}}Batch(ctx, {{.M.Ident}}sqlc.DeleteTenant{{.R.Pascal}}BatchParams{

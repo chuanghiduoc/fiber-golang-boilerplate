@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	tenancycontracts "{{.M.ModulePath}}/internal/contracts/tenancy"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 )
@@ -16,7 +18,7 @@ type tenantPurger struct {
 }
 
 // PurgeTenant implements tenancy.Purger.
-func (p tenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p tenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	for _, purger := range p.purgers {
 		if err := purger.PurgeTenant(ctx, tenantID); err != nil {
 			return fmt.Errorf("{{.M.Name}}: purge tenant %d: %w", tenantID, err)
@@ -25,15 +27,16 @@ func (p tenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
 	return nil
 }
 
-// RegisterTenantPurge contributes {{.M.Name}}'s tenant-wide purger to the
-// composition root's registry. A module with no generated resource registers
-// nothing; cmd/gen adds the bootstrap call with the module.
-func (m *Module) RegisterTenantPurge(registry *tenancycontracts.Registry) {
+// TenantPurgers contributes {{.M.Name}}'s tenant-wide purger to the composition
+// root's tenancy registry. A module with no generated resource registers
+// nothing; cmd/gen adds the module to the bootstrap registration list.
+func (m *Module) TenantPurgers() []tenancycontracts.Provider {
 	if len(m.tenantPurgers) == 0 {
-		return
+		return nil
 	}
-	registry.Register(tenancycontracts.Provider{
+	provider := tenancycontracts.Provider{
 		Name:   {{.M.Ident}}catalog.Owner,
 		Purger: tenantPurger{purgers: m.tenantPurgers},
-	})
+	}
+	return []tenancycontracts.Provider{provider}
 }

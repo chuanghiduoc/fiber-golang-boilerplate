@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -11,8 +12,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,22 +30,22 @@ type fakeQueue struct {
 	failWith error
 }
 
-func (q *fakeQueue) EnqueueOnce(_ context.Context, job jobs.Job) (id int64, created bool, err error) {
+func (q *fakeQueue) EnqueueOnce(_ context.Context, job jobs.Job) (id uuid.UUID, created bool, err error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.jobs = append(q.jobs, job)
 	if q.failWith != nil {
-		return 0, false, q.failWith
+		return uuid.Nil, false, q.failWith
 	}
-	return int64(len(q.jobs)), true, nil
+	return testID(len(q.jobs)), true, nil
 }
 
-func (q *fakeQueue) EnqueueOnceTx(_ context.Context, tx pgx.Tx, job jobs.Job) (id int64, created bool, err error) {
+func (q *fakeQueue) EnqueueOnceTx(_ context.Context, tx pgx.Tx, job jobs.Job) (id uuid.UUID, created bool, err error) {
 	q.mu.Lock()
 	q.txCalls++
 	q.mu.Unlock()
 	if tx == nil {
-		return 0, false, errors.New("nil transaction")
+		return uuid.Nil, false, errors.New("nil transaction")
 	}
 	return q.EnqueueOnce(context.Background(), job)
 }
@@ -73,25 +72,25 @@ func TestPublishLocalPropagatesMetadata(t *testing.T) {
 	require.NoError(t, bus.Subscribe("user.created", func(ctx context.Context, event Event) error {
 		assert.Equal(t, "user.created", event.Type)
 		assert.NotEmpty(t, event.ID)
-		assert.Equal(t, int64(7), event.TenantID)
+		assert.Equal(t, testID(7), event.TenantID)
 		assert.Equal(t, "req-1", event.RequestID)
-		assert.Equal(t, UserActor(42), event.Actor)
+		assert.Equal(t, UserActor(testID(42)), event.Actor)
 		assert.Equal(t, 1, event.DataVersion)
 		assert.False(t, event.OccurredAt.IsZero())
 
 		var data struct {
-			UserID int64 `json:"userId"`
+			UserID uuid.UUID `json:"userId"`
 		}
 		require.NoError(t, json.Unmarshal(event.Data, &data))
-		assert.Equal(t, int64(9), data.UserID)
+		assert.Equal(t, testID(9), data.UserID)
 		return nil
 	}))
 
 	ctx := requestctx.WithActorID(
-		requestctx.WithRequestID(tenant.WithID(context.Background(), 7), "req-1"),
-		42,
+		requestctx.WithRequestID(tenant.WithID(context.Background(), testID(7)), "req-1"),
+		testID(42),
 	)
-	event, err := NewEvent("user.created", 1, map[string]any{"userId": 9})
+	event, err := NewEvent("user.created", 1, map[string]any{"userId": testID(9).String()})
 	require.NoError(t, err)
 	require.NoError(t, bus.PublishLocal(ctx, event))
 }
@@ -99,22 +98,22 @@ func TestPublishLocalPropagatesMetadata(t *testing.T) {
 func TestPublishLocalKeepsExplicitMetadata(t *testing.T) {
 	bus := New(nil)
 	require.NoError(t, bus.Subscribe("explicit", func(_ context.Context, event Event) error {
-		assert.Equal(t, "chosen-id", event.ID)
-		assert.Equal(t, int64(3), event.TenantID)
+		assert.Equal(t, testID(6), event.ID)
+		assert.Equal(t, testID(3), event.TenantID)
 		assert.Equal(t, "chosen-request", event.RequestID)
 		assert.Equal(t, Actor{Type: ActorService, ID: "key_1"}, event.Actor)
 		return nil
 	}))
 
 	ctx := requestctx.WithActorID(
-		requestctx.WithRequestID(tenant.WithID(context.Background(), 7), "ctx-request"),
-		1,
+		requestctx.WithRequestID(tenant.WithID(context.Background(), testID(7)), "ctx-request"),
+		testID(1),
 	)
 	err := bus.PublishLocal(ctx, Event{
-		ID:          "chosen-id",
+		ID:          testID(6),
 		Type:        "explicit",
 		DataVersion: 2,
-		TenantID:    3,
+		TenantID:    testID(3),
 		RequestID:   "chosen-request",
 		Actor:       Actor{Type: ActorService, ID: "key_1"},
 		OccurredAt:  time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC),
@@ -168,7 +167,7 @@ func TestPublishDurableEnqueuesOneJobPerHandler(t *testing.T) {
 	require.NoError(t, bus.SubscribeDurable("invoice.paid", "email", durable, WithMaxAttempts(4)))
 	require.NoError(t, bus.SubscribeDurable("invoice.paid", "ledger", durable, WithJobKind("ledger.invoice.paid")))
 
-	ctx := tenant.WithID(context.Background(), 5)
+	ctx := tenant.WithID(context.Background(), testID(5))
 	event, err := NewEvent("invoice.paid", 1, map[string]any{"invoiceId": 12})
 	require.NoError(t, err)
 	require.NoError(t, bus.Publish(ctx, event))
@@ -180,12 +179,12 @@ func TestPublishDurableEnqueuesOneJobPerHandler(t *testing.T) {
 	byKind := make(map[string]jobs.Job, len(enqueued))
 	for _, job := range enqueued {
 		byKind[job.Kind] = job
-		assert.Equal(t, int64(5), job.TenantID)
-		assert.Equal(t, "event:invoice.paid:"+event.ID+":"+handlerNameForKind(job.Kind)+":5", job.IdempotencyKey)
+		assert.Equal(t, testID(5), job.TenantID)
+		assert.Equal(t, "event:invoice.paid:"+event.ID.String()+":"+handlerNameForKind(job.Kind)+":"+testID(5).String(), job.IdempotencyKey)
 		var decoded Event
 		require.NoError(t, json.Unmarshal(job.Payload, &decoded))
 		assert.Equal(t, event.ID, decoded.ID)
-		assert.Equal(t, int64(5), decoded.TenantID)
+		assert.Equal(t, testID(5), decoded.TenantID)
 	}
 	assert.Contains(t, byKind, "events.invoice.paid.email")
 	assert.Contains(t, byKind, "ledger.invoice.paid")
@@ -217,7 +216,7 @@ func TestPublishDurableQueueErrorIsJoinedWithLocalError(t *testing.T) {
 
 	event, err := NewEvent("order.created", 1, nil)
 	require.NoError(t, err)
-	err = bus.Publish(tenant.WithID(context.Background(), 2), event)
+	err = bus.Publish(tenant.WithID(context.Background(), testID(2)), event)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, sentinel)
 	assert.True(t, localRan)
@@ -299,28 +298,29 @@ func TestPublishTxRejectsNilTransaction(t *testing.T) {
 // published event.
 func TestPublishTxCountsOnlySuccessfulEnqueues(t *testing.T) {
 	const eventType = "metric.publish.tx"
-	counter := metrics.EventsPublishedTotal.WithLabelValues(eventType, "durable")
-	before := counterValue(t, counter)
+	before := counterValue(t, "events_published_total", "event", eventType, "mode", "durable")
 
 	failing := New(&fakeQueue{failWith: errors.New("queue down")})
 	require.NoError(t, failing.SubscribeDurable(eventType, "handler", func(context.Context, Event) error { return nil }))
 	event, err := NewEvent(eventType, 1, nil)
 	require.NoError(t, err)
 	require.Error(t, failing.PublishTx(context.Background(), &fakeTx{}, event))
-	assert.Equal(t, before, counterValue(t, counter), "a failed enqueue must not count as published")
+	assert.Equal(t, before, counterValue(t, "events_published_total", "event", eventType, "mode", "durable"),
+		"a failed enqueue must not count as published")
 
 	succeeding := New(&fakeQueue{})
 	require.NoError(t, succeeding.SubscribeDurable(eventType, "handler", func(context.Context, Event) error { return nil }))
 	require.NoError(t, succeeding.PublishTx(context.Background(), &fakeTx{}, event))
-	assert.Equal(t, before+1, counterValue(t, counter), "a successful enqueue must count exactly once")
+	assert.Equal(t, before+1, counterValue(t, "events_published_total", "event", eventType, "mode", "durable"),
+		"a successful enqueue must count exactly once")
 }
 
-// counterValue reads a Prometheus counter without pulling in testutil.
-func counterValue(t *testing.T, counter prometheus.Counter) float64 {
+// counterValue reads a Prometheus counter from the process registry. labels
+// are key/value pairs.
+func counterValue(t *testing.T, name string, labels ...string) float64 {
 	t.Helper()
-	var m dto.Metric
-	require.NoError(t, counter.Write(&m))
-	return m.GetCounter().GetValue()
+	value, _ := metrics.SnapshotValue(name, labels...)
+	return value
 }
 
 func TestSubscribeDurableValidation(t *testing.T) {
@@ -343,9 +343,9 @@ func TestRegisterJobsDispatchesEventWithContext(t *testing.T) {
 	bus := New(&fakeQueue{})
 	received := make(chan Event, 1)
 	require.NoError(t, bus.SubscribeDurable("user.created", "welcome", func(ctx context.Context, event Event) error {
-		assert.Equal(t, int64(11), tenant.IDFromContext(ctx))
+		assert.Equal(t, testID(11), tenant.IDFromContext(ctx))
 		assert.Equal(t, "req-9", requestctx.RequestID(ctx))
-		assert.Equal(t, int64(77), requestctx.ActorID(ctx))
+		assert.Equal(t, testID(77), requestctx.ActorID(ctx))
 		received <- event
 		return nil
 	}))
@@ -356,11 +356,11 @@ func TestRegisterJobsDispatchesEventWithContext(t *testing.T) {
 	handler := registrar.handlers["events.user.created.welcome"]
 	require.NotNil(t, handler)
 
-	event, err := NewEvent("user.created", 1, map[string]any{"userId": 1})
+	event, err := NewEvent("user.created", 1, map[string]any{"userId": testID(1).String()})
 	require.NoError(t, err)
-	event.TenantID = 11
+	event.TenantID = testID(11)
 	event.RequestID = "req-9"
-	event.Actor = UserActor(77)
+	event.Actor = UserActor(testID(77))
 	payload, err := json.Marshal(event)
 	require.NoError(t, err)
 
@@ -423,14 +423,12 @@ func TestEnvelopeShapeAndDefaults(t *testing.T) {
 		return nil
 	}))
 	// No id and no request actor: the bus assigns a UUIDv7 and the system actor.
-	require.NoError(t, bus.PublishLocal(tenant.WithID(context.Background(), 4), Event{
+	require.NoError(t, bus.PublishLocal(tenant.WithID(context.Background(), testID(4)), Event{
 		Type:        "file.uploaded",
 		DataVersion: 1,
 		Data:        json.RawMessage(`{"id":1}`),
 	}))
-	id, err := uuid.Parse(got.ID)
-	require.NoError(t, err)
-	assert.Equal(t, uuid.Version(7), id.Version())
+	assert.Equal(t, uuid.Version(7), got.ID.Version())
 	assert.Equal(t, Actor{Type: ActorSystem}, got.Actor)
 
 	got.RequestID = ""
@@ -465,4 +463,9 @@ func TestEnvelopeValidation(t *testing.T) {
 		event.Actor = actor
 		assert.ErrorIs(t, event.Validate(), ErrInvalidEvent, name)
 	}
+}
+
+// testID returns a deterministic UUID for a small fixture number.
+func testID(n int) uuid.UUID {
+	return uuid.MustParse(fmt.Sprintf("0192c9b0-7e4a-7000-8000-%012d", n))
 }

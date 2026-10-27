@@ -1,0 +1,77 @@
+# Namespace-scoped deployment identity. Create this Role (and a RoleBinding for
+# the federated deploy principal) in each target namespace, once. Bind the
+# companion namespace-bootstrap-clusterrole.yaml once too: the prereqs render
+# includes the cluster-scoped Namespace object, so the deployer needs get/patch
+# on the two namespaces (restricted by resourceNames) in addition to this Role.
+#
+# deploy.yml authenticates to the cluster with short-lived OIDC credentials
+# from AWS, Google Cloud, or Azure; it never reads a kubeconfig Secret. The
+# cluster maps that cloud identity to a Kubernetes user, and this Role grants
+# only what a rollout needs in ONE namespace.
+#
+# Pre-create the two namespaces (deploy/k8s/prereqs/namespace.yaml) as an
+# administrator, including the pod-security labels, and bind the minimal
+# ClusterRole so the idempotent apply can read them and record its last-applied
+# annotation. No cluster-admin binding is required.
+#
+# Bind it to the federated principal:
+#
+#   # EKS: the role ARN mapped by an access entry (or aws-auth ConfigMap).
+#   kubectl create rolebinding fiber-boilerplate-deployer -n fiber-boilerplate-production \
+#     --role=fiber-boilerplate-deployer --user=arn:aws:iam::123456789012:role/gha-deploy
+#
+#   # GKE: the Google service account used by google-github-actions/auth.
+#   kubectl create rolebinding fiber-boilerplate-deployer -n fiber-boilerplate-production \
+#     --role=fiber-boilerplate-deployer --user=deployer@my-project.iam.gserviceaccount.com
+#
+#   # AKS: the Entra ID application/service principal (or federated identity).
+#   kubectl create rolebinding fiber-boilerplate-deployer -n fiber-boilerplate-production \
+#     --role=fiber-boilerplate-deployer --user=<object-id-of-the-federated-credential-app>
+#
+# Do not grant secrets create/update: the Secret is owned by External Secrets
+# (or an operator), and the workflow only checks that it exists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fiber-boilerplate-deployer
+  namespace: fiber-boilerplate
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]

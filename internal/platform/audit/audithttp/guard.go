@@ -7,12 +7,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net/http"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant/tenanthttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -91,7 +92,11 @@ func (p Policy) target(c fiber.Ctx) guardTarget {
 // [CompletionRecorder]. Noop deliberately implements neither, so a
 // misconfigured required route returns 503 instead of accepting an unaudited
 // mutation.
-func Guard(recorder audit.Recorder, policy Policy) fiber.Handler {
+func Guard(recorder audit.Recorder, policy Policy, catalogs ...*apperror.Catalog) fiber.Handler {
+	catalog := apperror.PlatformCatalog()
+	if len(catalogs) > 0 && catalogs[0] != nil {
+		catalog = catalogs[0]
+	}
 	if recorder == nil {
 		recorder = audit.Noop{}
 	}
@@ -113,30 +118,30 @@ func Guard(recorder audit.Recorder, policy Policy) fiber.Handler {
 
 		info := requestInfoFor(c, eventID, target.action, target.resource)
 		c.SetContext(audit.WithRequestInfo(c.Context(), info))
-		fiber.Locals[int64](c, "audit_event_id", eventID)
+		fiber.Locals[uuid.UUID](c, "audit_event_id", eventID)
 		fiber.Locals[bool](c, auditGuardedLocal, true)
 
-		if eventID == 0 {
+		if eventID == uuid.Nil {
 			// Best-effort mode with no intent row: nothing to complete.
 			return c.Next()
 		}
-		return runAndCompleteIntent(c, recorder, policy, eventID, info)
+		return runAndCompleteIntent(c, recorder, policy, eventID, info, catalog)
 	}
 }
 
 // beginIntent stores the started intent row and returns its id. When the row
 // cannot be stored it returns system.audit_unavailable in required mode and a
 // zero id with no error in best-effort mode.
-func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTarget) (int64, error) {
+func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTarget) (uuid.UUID, error) {
 	idRecorder, ok := recorder.(audit.IDRecorder)
 	if !ok {
 		metrics.AuditIntentFailuresTotal.Inc()
-		slog.Error("audit guard recorder cannot write intent rows",
+		slog.ErrorContext(c.Context(), "audit guard recorder cannot write intent rows",
 			slog.String("action", target.action),
 			slog.String("mode", string(mode)),
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
+			slog.String("request_id", requestctx.RequestID(c.Context())),
 		)
-		return 0, intentUnavailable(mode)
+		return uuid.Nil, intentUnavailable(mode)
 	}
 
 	intent := intentEvent(c, target)
@@ -145,12 +150,12 @@ func beginIntent(c fiber.Ctx, recorder audit.Recorder, mode Mode, target guardTa
 	id, err := idRecorder.RecordID(ctx, intent)
 	if err != nil {
 		metrics.AuditIntentFailuresTotal.Inc()
-		slog.Warn("failed to write audit intent row",
+		slog.WarnContext(c.Context(), "failed to write audit intent row",
 			slog.String("action", target.action),
 			slog.String("request_id", intent.RequestID),
 			slog.Any("error", err),
 		)
-		return 0, intentUnavailable(mode)
+		return uuid.Nil, intentUnavailable(mode)
 	}
 	return id, nil
 }
@@ -163,7 +168,7 @@ func intentUnavailable(mode Mode) error {
 }
 
 func intentEvent(c fiber.Ctx, target guardTarget) audit.Event {
-	info := requestInfoFor(c, 0, target.action, target.resource)
+	info := requestInfoFor(c, uuid.Nil, target.action, target.resource)
 	intent := audit.Event{
 		TenantID:  info.TenantID,
 		ActorID:   info.ActorID,
@@ -190,7 +195,7 @@ func intentEvent(c fiber.Ctx, target guardTarget) audit.Event {
 
 // runAndCompleteIntent runs the handler and completes the intent row with the
 // observed outcome, including a panic, which is recorded and re-raised.
-func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, eventID int64, info *audit.RequestInfo) error {
+func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, eventID uuid.UUID, info *audit.RequestInfo, catalog *apperror.Catalog) error {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			completeGuarded(c, recorder, eventID, audit.Completion{
@@ -203,12 +208,12 @@ func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, e
 	}()
 
 	handlerErr := c.Next()
-	completion := classifyOutcome(c, handlerErr, info)
+	completion := classifyOutcome(c, handlerErr, info, catalog)
 	if policy.RequireDomain && completion.Outcome == audit.OutcomeSucceeded && info.DomainEvents == 0 {
 		metrics.AuditDomainMissingTotal.Inc()
 		completion.Outcome = audit.OutcomeUnknown
 		completion.ErrorCode = "audit.domain_missing"
-		slog.Warn("guarded mutation completed without a domain audit event",
+		slog.WarnContext(c.Context(), "guarded mutation completed without a domain audit event",
 			slog.String("action", info.Action),
 			slog.String("request_id", info.RequestID),
 		)
@@ -217,36 +222,29 @@ func runAndCompleteIntent(c fiber.Ctx, recorder audit.Recorder, policy Policy, e
 	return handlerErr
 }
 
-func completeGuarded(c fiber.Ctx, recorder audit.Recorder, eventID int64, completion audit.Completion) {
+func completeGuarded(c fiber.Ctx, recorder audit.Recorder, eventID uuid.UUID, completion audit.Completion) {
 	completer, ok := recorder.(audit.CompletionRecorder)
 	if !ok {
 		metrics.AuditCompletionFailuresTotal.Inc()
-		slog.Error("audit guard recorder cannot complete intent rows",
-			slog.Int64("audit_event_id", eventID),
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
+		slog.ErrorContext(c.Context(), "audit guard recorder cannot complete intent rows",
+			slog.String("audit_event_id", eventID.String()),
+			slog.String("request_id", requestctx.RequestID(c.Context())),
 		)
 		return
-	}
-	completion.ActorID = fiber.Locals[int64](c, "user_id")
-	role := fiber.Locals[string](c, "role")
-	completion.ActorRole = role
-	completion.ActorType = audit.ActorTypeForRole(role)
-	if completion.ActorID == 0 {
-		completion.ActorType = audit.ActorTypeAnonymous
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Context()), audit.WriteTimeout)
 	defer cancel()
 	if err := completer.Complete(ctx, eventID, completion); err != nil {
 		metrics.AuditCompletionFailuresTotal.Inc()
-		slog.Warn("failed to complete audit intent row",
-			slog.Int64("audit_event_id", eventID),
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
+		slog.WarnContext(c.Context(), "failed to complete audit intent row",
+			slog.String("audit_event_id", eventID.String()),
+			slog.String("request_id", requestctx.RequestID(c.Context())),
 			slog.Any("error", err),
 		)
 	}
 }
 
-func classifyOutcome(c fiber.Ctx, handlerErr error, info *audit.RequestInfo) audit.Completion {
+func classifyOutcome(c fiber.Ctx, handlerErr error, info *audit.RequestInfo, catalog *apperror.Catalog) audit.Completion {
 	completion := audit.Completion{Outcome: audit.OutcomeSucceeded, StatusCode: c.Response().StatusCode()}
 	if completion.StatusCode == 0 {
 		completion.StatusCode = fiber.StatusOK
@@ -267,7 +265,8 @@ func classifyOutcome(c fiber.Ctx, handlerErr error, info *audit.RequestInfo) aud
 
 	var appErr *apperror.AppError
 	if errors.As(handlerErr, &appErr) {
-		completion.StatusCode = appErr.Status
+		_, spec := catalog.Resolve(apperror.Code(appErr.Code))
+		completion.StatusCode = spec.Status
 		completion.ErrorCode = appErr.Code
 	} else {
 		var fiberErr *fiber.Error
@@ -290,14 +289,10 @@ func statusErrorCode(status int) string {
 	if status >= 200 && status < 300 {
 		return ""
 	}
-	title := http.StatusText(status)
-	if title == "" {
-		return "internal_error"
-	}
-	return strings.ToLower(strings.ReplaceAll(title, " ", "_"))
+	return apperror.NewForStatus(status, "").Code
 }
 
-func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *audit.RequestInfo {
+func requestInfoFor(c fiber.Ctx, eventID uuid.UUID, action, resource string) *audit.RequestInfo {
 	// IP and User-Agent are cloned: Fiber strings are zero-copy views into
 	// pooled buffers, while RequestInfo lives in the context beyond the handler.
 	info := &audit.RequestInfo{
@@ -305,16 +300,16 @@ func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *audit.
 		TenantID:           tenanthttp.ID(c),
 		Action:             action,
 		Resource:           resource,
-		RequestID:          fiber.Locals[string](c, "request_id"),
+		RequestID:          requestctx.RequestID(c.Context()),
 		IP:                 strings.Clone(c.IP()),
 		UserAgent:          strings.Clone(c.Get("User-Agent")),
 		IdempotencyKeyHash: audit.HashIdempotencyKey(c.Get("Idempotency-Key")),
 	}
-	if info.TenantID == 0 {
-		info.TenantID = tenant.EffectiveID(c.Context())
+	if info.TenantID == uuid.Nil {
+		info.TenantID = tenant.IDFromContext(c.Context())
 	}
 	if existing := audit.RequestInfoFromContext(c.Context()); existing != nil {
-		if existing.ActorID != 0 {
+		if existing.ActorID != uuid.Nil {
 			info.ActorID = existing.ActorID
 		}
 		if existing.ActorType != "" && existing.ActorType != audit.ActorTypeUnknown {
@@ -324,14 +319,14 @@ func requestInfoFor(c fiber.Ctx, eventID int64, action, resource string) *audit.
 			info.ActorRole = existing.ActorRole
 		}
 	}
-	if info.ActorID == 0 {
-		info.ActorID = fiber.Locals[int64](c, "user_id")
+	if info.ActorID == uuid.Nil {
+		info.ActorID = requestctx.ActorID(c.Context())
 	}
 	if info.ActorRole == "" {
-		info.ActorRole = fiber.Locals[string](c, "role")
+		info.ActorRole = requestRole(c)
 	}
 	if info.ActorType == "" || info.ActorType == audit.ActorTypeUnknown {
-		if info.ActorID != 0 {
+		if info.ActorID != uuid.Nil {
 			info.ActorType = audit.ActorTypeForRole(info.ActorRole)
 			if info.ActorType == audit.ActorTypeUnknown {
 				info.ActorType = audit.ActorTypeUser

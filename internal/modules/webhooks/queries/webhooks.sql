@@ -38,7 +38,7 @@ SELECT sqlc.embed(e),
 FROM webhook_endpoints e
 WHERE e.tenant_id = @tenant_id
   AND e.deleted_at IS NULL
-  AND (e.created_at, e.id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (e.created_at, e.id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY e.created_at DESC, e.id DESC
 LIMIT @row_limit::int;
 
@@ -100,6 +100,12 @@ SELECT * FROM webhook_endpoint_secrets
 WHERE tenant_id = @tenant_id AND endpoint_id = @endpoint_id AND active
 LIMIT 1;
 
+-- name: GetWebhookEndpointSecretByID :one
+-- A queued delivery references the exact secret version it snapshotted; the
+-- worker reads that row, never a ciphertext copied onto the delivery.
+SELECT * FROM webhook_endpoint_secrets
+WHERE tenant_id = @tenant_id AND id = @id;
+
 -- name: GetWebhookEndpointSigningSecrets :one
 -- The delivery worker signs with the current secret first and, while its
 -- explicit grace expiry is still open, the immediately previous one too.
@@ -139,6 +145,7 @@ SELECT
     ARRAY(SELECT sub.pattern FROM webhook_endpoint_subscriptions sub
           WHERE sub.tenant_id = e.tenant_id AND sub.endpoint_id = e.id
           ORDER BY sub.pattern COLLATE "C")::text[] AS event_types,
+    s.id AS secret_id,
     s.secret_ciphertext AS secret_ciphertext
 FROM webhook_endpoints e
 JOIN webhook_endpoint_secrets s
@@ -166,13 +173,13 @@ ON CONFLICT (tenant_id, event_id) DO NOTHING;
 
 -- name: CreateWebhookDelivery :one
 INSERT INTO webhook_deliveries (
-    tenant_id, endpoint_id, event_id,
-    url, secret_ciphertext, status, max_attempts, timeout_ms,
+    tenant_id, endpoint_id, event_id, secret_id,
+    url, status, max_attempts, timeout_ms,
     next_attempt_at, replayed_from_id, is_replay
 )
 VALUES (
-    @tenant_id, @endpoint_id, @event_id,
-    @url, @secret_ciphertext, 'pending', @max_attempts, @timeout_ms,
+    @tenant_id, @endpoint_id, @event_id, @secret_id,
+    @url, 'pending', @max_attempts, @timeout_ms,
     NOW(), @replayed_from_id, @is_replay
 )
 ON CONFLICT (tenant_id, endpoint_id, event_id) WHERE NOT is_replay DO NOTHING
@@ -191,9 +198,9 @@ SELECT sqlc.embed(d), ev.event_type, ev.occurred_at
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
 WHERE d.tenant_id = @tenant_id
-  AND (@endpoint_id::bigint = 0 OR d.endpoint_id = @endpoint_id)
+  AND (sqlc.narg(endpoint_id)::uuid IS NULL OR d.endpoint_id = sqlc.narg(endpoint_id)::uuid)
   AND (@status::text = '' OR d.status = @status)
-  AND (d.created_at, d.id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (d.created_at, d.id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT @row_limit::int;
 
@@ -350,21 +357,24 @@ WHERE ev.tenant_id = batch.tenant_id AND ev.event_id = batch.event_id;
 -- Inbound sources and events ------------------------------------------------
 
 -- name: CreateWebhookInboundSource :one
+-- The source and its first secret are separate rows: the caller creates the
+-- source, seals the secret (its AAD binds the source id), then inserts the
+-- version-1 secret in the same transaction.
 INSERT INTO webhook_inbound_sources (
-    tenant_id, name, slug, secret_ciphertext, status
+    tenant_id, name, slug, status
 )
 VALUES (
-    @tenant_id, @name, @slug, '', 'active'
+    @tenant_id, @name, @slug, @status
 )
 RETURNING *;
 
--- name: SetWebhookInboundSourceSecret :one
--- A new source is inserted with an empty placeholder and sealed immediately
--- in the same transaction, once the generated id is known (the secret's AAD
--- binds that id).
-UPDATE webhook_inbound_sources
-SET secret_ciphertext = @secret_ciphertext
-WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+-- name: CreateWebhookInboundSourceSecret :one
+INSERT INTO webhook_inbound_source_secrets (
+    tenant_id, source_id, version, secret_ciphertext, active
+)
+VALUES (
+    @tenant_id, @source_id, @version, @secret_ciphertext, TRUE
+)
 RETURNING *;
 
 -- name: GetWebhookInboundSource :one
@@ -375,11 +385,19 @@ WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL;
 SELECT * FROM webhook_inbound_sources
 WHERE id = @id AND deleted_at IS NULL;
 
+-- name: LockWebhookInboundSource :one
+-- Serializes concurrent secret rotations: the row lock is held until the
+-- rotation transaction commits, so NextWebhookInboundSourceSecretVersion
+-- cannot hand two rotations the same version.
+SELECT * FROM webhook_inbound_sources
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+FOR UPDATE;
+
 -- name: ListWebhookInboundSources :many
 SELECT * FROM webhook_inbound_sources
 WHERE tenant_id = @tenant_id
   AND deleted_at IS NULL
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -395,15 +413,40 @@ SET status = 'disabled', deleted_at = NOW()
 WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
 RETURNING *;
 
--- name: RotateWebhookInboundSourceSecret :one
--- The replaced secret stays valid for the grace window. A second rotation
--- overwrites it, so only the immediately previous secret is accepted.
-UPDATE webhook_inbound_sources
-SET previous_secret_ciphertext = secret_ciphertext,
-    previous_secret_expires_at = NOW() + make_interval(secs => @grace_seconds::double precision),
-    secret_ciphertext = @secret_ciphertext
-WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
-RETURNING *;
+-- name: ExpireOlderWebhookInboundSourceSecrets :exec
+-- A second rotation inside the grace window drops the older retired secret:
+-- only the immediately previous secret may co-sign inbound verification.
+UPDATE webhook_inbound_source_secrets
+SET grace_expires_at = NOW()
+WHERE tenant_id = @tenant_id
+  AND source_id = @source_id
+  AND NOT active
+  AND grace_expires_at > NOW();
+
+-- name: DeactivateWebhookInboundSourceSecrets :exec
+-- Retires the active secret but keeps it verifiable until its explicit grace
+-- expiry.
+UPDATE webhook_inbound_source_secrets
+SET active = FALSE,
+    grace_expires_at = NOW() + make_interval(secs => @grace_seconds::double precision)
+WHERE tenant_id = @tenant_id AND source_id = @source_id AND active;
+
+-- name: NextWebhookInboundSourceSecretVersion :one
+SELECT (COALESCE(MAX(version), 0) + 1)::integer AS version
+FROM webhook_inbound_source_secrets
+WHERE source_id = @source_id;
+
+-- name: GetWebhookInboundSourceSigningSecrets :one
+-- The receiver verifies with the current secret first and, while its explicit
+-- grace expiry is still open, the immediately previous one too.
+SELECT
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_inbound_source_secrets s
+      WHERE s.tenant_id = @tenant_id AND s.source_id = @source_id AND s.active
+      ORDER BY s.version DESC LIMIT 1), '')::text AS current_ciphertext,
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_inbound_source_secrets s
+      WHERE s.tenant_id = @tenant_id AND s.source_id = @source_id
+        AND NOT s.active AND s.grace_expires_at > NOW()
+      ORDER BY s.version DESC LIMIT 1), '')::text AS previous_ciphertext;
 
 -- name: CreateWebhookInboundEvent :one
 INSERT INTO webhook_inbound_events (
@@ -424,7 +467,7 @@ WHERE tenant_id = @tenant_id
 -- name: ListWebhookInboundEvents :many
 SELECT * FROM webhook_inbound_events
 WHERE tenant_id = @tenant_id AND source_id = @source_id
-  AND (received_at, id) < (@cursor_received_at::timestamptz, @cursor_id::bigint)
+  AND (received_at, id) < (@cursor_received_at::timestamptz, @cursor_id::uuid)
 ORDER BY received_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -442,3 +485,26 @@ WITH batch AS (
 DELETE FROM webhook_inbound_events AS e
 USING batch
 WHERE e.id = batch.id;
+
+-- name: UpdateWebhookEndpointIfUnchanged :one
+-- The ETag compare-and-swap for an endpoint update. A concurrent writer makes
+-- this return no rows (412) instead of overwriting the other change.
+UPDATE webhook_endpoints
+SET url = @url,
+    description = @description,
+    status = @status,
+    max_attempts = @max_attempts,
+    timeout_ms = @timeout_ms
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+  AND updated_at = @expected_updated_at
+RETURNING *;
+
+-- name: UpdateWebhookInboundSourceIfUnchanged :one
+-- The ETag compare-and-swap for an inbound source update.
+UPDATE webhook_inbound_sources
+SET name = @name,
+    slug = @slug,
+    status = @status
+WHERE id = @id AND tenant_id = @tenant_id AND deleted_at IS NULL
+  AND updated_at = @expected_updated_at
+RETURNING *;

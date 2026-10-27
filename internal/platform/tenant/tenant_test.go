@@ -2,30 +2,44 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
-func TestWithID_ZeroFallsBackAndNegativePropagates(t *testing.T) {
-	ctx := WithID(context.Background(), 0)
-	if got := EffectiveID(ctx); got != DefaultID {
-		t.Errorf("EffectiveID(WithID(0)) = %d, want %d", got, DefaultID)
+func TestIDFromContext_ZeroPropagates(t *testing.T) {
+	ctx := WithID(context.Background(), uuid.Nil)
+	if got := IDFromContext(ctx); got != uuid.Nil {
+		t.Errorf("IDFromContext(WithID(uuid.Nil)) = %s, want nil UUID", got)
 	}
 
-	// A negative ID is visible to validation boundaries; it must not be
-	// silently rewritten to the compatibility tenant.
-	ctx = WithID(context.Background(), -1)
-	if got := IDFromContext(ctx); got != -1 {
-		t.Errorf("IDFromContext(WithID(-1)) = %d, want -1", got)
-	}
-	if got := EffectiveID(ctx); got != -1 {
-		t.Errorf("EffectiveID(WithID(-1)) = %d, want -1", got)
-	}
-
-	ctx = WithIdentity(context.Background(), 2, "acme")
-	if got := EffectiveID(ctx); got != 2 {
-		t.Errorf("EffectiveID(WithIdentity) = %d, want 2", got)
+	ctx = WithIdentity(context.Background(), testID(2), "acme")
+	if got := IDFromContext(ctx); got != testID(2) {
+		t.Errorf("IDFromContext(WithIdentity) = %s, want %s", got, testID(2))
 	}
 	if got := SlugFromContext(ctx); got != "acme" {
 		t.Errorf("SlugFromContext = %q, want acme", got)
+	}
+}
+
+func TestRequire(t *testing.T) {
+	_, err := Require(WithID(context.Background(), uuid.Nil))
+	if !errors.Is(err, ErrMissingTenant) {
+		t.Fatalf("Require(WithID(uuid.Nil)) error = %v, want ErrMissingTenant", err)
+	}
+
+	got, err := Require(WithID(context.Background(), testID(7)))
+	if err != nil {
+		t.Fatalf("Require(WithID(7)) error = %v", err)
+	}
+	if got != testID(7) {
+		t.Fatalf("Require(WithID(7)) = %s, want %s", got, testID(7))
+	}
+
+	// The seeded default tenant is an explicit tenant like any other.
+	got, err = Require(WithID(context.Background(), DefaultID))
+	if err != nil || got != DefaultID {
+		t.Fatalf("Require(WithID(DefaultID)) = %s, %v", got, err)
 	}
 }

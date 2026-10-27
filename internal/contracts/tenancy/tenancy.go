@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
+
+	"github.com/google/uuid"
 )
 
 // PurgeBatchSize is the maximum number of rows one tenant-purge statement may
@@ -22,7 +24,7 @@ const PurgeBatchSize int32 = 500
 // tenants row, the tenant's audit trail, or another tenant's data. It must be
 // idempotent: a repeated call after a successful one succeeds.
 type Purger interface {
-	PurgeTenant(ctx context.Context, tenantID int64) error
+	PurgeTenant(ctx context.Context, tenantID uuid.UUID) error
 }
 
 // Provider is one module's tenant purger.

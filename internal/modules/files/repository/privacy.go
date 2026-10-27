@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 
+	"github.com/google/uuid"
+
 	filesvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/service"
 	filesqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/sqlc"
 )
@@ -19,7 +21,7 @@ func NewPrivacyRepository(db filesqlc.DBTX) *PrivacyRepository {
 	return &PrivacyRepository{q: filesqlc.New(db)}
 }
 
-func (r *PrivacyRepository) ListForUser(ctx context.Context, tenantID, userID int64) ([]filesvc.File, error) {
+func (r *PrivacyRepository) ListForUser(ctx context.Context, tenantID, userID uuid.UUID) ([]filesvc.File, error) {
 	rows, err := r.q.ListFilesForPrivacy(ctx, filesqlc.ListFilesForPrivacyParams{
 		TenantID: tenantID,
 		UserID:   userID,
@@ -34,7 +36,7 @@ func (r *PrivacyRepository) ListForUser(ctx context.Context, tenantID, userID in
 	return files, nil
 }
 
-func (r *PrivacyRepository) HardDelete(ctx context.Context, tenantID, userID, id int64) error {
+func (r *PrivacyRepository) HardDelete(ctx context.Context, tenantID, userID, id uuid.UUID) error {
 	_, err := r.q.DeleteFileForPrivacy(ctx, filesqlc.DeleteFileForPrivacyParams{
 		ID:       id,
 		TenantID: tenantID,

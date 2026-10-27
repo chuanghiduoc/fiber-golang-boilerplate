@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,8 +21,8 @@ import (
 // IDs, and records the failed ones like the SQL repository does.
 type fakeTrashRepo struct {
 	trash      []TrashedFile
-	retryAfter map[int64]time.Time
-	attempts   map[int64]int
+	retryAfter map[uuid.UUID]time.Time
+	attempts   map[uuid.UUID]int
 	now        time.Time
 	batches    int
 	gotDays    int32
@@ -55,10 +56,10 @@ func (r *fakeTrashRepo) PurgeBatch(ctx context.Context, retentionDays, limit int
 	r.trash = slices.DeleteFunc(r.trash, func(f TrashedFile) bool { return slices.Contains(ids, f.ID) })
 	for _, id := range failed {
 		if r.attempts == nil {
-			r.attempts = make(map[int64]int)
+			r.attempts = make(map[uuid.UUID]int)
 		}
 		if r.retryAfter == nil {
-			r.retryAfter = make(map[int64]time.Time)
+			r.retryAfter = make(map[uuid.UUID]time.Time)
 		}
 		r.attempts[id]++
 		r.retryAfter[id] = now.Add(time.Hour)
@@ -87,7 +88,8 @@ func (s *fakeBlobStore) Delete(_ context.Context, path string) error {
 func trashOf(n int) []TrashedFile {
 	files := make([]TrashedFile, n)
 	for i := range files {
-		files[i] = TrashedFile{ID: int64(i + 1), TenantID: int64(i%2 + 1), StoragePath: fmt.Sprintf("%d/7/blob-%d.png", i%2+1, i+1)}
+		tenantID := testID(i%2 + 1)
+		files[i] = TrashedFile{ID: testID(i + 1), TenantID: tenantID, StoragePath: fmt.Sprintf("%s/7/blob-%d.png", tenantID, i+1)}
 	}
 	return files
 }

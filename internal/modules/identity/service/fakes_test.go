@@ -1,17 +1,21 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
+	"github.com/google/uuid"
 )
 
 // memDB is an in-memory identity store for unit tests. It implements the
@@ -23,21 +27,23 @@ type memDB struct {
 	mu          sync.Mutex
 	txMu        sync.Mutex
 	nextID      int64
-	users       map[int64]*User
-	passwords   map[int64]string
-	identities  map[string]int64 // provider+"/"+subject -> user
-	memberships map[[2]int64]*Membership
-	sessions    map[int64]*Session
+	users       map[uuid.UUID]*User
+	passwords   map[uuid.UUID]string
+	identities  map[string]uuid.UUID // provider+"/"+subject -> user
+	memberships map[[2]uuid.UUID]*Membership
+	sessions    map[uuid.UUID]*Session
 	refresh     map[string]*RefreshToken // hash -> token
-	tenants     map[int64]*Tenant
-	factors     map[int64]*MFAFactor
-	recovery    map[int64]map[string]bool // user -> code hash -> used
-	invitations map[int64]*Invitation
-	tokens      map[int64]string // invitation id -> token hash
+	tenants     map[uuid.UUID]*Tenant
+	factors     map[uuid.UUID]*MFAFactor
+	recovery    map[uuid.UUID]map[string]bool // user -> code hash -> used
+	passkeys    map[uuid.UUID]*Passkey
+	invitations map[uuid.UUID]*Invitation
+	tokens      map[uuid.UUID]string // invitation id -> token hash
 	locale      string
 	mail        Mailer
+	bans        BanHasher
 	resetTokens map[string]*PasswordResetToken
-	resetOwner  map[string]int64
+	resetOwner  map[string]uuid.UUID
 	audits      []audit.Event
 	published   []events.Event
 }
@@ -46,27 +52,33 @@ var errFakeNotImplemented = errors.New("fake: not implemented")
 
 func newMemDB() *memDB {
 	db := &memDB{
-		users:       map[int64]*User{},
-		passwords:   map[int64]string{},
-		identities:  map[string]int64{},
-		memberships: map[[2]int64]*Membership{},
-		sessions:    map[int64]*Session{},
+		users:       map[uuid.UUID]*User{},
+		passwords:   map[uuid.UUID]string{},
+		identities:  map[string]uuid.UUID{},
+		memberships: map[[2]uuid.UUID]*Membership{},
+		sessions:    map[uuid.UUID]*Session{},
 		refresh:     map[string]*RefreshToken{},
-		tenants:     map[int64]*Tenant{},
-		factors:     map[int64]*MFAFactor{},
-		recovery:    map[int64]map[string]bool{},
-		invitations: map[int64]*Invitation{},
-		tokens:      map[int64]string{},
+		tenants:     map[uuid.UUID]*Tenant{},
+		factors:     map[uuid.UUID]*MFAFactor{},
+		recovery:    map[uuid.UUID]map[string]bool{},
+		passkeys:    map[uuid.UUID]*Passkey{},
+		invitations: map[uuid.UUID]*Invitation{},
+		tokens:      map[uuid.UUID]string{},
 		locale:      "en",
 		resetTokens: map[string]*PasswordResetToken{},
-		resetOwner:  map[string]int64{},
+		resetOwner:  map[string]uuid.UUID{},
 	}
-	db.tenants[1] = &Tenant{ID: 1, Slug: "default", Name: "Default", Status: TenantStatusActive}
-	db.tenants[2] = &Tenant{ID: 2, Slug: "acme", Name: "Acme", Status: TenantStatusActive}
+	hasher, err := banhash.New(strings.Join([]string{"unit", "test", "ban", "pepper"}, "-"))
+	if err != nil {
+		panic(err)
+	}
+	db.bans = hasher
+	db.tenants[testID(1)] = &Tenant{ID: testID(1), Slug: "default", Name: "Default", Status: TenantStatusActive}
+	db.tenants[testID(2)] = &Tenant{ID: testID(2), Slug: "acme", Name: "Acme", Status: TenantStatusActive}
 	return db
 }
 
-func (db *memDB) id() int64 { db.nextID++; return db.nextID }
+func (db *memDB) id() uuid.UUID { db.nextID++; return testID(uint64(db.nextID)) }
 
 func (db *memDB) stores() Stores {
 	return Stores{
@@ -79,8 +91,10 @@ func (db *memDB) stores() Stores {
 		Invitations:   memInvitations{db},
 		Tenants:       memTenants{db},
 		MFA:           memMFA{db},
+		Passkeys:      memPasskeys{db},
 		Privacy:       nil,
 		Roles:         memRoles{db},
+		Bans:          db.bans,
 	}
 }
 
@@ -140,7 +154,7 @@ func cloneUser(u *User, db *memDB) *User {
 
 type memUsers struct{ db *memDB }
 
-func (r memUsers) GetByID(_ context.Context, id int64) (*User, error) {
+func (r memUsers) GetByID(_ context.Context, id uuid.UUID) (*User, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u, ok := r.db.users[id]
@@ -188,14 +202,14 @@ func (r memUsers) Create(_ context.Context, in NewUser) (*User, error) {
 	return cloneUser(u, r.db), nil
 }
 
-func (r memUsers) CreatePassword(_ context.Context, userID int64, hash string) error {
+func (r memUsers) CreatePassword(_ context.Context, userID uuid.UUID, hash string) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	r.db.passwords[userID] = hash
 	return nil
 }
 
-func (r memUsers) PasswordHash(_ context.Context, userID int64) (string, error) {
+func (r memUsers) PasswordHash(_ context.Context, userID uuid.UUID) (string, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	hash, ok := r.db.passwords[userID]
@@ -205,7 +219,21 @@ func (r memUsers) PasswordHash(_ context.Context, userID int64) (string, error) 
 	return hash, nil
 }
 
-func (r memUsers) ReplacePassword(_ context.Context, userID int64, hash string) (*User, error) {
+func (r memUsers) RehashPassword(_ context.Context, userID uuid.UUID, currentHash, newHash string) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	if _, ok := r.db.users[userID]; !ok {
+		return apperror.ErrNotFound
+	}
+	// Mirror the conditional SQL update: a concurrent credential change wins.
+	if r.db.passwords[userID] != currentHash {
+		return nil
+	}
+	r.db.passwords[userID] = newHash
+	return nil
+}
+
+func (r memUsers) ReplacePassword(_ context.Context, userID uuid.UUID, hash string) (*User, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u, ok := r.db.users[userID]
@@ -258,7 +286,7 @@ func (r memUsers) UpdateProfile(_ context.Context, in ProfileUpdate) (*User, err
 	return cloneUser(u, r.db), nil
 }
 
-func (r memUsers) VerifyEmail(_ context.Context, id int64, email string) (*User, error) {
+func (r memUsers) VerifyEmail(_ context.Context, id uuid.UUID, email string) (*User, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u, ok := r.db.users[id]
@@ -270,7 +298,7 @@ func (r memUsers) VerifyEmail(_ context.Context, id int64, email string) (*User,
 	return cloneUser(u, r.db), nil
 }
 
-func (r memUsers) RevokeTokens(_ context.Context, id int64) (*User, error) {
+func (r memUsers) RevokeTokens(_ context.Context, id uuid.UUID) (*User, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u, ok := r.db.users[id]
@@ -281,31 +309,31 @@ func (r memUsers) RevokeTokens(_ context.Context, id int64) (*User, error) {
 	return cloneUser(u, r.db), nil
 }
 
-func (r memUsers) MarkDeleted(context.Context, int64) (*User, error) {
+func (r memUsers) MarkDeleted(context.Context, uuid.UUID) (*User, error) {
 	return nil, errFakeNotImplemented
 }
 
 type memMemberships struct{ db *memDB }
 
-func (r memMemberships) member(tenantID, userID int64) (*Member, bool) {
-	m, ok := r.db.memberships[[2]int64{tenantID, userID}]
+func (r memMemberships) member(tenantID, userID uuid.UUID) (*Member, bool) {
+	m, ok := r.db.memberships[[2]uuid.UUID{tenantID, userID}]
 	if !ok {
 		return nil, false
 	}
 	return &Member{User: *cloneUser(r.db.users[userID], r.db), Membership: *m}, true
 }
 
-func (r memMemberships) Get(ctx context.Context, userID int64) (*Member, error) {
+func (r memMemberships) Get(ctx context.Context, userID uuid.UUID) (*Member, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	m, ok := r.member(tenant.EffectiveID(ctx), userID)
+	m, ok := r.member(tenant.IDFromContext(ctx), userID)
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
 	return m, nil
 }
 
-func (r memMemberships) GetActive(ctx context.Context, userID int64) (*Member, error) {
+func (r memMemberships) GetActive(ctx context.Context, userID uuid.UUID) (*Member, error) {
 	m, err := r.Get(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -321,7 +349,7 @@ func (r memMemberships) list(ctx context.Context, activeOnly bool, cur paginatio
 	defer r.db.mu.Unlock()
 	var out []Member
 	for key := range r.db.memberships {
-		if key[0] != tenant.EffectiveID(ctx) {
+		if key[0] != tenant.IDFromContext(ctx) {
 			continue
 		}
 		m, _ := r.member(key[0], key[1])
@@ -329,7 +357,7 @@ func (r memMemberships) list(ctx context.Context, activeOnly bool, cur paginatio
 			out = append(out, *m)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].User.ID > out[j].User.ID })
+	sort.Slice(out, func(i, j int) bool { return out[i].User.ID.String() > out[j].User.ID.String() })
 	if len(out) > int(cur.Limit) {
 		out = out[:cur.Limit]
 	}
@@ -344,7 +372,31 @@ func (r memMemberships) ListCursor(ctx context.Context, cur pagination.DBCursor)
 	return r.list(ctx, false, cur), nil
 }
 
-func (r memMemberships) ListForUser(_ context.Context, userID int64) ([]Membership, error) {
+func (r memMemberships) ListFilteredCursor(ctx context.Context, cur pagination.DBCursor, status, role string) ([]Member, error) {
+	members := r.list(ctx, false, cur)
+	out := make([]Member, 0, len(members))
+	for _, member := range members {
+		if status != "" && string(member.Membership.Status) != status {
+			continue
+		}
+		if role != "" && !containsString(member.Membership.Roles, role) && member.Membership.Role != role {
+			continue
+		}
+		out = append(out, member)
+	}
+	return out, nil
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (r memMemberships) ListForUser(_ context.Context, userID uuid.UUID) ([]Membership, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	var out []Membership
@@ -353,14 +405,14 @@ func (r memMemberships) ListForUser(_ context.Context, userID int64) ([]Membersh
 			out = append(out, *m)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
+	sort.Slice(out, func(i, j int) bool { return out[i].TenantID.String() < out[j].TenantID.String() })
 	return out, nil
 }
 
-func (r memMemberships) Create(ctx context.Context, userID int64, role string) (*Membership, error) {
+func (r memMemberships) Create(ctx context.Context, userID uuid.UUID, role string) (*Membership, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	key := [2]int64{tenant.EffectiveID(ctx), userID}
+	key := [2]uuid.UUID{tenant.IDFromContext(ctx), userID}
 	if _, ok := r.db.memberships[key]; ok {
 		return nil, ErrAlreadyMember
 	}
@@ -372,10 +424,10 @@ func (r memMemberships) Create(ctx context.Context, userID int64, role string) (
 }
 
 // update applies fn to the membership when it is in status from.
-func (r memMemberships) update(ctx context.Context, userID int64, from func(MembershipStatus) bool, fn func(*Membership)) (*Membership, error) {
+func (r memMemberships) update(ctx context.Context, userID uuid.UUID, from func(MembershipStatus) bool, fn func(*Membership)) (*Membership, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	m, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]
+	m, ok := r.db.memberships[[2]uuid.UUID{tenant.IDFromContext(ctx), userID}]
 	if !ok || !from(m.Status) {
 		return nil, apperror.ErrNotFound
 	}
@@ -388,10 +440,10 @@ func is(s MembershipStatus) func(MembershipStatus) bool {
 	return func(got MembershipStatus) bool { return got == s }
 }
 
-func (r memMemberships) Reactivate(ctx context.Context, userID int64, role string) (*Membership, error) {
+func (r memMemberships) Reactivate(ctx context.Context, userID uuid.UUID, role string) (*Membership, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	m, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]
+	m, ok := r.db.memberships[[2]uuid.UUID{tenant.IDFromContext(ctx), userID}]
 	if !ok || m.Status != MembershipStatusRemoved || m.BannedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
@@ -401,55 +453,51 @@ func (r memMemberships) Reactivate(ctx context.Context, userID int64, role strin
 	return &c, nil
 }
 
-func (r memMemberships) UpdateRole(ctx context.Context, userID int64, role string) (*Membership, error) {
+func (r memMemberships) UpdateRole(ctx context.Context, userID uuid.UUID, role string) (*Membership, error) {
 	return r.update(ctx, userID, is(MembershipStatusActive), func(m *Membership) {
 		m.Role, m.Roles = role, []string{role}
 	})
 }
 
-func (r memMemberships) Ban(ctx context.Context, userID int64) (*Membership, error) {
+func (r memMemberships) Ban(ctx context.Context, userID uuid.UUID, marker BanMarker) (*Membership, error) {
 	return r.update(ctx, userID, is(MembershipStatusActive), func(m *Membership) {
 		now := time.Now()
 		m.Status, m.BannedAt, m.CredentialsRevokedAt = MembershipStatusSuspended, &now, &now
-		if u := r.db.users[userID]; u != nil {
-			m.BannedEmailHash = bannedEmailHash(u.Email)
-		}
+		m.BannedEmailHash = marker.Hash
 	})
 }
 
-func (r memMemberships) Unban(ctx context.Context, userID int64) (*Membership, error) {
+func (r memMemberships) Unban(ctx context.Context, userID uuid.UUID) (*Membership, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	m, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]
+	m, ok := r.db.memberships[[2]uuid.UUID{tenant.IDFromContext(ctx), userID}]
 	if !ok || m.Status != MembershipStatusSuspended || m.BannedAt == nil || m.ErasureRequestedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
-	m.Status, m.BannedAt, m.BannedEmailHash = MembershipStatusActive, nil, ""
+	m.Status, m.BannedAt, m.BannedEmailHash = MembershipStatusActive, nil, nil
 	c := *m
 	return &c, nil
 }
 
-func (r memMemberships) Remove(ctx context.Context, userID int64) (*Membership, error) {
+func (r memMemberships) Remove(ctx context.Context, userID uuid.UUID, marker BanMarker) (*Membership, error) {
 	return r.update(ctx, userID, func(s MembershipStatus) bool { return s != MembershipStatusRemoved }, func(m *Membership) {
 		now := time.Now()
 		banned := m.BannedAt != nil
 		m.Status, m.RemovedAt, m.CredentialsRevokedAt = MembershipStatusRemoved, &now, &now
-		// A ban, and its pseudonymous email marker, survives removal and
-		// erasure; an erasure reservation is not a ban and never derives one.
+		// A ban, and its keyed marker, survives removal and erasure; an
+		// erasure reservation is not a ban and never derives one.
 		if banned {
-			if m.BannedEmailHash == "" {
-				if u := r.db.users[userID]; u != nil {
-					m.BannedEmailHash = bannedEmailHash(u.Email)
-				}
+			if len(m.BannedEmailHash) == 0 {
+				m.BannedEmailHash = marker.Hash
 			}
 		} else {
-			m.BannedAt, m.BannedEmailHash = nil, ""
+			m.BannedAt, m.BannedEmailHash = nil, nil
 		}
 	})
 }
 
 // SuspendForErasure reserves a membership without setting a ban marker.
-func (r memMemberships) SuspendForErasure(ctx context.Context, userID int64) error {
+func (r memMemberships) SuspendForErasure(ctx context.Context, userID uuid.UUID) error {
 	_, err := r.update(ctx, userID, func(s MembershipStatus) bool { return s != MembershipStatusRemoved }, func(m *Membership) {
 		now := time.Now()
 		m.Status, m.ErasureRequestedAt, m.RemovedAt = MembershipStatusSuspended, &now, nil
@@ -463,7 +511,7 @@ func (r memMemberships) CountActiveOwners(ctx context.Context) (int64, error) {
 	defer r.db.mu.Unlock()
 	var n int64
 	for key, m := range r.db.memberships {
-		if key[0] == tenant.EffectiveID(ctx) && m.Role == RoleOwner && m.Status == MembershipStatusActive {
+		if key[0] == tenant.IDFromContext(ctx) && m.Role == RoleOwner && m.Status == MembershipStatusActive {
 			n++
 		}
 	}
@@ -472,10 +520,14 @@ func (r memMemberships) CountActiveOwners(ctx context.Context) (int64, error) {
 
 func (r memMemberships) LockOwnerChanges(context.Context) error { return nil }
 
-func (r memMemberships) LockMembership(ctx context.Context, userID int64) error {
+func (r memMemberships) TouchIfUnchanged(context.Context, uuid.UUID, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (r memMemberships) LockMembership(ctx context.Context, userID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	if _, ok := r.db.memberships[[2]int64{tenant.EffectiveID(ctx), userID}]; !ok {
+	if _, ok := r.db.memberships[[2]uuid.UUID{tenant.IDFromContext(ctx), userID}]; !ok {
 		return apperror.ErrNotFound
 	}
 	return nil
@@ -485,26 +537,27 @@ func (r memMemberships) Stats(context.Context) (MemberStats, error) {
 	return MemberStats{}, errFakeNotImplemented
 }
 
-func (r memMemberships) EmailBanned(ctx context.Context, email string) (bool, error) {
+func (r memMemberships) EmailBanned(ctx context.Context, hashes [][]byte) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	hash := bannedEmailHash(email)
-	normalized := NormalizeEmail(email)
 	for key, m := range r.db.memberships {
-		if key[0] != tenant.EffectiveID(ctx) {
+		if key[0] != tenant.IDFromContext(ctx) || len(m.BannedEmailHash) == 0 {
 			continue
 		}
-		if m.BannedEmailHash != "" && m.BannedEmailHash == hash {
-			return true, nil
-		}
-		if u := r.db.users[key[1]]; u != nil && m.Status == MembershipStatusSuspended && u.Email == normalized {
-			return true, nil
+		for _, hash := range hashes {
+			if bytes.Equal(m.BannedEmailHash, hash) {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
 }
 
-func (r memMemberships) GetPrincipal(ctx context.Context, userID int64) (*Principal, error) {
+func (r memMemberships) BannedMarkerCounts(context.Context) ([]BanMarkerCount, error) {
+	return nil, errFakeNotImplemented
+}
+
+func (r memMemberships) GetPrincipal(ctx context.Context, userID uuid.UUID) (*Principal, error) {
 	m, err := r.GetActive(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -516,7 +569,7 @@ func (r memMemberships) GetPrincipal(ctx context.Context, userID int64) (*Princi
 	}, nil
 }
 
-func (r memMemberships) LockPrincipal(ctx context.Context, userID int64) (*Principal, error) {
+func (r memMemberships) LockPrincipal(ctx context.Context, userID uuid.UUID) (*Principal, error) {
 	m, err := r.GetActive(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -533,8 +586,8 @@ type memSessions struct{ db *memDB }
 func (r memSessions) Create(ctx context.Context, in NewSession) (*Session, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	tid := tenant.EffectiveID(ctx)
-	m, ok := r.db.memberships[[2]int64{tid, in.UserID}]
+	tid := tenant.IDFromContext(ctx)
+	m, ok := r.db.memberships[[2]uuid.UUID{tid, in.UserID}]
 	u := r.db.users[in.UserID]
 	if !ok || m.Status != MembershipStatusActive || u.Status != UserStatusActive || u.TokenVersion != in.TokenVersion {
 		return nil, apperror.ErrNotFound
@@ -548,22 +601,22 @@ func (r memSessions) Create(ctx context.Context, in NewSession) (*Session, error
 	return &c, nil
 }
 
-func (r memSessions) Get(ctx context.Context, id int64) (*Session, error) {
+func (r memSessions) Get(ctx context.Context, id uuid.UUID) (*Session, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	s, ok := r.db.sessions[id]
-	if !ok || s.TenantID != tenant.EffectiveID(ctx) {
+	if !ok || s.TenantID != tenant.IDFromContext(ctx) {
 		return nil, apperror.ErrNotFound
 	}
 	c := *s
 	return &c, nil
 }
 
-func (r memSessions) ListLiveCursor(context.Context, int64, pagination.DBCursor) ([]Session, error) {
+func (r memSessions) ListLiveCursor(context.Context, uuid.UUID, pagination.DBCursor) ([]Session, error) {
 	return nil, errFakeNotImplemented
 }
 
-func (r memSessions) revoke(match func(*Session) bool, why RevokeReason) (userID int64, n int) {
+func (r memSessions) revoke(match func(*Session) bool, why RevokeReason) (userID uuid.UUID, n int) {
 	now := time.Now()
 	for _, s := range r.db.sessions {
 		if s.RevokedAt == nil && match(s) {
@@ -575,30 +628,30 @@ func (r memSessions) revoke(match func(*Session) bool, why RevokeReason) (userID
 	return userID, n
 }
 
-func (r memSessions) Revoke(ctx context.Context, userID, id int64, why RevokeReason) (bool, error) {
+func (r memSessions) Revoke(ctx context.Context, userID, id uuid.UUID, why RevokeReason) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	tid := tenant.EffectiveID(ctx)
+	tid := tenant.IDFromContext(ctx)
 	_, n := r.revoke(func(s *Session) bool { return s.ID == id && s.UserID == userID && s.TenantID == tid }, why)
 	return n > 0, nil
 }
 
-func (r memSessions) RevokeAllInTenant(ctx context.Context, userID int64, why RevokeReason) error {
+func (r memSessions) RevokeAllInTenant(ctx context.Context, userID uuid.UUID, why RevokeReason) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	tid := tenant.EffectiveID(ctx)
+	tid := tenant.IDFromContext(ctx)
 	r.revoke(func(s *Session) bool { return s.UserID == userID && s.TenantID == tid }, why)
 	return nil
 }
 
-func (r memSessions) RevokeAllForUser(_ context.Context, userID int64, why RevokeReason) error {
+func (r memSessions) RevokeAllForUser(_ context.Context, userID uuid.UUID, why RevokeReason) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	r.revoke(func(s *Session) bool { return s.UserID == userID }, why)
 	return nil
 }
 
-func (r memSessions) RevokeStaleForUser(_ context.Context, userID int64, why RevokeReason) error {
+func (r memSessions) RevokeStaleForUser(_ context.Context, userID uuid.UUID, why RevokeReason) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u := r.db.users[userID]
@@ -610,18 +663,18 @@ func (r memSessions) RevokeStaleForUser(_ context.Context, userID int64, why Rev
 	return nil
 }
 
-func (r memSessions) RevokeOtherUserSessions(_ context.Context, userID, keepID int64, why RevokeReason) error {
+func (r memSessions) RevokeOtherUserSessions(_ context.Context, userID, keepID uuid.UUID, why RevokeReason) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	r.revoke(func(s *Session) bool { return s.UserID == userID && s.ID != keepID }, why)
 	return nil
 }
 
-func (r memSessions) Restamp(ctx context.Context, userID, id int64, tokenVersion int32, amr []string) (*Session, error) {
+func (r memSessions) Restamp(ctx context.Context, userID, id uuid.UUID, tokenVersion int32, amr []string) (*Session, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	s, ok := r.db.sessions[id]
-	if !ok || s.UserID != userID || s.TenantID != tenant.EffectiveID(ctx) || s.RevokedAt != nil {
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
 		return nil, apperror.ErrNotFound
 	}
 	s.TokenVersion, s.AMR, s.LastUsedAt = tokenVersion, amr, time.Now()
@@ -629,7 +682,7 @@ func (r memSessions) Restamp(ctx context.Context, userID, id int64, tokenVersion
 	return &c, nil
 }
 
-func (r memSessions) DeleteRefreshTokens(_ context.Context, sessionID int64) error {
+func (r memSessions) DeleteRefreshTokens(_ context.Context, sessionID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	for hash, token := range r.db.refresh {
@@ -640,24 +693,24 @@ func (r memSessions) DeleteRefreshTokens(_ context.Context, sessionID int64) err
 	return nil
 }
 
-func (r memSessions) RevokeByRefreshToken(_ context.Context, hash string, why RevokeReason) (userID int64, revoked bool, err error) {
+func (r memSessions) RevokeByRefreshToken(_ context.Context, hash []byte, why RevokeReason) (userID uuid.UUID, revoked bool, err error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	rt, ok := r.db.refresh[hash]
+	rt, ok := r.db.refresh[string(hash)]
 	if !ok {
-		return 0, false, nil
+		return uuid.Nil, false, nil
 	}
 	userID, n := r.revoke(func(s *Session) bool { return s.ID == rt.SessionID }, why)
 	return userID, n > 0, nil
 }
 
-func (r memSessions) Touch(context.Context, int64, string, string) error { return nil }
+func (r memSessions) Touch(context.Context, uuid.UUID, string, string) error { return nil }
 
-func (r memSessions) MarkMFAVerified(ctx context.Context, userID, sessionID int64) (time.Time, error) {
+func (r memSessions) MarkMFAVerified(ctx context.Context, userID, sessionID uuid.UUID) (time.Time, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	s, ok := r.db.sessions[sessionID]
-	if !ok || s.UserID != userID || s.TenantID != tenant.EffectiveID(ctx) || s.RevokedAt != nil {
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
 		return time.Time{}, apperror.ErrNotFound
 	}
 	now := time.Now()
@@ -665,23 +718,36 @@ func (r memSessions) MarkMFAVerified(ctx context.Context, userID, sessionID int6
 	return now, nil
 }
 
-func (r memSessions) State(context.Context, int64, int64) (*SessionState, error) {
+func (r memSessions) MarkMFAVerifiedWithMethod(ctx context.Context, userID, sessionID uuid.UUID, method string) (time.Time, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	s, ok := r.db.sessions[sessionID]
+	if !ok || s.UserID != userID || s.TenantID != tenant.IDFromContext(ctx) || s.RevokedAt != nil {
+		return time.Time{}, apperror.ErrNotFound
+	}
+	now := time.Now()
+	s.MFAVerifiedAt = &now
+	s.AMR = withAMR(s.AMR, method)
+	return now, nil
+}
+
+func (r memSessions) State(context.Context, uuid.UUID, uuid.UUID) (*SessionState, error) {
 	return nil, errFakeNotImplemented
 }
 
 type memRefresh struct{ db *memDB }
 
-func (r memRefresh) Create(ctx context.Context, sessionID int64, hash string, expiresAt time.Time) error {
+func (r memRefresh) Create(ctx context.Context, sessionID uuid.UUID, hash []byte, expiresAt time.Time) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	r.db.refresh[hash] = &RefreshToken{ID: r.db.id(), TenantID: tenant.EffectiveID(ctx), SessionID: sessionID, ExpiresAt: expiresAt, CreatedAt: time.Now()}
+	r.db.refresh[string(hash)] = &RefreshToken{ID: r.db.id(), TenantID: tenant.IDFromContext(ctx), SessionID: sessionID, ExpiresAt: expiresAt, CreatedAt: time.Now()}
 	return nil
 }
 
-func (r memRefresh) GetByHash(_ context.Context, hash string) (*RefreshToken, error) {
+func (r memRefresh) GetByHash(_ context.Context, hash []byte) (*RefreshToken, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	rt, ok := r.db.refresh[hash]
+	rt, ok := r.db.refresh[string(hash)]
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
@@ -689,7 +755,7 @@ func (r memRefresh) GetByHash(_ context.Context, hash string) (*RefreshToken, er
 	return &c, nil
 }
 
-func (r memRefresh) MarkUsed(_ context.Context, tenantID, id int64) (bool, error) {
+func (r memRefresh) MarkUsed(_ context.Context, tenantID, id uuid.UUID) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	for _, rt := range r.db.refresh {
@@ -702,7 +768,7 @@ func (r memRefresh) MarkUsed(_ context.Context, tenantID, id int64) (bool, error
 	return false, nil
 }
 
-func (r memRefresh) ClassifyRotation(_ context.Context, hash string, usedAfter time.Time) (RefreshRotationState, error) {
+func (r memRefresh) ClassifyRotation(_ context.Context, hash []byte, usedAfter time.Time) (RefreshRotationState, error) {
 	// The real query reads committed rows only. Waiting for any in-flight
 	// fake transaction models that: a concurrent rotation's "mark used" and
 	// "insert next token" are seen together or not at all. The service calls
@@ -711,7 +777,7 @@ func (r memRefresh) ClassifyRotation(_ context.Context, hash string, usedAfter t
 	defer r.db.txMu.Unlock()
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	rt, ok := r.db.refresh[hash]
+	rt, ok := r.db.refresh[string(hash)]
 	if !ok {
 		return RefreshRotationState{}, apperror.ErrNotFound
 	}
@@ -724,7 +790,7 @@ func (r memRefresh) ClassifyRotation(_ context.Context, hash string, usedAfter t
 		UsedWithinGrace: rt.UsedAt != nil && rt.UsedAt.After(usedAfter),
 	}
 	for _, other := range r.db.refresh {
-		if other.SessionID == rt.SessionID && other.ID > rt.ID {
+		if other.SessionID == rt.SessionID && other.ID.String() > rt.ID.String() {
 			state.Rotated = true
 			break
 		}
@@ -734,7 +800,7 @@ func (r memRefresh) ClassifyRotation(_ context.Context, hash string, usedAfter t
 
 type memResets struct{ db *memDB }
 
-func (r memResets) Create(_ context.Context, userID int64, email, tokenHash string, expiresAt time.Time) (bool, error) {
+func (r memResets) Create(_ context.Context, userID uuid.UUID, email string, tokenHash []byte, expiresAt time.Time) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	u, ok := r.db.users[userID]
@@ -747,15 +813,15 @@ func (r memResets) Create(_ context.Context, userID int64, email, tokenHash stri
 			delete(r.db.resetTokens, hash)
 		}
 	}
-	r.db.resetOwner[tokenHash] = userID
-	r.db.resetTokens[tokenHash] = &PasswordResetToken{ID: r.db.id(), UserID: userID, ExpiresAt: expiresAt, CreatedAt: time.Now()}
+	r.db.resetOwner[string(tokenHash)] = userID
+	r.db.resetTokens[string(tokenHash)] = &PasswordResetToken{ID: r.db.id(), UserID: userID, ExpiresAt: expiresAt, CreatedAt: time.Now()}
 	return true, nil
 }
 
-func (r memResets) GetByHash(_ context.Context, tokenHash string) (*PasswordResetToken, error) {
+func (r memResets) GetByHash(_ context.Context, tokenHash []byte) (*PasswordResetToken, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	token, ok := r.db.resetTokens[tokenHash]
+	token, ok := r.db.resetTokens[string(tokenHash)]
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
@@ -763,28 +829,28 @@ func (r memResets) GetByHash(_ context.Context, tokenHash string) (*PasswordRese
 	return &c, nil
 }
 
-func (r memResets) Consume(_ context.Context, tokenHash string) (*PasswordResetToken, error) {
+func (r memResets) Consume(_ context.Context, tokenHash []byte) (*PasswordResetToken, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	token, ok := r.db.resetTokens[tokenHash]
+	token, ok := r.db.resetTokens[string(tokenHash)]
 	if !ok {
 		return nil, apperror.ErrNotFound
 	}
-	delete(r.db.resetTokens, tokenHash)
-	delete(r.db.resetOwner, tokenHash)
+	delete(r.db.resetTokens, string(tokenHash))
+	delete(r.db.resetOwner, string(tokenHash))
 	c := *token
 	return &c, nil
 }
 
-func (r memResets) Delete(_ context.Context, tokenHash string) error {
+func (r memResets) Delete(_ context.Context, tokenHash []byte) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	delete(r.db.resetTokens, tokenHash)
-	delete(r.db.resetOwner, tokenHash)
+	delete(r.db.resetTokens, string(tokenHash))
+	delete(r.db.resetOwner, string(tokenHash))
 	return nil
 }
 
-func (r memResets) DeleteByUser(_ context.Context, userID int64) error {
+func (r memResets) DeleteByUser(_ context.Context, userID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	for hash, owner := range r.db.resetOwner {
@@ -798,23 +864,25 @@ func (r memResets) DeleteByUser(_ context.Context, userID int64) error {
 
 type memVerifications struct{}
 
-func (memVerifications) Create(context.Context, int64, string, string, time.Time) error { return nil }
-func (memVerifications) Consume(context.Context, string) (*VerificationToken, error) {
+func (memVerifications) Create(context.Context, uuid.UUID, string, []byte, time.Time) error {
+	return nil
+}
+func (memVerifications) Consume(context.Context, []byte) (*VerificationToken, error) {
 	return nil, errFakeNotImplemented
 }
-func (memVerifications) DeleteByUser(context.Context, int64) error { return nil }
+func (memVerifications) DeleteByUser(context.Context, uuid.UUID) error { return nil }
 
 type memInvitations struct{ db *memDB }
 
 func (r memInvitations) Upsert(ctx context.Context, in NewInvitation) (*Invitation, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
-	tid := tenant.EffectiveID(ctx)
+	tid := tenant.IDFromContext(ctx)
 	now := time.Now()
 	for id, inv := range r.db.invitations {
 		if inv.TenantID == tid && inv.Email == in.Email && inv.AcceptedAt == nil {
 			inv.Role, inv.InvitedBy, inv.ExpiresAt, inv.UpdatedAt = in.Role, in.InvitedBy, in.ExpiresAt, now
-			r.db.tokens[id] = in.TokenHash
+			r.db.tokens[id] = string(in.TokenHash)
 			c := *inv
 			return &c, nil
 		}
@@ -824,7 +892,7 @@ func (r memInvitations) Upsert(ctx context.Context, in NewInvitation) (*Invitati
 		InvitedBy: in.InvitedBy, ExpiresAt: in.ExpiresAt, CreatedAt: now, UpdatedAt: now,
 	}
 	r.db.invitations[inv.ID] = inv
-	r.db.tokens[inv.ID] = in.TokenHash
+	r.db.tokens[inv.ID] = string(in.TokenHash)
 	c := *inv
 	return &c, nil
 }
@@ -833,11 +901,22 @@ func (r memInvitations) ListPendingCursor(context.Context, pagination.DBCursor) 
 	return nil, errFakeNotImplemented
 }
 
-func (r memInvitations) DeletePending(ctx context.Context, id int64) (bool, error) {
+func (r memInvitations) Get(ctx context.Context, id uuid.UUID) (*Invitation, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	inv, ok := r.db.invitations[id]
-	if !ok || inv.TenantID != tenant.EffectiveID(ctx) || inv.AcceptedAt != nil {
+	if !ok || inv.TenantID != tenant.IDFromContext(ctx) {
+		return nil, apperror.ErrNotFound
+	}
+	c := *inv
+	return &c, nil
+}
+
+func (r memInvitations) DeletePending(ctx context.Context, id uuid.UUID) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	inv, ok := r.db.invitations[id]
+	if !ok || inv.TenantID != tenant.IDFromContext(ctx) || inv.AcceptedAt != nil {
 		return false, nil
 	}
 	delete(r.db.invitations, id)
@@ -845,26 +924,26 @@ func (r memInvitations) DeletePending(ctx context.Context, id int64) (bool, erro
 	return true, nil
 }
 
-func (r memInvitations) TenantByTokenHash(_ context.Context, tokenHash string) (int64, error) {
+func (r memInvitations) TenantByTokenHash(_ context.Context, tokenHash []byte) (uuid.UUID, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	for id, hash := range r.db.tokens {
-		if hash == tokenHash {
+		if hash == string(tokenHash) {
 			return r.db.invitations[id].TenantID, nil
 		}
 	}
-	return 0, apperror.ErrNotFound
+	return uuid.Nil, apperror.ErrNotFound
 }
 
-func (r memInvitations) GetByTokenHashForUpdate(ctx context.Context, tenantID int64, tokenHash string) (*Invitation, error) {
+func (r memInvitations) GetByTokenHashForUpdate(ctx context.Context, tenantID uuid.UUID, tokenHash []byte) (*Invitation, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	for id, hash := range r.db.tokens {
-		if hash != tokenHash {
+		if hash != string(tokenHash) {
 			continue
 		}
 		inv := r.db.invitations[id]
-		if inv.TenantID != tenantID || inv.TenantID != tenant.EffectiveID(ctx) {
+		if inv.TenantID != tenantID || inv.TenantID != tenant.IDFromContext(ctx) {
 			return nil, apperror.ErrNotFound
 		}
 		c := *inv
@@ -873,7 +952,7 @@ func (r memInvitations) GetByTokenHashForUpdate(ctx context.Context, tenantID in
 	return nil, apperror.ErrNotFound
 }
 
-func (r memInvitations) MarkAccepted(ctx context.Context, tenantID, id, userID int64) (bool, error) {
+func (r memInvitations) MarkAccepted(ctx context.Context, tenantID, id, userID uuid.UUID) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	inv, ok := r.db.invitations[id]
@@ -881,13 +960,13 @@ func (r memInvitations) MarkAccepted(ctx context.Context, tenantID, id, userID i
 		return false, nil
 	}
 	now := time.Now()
-	inv.AcceptedAt, inv.AcceptedBy, inv.UpdatedAt = &now, &userID, now
+	inv.AcceptedAt, inv.AcceptedBy, inv.UpdatedAt = &now, uuid.NullUUID{UUID: userID, Valid: true}, now
 	return true, nil
 }
 
 type memTenants struct{ db *memDB }
 
-func (r memTenants) get(id int64, operational bool) (*Tenant, error) {
+func (r memTenants) get(id uuid.UUID, operational bool) (*Tenant, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	t, ok := r.db.tenants[id]
@@ -901,14 +980,16 @@ func (r memTenants) get(id int64, operational bool) (*Tenant, error) {
 func (r memTenants) GetOperationalBySlug(context.Context, string) (*Tenant, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memTenants) GetOperationalByID(_ context.Context, id int64) (*Tenant, error) {
+func (r memTenants) GetOperationalByID(_ context.Context, id uuid.UUID) (*Tenant, error) {
 	return r.get(id, true)
 }
-func (r memTenants) GetByID(_ context.Context, id int64) (*Tenant, error) { return r.get(id, false) }
+func (r memTenants) GetByID(_ context.Context, id uuid.UUID) (*Tenant, error) {
+	return r.get(id, false)
+}
 func (r memTenants) GetBySlug(context.Context, string) (*Tenant, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memTenants) GetByIDForUpdate(_ context.Context, id int64) (*Tenant, error) {
+func (r memTenants) GetByIDForUpdate(_ context.Context, id uuid.UUID) (*Tenant, error) {
 	return r.get(id, false)
 }
 func (r memTenants) ListCursor(_ context.Context, _ pagination.DBCursor) ([]Tenant, error) {
@@ -918,13 +999,30 @@ func (r memTenants) ListCursor(_ context.Context, _ pagination.DBCursor) ([]Tena
 	for _, t := range r.db.tenants {
 		tenants = append(tenants, *t)
 	}
-	sort.Slice(tenants, func(i, j int) bool { return tenants[i].ID > tenants[j].ID })
+	sort.Slice(tenants, func(i, j int) bool { return tenants[i].ID.String() > tenants[j].ID.String() })
 	return tenants, nil
 }
 func (r memTenants) Create(context.Context, NewTenant) (*Tenant, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memTenants) UpdateStatus(_ context.Context, id int64, status TenantStatus, deletion *time.Time) (*Tenant, error) {
+
+func (r memTenants) TouchIfUnchanged(context.Context, uuid.UUID, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (r memTenants) UpdateName(_ context.Context, id uuid.UUID, name string) (*Tenant, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	t, ok := r.db.tenants[id]
+	if !ok {
+		return nil, apperror.ErrNotFound
+	}
+	t.Name = name
+	t.UpdatedAt = time.Now()
+	c := *t
+	return &c, nil
+}
+func (r memTenants) UpdateStatus(_ context.Context, id uuid.UUID, status TenantStatus, deletion *time.Time) (*Tenant, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	t, ok := r.db.tenants[id]
@@ -935,7 +1033,7 @@ func (r memTenants) UpdateStatus(_ context.Context, id int64, status TenantStatu
 	c := *t
 	return &c, nil
 }
-func (r memTenants) Settings(_ context.Context, id int64) (*TenantSettings, error) {
+func (r memTenants) Settings(_ context.Context, id uuid.UUID) (*TenantSettings, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	if _, ok := r.db.tenants[id]; !ok {
@@ -950,7 +1048,7 @@ func (r memTenants) Settings(_ context.Context, id int64) (*TenantSettings, erro
 
 type memMFA struct{ db *memDB }
 
-func (r memMFA) GetTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
+func (r memMFA) GetTOTP(_ context.Context, userID uuid.UUID) (*MFAFactor, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	f, ok := r.db.factors[userID]
@@ -961,11 +1059,11 @@ func (r memMFA) GetTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
 	return &c, nil
 }
 
-func (r memMFA) GetTOTPForUpdate(ctx context.Context, userID int64) (*MFAFactor, error) {
+func (r memMFA) GetTOTPForUpdate(ctx context.Context, userID uuid.UUID) (*MFAFactor, error) {
 	return r.GetTOTP(ctx, userID)
 }
 
-func (r memMFA) GetConfirmedTOTP(_ context.Context, userID int64) (*MFAFactor, error) {
+func (r memMFA) GetConfirmedTOTP(_ context.Context, userID uuid.UUID) (*MFAFactor, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	f, ok := r.db.factors[userID]
@@ -976,7 +1074,7 @@ func (r memMFA) GetConfirmedTOTP(_ context.Context, userID int64) (*MFAFactor, e
 	return &c, nil
 }
 
-func (r memMFA) UpsertUnconfirmedTOTP(_ context.Context, userID int64, sealed string) (*MFAFactor, error) {
+func (r memMFA) UpsertUnconfirmedTOTP(_ context.Context, userID uuid.UUID, sealed string) (*MFAFactor, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	now := time.Now()
@@ -994,7 +1092,7 @@ func (r memMFA) UpsertUnconfirmedTOTP(_ context.Context, userID int64, sealed st
 	return &c, nil
 }
 
-func (r memMFA) ConfirmTOTP(_ context.Context, id, userID, step int64) (bool, error) {
+func (r memMFA) ConfirmTOTP(_ context.Context, id, userID uuid.UUID, step int64) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	f, ok := r.db.factors[userID]
@@ -1007,7 +1105,7 @@ func (r memMFA) ConfirmTOTP(_ context.Context, id, userID, step int64) (bool, er
 	return true, nil
 }
 
-func (r memMFA) ConsumeTOTPStep(_ context.Context, userID, step int64) (bool, error) {
+func (r memMFA) ConsumeTOTPStep(_ context.Context, userID uuid.UUID, step int64) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	f, ok := r.db.factors[userID]
@@ -1018,14 +1116,14 @@ func (r memMFA) ConsumeTOTPStep(_ context.Context, userID, step int64) (bool, er
 	return true, nil
 }
 
-func (r memMFA) DeleteTOTP(_ context.Context, userID int64) error {
+func (r memMFA) DeleteTOTP(_ context.Context, userID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	delete(r.db.factors, userID)
 	return nil
 }
 
-func (r memMFA) DeletePendingTOTP(_ context.Context, userID int64) error {
+func (r memMFA) DeletePendingTOTP(_ context.Context, userID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	if f, ok := r.db.factors[userID]; ok && f.ConfirmedAt == nil {
@@ -1034,14 +1132,14 @@ func (r memMFA) DeletePendingTOTP(_ context.Context, userID int64) error {
 	return nil
 }
 
-func (r memMFA) DeleteRecoveryCodes(_ context.Context, userID int64) error {
+func (r memMFA) DeleteRecoveryCodes(_ context.Context, userID uuid.UUID) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	delete(r.db.recovery, userID)
 	return nil
 }
 
-func (r memMFA) CreateRecoveryCodes(_ context.Context, userID int64, hashes []string) error {
+func (r memMFA) CreateRecoveryCodes(_ context.Context, userID uuid.UUID, hashes [][]byte) error {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	codes := r.db.recovery[userID]
@@ -1050,24 +1148,24 @@ func (r memMFA) CreateRecoveryCodes(_ context.Context, userID int64, hashes []st
 		r.db.recovery[userID] = codes
 	}
 	for _, hash := range hashes {
-		codes[hash] = false
+		codes[string(hash)] = false
 	}
 	return nil
 }
 
-func (r memMFA) UseRecoveryCode(_ context.Context, userID int64, hash string) (bool, error) {
+func (r memMFA) UseRecoveryCode(_ context.Context, userID uuid.UUID, hash []byte) (bool, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	codes := r.db.recovery[userID]
-	used, ok := codes[hash]
+	used, ok := codes[string(hash)]
 	if !ok || used {
 		return false, nil
 	}
-	codes[hash] = true
+	codes[string(hash)] = true
 	return true, nil
 }
 
-func (r memMFA) CountUnusedRecoveryCodes(_ context.Context, userID int64) (int64, error) {
+func (r memMFA) CountUnusedRecoveryCodes(_ context.Context, userID uuid.UUID) (int64, error) {
 	r.db.mu.Lock()
 	defer r.db.mu.Unlock()
 	var n int64
@@ -1081,6 +1179,105 @@ func (r memMFA) CountUnusedRecoveryCodes(_ context.Context, userID int64) (int64
 
 // memRoles resolves the built-in tenant roles (enough for inviter authority
 // checks in unit tests); tenant-defined roles are covered by integration tests.
+type memPasskeys struct{ db *memDB }
+
+func (r memPasskeys) Create(_ context.Context, in Passkey) (*Passkey, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for _, existing := range r.db.passkeys {
+		if bytes.Equal(existing.CredentialID, in.CredentialID) {
+			return nil, ErrPasskeyAlreadyRegistered
+		}
+	}
+	if in.ID == uuid.Nil {
+		in.ID = r.db.id()
+	}
+	now := time.Unix(1_700_000_000, 0)
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = now
+	}
+	in.UpdatedAt = now
+	created := in
+	r.db.passkeys[created.ID] = &created
+	copied := created
+	return &copied, nil
+}
+
+func (r memPasskeys) ListByUser(_ context.Context, userID uuid.UUID) ([]Passkey, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	out := make([]Passkey, 0)
+	for _, passkey := range r.db.passkeys {
+		if passkey.UserID == userID {
+			out = append(out, *passkey)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (r memPasskeys) GetByCredentialID(_ context.Context, credentialID []byte) (*Passkey, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for _, passkey := range r.db.passkeys {
+		if bytes.Equal(passkey.CredentialID, credentialID) {
+			copied := *passkey
+			return &copied, nil
+		}
+	}
+	return nil, apperror.ErrNotFound
+}
+
+func (r memPasskeys) Get(_ context.Context, userID, id uuid.UUID) (*Passkey, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	passkey, ok := r.db.passkeys[id]
+	if !ok || passkey.UserID != userID {
+		return nil, apperror.ErrNotFound
+	}
+	copied := *passkey
+	return &copied, nil
+}
+
+func (r memPasskeys) Delete(_ context.Context, userID, id uuid.UUID) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	passkey, ok := r.db.passkeys[id]
+	if !ok || passkey.UserID != userID {
+		return false, nil
+	}
+	delete(r.db.passkeys, id)
+	return true, nil
+}
+
+func (r memPasskeys) DeleteByUser(_ context.Context, userID uuid.UUID) error {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	for id, passkey := range r.db.passkeys {
+		if passkey.UserID == userID {
+			delete(r.db.passkeys, id)
+		}
+	}
+	return nil
+}
+
+func (r memPasskeys) UpdateAfterAssertion(_ context.Context, userID, id uuid.UUID, signCount int64, backupState bool) (bool, error) {
+	r.db.mu.Lock()
+	defer r.db.mu.Unlock()
+	passkey, ok := r.db.passkeys[id]
+	if !ok || passkey.UserID != userID {
+		return false, nil
+	}
+	if passkey.SignCount >= signCount && (signCount != 0 || passkey.SignCount != 0) {
+		return false, nil
+	}
+	passkey.SignCount = signCount
+	passkey.BackupState = backupState
+	now := time.Unix(1_700_000_000, 0)
+	passkey.LastUsedAt = &now
+	return true, nil
+}
+
 type memRoles struct{ db *memDB }
 
 func (r memRoles) GetByKey(_ context.Context, key string) (*Role, error) {
@@ -1096,24 +1293,24 @@ func (r memRoles) SyncCatalog(context.Context, []CatalogPermission, []CatalogRol
 func (r memRoles) ListCursor(context.Context, pagination.DBCursor) ([]Role, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memRoles) Get(context.Context, int64) (*Role, error) {
+func (r memRoles) Get(context.Context, uuid.UUID) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
 func (r memRoles) Create(context.Context, NewRole) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memRoles) Update(context.Context, int64, string, []string) (*Role, error) {
+func (r memRoles) Update(context.Context, uuid.UUID, string, []string, *time.Time) (*Role, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memRoles) Delete(context.Context, int64) (bool, error) {
+func (r memRoles) Delete(context.Context, uuid.UUID) (bool, error) {
 	return false, errFakeNotImplemented
 }
-func (r memRoles) MemberIDs(context.Context, int64) ([]int64, error) {
+func (r memRoles) MemberIDs(context.Context, uuid.UUID) ([]uuid.UUID, error) {
 	return nil, errFakeNotImplemented
 }
-func (r memRoles) ReplaceMemberRoles(context.Context, int64, []string) error {
+func (r memRoles) ReplaceMemberRoles(context.Context, uuid.UUID, []string) error {
 	return errFakeNotImplemented
 }
-func (r memRoles) AssignPlatformRole(context.Context, int64, string) error {
+func (r memRoles) AssignPlatformRole(context.Context, uuid.UUID, string) error {
 	return errFakeNotImplemented
 }

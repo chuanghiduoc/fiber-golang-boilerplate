@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -66,7 +67,7 @@ func doRequest(t *testing.T, app *fiber.App, header string) (resp *http.Response
 
 func TestMiddleware_DefaultTenant(t *testing.T) {
 	r := fakeResolver{tenants: map[string]tenant.Tenant{
-		"default": {ID: 1, Slug: "default", Name: "Default"},
+		"default": {ID: testID(1), Slug: "default", Name: "Default"},
 	}}
 	app := newTestApp(r, tenant.DefaultSlug)
 
@@ -74,15 +75,15 @@ func TestMiddleware_DefaultTenant(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(1) || body["slug"] != "default" {
+	if body["id"] != testID(1).String() || body["slug"] != "default" {
 		t.Fatalf("locals = %v, want tenant 1/default", body)
 	}
 }
 
 func TestMiddleware_HeaderSelectsTenant(t *testing.T) {
 	r := fakeResolver{tenants: map[string]tenant.Tenant{
-		"default": {ID: 1, Slug: "default", Name: "Default"},
-		"acme":    {ID: 2, Slug: "acme", Name: "Acme"},
+		"default": {ID: testID(1), Slug: "default", Name: "Default"},
+		"acme":    {ID: testID(2), Slug: "acme", Name: "Acme"},
 	}}
 	app := newTestApp(r, tenant.DefaultSlug)
 
@@ -90,14 +91,14 @@ func TestMiddleware_HeaderSelectsTenant(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(2) || body["slug"] != "acme" {
+	if body["id"] != testID(2).String() || body["slug"] != "acme" {
 		t.Fatalf("locals = %v, want tenant 2/acme", body)
 	}
 }
 
 func TestMiddleware_InvalidSlug(t *testing.T) {
 	r := fakeResolver{tenants: map[string]tenant.Tenant{
-		"default": {ID: 1, Slug: "default", Name: "Default"},
+		"default": {ID: testID(1), Slug: "default", Name: "Default"},
 	}}
 	app := newTestApp(r, tenant.DefaultSlug)
 
@@ -114,7 +115,7 @@ func TestMiddleware_InvalidSlug(t *testing.T) {
 
 func TestMiddleware_UnknownSlug(t *testing.T) {
 	r := fakeResolver{tenants: map[string]tenant.Tenant{
-		"default": {ID: 1, Slug: "default", Name: "Default"},
+		"default": {ID: testID(1), Slug: "default", Name: "Default"},
 	}}
 	app := newTestApp(r, tenant.DefaultSlug)
 
@@ -129,7 +130,7 @@ func TestMiddleware_UnknownSlug(t *testing.T) {
 
 func TestMiddleware_RequireHeaderWhenDefaultEmpty(t *testing.T) {
 	r := fakeResolver{tenants: map[string]tenant.Tenant{
-		"acme": {ID: 2, Slug: "acme", Name: "Acme"},
+		"acme": {ID: testID(2), Slug: "acme", Name: "Acme"},
 	}}
 	app := newTestApp(r, "")
 
@@ -145,7 +146,7 @@ func TestMiddleware_RequireHeaderWhenDefaultEmpty(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(2) || body["slug"] != "acme" {
+	if body["id"] != testID(2).String() || body["slug"] != "acme" {
 		t.Fatalf("locals = %v, want tenant 2/acme", body)
 	}
 }
@@ -157,7 +158,7 @@ func TestMiddleware_NoResolverPassesThrough(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(0) || body["slug"] != "" {
+	if body["id"] != uuid.Nil.String() || body["slug"] != "" {
 		t.Fatalf("locals = %v, want no tenant locals", body)
 	}
 }
@@ -208,15 +209,15 @@ func doPathRequest(t *testing.T, app *fiber.App, path, header string) (resp *htt
 }
 
 var tenantQueryTestResolver = fakeResolver{tenants: map[string]tenant.Tenant{
-	"default": {ID: 1, Slug: "default", Name: "Default"},
-	"acme":    {ID: 2, Slug: "acme", Name: "Acme"},
+	"default": {ID: testID(1), Slug: "default", Name: "Default"},
+	"acme":    {ID: testID(2), Slug: "acme", Name: "Acme"},
 }}
 
 func TestMiddleware_TenantQueryFallbackForBrowserAuth(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/auth/google",
-		"/api/v1/auth/reset-password",
-		"/api/v1/auth/verify-email",
+		"/api/v1/auth/password-resets/complete",
+		"/api/v1/auth/email-verifications/complete",
 	} {
 		t.Run(path, func(t *testing.T) {
 			app := newPathTestApp(tenantQueryTestResolver, "", path)
@@ -224,7 +225,7 @@ func TestMiddleware_TenantQueryFallbackForBrowserAuth(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200", resp.StatusCode)
 			}
-			if body["id"] != float64(2) || body["slug"] != "acme" {
+			if body["id"] != testID(2).String() || body["slug"] != "acme" {
 				t.Fatalf("locals = %v, want tenant 2/acme", body)
 			}
 		})
@@ -232,14 +233,14 @@ func TestMiddleware_TenantQueryFallbackForBrowserAuth(t *testing.T) {
 }
 
 func TestMiddleware_HeaderPrecedesTenantQuery(t *testing.T) {
-	const path = "/api/v1/auth/reset-password"
+	const path = "/api/v1/auth/password-resets/complete"
 	app := newPathTestApp(tenantQueryTestResolver, "", path)
 
 	resp, body := doPathRequest(t, app, path+"?tenant=acme", "default")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(1) || body["slug"] != "default" {
+	if body["id"] != testID(1).String() || body["slug"] != "default" {
 		t.Fatalf("locals = %v, want header tenant 1/default", body)
 	}
 }
@@ -264,7 +265,7 @@ type countingResolver struct {
 func (c *countingResolver) Resolve(_ context.Context, slug string) (tenant.Tenant, error) {
 	c.calls++
 	if slug == "acme" {
-		return tenant.Tenant{ID: 2, Slug: "acme", Name: "Acme"}, nil
+		return tenant.Tenant{ID: testID(2), Slug: "acme", Name: "Acme"}, nil
 	}
 	return tenant.Tenant{}, apperror.ErrNotFound
 }
@@ -342,14 +343,14 @@ func TestMiddleware_ExemptionsAreCaseInsensitive(t *testing.T) {
 // TestMiddleware_TenantQueryFallbackIsCaseInsensitive covers the same
 // canonicalization for the browser-auth query fallback.
 func TestMiddleware_TenantQueryFallbackIsCaseInsensitive(t *testing.T) {
-	const path = "/api/v1/auth/reset-password"
+	const path = "/api/v1/auth/password-resets/complete"
 	app := newPathTestApp(tenantQueryTestResolver, "", path)
 
-	resp, body := doPathRequest(t, app, "/API/V1/Auth/Reset-Password?tenant=acme", "")
+	resp, body := doPathRequest(t, app, "/API/V1/Auth/Password-Resets/Complete?tenant=acme", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if body["id"] != float64(2) || body["slug"] != "acme" {
+	if body["id"] != testID(2).String() || body["slug"] != "acme" {
 		t.Fatalf("locals = %v, want tenant 2/acme", body)
 	}
 }

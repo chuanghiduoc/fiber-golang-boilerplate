@@ -1,0 +1,24 @@
+apiVersion: policy.sigstore.dev/v1beta1
+kind: ClusterImagePolicy
+metadata:
+  name: fiber-boilerplate-release
+  labels:
+    app.kubernetes.io/name: fiber-boilerplate
+    app.kubernetes.io/part-of: fiber-boilerplate
+spec:
+  # The glob matches the release repository only. Replace OWNER/REPO with the
+  # lowercase GHCR path; a wildcard segment would let another repository's
+  # release sign an image this policy accepts.
+  images:
+    - glob: "ghcr.io/OWNER/REPO**"
+  authorities:
+    # Exactly the cosign keyless identity deploy.yml verifies: the release
+    # workflow in this repository, on a v<semver> tag (pre-releases included;
+    # production deploys still narrow to a stable tag in deploy.yml). The
+    # certificate identity is a regexp over the Fulcio SAN.
+    - keyless:
+        identities:
+          - issuer: https://token.actions.githubusercontent.com
+            subjectRegExp: '^https://github\.com/OWNER/REPO/\.github/workflows/release\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+      ctlog:
+        url: https://rekor.sigstore.dev

@@ -20,11 +20,7 @@ func TestRevokeMigrationTableAccessIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	_, owner, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
-	if err != nil {
-		t.Fatalf("setup test db: %v", err)
-	}
-	t.Cleanup(cleanup)
+	owner := pgtest.New(t).Owner
 
 	privilege := func(role, verb string) bool {
 		t.Helper()

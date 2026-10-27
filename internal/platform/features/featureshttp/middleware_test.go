@@ -9,6 +9,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
 )
@@ -17,28 +18,33 @@ import (
 // tests so they stay independent of any business module.
 const keyTestUploads features.Key = "featureshttp_test_uploads"
 
-func init() {
-	if err := features.Register("featureshttptest",
-		features.Definition{Key: keyTestUploads, Description: "test", Default: true},
-	); err != nil {
+var testCatalog = newTestCatalog()
+
+func newTestCatalog() *features.Catalog {
+	catalog := features.NewCatalog()
+	if err := catalog.Add(features.Provider{Owner: "featureshttptest", Definitions: []features.Definition{
+		{Key: keyTestUploads, Description: "test", Default: true},
+	}}); err != nil {
 		panic(err)
 	}
+	catalog.Seal()
+	return catalog
 }
 
 func TestMiddlewareEvaluatesRequestTenantAndUser(t *testing.T) {
 	snapshot := features.Snapshot{
 		UserTargets: map[features.Key]map[features.UserTargetKey]bool{
-			keyTestUploads: {{TenantID: 7, UserID: 9}: false},
+			keyTestUploads: {{TenantID: testID(7), UserID: testID(9)}: false},
 		},
 	}
 	store := features.StoreFunc(func(context.Context) (features.Snapshot, error) { return snapshot, nil })
-	flags := features.NewEvaluator(features.Options{Store: store})
+	flags := features.NewEvaluator(features.Options{Catalog: testCatalog, Store: store})
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(func(c fiber.Ctx) error {
-		c.SetContext(tenant.WithID(c.Context(), 7))
+		c.SetContext(tenant.WithID(c.Context(), testID(7)))
 		if c.Get("X-User") == "9" {
-			fiber.Locals[int64](c, "user_id", 9)
+			c.SetContext(requestctx.WithActorID(c.Context(), testID(9)))
 		}
 		return c.Next()
 	})

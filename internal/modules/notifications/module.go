@@ -3,9 +3,11 @@
 package notifications
 
 import (
-	"github.com/gofiber/fiber/v3"
-
+	"context"
+	"encoding/json"
+	"fmt"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
@@ -13,8 +15,10 @@ import (
 	notificationshandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/handler"
 	notificationsprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/privacy"
 	notificationsservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/google/uuid"
 )
 
 // Module owns the authenticated notification and preference routes.
@@ -27,6 +31,8 @@ type Module struct {
 }
 
 var (
+	_ app.RouteProvider    = (*Module)(nil)
+	_ app.EventProvider    = (*Module)(nil)
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
 	_ app.PrivacyProvider  = (*Module)(nil)
@@ -50,27 +56,41 @@ func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
 	registry.Register(privacycontracts.Provider{Name: "notifications", Exporter: m.privacy, Eraser: m.privacy})
 }
 
-func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	rl := deps.Limiters
-	auth := deps.Authenticate()
-	// The admin send is a privileged cross-user write, so it is Tier 2: a
-	// required intent row is written after idempotency and before the
-	// handler. The caller's own feed/preference writes stay fallback-audited.
-	sendGuard := audithttp.Guard(deps.Audit, audithttp.Policy{
-		Mode:     audithttp.ModeRequired,
-		Action:   "notification.sent",
-		Resource: "notification",
+// RegisterRoutes implements app.RouteProvider. The notifications module owns
+// the caller's feed and preferences plus the member-scoped send.
+func (m *Module) RegisterRoutes(api *httpapi.API, _ app.Deps) {
+	m.handler.Register(api)
+}
+
+// RegisterEvents implements app.EventProvider: identity publishes
+// identity.data_export.ready after the export row is ready, and this durable
+// subscription creates the in-app notification (and its email, according to
+// the user's preferences). The two modules stay decoupled: no late binding and
+// no import of identity's internals.
+func (m *Module) RegisterEvents(bus *events.Bus) {
+	if err := bus.SubscribeDurable(identitycontracts.EventDataExportReady, "notifications", m.handleDataExportReady); err != nil {
+		panic(fmt.Sprintf("notifications: subscribe %s: %v", identitycontracts.EventDataExportReady, err))
+	}
+}
+
+func (m *Module) handleDataExportReady(ctx context.Context, event events.Event) error {
+	var payload identitycontracts.DataExportReady
+	if err := json.Unmarshal(event.Data, &payload); err != nil {
+		return jobs.Permanent(fmt.Errorf("decode %s: %w", identitycontracts.EventDataExportReady, err))
+	}
+	if payload.ExportID == uuid.Nil || payload.UserID == uuid.Nil || event.TenantID == uuid.Nil {
+		return jobs.Permanent(fmt.Errorf("%s: missing export, user, or tenant", identitycontracts.EventDataExportReady))
+	}
+	data, err := json.Marshal(map[string]string{"exportId": payload.ExportID.String()})
+	if err != nil {
+		return jobs.Permanent(fmt.Errorf("encode notification data: %w", err))
+	}
+	return m.notifier.Notify(ctx, notificationcontracts.CreateNotificationInput{
+		TenantID: event.TenantID,
+		UserID:   payload.UserID,
+		Type:     "privacy.data_export_ready",
+		Title:    "Your data export is ready",
+		Body:     "Download it from your account within 7 days.",
+		Data:     data,
 	})
-
-	notifications := v1.Group("/notifications", auth)
-	notifications.Get("/unread-count", rl.Relaxed, authzhttp.Require(notificationscatalog.PermissionNotificationsRead), m.handler.UnreadCount)
-	notifications.Get("/", rl.Relaxed, authzhttp.Require(notificationscatalog.PermissionNotificationsRead), m.handler.List)
-	notifications.Get("/:id", rl.Relaxed, authzhttp.Require(notificationscatalog.PermissionNotificationsRead), m.handler.Get)
-	notifications.Post("/read-all", rl.Normal, authzhttp.Require(notificationscatalog.PermissionNotificationsWrite), deps.Idempotency, m.handler.MarkAllRead)
-	notifications.Post("/:id/read", rl.Normal, authzhttp.Require(notificationscatalog.PermissionNotificationsWrite), deps.Idempotency, m.handler.MarkRead)
-	notifications.Post("/send", rl.Normal, authzhttp.Require(notificationscatalog.PermissionNotificationsSend), deps.Idempotency, sendGuard, m.handler.Send)
-
-	preferences := v1.Group("/notification-preferences", auth)
-	preferences.Get("/", rl.Relaxed, authzhttp.Require(notificationscatalog.PermissionNotificationsRead), m.handler.ListPreferences)
-	preferences.Put("/", rl.Normal, authzhttp.Require(notificationscatalog.PermissionNotificationsWrite), deps.Idempotency, m.handler.SetPreference)
 }

@@ -3,10 +3,10 @@ package repository
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgtype"
-
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/google/uuid"
 )
 
 // PrivacyExportRepository implements the identity-only reads the GDPR export
@@ -22,7 +22,7 @@ func NewPrivacyExportRepository(db identitysqlc.DBTX) *PrivacyExportRepository {
 	return &PrivacyExportRepository{q: identitysqlc.New(db)}
 }
 
-func (r *PrivacyExportRepository) ListExternalIdentities(ctx context.Context, userID int64) ([]identityservice.ExternalIdentityExport, error) {
+func (r *PrivacyExportRepository) ListExternalIdentities(ctx context.Context, userID uuid.UUID) ([]identityservice.ExternalIdentityExport, error) {
 	rows, err := r.q.ListUserExternalIdentities(ctx, userID)
 	if err != nil {
 		return nil, err
@@ -38,7 +38,7 @@ func (r *PrivacyExportRepository) ListExternalIdentities(ctx context.Context, us
 	return out, nil
 }
 
-func (r *PrivacyExportRepository) ListRoleAssignments(ctx context.Context, tenantID, userID int64) ([]identityservice.RoleAssignmentExport, error) {
+func (r *PrivacyExportRepository) ListRoleAssignments(ctx context.Context, tenantID, userID uuid.UUID) ([]identityservice.RoleAssignmentExport, error) {
 	rows, err := r.q.ListUserRoleAssignments(ctx, identitysqlc.ListUserRoleAssignmentsParams{TenantID: tenantID, UserID: userID})
 	if err != nil {
 		return nil, err
@@ -50,7 +50,7 @@ func (r *PrivacyExportRepository) ListRoleAssignments(ctx context.Context, tenan
 	return out, nil
 }
 
-func (r *PrivacyExportRepository) ListInvitationsSent(ctx context.Context, tenantID, userID int64) ([]identityservice.InvitationExport, error) {
+func (r *PrivacyExportRepository) ListInvitationsSent(ctx context.Context, tenantID, userID uuid.UUID) ([]identityservice.InvitationExport, error) {
 	rows, err := r.q.ListUserInvitationsSent(ctx, identitysqlc.ListUserInvitationsSentParams{TenantID: tenantID, UserID: userID})
 	if err != nil {
 		return nil, err
@@ -60,14 +60,14 @@ func (r *PrivacyExportRepository) ListInvitationsSent(ctx context.Context, tenan
 		out[i] = identityservice.InvitationExport{
 			ID: rows[i].ID, Email: rows[i].EmailNormalized, Role: rows[i].Role,
 			InvitedBy: rows[i].InvitedBy, ExpiresAt: rows[i].ExpiresAt.Time,
-			AcceptedAt: timePtr(rows[i].AcceptedAt), AcceptedBy: pgInt8Ptr(rows[i].AcceptedBy),
+			AcceptedAt: database.TimePtr(rows[i].AcceptedAt), AcceptedBy: rows[i].AcceptedBy,
 			CreatedAt: rows[i].CreatedAt.Time,
 		}
 	}
 	return out, nil
 }
 
-func (r *PrivacyExportRepository) ListInvitationsReceived(ctx context.Context, tenantID, userID int64, email string) ([]identityservice.InvitationExport, error) {
+func (r *PrivacyExportRepository) ListInvitationsReceived(ctx context.Context, tenantID, userID uuid.UUID, email string) ([]identityservice.InvitationExport, error) {
 	rows, err := r.q.ListUserInvitationsReceived(ctx, identitysqlc.ListUserInvitationsReceivedParams{
 		TenantID: tenantID, UserID: userID, Email: email,
 	})
@@ -79,17 +79,9 @@ func (r *PrivacyExportRepository) ListInvitationsReceived(ctx context.Context, t
 		out[i] = identityservice.InvitationExport{
 			ID: rows[i].ID, Email: rows[i].EmailNormalized, Role: rows[i].Role,
 			InvitedBy: rows[i].InvitedBy, ExpiresAt: rows[i].ExpiresAt.Time,
-			AcceptedAt: timePtr(rows[i].AcceptedAt), AcceptedBy: pgInt8Ptr(rows[i].AcceptedBy),
+			AcceptedAt: database.TimePtr(rows[i].AcceptedAt), AcceptedBy: rows[i].AcceptedBy,
 			CreatedAt: rows[i].CreatedAt.Time,
 		}
 	}
 	return out, nil
-}
-
-func pgInt8Ptr(v pgtype.Int8) *int64 {
-	if !v.Valid {
-		return nil
-	}
-	n := v.Int64
-	return &n
 }

@@ -9,7 +9,6 @@ package bootstrap
 
 import (
 	"context"
-	"time"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
@@ -61,9 +60,11 @@ type Modules struct {
 func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	privacyRegistry := privacycontracts.NewRegistry()
 	tenancyRegistry := tenancycontracts.NewRegistry()
-	identityModule, identityProvides, err := identity.Build(infra, identity.Settings{
-		OAuth: cfg.OAuth,
-	}, privacyRegistry, tenancyRegistry)
+	identityModule, err := identity.Build(infra, identity.Settings{
+		OAuth:          cfg.OAuth,
+		DataEncryption: cfg.DataEncryption,
+		WebAuthn:       cfg.WebAuthn,
+	}, identity.Deps{Privacy: privacyRegistry, Tenancy: tenancyRegistry})
 	if err != nil {
 		return nil, err
 	}
@@ -73,82 +74,112 @@ func Build(cfg *config.Config, infra app.Infra) (*Modules, error) {
 	}
 	webhooksModule, err := webhooks.Build(infra, webhooks.Settings{
 		Webhook: cfg.Webhook,
-		// JWT_SECRET is the local/test-only fallback; production requires
-		// the dedicated key (config validation).
-		SecretKey:          cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret),
+		// The dedicated key is required in every environment; config
+		// validation rejects an unset key and the published samples.
+		SecretKey:          cfg.Webhook.ResolvedSecretKey(),
 		PreviousSecretKeys: cfg.Webhook.PreviousSecretKeyList(),
 		RequireHTTPS:       requireWebhookHTTPS,
-	}, identityProvides.TenantActive)
+	}, webhooks.Deps{TenantActive: identityModule.TenantActive()})
 	if err != nil {
 		return nil, err
 	}
 	// Identity and files publish domain events on infra.Events inside their
 	// transactions; webhooks subscribes to them (app.EventProvider), so no
 	// producer is wired to the webhooks module.
-	filesModule, filesProvides, err := files.Build(infra, files.Settings{
+	filesModule, err := files.Build(infra, files.Settings{
 		MaxFileSize:        cfg.Storage.MaxFileSize,
 		AllowedTypes:       cfg.Storage.AllowedTypes(),
 		TenantQuotaBytes:   cfg.Files.TenantQuotaBytes,
 		UserQuotaBytes:     cfg.Files.UserQuotaBytes,
 		ScanDriver:         cfg.Files.EnabledScanDriver(),
 		ClamAVAddr:         cfg.Files.ClamAVAddr,
-		ClamAVTimeout:      time.Duration(cfg.Files.ClamAVTimeoutSecs) * time.Second,
+		ClamAVTimeout:      cfg.Files.ClamAVTimeout,
 		TrashRetentionDays: cfg.Retention.FilesTrashRetentionDays(),
-	})
+	}, files.Deps{})
 	if err != nil {
 		return nil, err
 	}
 
-	apikeysModule, apikeysProvides := apikeys.Build(infra, identityProvides.Principals, identityProvides.MemberRanks, apikeys.Settings{
+	apikeysModule, err := apikeys.Build(infra, apikeys.Settings{
 		MaxLifetime: cfg.APIKeys.MaxLifetime,
-	})
+	}, apikeys.Deps{Principals: identityModule.Principals(), MemberRanks: identityModule.MemberRanks()})
+	if err != nil {
+		return nil, err
+	}
 
 	// cmd/gen (make gen module=<name>) inserts generated modules above the
 	// two gen: markers below; keep both lines.
 	// gen:module-build
 
-	notificationsModule := notifications.Build(infra, identityProvides.Recipients, notifications.Settings{
+	notificationsModule, err := notifications.Build(infra, notifications.Settings{
 		RetentionDays: cfg.Retention.NotificationsRetentionDays(),
-	})
-	identityModule.SetNotifier(notificationsModule.Notifier())
+	}, notifications.Deps{Recipients: identityModule.Recipients()})
+	if err != nil {
+		return nil, err
+	}
 
-	// Tenant purgers are registered after every module is built, non-identity
-	// first and identity last: only identity deletes memberships, so every
-	// other module can still reach the rows its foreign keys reference.
-	filesModule.RegisterTenantPurge(tenancyRegistry)
-	apikeysModule.RegisterTenantPurge(tenancyRegistry)
-	featuresModule := features.Build(infra)
-	featuresModule.RegisterTenantPurge(tenancyRegistry)
-	webhooksModule.RegisterTenantPurge(tenancyRegistry)
-	notificationsModule.RegisterTenantPurge(tenancyRegistry)
-	// cmd/gen (make gen module=<name>) inserts generated modules' purger
-	// registration above this marker; keep the line.
-	// gen:module-purge
-	identityModule.RegisterTenantPurge(tenancyRegistry)
+	// Each module contributes its tenant-wide purgers through
+	// app.TenantPurgeProvider. The composition root owns the order: non-identity
+	// first and identity last, because only identity deletes memberships, so
+	// every other module can still reach the rows its foreign keys reference.
+	featuresModule, err := features.Build(infra, features.Settings{}, features.Deps{})
+	if err != nil {
+		return nil, err
+	}
+	registerTenantPurgers(tenancyRegistry,
+		filesModule,
+		apikeysModule,
+		featuresModule,
+		webhooksModule,
+		notificationsModule,
+		// cmd/gen (make gen module=<name>) inserts generated modules above this
+		// marker; keep the line.
+		// gen:module-purge
+	)
+	registerTenantPurgers(tenancyRegistry, identityModule)
 	// The durable jobs table is platform-owned rather than part of a module,
 	// so its purger is registered here, after every module: queued encrypted
 	// email payloads must not survive the tenant that produced them, and
 	// running jobs are left to finish.
 	tenancyRegistry.Register(tenancycontracts.Provider{Name: "jobs", Purger: jobs.NewTenantPurger(infra.DB)})
 
+	adminModule, err := admin.Build(infra, admin.Settings{}, admin.Deps{})
+	if err != nil {
+		return nil, err
+	}
+
 	return &Modules{
 		List: []app.Module{
 			identityModule,
 			filesModule,
-			admin.Build(identityProvides.Admin, filesProvides.Admin),
+			adminModule,
 			featuresModule,
 			webhooksModule,
 			apikeysModule,
 			notificationsModule,
 			// gen:module-list
 		},
-		Sessions:       identityProvides.Sessions,
-		TenantResolver: identityProvides.TenantResolver,
-		APIKeyVerifier: apikeysProvides.Verifier,
+		Sessions:       identityModule.SessionStore(),
+		TenantResolver: identityModule.TenantResolver(),
+		APIKeyVerifier: apikeysModule.Verifier(),
 		Privacy:        privacyRegistry,
 		Tenancy:        tenancyRegistry,
 		Startup:        identityModule.Startup,
 		Background:     []func(context.Context){webhooksModule.RunRetention},
 		Close:          []func(){webhooksModule.Close},
 	}, nil
+}
+
+// registerTenantPurgers registers every purger the given modules expose, in
+// argument order. Modules that have no tenant-owned data contribute nothing.
+func registerTenantPurgers(registry *tenancycontracts.Registry, modules ...app.Module) {
+	for _, module := range modules {
+		provider, ok := module.(app.TenantPurgeProvider)
+		if !ok {
+			continue
+		}
+		for _, purger := range provider.TenantPurgers() {
+			registry.Register(purger)
+		}
+	}
 }

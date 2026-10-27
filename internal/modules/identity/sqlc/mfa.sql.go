@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const confirmMFAFactor = `-- name: ConfirmMFAFactor :execrows
@@ -16,9 +18,9 @@ WHERE id = $2 AND user_id = $3 AND confirmed_at IS NULL
 `
 
 type ConfirmMFAFactorParams struct {
-	Step   int64 `json:"step"`
-	ID     int64 `json:"id"`
-	UserID int64 `json:"user_id"`
+	Step   int64     `json:"step"`
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ConfirmMFAFactor(ctx context.Context, arg ConfirmMFAFactorParams) (int64, error) {
@@ -37,8 +39,8 @@ WHERE user_id = $2 AND type = 'totp' AND confirmed_at IS NOT NULL
 `
 
 type ConsumeMFAStepParams struct {
-	Step   int64 `json:"step"`
-	UserID int64 `json:"user_id"`
+	Step   int64     `json:"step"`
+	UserID uuid.UUID `json:"user_id"`
 }
 
 // Replay guard: the verified step must be newer than every step this factor
@@ -56,7 +58,7 @@ SELECT count(*) FROM mfa_recovery_codes
 WHERE user_id = $1 AND used_at IS NULL
 `
 
-func (q *Queries) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int64, error) {
+func (q *Queries) CountUnusedRecoveryCodes(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countUnusedRecoveryCodes, userID)
 	var count int64
 	err := row.Scan(&count)
@@ -65,12 +67,12 @@ func (q *Queries) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (i
 
 const createRecoveryCodes = `-- name: CreateRecoveryCodes :exec
 INSERT INTO mfa_recovery_codes (user_id, code_hash)
-SELECT $1, unnest($2::text[])
+SELECT $1, unnest($2::bytea[])
 `
 
 type CreateRecoveryCodesParams struct {
-	UserID     int64    `json:"user_id"`
-	CodeHashes []string `json:"code_hashes"`
+	UserID     uuid.UUID `json:"user_id"`
+	CodeHashes [][]byte  `json:"code_hashes"`
 }
 
 func (q *Queries) CreateRecoveryCodes(ctx context.Context, arg CreateRecoveryCodesParams) error {
@@ -83,7 +85,7 @@ DELETE FROM mfa_factors
 WHERE user_id = $1 AND type = 'totp'
 `
 
-func (q *Queries) DeleteMFAFactor(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteMFAFactor(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteMFAFactor, userID)
 	return err
 }
@@ -95,7 +97,7 @@ WHERE user_id = $1 AND type = 'totp' AND confirmed_at IS NULL
 
 // A password change or reset removes an unconfirmed enrollment: whoever
 // started it no longer proves control of the account.
-func (q *Queries) DeletePendingMFAFactor(ctx context.Context, userID int64) error {
+func (q *Queries) DeletePendingMFAFactor(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deletePendingMFAFactor, userID)
 	return err
 }
@@ -105,7 +107,7 @@ DELETE FROM mfa_recovery_codes
 WHERE user_id = $1
 `
 
-func (q *Queries) DeleteRecoveryCodes(ctx context.Context, userID int64) error {
+func (q *Queries) DeleteRecoveryCodes(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, deleteRecoveryCodes, userID)
 	return err
 }
@@ -115,7 +117,7 @@ SELECT id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, creat
 WHERE user_id = $1 AND type = 'totp' AND confirmed_at IS NOT NULL
 `
 
-func (q *Queries) GetConfirmedMFAFactor(ctx context.Context, userID int64) (MfaFactor, error) {
+func (q *Queries) GetConfirmedMFAFactor(ctx context.Context, userID uuid.UUID) (MfaFactor, error) {
 	row := q.db.QueryRow(ctx, getConfirmedMFAFactor, userID)
 	var i MfaFactor
 	err := row.Scan(
@@ -136,7 +138,7 @@ SELECT id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, creat
 WHERE user_id = $1 AND type = 'totp'
 `
 
-func (q *Queries) GetMFAFactor(ctx context.Context, userID int64) (MfaFactor, error) {
+func (q *Queries) GetMFAFactor(ctx context.Context, userID uuid.UUID) (MfaFactor, error) {
 	row := q.db.QueryRow(ctx, getMFAFactor, userID)
 	var i MfaFactor
 	err := row.Scan(
@@ -163,7 +165,7 @@ FOR UPDATE
 // Confirmation locks the pending factor so a concurrent enrollment cannot
 // replace the secret between verification and the confirm update. A confirmed
 // row (if one coexists) wins so the caller reports "already enabled".
-func (q *Queries) GetMFAFactorForUpdate(ctx context.Context, userID int64) (MfaFactor, error) {
+func (q *Queries) GetMFAFactorForUpdate(ctx context.Context, userID uuid.UUID) (MfaFactor, error) {
 	row := q.db.QueryRow(ctx, getMFAFactorForUpdate, userID)
 	var i MfaFactor
 	err := row.Scan(
@@ -190,8 +192,8 @@ RETURNING id, user_id, type, secret_ciphertext, confirmed_at, last_used_step, cr
 `
 
 type UpsertUnconfirmedMFAFactorParams struct {
-	UserID           int64  `json:"user_id"`
-	SecretCiphertext string `json:"secret_ciphertext"`
+	UserID           uuid.UUID `json:"user_id"`
+	SecretCiphertext string    `json:"secret_ciphertext"`
 }
 
 // One pending enrollment per user. Re-enrollment replaces the pending secret
@@ -220,8 +222,8 @@ WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL
 `
 
 type UseRecoveryCodeParams struct {
-	UserID   int64  `json:"user_id"`
-	CodeHash string `json:"code_hash"`
+	UserID   uuid.UUID `json:"user_id"`
+	CodeHash []byte    `json:"code_hash"`
 }
 
 // Single use: only the first concurrent request can claim a code.

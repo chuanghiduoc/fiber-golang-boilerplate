@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	featuressqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/features/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -23,7 +25,7 @@ func NewTenantPurger(db featuressqlc.DBTX) *TenantPurger {
 }
 
 // PurgeTenant deletes one bounded page of targets at a time until none remain.
-func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID int64) error {
+func (p *TenantPurger) PurgeTenant(ctx context.Context, tenantID uuid.UUID) error {
 	ctx = tenant.WithID(ctx, tenantID)
 	for {
 		deleted, err := p.q.DeleteTenantFeatureFlagTargetsBatch(ctx, featuressqlc.DeleteTenantFeatureFlagTargetsBatchParams{

@@ -1,14 +1,15 @@
 -- name: CreateSession :one
 -- A session is only created for an active member whose token version still
--- equals the one the caller authenticated at. This closes the bcrypt-length
+-- equals the one the caller authenticated at. This closes the password-check
 -- window where a password change commits after the password check, and the
 -- MFA window where a login read "MFA not required" before a factor was
 -- confirmed: bumping users.token_version on every credential/MFA change makes
 -- the stale version check fail. The factor guard is the second line: once a
--- confirmed factor exists, a session whose amr has no otp/rc can never be
--- created, whatever the caller decided earlier. mfa_verified_at is set only
--- when the session already carries an otp/rc method (MFA verify or Google +
--- MFA); a first-factor session leaves it NULL.
+-- confirmed TOTP factor exists, a session whose amr has no otp/rc/hwk/swk can
+-- never be created, whatever the caller decided earlier. mfa_verified_at is
+-- set only when the session already carries a second-factor method (MFA
+-- verify, passkey login, or Google + MFA); a first-factor session leaves it
+-- NULL.
 INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at)
 SELECT m.tenant_id, m.user_id, u.token_version, @expires_at, @user_agent, @ip, @amr, @mfa_verified_at
 FROM memberships m
@@ -19,6 +20,8 @@ WHERE m.tenant_id = @tenant_id AND m.user_id = @user_id
   AND (
       'otp' = ANY(@amr::text[])
       OR 'rc' = ANY(@amr::text[])
+      OR 'hwk' = ANY(@amr::text[])
+      OR 'swk' = ANY(@amr::text[])
       OR NOT EXISTS (
           SELECT 1 FROM mfa_factors f
           WHERE f.user_id = u.id AND f.confirmed_at IS NOT NULL
@@ -32,10 +35,10 @@ WHERE tenant_id = $1 AND id = $2;
 
 -- name: ListLiveSessionsCursor :many
 SELECT * FROM sessions
-WHERE tenant_id = @tenant_id::bigint AND user_id = @user_id::bigint
+WHERE tenant_id = @tenant_id::uuid AND user_id = @user_id::uuid
   AND revoked_at IS NULL
   AND expires_at > NOW()
-  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::bigint)
+  AND (created_at, id) < (@cursor_created_at::timestamptz, @cursor_id::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT @row_limit::int;
 
@@ -126,12 +129,25 @@ WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
   AND revoked_at IS NULL
 RETURNING mfa_verified_at;
 
+-- name: MarkSessionMFAVerifiedWithMethod :one
+-- Passkey step-up: record the fresh proof and add the phishing-resistant amr
+-- method to the session, so later RequireMFA checks accept the session without
+-- re-issuing its tokens. Tenant-scoped and fail-closed on a foreign/revoked
+-- session.
+UPDATE sessions
+SET mfa_verified_at = NOW(), updated_at = NOW(),
+    amr = ARRAY(SELECT DISTINCT unnest(amr || @method::text))
+WHERE tenant_id = @tenant_id AND user_id = @user_id AND id = @id
+  AND revoked_at IS NULL
+RETURNING mfa_verified_at;
+
+
 -- name: GetSessionState :one
 -- The access-token validator's single lookup: the session (with its tenant
 -- and revocation), the membership status and effective permissions (tenant
 -- roles plus platform assignments), the user's token version and status, and
 -- the tenant's status. role_keys is ordered owner, admin, member.
-SELECT s.tenant_id, s.revoked_at, s.expires_at, s.mfa_verified_at, m.status AS membership_status,
+SELECT s.tenant_id, s.revoked_at, s.expires_at, s.mfa_verified_at, s.amr, m.status AS membership_status,
        u.token_version, u.status AS user_status,
        CASE
            WHEN t.status = 'active'

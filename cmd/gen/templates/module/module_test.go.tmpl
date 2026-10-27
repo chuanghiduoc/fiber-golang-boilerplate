@@ -6,16 +6,20 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"{{.M.ModulePath}}/config"
 	"{{.M.ModulePath}}/internal/app"
+	"{{.M.ModulePath}}/internal/cache"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 	"{{.M.ModulePath}}/internal/platform/authz"
 	"{{.M.ModulePath}}/internal/platform/i18n"
+	"{{.M.ModulePath}}/internal/platform/tenant"
+	"{{.M.ModulePath}}/internal/testutil/sessiontest"
 	"{{.M.ModulePath}}/pkg/apperror"
-	"{{.M.ModulePath}}/pkg/cache"
 	"{{.M.ModulePath}}/pkg/token"
 )
 
@@ -41,15 +45,20 @@ func testApp(t *testing.T, infra app.Infra, deps app.Deps) *fiber.App {
 	if deps.Cache == nil {
 		deps.Cache = cache.NewMemoryCache()
 	}
+	if deps.Sessions == nil {
+		deps.Sessions = sessiontest.AllowAll()
+	}
 	application := app.New(testConfig(), deps)
 	application.Register(m)
 	return application.Fiber()
 }
 
 // bearer mints an access token for userID with role in tenantID.
-func bearer(t *testing.T, userID, tenantID int64, role string) string {
+func bearer(t *testing.T, userID, tenantID uuid.UUID, role string) string {
 	t.Helper()
-	tok, err := token.GenerateWithTenant(userID, tenantID, "user@example.com", role, testJWTSecret, 1)
+	tok, err := token.GenerateForSession(token.SessionClaims{
+		UserID: userID, TenantID: tenantID, SessionID: uuid.New(), TokenVersion: 1,
+	}, testJWTSecret, time.Hour)
 	if err != nil {
 		t.Fatalf("token: %v", err)
 	}
@@ -65,7 +74,11 @@ func do(t *testing.T, fiberApp *fiber.App, method, target, authorization, body s
 	}
 	req := httptest.NewRequest(method, target, reader)
 	if body != "" {
-		req.Header.Set(fiber.HeaderContentType, fiber.MIMEApplicationJSON)
+		contentType := fiber.MIMEApplicationJSON
+		if method == http.MethodPatch {
+			contentType = "application/merge-patch+json"
+		}
+		req.Header.Set(fiber.HeaderContentType, contentType)
 	}
 	if authorization != "" {
 		req.Header.Set(fiber.HeaderAuthorization, authorization)
@@ -90,11 +103,12 @@ func TestCatalogRegistersAndLocalizes(t *testing.T) {
 	if m.Name() != {{.M.Ident}}catalog.Owner {
 		t.Fatalf("Name() = %q, want %q", m.Name(), {{.M.Ident}}catalog.Owner)
 	}
-	if err := app.RegisterCatalogs(m); err != nil {
-		t.Fatalf("RegisterCatalogs: %v", err)
+	catalogs, err := app.BuildCatalogs(m)
+	if err != nil {
+		t.Fatalf("BuildCatalogs: %v", err)
 	}
 	for _, grant := range {{.M.Ident}}catalog.Permissions() {
-		if !authz.IsKnownPermission(grant.Permission) {
+		if !catalogs.Permissions.IsKnownPermission(grant.Permission) {
 			t.Errorf("%s is not registered", grant.Permission)
 		}
 	}
@@ -102,42 +116,31 @@ func TestCatalogRegistersAndLocalizes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("locales: %v", err)
 	}
-	for code := range {{.M.Ident}}catalog.ErrorCodes() {
-		if _, ok := apperror.SpecFor(code); !ok {
-			t.Errorf("%s is not registered", code)
+	for _, spec := range {{.M.Ident}}catalog.Errors() {
+		if _, ok := catalogs.Errors.SpecFor(spec.Code); !ok {
+			t.Errorf("%s is not registered", spec.Code)
 		}
 		for _, locale := range bundle.SupportedLocales() {
-			if key := "errors." + string(code) + ".title"; !bundle.Has(locale, key) {
+			if key := "errors." + string(spec.Code) + ".title"; !bundle.Has(locale, key) {
 				t.Errorf("%s is missing %q", locale, key)
 			}
 		}
 	}
 }
 
-// TestEveryRouteRequiresAuthentication walks the module's route table, so a
-// route added later (by cmd/gen or by hand) is covered automatically.
-func TestEveryRouteRequiresAuthentication(t *testing.T) {
+// TestHealthRequiresAuthentication proves the generated operation is on the
+// authenticated huma path, not a bare Fiber route.
+func TestHealthRequiresAuthentication(t *testing.T) {
 	fiberApp := testApp(t, app.Infra{}, app.Deps{})
-	prefix := "/api/v1/{{.M.Route}}"
-	seen := 0
-	for _, route := range fiberApp.GetRoutes(true) {
-		if route.Path != prefix && !strings.HasPrefix(route.Path, prefix+"/") {
-			continue
-		}
-		seen++
-		target := strings.ReplaceAll(route.Path, ":id", "1")
-		if status, body := do(t, fiberApp, route.Method, target, "", ""); status != http.StatusUnauthorized {
-			t.Errorf("%s %s without a token = %d %s, want 401", route.Method, route.Path, status, body)
-		}
-	}
-	if seen == 0 {
-		t.Fatalf("no routes under %s", prefix)
+	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", "", "")
+	if status != http.StatusUnauthorized {
+		t.Errorf("GET health without a token = %d %s, want 401", status, body)
 	}
 }
 
 func TestHealthRequiresPermission(t *testing.T) {
 	fiberApp := testApp(t, app.Infra{}, app.Deps{})
-	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", bearer(t, 7, 1, authz.RoleMember), "")
+	status, body := do(t, fiberApp, http.MethodGet, "/api/v1/{{.M.Route}}/health", bearer(t, uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000d1"), tenant.DefaultID, authz.RoleMember), "")
 	if status != http.StatusForbidden {
 		t.Fatalf("GET health as a user = %d %s, want 403 ({{.M.Name}}:read is admin-only)", status, body)
 	}

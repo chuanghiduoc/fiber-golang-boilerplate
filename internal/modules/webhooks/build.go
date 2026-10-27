@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
@@ -20,7 +22,7 @@ import (
 
 const (
 	// retentionInterval is how often delivered/attempt rows past
-	// WEBHOOK_RETENTION_DAYS are pruned.
+	// WEBHOOK_RETENTION are pruned.
 	retentionInterval = time.Hour
 	// eventJobMaxAttempts is the budget of each durable event subscription
 	// job: fan-out only fails on database errors, which are usually
@@ -29,8 +31,7 @@ const (
 )
 
 // Settings are the configuration webhooks owns. The composition root resolves
-// the secret keys (including the local-only JWT_SECRET fallback), so the
-// module never reads another section.
+// the dedicated secret keys, so the module never reads another section.
 type Settings struct {
 	// Webhook holds delivery, retention, inbound, and SSRF settings.
 	Webhook config.WebhookConfig
@@ -47,13 +48,19 @@ type Settings struct {
 // key; the HTTP client pins DNS results to vetted public IPs and never
 // follows redirects. tenantActive is identity's tenant check, so the inbound
 // receiver rejects suspended tenants like every request.
-func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Context, tenantID int64) (bool, error)) (*Module, error) {
+// Deps are the contracts webhooks consumes from identity.
+type Deps struct {
+	TenantActive func(ctx context.Context, tenantID uuid.UUID) (bool, error)
+}
+
+func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
+	tenantActive := deps.TenantActive
 	cfg := settings.Webhook
 	codec, err := webhookservice.NewSecretCodec(settings.SecretKey, settings.PreviousSecretKeys...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize webhook secret encryption: %w", err)
 	}
-	ports, err := cfg.AllowedPorts()
+	ports, err := cfg.AllowedPortsList()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize webhook port policy: %w", err)
 	}
@@ -63,18 +70,18 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 	}
 	client := webhook.NewClient(webhook.ClientConfig{
 		Guard:          guard,
-		Timeout:        cfg.RequestTimeout(),
-		ConnectTimeout: cfg.ConnectTimeout(),
+		Timeout:        cfg.RequestTimeout,
+		ConnectTimeout: cfg.ConnectTimeout,
 	})
-	repo := webhookrepo.New(infra.DB, infra.Tx, infra.Queue)
+	repo := webhookrepo.New(infra.DB, infra.Tx, infra.Queue, infra.Audit)
 	var tenants webhookservice.TenantChecker
 	if tenantActive != nil {
 		tenants = webhookservice.TenantCheckerFunc(tenantActive)
 	}
 	svc := webhookservice.New(repo, repo, repo, codec, infra.Audit, webhookservice.Options{
 		DefaultMaxAttempts: cfg.MaxAttempts,
-		DefaultTimeoutMS:   int32(cfg.RequestTimeoutSeconds * 1000), // #nosec G115 -- validated 1..120 seconds
-		TimestampTolerance: cfg.TimestampTolerance(),
+		DefaultTimeoutMS:   int32(cfg.RequestTimeout.Milliseconds()), // #nosec G115 -- validated 1s..120s
+		TimestampTolerance: cfg.TimestampTolerance,
 		Tenants:            tenants,
 		URLGuard:           guard,
 		RequireHTTPS:       settings.RequireHTTPS,
@@ -86,10 +93,10 @@ func Build(infra app.Infra, settings Settings, tenantActive func(ctx context.Con
 	m.dispatcher = dispatcher
 	m.client = client
 	m.deliveryWorker = webhookservice.NewDeliveryWorker(repo, codec, client, webhookservice.WorkerOptions{
-		RetryBase: cfg.RetryBase(),
-		RetryMax:  cfg.RetryMax(),
+		RetryBase: cfg.RetryBase,
+		RetryMax:  cfg.RetryMax,
 	})
-	m.retentionDays = int32(cfg.RetentionDays) // #nosec G115 -- validated 1..3650 days
+	m.retentionDays = int32(cfg.Retention / (24 * time.Hour)) // #nosec G115 -- validated 1..3650 whole days
 	m.privacy = webhooksprivacy.New(webhookrepo.NewPrivacyStore(infra.DB))
 	m.tenantPurger = webhookrepo.NewTenantPurger(infra.DB)
 	return m, nil

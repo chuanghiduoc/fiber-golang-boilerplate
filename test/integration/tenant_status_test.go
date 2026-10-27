@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -21,18 +22,17 @@ import (
 
 func TestTenantStatus_SuspendedDefaultTenantReturnsNotFound(t *testing.T) {
 	ctx := context.Background()
-	pool, cleanup, err := testutil.SetupTestDB(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := testutil.NewFixture(t)
+	pool := fx.Bypass
 
-	var suspendedID int64
+	var suspendedID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name, status)
 		 VALUES ('suspended-default', 'Suspended Default', 'suspended') RETURNING id`,
 	).Scan(&suspendedID))
 	require.NotZero(t, suspendedID)
 
-	resolver := identityadapter.NewTenantResolver(identityrepo.NewStores(testutil.Scoped(pool)).Tenants)
+	resolver := identityadapter.NewTenantResolver(identityrepo.NewStores(fx.Scoped()).Tenants)
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	api := app.Group("/api/v1", tenanthttp.Middleware(resolver, "suspended-default"))
 	api.Get("/ping", func(c fiber.Ctx) error { return c.SendString("pong") })

@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -20,8 +21,8 @@ ON CONFLICT (user_id, role_id) DO NOTHING
 `
 
 type AssignPlatformRoleParams struct {
-	UserID  int64  `json:"user_id"`
-	RoleKey string `json:"role_key"`
+	UserID  uuid.UUID `json:"user_id"`
+	RoleKey string    `json:"role_key"`
 }
 
 func (q *Queries) AssignPlatformRole(ctx context.Context, arg AssignPlatformRoleParams) error {
@@ -36,9 +37,9 @@ RETURNING id, tenant_id, scope, key, name, created_at, updated_at
 `
 
 type CreateRoleParams struct {
-	TenantID pgtype.Int8 `json:"tenant_id"`
-	Key      string      `json:"key"`
-	Name     string      `json:"name"`
+	TenantID uuid.NullUUID `json:"tenant_id"`
+	Key      string        `json:"key"`
+	Name     string        `json:"name"`
 }
 
 func (q *Queries) CreateRole(ctx context.Context, arg CreateRoleParams) (Role, error) {
@@ -62,8 +63,8 @@ WHERE tenant_id = $1 AND user_id = $2
 `
 
 type DeleteMemberRolesParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteMemberRoles(ctx context.Context, arg DeleteMemberRolesParams) error {
@@ -74,13 +75,13 @@ func (q *Queries) DeleteMemberRoles(ctx context.Context, arg DeleteMemberRolesPa
 const deleteMemberRolesExcept = `-- name: DeleteMemberRolesExcept :exec
 DELETE FROM membership_roles
 WHERE tenant_id = $1 AND user_id = $2
-  AND role_id <> ALL($3::bigint[])
+  AND role_id <> ALL($3::uuid[])
 `
 
 type DeleteMemberRolesExceptParams struct {
-	TenantID    int64   `json:"tenant_id"`
-	UserID      int64   `json:"user_id"`
-	KeepRoleIds []int64 `json:"keep_role_ids"`
+	TenantID    uuid.UUID   `json:"tenant_id"`
+	UserID      uuid.UUID   `json:"user_id"`
+	KeepRoleIds []uuid.UUID `json:"keep_role_ids"`
 }
 
 func (q *Queries) DeleteMemberRolesExcept(ctx context.Context, arg DeleteMemberRolesExceptParams) error {
@@ -94,8 +95,8 @@ WHERE id = $1 AND tenant_id = $2
 `
 
 type DeleteRoleParams struct {
-	ID       int64       `json:"id"`
-	TenantID pgtype.Int8 `json:"tenant_id"`
+	ID       uuid.UUID     `json:"id"`
+	TenantID uuid.NullUUID `json:"tenant_id"`
 }
 
 func (q *Queries) DeleteRole(ctx context.Context, arg DeleteRoleParams) (int64, error) {
@@ -110,14 +111,14 @@ const deleteTenantRolesBatch = `-- name: DeleteTenantRolesBatch :execrows
 DELETE FROM roles
 WHERE id IN (
     SELECT id FROM roles
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantRolesBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge: custom roles of the tenant, one bounded id page per statement.
@@ -141,17 +142,17 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        )::text[] AS permissions
 FROM roles r
 WHERE r.id = $1
-  AND (r.tenant_id IS NULL OR r.tenant_id = $2::bigint)
+  AND (r.tenant_id IS NULL OR r.tenant_id = $2::uuid)
 `
 
 type GetRoleParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetRoleRow struct {
-	ID          int64              `json:"id"`
-	TenantID    pgtype.Int8        `json:"tenant_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.NullUUID      `json:"tenant_id"`
 	Scope       string             `json:"scope"`
 	Key         string             `json:"key"`
 	Name        string             `json:"name"`
@@ -187,19 +188,19 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
 FROM roles r
 WHERE r.key = $1
   AND r.scope = 'tenant'
-  AND (r.tenant_id IS NULL OR r.tenant_id = $2::bigint)
+  AND (r.tenant_id IS NULL OR r.tenant_id = $2::uuid)
 ORDER BY r.tenant_id NULLS FIRST
 LIMIT 1
 `
 
 type GetRoleByKeyParams struct {
-	Key      string `json:"key"`
-	TenantID int64  `json:"tenant_id"`
+	Key      string    `json:"key"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetRoleByKeyRow struct {
-	ID          int64              `json:"id"`
-	TenantID    pgtype.Int8        `json:"tenant_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.NullUUID      `json:"tenant_id"`
 	Scope       string             `json:"scope"`
 	Key         string             `json:"key"`
 	Name        string             `json:"name"`
@@ -231,9 +232,9 @@ ON CONFLICT (tenant_id, user_id, role_id) DO NOTHING
 `
 
 type InsertMembershipRoleParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
-	RoleID   int64 `json:"role_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	RoleID   uuid.UUID `json:"role_id"`
 }
 
 func (q *Queries) InsertMembershipRole(ctx context.Context, arg InsertMembershipRoleParams) error {
@@ -252,22 +253,22 @@ SELECT r.id, r.tenant_id, r.scope, r.key, r.name, r.created_at, r.updated_at,
        )::text[] AS permissions
 FROM roles r
 WHERE r.scope = 'tenant'
-  AND (r.tenant_id IS NULL OR r.tenant_id = $1::bigint)
-  AND (r.created_at, r.id) < ($2::timestamptz, $3::bigint)
+  AND (r.tenant_id IS NULL OR r.tenant_id = $1::uuid)
+  AND (r.created_at, r.id) < ($2::timestamptz, $3::uuid)
 ORDER BY r.created_at DESC, r.id DESC
 LIMIT $4::int
 `
 
 type ListRolesCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
 type ListRolesCursorRow struct {
-	ID          int64              `json:"id"`
-	TenantID    pgtype.Int8        `json:"tenant_id"`
+	ID          uuid.UUID          `json:"id"`
+	TenantID    uuid.NullUUID      `json:"tenant_id"`
 	Scope       string             `json:"scope"`
 	Key         string             `json:"key"`
 	Name        string             `json:"name"`
@@ -316,15 +317,15 @@ const listUserRoleAssignments = `-- name: ListUserRoleAssignments :many
 SELECT r.key, mr.created_at
 FROM membership_roles mr
 JOIN roles r ON r.id = mr.role_id
-WHERE mr.tenant_id = $1::bigint
-  AND mr.user_id = $2::bigint
+WHERE mr.tenant_id = $1::uuid
+  AND mr.user_id = $2::uuid
   AND r.scope = 'tenant'
 ORDER BY mr.created_at, r.key
 `
 
 type ListUserRoleAssignmentsParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 type ListUserRoleAssignmentsRow struct {
@@ -357,12 +358,12 @@ func (q *Queries) ListUserRoleAssignments(ctx context.Context, arg ListUserRoleA
 
 const lockMembershipRoles = `-- name: LockMembershipRoles :exec
 SELECT pg_advisory_xact_lock(
-    hashtextextended('identity.membership_roles:' || $1::bigint, $2::bigint))
+    hashtextextended('identity.membership_roles:' || $1::uuid || ':' || $2::uuid, 0))
 `
 
 type LockMembershipRolesParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Serializes role replacement for one membership, so concurrent requests
@@ -399,8 +400,8 @@ WHERE role_id = $1
 `
 
 type PruneRolePermissionsParams struct {
-	RoleID   int64    `json:"role_id"`
-	KeepKeys []string `json:"keep_keys"`
+	RoleID   uuid.UUID `json:"role_id"`
+	KeepKeys []string  `json:"keep_keys"`
 }
 
 func (q *Queries) PruneRolePermissions(ctx context.Context, arg PruneRolePermissionsParams) error {
@@ -426,19 +427,19 @@ ORDER BY user_id
 `
 
 type RoleMemberIDsParams struct {
-	TenantID int64 `json:"tenant_id"`
-	RoleID   int64 `json:"role_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	RoleID   uuid.UUID `json:"role_id"`
 }
 
-func (q *Queries) RoleMemberIDs(ctx context.Context, arg RoleMemberIDsParams) ([]int64, error) {
+func (q *Queries) RoleMemberIDs(ctx context.Context, arg RoleMemberIDsParams) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, roleMemberIDs, arg.TenantID, arg.RoleID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int64{}
+	items := []uuid.UUID{}
 	for rows.Next() {
-		var user_id int64
+		var user_id uuid.UUID
 		if err := rows.Scan(&user_id); err != nil {
 			return nil, err
 		}
@@ -458,13 +459,50 @@ RETURNING id, tenant_id, scope, key, name, created_at, updated_at
 `
 
 type UpdateRoleParams struct {
-	Name     string      `json:"name"`
-	ID       int64       `json:"id"`
-	TenantID pgtype.Int8 `json:"tenant_id"`
+	Name     string        `json:"name"`
+	ID       uuid.UUID     `json:"id"`
+	TenantID uuid.NullUUID `json:"tenant_id"`
 }
 
 func (q *Queries) UpdateRole(ctx context.Context, arg UpdateRoleParams) (Role, error) {
 	row := q.db.QueryRow(ctx, updateRole, arg.Name, arg.ID, arg.TenantID)
+	var i Role
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Scope,
+		&i.Key,
+		&i.Name,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const updateRoleIfUnchanged = `-- name: UpdateRoleIfUnchanged :one
+UPDATE roles
+SET name = $1
+WHERE id = $2 AND tenant_id = $3
+  AND updated_at = $4
+RETURNING id, tenant_id, scope, key, name, created_at, updated_at
+`
+
+type UpdateRoleIfUnchangedParams struct {
+	Name              string             `json:"name"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.NullUUID      `json:"tenant_id"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+}
+
+// Renames a tenant role only while its updated_at still matches the ETag the
+// caller read; a concurrent writer makes this return no rows (412).
+func (q *Queries) UpdateRoleIfUnchanged(ctx context.Context, arg UpdateRoleIfUnchangedParams) (Role, error) {
+	row := q.db.QueryRow(ctx, updateRoleIfUnchanged,
+		arg.Name,
+		arg.ID,
+		arg.TenantID,
+		arg.ExpectedUpdatedAt,
+	)
 	var i Role
 	err := row.Scan(
 		&i.ID,
@@ -501,8 +539,8 @@ ON CONFLICT (role_id, permission_key) DO NOTHING
 `
 
 type UpsertRolePermissionParams struct {
-	RoleID        int64  `json:"role_id"`
-	PermissionKey string `json:"permission_key"`
+	RoleID        uuid.UUID `json:"role_id"`
+	PermissionKey string    `json:"permission_key"`
 }
 
 func (q *Queries) UpsertRolePermission(ctx context.Context, arg UpsertRolePermissionParams) error {

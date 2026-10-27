@@ -9,16 +9,16 @@
 package {{.M.Name}}
 
 import (
+	"context"
 	"io/fs"
-
-	"github.com/gofiber/fiber/v3"
+	"net/http"
 
 	"{{.M.ModulePath}}/internal/app"
 	tenancycontracts "{{.M.ModulePath}}/internal/contracts/tenancy"
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 	{{.M.Ident}}handler "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/handler"
 	"{{.M.ModulePath}}/internal/platform/authz"
-	"{{.M.ModulePath}}/internal/platform/authz/authzhttp"
+	"{{.M.ModulePath}}/internal/platform/httpapi"
 	"{{.M.ModulePath}}/pkg/apperror"
 )
 
@@ -33,10 +33,12 @@ type Handlers struct {
 type Module struct {
 	handlers Handlers
 	// tenantPurgers erase each generated resource's rows when a deleted tenant
-	// is purged. cmd/gen appends one per resource; RegisterTenantPurge exposes
+	// is purged. cmd/gen appends one per resource; TenantPurgers exposes
 	// them through the internal/contracts/tenancy registry.
 	tenantPurgers []tenancycontracts.Purger
 }
+
+var _ app.RouteProvider = (*Module)(nil)
 
 // New builds the module from its handlers. Production code uses Build.
 func New(handlers Handlers) *Module {
@@ -49,17 +51,28 @@ func (m *Module) Name() string { return {{.M.Ident}}catalog.Owner }
 // Permissions implements app.PermissionProvider.
 func (m *Module) Permissions() []authz.Grant { return {{.M.Ident}}catalog.Permissions() }
 
-// ErrorCodes implements app.ErrorProvider.
-func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return {{.M.Ident}}catalog.ErrorCodes() }
+// Errors implements app.ErrorProvider.
+func (m *Module) Errors() []apperror.Spec { return {{.M.Ident}}catalog.Errors() }
 
 // Locales implements app.LocaleProvider.
 func (m *Module) Locales() fs.FS { return {{.M.Ident}}catalog.Locales() }
 
-// RegisterRoutes mounts the module below /api/v1/{{.M.Route}}. Every route runs
-// rate limit -> authzhttp.Require -> idempotency (writes) -> audithttp.Guard
-// (mutations) -> handler; test/arch enforces the permission and audit order.
-func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	group := v1.Group("/{{.M.Route}}", deps.Authenticate())
-	group.Get("/health", deps.Limiters.Relaxed, authzhttp.Require({{.M.Ident}}catalog.PermissionRead), m.handlers.Health.Health)
+// RegisterRoutes implements app.RouteProvider. Operations carry their whole
+// policy (permission, rate tier, idempotency, audit) in the declaration; the
+// shared middleware chain enforces the order test/arch checks.
+func (m *Module) RegisterRoutes(api *httpapi.API, deps app.Deps) {
+	httpapi.Register(api, httpapi.Op{
+		Method:      http.MethodGet,
+		Path:        "/api/v1/{{.M.Route}}/health",
+		OperationID: "{{.M.Ident}}Health",
+		Tags:        []string{"{{.M.Route}}"},
+		Summary:     "{{.M.Name}} module health",
+		Description: "Checks that the {{.M.Name}} module can reach its database.",
+	}, httpapi.Policy{
+		Permission: {{.M.Ident}}catalog.PermissionRead,
+		RateLimit:  httpapi.RateLimitRelaxed,
+	}, func(ctx context.Context, _ *struct{}) (*httpapi.Output[{{.M.Ident}}handler.HealthResponse], error) {
+		return m.handlers.Health.Health(ctx)
+	})
 	// gen:routes
 }

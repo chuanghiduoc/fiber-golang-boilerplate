@@ -8,6 +8,7 @@ import (
 
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/google/uuid"
 )
 
 // issueSession opens a session for the MFA harness user and returns its row.
@@ -19,9 +20,9 @@ import (
 func (h *mfaHarness) issueSession(t *testing.T, amr []string) *Session {
 	t.Helper()
 	h.db.mu.Lock()
-	version := h.db.users[100].TokenVersion
+	version := h.db.users[testID(100)].TokenVersion
 	h.db.mu.Unlock()
-	pair, err := h.sessions.Issue(tenant.WithID(context.Background(), tenant.DefaultID), 100, version, append(amr, AMROTP))
+	pair, err := h.sessions.Issue(tenant.WithID(context.Background(), tenant.DefaultID), testID(100), version, append(amr, AMROTP))
 	if err != nil {
 		t.Fatalf("issue session: %v", err)
 	}
@@ -29,14 +30,14 @@ func (h *mfaHarness) issueSession(t *testing.T, amr []string) *Session {
 	defer h.db.mu.Unlock()
 	session, ok := h.db.sessions[pair.SessionID]
 	if !ok {
-		t.Fatalf("session %d not stored", pair.SessionID)
+		t.Fatalf("session %s not stored", pair.SessionID)
 	}
 	session.MFAVerifiedAt = nil
 	copied := *session
 	return &copied
 }
 
-func (h *mfaHarness) sessionMFAVerifiedAt(sessionID int64) *time.Time {
+func (h *mfaHarness) sessionMFAVerifiedAt(sessionID uuid.UUID) *time.Time {
 	h.db.mu.Lock()
 	defer h.db.mu.Unlock()
 	session, ok := h.db.sessions[sessionID]
@@ -66,7 +67,7 @@ func TestMFAStepUpMarksTheCallersSession(t *testing.T) {
 	session := h.issueSession(t, []string{AMRPassword})
 	other := h.issueSession(t, []string{AMRPassword})
 
-	verifiedAt, err := h.svc.(MFAStepUpService).StepUp(context.Background(), 100, session.ID, codes[0])
+	verifiedAt, err := h.svc.(MFAStepUpService).StepUp(testTenantCtx(), testID(100), session.ID, codes[0])
 	if err != nil {
 		t.Fatalf("StepUp: %v", err)
 	}
@@ -102,10 +103,10 @@ func TestMFAStepUpConsumesTheCode(t *testing.T) {
 	session := h.issueSession(t, []string{AMRPassword})
 	svc := h.svc.(MFAStepUpService)
 
-	if _, err := svc.StepUp(context.Background(), 100, session.ID, codes[0]); err != nil {
+	if _, err := svc.StepUp(testTenantCtx(), testID(100), session.ID, codes[0]); err != nil {
 		t.Fatalf("first StepUp: %v", err)
 	}
-	if _, err := svc.StepUp(context.Background(), 100, session.ID, codes[0]); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
+	if _, err := svc.StepUp(testTenantCtx(), testID(100), session.ID, codes[0]); errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
 		t.Fatalf("replayed code error = %v, want mfa_invalid_code", err)
 	}
 }
@@ -118,7 +119,7 @@ func TestMFAStepUpRejectsUnknownSession(t *testing.T) {
 	session := h.issueSession(t, []string{AMRPassword})
 	svc := h.svc.(MFAStepUpService)
 
-	_, err := svc.StepUp(context.Background(), 100, session.ID+1000, codes[0])
+	_, err := svc.StepUp(testTenantCtx(), testID(100), testID(9999), codes[0])
 	if statusOf(err) != http.StatusUnauthorized {
 		t.Fatalf("unknown session error = %v, want 401", err)
 	}
@@ -128,7 +129,7 @@ func TestMFAStepUpRejectsUnknownSession(t *testing.T) {
 	// A valid session can still step up (the production transaction rolls the
 	// failed attempt back; the in-memory fake does not model rollbacks, so it
 	// uses a different single-use code here).
-	if _, err := svc.StepUp(context.Background(), 100, session.ID, codes[1]); err != nil {
+	if _, err := svc.StepUp(testTenantCtx(), testID(100), session.ID, codes[1]); err != nil {
 		t.Fatalf("StepUp on a valid session: %v", err)
 	}
 }
@@ -139,7 +140,7 @@ func TestMFAStepUpRejectsInvalidCode(t *testing.T) {
 	h.enrollAndConfirm(t)
 	session := h.issueSession(t, []string{AMRPassword})
 
-	_, err := h.svc.(MFAStepUpService).StepUp(context.Background(), 100, session.ID, "000000")
+	_, err := h.svc.(MFAStepUpService).StepUp(testTenantCtx(), testID(100), session.ID, "000000")
 	if errorCode(err) != string(identitycatalog.CodeAuthMFAInvalidCode) {
 		t.Fatalf("invalid code error = %v, want mfa_invalid_code", err)
 	}
@@ -156,12 +157,12 @@ func TestMFAStepUpSharesTheSecondFactorBudget(t *testing.T) {
 	svc := h.svc.(MFAStepUpService)
 
 	for i := range maxMFAAttempts {
-		_, err := svc.StepUp(context.Background(), 100, session.ID, "000000")
+		_, err := svc.StepUp(testTenantCtx(), testID(100), session.ID, "000000")
 		if statusOf(err) != http.StatusUnauthorized {
 			t.Fatalf("attempt %d error = %v, want 401", i+1, err)
 		}
 	}
-	_, err := svc.StepUp(context.Background(), 100, session.ID, "000000")
+	_, err := svc.StepUp(testTenantCtx(), testID(100), session.ID, "000000")
 	if statusOf(err) != http.StatusTooManyRequests {
 		t.Fatalf("attempt past the budget error = %v, want 429", err)
 	}

@@ -11,18 +11,18 @@ import (
 // JOBS_WORKER_EXCLUDE_KINDS=webhook.delivery. Every kind must be claimed by
 // some worker, or its jobs stay queued. Empty lists claim every kind.
 type JobsConfig struct {
-	WorkerKinds        string `env:"JOBS_WORKER_KINDS"`
-	WorkerExcludeKinds string `env:"JOBS_WORKER_EXCLUDE_KINDS"`
+	WorkerKinds        []string `env:"JOBS_WORKER_KINDS" envSeparator:","`
+	WorkerExcludeKinds []string `env:"JOBS_WORKER_EXCLUDE_KINDS" envSeparator:","`
 }
 
 // WorkerKindList returns the parsed JOBS_WORKER_KINDS entries.
 func (j JobsConfig) WorkerKindList() []string {
-	return splitCSV(j.WorkerKinds)
+	return trimmedList(j.WorkerKinds)
 }
 
 // WorkerExcludeKindList returns the parsed JOBS_WORKER_EXCLUDE_KINDS entries.
 func (j JobsConfig) WorkerExcludeKindList() []string {
-	return splitCSV(j.WorkerExcludeKinds)
+	return trimmedList(j.WorkerExcludeKinds)
 }
 
 // validate rejects a kind that is both included and excluded: the worker

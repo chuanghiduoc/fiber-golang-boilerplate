@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -17,9 +18,9 @@ VALUES ($1, $2, $3, $4)
 `
 
 type CreateRefreshTokenParams struct {
-	TenantID  int64              `json:"tenant_id"`
-	SessionID int64              `json:"session_id"`
-	TokenHash string             `json:"token_hash"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	SessionID uuid.UUID          `json:"session_id"`
+	TokenHash []byte             `json:"token_hash"`
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
@@ -40,7 +41,7 @@ WHERE token_hash = $1
 
 // Possession-based lookup (the hash is unique across tenants); the service
 // compares the row's tenant with the request tenant before using it.
-func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error) {
+func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (RefreshToken, error) {
 	row := q.db.QueryRow(ctx, getRefreshTokenByHash, tokenHash)
 	var i RefreshToken
 	err := row.Scan(
@@ -62,8 +63,8 @@ WHERE tenant_id = $1 AND id = $2 AND used_at IS NULL
 `
 
 type MarkRefreshTokenUsedParams struct {
-	TenantID int64 `json:"tenant_id"`
-	ID       int64 `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
 }
 
 // Exactly one concurrent rotation can win; the loser sees zero rows and is

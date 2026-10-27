@@ -12,11 +12,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
 func TestPermissionSyncIsIdempotent(t *testing.T) {
@@ -24,11 +25,11 @@ func TestPermissionSyncIsIdempotent(t *testing.T) {
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 
 	for i := 0; i < 2; i++ {
-		require.NoError(t, identityservice.SyncPermissions(ctx, e.tx, e.stores.Roles))
+		require.NoError(t, identityservice.SyncPermissions(ctx, e.tx, e.stores.Roles, testCatalog))
 	}
 
 	permissions := scalar[int64](t, e.pool, `SELECT count(*) FROM permissions`)
-	assert.Equal(t, int64(len(authz.AllPermissions())), permissions)
+	assert.Equal(t, int64(len(testCatalog.AllPermissions())), permissions)
 
 	counts := map[string]int64{}
 	rows, err := e.pool.Query(ctx, `
@@ -45,10 +46,10 @@ func TestPermissionSyncIsIdempotent(t *testing.T) {
 	}
 	require.NoError(t, rows.Err())
 
-	assert.Equal(t, int64(len(authz.AllTenantPermissions())), counts[authz.RoleOwner])
-	assert.Equal(t, int64(len(authz.AllTenantPermissions())), counts[authz.RoleAdmin])
-	assert.Equal(t, int64(len(authz.PermissionsForRole(authz.RoleMember))), counts[authz.RoleMember])
-	assert.Equal(t, int64(len(authz.AllPlatformPermissions())), counts[authz.RolePlatformAdmin])
+	assert.Equal(t, int64(len(testCatalog.AllTenantPermissions())), counts[authz.RoleOwner])
+	assert.Equal(t, int64(len(testCatalog.AllTenantPermissions())), counts[authz.RoleAdmin])
+	assert.Equal(t, int64(len(testCatalog.PermissionsForRole(authz.RoleMember))), counts[authz.RoleMember])
+	assert.Equal(t, int64(len(testCatalog.AllPlatformPermissions())), counts[authz.RolePlatformAdmin])
 }
 
 func TestEffectivePermissionsAreUnionedInTheSessionState(t *testing.T) {
@@ -115,12 +116,12 @@ func TestPlatformAdminVersusTenantAdmin(t *testing.T) {
 func TestReplaceMemberRolesProtectsTheLastOwner(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
-	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
+	roles := identityservice.NewRoleService(e.stores, e.tx, nil, testCatalog)
 	owner := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-owner@example.com",
 		testutil.MemberOptions{Role: "owner"})
 
 	_, err := roles.ReplaceMemberRoles(ctx, owner.UserID, []string{identityservice.RoleMember})
-	assert.Equal(t, string(apperror.CodeUserLastAdmin), appCode(err))
+	assert.Equal(t, string(identitycatalog.CodeUserLastAdmin), appCode(err))
 
 	// Keeping the owner role while adding another role is a valid replacement.
 	updated, err := roles.ReplaceMemberRoles(ctx, owner.UserID,
@@ -147,10 +148,10 @@ func TestSyncCatalogPrunesPermissionHeldByAnAPIKey(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		var keyID int64
+		var keyID uuid.UUID
 		if err := e.pool.QueryRow(ctx, `
-			INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash)
-			VALUES (1, $1, 'stale', 'p', 'rbac-stale-hash') RETURNING id`, member.UserID).Scan(&keyID); err != nil {
+			INSERT INTO api_keys (tenant_id, user_id, name, prefix, key_hash, expires_at)
+			VALUES ($2, $1, 'stale', 'p', decode(repeat('ab', 32), 'hex'), NOW() + interval '1 hour') RETURNING id`, member.UserID, tenant.DefaultID).Scan(&keyID); err != nil {
 			return err
 		}
 		_, err = e.pool.Exec(ctx,
@@ -158,7 +159,7 @@ func TestSyncCatalogPrunesPermissionHeldByAnAPIKey(t *testing.T) {
 		return err
 	}())
 
-	require.NoError(t, identityservice.SyncPermissions(ctx, e.tx, e.stores.Roles))
+	require.NoError(t, identityservice.SyncPermissions(ctx, e.tx, e.stores.Roles, testCatalog))
 	assert.Zero(t, scalar[int64](t, e.pool,
 		`SELECT count(*) FROM permissions WHERE key = 'legacy:removed'`))
 	assert.Zero(t, scalar[int64](t, e.pool,
@@ -169,7 +170,7 @@ func TestSyncCatalogPrunesPermissionHeldByAnAPIKey(t *testing.T) {
 func TestReplaceMemberRolesIsSerialized(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
-	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
+	roles := identityservice.NewRoleService(e.stores, e.tx, nil, testCatalog)
 	member := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-concurrent@example.com",
 		testutil.MemberOptions{})
 	_, err := e.stores.Roles.Create(ctx, identityservice.NewRole{Key: "alpha", Name: "Alpha"})
@@ -201,7 +202,7 @@ func TestReplaceMemberRolesIsSerialized(t *testing.T) {
 func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 	e := newEnv(t, nil)
 	ctx := authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID))
-	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
+	roles := identityservice.NewRoleService(e.stores, e.tx, nil, testCatalog)
 	first := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-concurrent-owner-a@example.com",
 		testutil.MemberOptions{Role: "owner"})
 	second := testutil.CreateMember(t, ctx, e.pool, tenant.DefaultID, "rbac-concurrent-owner-b@example.com",
@@ -209,7 +210,7 @@ func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 
 	errs := make([]error, 2)
 	var wg sync.WaitGroup
-	for i, id := range []int64{first.UserID, second.UserID} {
+	for i, id := range []uuid.UUID{first.UserID, second.UserID} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -223,7 +224,7 @@ func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 		switch {
 		case err == nil:
 			successes++
-		case appCode(err) == string(apperror.CodeUserLastAdmin):
+		case appCode(err) == string(identitycatalog.CodeUserLastAdmin):
 			conflicts++
 		default:
 			t.Fatalf("unexpected error: %v", err)
@@ -233,12 +234,12 @@ func TestConcurrentLastOwnerRemovalLeavesOneOwner(t *testing.T) {
 	assert.Equal(t, 1, conflicts)
 	assert.Equal(t, int64(1), scalar[int64](t, e.pool, `
 		SELECT count(*) FROM membership_roles mr JOIN roles r ON r.id = mr.role_id
-		WHERE mr.tenant_id = 1 AND r.tenant_id IS NULL AND r.key = 'owner'`))
+		WHERE mr.tenant_id = '0192c9b0-7e4a-7000-8000-000000000001' AND r.tenant_id IS NULL AND r.key = 'owner'`))
 }
 
 func TestTenantRoleCannotShadowASystemRoleKey(t *testing.T) {
 	e := newEnv(t, nil)
-	roles := identityservice.NewRoleService(e.stores, e.tx, nil)
+	roles := identityservice.NewRoleService(e.stores, e.tx, nil, testCatalog)
 	_, err := roles.Create(authz.SystemContext(tenant.WithID(context.Background(), tenant.DefaultID)), identityservice.NewRole{Key: "owner", Name: "Fake owner"})
 	assert.Equal(t, http.StatusConflict, appStatus(err))
 }

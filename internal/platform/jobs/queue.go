@@ -7,11 +7,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
@@ -53,28 +54,28 @@ func NewQueue(db database.DBTX) *Queue {
 
 // Enqueue inserts job as queued work and returns its id. A zero RunAt means
 // now, a zero MaxAttempts means DefaultMaxAttempts, and a nil Payload means an
-// empty JSON object. A zero TenantID is resolved from the context, falling back
-// to tenant.DefaultID.
-func (q *Queue) Enqueue(ctx context.Context, job Job) (int64, error) {
+// empty JSON object. A zero TenantID is resolved from the context; a job with
+// no tenant in either place is rejected with ErrInvalidTenant.
+func (q *Queue) Enqueue(ctx context.Context, job Job) (uuid.UUID, error) {
 	normalized, err := prepareJob(ctx, job, time.Now())
 	if err != nil {
-		return 0, err
+		return uuid.Nil, err
 	}
 	if q == nil || q.db == nil {
-		return 0, ErrNoPool
+		return uuid.Nil, ErrNoPool
 	}
 	return insertJob(ctx, q.db, normalized)
 }
 
 // EnqueueTx inserts job using tx, so the job is committed atomically with the
 // caller's transaction. Tenant resolution matches Enqueue.
-func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, job Job) (int64, error) {
+func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, job Job) (uuid.UUID, error) {
 	normalized, err := prepareJob(ctx, job, time.Now())
 	if err != nil {
-		return 0, err
+		return uuid.Nil, err
 	}
 	if tx == nil {
-		return 0, ErrNoTx
+		return uuid.Nil, ErrNoTx
 	}
 	return insertJob(ctx, tx, normalized)
 }
@@ -83,26 +84,26 @@ func (q *Queue) EnqueueTx(ctx context.Context, tx pgx.Tx, job Job) (int64, error
 // already exists. It returns the existing or newly inserted id and whether a
 // row was inserted. A non-empty IdempotencyKey is required; duplicate
 // concurrent producers safely converge on one row.
-func (q *Queue) EnqueueOnce(ctx context.Context, job Job) (id int64, created bool, err error) {
+func (q *Queue) EnqueueOnce(ctx context.Context, job Job) (id uuid.UUID, created bool, err error) {
 	normalized, err := prepareIdempotentJob(ctx, job, time.Now())
 	if err != nil {
-		return 0, false, err
+		return uuid.Nil, false, err
 	}
 	if q == nil || q.db == nil {
-		return 0, false, ErrNoPool
+		return uuid.Nil, false, ErrNoPool
 	}
 	return insertJobOnce(ctx, q.db, normalized)
 }
 
 // EnqueueOnceTx is EnqueueOnce using tx, so the deduplicated job commits
 // atomically with the caller's transaction.
-func (q *Queue) EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job Job) (id int64, created bool, err error) {
+func (q *Queue) EnqueueOnceTx(ctx context.Context, tx pgx.Tx, job Job) (id uuid.UUID, created bool, err error) {
 	normalized, err := prepareIdempotentJob(ctx, job, time.Now())
 	if err != nil {
-		return 0, false, err
+		return uuid.Nil, false, err
 	}
 	if tx == nil {
-		return 0, false, ErrNoTx
+		return uuid.Nil, false, ErrNoTx
 	}
 	return insertJobOnce(ctx, tx, normalized)
 }
@@ -118,17 +119,17 @@ func prepareIdempotentJob(ctx context.Context, job Job, now time.Time) (Job, err
 // context is authoritative when the caller did not set a tenant explicitly, so
 // request-scoped producers inherit tenant isolation without extra plumbing.
 func prepareJob(ctx context.Context, job Job, now time.Time) (Job, error) {
-	if job.TenantID == 0 {
-		job.TenantID = tenant.EffectiveID(ctx)
+	if job.TenantID == uuid.Nil {
+		job.TenantID = tenant.IDFromContext(ctx)
 	}
-	if job.TenantID <= 0 {
+	if job.TenantID == uuid.Nil {
 		return Job{}, ErrInvalidTenant
 	}
 	return job.normalize(now)
 }
 
-func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
-	var id int64
+func insertJob(ctx context.Context, db queryRower, job Job) (uuid.UUID, error) {
+	var id uuid.UUID
 	err := db.QueryRow(ctx, insertJobSQL,
 		job.TenantID,
 		job.Kind,
@@ -139,12 +140,12 @@ func insertJob(ctx context.Context, db queryRower, job Job) (int64, error) {
 		nullableIdempotencyKey(job.IdempotencyKey),
 	).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("jobs: enqueue %q: %w", job.Kind, err)
+		return uuid.Nil, fmt.Errorf("jobs: enqueue %q: %w", job.Kind, err)
 	}
 	return id, nil
 }
 
-func insertJobOnce(ctx context.Context, db queryRower, job Job) (id int64, created bool, err error) {
+func insertJobOnce(ctx context.Context, db queryRower, job Job) (id uuid.UUID, created bool, err error) {
 	err = db.QueryRow(ctx, enqueueOnceSQL,
 		job.TenantID,
 		job.Kind,
@@ -161,11 +162,11 @@ func insertJobOnce(ctx context.Context, db queryRower, job Job) (id int64, creat
 		// The conflict target matched an existing row. Reading it back gives
 		// callers a stable id even though this call inserted nothing.
 		if err := db.QueryRow(ctx, existingIdempotentJobSQL, job.TenantID, job.IdempotencyKey).Scan(&id); err != nil {
-			return 0, false, fmt.Errorf("jobs: read idempotent job %q: %w", job.Kind, err)
+			return uuid.Nil, false, fmt.Errorf("jobs: read idempotent job %q: %w", job.Kind, err)
 		}
 		return id, false, nil
 	default:
-		return 0, false, fmt.Errorf("jobs: enqueue once %q: %w", job.Kind, err)
+		return uuid.Nil, false, fmt.Errorf("jobs: enqueue once %q: %w", job.Kind, err)
 	}
 }
 

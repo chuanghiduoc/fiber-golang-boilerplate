@@ -3,23 +3,24 @@ package handler
 import (
 	"context"
 	"strconv"
+	"time"
 
-	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	{{.M.Ident}}dto "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/dto"
 	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
-	"{{.M.ModulePath}}/internal/platform/httpx"
-	"{{.M.ModulePath}}/pkg/response"
+	"{{.M.ModulePath}}/internal/platform/httpapi"
+	"{{.M.ModulePath}}/pkg/pagination"
 )
 
 // {{.R.Pascal}}UseCases is the service surface {{.R.Pascal}}Handler needs;
 // *{{.M.Ident}}service.{{.R.Pascal}}Service implements it.
 type {{.R.Pascal}}UseCases interface {
 	Create(ctx context.Context, in {{.M.Ident}}service.{{.R.Pascal}}Input) ({{.M.Ident}}service.{{.R.Pascal}}, error)
-	Get(ctx context.Context, id int64) ({{.M.Ident}}service.{{.R.Pascal}}, error)
+	Get(ctx context.Context, id uuid.UUID) ({{.M.Ident}}service.{{.R.Pascal}}, error)
 	List(ctx context.Context, limit int, startingAfter string) ({{.M.Ident}}service.{{.R.Pascal}}Page, error)
-	Patch(ctx context.Context, id int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error)
-	Delete(ctx context.Context, id int64) error
+	Patch(ctx context.Context, id uuid.UUID, in {{.M.Ident}}service.{{.R.Pascal}}Patch, expected *time.Time) ({{.M.Ident}}service.{{.R.Pascal}}, error)
+	Delete(ctx context.Context, id uuid.UUID) error
 }
 
 // {{.R.Pascal}}Handler serves /{{.M.Route}}/{{.R.PluralRoute}}.
@@ -32,145 +33,93 @@ func New{{.R.Pascal}}Handler(service {{.R.Pascal}}UseCases) *{{.R.Pascal}}Handle
 	return &{{.R.Pascal}}Handler{service: service}
 }
 
-// Create godoc
-// @Summary Create a {{.R.Human}}
-// @Tags {{.M.Pascal}}
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Security ApiKeyAuth
-// @Param Idempotency-Key header string false "Idempotency key"
-// @Param request body {{.M.Ident}}dto.{{.R.Pascal}}Request true "{{.R.Human}}"
-// @Success 201 {object} {{.M.Ident}}dto.{{.R.Pascal}}Response
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}} [post]
-func (h *{{.R.Pascal}}Handler) Create(c fiber.Ctx) error {
-	var req {{.M.Ident}}dto.{{.R.Pascal}}Request
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
-	}
-	created, err := h.service.Create(c.Context(), {{.M.Ident}}service.{{.R.Pascal}}Input{Name: req.Name})
-	if err != nil {
-		return err
-	}
-	c.Set(fiber.HeaderLocation, "/api/v1/{{.M.Route}}/{{.R.PluralRoute}}/"+strconv.FormatInt(created.ID, 10))
-	return response.Created(c, to{{.R.Pascal}}Response(created))
+type Create{{.R.Pascal}}Input struct {
+	Body {{.M.Ident}}dto.{{.R.Pascal}}Request
 }
 
-// Get godoc
-// @Summary Get a {{.R.Human}}
-// @Tags {{.M.Pascal}}
-// @Produce json
-// @Security BearerAuth
-// @Security ApiKeyAuth
-// @Param id path int true "{{.R.Human}} ID"
-// @Success 200 {object} {{.M.Ident}}dto.{{.R.Pascal}}Response
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}}/{id} [get]
-func (h *{{.R.Pascal}}Handler) Get(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
-	if err != nil {
-		return err
-	}
-	found, err := h.service.Get(c.Context(), id)
-	if err != nil {
-		return err
-	}
-	return response.Success(c, to{{.R.Pascal}}Response(found))
+type {{.R.Pascal}}IDInput struct {
+	ID uuid.UUID `path:"id" doc:"{{.R.Human}} id."`
 }
 
-// List godoc
-// @Summary List {{.R.HumanPlural}}
-// @Description Cursor-paginated, newest first.
-// @Tags {{.M.Pascal}}
-// @Produce json
-// @Security BearerAuth
-// @Security ApiKeyAuth
-// @Param limit query int false "Max items to return" default(20)
-// @Param startingAfter query string false "nextCursor of the previous page"
-// @Success 200 {object} response.ListResponse{data=[]{{.M.Ident}}dto.{{.R.Pascal}}Response}
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}} [get]
-func (h *{{.R.Pascal}}Handler) List(c fiber.Ctx) error {
-	limit, startingAfter, err := httpx.CursorQuery(c)
+type List{{.R.PluralPascal}}Input struct {
+	Limit         int    `query:"limit" minimum:"1" maximum:"100" default:"20" doc:"Page size."`
+	StartingAfter string `query:"startingAfter" doc:"nextCursor of the previous page."`
+}
+
+type Patch{{.R.Pascal}}Input struct {
+	ID      uuid.UUID                      `path:"id" doc:"{{.R.Human}} id."`
+	IfMatch string                         `header:"If-Match" doc:"Current ETag; a stale value is rejected with 412."`
+	Body    {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest `contentType:"application/merge-patch+json"`
+}
+
+// Create stores a new {{.R.Human}}.
+func (h *{{.R.Pascal}}Handler) Create(ctx context.Context, in *Create{{.R.Pascal}}Input) (*httpapi.Created[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+	created, err := h.service.Create(ctx, {{.M.Ident}}service.{{.R.Pascal}}Input{Name: in.Body.Name})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	page, err := h.service.List(c.Context(), limit, startingAfter)
+	return httpapi.NewCreated("/api/v1/{{.M.Route}}/{{.R.PluralRoute}}/"+created.ID.String(), to{{.R.Pascal}}Response(created)), nil
+}
+
+// Get returns one {{.R.Human}} with its ETag.
+func (h *{{.R.Pascal}}Handler) Get(ctx context.Context, in *{{.R.Pascal}}IDInput) (*httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+	found, err := h.service.Get(ctx, in.ID)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return &httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response]{
+		ETag: {{.R.Camel}}ETag(found.UpdatedAt),
+		Body: to{{.R.Pascal}}Response(found),
+	}, nil
+}
+
+// List returns a cursor page, newest first.
+func (h *{{.R.Pascal}}Handler) List(ctx context.Context, in *List{{.R.PluralPascal}}Input) (*httpapi.ListOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+	page, err := h.service.List(ctx, in.Limit, in.StartingAfter)
+	if err != nil {
+		return nil, err
 	}
 	items := make([]{{.M.Ident}}dto.{{.R.Pascal}}Response, len(page.Items))
 	for i, item := range page.Items {
 		items[i] = to{{.R.Pascal}}Response(item)
 	}
-	return response.List(c, items, page.HasMore, page.NextCursor)
+	return &httpapi.ListOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response]{
+		Body: pagination.NewList("/api/v1/{{.M.Route}}/{{.R.PluralRoute}}", items, page.HasMore, page.NextCursor),
+	}, nil
 }
 
-// Patch godoc
-// @Summary Update a {{.R.Human}}
-// @Description Partial update: only the fields present in the body change.
-// @Tags {{.M.Pascal}}
-// @Accept json
-// @Produce json
-// @Security BearerAuth
-// @Security ApiKeyAuth
-// @Param Idempotency-Key header string false "Idempotency key"
-// @Param id path int true "{{.R.Human}} ID"
-// @Param request body {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest true "{{.R.Human}} fields to change"
-// @Success 200 {object} {{.M.Ident}}dto.{{.R.Pascal}}Response
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Failure 422 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}}/{id} [patch]
-func (h *{{.R.Pascal}}Handler) Patch(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
+// Patch applies an RFC 7396 merge patch. If-Match is a precondition enforced
+// by the UPDATE itself, so two writers holding the same ETag cannot both win.
+func (h *{{.R.Pascal}}Handler) Patch(ctx context.Context, in *Patch{{.R.Pascal}}Input) (*httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response], error) {
+	current, err := h.service.Get(ctx, in.ID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	var req {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest
-	if err := httpx.BindAndValidate(c, &req); err != nil {
-		return err
+	currentETag := {{.R.Camel}}ETag(current.UpdatedAt)
+	if err := httpapi.CheckIfMatchValue(in.IfMatch, currentETag); err != nil {
+		return nil, err
 	}
-	updated, err := h.service.Patch(c.Context(), id, {{.M.Ident}}service.{{.R.Pascal}}Patch{Name: req.Name})
+	var expected *time.Time
+	if in.IfMatch != "" {
+		value := current.UpdatedAt
+		expected = &value
+	}
+	updated, err := h.service.Patch(ctx, in.ID, {{.M.Ident}}service.{{.R.Pascal}}Patch{Name: in.Body.Name}, expected)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return response.Success(c, to{{.R.Pascal}}Response(updated))
+	return &httpapi.ETagOutput[{{.M.Ident}}dto.{{.R.Pascal}}Response]{
+		ETag: {{.R.Camel}}ETag(updated.UpdatedAt),
+		Body: to{{.R.Pascal}}Response(updated),
+	}, nil
 }
 
-// Delete godoc
-// @Summary Delete a {{.R.Human}}
-// @Tags {{.M.Pascal}}
-// @Security BearerAuth
-// @Security ApiKeyAuth
-// @Param Idempotency-Key header string false "Idempotency key"
-// @Param id path int true "{{.R.Human}} ID"
-// @Success 204
-// @Failure 400 {object} apperror.ProblemDetails
-// @Failure 401 {object} apperror.ProblemDetails
-// @Failure 403 {object} apperror.ProblemDetails
-// @Failure 404 {object} apperror.ProblemDetails
-// @Router /{{.M.Route}}/{{.R.PluralRoute}}/{id} [delete]
-func (h *{{.R.Pascal}}Handler) Delete(c fiber.Ctx) error {
-	id, err := httpx.ParamID(c, "id")
-	if err != nil {
-		return err
+// Delete removes one {{.R.Human}}.
+func (h *{{.R.Pascal}}Handler) Delete(ctx context.Context, in *{{.R.Pascal}}IDInput) (*httpapi.Empty, error) {
+	if err := h.service.Delete(ctx, in.ID); err != nil {
+		return nil, err
 	}
-	if err := h.service.Delete(c.Context(), id); err != nil {
-		return err
-	}
-	return response.NoContent(c)
+	return &httpapi.Empty{}, nil
 }
 
 func to{{.R.Pascal}}Response(item {{.M.Ident}}service.{{.R.Pascal}}) {{.M.Ident}}dto.{{.R.Pascal}}Response {
@@ -180,4 +129,13 @@ func to{{.R.Pascal}}Response(item {{.M.Ident}}service.{{.R.Pascal}}) {{.M.Ident}
 		CreatedAt: item.CreatedAt,
 		UpdatedAt: item.UpdatedAt,
 	}
+}
+
+// {{.R.Camel}}ETag derives the strong validator from the exact column the
+// conditional UPDATE compares against.
+func {{.R.Camel}}ETag(updatedAt time.Time) string {
+	if updatedAt.IsZero() {
+		return ""
+	}
+	return `"` + strconv.FormatInt(updatedAt.UTC().UnixNano(), 10) + `v"`
 }

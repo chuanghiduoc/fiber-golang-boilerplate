@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type DBConfig struct {
@@ -30,12 +31,12 @@ type DBConfig struct {
 	SSLMode        string `env:"DB_SSLMODE" envDefault:"disable"`
 	// SSLRootCert is an optional path to the CA bundle that verifies the server
 	// certificate. verify-full without it uses the system trust store.
-	SSLRootCert     string `env:"DB_SSLROOTCERT"`
-	ConnectTimeout  int    `env:"DB_CONNECT_TIMEOUT" envDefault:"10"` // seconds
-	MaxConns        int32  `env:"DB_MAX_CONNS" envDefault:"25"`
-	MinConns        int32  `env:"DB_MIN_CONNS" envDefault:"5"`
-	MaxConnLifetime int    `env:"DB_MAX_CONN_LIFETIME" envDefault:"3600"` // seconds
-	MaxConnIdleTime int    `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"300"` // seconds
+	SSLRootCert     string        `env:"DB_SSLROOTCERT"`
+	ConnectTimeout  time.Duration `env:"DB_CONNECT_TIMEOUT" envDefault:"10s"`
+	MaxConns        int32         `env:"DB_MAX_CONNS" envDefault:"25"`
+	MinConns        int32         `env:"DB_MIN_CONNS" envDefault:"5"`
+	MaxConnLifetime time.Duration `env:"DB_MAX_CONN_LIFETIME" envDefault:"1h"`
+	MaxConnIdleTime time.Duration `env:"DB_MAX_CONN_IDLE_TIME" envDefault:"5m"`
 	// QueryExecMode is the pgx query execution mode. cache_statement (the
 	// pgx default) prepares named statements per connection, which a
 	// transaction-mode pooler must support (PgBouncer 1.21+ with
@@ -99,8 +100,14 @@ func (db DBConfig) ForMigration() DBConfig {
 
 // Validate checks the database connection and pool settings.
 func (db DBConfig) Validate() error {
-	if db.ConnectTimeout < 1 {
-		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1 second")
+	if db.ConnectTimeout < time.Second {
+		return fmt.Errorf("DB_CONNECT_TIMEOUT must be at least 1s")
+	}
+	if db.MaxConnLifetime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_LIFETIME must not be negative")
+	}
+	if db.MaxConnIdleTime < 0 {
+		return fmt.Errorf("DB_MAX_CONN_IDLE_TIME must not be negative")
 	}
 	if db.MaxConns < 1 {
 		return fmt.Errorf("DB_MAX_CONNS must be at least 1")

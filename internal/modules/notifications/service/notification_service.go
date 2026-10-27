@@ -9,16 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"log/slog"
 	"regexp"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -46,13 +47,15 @@ var notificationTypePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 type NotificationService interface {
 	Create(ctx context.Context, input notificationcontracts.CreateNotificationInput) (CreateResult, error)
 	Notify(ctx context.Context, input notificationcontracts.CreateNotificationInput) error
-	Get(ctx context.Context, userID, id int64) (*Notification, error)
-	List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error)
-	MarkRead(ctx context.Context, userID, id int64) (*Notification, error)
-	MarkAllRead(ctx context.Context, userID int64) (int64, error)
-	UnreadCount(ctx context.Context, userID int64) (int64, error)
-	ListPreferences(ctx context.Context, userID int64) ([]Preference, error)
-	SetPreference(ctx context.Context, userID int64, update PreferenceUpdate) (*Preference, error)
+	Get(ctx context.Context, userID, id uuid.UUID) (*Notification, error)
+	List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error)
+	SetRead(ctx context.Context, userID, id uuid.UUID, read bool) (*Notification, error)
+	MarkRead(ctx context.Context, userID, id uuid.UUID) (*Notification, error)
+	MarkUnread(ctx context.Context, userID, id uuid.UUID) (*Notification, error)
+	MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error)
+	UnreadCount(ctx context.Context, userID uuid.UUID) (int64, error)
+	ListPreferences(ctx context.Context, userID uuid.UUID) ([]Preference, error)
+	SetPreference(ctx context.Context, userID uuid.UUID, update PreferenceUpdate) (*Preference, error)
 }
 
 type notificationService struct {
@@ -148,7 +151,7 @@ func (s *notificationService) Create(ctx context.Context, input notificationcont
 		created, err = s.deliver(scopedCtx, s.repo, s.sender, channels, in, message)
 	}
 	if err != nil {
-		return CreateResult{}, s.createError(scopedCtx, err, normalized)
+		return CreateResult{}, s.createError(err)
 	}
 
 	return CreateResult{Notification: created, EmailQueued: channels.email}, nil
@@ -208,8 +211,8 @@ func sendEmail(ctx context.Context, mail Mailer, message email.Message) error {
 }
 
 // createError preserves domain errors and hides persistence/queue internals
-// behind a public 500 detail while logging the cause.
-func (s *notificationService) createError(ctx context.Context, err error, input notificationcontracts.CreateNotificationInput) error {
+// behind a public 500 detail while keeping the cause for the error log.
+func (s *notificationService) createError(err error) error {
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {
 		return err
@@ -217,18 +220,12 @@ func (s *notificationService) createError(ctx context.Context, err error, input 
 	if errors.Is(err, apperror.ErrNotFound) {
 		return apperror.NewNotFound("notification recipient not found")
 	}
-	slog.Error("failed to create notification",
-		slog.Int64("tenant_id", tenant.EffectiveID(ctx)),
-		slog.Int64("user_id", input.UserID),
-		slog.String("type", input.Type),
-		slog.Any("error", err),
-	)
-	return apperror.NewInternal("failed to create notification")
+	return apperror.Internal(err, "failed to create notification")
 }
 
 // resolveRecipient resolves the recipient through the identity contract, which
 // only returns an active member of the context tenant.
-func (s *notificationService) resolveRecipient(ctx context.Context, userID int64) (identitycontracts.NotificationRecipient, error) {
+func (s *notificationService) resolveRecipient(ctx context.Context, userID uuid.UUID) (identitycontracts.NotificationRecipient, error) {
 	if s.recipients == nil {
 		return identitycontracts.NotificationRecipient{}, apperror.NewInternal("notification recipient lookup is not configured")
 	}
@@ -237,7 +234,7 @@ func (s *notificationService) resolveRecipient(ctx context.Context, userID int64
 		if errors.Is(err, apperror.ErrNotFound) {
 			return identitycontracts.NotificationRecipient{}, apperror.NewNotFound("notification recipient not found")
 		}
-		return identitycontracts.NotificationRecipient{}, apperror.NewInternal("failed to resolve notification recipient")
+		return identitycontracts.NotificationRecipient{}, apperror.Internal(err, "failed to resolve notification recipient")
 	}
 	return recipient, nil
 }
@@ -260,30 +257,30 @@ func (s *notificationService) buildEmailMessage(input notificationcontracts.Crea
 	}, nil
 }
 
-func (s *notificationService) channelEnabled(ctx context.Context, userID int64, notificationType, channel string) (bool, error) {
+func (s *notificationService) channelEnabled(ctx context.Context, userID uuid.UUID, notificationType, channel string) (bool, error) {
 	pref, err := s.repo.GetPreference(ctx, userID, notificationType, channel)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			// No explicit preference means the channel is enabled.
 			return true, nil
 		}
-		return false, apperror.NewInternal("failed to read notification preferences")
+		return false, apperror.Internal(err, "failed to read notification preferences")
 	}
 	return pref.Enabled, nil
 }
 
-func (s *notificationService) Get(ctx context.Context, userID, id int64) (*Notification, error) {
+func (s *notificationService) Get(ctx context.Context, userID, id uuid.UUID) (*Notification, error) {
 	row, err := s.repo.GetByID(ctx, id, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("notification not found")
 		}
-		return nil, apperror.NewInternal("failed to get notification")
+		return nil, apperror.Internal(err, "failed to get notification")
 	}
 	return row, nil
 }
 
-func (s *notificationService) List(ctx context.Context, userID int64, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error) {
+func (s *notificationService) List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string, unreadOnly bool) ([]Notification, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
@@ -291,7 +288,7 @@ func (s *notificationService) List(ctx context.Context, userID int64, limit int,
 
 	rows, err := s.repo.ListCursor(ctx, userID, cur, unreadOnly)
 	if err != nil {
-		return nil, false, apperror.NewInternal("failed to list notifications")
+		return nil, false, apperror.Internal(err, "failed to list notifications")
 	}
 
 	hasMore := len(rows) > pageSize
@@ -301,42 +298,62 @@ func (s *notificationService) List(ctx context.Context, userID int64, limit int,
 	return rows, hasMore, nil
 }
 
-func (s *notificationService) MarkRead(ctx context.Context, userID, id int64) (*Notification, error) {
+func (s *notificationService) MarkRead(ctx context.Context, userID, id uuid.UUID) (*Notification, error) {
 	row, err := s.repo.MarkRead(ctx, id, userID)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("notification not found")
 		}
-		return nil, apperror.NewInternal("failed to mark notification as read")
+		return nil, apperror.Internal(err, "failed to mark notification as read")
 	}
 	return row, nil
 }
 
-func (s *notificationService) MarkAllRead(ctx context.Context, userID int64) (int64, error) {
+// SetRead applies the merge-patch read state: true marks the notification read,
+// false clears read_at so it is unread again.
+func (s *notificationService) SetRead(ctx context.Context, userID, id uuid.UUID, read bool) (*Notification, error) {
+	if read {
+		return s.MarkRead(ctx, userID, id)
+	}
+	return s.MarkUnread(ctx, userID, id)
+}
+
+func (s *notificationService) MarkUnread(ctx context.Context, userID, id uuid.UUID) (*Notification, error) {
+	row, err := s.repo.MarkUnread(ctx, id, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("notification not found")
+		}
+		return nil, apperror.Internal(err, "failed to mark notification as unread")
+	}
+	return row, nil
+}
+
+func (s *notificationService) MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error) {
 	updated, err := s.repo.MarkAllRead(ctx, userID)
 	if err != nil {
-		return 0, apperror.NewInternal("failed to mark notifications as read")
+		return 0, apperror.Internal(err, "failed to mark notifications as read")
 	}
 	return updated, nil
 }
 
-func (s *notificationService) UnreadCount(ctx context.Context, userID int64) (int64, error) {
+func (s *notificationService) UnreadCount(ctx context.Context, userID uuid.UUID) (int64, error) {
 	count, err := s.repo.CountUnread(ctx, userID)
 	if err != nil {
-		return 0, apperror.NewInternal("failed to count unread notifications")
+		return 0, apperror.Internal(err, "failed to count unread notifications")
 	}
 	return count, nil
 }
 
-func (s *notificationService) ListPreferences(ctx context.Context, userID int64) ([]Preference, error) {
+func (s *notificationService) ListPreferences(ctx context.Context, userID uuid.UUID) ([]Preference, error) {
 	rows, err := s.repo.ListPreferences(ctx, userID)
 	if err != nil {
-		return nil, apperror.NewInternal("failed to list notification preferences")
+		return nil, apperror.Internal(err, "failed to list notification preferences")
 	}
 	return rows, nil
 }
 
-func (s *notificationService) SetPreference(ctx context.Context, userID int64, update PreferenceUpdate) (*Preference, error) {
+func (s *notificationService) SetPreference(ctx context.Context, userID uuid.UUID, update PreferenceUpdate) (*Preference, error) {
 	notificationType := strings.TrimSpace(update.Type)
 	if err := validateType(notificationType); err != nil {
 		return nil, err
@@ -355,25 +372,21 @@ func (s *notificationService) SetPreference(ctx context.Context, userID int64, u
 		Enabled: *update.Enabled,
 	})
 	if err != nil {
-		return nil, apperror.NewInternal("failed to save notification preference")
+		return nil, apperror.Internal(err, "failed to save notification preference")
 	}
 	return row, nil
 }
 
-func resolveTenantContext(ctx context.Context, explicit int64) (context.Context, error) {
-	if explicit < 0 {
-		return nil, apperror.NewBadRequest(invalidTenant)
-	}
-
+func resolveTenantContext(ctx context.Context, explicit uuid.UUID) (context.Context, error) {
 	contextTenant := tenant.IDFromContext(ctx)
-	effective := tenant.EffectiveID(ctx)
-	if explicit > 0 {
-		if contextTenant != 0 && explicit != contextTenant {
+	effective := contextTenant
+	if explicit != uuid.Nil {
+		if contextTenant != uuid.Nil && explicit != contextTenant {
 			return nil, apperror.NewForbidden("tenant mismatch")
 		}
 		effective = explicit
 	}
-	if effective <= 0 {
+	if effective == uuid.Nil {
 		return nil, apperror.NewInternal(invalidTenant)
 	}
 	if contextTenant != effective {
@@ -386,7 +399,7 @@ func normalizeInput(input notificationcontracts.CreateNotificationInput) (notifi
 	input.Type = strings.TrimSpace(input.Type)
 	input.Title = strings.TrimSpace(input.Title)
 	input.Body = strings.TrimSpace(input.Body)
-	if input.UserID <= 0 {
+	if input.UserID == uuid.Nil {
 		return notificationcontracts.CreateNotificationInput{}, apperror.NewBadRequest("userId is required")
 	}
 	if err := validateType(input.Type); err != nil {

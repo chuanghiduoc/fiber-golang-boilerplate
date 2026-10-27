@@ -46,10 +46,11 @@ func RequestID() fiber.Handler {
 		}
 
 		c.Set("X-Request-Id", requestID)
-		fiber.Locals[string](c, "request_id", requestID)
 
 		// Also set in context.Context for service/repository layer access.
-		c.SetContext(requestctx.WithRequestID(c.Context(), requestID))
+		ctx := requestctx.WithRequestID(c.Context(), requestID)
+		ctx = requestctx.WithPath(ctx, c.Path())
+		c.SetContext(ctx)
 
 		return c.Next()
 	}

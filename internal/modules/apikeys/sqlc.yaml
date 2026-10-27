@@ -1,10 +1,13 @@
 # sqlc configuration owned by this module. Paths are relative to this file;
 # regenerate with `make sqlc-generate` (every module) or `go generate` here.
+# The schema is every up migration: a generated resource adds a timestamped
+# migration, and sqlc must see its table. Down files and the tab-separated
+# schema snapshot artifact are excluded by the glob.
 version: "2"
 sql:
   - engine: "postgresql"
     queries: "queries/"
-    schema: "../../../migrations/"
+    schema: ["../../../migrations/*.up.sql"]
     gen:
       go:
         package: "sqlc"
@@ -13,3 +16,13 @@ sql:
         emit_json_tags: true
         emit_empty_slices: true
         omit_unused_structs: true
+        overrides:
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type: "github.com/google/uuid.NullUUID"
+          - db_type: "bytea"
+            go_type:
+              type: "byte"
+              slice: true

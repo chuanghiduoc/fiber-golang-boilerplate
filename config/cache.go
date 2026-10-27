@@ -25,10 +25,10 @@ type CacheConfig struct {
 	// would turn a blackholed Redis into multi-second stalls on every request
 	// even though rate limiting and idempotency fail open, so these are short.
 	// They override timeout/retry parameters in REDIS_URL.
-	RedisDialTimeoutMS  int `env:"REDIS_DIAL_TIMEOUT_MS" envDefault:"2000"`
-	RedisReadTimeoutMS  int `env:"REDIS_READ_TIMEOUT_MS" envDefault:"500"`
-	RedisWriteTimeoutMS int `env:"REDIS_WRITE_TIMEOUT_MS" envDefault:"500"`
-	RedisPoolTimeoutMS  int `env:"REDIS_POOL_TIMEOUT_MS" envDefault:"1000"`
+	RedisDialTimeout  time.Duration `env:"REDIS_DIAL_TIMEOUT" envDefault:"2s"`
+	RedisReadTimeout  time.Duration `env:"REDIS_READ_TIMEOUT" envDefault:"500ms"`
+	RedisWriteTimeout time.Duration `env:"REDIS_WRITE_TIMEOUT" envDefault:"500ms"`
+	RedisPoolTimeout  time.Duration `env:"REDIS_POOL_TIMEOUT" envDefault:"1s"`
 	// RedisMaxRetries is the number of retries after the first attempt; 0
 	// disables retries.
 	RedisMaxRetries int `env:"REDIS_MAX_RETRIES" envDefault:"1"`
@@ -44,31 +44,33 @@ const (
 	maxRedisRetries          = 10
 )
 
-func millisOrDefault(ms int, fallback time.Duration) time.Duration {
-	if ms <= 0 {
+func durationOrDefault(d, fallback time.Duration) time.Duration {
+	if d <= 0 {
 		return fallback
 	}
-	return time.Duration(ms) * time.Millisecond
+	return d
 }
 
-// RedisDialTimeout returns the Redis connect timeout.
-func (c CacheConfig) RedisDialTimeout() time.Duration {
-	return millisOrDefault(c.RedisDialTimeoutMS, DefaultRedisDialTimeout)
+// EffectiveRedisDialTimeout returns the Redis connect timeout, applying the
+// package default to a zero value built outside env parsing.
+func (c CacheConfig) EffectiveRedisDialTimeout() time.Duration {
+	return durationOrDefault(c.RedisDialTimeout, DefaultRedisDialTimeout)
 }
 
-// RedisReadTimeout returns the Redis per-command read timeout.
-func (c CacheConfig) RedisReadTimeout() time.Duration {
-	return millisOrDefault(c.RedisReadTimeoutMS, DefaultRedisReadTimeout)
+// EffectiveRedisReadTimeout returns the Redis per-command read timeout.
+func (c CacheConfig) EffectiveRedisReadTimeout() time.Duration {
+	return durationOrDefault(c.RedisReadTimeout, DefaultRedisReadTimeout)
 }
 
-// RedisWriteTimeout returns the Redis per-command write timeout.
-func (c CacheConfig) RedisWriteTimeout() time.Duration {
-	return millisOrDefault(c.RedisWriteTimeoutMS, DefaultRedisWriteTimeout)
+// EffectiveRedisWriteTimeout returns the Redis per-command write timeout.
+func (c CacheConfig) EffectiveRedisWriteTimeout() time.Duration {
+	return durationOrDefault(c.RedisWriteTimeout, DefaultRedisWriteTimeout)
 }
 
-// RedisPoolTimeout returns how long a command waits for a free connection.
-func (c CacheConfig) RedisPoolTimeout() time.Duration {
-	return millisOrDefault(c.RedisPoolTimeoutMS, DefaultRedisPoolTimeout)
+// EffectiveRedisPoolTimeout returns how long a command waits for a free
+// connection.
+func (c CacheConfig) EffectiveRedisPoolTimeout() time.Duration {
+	return durationOrDefault(c.RedisPoolTimeout, DefaultRedisPoolTimeout)
 }
 
 // Validate checks the cache driver and Redis client bounds.
@@ -85,8 +87,8 @@ func (c CacheConfig) Validate() error {
 	if c.MemoryMaxEntries <= 0 {
 		return fmt.Errorf("CACHE_MEMORY_MAX_ENTRIES must be greater than 0")
 	}
-	if c.RedisDialTimeoutMS < 0 || c.RedisReadTimeoutMS < 0 || c.RedisWriteTimeoutMS < 0 || c.RedisPoolTimeoutMS < 0 {
-		return fmt.Errorf("REDIS_*_TIMEOUT_MS values must not be negative")
+	if c.RedisDialTimeout < 0 || c.RedisReadTimeout < 0 || c.RedisWriteTimeout < 0 || c.RedisPoolTimeout < 0 {
+		return fmt.Errorf("REDIS_*_TIMEOUT values must not be negative")
 	}
 	if c.RedisMaxRetries < 0 || c.RedisMaxRetries > maxRedisRetries {
 		return fmt.Errorf("REDIS_MAX_RETRIES must be between 0 and %d", maxRedisRetries)

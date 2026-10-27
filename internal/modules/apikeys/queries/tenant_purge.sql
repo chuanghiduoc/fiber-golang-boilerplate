@@ -5,6 +5,6 @@
 DELETE FROM api_keys
 WHERE id IN (
     SELECT id FROM api_keys
-    WHERE tenant_id = @tenant_id::bigint
+    WHERE tenant_id = @tenant_id::uuid
     LIMIT @batch_size::int
 );

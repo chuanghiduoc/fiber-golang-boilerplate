@@ -25,6 +25,33 @@ SET enabled = EXCLUDED.enabled,
     updated_at = NOW()
 RETURNING *;
 
+-- name: InsertFeatureFlag :one
+INSERT INTO feature_flags (flag_key, enabled, kill_switch, description)
+VALUES (@flag_key, @enabled, @kill_switch, @description)
+RETURNING *;
+
+-- name: InsertFeatureFlagIfAbsent :one
+INSERT INTO feature_flags (flag_key, enabled, kill_switch, description)
+VALUES (@flag_key, @enabled, @kill_switch, @description)
+ON CONFLICT (flag_key) DO NOTHING
+RETURNING *;
+
+-- name: UpdateFeatureFlagIfUnchanged :one
+UPDATE feature_flags
+SET enabled = @enabled,
+    kill_switch = @kill_switch,
+    description = @description,
+    updated_at = NOW()
+WHERE flag_key = @flag_key
+  AND updated_at = @expected_updated_at
+RETURNING *;
+
+-- name: DeleteFeatureFlagIfUnchanged :one
+DELETE FROM feature_flags
+WHERE flag_key = @flag_key
+  AND updated_at = @expected_updated_at
+RETURNING flag_key;
+
 -- name: DeleteFeatureFlag :one
 DELETE FROM feature_flags
 WHERE flag_key = $1
@@ -34,6 +61,11 @@ RETURNING flag_key;
 SELECT * FROM feature_flag_targets
 WHERE tenant_id = $1 AND flag_key = $2
 ORDER BY user_id NULLS FIRST, id;
+
+-- name: ListAllFeatureFlagTargets :many
+SELECT * FROM feature_flag_targets
+WHERE flag_key = $1
+ORDER BY tenant_id, user_id NULLS FIRST, id;
 
 -- name: UpsertFeatureFlagTenantTarget :one
 WITH flag AS (
@@ -59,7 +91,12 @@ ON CONFLICT (tenant_id, flag_key, user_id)
 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()
 RETURNING *;
 
--- name: DeleteFeatureFlagTarget :one
+-- name: DeleteFeatureFlagTenantTarget :one
 DELETE FROM feature_flag_targets
-WHERE id = $1 AND tenant_id = $2 AND flag_key = $3
-RETURNING id;
+WHERE flag_key = $1 AND tenant_id = $2 AND user_id IS NULL
+RETURNING *;
+
+-- name: DeleteFeatureFlagUserTarget :one
+DELETE FROM feature_flag_targets
+WHERE flag_key = $1 AND tenant_id = $2 AND user_id = $3
+RETURNING *;

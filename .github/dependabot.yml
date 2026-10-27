@@ -45,7 +45,7 @@ updates:
       - "ci"
     open-pull-requests-limit: 5
 
-  # Dockerfile base images (Go toolchain and Alpine runtime).
+  # Dockerfile base images (Go toolchain and distroless runtime).
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
@@ -62,7 +62,8 @@ updates:
     open-pull-requests-limit: 5
 
   # docker-compose.yml service images (PostgreSQL, Redis, SeaweedFS, OTel
-  # Collector).
+  # Collector). Compose pins each tag by digest too, so an update proposes the
+  # digest bump for an existing tag or a version bump plus its digest.
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:

@@ -8,18 +8,19 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteMemberInvitations = `-- name: DeleteMemberInvitations :execrows
 DELETE FROM invitations
-WHERE tenant_id = $1::bigint
-  AND (invited_by = $2::bigint OR accepted_by = $2::bigint)
+WHERE tenant_id = $1::uuid
+  AND (invited_by = $2::uuid OR accepted_by = $2::uuid)
 `
 
 type DeleteMemberInvitationsParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Tenant purge releases the RESTRICT foreign keys before deleting one
@@ -40,8 +41,8 @@ WHERE tenant_id = $1 AND id = $2 AND accepted_at IS NULL
 `
 
 type DeletePendingInvitationParams struct {
-	TenantID int64 `json:"tenant_id"`
-	ID       int64 `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
 }
 
 func (q *Queries) DeletePendingInvitation(ctx context.Context, arg DeletePendingInvitationParams) (int64, error) {
@@ -58,8 +59,8 @@ WHERE tenant_id = $1 AND invited_by = $2 AND accepted_at IS NULL
 `
 
 type DeletePendingInvitationsByInviterParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	InvitedBy int64 `json:"invited_by"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	InvitedBy uuid.UUID `json:"invited_by"`
 }
 
 // A ban or removal ends every pending invitation the member created: the
@@ -76,14 +77,14 @@ const deleteTenantInvitationsBatch = `-- name: DeleteTenantInvitationsBatch :exe
 DELETE FROM invitations
 WHERE id IN (
     SELECT id FROM invitations
-    WHERE tenant_id = $1::bigint
+    WHERE tenant_id = $1::uuid
     LIMIT $2::int
 )
 `
 
 type DeleteTenantInvitationsBatchParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	BatchSize int32 `json:"batch_size"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	BatchSize int32     `json:"batch_size"`
 }
 
 // Tenant purge: invitations reference memberships through invited_by and
@@ -97,34 +98,79 @@ func (q *Queries) DeleteTenantInvitationsBatch(ctx context.Context, arg DeleteTe
 	return result.RowsAffected(), nil
 }
 
+const getInvitation = `-- name: GetInvitation :one
+SELECT i.id, i.tenant_id, i.email_normalized, i.role_id, i.token_hash, i.invited_by, i.expires_at, i.accepted_at, i.accepted_by, i.created_at, i.updated_at, r.key AS role
+FROM invitations i
+JOIN roles r ON r.id = i.role_id
+WHERE i.tenant_id = $1::uuid AND i.id = $2::uuid
+`
+
+type GetInvitationParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+type GetInvitationRow struct {
+	Invitation Invitation `json:"invitation"`
+	Role       string     `json:"role"`
+}
+
+func (q *Queries) GetInvitation(ctx context.Context, arg GetInvitationParams) (GetInvitationRow, error) {
+	row := q.db.QueryRow(ctx, getInvitation, arg.TenantID, arg.ID)
+	var i GetInvitationRow
+	err := row.Scan(
+		&i.Invitation.ID,
+		&i.Invitation.TenantID,
+		&i.Invitation.EmailNormalized,
+		&i.Invitation.RoleID,
+		&i.Invitation.TokenHash,
+		&i.Invitation.InvitedBy,
+		&i.Invitation.ExpiresAt,
+		&i.Invitation.AcceptedAt,
+		&i.Invitation.AcceptedBy,
+		&i.Invitation.CreatedAt,
+		&i.Invitation.UpdatedAt,
+		&i.Role,
+	)
+	return i, err
+}
+
 const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one
-SELECT id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at FROM invitations
-WHERE tenant_id = $1 AND token_hash = $2
-FOR UPDATE
+SELECT i.id, i.tenant_id, i.email_normalized, i.role_id, i.token_hash, i.invited_by, i.expires_at, i.accepted_at, i.accepted_by, i.created_at, i.updated_at, r.key AS role
+FROM invitations i
+JOIN roles r ON r.id = i.role_id
+WHERE i.tenant_id = $1 AND i.token_hash = $2
+FOR UPDATE OF i
 `
 
 type GetInvitationByTokenHashForUpdateParams struct {
-	TenantID  int64  `json:"tenant_id"`
-	TokenHash string `json:"token_hash"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	TokenHash []byte    `json:"token_hash"`
+}
+
+type GetInvitationByTokenHashForUpdateRow struct {
+	Invitation Invitation `json:"invitation"`
+	Role       string     `json:"role"`
 }
 
 // Tenant-scoped possession lookup: the row lock serializes concurrent accepts.
 // tenant_id is explicit so the statement stays safe even under RLS bypass.
-func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, arg GetInvitationByTokenHashForUpdateParams) (Invitation, error) {
+func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, arg GetInvitationByTokenHashForUpdateParams) (GetInvitationByTokenHashForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getInvitationByTokenHashForUpdate, arg.TenantID, arg.TokenHash)
-	var i Invitation
+	var i GetInvitationByTokenHashForUpdateRow
 	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.EmailNormalized,
+		&i.Invitation.ID,
+		&i.Invitation.TenantID,
+		&i.Invitation.EmailNormalized,
+		&i.Invitation.RoleID,
+		&i.Invitation.TokenHash,
+		&i.Invitation.InvitedBy,
+		&i.Invitation.ExpiresAt,
+		&i.Invitation.AcceptedAt,
+		&i.Invitation.AcceptedBy,
+		&i.Invitation.CreatedAt,
+		&i.Invitation.UpdatedAt,
 		&i.Role,
-		&i.TokenHash,
-		&i.InvitedBy,
-		&i.ExpiresAt,
-		&i.AcceptedAt,
-		&i.AcceptedBy,
-		&i.CreatedAt,
-		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -138,30 +184,37 @@ WHERE token_hash = $1
 // of) the inviting tenant yet, so the tenant is resolved by token hash alone
 // before the tenant-scoped transaction starts. The invitation is re-locked
 // and re-validated under that tenant's scope.
-func (q *Queries) GetInvitationTenantByTokenHash(ctx context.Context, tokenHash string) (int64, error) {
+func (q *Queries) GetInvitationTenantByTokenHash(ctx context.Context, tokenHash []byte) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, getInvitationTenantByTokenHash, tokenHash)
-	var tenant_id int64
+	var tenant_id uuid.UUID
 	err := row.Scan(&tenant_id)
 	return tenant_id, err
 }
 
 const listPendingInvitationsCursor = `-- name: ListPendingInvitationsCursor :many
-SELECT id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at FROM invitations
-WHERE tenant_id = $1::bigint
-  AND accepted_at IS NULL
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
-ORDER BY created_at DESC, id DESC
+SELECT i.id, i.tenant_id, i.email_normalized, i.role_id, i.token_hash, i.invited_by, i.expires_at, i.accepted_at, i.accepted_by, i.created_at, i.updated_at, r.key AS role
+FROM invitations i
+JOIN roles r ON r.id = i.role_id
+WHERE i.tenant_id = $1::uuid
+  AND i.accepted_at IS NULL
+  AND (i.created_at, i.id) < ($2::timestamptz, $3::uuid)
+ORDER BY i.created_at DESC, i.id DESC
 LIMIT $4::int
 `
 
 type ListPendingInvitationsCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
-func (q *Queries) ListPendingInvitationsCursor(ctx context.Context, arg ListPendingInvitationsCursorParams) ([]Invitation, error) {
+type ListPendingInvitationsCursorRow struct {
+	Invitation Invitation `json:"invitation"`
+	Role       string     `json:"role"`
+}
+
+func (q *Queries) ListPendingInvitationsCursor(ctx context.Context, arg ListPendingInvitationsCursorParams) ([]ListPendingInvitationsCursorRow, error) {
 	rows, err := q.db.Query(ctx, listPendingInvitationsCursor,
 		arg.TenantID,
 		arg.CursorCreatedAt,
@@ -172,21 +225,22 @@ func (q *Queries) ListPendingInvitationsCursor(ctx context.Context, arg ListPend
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Invitation{}
+	items := []ListPendingInvitationsCursorRow{}
 	for rows.Next() {
-		var i Invitation
+		var i ListPendingInvitationsCursorRow
 		if err := rows.Scan(
-			&i.ID,
-			&i.TenantID,
-			&i.EmailNormalized,
+			&i.Invitation.ID,
+			&i.Invitation.TenantID,
+			&i.Invitation.EmailNormalized,
+			&i.Invitation.RoleID,
+			&i.Invitation.TokenHash,
+			&i.Invitation.InvitedBy,
+			&i.Invitation.ExpiresAt,
+			&i.Invitation.AcceptedAt,
+			&i.Invitation.AcceptedBy,
+			&i.Invitation.CreatedAt,
+			&i.Invitation.UpdatedAt,
 			&i.Role,
-			&i.TokenHash,
-			&i.InvitedBy,
-			&i.ExpiresAt,
-			&i.AcceptedAt,
-			&i.AcceptedBy,
-			&i.CreatedAt,
-			&i.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -205,9 +259,9 @@ WHERE tenant_id = $2 AND id = $3 AND accepted_at IS NULL
 `
 
 type MarkInvitationAcceptedParams struct {
-	AcceptedBy pgtype.Int8 `json:"accepted_by"`
-	TenantID   int64       `json:"tenant_id"`
-	ID         int64       `json:"id"`
+	AcceptedBy uuid.NullUUID `json:"accepted_by"`
+	TenantID   uuid.UUID     `json:"tenant_id"`
+	ID         uuid.UUID     `json:"id"`
 }
 
 func (q *Queries) MarkInvitationAccepted(ctx context.Context, arg MarkInvitationAcceptedParams) (int64, error) {
@@ -241,33 +295,33 @@ func (q *Queries) PurgeExpiredInvitations(ctx context.Context, batchSize int32) 
 }
 
 const upsertInvitation = `-- name: UpsertInvitation :one
-INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at)
+INSERT INTO invitations (tenant_id, email_normalized, role_id, token_hash, invited_by, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (tenant_id, email_normalized) WHERE accepted_at IS NULL DO UPDATE
-SET role = EXCLUDED.role,
+SET role_id = EXCLUDED.role_id,
     token_hash = EXCLUDED.token_hash,
     invited_by = EXCLUDED.invited_by,
     expires_at = EXCLUDED.expires_at
-RETURNING id, tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at
+RETURNING id, tenant_id, email_normalized, role_id, token_hash, invited_by, expires_at, accepted_at, accepted_by, created_at, updated_at
 `
 
 type UpsertInvitationParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	EmailNormalized string             `json:"email_normalized"`
-	Role            string             `json:"role"`
-	TokenHash       string             `json:"token_hash"`
-	InvitedBy       int64              `json:"invited_by"`
+	RoleID          uuid.UUID          `json:"role_id"`
+	TokenHash       []byte             `json:"token_hash"`
+	InvitedBy       uuid.UUID          `json:"invited_by"`
 	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
 }
 
 // One pending invitation per (tenant, address): re-inviting replaces the
 // token, role, inviter, and expiry of the pending row, so the newest emailed
-// link is the only valid one.
+// link is the only valid one. role_id grants a tenant role on acceptance.
 func (q *Queries) UpsertInvitation(ctx context.Context, arg UpsertInvitationParams) (Invitation, error) {
 	row := q.db.QueryRow(ctx, upsertInvitation,
 		arg.TenantID,
 		arg.EmailNormalized,
-		arg.Role,
+		arg.RoleID,
 		arg.TokenHash,
 		arg.InvitedBy,
 		arg.ExpiresAt,
@@ -277,7 +331,7 @@ func (q *Queries) UpsertInvitation(ctx context.Context, arg UpsertInvitationPara
 		&i.ID,
 		&i.TenantID,
 		&i.EmailNormalized,
-		&i.Role,
+		&i.RoleID,
 		&i.TokenHash,
 		&i.InvitedBy,
 		&i.ExpiresAt,

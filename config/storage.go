@@ -3,16 +3,16 @@ package config
 import "fmt"
 
 type StorageConfig struct {
-	Driver           string `env:"STORAGE_DRIVER" envDefault:"local"`
-	LocalPath        string `env:"STORAGE_LOCAL_PATH" envDefault:"./uploads"`
-	MaxFileSize      int64  `env:"STORAGE_MAX_FILE_SIZE" envDefault:"10485760"` // 10MB
-	AllowedMIMETypes string `env:"STORAGE_ALLOWED_MIME_TYPES" envDefault:"image/jpeg,image/png,image/gif,image/webp,application/pdf"`
-	S3Endpoint       string `env:"STORAGE_S3_ENDPOINT"`
-	S3Region         string `env:"STORAGE_S3_REGION" envDefault:"us-east-1"`
-	S3Bucket         string `env:"STORAGE_S3_BUCKET" envDefault:"uploads"`
-	S3AccessKey      string `env:"STORAGE_S3_ACCESS_KEY"`
-	S3SecretKey      string `env:"STORAGE_S3_SECRET_KEY"`
-	S3UseSSL         bool   `env:"STORAGE_S3_USE_SSL" envDefault:"false"`
+	Driver           string   `env:"STORAGE_DRIVER" envDefault:"local"`
+	LocalPath        string   `env:"STORAGE_LOCAL_PATH" envDefault:"./uploads"`
+	MaxFileSize      int64    `env:"STORAGE_MAX_FILE_SIZE" envDefault:"10485760"` // 10MB
+	AllowedMIMETypes []string `env:"STORAGE_ALLOWED_MIME_TYPES" envSeparator:"," envDefault:"image/jpeg,image/png,image/gif,image/webp,application/pdf"`
+	S3Endpoint       string   `env:"STORAGE_S3_ENDPOINT"`
+	S3Region         string   `env:"STORAGE_S3_REGION" envDefault:"us-east-1"`
+	S3Bucket         string   `env:"STORAGE_S3_BUCKET" envDefault:"uploads"`
+	S3AccessKey      string   `env:"STORAGE_S3_ACCESS_KEY"`
+	S3SecretKey      string   `env:"STORAGE_S3_SECRET_KEY"`
+	S3UseSSL         bool     `env:"STORAGE_S3_USE_SSL" envDefault:"false"`
 	// S3AllowInsecure acknowledges plaintext object-storage traffic in
 	// production (for example a cluster-local SeaweedFS behind a
 	// NetworkPolicy). Without it, production requires STORAGE_S3_USE_SSL=true.
@@ -21,7 +21,7 @@ type StorageConfig struct {
 
 // AllowedTypes returns the list of allowed MIME types for uploads.
 func (s StorageConfig) AllowedTypes() []string {
-	return splitCSV(s.AllowedMIMETypes)
+	return trimmedList(s.AllowedMIMETypes)
 }
 
 // UsesS3 reports whether the driver talks to an S3-compatible object store.

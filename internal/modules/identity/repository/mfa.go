@@ -3,8 +3,10 @@ package repository
 import (
 	"context"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	identitysqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/sqlc"
+	"github.com/google/uuid"
 )
 
 // MFARepository implements service.MFARepository. MFA is per global user, so
@@ -29,14 +31,14 @@ func toMFAFactor(row identitysqlc.MfaFactor) *identityservice.MFAFactor {
 		UserID:           row.UserID,
 		Type:             row.Type,
 		SecretCiphertext: row.SecretCiphertext,
-		ConfirmedAt:      timePtr(row.ConfirmedAt),
+		ConfirmedAt:      database.TimePtr(row.ConfirmedAt),
 		LastUsedStep:     row.LastUsedStep,
 		CreatedAt:        row.CreatedAt.Time,
 		UpdatedAt:        row.UpdatedAt.Time,
 	}
 }
 
-func (r *MFARepository) GetTOTP(ctx context.Context, userID int64) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetTOTP(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
 	row, err := r.q.GetMFAFactor(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -44,7 +46,7 @@ func (r *MFARepository) GetTOTP(ctx context.Context, userID int64) (*identityser
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID int64) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
 	row, err := r.q.GetMFAFactorForUpdate(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -52,7 +54,7 @@ func (r *MFARepository) GetTOTPForUpdate(ctx context.Context, userID int64) (*id
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID int64) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID uuid.UUID) (*identityservice.MFAFactor, error) {
 	row, err := r.q.GetConfirmedMFAFactor(ctx, userID)
 	if err != nil {
 		return nil, wrapErr(err)
@@ -60,7 +62,7 @@ func (r *MFARepository) GetConfirmedTOTP(ctx context.Context, userID int64) (*id
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) UpsertUnconfirmedTOTP(ctx context.Context, userID int64, secretCiphertext string) (*identityservice.MFAFactor, error) {
+func (r *MFARepository) UpsertUnconfirmedTOTP(ctx context.Context, userID uuid.UUID, secretCiphertext string) (*identityservice.MFAFactor, error) {
 	row, err := r.q.UpsertUnconfirmedMFAFactor(ctx, identitysqlc.UpsertUnconfirmedMFAFactorParams{
 		UserID:           userID,
 		SecretCiphertext: secretCiphertext,
@@ -71,7 +73,7 @@ func (r *MFARepository) UpsertUnconfirmedTOTP(ctx context.Context, userID int64,
 	return toMFAFactor(row), nil
 }
 
-func (r *MFARepository) ConfirmTOTP(ctx context.Context, id, userID, step int64) (bool, error) {
+func (r *MFARepository) ConfirmTOTP(ctx context.Context, id, userID uuid.UUID, step int64) (bool, error) {
 	n, err := r.q.ConfirmMFAFactor(ctx, identitysqlc.ConfirmMFAFactorParams{
 		ID: id, UserID: userID, Step: step,
 	})
@@ -86,7 +88,7 @@ func (r *MFARepository) ConfirmTOTP(ctx context.Context, id, userID, step int64)
 	return n > 0, nil
 }
 
-func (r *MFARepository) ConsumeTOTPStep(ctx context.Context, userID, step int64) (bool, error) {
+func (r *MFARepository) ConsumeTOTPStep(ctx context.Context, userID uuid.UUID, step int64) (bool, error) {
 	n, err := r.q.ConsumeMFAStep(ctx, identitysqlc.ConsumeMFAStepParams{UserID: userID, Step: step})
 	if err != nil {
 		return false, wrapErr(err)
@@ -94,25 +96,25 @@ func (r *MFARepository) ConsumeTOTPStep(ctx context.Context, userID, step int64)
 	return n > 0, nil
 }
 
-func (r *MFARepository) DeleteTOTP(ctx context.Context, userID int64) error {
+func (r *MFARepository) DeleteTOTP(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeleteMFAFactor(ctx, userID))
 }
 
-func (r *MFARepository) DeletePendingTOTP(ctx context.Context, userID int64) error {
+func (r *MFARepository) DeletePendingTOTP(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeletePendingMFAFactor(ctx, userID))
 }
 
-func (r *MFARepository) DeleteRecoveryCodes(ctx context.Context, userID int64) error {
+func (r *MFARepository) DeleteRecoveryCodes(ctx context.Context, userID uuid.UUID) error {
 	return wrapErr(r.q.DeleteRecoveryCodes(ctx, userID))
 }
 
-func (r *MFARepository) CreateRecoveryCodes(ctx context.Context, userID int64, hashes []string) error {
+func (r *MFARepository) CreateRecoveryCodes(ctx context.Context, userID uuid.UUID, hashes [][]byte) error {
 	return wrapErr(r.q.CreateRecoveryCodes(ctx, identitysqlc.CreateRecoveryCodesParams{
 		UserID: userID, CodeHashes: hashes,
 	}))
 }
 
-func (r *MFARepository) UseRecoveryCode(ctx context.Context, userID int64, hash string) (bool, error) {
+func (r *MFARepository) UseRecoveryCode(ctx context.Context, userID uuid.UUID, hash []byte) (bool, error) {
 	n, err := r.q.UseRecoveryCode(ctx, identitysqlc.UseRecoveryCodeParams{UserID: userID, CodeHash: hash})
 	if err != nil {
 		return false, wrapErr(err)
@@ -120,7 +122,7 @@ func (r *MFARepository) UseRecoveryCode(ctx context.Context, userID int64, hash 
 	return n > 0, nil
 }
 
-func (r *MFARepository) CountUnusedRecoveryCodes(ctx context.Context, userID int64) (int64, error) {
+func (r *MFARepository) CountUnusedRecoveryCodes(ctx context.Context, userID uuid.UUID) (int64, error) {
 	n, err := r.q.CountUnusedRecoveryCodes(ctx, userID)
 	if err != nil {
 		return 0, wrapErr(err)

@@ -8,6 +8,8 @@ import (
 	"math"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 )
@@ -69,23 +71,23 @@ func (d *Dispatcher) Dispatch(ctx context.Context, event events.Event) (int, err
 			continue
 		}
 		_, inserted, err := d.store.CreateDeliveryWithJob(ctx, DeliveryDraft{
-			TenantID:         event.TenantID,
-			EndpointID:       endpoint.ID,
-			EventID:          event.ID,
-			EventType:        event.Type,
-			DataVersion:      int32(event.DataVersion), // #nosec G115 -- validated 1..math.MaxInt32
-			ActorType:        event.Actor.Type,
-			ActorID:          event.Actor.ID,
-			EventCreatedAt:   event.OccurredAt,
-			URL:              endpoint.URL,
-			Payload:          event.Data,
-			SecretCiphertext: endpoint.SecretCiphertext,
-			MaxAttempts:      endpoint.MaxAttempts,
-			TimeoutMS:        endpoint.TimeoutMS,
-			RunAt:            d.now(),
+			TenantID:       event.TenantID,
+			EndpointID:     endpoint.ID,
+			EventID:        event.ID,
+			EventType:      event.Type,
+			DataVersion:    int32(event.DataVersion), // #nosec G115 -- validated 1..math.MaxInt32
+			ActorType:      event.Actor.Type,
+			ActorID:        event.Actor.ID,
+			EventCreatedAt: event.OccurredAt,
+			URL:            endpoint.URL,
+			Payload:        event.Data,
+			SecretID:       endpoint.SecretID,
+			MaxAttempts:    endpoint.MaxAttempts,
+			TimeoutMS:      endpoint.TimeoutMS,
+			RunAt:          d.now(),
 		})
 		if err != nil {
-			return created, fmt.Errorf("webhooks: create delivery for endpoint %d: %w", endpoint.ID, err)
+			return created, fmt.Errorf("webhooks: create delivery for endpoint %s: %w", endpoint.ID, err)
 		}
 		if inserted {
 			created++
@@ -108,12 +110,16 @@ func validateDispatchEvent(event events.Event) error {
 		return fmt.Errorf("%w: %w", ErrInvalidEvent, err)
 	}
 	switch {
-	case event.TenantID <= 0:
+	case event.TenantID == uuid.Nil:
 		return fmt.Errorf("%w: tenant id is required", ErrInvalidEvent)
-	case event.ID == "":
+	case event.ID == uuid.Nil:
 		return fmt.Errorf("%w: id is required", ErrInvalidEvent)
 	case event.Actor.Type == "":
 		return fmt.Errorf("%w: actor is required", ErrInvalidEvent)
+	case event.Actor.Type != events.ActorSystem:
+		if _, err := uuid.Parse(event.Actor.ID); err != nil {
+			return fmt.Errorf("%w: actor id must be a UUID", ErrInvalidEvent)
+		}
 	case event.DataVersion > maxDataVersion:
 		return fmt.Errorf("%w: dataVersion is out of range", ErrInvalidEvent)
 	case !ValidType(event.Type):

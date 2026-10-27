@@ -2,7 +2,7 @@ package tenant
 
 import (
 	"context"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 	"unsafe"
@@ -18,7 +18,7 @@ func cachedSlugs(r *CachedResolver) []string {
 	for slug := range r.entries {
 		slugs = append(slugs, slug)
 	}
-	sort.Strings(slugs)
+	slices.Sort(slugs)
 	return slugs
 }
 
@@ -27,8 +27,8 @@ func cachedSlugs(r *CachedResolver) []string {
 // buffer. The cache key must not change with it.
 func TestCachedResolverKeyIsIndependentOfCallerBuffer(t *testing.T) {
 	backend := &mapResolver{tenants: map[string]Tenant{
-		"acme": {ID: 2, Slug: "acme"},
-		"beta": {ID: 3, Slug: "beta"},
+		"acme": {ID: testID(2), Slug: "acme"},
+		"beta": {ID: testID(3), Slug: "beta"},
 	}}
 	cached := NewCachedResolver(backend, time.Minute, time.Minute, 16)
 
@@ -42,6 +42,6 @@ func TestCachedResolverKeyIsIndependentOfCallerBuffer(t *testing.T) {
 	assert.Equal(t, []string{"acme"}, cachedSlugs(cached), "cache key must be an owned copy")
 	got, err := cached.Resolve(context.Background(), "acme")
 	require.NoError(t, err)
-	assert.Equal(t, int64(2), got.ID)
+	assert.Equal(t, testID(2), got.ID)
 	assert.Equal(t, int64(1), backend.calls.Load(), "the second lookup must be a cache hit")
 }

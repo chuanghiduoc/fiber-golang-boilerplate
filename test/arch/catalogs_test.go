@@ -5,7 +5,6 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // TestEveryRegisteredCodeHasLocalizedTitles builds the production module
@@ -14,11 +13,15 @@ import (
 // module). i18n.New itself enforces key/placeholder parity and collisions.
 func TestEveryRegisteredCodeHasLocalizedTitles(t *testing.T) {
 	modules, _ := productionModules(t)
+	catalogs, err := app.BuildCatalogs(modules...)
+	if err != nil {
+		t.Fatalf("build catalogs: %v", err)
+	}
 	bundle, err := i18n.New("en", app.LocaleSources(modules...)...)
 	if err != nil {
 		t.Fatalf("merged i18n bundle: %v", err)
 	}
-	for _, code := range apperror.AllCodes() {
+	for _, code := range catalogs.Errors.Codes() {
 		key := "errors." + string(code) + ".title"
 		// i18n.New already guarantees every locale has the same keys, so a
 		// key present in one locale is present in all of them.

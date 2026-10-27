@@ -9,14 +9,10 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-)
-
-const (
-	localTenantID   = "tenant_id"
-	localTenantSlug = "tenant_slug"
 )
 
 // Middleware resolves the tenant from X-Tenant-Slug and stores tenant_id and
@@ -65,14 +61,12 @@ func Middleware(r tenant.Resolver, defaultSlug string) fiber.Handler {
 			if errors.Is(err, apperror.ErrNotFound) {
 				return apperror.NewNotFound("tenant not found")
 			}
-			return apperror.NewInternal("failed to resolve tenant")
+			return apperror.Internal(err, "failed to resolve tenant")
 		}
-		if resolved.ID <= 0 {
+		if resolved.ID == uuid.Nil {
 			return apperror.NewInternal("failed to resolve tenant")
 		}
 
-		fiber.Locals[int64](c, localTenantID, resolved.ID)
-		fiber.Locals[string](c, localTenantSlug, resolved.Slug)
 		c.SetContext(tenant.WithIdentity(c.Context(), resolved.ID, resolved.Slug))
 		return c.Next()
 	}
@@ -80,14 +74,14 @@ func Middleware(r tenant.Resolver, defaultSlug string) fiber.Handler {
 
 // ID returns the tenant ID resolved for the request, or 0 when no tenant
 // middleware ran.
-func ID(c fiber.Ctx) int64 {
-	return fiber.Locals[int64](c, localTenantID)
+func ID(c fiber.Ctx) uuid.UUID {
+	return tenant.IDFromContext(c.Context())
 }
 
 // Slug returns the tenant slug resolved for the request, or "" when no tenant
 // middleware ran (or when a JWT claim overrode an unresolved default).
 func Slug(c fiber.Ctx) string {
-	return fiber.Locals[string](c, localTenantSlug)
+	return tenant.SlugFromContext(c.Context())
 }
 
 const oauthCallbackPath = "/api/v1/auth/google/callback"
@@ -101,9 +95,9 @@ const webhookInboundPrefix = "/api/v1/webhooks/inbound/"
 // cannot set X-Tenant-Slug. Authenticated routes never use this fallback; the
 // JWT tenant_id claim remains authoritative there.
 var tenantQueryPaths = map[string]struct{}{
-	"/api/v1/auth/google":         {},
-	"/api/v1/auth/reset-password": {},
-	"/api/v1/auth/verify-email":   {},
+	"/api/v1/auth/google":                       {},
+	"/api/v1/auth/password-resets/complete":     {},
+	"/api/v1/auth/email-verifications/complete": {},
 }
 
 func allowsTenantQuery(path string) bool {

@@ -18,11 +18,6 @@ const (
 // Owner is the module name (Module.Name()) that owns these entries.
 const Owner = "notifications"
 
-// Register adds the permissions to the authz catalog. app.RegisterCatalogs
-// does the same at startup through app.PermissionProvider; module unit tests
-// that mount routes without the app call it directly. Repeating it is a no-op.
-func Register() error { return authz.Register(Owner, Permissions()...) }
-
 // Permissions returns the notifications grants for app.PermissionProvider.
 func Permissions() []authz.Grant {
 	user := []string{authz.RoleMember}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	apikeysprivacy "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/privacy"
 	apikeyssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/sqlc"
 )
@@ -19,7 +21,7 @@ func NewPrivacyStore(db apikeyssqlc.DBTX) *PrivacyStore {
 	return &PrivacyStore{q: apikeyssqlc.New(db)}
 }
 
-func (s *PrivacyStore) List(ctx context.Context, tenantID, userID int64) ([]apikeysprivacy.Key, error) {
+func (s *PrivacyStore) List(ctx context.Context, tenantID, userID uuid.UUID) ([]apikeysprivacy.Key, error) {
 	rows, err := s.q.ListAPIKeysForPrivacy(ctx, apikeyssqlc.ListAPIKeysForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})
@@ -30,7 +32,7 @@ func (s *PrivacyStore) List(ctx context.Context, tenantID, userID int64) ([]apik
 	for i, row := range rows {
 		out[i] = apikeysprivacy.Key{
 			ID: row.ID, Name: row.Name, Prefix: row.Prefix, Scopes: row.Scopes,
-			ExpiresAt:          privacyTimePtr(row.ExpiresAt.Time, row.ExpiresAt.Valid),
+			ExpiresAt:          row.ExpiresAt.Time,
 			RevokedAt:          privacyTimePtr(row.RevokedAt.Time, row.RevokedAt.Valid),
 			RotatedAt:          privacyTimePtr(row.RotatedAt.Time, row.RotatedAt.Valid),
 			RotationGraceUntil: privacyTimePtr(row.RotationGraceUntil.Time, row.RotationGraceUntil.Valid),
@@ -42,7 +44,7 @@ func (s *PrivacyStore) List(ctx context.Context, tenantID, userID int64) ([]apik
 	return out, nil
 }
 
-func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID int64) error {
+func (s *PrivacyStore) DeleteAll(ctx context.Context, tenantID, userID uuid.UUID) error {
 	_, err := s.q.DeleteAPIKeysForPrivacy(ctx, apikeyssqlc.DeleteAPIKeysForPrivacyParams{
 		TenantID: tenantID, UserID: userID,
 	})

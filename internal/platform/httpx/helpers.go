@@ -12,26 +12,28 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
-// ParamID extracts and validates a required int64 path parameter.
-func ParamID(c fiber.Ctx, name string) (int64, error) {
-	id := fiber.Params[int64](c, name)
-	if id == 0 {
-		return 0, apperror.NewBadRequest("invalid " + name)
+// ParamID extracts and validates a required UUID path parameter.
+func ParamID(c fiber.Ctx, name string) (uuid.UUID, error) {
+	id, err := uuid.Parse(c.Params(name))
+	if err != nil || id == uuid.Nil {
+		return uuid.Nil, apperror.NewBadRequest("invalid " + name)
 	}
 	return id, nil
 }
 
 // AuthUserID returns the authenticated user's ID from the JWT context.
 // The key is set by middleware.JWTAuth.
-func AuthUserID(c fiber.Ctx) int64 {
-	return fiber.Locals[int64](c, "user_id")
+func AuthUserID(c fiber.Ctx) uuid.UUID {
+	return requestctx.ActorID(c.Context())
 }
 
 // Can reports whether the authenticated subject holds permission. Use it

@@ -22,7 +22,7 @@ func TestTenantPurgerDeletesFeatureTargetsInBoundedBatches(t *testing.T) {
 			return pgconn.CommandTag{}, fmt.Errorf("unexpected SQL: %s", sql)
 		}
 		require.Len(t, args, 2)
-		require.Equal(t, int64(7), args[0])
+		require.Equal(t, testID(7), args[0])
 		require.Equal(t, tenancycontracts.PurgeBatchSize, args[1])
 		if len(db.ExecCalls) == 1 {
 			return fakedb.Deleted(int64(tenancycontracts.PurgeBatchSize)), nil
@@ -30,6 +30,6 @@ func TestTenantPurgerDeletesFeatureTargetsInBoundedBatches(t *testing.T) {
 		return fakedb.Deleted(0), nil
 	}
 
-	require.NoError(t, featuresrepo.NewTenantPurger(db).PurgeTenant(context.Background(), 7))
+	require.NoError(t, featuresrepo.NewTenantPurger(db).PurgeTenant(context.Background(), testID(7)))
 	assert.Len(t, db.ExecCalls, 2, "a full page is followed by another select")
 }

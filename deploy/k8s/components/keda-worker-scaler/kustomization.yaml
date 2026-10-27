@@ -1,0 +1,26 @@
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+# Optional KEDA scaling for the job worker on the queue-lag histogram the
+# platform already exports (jobs_queue_lag_seconds, labelled by kind). KEDA
+# replaces the fixed replica count: the component removes spec.replicas from
+# the worker Deployment and adds a ScaledObject.
+#
+# Enable it in an overlay:
+#
+#   components:
+#     - ../../components/keda-worker-scaler
+#
+# Requires KEDA installed and the Prometheus URL/query patched in
+# scaledobject.yaml. A stalled queue exports no observations rather than a
+# growing lag, so pair this with an alert on jobs_dead_total and on a missing
+# jobs_claimed_total increase; see README.md#job-workers.
+patches:
+  - target:
+      kind: Deployment
+      name: fiber-boilerplate-worker
+    patch: |-
+      - op: remove
+        path: /spec/replicas
+resources:
+  - scaledobject.yaml

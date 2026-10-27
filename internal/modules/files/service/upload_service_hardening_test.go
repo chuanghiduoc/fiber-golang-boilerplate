@@ -21,19 +21,19 @@ func TestUploadList_IncludeDeleted(t *testing.T) {
 	repo := newMockFileRepo()
 	svc := newTestUploadService(repo, newMockStorage())
 	now := time.Now()
-	repo.files[1] = &File{ID: 1, TenantID: 1, UserID: 1, OriginalName: "active.txt", CreatedAt: now}
-	repo.files[2] = &File{ID: 2, TenantID: 1, UserID: 1, OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: &now}
+	repo.files[testID(1)] = &File{ID: testID(1), TenantID: testID(1), UserID: testID(1), OriginalName: "active.txt", CreatedAt: now}
+	repo.files[testID(2)] = &File{ID: testID(2), TenantID: testID(1), UserID: testID(1), OriginalName: "deleted.txt", CreatedAt: now, DeletedAt: &now}
 	repo.nextID = 3
 
-	activeOnly, _, err := svc.List(systemCtx(), 1, 10, "", false)
+	activeOnly, _, err := svc.List(systemCtx(), testID(1), 10, "", false)
 	if err != nil {
 		t.Fatalf("list active: %v", err)
 	}
-	if len(activeOnly) != 1 || activeOnly[0].ID != 1 {
+	if len(activeOnly) != 1 || activeOnly[0].ID != testID(1) {
 		t.Fatalf("active list = %+v, want only file 1", activeOnly)
 	}
 
-	withDeleted, _, err := svc.List(systemCtx(), 1, 10, "", true)
+	withDeleted, _, err := svc.List(systemCtx(), testID(1), 10, "", true)
 	if err != nil {
 		t.Fatalf("list with deleted: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestUploadList_IncludeDeleted(t *testing.T) {
 		t.Fatalf("includeDeleted list = %d items, want 2", len(withDeleted))
 	}
 	for _, f := range withDeleted {
-		if f.ID == 2 && f.DeletedAt == nil {
+		if f.ID == testID(2) && f.DeletedAt == nil {
 			t.Error("deleted file must expose deletedAt")
 		}
 	}

@@ -4,21 +4,26 @@ package testutil
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/crypto/argon2"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/token"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/validator"
 )
 
 // Member is a fixture user with a membership in one tenant (users
 // are global identities; tenant-owned rows reference memberships).
 type Member struct {
-	UserID       int64
-	TenantID     int64
+	UserID       uuid.UUID
+	TenantID     uuid.UUID
 	Email        string
 	Role         string
 	TokenVersion int32
@@ -28,7 +33,8 @@ type Member struct {
 // passwordless, active "member".
 type MemberOptions struct {
 	Role string // system role key: "member" (default), "admin", or "owner"
-	// Password, when set, stores a bcrypt (MinCost) hash in user_passwords.
+	// Password, when set, stores a cheap-parameter Argon2id hash in
+	// user_passwords.
 	Password   string
 	Unverified bool
 }
@@ -36,16 +42,16 @@ type MemberOptions struct {
 // CreateMember inserts a global user (or reuses the live user with the same
 // email) and an active membership in tenantID. Emails are normalized to
 // lower case like the identity service does.
-func CreateMember(t testing.TB, ctx context.Context, pool *pgxpool.Pool, tenantID int64, email string, opts MemberOptions) Member {
+func CreateMember(t testing.TB, ctx context.Context, pool *pgxpool.Pool, tenantID uuid.UUID, email string, opts MemberOptions) Member {
 	t.Helper()
 	m, err := createMember(ctx, pool, tenantID, email, opts)
 	if err != nil {
-		t.Fatalf("create member %s in tenant %d: %v", email, tenantID, err)
+		t.Fatalf("create member %s in tenant %s: %v", email, tenantID, err)
 	}
 	return m
 }
 
-func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID int64, email string, opts MemberOptions) (Member, error) {
+func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID uuid.UUID, email string, opts MemberOptions) (Member, error) {
 	role := opts.Role
 	if role == "" || role == "user" {
 		role = "member"
@@ -67,14 +73,14 @@ func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID int64, email
 		return Member{}, fmt.Errorf("upsert user: %w", err)
 	}
 	if opts.Password != "" {
-		hash, err := bcrypt.GenerateFromPassword([]byte(opts.Password), bcrypt.MinCost)
+		hash, err := testPasswordHash(opts.Password)
 		if err != nil {
 			return Member{}, err
 		}
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO user_passwords (user_id, password_hash) VALUES ($1, $2)
 			ON CONFLICT (user_id) DO UPDATE SET password_hash = EXCLUDED.password_hash`,
-			m.UserID, string(hash)); err != nil {
+			m.UserID, hash); err != nil {
 			return Member{}, fmt.Errorf("set password: %w", err)
 		}
 	}
@@ -97,11 +103,31 @@ func createMember(ctx context.Context, pool *pgxpool.Pool, tenantID int64, email
 	return m, nil
 }
 
+// testPasswordHash builds a real Argon2id PHC string with the cheap fixture
+// parameters. Integration sign-ins verify it and rehash it at the production
+// parameters on success, exactly like a legacy hash.
+func testPasswordHash(password string) (string, error) {
+	const (
+		memory      = 1024
+		iterations  = 1
+		parallelism = 1
+		saltLength  = 16
+		keyLength   = 32
+	)
+	salt := make([]byte, saltLength)
+	if _, err := rand.Read(salt); err != nil {
+		return "", err
+	}
+	key := argon2.IDKey([]byte(validator.NormalizePassword(password)), salt, iterations, memory, parallelism, keyLength)
+	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s", memory, iterations, parallelism,
+		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(key)), nil
+}
+
 // CreateTenant inserts an active tenant (and its settings row) and returns
 // its id.
-func CreateTenant(t testing.TB, ctx context.Context, pool *pgxpool.Pool, slug string) int64 {
+func CreateTenant(t testing.TB, ctx context.Context, pool *pgxpool.Pool, slug string) uuid.UUID {
 	t.Helper()
-	var id int64
+	var id uuid.UUID
 	if err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug).Scan(&id); err != nil {
 		t.Fatalf("create tenant %s: %v", slug, err)
@@ -125,28 +151,27 @@ func SessionToken(t testing.TB, ctx context.Context, pool *pgxpool.Pool, m Membe
 func SessionTokenAMR(t testing.TB, ctx context.Context, pool *pgxpool.Pool, m Member, secret string, amr []string) string {
 	t.Helper()
 	var (
-		sessionID int64
+		sessionID uuid.UUID
 		version   int32
 	)
 	err := pool.QueryRow(ctx, `
 		INSERT INTO sessions (tenant_id, user_id, token_version, expires_at, amr, mfa_verified_at)
 		SELECT m.tenant_id, m.user_id, u.token_version, NOW() + INTERVAL '720 hours', $3,
-		       CASE WHEN $3::text[] && ARRAY['otp', 'rc']::text[] THEN NOW() ELSE NULL END
+		       CASE WHEN $3::text[] && ARRAY['otp', 'rc', 'hwk', 'swk']::text[] THEN NOW() ELSE NULL END
 		FROM memberships m JOIN users u ON u.id = m.user_id
 		WHERE m.tenant_id = $1 AND m.user_id = $2
 		RETURNING id, token_version`,
 		m.TenantID, m.UserID, amr).Scan(&sessionID, &version)
 	if err != nil {
-		t.Fatalf("create session for user %d in tenant %d: %v", m.UserID, m.TenantID, err)
+		t.Fatalf("create session for user %s in tenant %s: %v", m.UserID, m.TenantID, err)
 	}
 	tok, err := token.GenerateForSession(token.SessionClaims{
 		UserID:       m.UserID,
 		TenantID:     m.TenantID,
 		SessionID:    sessionID,
-		Email:        m.Email,
 		TokenVersion: version,
 		AMR:          amr,
-	}, secret, 1)
+	}, secret, time.Hour)
 	if err != nil {
 		t.Fatalf("sign session token: %v", err)
 	}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -21,9 +22,9 @@ import (
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
-func createTrialTenant(t *testing.T, ctx context.Context, h *privacyHarness, slug string, trialEnd *time.Time) int64 {
+func createTrialTenant(t *testing.T, ctx context.Context, h *privacyHarness, slug string, trialEnd *time.Time) uuid.UUID {
 	t.Helper()
-	var id int64
+	var id uuid.UUID
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name, status, trial_ends_at) VALUES ($1, $1, 'trialing', $2) RETURNING id`,
 		slug, trialEnd).Scan(&id))
@@ -35,11 +36,11 @@ func createTrialTenant(t *testing.T, ctx context.Context, h *privacyHarness, slu
 // seedTenantCheckFixtures adds every kind of tenant-wide row the purge must
 // remove: a custom role and assignment, an invitation, a tenant-wide feature
 // target, a webhook inbound source/event, and an audit row that must survive.
-func seedTenantCheckFixtures(t *testing.T, h *privacyHarness, tenantID, userID int64) {
+func seedTenantCheckFixtures(t *testing.T, h *privacyHarness, tenantID, userID uuid.UUID) {
 	t.Helper()
 	ctx := context.Background()
 
-	var roleID int64
+	var roleID uuid.UUID
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'analyst', 'Analyst') RETURNING id`,
 		tenantID).Scan(&roleID))
@@ -49,10 +50,10 @@ func seedTenantCheckFixtures(t *testing.T, h *privacyHarness, tenantID, userID i
 	require.NoError(t, err)
 
 	_, err = h.pool.Exec(ctx,
-		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at)
-		 VALUES ($1, $2, 'member', $3, $4, NOW() + interval '7 days')`,
-		tenantID, fmt.Sprintf("invitee-%d-%d@example.test", tenantID, userID),
-		fmt.Sprintf("invite-token-%d-%d", tenantID, userID), userID)
+		`INSERT INTO invitations (tenant_id, email_normalized, role_id, token_hash, invited_by, expires_at)
+		 VALUES ($1, $2, (SELECT id FROM roles WHERE tenant_id IS NULL AND scope = 'tenant' AND key = 'member'), sha256($3::bytea), $4, NOW() + interval '7 days')`,
+		tenantID, fmt.Sprintf("invitee-%s-%s@example.test", tenantID, userID),
+		fmt.Sprintf("invite-token-%s-%s", tenantID, userID), userID)
 	require.NoError(t, err)
 
 	_, err = h.pool.Exec(ctx,
@@ -60,15 +61,20 @@ func seedTenantCheckFixtures(t *testing.T, h *privacyHarness, tenantID, userID i
 		 VALUES ('privacy_test_flag', $1, NULL, false)`, tenantID)
 	require.NoError(t, err)
 
-	var sourceID int64
+	var sourceID uuid.UUID
 	require.NoError(t, h.pool.QueryRow(ctx,
-		`INSERT INTO webhook_inbound_sources (tenant_id, name, slug, secret_ciphertext, status)
-		 VALUES ($1, 'inbound', $2, 'sealed', 'active') RETURNING id`,
-		tenantID, fmt.Sprintf("inbound-%d", tenantID)).Scan(&sourceID))
+		`INSERT INTO webhook_inbound_sources (tenant_id, name, slug, status)
+		 VALUES ($1, 'inbound', $2, 'active') RETURNING id`,
+		tenantID, fmt.Sprintf("inbound-%s", tenantID)).Scan(&sourceID))
+	_, err = h.pool.Exec(ctx,
+		`INSERT INTO webhook_inbound_source_secrets (tenant_id, source_id, version, secret_ciphertext)
+		 VALUES ($1, $2, 1, 'sealed')`,
+		tenantID, sourceID)
+	require.NoError(t, err)
 	_, err = h.pool.Exec(ctx,
 		`INSERT INTO webhook_inbound_events (tenant_id, source_id, external_event_id, signature, payload)
 		 VALUES ($1, $2, $3, 'sig', '{}'::jsonb)`,
-		tenantID, sourceID, fmt.Sprintf("event-%d", tenantID))
+		tenantID, sourceID, fmt.Sprintf("event-%s", tenantID))
 	require.NoError(t, err)
 
 	_, err = h.pool.Exec(ctx,
@@ -77,16 +83,16 @@ func seedTenantCheckFixtures(t *testing.T, h *privacyHarness, tenantID, userID i
 	require.NoError(t, err)
 }
 
-func zeroForTenant(t *testing.T, h *privacyHarness, table string, tenantID int64) {
+func zeroForTenant(t *testing.T, h *privacyHarness, table string, tenantID uuid.UUID) {
 	t.Helper()
 	var count int64
 	require.NoError(t, h.pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM `+table+` WHERE tenant_id = $1`, tenantID).Scan(&count),
-		"count %s for tenant %d", table, tenantID)
-	assert.Zero(t, count, "%s still holds rows for tenant %d", table, tenantID)
+		"count %s for tenant %s", table, tenantID)
+	assert.Zero(t, count, "%s still holds rows for tenant %s", table, tenantID)
 }
 
-func countForTenant(t *testing.T, h *privacyHarness, table string, tenantID int64) int64 {
+func countForTenant(t *testing.T, h *privacyHarness, table string, tenantID uuid.UUID) int64 {
 	t.Helper()
 	var count int64
 	require.NoError(t, h.pool.QueryRow(context.Background(),
@@ -114,11 +120,11 @@ func TestTenantPurge_DeletedTenantIsErasedAndIsIdempotent(t *testing.T) {
 	seedTenantCheckFixtures(t, h, tenantA, memberA.UserID)
 	seedTenantCheckFixtures(t, h, tenantB, memberB.UserID)
 
-	removedExportPath := fmt.Sprintf("%d/%d/exports/removed.json", tenantA, removedA.UserID)
+	removedExportPath := fmt.Sprintf("%s/%s/exports/removed.json", tenantA, removedA.UserID)
 	require.NoError(t, h.store.Put(ctx, removedExportPath, strings.NewReader(`{"userId":1}`), 12, "application/json"))
 	_, err = h.pool.Exec(ctx,
-		`INSERT INTO data_exports (tenant_id, user_id, status, storage_path)
-		 VALUES ($1, $2, 'ready', $3)`, tenantA, removedA.UserID, removedExportPath)
+		`INSERT INTO data_exports (tenant_id, user_id, status, storage_path, expires_at)
+		 VALUES ($1, $2, 'ready', $3, NOW() + interval '7 days')`, tenantA, removedA.UserID, removedExportPath)
 	require.NoError(t, err)
 
 	auditBefore := countForTenant(t, h, "audit_events", tenantA)
@@ -156,7 +162,7 @@ func TestTenantPurge_DeletedTenantIsErasedAndIsIdempotent(t *testing.T) {
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`SELECT count(*) FROM memberships WHERE tenant_id = $1`, tenantA).Scan(&removedMemberships))
 	assert.Zero(t, removedMemberships)
-	_, err = h.store.Get(ctx, h.records[fmt.Sprintf("%d/%d", tenantA, memberA.UserID)])
+	_, err = h.store.Get(ctx, h.records[fmt.Sprintf("%s/%s", tenantA, memberA.UserID)])
 	assert.ErrorIs(t, err, storage.ErrNotFound, "purge deletes the tenant's file blobs")
 	_, err = h.store.Get(ctx, removedExportPath)
 	assert.ErrorIs(t, err, storage.ErrNotFound, "purge deletes the tenant's export blobs")
@@ -167,7 +173,7 @@ func TestTenantPurge_DeletedTenantIsErasedAndIsIdempotent(t *testing.T) {
 	assert.NotZero(t, countForTenant(t, h, "api_keys", tenantB))
 	assert.NotZero(t, countForTenant(t, h, "webhook_endpoints", tenantB))
 	assert.NotZero(t, countForTenant(t, h, "memberships", tenantB))
-	reader, err := h.store.Get(ctx, h.records[fmt.Sprintf("%d/%d", tenantB, memberB.UserID)])
+	reader, err := h.store.Get(ctx, h.records[fmt.Sprintf("%s/%s", tenantB, memberB.UserID)])
 	require.NoError(t, err, "the other tenant's blob stays")
 	require.NoError(t, reader.Close())
 
@@ -248,7 +254,7 @@ func TestTrialExpiry_StopsServingAndSuspendsHourly(t *testing.T) {
 
 	// The clock, not the hourly job, decides operational state: an expired
 	// trial already returns 404 from tenant resolution and 401 for sessions.
-	status, _ := h.request(t, http.MethodGet, "/api/v1/users/me", token, "trial-expired", "")
+	status, _ := h.request(t, http.MethodGet, "/api/v1/me/profile", token, "trial-expired", "")
 	assert.Equal(t, fiber.StatusNotFound, status)
 
 	handler := h.jobs.handler(t, "identity.tenants.expire_trials")
@@ -270,7 +276,7 @@ func TestTrialExpiry_StopsServingAndSuspendsHourly(t *testing.T) {
 
 	// A suspended tenant is not operational: resolution still returns 404, the
 	// same response as an unknown tenant (never a hint that it exists).
-	status, _ = h.request(t, http.MethodGet, "/api/v1/users/me", token, "trial-expired", "")
+	status, _ = h.request(t, http.MethodGet, "/api/v1/me/profile", token, "trial-expired", "")
 	assert.Equal(t, fiber.StatusNotFound, status)
 
 	// Re-running the job after the status changed is a no-op.
@@ -281,7 +287,7 @@ func TestPrivacy_ExportIncludesArticle15DataWithoutSecrets(t *testing.T) {
 	h := setupPrivacyHarness(t)
 	ctx := context.Background()
 	user := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "art15@example.com",
-		testutil.MemberOptions{Password: "Password1!", Role: "admin"})
+		testutil.MemberOptions{Password: testPassphrase, Role: "admin"})
 	inviter := testutil.CreateMember(t, ctx, h.pool, tenant.DefaultID, "art15-inviter@example.com",
 		testutil.MemberOptions{Role: "member"})
 	token := testutil.SessionToken(t, ctx, h.pool, user, privacyIntegrationSecret)
@@ -300,25 +306,25 @@ func TestPrivacy_ExportIncludesArticle15DataWithoutSecrets(t *testing.T) {
 		 VALUES ($1, 'totp', 'sealed-totp-secret-must-not-leak', NOW())`, user.UserID)
 	require.NoError(t, err)
 	_, err = h.pool.Exec(ctx,
-		`INSERT INTO mfa_recovery_codes (user_id, code_hash) VALUES ($1, 'recovery-hash-one'), ($1, 'recovery-hash-two')`,
+		`INSERT INTO mfa_recovery_codes (user_id, code_hash) VALUES ($1, sha256('recovery-hash-one'::bytea)), ($1, sha256('recovery-hash-two'::bytea))`,
 		user.UserID)
 	require.NoError(t, err)
 	_, err = h.pool.Exec(ctx,
-		`UPDATE mfa_recovery_codes SET used_at = NOW() WHERE user_id = $1 AND code_hash = 'recovery-hash-one'`, user.UserID)
+		`UPDATE mfa_recovery_codes SET used_at = NOW() WHERE user_id = $1 AND code_hash = sha256('recovery-hash-one'::bytea)`, user.UserID)
 	require.NoError(t, err)
 
 	_, err = h.pool.Exec(ctx,
-		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at)
-		 VALUES ($1, 'art15-sent@example.com', 'member', 'art15-sent-token', $2, NOW() + interval '7 days')`,
+		`INSERT INTO invitations (tenant_id, email_normalized, role_id, token_hash, invited_by, expires_at)
+		 VALUES ($1, 'art15-sent@example.com', (SELECT id FROM roles WHERE tenant_id IS NULL AND scope = 'tenant' AND key = 'member'), sha256('art15-sent-token'::bytea), $2, NOW() + interval '7 days')`,
 		tenant.DefaultID, user.UserID)
 	require.NoError(t, err)
 	_, err = h.pool.Exec(ctx,
-		`INSERT INTO invitations (tenant_id, email_normalized, role, token_hash, invited_by, expires_at, accepted_at, accepted_by)
-		 VALUES ($1, $2, 'member', 'art15-received-token', $3, NOW() + interval '7 days', NOW(), $4)`,
+		`INSERT INTO invitations (tenant_id, email_normalized, role_id, token_hash, invited_by, expires_at, accepted_at, accepted_by)
+		 VALUES ($1, $2, (SELECT id FROM roles WHERE tenant_id IS NULL AND scope = 'tenant' AND key = 'member'), sha256('art15-received-token'::bytea), $3, NOW() + interval '7 days', NOW(), $4)`,
 		tenant.DefaultID, user.Email, inviter.UserID, user.UserID)
 	require.NoError(t, err)
 
-	var roleID int64
+	var roleID uuid.UUID
 	require.NoError(t, h.pool.QueryRow(ctx,
 		`INSERT INTO roles (tenant_id, scope, key, name) VALUES ($1, 'tenant', 'auditor', 'Auditor') RETURNING id`,
 		tenant.DefaultID).Scan(&roleID))
@@ -336,15 +342,15 @@ func TestPrivacy_ExportIncludesArticle15DataWithoutSecrets(t *testing.T) {
 	}
 
 	status, body := h.request(t, http.MethodPost, "/api/v1/me/data-exports", token, "default", "")
-	require.Equal(t, fiber.StatusCreated, status, "body: %s", body)
+	require.Equal(t, fiber.StatusAccepted, status, "body: %s", body)
 	var created struct {
-		ID int64 `json:"id"`
+		ID uuid.UUID `json:"id"`
 	}
 	require.NoError(t, json.Unmarshal(body, &created))
 	require.NoError(t, h.runKind(t, "privacy.data_export"))
 
 	status, body = h.request(t, http.MethodGet,
-		"/api/v1/me/data-exports/"+strconv.FormatInt(created.ID, 10)+"/download", token, "default", "")
+		"/api/v1/me/data-exports/"+created.ID.String()+"/content", token, "default", "")
 	require.Equal(t, fiber.StatusOK, status, "body: %s", body)
 	sections := decodeExport(t, body)
 	var identity struct {

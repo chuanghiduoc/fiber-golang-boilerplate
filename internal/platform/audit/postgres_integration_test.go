@@ -4,14 +4,15 @@ package audit
 
 import (
 	"context"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -22,34 +23,28 @@ import (
 // setupAuditTestDB gives each test its own migrated schema and a pool
 // connected as the non-superuser app role, so the recorder runs with RLS
 // enforced. Dropping the schema removes the rows; audit_events rejects DELETE.
-func setupAuditTestDB(t *testing.T) *pgxpool.Pool {
+func setupAuditTestDB(t *testing.T) *pgtest.Fixture {
 	t.Helper()
-	pool, _ := setupAuditTestDBWithOwner(t)
-	return pool
+	return setupAuditTestDBWithOwner(t)
 }
 
 // setupAuditTestDBWithOwner also returns a pool connected as the schema owner.
 // A test that must reach a trigger on a statement the app role no longer has
-// (TRUNCATE) uses it; application assertions stay on the app pool.
-func setupAuditTestDBWithOwner(t *testing.T) (*pgxpool.Pool, *pgxpool.Pool) {
+// (TRUNCATE) uses it; application assertions stay on the app fx.Bypass.
+func setupAuditTestDBWithOwner(t *testing.T) *pgtest.Fixture {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	pool, owner, cleanup, err := pgtest.SetupTestDBWithOwner(ctx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
-	return pool, owner
+	return pgtest.New(t)
 }
 
 // TestPostgresRecorderIntegration inserts an event and reads it back.
 func TestPostgresRecorderIntegration(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	fx := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-test-%d", time.Now().UnixNano())
 
-	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	recorder := NewPostgresRecorder(fx.Scoped())
 	wantMetadata := map[string]any{
 		"reason": "admin-request",
 		"admin":  true,
@@ -57,7 +52,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 	wantCreatedAt := time.Now().UTC().Truncate(time.Microsecond)
 
 	err := recorder.Record(ctx, Event{
-		ActorID:    42,
+		ActorID:    testID(42),
 		Action:     "user.role_changed",
 		Resource:   "user",
 		ResourceID: "7",
@@ -70,8 +65,8 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 	require.NoError(t, err)
 
 	var (
-		tenantID   int64
-		actorID    *int64
+		tenantID   uuid.UUID
+		actorID    *uuid.UUID
 		action     string
 		resource   string
 		resourceID *string
@@ -81,7 +76,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 		gotRequest *string
 		createdAt  time.Time
 	)
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fx.Bypass.QueryRow(ctx, `
 		SELECT tenant_id, actor_id, action, resource, resource_id, metadata, host(ip), user_agent, request_id, created_at
 		FROM audit_events
 		WHERE request_id = $1`, requestID,
@@ -89,7 +84,7 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 
 	assert.Equal(t, tenant.DefaultID, tenantID)
 	require.NotNil(t, actorID)
-	assert.Equal(t, int64(42), *actorID)
+	assert.Equal(t, testID(42), *actorID)
 	assert.Equal(t, "user.role_changed", action)
 	assert.Equal(t, "user", resource)
 	require.NotNil(t, resourceID)
@@ -111,13 +106,13 @@ func TestPostgresRecorderIntegration(t *testing.T) {
 // invalid UTF-8 or NUL bytes is stored instead of failing the insert (22021),
 // which would 503 guarded routes and drop fallback audit rows.
 func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	fx := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-hostile-%d", time.Now().UnixNano())
 
-	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	recorder := NewPostgresRecorder(fx.Scoped())
 	require.NoError(t, recorder.Record(ctx, Event{
 		Action:     "POST /files",
 		Resource:   "/files",
@@ -130,7 +125,7 @@ func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
 
 	var userAgent, resourceID string
 	var metadata []byte
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT user_agent, resource_id, metadata FROM audit_events WHERE request_id = $1`, requestID,
 	).Scan(&userAgent, &resourceID, &metadata))
 	assert.Equal(t, "bad�agent", userAgent)
@@ -141,13 +136,13 @@ func TestPostgresRecorderAcceptsHostileText(t *testing.T) {
 // TestPostgresRecorderIntegrationTenant writes tenant-scoped rows and verifies
 // that the recorder resolves a missing Event.TenantID from the context.
 func TestPostgresRecorderIntegrationTenant(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	fx := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	slug := fmt.Sprintf("audit-tenant-%d", time.Now().UnixNano())
-	var tenantID int64
-	require.NoError(t, pool.QueryRow(ctx,
+	var tenantID uuid.UUID
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ($1, 'Audit Tenant') RETURNING id`, slug).
 		Scan(&tenantID))
 
@@ -155,7 +150,7 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 	ctxRequestID := requestID + "-ctx"
 	ctxTenant := tenant.WithID(ctx, tenantID)
 
-	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	recorder := NewPostgresRecorder(fx.Scoped())
 	require.NoError(t, recorder.Record(ctxTenant, Event{
 		TenantID:   tenantID,
 		Action:     "tenant.settings_changed",
@@ -171,12 +166,12 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 		RequestID: ctxRequestID,
 	}))
 
-	var gotTenant int64
-	require.NoError(t, pool.QueryRow(ctx,
+	var gotTenant uuid.UUID
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT tenant_id FROM audit_events WHERE request_id = $1`, requestID).Scan(&gotTenant))
 	assert.Equal(t, tenantID, gotTenant, "an explicit Event.TenantID must be stored")
 
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT tenant_id FROM audit_events WHERE request_id = $1`, ctxRequestID).Scan(&gotTenant))
 	assert.Equal(t, tenantID, gotTenant,
 		"a zero Event.TenantID must be resolved from the recording context")
@@ -185,29 +180,29 @@ func TestPostgresRecorderIntegrationTenant(t *testing.T) {
 // TestPostgresRecorderIntegrationDefaults covers the nullable columns and the
 // default metadata/created_at handling against a real database.
 func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	fx := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-test-defaults-%d", time.Now().UnixNano())
 
 	before := time.Now().UTC().Add(-time.Minute)
-	require.NoError(t, NewPostgresRecorder(pgtest.Scoped(pool)).Record(ctx, Event{
+	require.NoError(t, NewPostgresRecorder(fx.Scoped()).Record(ctx, Event{
 		Action:    "system.cleanup",
 		Resource:  "job",
 		RequestID: requestID,
 	}))
 
 	var (
-		tenantID   int64
-		actorID    *int64
+		tenantID   uuid.UUID
+		actorID    *uuid.UUID
 		resourceID *string
 		ip         *string
 		userAgent  *string
 		metadata   []byte
 		createdAt  time.Time
 	)
-	require.NoError(t, pool.QueryRow(ctx, `
+	require.NoError(t, fx.Bypass.QueryRow(ctx, `
 		SELECT tenant_id, actor_id, resource_id, ip, user_agent, metadata, created_at
 		FROM audit_events
 		WHERE request_id = $1`, requestID,
@@ -225,14 +220,14 @@ func TestPostgresRecorderIntegrationDefaults(t *testing.T) {
 // TestPostgresRecorderRecordTxRollback proves a transactional audit write
 // disappears with the mutation when the transaction rolls back.
 func TestPostgresRecorderRecordTxRollback(t *testing.T) {
-	pool := setupAuditTestDB(t)
+	fx := setupAuditTestDB(t)
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-tx-rollback-%d", time.Now().UnixNano())
-	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	recorder := NewPostgresRecorder(fx.Scoped())
 	rolledBack := errors.New("roll back")
-	err := pgtest.NewTxManager(pool).WithTx(ctx, func(tx pgx.Tx) error {
+	err := fx.Tx().WithTx(ctx, func(tx pgx.Tx) error {
 		if err := recorder.RecordTx(ctx, tx, Event{
 			Action:    "user.role_changed",
 			Resource:  "user",
@@ -247,7 +242,7 @@ func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 	require.ErrorIs(t, err, rolledBack)
 
 	var count int64
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT COUNT(*) FROM audit_events WHERE request_id = $1`, requestID).Scan(&count))
 	assert.Zero(t, count, "a rolled-back transaction must leave no audit row")
 }
@@ -255,13 +250,14 @@ func TestPostgresRecorderRecordTxRollback(t *testing.T) {
 // TestPostgresRecorderCompleteOnce covers intent creation, completion fields,
 // one-shot semantics, and the completion-only trigger.
 func TestPostgresRecorderCompleteOnce(t *testing.T) {
-	pool, owner := setupAuditTestDBWithOwner(t)
+	fx := setupAuditTestDBWithOwner(t)
+	owner := fx.Owner
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 
 	requestID := fmt.Sprintf("audit-complete-%d", time.Now().UnixNano())
 
-	recorder := NewPostgresRecorder(pgtest.Scoped(pool))
+	recorder := NewPostgresRecorder(fx.Scoped())
 	id, err := recorder.RecordID(ctx, Event{
 		ActorType:  ActorTypeAnonymous,
 		Action:     "auth.login",
@@ -272,13 +268,13 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		StatusCode: 0,
 	})
 	require.NoError(t, err)
-	require.Positive(t, id)
+	require.NotEqual(t, uuid.Nil, id)
 
 	var (
 		outcome     string
 		completedAt *time.Time
 	)
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT outcome, completed_at FROM audit_events WHERE id = $1`, id).
 		Scan(&outcome, &completedAt))
 	assert.Equal(t, OutcomeStarted, outcome)
@@ -290,12 +286,12 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	}))
 
 	var (
-		actorID    *int64
+		actorID    *uuid.UUID
 		actorType  string
 		actorRole  *string
 		statusCode *int16
 	)
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT outcome, completed_at, actor_id, actor_type, actor_role, status_code
 		 FROM audit_events WHERE id = $1`, id).
 		Scan(&outcome, &completedAt, &actorID, &actorType, &actorRole, &statusCode))
@@ -310,15 +306,14 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	err = recorder.Complete(ctx, id, Completion{Outcome: OutcomeFailed, StatusCode: 500})
 	require.ErrorIs(t, err, ErrAlreadyCompleted, "completion must happen at most once")
 
-	_, err = pool.Exec(ctx,
+	_, err = fx.Bypass.Exec(ctx,
 		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, id)
 	require.Error(t, err, "completed rows must reject non-completion updates")
 
-	// A guarded request that was already authenticated records the same actor
-	// on the intent and the completion; completing it as another actor is
-	// refused by the trigger.
+	// The actor belongs to the intent: completion keeps it, and an UPDATE that
+	// completes the row as another actor is refused by the trigger.
 	sameActorID, err := recorder.RecordID(ctx, Event{
-		ActorID:   42,
+		ActorID:   testID(42),
 		ActorType: ActorTypeUser,
 		ActorRole: "admin",
 		Action:    "user.updated",
@@ -329,23 +324,20 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, recorder.Complete(ctx, sameActorID, Completion{
-		ActorID:    42,
-		ActorType:  ActorTypeUser,
-		ActorRole:  "admin",
 		Outcome:    OutcomeSucceeded,
 		StatusCode: 200,
 	}))
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT actor_id, actor_type, actor_role FROM audit_events WHERE id = $1`, sameActorID).
 		Scan(&actorID, &actorType, &actorRole))
 	require.NotNil(t, actorID)
-	assert.Equal(t, int64(42), *actorID)
+	assert.Equal(t, testID(42), *actorID)
 	assert.Equal(t, ActorTypeUser, actorType)
 	require.NotNil(t, actorRole)
 	assert.Equal(t, "admin", *actorRole)
 
 	swappedID, err := recorder.RecordID(ctx, Event{
-		ActorID:   42,
+		ActorID:   testID(42),
 		ActorType: ActorTypeUser,
 		ActorRole: "admin",
 		Action:    "user.updated",
@@ -355,13 +347,9 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		Outcome:   OutcomeStarted,
 	})
 	require.NoError(t, err)
-	err = recorder.Complete(ctx, swappedID, Completion{
-		ActorID:    43,
-		ActorType:  ActorTypeUser,
-		ActorRole:  "admin",
-		Outcome:    OutcomeSucceeded,
-		StatusCode: 200,
-	})
+	_, err = fx.Bypass.Exec(ctx, `UPDATE audit_events
+		SET outcome = 'succeeded', completed_at = now(), actor_id = $2
+		WHERE id = $1`, swappedID, testID(43))
 	require.Error(t, err, "a started row must not be completed with a different actor")
 	assert.Contains(t, err.Error(), "audit completion may only change completion fields")
 
@@ -373,19 +361,19 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 		Source:    SourceService,
 		Outcome:   OutcomeSucceeded,
 	}))
-	var serviceID int64
-	require.NoError(t, pool.QueryRow(ctx,
+	var serviceID uuid.UUID
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT id FROM audit_events WHERE request_id = $1`, requestID+"-service").Scan(&serviceID))
 	err = recorder.Complete(ctx, serviceID, Completion{Outcome: OutcomeFailed, StatusCode: 500})
 	require.ErrorIs(t, err, ErrAlreadyCompleted)
 
-	_, err = pool.Exec(ctx,
+	_, err = fx.Bypass.Exec(ctx,
 		`UPDATE audit_events SET action = 'tampered' WHERE id = $1`, serviceID)
 	require.Error(t, err, "terminal rows must reject updates")
 
 	// Append-only covers removal too: neither DELETE nor TRUNCATE may drop
 	// audit rows outside a reviewed, trigger-disabling maintenance path.
-	_, err = pool.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceID)
+	_, err = fx.Bypass.Exec(ctx, `DELETE FROM audit_events WHERE id = $1`, serviceID)
 	require.ErrorContains(t, err, "append-only", "audit rows must reject DELETE")
 	// Inside a rolled-back transaction so a missing trigger cannot wipe a
 	// shared test database. TRUNCATE runs as the schema owner: the app role is
@@ -396,7 +384,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 	require.NoError(t, truncateTx.Rollback(ctx))
 	require.ErrorContains(t, err, "append-only", "audit_events must reject TRUNCATE")
 	var remaining int64
-	require.NoError(t, pool.QueryRow(ctx,
+	require.NoError(t, fx.Bypass.QueryRow(ctx,
 		`SELECT COUNT(*) FROM audit_events WHERE id IN ($1, $2)`, id, serviceID).Scan(&remaining))
 	assert.Equal(t, int64(2), remaining)
 }
@@ -404,7 +392,7 @@ func TestPostgresRecorderCompleteOnce(t *testing.T) {
 // TestAppRoleCannotTruncate keeps the runtime role's grant list honest:
 // TRUNCATE ignores row-level security, so the API/worker role must not have it.
 func TestAppRoleCannotTruncate(t *testing.T) {
-	pool := pgtest.AppPool(setupAuditTestDB(t))
+	pool := setupAuditTestDB(t).App
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 15*time.Second)
 	defer cancel()
 

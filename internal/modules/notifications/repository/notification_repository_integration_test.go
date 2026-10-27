@@ -8,40 +8,52 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
-func createUser(t *testing.T, pool *pgxpool.Pool, tenantID int64, email string) int64 {
+func createUser(t *testing.T, pool *pgxpool.Pool, tenantID uuid.UUID, email string) uuid.UUID {
 	t.Helper()
-	return testutil.CreateMember(t, context.Background(), pool, tenantID, email, testutil.MemberOptions{}).UserID
+	ctx := context.Background()
+	var id uuid.UUID
+	require.NoError(t, pool.QueryRow(ctx,
+		`INSERT INTO users (email, name, email_verified_at) VALUES ($1, $1, NOW()) RETURNING id`,
+		email).Scan(&id))
+	_, err := pool.Exec(ctx, `INSERT INTO memberships (tenant_id, user_id) VALUES ($1, $2)`, tenantID, id)
+	require.NoError(t, err)
+	return id
 }
 
-func createTenant(t *testing.T, pool *pgxpool.Pool, slug string) int64 {
+func createTenant(t *testing.T, pool *pgxpool.Pool, slug string) uuid.UUID {
 	t.Helper()
-	return testutil.CreateTenant(t, context.Background(), pool, slug)
+	var id uuid.UUID
+	require.NoError(t, pool.QueryRow(context.Background(),
+		`INSERT INTO tenants (slug, name) VALUES ($1, $1) RETURNING id`, slug).Scan(&id))
+	_, err := pool.Exec(context.Background(), `INSERT INTO tenant_settings (tenant_id) VALUES ($1)`, id)
+	require.NoError(t, err)
+	return id
 }
 
 func TestRepositoryUserAndTenantIsolation(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	ctx := context.Background()
 	tenantTwo := createTenant(t, pool, "notifications-two")
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-two@example.com")
 
-	repo := NewNotificationRepository(testutil.Scoped(pool))
+	repo := NewNotificationRepository(fx.Scoped())
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
@@ -114,21 +126,31 @@ func TestRepositoryUserAndTenantIsolation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, count)
 
+	unreadAgain, err := repo.MarkUnread(ctxOne, first.ID, userOne)
+	require.NoError(t, err)
+	require.Nil(t, unreadAgain.ReadAt)
+	count, err = repo.CountUnread(ctxOne, userOne)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), count)
+
+	_, err = repo.MarkUnread(ctxOne, first.ID, userTwo)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, apperror.ErrNotFound))
+
 	updated, err := repo.MarkAllRead(ctxOne, userOne)
 	require.NoError(t, err)
-	assert.Zero(t, updated)
+	assert.Equal(t, int64(1), updated)
 }
 
 func TestRepositoryUnreadListAndCursor(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	ctx := tenant.WithID(context.Background(), tenant.DefaultID)
 	userID := createUser(t, pool, tenant.DefaultID, "notifications-cursor@example.com")
-	repo := NewNotificationRepository(testutil.Scoped(pool))
+	repo := NewNotificationRepository(fx.Scoped())
 
 	base := time.Now().UTC().Add(-time.Hour)
 	for i, title := range []string{"one", "two", "three"} {
@@ -165,17 +187,16 @@ func TestRepositoryUnreadListAndCursor(t *testing.T) {
 }
 
 func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
-	setupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	pool, cleanup, err := testutil.SetupTestDB(setupCtx)
-	require.NoError(t, err)
-	t.Cleanup(cleanup)
+	fx := pgtest.New(t)
+	pool := fx.Bypass
 
 	ctx := context.Background()
 	tenantTwo := createTenant(t, pool, "notifications-prefs-two")
 	userOne := createUser(t, pool, tenant.DefaultID, "notifications-prefs-one@example.com")
 	userTwo := createUser(t, pool, tenantTwo, "notifications-prefs-two@example.com")
-	repo := NewNotificationRepository(testutil.Scoped(pool))
+	repo := NewNotificationRepository(fx.Scoped())
 	ctxOne := tenant.WithID(ctx, tenant.DefaultID)
 	ctxTwo := tenant.WithID(ctx, tenantTwo)
 
@@ -189,7 +210,7 @@ func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
 		UserID: userOne, Type: "security.alert", Channel: "email", Enabled: true,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, first.ID, same.ID, "the unique index must make the upsert idempotent")
+	assert.Equal(t, first.CreatedAt, same.CreatedAt, "the natural key must make the upsert idempotent")
 	assert.True(t, same.Enabled)
 
 	_, err = repo.GetPreference(ctxOne, userOne, "security.alert", "in_app")
@@ -207,5 +228,5 @@ func TestRepositoryPreferencesAreUniquelyScoped(t *testing.T) {
 	list, err := repo.ListPreferences(ctxOne, userOne)
 	require.NoError(t, err)
 	require.Len(t, list, 1)
-	assert.Equal(t, first.ID, list[0].ID)
+	assert.Equal(t, first.CreatedAt, list[0].CreatedAt)
 }

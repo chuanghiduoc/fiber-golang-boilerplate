@@ -15,6 +15,7 @@ import (
 
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	filescatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/files/catalog"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -33,33 +34,34 @@ var mimeExtensions = map[string]string{
 }
 
 type UploadService interface {
-	Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error)
-	GetFileInfo(ctx context.Context, id, userID int64) (*File, error)
-	Download(ctx context.Context, id, userID int64) (*File, io.ReadCloser, error)
-	List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error)
-	Delete(ctx context.Context, id, userID int64) error
-	Restore(ctx context.Context, id, userID int64) (*File, error)
+	Upload(ctx context.Context, userID uuid.UUID, filename string, reader io.Reader, size int64, contentType string) (*File, error)
+	GetFileInfo(ctx context.Context, id, userID uuid.UUID) (*File, error)
+	Download(ctx context.Context, id, userID uuid.UUID) (*File, io.ReadCloser, error)
+	List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error)
+	Delete(ctx context.Context, id, userID uuid.UUID) error
+	Restore(ctx context.Context, id, userID uuid.UUID) (*File, error)
 }
 
 type uploadService struct {
-	repo    FileRepository
-	tx      Transactor
-	storage storage.Storage
-	opts    UploadOptions
+	repo       FileRepository
+	tx         Transactor
+	storage    storage.Storage
+	authorizer authz.Authorizer
+	opts       UploadOptions
 }
 
 // NewUploadService builds the user file service. Mutations run through tx, so
 // a metadata change and its domain event commit atomically.
-func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage, opts UploadOptions) UploadService {
-	return &uploadService{repo: repo, tx: tx, storage: store, opts: opts}
+func NewUploadService(repo FileRepository, tx Transactor, store storage.Storage, authorizer authz.Authorizer, opts UploadOptions) UploadService {
+	return &uploadService{repo: repo, tx: tx, storage: store, authorizer: authorizer, opts: opts}
 }
 
-func (s *uploadService) Upload(ctx context.Context, userID int64, filename string, reader io.Reader, size int64, contentType string) (*File, error) {
-	tenantID := tenant.EffectiveID(ctx)
-	if tenantID <= 0 {
-		return nil, apperror.NewInternal("tenant context is required")
+func (s *uploadService) Upload(ctx context.Context, userID uuid.UUID, filename string, reader io.Reader, size int64, contentType string) (*File, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, apperror.Internal(err, "tenant context is required")
 	}
-	if err := authorizeUserResource(ctx, filescatalog.PermissionFilesWrite, tenantID, userID); err != nil {
+	if err := authorizeUserResource(s.authorizer, ctx, filescatalog.PermissionFilesWrite, tenantID, userID); err != nil {
 		return nil, err
 	}
 
@@ -71,7 +73,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	// The tenant prefix keeps identically named blobs from different tenants
 	// in separate key spaces and makes the owning tenant visible during
 	// storage/backup operations.
-	storagePath := fmt.Sprintf("%d/%d/%s%s", tenantID, userID, uuid.New().String(), extensionForMIME(contentType))
+	storagePath := fmt.Sprintf("%s/%s/%s%s", tenantID, userID, uuid.New().String(), extensionForMIME(contentType))
 
 	// Cheap pre-check before the blob Put and clamd scan: an upload that is
 	// already over quota is refused without spending storage or scanner work.
@@ -81,7 +83,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	}
 
 	if err := s.storage.Put(ctx, storagePath, reader, size, contentType); err != nil {
-		return nil, apperror.NewInternal("failed to store file")
+		return nil, apperror.Internal(err, "failed to store file")
 	}
 
 	// Scan the stored blob before any metadata is committed. A configured
@@ -104,7 +106,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 	var file *File
 	// The metadata row and the file.uploaded event commit together; a publish
 	// failure rolls the row back and cleans up the blob below.
-	err := s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
+	err = s.tx.InTx(ctx, func(ctx context.Context, tx TxRepos) error {
 		if err := s.checkQuota(ctx, tx.Files, userID, size); err != nil {
 			return err
 		}
@@ -129,8 +131,7 @@ func (s *uploadService) Upload(ctx context.Context, userID int64, filename strin
 		if errors.As(err, &appErr) {
 			return nil, appErr
 		}
-		slog.Error("failed to save file metadata", slog.Any("error", err))
-		return nil, apperror.NewInternal("failed to save file metadata")
+		return nil, apperror.Internal(err, "failed to save file metadata")
 	}
 	return file, nil
 }
@@ -180,14 +181,14 @@ func (s *uploadService) removeBlob(ctx context.Context, storagePath, reason stri
 // written. It can race with a concurrent upload, which the locked check in the
 // metadata transaction then catches; its only job is to spare clearly
 // over-quota requests the Put and scan cost.
-func (s *uploadService) precheckQuota(ctx context.Context, repo FileRepository, userID, size int64) error {
+func (s *uploadService) precheckQuota(ctx context.Context, repo FileRepository, userID uuid.UUID, size int64) error {
 	if !s.quotasEnabled() {
 		return nil
 	}
 	tenantBytes, userBytes, err := repo.StorageUsage(ctx, userID)
 	if err != nil {
 		slog.Error("failed to check storage quota before upload", slog.Any("error", err))
-		return apperror.NewInternal("failed to check storage quota")
+		return apperror.Internal(err, "failed to check storage quota")
 	}
 	if s.quotaExceeded(tenantBytes, userBytes, size) {
 		return apperror.NewCode(filescatalog.CodeFileQuotaExceeded, "storage quota exceeded")
@@ -210,7 +211,7 @@ func (s *uploadService) quotaExceeded(tenantBytes, userBytes, size int64) bool {
 // held until the transaction ends, so concurrent uploads serialize: the second
 // one sees the first one's row and cannot also pass. Trashed rows count
 // because their blobs are still stored.
-func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, userID, size int64) error {
+func (s *uploadService) checkQuota(ctx context.Context, repo FileRepository, userID uuid.UUID, size int64) error {
 	if !s.quotasEnabled() {
 		return nil
 	}
@@ -259,19 +260,37 @@ func extensionForMIME(contentType string) string {
 	return ".bin"
 }
 
-func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*File, error) {
+// hasTenantFilePermission reports whether the caller holds the admin
+// permission that widens the file collection to every owner in the tenant.
+// Background callers have no subject and stay on the owner-scoped path.
+func hasTenantFilePermission(ctx context.Context, permission authz.Permission) bool {
+	subject, ok := authz.SubjectFromContext(ctx)
+	return ok && subject.Has(permission)
+}
+
+func (s *uploadService) GetFileInfo(ctx context.Context, id, userID uuid.UUID) (*File, error) {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("file not found")
 		}
-		return nil, apperror.NewInternal("failed to get file")
+		return nil, apperror.Internal(err, "failed to get file")
 	}
-	if err := authorizeFile(ctx, filescatalog.PermissionFilesRead, file); err != nil {
+	if hasTenantFilePermission(ctx, authz.PermissionAdminFilesRead) {
+		if err := authorizeTenant(s.authorizer, ctx, authz.PermissionAdminFilesRead, file.TenantID); err != nil {
+			return nil, err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) {
+			// Do not reveal that another tenant's file ID exists.
+			return nil, apperror.NewNotFound("file not found")
+		}
+		return file, nil
+	}
+	if err := authorizeFile(s.authorizer, ctx, filescatalog.PermissionFilesRead, file); err != nil {
 		return nil, err
 	}
 
-	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
+	if file.TenantID != tenant.IDFromContext(ctx) || file.UserID != userID {
 		// Do not reveal that another tenant's file ID exists.
 		return nil, apperror.NewNotFound("file not found")
 	}
@@ -279,20 +298,29 @@ func (s *uploadService) GetFileInfo(ctx context.Context, id, userID int64) (*Fil
 	return file, nil
 }
 
-func (s *uploadService) Download(ctx context.Context, id, userID int64) (*File, io.ReadCloser, error) {
+func (s *uploadService) Download(ctx context.Context, id, userID uuid.UUID) (*File, io.ReadCloser, error) {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, nil, apperror.NewNotFound("file not found")
 		}
-		return nil, nil, apperror.NewInternal("failed to get file")
+		return nil, nil, apperror.Internal(err, "failed to get file")
 	}
 
-	if err := authorizeFile(ctx, filescatalog.PermissionFilesRead, file); err != nil {
-		return nil, nil, err
-	}
-	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
-		return nil, nil, apperror.NewNotFound("file not found")
+	if hasTenantFilePermission(ctx, authz.PermissionAdminFilesRead) {
+		if err := authorizeTenant(s.authorizer, ctx, authz.PermissionAdminFilesRead, file.TenantID); err != nil {
+			return nil, nil, err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) {
+			return nil, nil, apperror.NewNotFound("file not found")
+		}
+	} else {
+		if err := authorizeFile(s.authorizer, ctx, filescatalog.PermissionFilesRead, file); err != nil {
+			return nil, nil, err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) || file.UserID != userID {
+			return nil, nil, apperror.NewNotFound("file not found")
+		}
 	}
 
 	// The response body is streamed after the handler returns, at which point
@@ -313,31 +341,46 @@ func (s *uploadService) Download(ctx context.Context, id, userID int64) (*File, 
 func storageReadError(file *File, err error) *apperror.AppError {
 	if errors.Is(err, storage.ErrNotFound) {
 		slog.Error("file metadata exists but its blob is missing",
-			slog.Int64("file_id", file.ID),
-			slog.Int64("tenant_id", file.TenantID),
+			slog.String("file_id", file.ID.String()),
+			slog.String("tenant_id", file.TenantID.String()),
 			slog.String("path", file.StoragePath),
 		)
 		return apperror.NewNotFound("file not found")
 	}
 	slog.Error("failed to read file from storage",
-		slog.Int64("file_id", file.ID),
+		slog.String("file_id", file.ID.String()),
 		slog.Any("error", err),
 	)
-	return apperror.NewInternal("failed to read file from storage")
+	return apperror.Internal(err, "failed to read file from storage")
 }
 
-func (s *uploadService) List(ctx context.Context, userID int64, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error) {
+func (s *uploadService) List(ctx context.Context, userID uuid.UUID, limit int, startingAfter string, includeDeleted bool) ([]File, bool, error) {
 	cur, pageSize, err := buildCursor(limit, startingAfter)
 	if err != nil {
 		return nil, false, err
 	}
-	if err := authorizeUserResource(ctx, filescatalog.PermissionFilesRead, tenant.EffectiveID(ctx), userID); err != nil {
-		return nil, false, err
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, false, apperror.Internal(err, "tenant context is required")
 	}
 
-	files, err := s.repo.ListByUserCursor(ctx, userID, cur, includeDeleted)
+	var files []File
+	if hasTenantFilePermission(ctx, authz.PermissionAdminFilesRead) {
+		if authErr := authorizeTenant(s.authorizer, ctx, filescatalog.PermissionFilesRead, tenantID); authErr != nil {
+			return nil, false, authErr
+		}
+		if authErr := authorizeTenant(s.authorizer, ctx, authz.PermissionAdminFilesRead, tenantID); authErr != nil {
+			return nil, false, authErr
+		}
+		files, err = s.repo.ListCursor(ctx, cur, includeDeleted)
+	} else {
+		if authErr := authorizeUserResource(s.authorizer, ctx, filescatalog.PermissionFilesRead, tenantID, userID); authErr != nil {
+			return nil, false, authErr
+		}
+		files, err = s.repo.ListByUserCursor(ctx, userID, cur, includeDeleted)
+	}
 	if err != nil {
-		return nil, false, apperror.NewInternal("failed to list files")
+		return nil, false, apperror.Internal(err, "failed to list files")
 	}
 
 	hasMore := len(files) > pageSize
@@ -347,20 +390,29 @@ func (s *uploadService) List(ctx context.Context, userID int64, limit int, start
 	return files, hasMore, nil
 }
 
-func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
+func (s *uploadService) Delete(ctx context.Context, id, userID uuid.UUID) error {
 	file, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("file not found")
 		}
-		return apperror.NewInternal("failed to get file")
+		return apperror.Internal(err, "failed to get file")
 	}
 
-	if err := authorizeFile(ctx, filescatalog.PermissionFilesDelete, file); err != nil {
-		return err
-	}
-	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
-		return apperror.NewNotFound("file not found")
+	if hasTenantFilePermission(ctx, authz.PermissionAdminFilesDelete) {
+		if err := authorizeTenant(s.authorizer, ctx, authz.PermissionAdminFilesDelete, file.TenantID); err != nil {
+			return err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) {
+			return apperror.NewNotFound("file not found")
+		}
+	} else {
+		if err := authorizeFile(s.authorizer, ctx, filescatalog.PermissionFilesDelete, file); err != nil {
+			return err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) || file.UserID != userID {
+			return apperror.NewNotFound("file not found")
+		}
 	}
 
 	// Soft delete — do NOT remove from storage so the file can be restored.
@@ -376,29 +428,42 @@ func (s *uploadService) Delete(ctx context.Context, id, userID int64) error {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("file not found")
 		}
-		return apperror.NewInternal("failed to delete file metadata")
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) {
+			return appErr
+		}
+		return apperror.Internal(err, "failed to delete file metadata")
 	}
 
 	slog.Info("file soft-deleted",
-		slog.Int64("file_id", id),
+		slog.String("file_id", id.String()),
 		slog.String("path", file.StoragePath),
 	)
 	return nil
 }
 
-func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*File, error) {
+func (s *uploadService) Restore(ctx context.Context, id, userID uuid.UUID) (*File, error) {
 	file, err := s.repo.GetByIDIncludingDeleted(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("file not found")
 		}
-		return nil, apperror.NewInternal("failed to get file")
+		return nil, apperror.Internal(err, "failed to get file")
 	}
-	if err := authorizeFile(ctx, filescatalog.PermissionFilesRestore, file); err != nil {
-		return nil, err
-	}
-	if file.TenantID != tenant.EffectiveID(ctx) || file.UserID != userID {
-		return nil, apperror.NewNotFound("file not found")
+	if hasTenantFilePermission(ctx, authz.PermissionAdminFilesRestore) {
+		if err := authorizeTenant(s.authorizer, ctx, authz.PermissionAdminFilesRestore, file.TenantID); err != nil {
+			return nil, err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) {
+			return nil, apperror.NewNotFound("file not found")
+		}
+	} else {
+		if err := authorizeFile(s.authorizer, ctx, filescatalog.PermissionFilesRestore, file); err != nil {
+			return nil, err
+		}
+		if file.TenantID != tenant.IDFromContext(ctx) || file.UserID != userID {
+			return nil, apperror.NewNotFound("file not found")
+		}
 	}
 	if file.DeletedAt == nil {
 		return nil, apperror.NewCode(filescatalog.CodeFileNotDeleted, "file is not deleted")
@@ -421,7 +486,11 @@ func (s *uploadService) Restore(ctx context.Context, id, userID int64) (*File, e
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("file not found")
 		}
-		return nil, apperror.NewInternal("failed to restore file")
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) {
+			return nil, appErr
+		}
+		return nil, apperror.Internal(err, "failed to restore file")
 	}
 	return restored, nil
 }

@@ -9,7 +9,7 @@ ORDER BY id;
 -- name: ListPreferencesForPrivacy :many
 SELECT * FROM notification_preferences
 WHERE tenant_id = $1 AND user_id = $2
-ORDER BY id;
+ORDER BY type, channel;
 
 -- name: DeleteNotificationPreferencesForPrivacy :exec
 DELETE FROM notification_preferences

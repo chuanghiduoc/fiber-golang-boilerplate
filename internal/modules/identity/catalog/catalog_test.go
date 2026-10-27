@@ -4,9 +4,7 @@ import (
 	"testing"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/i18n"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
 // TestPublicValuesAreStable pins identity's public identifiers: clients branch
@@ -19,8 +17,10 @@ func TestPublicValuesAreStable(t *testing.T) {
 		string(CodeAuthInvalidCredentials):      "auth.invalid_credentials",
 		string(CodeAuthEmailNotVerified):        "auth.email_not_verified",
 		string(CodeAuthRefreshInvalid):          "auth.refresh_invalid",
+		string(CodeAuthCSRFFailed):              "auth.csrf_failed",
 		string(CodeUserEmailTaken):              "user.email_taken",
 		string(CodeUserNotFound):                "user.not_found",
+		string(CodeUserLastAdmin):               "user.last_admin",
 		string(CodeInvitationInvalid):           "invitation.invalid",
 		string(CodeInvitationInviterIneligible): "invitation.inviter_ineligible",
 		string(CodeMembershipExists):            "membership.exists",
@@ -39,28 +39,24 @@ func TestPublicValuesAreStable(t *testing.T) {
 	}
 }
 
-func TestCatalogRegistersAndLocalizes(t *testing.T) {
-	if err := Register(); err != nil {
-		t.Fatal(err)
+func TestCatalogProvidersBuildInjectedCatalogs(t *testing.T) {
+	errors := testErrors()
+	if _, ok := errors.SpecFor(CodeUserNotFound); !ok {
+		t.Error("error codes not provided")
 	}
-	if err := Register(); err != nil {
-		t.Fatalf("Register must be idempotent: %v", err)
-	}
-	if _, ok := apperror.SpecFor(CodeUserNotFound); !ok {
-		t.Error("error codes not registered")
-	}
-	if !features.IsKnown(KeyGoogleOAuth) {
-		t.Error("flags not registered")
-	}
-	if !authz.Has(authz.RoleMember, PermissionProfileWrite) {
+	permissions := testPermissions()
+	if !permissions.Has(authz.RoleMember, PermissionProfileWrite) {
 		t.Error("users must hold profile:write")
+	}
+	if !testFlags().IsKnown(KeyGoogleOAuth) {
+		t.Error("flags not provided")
 	}
 	bundle, err := i18n.New("en", i18n.Source{Owner: "identity", FS: Locales()})
 	if err != nil {
 		t.Fatalf("locales: %v", err)
 	}
-	for code := range ErrorCodes() {
-		key := "errors." + string(code) + ".title"
+	for _, spec := range Errors() {
+		key := "errors." + string(spec.Code) + ".title"
 		for _, locale := range bundle.SupportedLocales() {
 			if !bundle.Has(locale, key) {
 				t.Errorf("%s is missing %q", locale, key)

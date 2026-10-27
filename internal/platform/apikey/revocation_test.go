@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
 
 	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
@@ -31,12 +32,12 @@ func TestVerifier_RejectsKeysIssuedBeforeCredentialRevocation(t *testing.T) {
 			store := &fakeStore{key: key}
 			revokedAt := tc.revokedAt
 			verifier := NewVerifier(store, fakePrincipals{principal: identitycontracts.Principal{
-				ID: 42, TenantID: 1, Role: authz.RoleMember,
+				ID: testID(42), TenantID: testID(1), Role: authz.RoleMember,
 				TenantStatus:         identitycontracts.TenantStatusActive,
 				CredentialsRevokedAt: &revokedAt,
 			}})
 
-			_, err := verifier.Verify(context.Background(), credentials.Key, 0)
+			_, err := verifier.Verify(context.Background(), credentials.Key, uuid.Nil)
 			if tc.wantOK {
 				if err != nil {
 					t.Fatalf("err = %v, want success for a key issued after the revocation", err)
@@ -44,7 +45,7 @@ func TestVerifier_RejectsKeysIssuedBeforeCredentialRevocation(t *testing.T) {
 				return
 			}
 			var appErr *apperror.AppError
-			if !errors.As(err, &appErr) || appErr.Status != fiber.StatusUnauthorized {
+			if !errors.As(err, &appErr) || resolvedStatus(appErr) != fiber.StatusUnauthorized {
 				t.Fatalf("err = %v, want 401 for a key issued before the revocation", err)
 			}
 			if len(store.touched) != 0 {

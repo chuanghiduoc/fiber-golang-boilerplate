@@ -33,7 +33,7 @@ func TestTenantPurgerDrainsEveryWebhookTableInBoundedBatches(t *testing.T) {
 		}
 		require.NotEmpty(t, table, "unexpected SQL: %s", sql)
 		require.Len(t, args, 2)
-		require.Equal(t, int64(7), args[0])
+		require.Equal(t, testID(7), args[0])
 		require.Equal(t, tenancycontracts.PurgeBatchSize, args[1])
 		calls[table]++
 		if calls[table] == 1 {
@@ -42,7 +42,7 @@ func TestTenantPurgerDrainsEveryWebhookTableInBoundedBatches(t *testing.T) {
 		return fakedb.Deleted(0), nil
 	}
 
-	require.NoError(t, webhookrepo.NewTenantPurger(db).PurgeTenant(context.Background(), 7))
+	require.NoError(t, webhookrepo.NewTenantPurger(db).PurgeTenant(context.Background(), testID(7)))
 	for _, table := range []string{"deliveries", "events", "endpoints", "inbound events", "inbound sources"} {
 		assert.Equal(t, 2, calls[table], "%s must be drained to zero", table)
 	}

@@ -1,32 +1,20 @@
-// Package featuresdto contains the feature-flag admin transport types.
+// Package featuresdto contains the feature-flag transport types.
 package featuresdto
 
-import "time"
+import (
+	"time"
 
-// UpsertFlagRequest replaces the database default and kill switch for a
-// compile-time flag. The key comes from the path, never the body. Omitting
-// enabled (or sending null) clears the database default so environment and
-// compiled defaults apply again.
-type UpsertFlagRequest struct {
-	Enabled     *bool   `json:"enabled"`
-	KillSwitch  *bool   `json:"killSwitch" validate:"required"`
-	Description *string `json:"description" validate:"omitempty,max=500"`
-}
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/uuid"
 
-// UpsertTargetRequest creates or replaces a tenant-wide target (when userId is
-// omitted) or a user target (when userId is present). The tenant always comes
-// from the request context, so callers cannot write another tenant's target.
-type UpsertTargetRequest struct {
-	UserID  *int64 `json:"userId" validate:"omitempty,min=1"`
-	Enabled *bool  `json:"enabled" validate:"required"`
-}
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/patch"
+)
 
-// FlagResponse is the admin view of one compile-time flag. Enabled is the
+// FeatureFlagResponse is the process-wide flag state plus the value the
+// requesting caller observes after the full precedence chain. Enabled is the
 // configured database default (or the compiled default when Configured is
-// false, including a row that exists only for a kill switch or targets);
-// Effective is the value the requesting admin would observe after the
-// full precedence chain.
-type FlagResponse struct {
+// false, including a row that exists only for a kill switch or targets).
+type FeatureFlagResponse struct {
 	Key         string     `json:"key"`
 	Description string     `json:"description"`
 	Enabled     bool       `json:"enabled"`
@@ -38,19 +26,63 @@ type FlagResponse struct {
 	UpdatedAt   *time.Time `json:"updatedAt,omitempty"`
 }
 
-// FlagDetailResponse includes the flag and every target in the current tenant.
-type FlagDetailResponse struct {
-	Flag    FlagResponse     `json:"flag"`
-	Targets []TargetResponse `json:"targets"`
+// EvaluatedFlagResponse is one flag's effective value for the request tenant.
+type EvaluatedFlagResponse struct {
+	Key        string `json:"key"`
+	Enabled    bool   `json:"enabled"`
+	KillSwitch bool   `json:"killSwitch"`
+	Source     string `json:"source"`
 }
 
-// TargetResponse is a tenant-wide (userId omitted) or user target.
-type TargetResponse struct {
-	ID        int64      `json:"id"`
+// FeatureFlagTargetResponse is a tenant-wide (userId omitted) or user target.
+// TargetID is the canonical item id, not the surrogate row id.
+type FeatureFlagTargetResponse struct {
+	TargetID  string     `json:"targetId"`
 	FlagKey   string     `json:"flagKey"`
-	TenantID  int64      `json:"tenantId"`
-	UserID    *int64     `json:"userId,omitempty"`
+	TenantID  uuid.UUID  `json:"tenantId" format:"uuid"`
+	UserID    *uuid.UUID `json:"userId,omitempty" format:"uuid"`
 	Enabled   bool       `json:"enabled"`
 	CreatedAt *time.Time `json:"createdAt,omitempty"`
 	UpdatedAt *time.Time `json:"updatedAt,omitempty"`
+}
+
+// CreateFeatureFlagRequest creates the process-wide row for a catalog key. The
+// key is part of the body because the collection is the resource family; the
+// item URI uses it afterwards.
+type CreateFeatureFlagRequest struct {
+	Key         string  `json:"key" required:"true" maxLength:"128"`
+	Enabled     *bool   `json:"enabled" required:"false"`
+	KillSwitch  *bool   `json:"killSwitch" required:"true"`
+	Description *string `json:"description" required:"true" maxLength:"500"`
+}
+
+// MergeBool is one RFC 7396 boolean member: present-and-null clears the field,
+// present-with-a-value replaces it, absent leaves it unchanged.
+type MergeBool struct{ patch.Field[bool] }
+
+// Schema implements huma.SchemaProvider.
+func (MergeBool) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{Type: huma.TypeBoolean, Nullable: true}
+}
+
+// MergeString is one RFC 7396 string member.
+type MergeString struct{ patch.Field[string] }
+
+// Schema implements huma.SchemaProvider.
+func (MergeString) Schema(huma.Registry) *huma.Schema {
+	return &huma.Schema{Type: huma.TypeString, Nullable: true}
+}
+
+// UpdateFeatureFlagRequest is a merge patch on a flag row. Nulling enabled
+// clears the database default; nulling killSwitch clears it to false; nulling
+// description restores the catalog description.
+type UpdateFeatureFlagRequest struct {
+	Enabled     MergeBool   `json:"enabled" required:"false"`
+	KillSwitch  MergeBool   `json:"killSwitch" required:"false"`
+	Description MergeString `json:"description" required:"false"`
+}
+
+// PutTargetRequest replaces the enabled state at a target item URI.
+type PutTargetRequest struct {
+	Enabled *bool `json:"enabled" required:"true"`
 }

@@ -15,10 +15,10 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/apikey"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
 )
 
 func TestNewLimiter_KeysAPIKeysSeparately(t *testing.T) {
@@ -26,9 +26,9 @@ func TestNewLimiter_KeysAPIKeysSeparately(t *testing.T) {
 	app.Use(func(c fiber.Ctx) error {
 		switch c.Get("X-Test-Key") {
 		case "one":
-			fiber.Locals[int64](c, apikey.LocalAPIKeyID, 1)
+			c.SetContext(apikey.WithAPIKeyID(c.Context(), testID(1)))
 		case "two":
-			fiber.Locals[int64](c, apikey.LocalAPIKeyID, 2)
+			c.SetContext(apikey.WithAPIKeyID(c.Context(), testID(2)))
 		}
 		return c.Next()
 	})

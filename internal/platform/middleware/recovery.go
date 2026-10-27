@@ -6,6 +6,7 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -17,8 +18,8 @@ func Recovery(env string) fiber.Handler {
 
 				// request_id is empty when the panic happened before the
 				// RequestID middleware ran (outermost Recovery).
-				slog.Error("panic recovered",
-					slog.String("request_id", fiber.Locals[string](c, "request_id")),
+				slog.ErrorContext(c.Context(), "panic recovered",
+					slog.String("request_id", requestctx.RequestID(c.Context())),
 					slog.Any("error", r),
 					slog.String("stack", string(stackTrace)),
 				)

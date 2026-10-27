@@ -11,13 +11,22 @@ import (
 )
 
 // Build constructs the feature-flag admin surface. It shares the process
-// evaluator so a successful write invalidates the local snapshot immediately.
-func Build(infra app.Infra) *Module {
+// evaluator so a successful write invalidates the local snapshot immediately,
+// and it binds flag writes to one transaction with their Tier 1 audit row.
+// Settings are the feature-flag configuration the composition root passes (none today).
+type Settings struct{}
+
+// Deps are the contracts features consumes from other modules (none today).
+type Deps struct{}
+
+func Build(infra app.Infra, _ Settings, _ Deps) (*Module, error) {
 	repo := featuresrepo.New(infra.DB)
-	m := New(featureshandler.NewHandler(featuressvc.New(repo, infra.Flags, infra.Audit)))
+	m := New(featureshandler.NewHandler(featuressvc.New(
+		repo, infra.Flags, infra.Audit, featuresrepo.NewTransactor(infra.Tx, infra.Audit),
+		infra.Catalogs.Features, authz.NewAuthorizer(infra.Catalogs.Permissions))))
 	m.privacy = featuresprivacy.New(featuresrepo.NewPrivacyStore(infra.DB))
 	m.tenantPurger = featuresrepo.NewTenantPurger(infra.DB)
-	return m
+	return m, nil
 }
 
 // Permissions implements app.PermissionProvider.

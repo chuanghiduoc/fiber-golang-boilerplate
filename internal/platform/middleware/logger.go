@@ -8,8 +8,11 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"github.com/google/uuid"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
 
@@ -38,33 +41,38 @@ func redactQuery(raw string) string {
 	return values.Encode()
 }
 
-func Logger() fiber.Handler {
+func Logger(catalog *apperror.Catalog) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		start := time.Now()
 
 		err := c.Next()
 
 		latency := time.Since(start)
-		status := effectiveStatus(c, err)
+		status := effectiveStatus(catalog, c, err)
 
-		var userID int64
-		if v := fiber.Locals[int64](c, "user_id"); v != 0 {
+		var userID uuid.UUID
+		if v := requestctx.ActorID(c.Context()); v != uuid.Nil {
 			userID = v
 		}
 
-		attrs := make([]slog.Attr, 0, 13)
+		attrs := make([]slog.Attr, 0, 14)
 		attrs = append(attrs,
-			slog.String("method", c.Method()),
-			slog.String("path", c.Path()),
-			slog.Int("status", status),
-			slog.Duration("latency", latency),
-			slog.String("ip", c.IP()),
-			slog.String("request_id", fiber.Locals[string](c, "request_id")),
-			slog.Int64("user_id", userID),
-			slog.Int("content_length", c.Request().Header.ContentLength()),
-			slog.String("user_agent", c.Get("User-Agent")),
-			slog.String("query", redactQuery(string(c.Request().URI().QueryString()))),
+			slog.String("http.request.method", httpRequestMethod(c.Method())),
+			slog.String("url.path", c.Path()),
+			slog.String("http.route", routeTemplate(c)),
+			slog.Int("http.response.status_code", status),
+			slog.Duration("duration", latency),
+			slog.String("client.address", c.IP()),
+			slog.String("app.request_id", requestctx.RequestID(c.Context())),
+			slog.String("user_agent.original", c.Get("User-Agent")),
+			slog.String("url.query", redactQuery(string(c.Request().URI().QueryString()))),
 		)
+		if size := c.Request().Header.ContentLength(); size >= 0 {
+			attrs = append(attrs, slog.Int64("http.request.body.size", int64(size)))
+		}
+		if userID != uuid.Nil {
+			attrs = append(attrs, slog.String(string(semconv.EnduserIDKey), userID.String()))
+		}
 		attrs = append(attrs, traceAttrs(c.Context())...)
 
 		switch {

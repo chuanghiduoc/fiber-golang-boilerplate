@@ -8,20 +8,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 type noopQueue struct{}
 
-func (noopQueue) EnqueueOnceTx(context.Context, pgx.Tx, jobs.Job) (id int64, created bool, err error) {
-	return 1, true, nil
+func (noopQueue) EnqueueOnceTx(context.Context, pgx.Tx, jobs.Job) (id uuid.UUID, created bool, err error) {
+	return testID(1), true, nil
 }
 
 type fakeStore struct {
@@ -164,11 +164,10 @@ func testScheduler(t *testing.T, st *fakeStore, spec Spec, opts ...Option) *Sche
 	return newScheduler(st, registry, noopQueue{}, "test-scheduler", append(base, opts...)...)
 }
 
-func metricCounter(t *testing.T, counter prometheus.Counter) float64 {
+func metricCounter(t *testing.T, name string) float64 {
 	t.Helper()
-	var metric dto.Metric
-	require.NoError(t, counter.Write(&metric))
-	return metric.GetCounter().GetValue()
+	value, _ := metrics.SnapshotValue(name)
+	return value
 }
 
 func TestSchedulerRunOnceEnqueuesLatestSlot(t *testing.T) {
@@ -180,7 +179,7 @@ func TestSchedulerRunOnceEnqueuesLatestSlot(t *testing.T) {
 		Name:     "cleanup",
 		Interval: 5 * time.Minute,
 		Kind:     "maintenance.cleanup",
-		TenantID: 4,
+		TenantID: testID(4),
 		Payload:  json.RawMessage(`{"batch":10}`),
 	}, fixedClock(now), WithCatchup(CatchupLatest))
 
@@ -188,7 +187,7 @@ func TestSchedulerRunOnceEnqueuesLatestSlot(t *testing.T) {
 	enqueued := st.enqueuedJobs()
 	require.Len(t, enqueued, 1)
 	assert.Equal(t, "maintenance.cleanup", enqueued[0].Kind)
-	assert.Equal(t, int64(4), enqueued[0].TenantID)
+	assert.Equal(t, testID(4), enqueued[0].TenantID)
 	assert.Equal(t, "scheduler:cleanup:2026-10-24T12:05:00Z", enqueued[0].IdempotencyKey)
 	assert.JSONEq(t, `{"schedule":"cleanup","scheduledFor":"2026-10-24T12:05:00Z","data":{"batch":10}}`, string(enqueued[0].Payload))
 
@@ -395,13 +394,13 @@ func TestSchedulerPurgesRuns(t *testing.T) {
 	s := testScheduler(t, st, Spec{Name: "cleanup", Interval: time.Minute, Kind: "maintenance.cleanup"},
 		WithRetention(24*time.Hour))
 
-	before := metricCounter(t, metrics.SchedulerRunsPurgedTotal)
+	before := metricCounter(t, "scheduler_runs_purged_total")
 	s.purgeRuns(context.Background())
 	st.mu.Lock()
 	window := st.purgeWindow
 	st.mu.Unlock()
 	assert.Equal(t, 24*time.Hour, window)
-	assert.Equal(t, before+3, metricCounter(t, metrics.SchedulerRunsPurgedTotal))
+	assert.Equal(t, before+3, metricCounter(t, "scheduler_runs_purged_total"))
 }
 
 func TestSchedulerOptionsNormalize(t *testing.T) {
@@ -431,4 +430,24 @@ func TestSchedulerRunRejectsIncompleteConfiguration(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	require.NoError(t, (&Scheduler{}).Run(ctx), "an already-canceled context exits cleanly")
+}
+
+// TestSchedulerDefaultsUnsetSpecTenant pins the platform-job tenant: a
+// schedule that does not name a tenant enqueues for the seeded default tenant
+// (a real row), not for the leader's request context.
+func TestSchedulerDefaultsUnsetSpecTenant(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 10, 24, 12, 7, 30, 0, time.UTC)
+	st := newFakeStore()
+	s := testScheduler(t, st, Spec{
+		Name:     "default-tenant",
+		Interval: 5 * time.Minute,
+		Kind:     "maintenance.cleanup",
+	}, fixedClock(now), WithCatchup(CatchupLatest))
+
+	s.runOnce(context.Background())
+	enqueued := st.enqueuedJobs()
+	require.Len(t, enqueued, 1)
+	assert.Equal(t, tenant.DefaultID, enqueued[0].TenantID)
 }

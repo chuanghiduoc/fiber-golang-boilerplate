@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	filescontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/files"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
@@ -18,17 +20,17 @@ import (
 func TestMutationsPublishDomainEvents(t *testing.T) {
 	repo := newMockFileRepo()
 	tx := newFakeTx(repo)
-	svc := NewUploadService(repo, tx, newMockStorage(), UploadOptions{})
-	admin := NewAdminFileService(repo, tx, newMockStorage())
+	svc := NewUploadService(repo, tx, newMockStorage(), testAuthorizer(), UploadOptions{})
+	admin := NewAdminFileService(repo, tx, newMockStorage(), testAuthorizer())
 
-	file, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+	file, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 	if err != nil {
 		t.Fatalf("upload: %v", err)
 	}
-	if err := svc.Delete(systemCtx(), file.ID, 1); err != nil {
+	if err := svc.Delete(systemCtx(), file.ID, testID(1)); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := svc.Restore(systemCtx(), file.ID, 1); err != nil {
+	if _, err := svc.Restore(systemCtx(), file.ID, testID(1)); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if err := admin.DeleteFile(systemCtx(), file.ID); err != nil {
@@ -51,10 +53,10 @@ func TestMutationsPublishDomainEvents(t *testing.T) {
 	}
 	for i, eventType := range want {
 		event := published[i]
-		if event.Type != eventType || event.DataVersion != 1 || event.TenantID != 1 {
-			t.Errorf("event %d = %s v%d tenant %d, want %s v1 tenant 1", i, event.Type, event.DataVersion, event.TenantID, eventType)
+		if event.Type != eventType || event.DataVersion != 1 || event.TenantID != testID(1) {
+			t.Errorf("event %d = %s v%d tenant %s, want %s v1 tenant %s", i, event.Type, event.DataVersion, event.TenantID, eventType, testID(1))
 		}
-		if event.ID == "" {
+		if event.ID == uuid.Nil {
 			t.Errorf("event %d has no id", i)
 		}
 	}
@@ -66,7 +68,7 @@ func TestEventPayloadsAreContracts(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	deleted := created.Add(time.Hour)
 	file := &File{
-		ID: 9, TenantID: 2, UserID: 3, OriginalName: "a.pdf", StoragePath: "2/3/x.pdf",
+		ID: testID(9), TenantID: testID(2), UserID: testID(3), OriginalName: "a.pdf", StoragePath: "2/3/x.pdf",
 		MimeType: "application/pdf", Size: 42, CreatedAt: created,
 	}
 	deletedFile := *file
@@ -76,9 +78,9 @@ func TestEventPayloadsAreContracts(t *testing.T) {
 		data any
 		want string
 	}{
-		{"uploaded", fileUploaded(file), `{"fileId":9,"ownerId":3,"originalName":"a.pdf","mimeType":"application/pdf","size":42,"createdAt":"2026-01-02T03:04:05Z"}`},
-		{"restored", fileRestored(file), `{"fileId":9,"ownerId":3,"originalName":"a.pdf"}`},
-		{"deleted", fileDeleted(&deletedFile), `{"fileId":9,"ownerId":3,"originalName":"a.pdf","deletedAt":"2026-01-02T04:04:05Z"}`},
+		{"uploaded", fileUploaded(file), `{"fileId":"0192c9b0-7e4a-7000-8000-000000000009","ownerId":"0192c9b0-7e4a-7000-8000-000000000003","originalName":"a.pdf","mimeType":"application/pdf","size":42,"createdAt":"2026-01-02T03:04:05Z"}`},
+		{"restored", fileRestored(file), `{"fileId":"0192c9b0-7e4a-7000-8000-000000000009","ownerId":"0192c9b0-7e4a-7000-8000-000000000003","originalName":"a.pdf"}`},
+		{"deleted", fileDeleted(&deletedFile), `{"fileId":"0192c9b0-7e4a-7000-8000-000000000009","ownerId":"0192c9b0-7e4a-7000-8000-000000000003","originalName":"a.pdf","deletedAt":"2026-01-02T04:04:05Z"}`},
 	}
 
 	for _, tc := range cases {
@@ -99,17 +101,17 @@ func TestPublishFailureFailsMutation(t *testing.T) {
 	tx := newFakeTx(repo)
 	tx.events.err = errors.New("queue unavailable")
 	store := newMockStorage()
-	svc := NewUploadService(repo, tx, store, UploadOptions{})
+	svc := NewUploadService(repo, tx, store, testAuthorizer(), UploadOptions{})
 
-	_, err := svc.Upload(systemCtx(), 1, "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
+	_, err := svc.Upload(systemCtx(), testID(1), "photo.jpg", strings.NewReader("data"), 4, "image/jpeg")
 	requireStatus(t, err, 500)
 	if len(store.files) != 0 {
 		t.Fatalf("stored files = %d, want the blob cleaned up", len(store.files))
 	}
 
-	repo.files[7] = &File{ID: 7, TenantID: 1, UserID: 1, StoragePath: "1/1/x.bin", CreatedAt: time.Now()}
-	admin := NewAdminFileService(repo, tx, store)
-	requireStatus(t, admin.DeleteFile(systemCtx(), 7), 500)
+	repo.files[testID(7)] = &File{ID: testID(7), TenantID: testID(1), UserID: testID(1), StoragePath: "1/1/x.bin", CreatedAt: time.Now()}
+	admin := NewAdminFileService(repo, tx, store, testAuthorizer())
+	requireStatus(t, admin.DeleteFile(systemCtx(), testID(7)), 500)
 }
 
 // A Tier 1 audit failure maps to 503 system.audit_unavailable.
@@ -118,9 +120,9 @@ func TestAdminMutationAuditFailureIsUnavailable(t *testing.T) {
 	seedAdminFiles(repo, 1)
 	tx := newFakeTx(repo)
 	tx.audit = auditWriterFunc(func(context.Context, audit.Event) error { return errors.New("audit down") })
-	svc := NewAdminFileService(repo, tx, newFakeAdminStorage())
+	svc := NewAdminFileService(repo, tx, newFakeAdminStorage(), testAuthorizer())
 
-	err := svc.DeleteFile(systemCtx(), 1)
+	err := svc.DeleteFile(systemCtx(), testID(1))
 	var appErr *apperror.AppError
 	if !errors.As(err, &appErr) || appErr.Code != string(apperror.CodeSystemAuditUnavailable) {
 		t.Fatalf("expected %s, got %v", apperror.CodeSystemAuditUnavailable, err)

@@ -5,13 +5,14 @@
 package sqlc
 
 import (
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Notification struct {
-	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
-	UserID    int64              `json:"user_id"`
+	ID        uuid.UUID          `json:"id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	UserID    uuid.UUID          `json:"user_id"`
 	Type      string             `json:"type"`
 	Title     string             `json:"title"`
 	Body      string             `json:"body"`
@@ -22,9 +23,8 @@ type Notification struct {
 }
 
 type NotificationPreference struct {
-	ID        int64              `json:"id"`
-	TenantID  int64              `json:"tenant_id"`
-	UserID    int64              `json:"user_id"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
+	UserID    uuid.UUID          `json:"user_id"`
 	Type      string             `json:"type"`
 	Channel   string             `json:"channel"`
 	Enabled   bool               `json:"enabled"`

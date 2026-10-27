@@ -8,6 +8,7 @@ package sqlc
 import (
 	"context"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -30,41 +31,41 @@ WHERE webhook_deliveries.id = $2
         AND e.status = 'active'
         AND e.deleted_at IS NULL
   )
-RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.url, webhook_deliveries.secret_ciphertext, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.is_replay, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.data_version, ev.actor_type,
+RETURNING webhook_deliveries.id, webhook_deliveries.tenant_id, webhook_deliveries.endpoint_id, webhook_deliveries.event_id, webhook_deliveries.secret_id, webhook_deliveries.url, webhook_deliveries.status, webhook_deliveries.attempts, webhook_deliveries.max_attempts, webhook_deliveries.timeout_ms, webhook_deliveries.next_attempt_at, webhook_deliveries.last_status_code, webhook_deliveries.last_error, webhook_deliveries.delivered_at, webhook_deliveries.replayed_from_id, webhook_deliveries.is_replay, webhook_deliveries.created_at, webhook_deliveries.updated_at, ev.event_type, ev.data_version, ev.actor_type,
           ev.actor_id, ev.occurred_at, ev.payload
 `
 
 type ClaimWebhookDeliveryParams struct {
-	LeaseSeconds float64 `json:"lease_seconds"`
-	ID           int64   `json:"id"`
-	TenantID     int64   `json:"tenant_id"`
+	LeaseSeconds float64   `json:"lease_seconds"`
+	ID           uuid.UUID `json:"id"`
+	TenantID     uuid.UUID `json:"tenant_id"`
 }
 
 type ClaimWebhookDeliveryRow struct {
-	ID               int64              `json:"id"`
-	TenantID         int64              `json:"tenant_id"`
-	EndpointID       int64              `json:"endpoint_id"`
-	EventID          string             `json:"event_id"`
-	Url              string             `json:"url"`
-	SecretCiphertext string             `json:"secret_ciphertext"`
-	Status           string             `json:"status"`
-	Attempts         int32              `json:"attempts"`
-	MaxAttempts      int32              `json:"max_attempts"`
-	TimeoutMs        int32              `json:"timeout_ms"`
-	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
-	LastStatusCode   pgtype.Int4        `json:"last_status_code"`
-	LastError        pgtype.Text        `json:"last_error"`
-	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
-	ReplayedFromID   pgtype.Int8        `json:"replayed_from_id"`
-	IsReplay         bool               `json:"is_replay"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	EventType        string             `json:"event_type"`
-	DataVersion      int32              `json:"data_version"`
-	ActorType        string             `json:"actor_type"`
-	ActorID          pgtype.Text        `json:"actor_id"`
-	OccurredAt       pgtype.Timestamptz `json:"occurred_at"`
-	Payload          []byte             `json:"payload"`
+	ID             uuid.UUID          `json:"id"`
+	TenantID       uuid.UUID          `json:"tenant_id"`
+	EndpointID     uuid.UUID          `json:"endpoint_id"`
+	EventID        uuid.UUID          `json:"event_id"`
+	SecretID       uuid.UUID          `json:"secret_id"`
+	Url            string             `json:"url"`
+	Status         string             `json:"status"`
+	Attempts       int32              `json:"attempts"`
+	MaxAttempts    int32              `json:"max_attempts"`
+	TimeoutMs      int32              `json:"timeout_ms"`
+	NextAttemptAt  pgtype.Timestamptz `json:"next_attempt_at"`
+	LastStatusCode pgtype.Int4        `json:"last_status_code"`
+	LastError      pgtype.Text        `json:"last_error"`
+	DeliveredAt    pgtype.Timestamptz `json:"delivered_at"`
+	ReplayedFromID uuid.NullUUID      `json:"replayed_from_id"`
+	IsReplay       bool               `json:"is_replay"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
+	EventType      string             `json:"event_type"`
+	DataVersion    int32              `json:"data_version"`
+	ActorType      string             `json:"actor_type"`
+	ActorID        uuid.NullUUID      `json:"actor_id"`
+	OccurredAt     pgtype.Timestamptz `json:"occurred_at"`
+	Payload        []byte             `json:"payload"`
 }
 
 // A disabled or deleted endpoint is never claimed, so it stops receiving
@@ -78,8 +79,8 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 		&i.TenantID,
 		&i.EndpointID,
 		&i.EventID,
+		&i.SecretID,
 		&i.Url,
-		&i.SecretCiphertext,
 		&i.Status,
 		&i.Attempts,
 		&i.MaxAttempts,
@@ -104,13 +105,13 @@ func (q *Queries) ClaimWebhookDelivery(ctx context.Context, arg ClaimWebhookDeli
 
 const createWebhookDelivery = `-- name: CreateWebhookDelivery :one
 INSERT INTO webhook_deliveries (
-    tenant_id, endpoint_id, event_id,
-    url, secret_ciphertext, status, max_attempts, timeout_ms,
+    tenant_id, endpoint_id, event_id, secret_id,
+    url, status, max_attempts, timeout_ms,
     next_attempt_at, replayed_from_id, is_replay
 )
 VALUES (
-    $1, $2, $3,
-    $4, $5, 'pending', $6, $7,
+    $1, $2, $3, $4,
+    $5, 'pending', $6, $7,
     NOW(), $8, $9
 )
 ON CONFLICT (tenant_id, endpoint_id, event_id) WHERE NOT is_replay DO NOTHING
@@ -118,30 +119,30 @@ RETURNING id
 `
 
 type CreateWebhookDeliveryParams struct {
-	TenantID         int64       `json:"tenant_id"`
-	EndpointID       int64       `json:"endpoint_id"`
-	EventID          string      `json:"event_id"`
-	Url              string      `json:"url"`
-	SecretCiphertext string      `json:"secret_ciphertext"`
-	MaxAttempts      int32       `json:"max_attempts"`
-	TimeoutMs        int32       `json:"timeout_ms"`
-	ReplayedFromID   pgtype.Int8 `json:"replayed_from_id"`
-	IsReplay         bool        `json:"is_replay"`
+	TenantID       uuid.UUID     `json:"tenant_id"`
+	EndpointID     uuid.UUID     `json:"endpoint_id"`
+	EventID        uuid.UUID     `json:"event_id"`
+	SecretID       uuid.UUID     `json:"secret_id"`
+	Url            string        `json:"url"`
+	MaxAttempts    int32         `json:"max_attempts"`
+	TimeoutMs      int32         `json:"timeout_ms"`
+	ReplayedFromID uuid.NullUUID `json:"replayed_from_id"`
+	IsReplay       bool          `json:"is_replay"`
 }
 
-func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (int64, error) {
+func (q *Queries) CreateWebhookDelivery(ctx context.Context, arg CreateWebhookDeliveryParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, createWebhookDelivery,
 		arg.TenantID,
 		arg.EndpointID,
 		arg.EventID,
+		arg.SecretID,
 		arg.Url,
-		arg.SecretCiphertext,
 		arg.MaxAttempts,
 		arg.TimeoutMs,
 		arg.ReplayedFromID,
 		arg.IsReplay,
 	)
-	var id int64
+	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
@@ -159,15 +160,15 @@ RETURNING id
 `
 
 type CreateWebhookDeliveryAttemptParams struct {
-	TenantID   int64       `json:"tenant_id"`
-	DeliveryID int64       `json:"delivery_id"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
+	DeliveryID uuid.UUID   `json:"delivery_id"`
 	Attempt    int32       `json:"attempt"`
 	StatusCode int32       `json:"status_code"`
 	DurationMs int32       `json:"duration_ms"`
 	Error      pgtype.Text `json:"error"`
 }
 
-func (q *Queries) CreateWebhookDeliveryAttempt(ctx context.Context, arg CreateWebhookDeliveryAttemptParams) (int64, error) {
+func (q *Queries) CreateWebhookDeliveryAttempt(ctx context.Context, arg CreateWebhookDeliveryAttemptParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, createWebhookDeliveryAttempt,
 		arg.TenantID,
 		arg.DeliveryID,
@@ -176,7 +177,7 @@ func (q *Queries) CreateWebhookDeliveryAttempt(ctx context.Context, arg CreateWe
 		arg.DurationMs,
 		arg.Error,
 	)
-	var id int64
+	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
@@ -193,12 +194,12 @@ RETURNING id, tenant_id, url, description, status, max_attempts, timeout_ms, cre
 `
 
 type CreateWebhookEndpointParams struct {
-	TenantID    int64  `json:"tenant_id"`
-	Url         string `json:"url"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	MaxAttempts int32  `json:"max_attempts"`
-	TimeoutMs   int32  `json:"timeout_ms"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	Url         string    `json:"url"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"`
+	MaxAttempts int32     `json:"max_attempts"`
+	TimeoutMs   int32     `json:"timeout_ms"`
 }
 
 // Outbound endpoints -------------------------------------------------------
@@ -238,14 +239,14 @@ INSERT INTO webhook_endpoint_secrets (
 VALUES (
     $1, $2, $3, $4, TRUE
 )
-RETURNING id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at
+RETURNING id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at, updated_at
 `
 
 type CreateWebhookEndpointSecretParams struct {
-	TenantID         int64  `json:"tenant_id"`
-	EndpointID       int64  `json:"endpoint_id"`
-	Version          int32  `json:"version"`
-	SecretCiphertext string `json:"secret_ciphertext"`
+	TenantID         uuid.UUID `json:"tenant_id"`
+	EndpointID       uuid.UUID `json:"endpoint_id"`
+	Version          int32     `json:"version"`
+	SecretCiphertext string    `json:"secret_ciphertext"`
 }
 
 func (q *Queries) CreateWebhookEndpointSecret(ctx context.Context, arg CreateWebhookEndpointSecretParams) (WebhookEndpointSecret, error) {
@@ -265,6 +266,7 @@ func (q *Queries) CreateWebhookEndpointSecret(ctx context.Context, arg CreateWeb
 		&i.Active,
 		&i.GraceExpiresAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -276,9 +278,9 @@ FROM unnest($3::text[]) AS pattern
 `
 
 type CreateWebhookEndpointSubscriptionsParams struct {
-	TenantID   int64    `json:"tenant_id"`
-	EndpointID int64    `json:"endpoint_id"`
-	Patterns   []string `json:"patterns"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
+	Patterns   []string  `json:"patterns"`
 }
 
 func (q *Queries) CreateWebhookEndpointSubscriptions(ctx context.Context, arg CreateWebhookEndpointSubscriptionsParams) error {
@@ -300,12 +302,12 @@ ON CONFLICT (tenant_id, event_id) DO NOTHING
 `
 
 type CreateWebhookEventParams struct {
-	TenantID    int64              `json:"tenant_id"`
-	EventID     string             `json:"event_id"`
+	TenantID    uuid.UUID          `json:"tenant_id"`
+	EventID     uuid.UUID          `json:"event_id"`
 	EventType   string             `json:"event_type"`
 	DataVersion int32              `json:"data_version"`
 	ActorType   string             `json:"actor_type"`
-	ActorID     pgtype.Text        `json:"actor_id"`
+	ActorID     uuid.NullUUID      `json:"actor_id"`
 	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
 	Payload     []byte             `json:"payload"`
 }
@@ -340,15 +342,15 @@ RETURNING id
 `
 
 type CreateWebhookInboundEventParams struct {
-	TenantID        int64  `json:"tenant_id"`
-	SourceID        int64  `json:"source_id"`
-	ExternalEventID string `json:"external_event_id"`
-	EventType       string `json:"event_type"`
-	Signature       string `json:"signature"`
-	Payload         []byte `json:"payload"`
+	TenantID        uuid.UUID `json:"tenant_id"`
+	SourceID        uuid.UUID `json:"source_id"`
+	ExternalEventID string    `json:"external_event_id"`
+	EventType       string    `json:"event_type"`
+	Signature       string    `json:"signature"`
+	Payload         []byte    `json:"payload"`
 }
 
-func (q *Queries) CreateWebhookInboundEvent(ctx context.Context, arg CreateWebhookInboundEventParams) (int64, error) {
+func (q *Queries) CreateWebhookInboundEvent(ctx context.Context, arg CreateWebhookInboundEventParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, createWebhookInboundEvent,
 		arg.TenantID,
 		arg.SourceID,
@@ -357,7 +359,7 @@ func (q *Queries) CreateWebhookInboundEvent(ctx context.Context, arg CreateWebho
 		arg.Signature,
 		arg.Payload,
 	)
-	var id int64
+	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
 }
@@ -365,36 +367,81 @@ func (q *Queries) CreateWebhookInboundEvent(ctx context.Context, arg CreateWebho
 const createWebhookInboundSource = `-- name: CreateWebhookInboundSource :one
 
 INSERT INTO webhook_inbound_sources (
-    tenant_id, name, slug, secret_ciphertext, status
+    tenant_id, name, slug, status
 )
 VALUES (
-    $1, $2, $3, '', 'active'
+    $1, $2, $3, $4
 )
-RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, status, created_at, updated_at, deleted_at
 `
 
 type CreateWebhookInboundSourceParams struct {
-	TenantID int64  `json:"tenant_id"`
-	Name     string `json:"name"`
-	Slug     string `json:"slug"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Name     string    `json:"name"`
+	Slug     string    `json:"slug"`
+	Status   string    `json:"status"`
 }
 
 // Inbound sources and events ------------------------------------------------
+// The source and its first secret are separate rows: the caller creates the
+// source, seals the secret (its AAD binds the source id), then inserts the
+// version-1 secret in the same transaction.
 func (q *Queries) CreateWebhookInboundSource(ctx context.Context, arg CreateWebhookInboundSourceParams) (WebhookInboundSource, error) {
-	row := q.db.QueryRow(ctx, createWebhookInboundSource, arg.TenantID, arg.Name, arg.Slug)
+	row := q.db.QueryRow(ctx, createWebhookInboundSource,
+		arg.TenantID,
+		arg.Name,
+		arg.Slug,
+		arg.Status,
+	)
 	var i WebhookInboundSource
 	err := row.Scan(
 		&i.ID,
 		&i.TenantID,
 		&i.Name,
 		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const createWebhookInboundSourceSecret = `-- name: CreateWebhookInboundSourceSecret :one
+INSERT INTO webhook_inbound_source_secrets (
+    tenant_id, source_id, version, secret_ciphertext, active
+)
+VALUES (
+    $1, $2, $3, $4, TRUE
+)
+RETURNING id, tenant_id, source_id, version, secret_ciphertext, active, grace_expires_at, created_at, updated_at
+`
+
+type CreateWebhookInboundSourceSecretParams struct {
+	TenantID         uuid.UUID `json:"tenant_id"`
+	SourceID         uuid.UUID `json:"source_id"`
+	Version          int32     `json:"version"`
+	SecretCiphertext string    `json:"secret_ciphertext"`
+}
+
+func (q *Queries) CreateWebhookInboundSourceSecret(ctx context.Context, arg CreateWebhookInboundSourceSecretParams) (WebhookInboundSourceSecret, error) {
+	row := q.db.QueryRow(ctx, createWebhookInboundSourceSecret,
+		arg.TenantID,
+		arg.SourceID,
+		arg.Version,
+		arg.SecretCiphertext,
+	)
+	var i WebhookInboundSourceSecret
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.SourceID,
+		&i.Version,
+		&i.SecretCiphertext,
+		&i.Active,
+		&i.GraceExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -407,15 +454,35 @@ WHERE tenant_id = $2 AND endpoint_id = $3 AND active
 `
 
 type DeactivateWebhookEndpointSecretsParams struct {
-	GraceSeconds float64 `json:"grace_seconds"`
-	TenantID     int64   `json:"tenant_id"`
-	EndpointID   int64   `json:"endpoint_id"`
+	GraceSeconds float64   `json:"grace_seconds"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	EndpointID   uuid.UUID `json:"endpoint_id"`
 }
 
 // Retires the active secret but keeps it usable for dual-signing until its
 // explicit grace expiry.
 func (q *Queries) DeactivateWebhookEndpointSecrets(ctx context.Context, arg DeactivateWebhookEndpointSecretsParams) error {
 	_, err := q.db.Exec(ctx, deactivateWebhookEndpointSecrets, arg.GraceSeconds, arg.TenantID, arg.EndpointID)
+	return err
+}
+
+const deactivateWebhookInboundSourceSecrets = `-- name: DeactivateWebhookInboundSourceSecrets :exec
+UPDATE webhook_inbound_source_secrets
+SET active = FALSE,
+    grace_expires_at = NOW() + make_interval(secs => $1::double precision)
+WHERE tenant_id = $2 AND source_id = $3 AND active
+`
+
+type DeactivateWebhookInboundSourceSecretsParams struct {
+	GraceSeconds float64   `json:"grace_seconds"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	SourceID     uuid.UUID `json:"source_id"`
+}
+
+// Retires the active secret but keeps it verifiable until its explicit grace
+// expiry.
+func (q *Queries) DeactivateWebhookInboundSourceSecrets(ctx context.Context, arg DeactivateWebhookInboundSourceSecretsParams) error {
+	_, err := q.db.Exec(ctx, deactivateWebhookInboundSourceSecrets, arg.GraceSeconds, arg.TenantID, arg.SourceID)
 	return err
 }
 
@@ -426,8 +493,8 @@ WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 `
 
 type DeleteWebhookEndpointParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) DeleteWebhookEndpoint(ctx context.Context, arg DeleteWebhookEndpointParams) (int64, error) {
@@ -444,8 +511,8 @@ WHERE tenant_id = $1 AND endpoint_id = $2
 `
 
 type DeleteWebhookEndpointSubscriptionsParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	EndpointID int64 `json:"endpoint_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
 }
 
 func (q *Queries) DeleteWebhookEndpointSubscriptions(ctx context.Context, arg DeleteWebhookEndpointSubscriptionsParams) error {
@@ -457,12 +524,12 @@ const deleteWebhookInboundSource = `-- name: DeleteWebhookInboundSource :one
 UPDATE webhook_inbound_sources
 SET status = 'disabled', deleted_at = NOW()
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, status, created_at, updated_at, deleted_at
 `
 
 type DeleteWebhookInboundSourceParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) DeleteWebhookInboundSource(ctx context.Context, arg DeleteWebhookInboundSourceParams) (WebhookInboundSource, error) {
@@ -473,9 +540,6 @@ func (q *Queries) DeleteWebhookInboundSource(ctx context.Context, arg DeleteWebh
 		&i.TenantID,
 		&i.Name,
 		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -494,14 +558,35 @@ WHERE tenant_id = $1
 `
 
 type ExpireOlderWebhookEndpointSecretsParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	EndpointID int64 `json:"endpoint_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
 }
 
 // A second rotation inside the grace window drops the older retired secret:
 // only the immediately previous secret may co-sign deliveries.
 func (q *Queries) ExpireOlderWebhookEndpointSecrets(ctx context.Context, arg ExpireOlderWebhookEndpointSecretsParams) error {
 	_, err := q.db.Exec(ctx, expireOlderWebhookEndpointSecrets, arg.TenantID, arg.EndpointID)
+	return err
+}
+
+const expireOlderWebhookInboundSourceSecrets = `-- name: ExpireOlderWebhookInboundSourceSecrets :exec
+UPDATE webhook_inbound_source_secrets
+SET grace_expires_at = NOW()
+WHERE tenant_id = $1
+  AND source_id = $2
+  AND NOT active
+  AND grace_expires_at > NOW()
+`
+
+type ExpireOlderWebhookInboundSourceSecretsParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	SourceID uuid.UUID `json:"source_id"`
+}
+
+// A second rotation inside the grace window drops the older retired secret:
+// only the immediately previous secret may co-sign inbound verification.
+func (q *Queries) ExpireOlderWebhookInboundSourceSecrets(ctx context.Context, arg ExpireOlderWebhookInboundSourceSecretsParams) error {
+	_, err := q.db.Exec(ctx, expireOlderWebhookInboundSourceSecrets, arg.TenantID, arg.SourceID)
 	return err
 }
 
@@ -530,8 +615,8 @@ WHERE webhook_deliveries.id = $1
 `
 
 type ExpireUnclaimableWebhookDeliveryParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 // Dead-letters a pending delivery that can never be claimed again: its
@@ -547,14 +632,14 @@ func (q *Queries) ExpireUnclaimableWebhookDelivery(ctx context.Context, arg Expi
 }
 
 const getActiveWebhookEndpointSecret = `-- name: GetActiveWebhookEndpointSecret :one
-SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at FROM webhook_endpoint_secrets
+SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at, updated_at FROM webhook_endpoint_secrets
 WHERE tenant_id = $1 AND endpoint_id = $2 AND active
 LIMIT 1
 `
 
 type GetActiveWebhookEndpointSecretParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	EndpointID int64 `json:"endpoint_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
 }
 
 func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetActiveWebhookEndpointSecretParams) (WebhookEndpointSecret, error) {
@@ -569,12 +654,13 @@ func (q *Queries) GetActiveWebhookEndpointSecret(ctx context.Context, arg GetAct
 		&i.Active,
 		&i.GraceExpiresAt,
 		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
 
 const getWebhookDelivery = `-- name: GetWebhookDelivery :one
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.data_version, ev.actor_type, ev.actor_id,
        ev.occurred_at, ev.payload
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
@@ -582,8 +668,8 @@ WHERE d.id = $1 AND d.tenant_id = $2
 `
 
 type GetWebhookDeliveryParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetWebhookDeliveryRow struct {
@@ -591,7 +677,7 @@ type GetWebhookDeliveryRow struct {
 	EventType       string             `json:"event_type"`
 	DataVersion     int32              `json:"data_version"`
 	ActorType       string             `json:"actor_type"`
-	ActorID         pgtype.Text        `json:"actor_id"`
+	ActorID         uuid.NullUUID      `json:"actor_id"`
 	OccurredAt      pgtype.Timestamptz `json:"occurred_at"`
 	Payload         []byte             `json:"payload"`
 }
@@ -604,8 +690,8 @@ func (q *Queries) GetWebhookDelivery(ctx context.Context, arg GetWebhookDelivery
 		&i.WebhookDelivery.TenantID,
 		&i.WebhookDelivery.EndpointID,
 		&i.WebhookDelivery.EventID,
+		&i.WebhookDelivery.SecretID,
 		&i.WebhookDelivery.Url,
-		&i.WebhookDelivery.SecretCiphertext,
 		&i.WebhookDelivery.Status,
 		&i.WebhookDelivery.Attempts,
 		&i.WebhookDelivery.MaxAttempts,
@@ -638,8 +724,8 @@ WHERE e.id = $1 AND e.tenant_id = $2 AND e.deleted_at IS NULL
 `
 
 type GetWebhookEndpointParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type GetWebhookEndpointRow struct {
@@ -666,6 +752,35 @@ func (q *Queries) GetWebhookEndpoint(ctx context.Context, arg GetWebhookEndpoint
 	return i, err
 }
 
+const getWebhookEndpointSecretByID = `-- name: GetWebhookEndpointSecretByID :one
+SELECT id, tenant_id, endpoint_id, version, secret_ciphertext, active, grace_expires_at, created_at, updated_at FROM webhook_endpoint_secrets
+WHERE tenant_id = $1 AND id = $2
+`
+
+type GetWebhookEndpointSecretByIDParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+// A queued delivery references the exact secret version it snapshotted; the
+// worker reads that row, never a ciphertext copied onto the delivery.
+func (q *Queries) GetWebhookEndpointSecretByID(ctx context.Context, arg GetWebhookEndpointSecretByIDParams) (WebhookEndpointSecret, error) {
+	row := q.db.QueryRow(ctx, getWebhookEndpointSecretByID, arg.TenantID, arg.ID)
+	var i WebhookEndpointSecret
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.EndpointID,
+		&i.Version,
+		&i.SecretCiphertext,
+		&i.Active,
+		&i.GraceExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getWebhookEndpointSigningSecrets = `-- name: GetWebhookEndpointSigningSecrets :one
 SELECT
     COALESCE((SELECT s.secret_ciphertext FROM webhook_endpoint_secrets s
@@ -678,8 +793,8 @@ SELECT
 `
 
 type GetWebhookEndpointSigningSecretsParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	EndpointID int64 `json:"endpoint_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
 }
 
 type GetWebhookEndpointSigningSecretsRow struct {
@@ -704,9 +819,9 @@ WHERE tenant_id = $1
 `
 
 type GetWebhookInboundEventByExternalIDParams struct {
-	TenantID        int64  `json:"tenant_id"`
-	SourceID        int64  `json:"source_id"`
-	ExternalEventID string `json:"external_event_id"`
+	TenantID        uuid.UUID `json:"tenant_id"`
+	SourceID        uuid.UUID `json:"source_id"`
+	ExternalEventID string    `json:"external_event_id"`
 }
 
 func (q *Queries) GetWebhookInboundEventByExternalID(ctx context.Context, arg GetWebhookInboundEventByExternalIDParams) (WebhookInboundEvent, error) {
@@ -726,13 +841,13 @@ func (q *Queries) GetWebhookInboundEventByExternalID(ctx context.Context, arg Ge
 }
 
 const getWebhookInboundSource = `-- name: GetWebhookInboundSource :one
-SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 `
 
 type GetWebhookInboundSourceParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) GetWebhookInboundSource(ctx context.Context, arg GetWebhookInboundSourceParams) (WebhookInboundSource, error) {
@@ -743,9 +858,6 @@ func (q *Queries) GetWebhookInboundSource(ctx context.Context, arg GetWebhookInb
 		&i.TenantID,
 		&i.Name,
 		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -755,11 +867,11 @@ func (q *Queries) GetWebhookInboundSource(ctx context.Context, arg GetWebhookInb
 }
 
 const getWebhookInboundSourceByID = `-- name: GetWebhookInboundSourceByID :one
-SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE id = $1 AND deleted_at IS NULL
 `
 
-func (q *Queries) GetWebhookInboundSourceByID(ctx context.Context, id int64) (WebhookInboundSource, error) {
+func (q *Queries) GetWebhookInboundSourceByID(ctx context.Context, id uuid.UUID) (WebhookInboundSource, error) {
 	row := q.db.QueryRow(ctx, getWebhookInboundSourceByID, id)
 	var i WebhookInboundSource
 	err := row.Scan(
@@ -767,14 +879,41 @@ func (q *Queries) GetWebhookInboundSourceByID(ctx context.Context, id int64) (We
 		&i.TenantID,
 		&i.Name,
 		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
 	)
+	return i, err
+}
+
+const getWebhookInboundSourceSigningSecrets = `-- name: GetWebhookInboundSourceSigningSecrets :one
+SELECT
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_inbound_source_secrets s
+      WHERE s.tenant_id = $1 AND s.source_id = $2 AND s.active
+      ORDER BY s.version DESC LIMIT 1), '')::text AS current_ciphertext,
+    COALESCE((SELECT s.secret_ciphertext FROM webhook_inbound_source_secrets s
+      WHERE s.tenant_id = $1 AND s.source_id = $2
+        AND NOT s.active AND s.grace_expires_at > NOW()
+      ORDER BY s.version DESC LIMIT 1), '')::text AS previous_ciphertext
+`
+
+type GetWebhookInboundSourceSigningSecretsParams struct {
+	TenantID uuid.UUID `json:"tenant_id"`
+	SourceID uuid.UUID `json:"source_id"`
+}
+
+type GetWebhookInboundSourceSigningSecretsRow struct {
+	CurrentCiphertext  string `json:"current_ciphertext"`
+	PreviousCiphertext string `json:"previous_ciphertext"`
+}
+
+// The receiver verifies with the current secret first and, while its explicit
+// grace expiry is still open, the immediately previous one too.
+func (q *Queries) GetWebhookInboundSourceSigningSecrets(ctx context.Context, arg GetWebhookInboundSourceSigningSecretsParams) (GetWebhookInboundSourceSigningSecretsRow, error) {
+	row := q.db.QueryRow(ctx, getWebhookInboundSourceSigningSecrets, arg.TenantID, arg.SourceID)
+	var i GetWebhookInboundSourceSigningSecretsRow
+	err := row.Scan(&i.CurrentCiphertext, &i.PreviousCiphertext)
 	return i, err
 }
 
@@ -788,6 +927,7 @@ SELECT
     ARRAY(SELECT sub.pattern FROM webhook_endpoint_subscriptions sub
           WHERE sub.tenant_id = e.tenant_id AND sub.endpoint_id = e.id
           ORDER BY sub.pattern COLLATE "C")::text[] AS event_types,
+    s.id AS secret_id,
     s.secret_ciphertext AS secret_ciphertext
 FROM webhook_endpoints e
 JOIN webhook_endpoint_secrets s
@@ -799,16 +939,17 @@ ORDER BY e.id
 `
 
 type ListActiveWebhookEndpointsWithSecretRow struct {
-	ID               int64    `json:"id"`
-	TenantID         int64    `json:"tenant_id"`
-	Url              string   `json:"url"`
-	MaxAttempts      int32    `json:"max_attempts"`
-	TimeoutMs        int32    `json:"timeout_ms"`
-	EventTypes       []string `json:"event_types"`
-	SecretCiphertext string   `json:"secret_ciphertext"`
+	ID               uuid.UUID `json:"id"`
+	TenantID         uuid.UUID `json:"tenant_id"`
+	Url              string    `json:"url"`
+	MaxAttempts      int32     `json:"max_attempts"`
+	TimeoutMs        int32     `json:"timeout_ms"`
+	EventTypes       []string  `json:"event_types"`
+	SecretID         uuid.UUID `json:"secret_id"`
+	SecretCiphertext string    `json:"secret_ciphertext"`
 }
 
-func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tenantID int64) ([]ListActiveWebhookEndpointsWithSecretRow, error) {
+func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tenantID uuid.UUID) ([]ListActiveWebhookEndpointsWithSecretRow, error) {
 	rows, err := q.db.Query(ctx, listActiveWebhookEndpointsWithSecret, tenantID)
 	if err != nil {
 		return nil, err
@@ -824,6 +965,7 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 			&i.MaxAttempts,
 			&i.TimeoutMs,
 			&i.EventTypes,
+			&i.SecretID,
 			&i.SecretCiphertext,
 		); err != nil {
 			return nil, err
@@ -837,23 +979,23 @@ func (q *Queries) ListActiveWebhookEndpointsWithSecret(ctx context.Context, tena
 }
 
 const listWebhookDeliveries = `-- name: ListWebhookDeliveries :many
-SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.url, d.secret_ciphertext, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.occurred_at
+SELECT d.id, d.tenant_id, d.endpoint_id, d.event_id, d.secret_id, d.url, d.status, d.attempts, d.max_attempts, d.timeout_ms, d.next_attempt_at, d.last_status_code, d.last_error, d.delivered_at, d.replayed_from_id, d.is_replay, d.created_at, d.updated_at, ev.event_type, ev.occurred_at
 FROM webhook_deliveries d
 JOIN webhook_events ev ON ev.tenant_id = d.tenant_id AND ev.event_id = d.event_id
 WHERE d.tenant_id = $1
-  AND ($2::bigint = 0 OR d.endpoint_id = $2)
+  AND ($2::uuid IS NULL OR d.endpoint_id = $2::uuid)
   AND ($3::text = '' OR d.status = $3)
-  AND (d.created_at, d.id) < ($4::timestamptz, $5::bigint)
+  AND (d.created_at, d.id) < ($4::timestamptz, $5::uuid)
 ORDER BY d.created_at DESC, d.id DESC
 LIMIT $6::int
 `
 
 type ListWebhookDeliveriesParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	EndpointID      int64              `json:"endpoint_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	EndpointID      uuid.NullUUID      `json:"endpoint_id"`
 	Status          string             `json:"status"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -885,8 +1027,8 @@ func (q *Queries) ListWebhookDeliveries(ctx context.Context, arg ListWebhookDeli
 			&i.WebhookDelivery.TenantID,
 			&i.WebhookDelivery.EndpointID,
 			&i.WebhookDelivery.EventID,
+			&i.WebhookDelivery.SecretID,
 			&i.WebhookDelivery.Url,
-			&i.WebhookDelivery.SecretCiphertext,
 			&i.WebhookDelivery.Status,
 			&i.WebhookDelivery.Attempts,
 			&i.WebhookDelivery.MaxAttempts,
@@ -919,8 +1061,8 @@ ORDER BY attempt ASC
 `
 
 type ListWebhookDeliveryAttemptsParams struct {
-	TenantID   int64 `json:"tenant_id"`
-	DeliveryID int64 `json:"delivery_id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	DeliveryID uuid.UUID `json:"delivery_id"`
 }
 
 func (q *Queries) ListWebhookDeliveryAttempts(ctx context.Context, arg ListWebhookDeliveryAttemptsParams) ([]WebhookDeliveryAttempt, error) {
@@ -960,15 +1102,15 @@ SELECT e.id, e.tenant_id, e.url, e.description, e.status, e.max_attempts, e.time
 FROM webhook_endpoints e
 WHERE e.tenant_id = $1
   AND e.deleted_at IS NULL
-  AND (e.created_at, e.id) < ($2::timestamptz, $3::bigint)
+  AND (e.created_at, e.id) < ($2::timestamptz, $3::uuid)
 ORDER BY e.created_at DESC, e.id DESC
 LIMIT $4::int
 `
 
 type ListWebhookEndpointsParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -1017,16 +1159,16 @@ func (q *Queries) ListWebhookEndpoints(ctx context.Context, arg ListWebhookEndpo
 const listWebhookInboundEvents = `-- name: ListWebhookInboundEvents :many
 SELECT id, tenant_id, source_id, external_event_id, event_type, signature, payload, received_at FROM webhook_inbound_events
 WHERE tenant_id = $1 AND source_id = $2
-  AND (received_at, id) < ($3::timestamptz, $4::bigint)
+  AND (received_at, id) < ($3::timestamptz, $4::uuid)
 ORDER BY received_at DESC, id DESC
 LIMIT $5::int
 `
 
 type ListWebhookInboundEventsParams struct {
-	TenantID         int64              `json:"tenant_id"`
-	SourceID         int64              `json:"source_id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
+	SourceID         uuid.UUID          `json:"source_id"`
 	CursorReceivedAt pgtype.Timestamptz `json:"cursor_received_at"`
-	CursorID         int64              `json:"cursor_id"`
+	CursorID         uuid.UUID          `json:"cursor_id"`
 	RowLimit         int32              `json:"row_limit"`
 }
 
@@ -1066,18 +1208,18 @@ func (q *Queries) ListWebhookInboundEvents(ctx context.Context, arg ListWebhookI
 }
 
 const listWebhookInboundSources = `-- name: ListWebhookInboundSources :many
-SELECT id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+SELECT id, tenant_id, name, slug, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
 WHERE tenant_id = $1
   AND deleted_at IS NULL
-  AND (created_at, id) < ($2::timestamptz, $3::bigint)
+  AND (created_at, id) < ($2::timestamptz, $3::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $4::int
 `
 
 type ListWebhookInboundSourcesParams struct {
-	TenantID        int64              `json:"tenant_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -1100,9 +1242,6 @@ func (q *Queries) ListWebhookInboundSources(ctx context.Context, arg ListWebhook
 			&i.TenantID,
 			&i.Name,
 			&i.Slug,
-			&i.SecretCiphertext,
-			&i.PreviousSecretCiphertext,
-			&i.PreviousSecretExpiresAt,
 			&i.Status,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -1129,8 +1268,8 @@ FOR UPDATE
 `
 
 type LockWebhookEndpointParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 type LockWebhookEndpointRow struct {
@@ -1160,6 +1299,36 @@ func (q *Queries) LockWebhookEndpoint(ctx context.Context, arg LockWebhookEndpoi
 	return i, err
 }
 
+const lockWebhookInboundSource = `-- name: LockWebhookInboundSource :one
+SELECT id, tenant_id, name, slug, status, created_at, updated_at, deleted_at FROM webhook_inbound_sources
+WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+FOR UPDATE
+`
+
+type LockWebhookInboundSourceParams struct {
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+}
+
+// Serializes concurrent secret rotations: the row lock is held until the
+// rotation transaction commits, so NextWebhookInboundSourceSecretVersion
+// cannot hand two rotations the same version.
+func (q *Queries) LockWebhookInboundSource(ctx context.Context, arg LockWebhookInboundSourceParams) (WebhookInboundSource, error) {
+	row := q.db.QueryRow(ctx, lockWebhookInboundSource, arg.ID, arg.TenantID)
+	var i WebhookInboundSource
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Slug,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const markWebhookDeliveryDead = `-- name: MarkWebhookDeliveryDead :execrows
 UPDATE webhook_deliveries
 SET status = 'dead',
@@ -1173,8 +1342,8 @@ WHERE id = $3 AND tenant_id = $4 AND status = 'pending'
 type MarkWebhookDeliveryDeadParams struct {
 	StatusCode int32       `json:"status_code"`
 	LastError  pgtype.Text `json:"last_error"`
-	ID         int64       `json:"id"`
-	TenantID   int64       `json:"tenant_id"`
+	ID         uuid.UUID   `json:"id"`
+	TenantID   uuid.UUID   `json:"tenant_id"`
 	Attempts   int32       `json:"attempts"`
 }
 
@@ -1205,10 +1374,10 @@ WHERE id = $2 AND tenant_id = $3 AND status = 'pending'
 `
 
 type MarkWebhookDeliverySucceededParams struct {
-	StatusCode int32 `json:"status_code"`
-	ID         int64 `json:"id"`
-	TenantID   int64 `json:"tenant_id"`
-	Attempts   int32 `json:"attempts"`
+	StatusCode int32     `json:"status_code"`
+	ID         uuid.UUID `json:"id"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	Attempts   int32     `json:"attempts"`
 }
 
 // The outcome writes below are fenced by the attempt the worker claimed
@@ -1234,8 +1403,21 @@ FROM webhook_endpoint_secrets
 WHERE endpoint_id = $1
 `
 
-func (q *Queries) NextWebhookEndpointSecretVersion(ctx context.Context, endpointID int64) (int32, error) {
+func (q *Queries) NextWebhookEndpointSecretVersion(ctx context.Context, endpointID uuid.UUID) (int32, error) {
 	row := q.db.QueryRow(ctx, nextWebhookEndpointSecretVersion, endpointID)
+	var version int32
+	err := row.Scan(&version)
+	return version, err
+}
+
+const nextWebhookInboundSourceSecretVersion = `-- name: NextWebhookInboundSourceSecretVersion :one
+SELECT (COALESCE(MAX(version), 0) + 1)::integer AS version
+FROM webhook_inbound_source_secrets
+WHERE source_id = $1
+`
+
+func (q *Queries) NextWebhookInboundSourceSecretVersion(ctx context.Context, sourceID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, nextWebhookInboundSourceSecretVersion, sourceID)
 	var version int32
 	err := row.Scan(&version)
 	return version, err
@@ -1345,9 +1527,9 @@ WHERE id = $1 AND tenant_id = $2 AND status = 'pending'
 `
 
 type ReleaseWebhookDeliveryClaimParams struct {
-	ID       int64 `json:"id"`
-	TenantID int64 `json:"tenant_id"`
-	Attempts int32 `json:"attempts"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Attempts int32     `json:"attempts"`
 }
 
 // Gives back a claimed attempt that was interrupted by worker shutdown before
@@ -1376,8 +1558,8 @@ type RescheduleWebhookDeliveryParams struct {
 	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
 	StatusCode    int32              `json:"status_code"`
 	LastError     pgtype.Text        `json:"last_error"`
-	ID            int64              `json:"id"`
-	TenantID      int64              `json:"tenant_id"`
+	ID            uuid.UUID          `json:"id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
 	Attempts      int32              `json:"attempts"`
 }
 
@@ -1396,83 +1578,6 @@ func (q *Queries) RescheduleWebhookDelivery(ctx context.Context, arg RescheduleW
 	return result.RowsAffected(), nil
 }
 
-const rotateWebhookInboundSourceSecret = `-- name: RotateWebhookInboundSourceSecret :one
-UPDATE webhook_inbound_sources
-SET previous_secret_ciphertext = secret_ciphertext,
-    previous_secret_expires_at = NOW() + make_interval(secs => $1::double precision),
-    secret_ciphertext = $2
-WHERE id = $3 AND tenant_id = $4 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
-`
-
-type RotateWebhookInboundSourceSecretParams struct {
-	GraceSeconds     float64 `json:"grace_seconds"`
-	SecretCiphertext string  `json:"secret_ciphertext"`
-	ID               int64   `json:"id"`
-	TenantID         int64   `json:"tenant_id"`
-}
-
-// The replaced secret stays valid for the grace window. A second rotation
-// overwrites it, so only the immediately previous secret is accepted.
-func (q *Queries) RotateWebhookInboundSourceSecret(ctx context.Context, arg RotateWebhookInboundSourceSecretParams) (WebhookInboundSource, error) {
-	row := q.db.QueryRow(ctx, rotateWebhookInboundSourceSecret,
-		arg.GraceSeconds,
-		arg.SecretCiphertext,
-		arg.ID,
-		arg.TenantID,
-	)
-	var i WebhookInboundSource
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Name,
-		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
-		&i.Status,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
-const setWebhookInboundSourceSecret = `-- name: SetWebhookInboundSourceSecret :one
-UPDATE webhook_inbound_sources
-SET secret_ciphertext = $1
-WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
-`
-
-type SetWebhookInboundSourceSecretParams struct {
-	SecretCiphertext string `json:"secret_ciphertext"`
-	ID               int64  `json:"id"`
-	TenantID         int64  `json:"tenant_id"`
-}
-
-// A new source is inserted with an empty placeholder and sealed immediately
-// in the same transaction, once the generated id is known (the secret's AAD
-// binds that id).
-func (q *Queries) SetWebhookInboundSourceSecret(ctx context.Context, arg SetWebhookInboundSourceSecretParams) (WebhookInboundSource, error) {
-	row := q.db.QueryRow(ctx, setWebhookInboundSourceSecret, arg.SecretCiphertext, arg.ID, arg.TenantID)
-	var i WebhookInboundSource
-	err := row.Scan(
-		&i.ID,
-		&i.TenantID,
-		&i.Name,
-		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
-		&i.Status,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.DeletedAt,
-	)
-	return i, err
-}
-
 const updateWebhookDeliveryEndpointSnapshot = `-- name: UpdateWebhookDeliveryEndpointSnapshot :exec
 UPDATE webhook_deliveries
 SET url = $1,
@@ -1483,10 +1588,10 @@ WHERE tenant_id = $3
 `
 
 type UpdateWebhookDeliveryEndpointSnapshotParams struct {
-	Url        string `json:"url"`
-	TimeoutMs  int32  `json:"timeout_ms"`
-	TenantID   int64  `json:"tenant_id"`
-	EndpointID int64  `json:"endpoint_id"`
+	Url        string    `json:"url"`
+	TimeoutMs  int32     `json:"timeout_ms"`
+	TenantID   uuid.UUID `json:"tenant_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
 }
 
 // Runs in the endpoint update transaction: a queued delivery must follow the
@@ -1514,13 +1619,13 @@ RETURNING id, tenant_id, url, description, status, max_attempts, timeout_ms, cre
 `
 
 type UpdateWebhookEndpointParams struct {
-	Url         string `json:"url"`
-	Description string `json:"description"`
-	Status      string `json:"status"`
-	MaxAttempts int32  `json:"max_attempts"`
-	TimeoutMs   int32  `json:"timeout_ms"`
-	ID          int64  `json:"id"`
-	TenantID    int64  `json:"tenant_id"`
+	Url         string    `json:"url"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"`
+	MaxAttempts int32     `json:"max_attempts"`
+	TimeoutMs   int32     `json:"timeout_ms"`
+	ID          uuid.UUID `json:"id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEndpointParams) (WebhookEndpoint, error) {
@@ -1549,19 +1654,71 @@ func (q *Queries) UpdateWebhookEndpoint(ctx context.Context, arg UpdateWebhookEn
 	return i, err
 }
 
+const updateWebhookEndpointIfUnchanged = `-- name: UpdateWebhookEndpointIfUnchanged :one
+UPDATE webhook_endpoints
+SET url = $1,
+    description = $2,
+    status = $3,
+    max_attempts = $4,
+    timeout_ms = $5
+WHERE id = $6 AND tenant_id = $7 AND deleted_at IS NULL
+  AND updated_at = $8
+RETURNING id, tenant_id, url, description, status, max_attempts, timeout_ms, created_at, updated_at, deleted_at
+`
+
+type UpdateWebhookEndpointIfUnchangedParams struct {
+	Url               string             `json:"url"`
+	Description       string             `json:"description"`
+	Status            string             `json:"status"`
+	MaxAttempts       int32              `json:"max_attempts"`
+	TimeoutMs         int32              `json:"timeout_ms"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+}
+
+// The ETag compare-and-swap for an endpoint update. A concurrent writer makes
+// this return no rows (412) instead of overwriting the other change.
+func (q *Queries) UpdateWebhookEndpointIfUnchanged(ctx context.Context, arg UpdateWebhookEndpointIfUnchangedParams) (WebhookEndpoint, error) {
+	row := q.db.QueryRow(ctx, updateWebhookEndpointIfUnchanged,
+		arg.Url,
+		arg.Description,
+		arg.Status,
+		arg.MaxAttempts,
+		arg.TimeoutMs,
+		arg.ID,
+		arg.TenantID,
+		arg.ExpectedUpdatedAt,
+	)
+	var i WebhookEndpoint
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Url,
+		&i.Description,
+		&i.Status,
+		&i.MaxAttempts,
+		&i.TimeoutMs,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const updateWebhookInboundSource = `-- name: UpdateWebhookInboundSource :one
 UPDATE webhook_inbound_sources
 SET name = $1, slug = $2, status = $3
 WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-RETURNING id, tenant_id, name, slug, secret_ciphertext, previous_secret_ciphertext, previous_secret_expires_at, status, created_at, updated_at, deleted_at
+RETURNING id, tenant_id, name, slug, status, created_at, updated_at, deleted_at
 `
 
 type UpdateWebhookInboundSourceParams struct {
-	Name     string `json:"name"`
-	Slug     string `json:"slug"`
-	Status   string `json:"status"`
-	ID       int64  `json:"id"`
-	TenantID int64  `json:"tenant_id"`
+	Name     string    `json:"name"`
+	Slug     string    `json:"slug"`
+	Status   string    `json:"status"`
+	ID       uuid.UUID `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
 func (q *Queries) UpdateWebhookInboundSource(ctx context.Context, arg UpdateWebhookInboundSourceParams) (WebhookInboundSource, error) {
@@ -1578,9 +1735,49 @@ func (q *Queries) UpdateWebhookInboundSource(ctx context.Context, arg UpdateWebh
 		&i.TenantID,
 		&i.Name,
 		&i.Slug,
-		&i.SecretCiphertext,
-		&i.PreviousSecretCiphertext,
-		&i.PreviousSecretExpiresAt,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
+const updateWebhookInboundSourceIfUnchanged = `-- name: UpdateWebhookInboundSourceIfUnchanged :one
+UPDATE webhook_inbound_sources
+SET name = $1,
+    slug = $2,
+    status = $3
+WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+  AND updated_at = $6
+RETURNING id, tenant_id, name, slug, status, created_at, updated_at, deleted_at
+`
+
+type UpdateWebhookInboundSourceIfUnchangedParams struct {
+	Name              string             `json:"name"`
+	Slug              string             `json:"slug"`
+	Status            string             `json:"status"`
+	ID                uuid.UUID          `json:"id"`
+	TenantID          uuid.UUID          `json:"tenant_id"`
+	ExpectedUpdatedAt pgtype.Timestamptz `json:"expected_updated_at"`
+}
+
+// The ETag compare-and-swap for an inbound source update.
+func (q *Queries) UpdateWebhookInboundSourceIfUnchanged(ctx context.Context, arg UpdateWebhookInboundSourceIfUnchangedParams) (WebhookInboundSource, error) {
+	row := q.db.QueryRow(ctx, updateWebhookInboundSourceIfUnchanged,
+		arg.Name,
+		arg.Slug,
+		arg.Status,
+		arg.ID,
+		arg.TenantID,
+		arg.ExpectedUpdatedAt,
+	)
+	var i WebhookInboundSource
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Name,
+		&i.Slug,
 		&i.Status,
 		&i.CreatedAt,
 		&i.UpdatedAt,

@@ -4,9 +4,11 @@ package jobs
 
 import (
 	"context"
+
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -50,7 +52,9 @@ func startStressWorker(t *testing.T, worker *Worker) func() {
 // four. It asserts every job reaches succeeded, is handled exactly once, and
 // leaves no queued or running row behind.
 func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
@@ -63,8 +67,8 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 		handlerDelay      = 5 * time.Millisecond
 	)
 
-	queue := NewQueue(pgtest.Scoped(pool))
-	dbIDs := make(map[int]int64, total)
+	queue := NewQueue(pgtest.Scoped(pools))
+	dbIDs := make(map[int]uuid.UUID, total)
 	for i := 0; i < total; i++ {
 		id, err := queue.Enqueue(ctx, Job{
 			Kind:        kind,
@@ -77,9 +81,9 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 
 	var (
 		handledMu sync.Mutex
-		handled   = make(map[int64]int, total)
+		handled   = make(map[uuid.UUID]int, total)
 	)
-	seen := make(chan int64, total)
+	seen := make(chan uuid.UUID, total)
 	handler := func(_ context.Context, payload json.RawMessage) error {
 		var item struct {
 			Seq int `json:"seq"`
@@ -112,7 +116,7 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 			// claim or attempt fences.
 			workerID = "stress-shared"
 		}
-		worker := NewWorker(pgtest.Scoped(pool), workerID,
+		worker := NewWorker(pgtest.Scoped(pools), workerID,
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(10*time.Millisecond),
 			WithRetention(0),
@@ -137,7 +141,7 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 	handledMu.Lock()
 	require.Len(t, handled, total)
 	for id, count := range handled {
-		assert.Equal(t, 1, count, "job %d must be handled exactly once", id)
+		assert.Equal(t, 1, count, "job %s must be handled exactly once", id)
 	}
 	handledMu.Unlock()
 
@@ -179,7 +183,9 @@ func TestWorkerStressIntegrationProcessesAllJobsExactlyOnce(t *testing.T) {
 // always fail and must dead-letter after five attempts; the rest must succeed on
 // the first attempt exactly once.
 func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
@@ -195,7 +201,7 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 	poison := func(seq int) bool { return seq%10 < 3 }
 	expectedPoison := total / 10 * 3
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	for i := 0; i < total; i++ {
 		_, err := queue.Enqueue(ctx, Job{
 			Kind:        kind,
@@ -235,7 +241,7 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 
 	stops := make([]func(), 0, workerCount)
 	for i := 0; i < workerCount; i++ {
-		worker := NewWorker(pgtest.Scoped(pool), fmt.Sprintf("stress-retry-%d", i),
+		worker := NewWorker(pgtest.Scoped(pools), fmt.Sprintf("stress-retry-%d", i),
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(5*time.Millisecond),
 			WithRetention(0),
@@ -316,7 +322,9 @@ func TestWorkerStressIntegrationRetriesAndDeadLetters(t *testing.T) {
 // processing. Old terminal rows must be deleted; queued and running rows,
 // including deliberately old ones, must never be touched.
 func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 25*time.Second)
 	defer cancel()
@@ -330,40 +338,40 @@ func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 		handlerDelay      = 10 * time.Millisecond
 	)
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 
-	insertTerminal := func(jobKind, status string) int64 {
+	insertTerminal := func(jobKind, status string) uuid.UUID {
 		t.Helper()
-		var id int64
+		var id uuid.UUID
 		require.NoError(t, pool.QueryRow(ctx, `
-			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, tenant_id)
 			VALUES ($1, '{}'::jsonb, $2, now(), 3,
-			        now() - interval '40 days', now() - interval '40 days')
-			RETURNING id`, jobKind, status).Scan(&id))
+			        now() - interval '40 days', now() - interval '40 days', $3)
+			RETURNING id`, jobKind, status, tenant.DefaultID).Scan(&id))
 		return id
 	}
 
-	oldTerminalIDs := make([]int64, 0, liveJobs)
+	oldTerminalIDs := make([]uuid.UUID, 0, liveJobs)
 	for i := 0; i < liveJobs/2; i++ {
 		oldTerminalIDs = append(oldTerminalIDs, insertTerminal(kind+".old_succeeded", "succeeded"))
 		oldTerminalIDs = append(oldTerminalIDs, insertTerminal(kind+".old_dead", "dead"))
 	}
 
-	var oldQueuedID int64
+	var oldQueuedID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx, `
-		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, tenant_id)
 		VALUES ($1, '{}'::jsonb, 'queued', now() + interval '1 day', 3,
-		        now() - interval '40 days', now() - interval '40 days')
-		RETURNING id`, kind+".old_queued").Scan(&oldQueuedID))
+		        now() - interval '40 days', now() - interval '40 days', $2)
+		RETURNING id`, kind+".old_queued", tenant.DefaultID).Scan(&oldQueuedID))
 
-	var oldRunningID int64
+	var oldRunningID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx, `
 		INSERT INTO jobs (kind, payload, status, run_at, max_attempts,
-		                  created_at, updated_at, attempts, locked_at, locked_by, lease_expires_at)
+		                  created_at, updated_at, attempts, locked_at, locked_by, lease_expires_at, tenant_id)
 		VALUES ($1, '{}'::jsonb, 'running', now(), 3,
 		        now() - interval '40 days', now() - interval '40 days',
-		        1, now(), 'pre-existing-worker', now() + interval '1 hour')
-		RETURNING id`, kind+".old_running").Scan(&oldRunningID))
+		        1, now(), 'pre-existing-worker', now() + interval '1 hour', $2)
+		RETURNING id`, kind+".old_running", tenant.DefaultID).Scan(&oldRunningID))
 
 	for i := 0; i < liveJobs; i++ {
 		_, err := queue.Enqueue(ctx, Job{
@@ -407,7 +415,7 @@ func TestWorkerStressIntegrationRetentionRace(t *testing.T) {
 
 	stops := make([]func(), 0, workerCount)
 	for i := 0; i < workerCount; i++ {
-		worker := NewWorker(pgtest.Scoped(pool), fmt.Sprintf("stress-retention-%d", i),
+		worker := NewWorker(pgtest.Scoped(pools), fmt.Sprintf("stress-retention-%d", i),
 			WithConcurrency(workerConcurrency),
 			WithPollInterval(5*time.Millisecond),
 			WithRetention(0),

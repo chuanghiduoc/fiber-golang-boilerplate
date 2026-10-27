@@ -6,18 +6,16 @@ package repository
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	apikeysvc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/service"
 	apikeyssqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/apikeys/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -35,14 +33,18 @@ func NewAPIKeyRepository(db apikeyssqlc.DBTX) *APIKeyRepository {
 }
 
 func (r *APIKeyRepository) Create(ctx context.Context, key apikeysvc.NewKey) (*apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.CreateAPIKey(ctx, apikeyssqlc.CreateAPIKeyParams{
 		Scopes:    scopeStrings(key.Scopes),
-		TenantID:  tenant.EffectiveID(ctx),
+		TenantID:  tenantID,
 		UserID:    key.UserID,
 		Name:      key.Name,
 		Prefix:    key.Prefix,
 		KeyHash:   key.Hash,
-		ExpiresAt: timestamptz(key.ExpiresAt),
+		ExpiresAt: database.TimestamptzPtr(&key.ExpiresAt),
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -50,10 +52,14 @@ func (r *APIKeyRepository) Create(ctx context.Context, key apikeysvc.NewKey) (*a
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *APIKeyRepository) GetByID(ctx context.Context, id int64) (*apikeysvc.APIKey, error) {
+func (r *APIKeyRepository) GetByID(ctx context.Context, id uuid.UUID) (*apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.GetAPIKeyByID(ctx, apikeyssqlc.GetAPIKeyByIDParams{
 		ID:       id,
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -61,7 +67,7 @@ func (r *APIKeyRepository) GetByID(ctx context.Context, id int64) (*apikeysvc.AP
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *APIKeyRepository) GetByHash(ctx context.Context, hash string) (*apikeysvc.APIKey, error) {
+func (r *APIKeyRepository) GetByHash(ctx context.Context, hash []byte) (*apikeysvc.APIKey, error) {
 	// Possession of the hash authenticates the caller before a request tenant
 	// can be trusted: the key's tenant is learned from this row. This single
 	// statement is therefore a deliberate cross-tenant read; the verifier
@@ -76,8 +82,12 @@ func (r *APIKeyRepository) GetByHash(ctx context.Context, hash string) (*apikeys
 }
 
 func (r *APIKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCursor) ([]apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListAPIKeysCursor(ctx, apikeyssqlc.ListAPIKeysCursorParams{
-		TenantID:        tenant.EffectiveID(ctx),
+		TenantID:        tenantID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
 		RowLimit:        cur.Limit,
@@ -85,19 +95,45 @@ func (r *APIKeyRepository) ListCursor(ctx context.Context, cur pagination.DBCurs
 	if err != nil {
 		return nil, err
 	}
+	return toAPIKeys(rows), nil
+}
+
+func (r *APIKeyRepository) ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor) ([]apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := r.q.ListAPIKeysByUserCursor(ctx, apikeyssqlc.ListAPIKeysByUserCursorParams{
+		TenantID:        tenantID,
+		UserID:          userID,
+		CursorCreatedAt: cur.CreatedAtParam(),
+		CursorID:        cur.IDParam(),
+		RowLimit:        cur.Limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toAPIKeys(rows), nil
+}
+
+func toAPIKeys[T apiKeyRowTypes](rows []T) []apikeysvc.APIKey {
 	keys := make([]apikeysvc.APIKey, len(rows))
 	for i := range rows {
 		keys[i] = *toAPIKey(keyRow(rows[i]))
 	}
-	return keys, nil
+	return keys
 }
 
-func (r *APIKeyRepository) Update(ctx context.Context, id int64, name string, scopes []authz.Permission) (*apikeysvc.APIKey, error) {
+func (r *APIKeyRepository) Update(ctx context.Context, id uuid.UUID, name string, scopes []authz.Permission) (*apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.UpdateAPIKey(ctx, apikeyssqlc.UpdateAPIKeyParams{
 		Scopes:   scopeStrings(scopes),
 		Name:     name,
 		ID:       id,
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -105,10 +141,14 @@ func (r *APIKeyRepository) Update(ctx context.Context, id int64, name string, sc
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *APIKeyRepository) Revoke(ctx context.Context, id int64) (*apikeysvc.APIKey, error) {
+func (r *APIKeyRepository) Revoke(ctx context.Context, id uuid.UUID) (*apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.RevokeAPIKey(ctx, apikeyssqlc.RevokeAPIKeyParams{
 		ID:       id,
-		TenantID: tenant.EffectiveID(ctx),
+		TenantID: tenantID,
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -116,11 +156,15 @@ func (r *APIKeyRepository) Revoke(ctx context.Context, id int64) (*apikeysvc.API
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *APIKeyRepository) MarkRotated(ctx context.Context, id int64, graceSeconds int32) (*apikeysvc.APIKey, error) {
+func (r *APIKeyRepository) MarkRotated(ctx context.Context, id uuid.UUID, graceSeconds int32) (*apikeysvc.APIKey, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.MarkAPIKeyRotated(ctx, apikeyssqlc.MarkAPIKeyRotatedParams{
 		GraceSeconds: graceSeconds,
 		ID:           id,
-		TenantID:     tenant.EffectiveID(ctx),
+		TenantID:     tenantID,
 	})
 	if err != nil {
 		return nil, wrapErr(err)
@@ -128,10 +172,10 @@ func (r *APIKeyRepository) MarkRotated(ctx context.Context, id int64, graceSecon
 	return toAPIKey(keyRow(row)), nil
 }
 
-func (r *APIKeyRepository) TouchLastUsed(ctx context.Context, id int64, at time.Time) error {
+func (r *APIKeyRepository) TouchLastUsed(ctx context.Context, id uuid.UUID, at time.Time) error {
 	return r.q.TouchAPIKeyLastUsed(ctx, apikeyssqlc.TouchAPIKeyLastUsedParams{
 		ID:         id,
-		LastUsedAt: timestamptz(&at),
+		LastUsedAt: database.TimestamptzPtr(&at),
 	})
 }
 
@@ -153,7 +197,8 @@ type apiKeyRow = apikeyssqlc.GetAPIKeyByIDRow
 
 type apiKeyRowTypes interface {
 	apikeyssqlc.CreateAPIKeyRow | apikeyssqlc.GetAPIKeyByIDRow | apikeyssqlc.GetAPIKeyByHashRow |
-		apikeyssqlc.ListAPIKeysCursorRow | apikeyssqlc.UpdateAPIKeyRow | apikeyssqlc.RevokeAPIKeyRow |
+		apikeyssqlc.ListAPIKeysCursorRow | apikeyssqlc.ListAPIKeysByUserCursorRow |
+		apikeyssqlc.UpdateAPIKeyRow | apikeyssqlc.RevokeAPIKeyRow |
 		apikeyssqlc.MarkAPIKeyRotatedRow
 }
 
@@ -174,34 +219,19 @@ func toAPIKey(row apiKeyRow) *apikeysvc.APIKey {
 		Prefix:             row.Prefix,
 		Hash:               row.KeyHash,
 		Scopes:             scopes,
-		ExpiresAt:          timePtr(row.ExpiresAt),
-		RevokedAt:          timePtr(row.RevokedAt),
-		RotatedAt:          timePtr(row.RotatedAt),
-		RotationGraceUntil: timePtr(row.RotationGraceUntil),
-		LastUsedAt:         timePtr(row.LastUsedAt),
+		ExpiresAt:          row.ExpiresAt.Time,
+		RevokedAt:          database.TimePtr(row.RevokedAt),
+		RotatedAt:          database.TimePtr(row.RotatedAt),
+		RotationGraceUntil: database.TimePtr(row.RotationGraceUntil),
+		LastUsedAt:         database.TimePtr(row.LastUsedAt),
 		CreatedAt:          row.CreatedAt.Time,
 		UpdatedAt:          row.UpdatedAt.Time,
 	}
 }
 
-func timePtr(ts pgtype.Timestamptz) *time.Time {
-	if !ts.Valid {
-		return nil
-	}
-	t := ts.Time
-	return &t
-}
-
-func timestamptz(t *time.Time) pgtype.Timestamptz {
-	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return pgtype.Timestamptz{Time: *t, Valid: true}
-}
-
 func wrapErr(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apperror.ErrNotFound
+	if mapped := database.MapError(err); mapped != err {
+		return mapped
 	}
 	// fk_api_keys_tenant_user: the owner does not exist in the key's tenant.
 	// Surface it like any other missing owner instead of a 500.

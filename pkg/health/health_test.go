@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
 )
 
 func TestLiveness(t *testing.T) {

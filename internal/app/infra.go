@@ -3,16 +3,14 @@ package app
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/jobs"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/storage"
 )
 
@@ -26,20 +24,16 @@ import (
 // settings.
 //
 // Construction must be side-effect free (no I/O), so tests can build every
-// module from an Infra with nil Pool/Storage to inspect routes.
+// module from an Infra with nil Storage to inspect routes.
 type Infra struct {
 	// Platform is the process-wide configuration every module may read.
 	Platform PlatformConfig
-	// Pool is for pool-level infrastructure only (health checks, shutdown).
-	// Repositories take DB so every statement carries the RLS scope.
-	Pool *pgxpool.Pool
-	// BypassPool is the dedicated BYPASSRLS role pool used by DB and Tx for
-	// WithRLSBypass statements. It is nil outside production when the process
-	// deliberately runs with one role.
-	BypassPool *pgxpool.Pool
-	DB         database.DBTX
-	Tx         *database.TxManager
-	Cache      cache.Cache
+	// DB is the tenant-scoped statement handle. Database pools themselves stay
+	// private to cmd/api: modules never reach a raw pool, so no module can
+	// bypass the RLS scope or close the process's connections.
+	DB    database.DBTX
+	Tx    *database.TxManager
+	Cache cache.Cache
 	// Audit is the process-wide recorder; it implements both audit.Recorder
 	// (Tier 2 guards, best-effort events) and audit.TxRecorder (Tier 1).
 	Audit *audit.PostgresRecorder
@@ -48,7 +42,7 @@ type Infra struct {
 	// PayloadCodec seals job payloads at rest with DATA_ENCRYPTION_KEY. It is
 	// required whenever Queue is set and a module enqueues personal data.
 	PayloadCodec *jobs.PayloadCodec
-	// Email enqueues encrypted email.send jobs; the platform worker delivers
+	// Email enqueues encrypted email.send.encrypted jobs; the platform worker delivers
 	// them (see cmd/api). Services that send mail use this, never pkg/email.
 	Email   *jobs.QueuedSender
 	Storage storage.Storage
@@ -57,6 +51,11 @@ type Infra struct {
 	// their transaction; subscribers (webhooks) register through
 	// app.EventProvider. Nil (tests) disables publishing.
 	Events *events.Bus
+	// Catalogs are the injected capability catalogs. The composition root
+	// creates them before building modules (they start with the platform
+	// entries), passes the same instances to services and transports, adds
+	// every module provider after Build, and seals them before serving.
+	Catalogs Catalogs
 }
 
 // PlatformConfig is the configuration shared by every module: application
@@ -75,10 +74,9 @@ type PlatformConfig struct {
 //
 // It is deliberately fail-closed: only a tenant stored in the context
 // (tenant.WithID) becomes the scope. An unset tenant maps to 0, which the
-// policy sees as "no tenant rows"; it never falls back to the compatibility
-// tenant. Background work sets the tenant explicitly (the job worker restores
-// the job's tenant_id), and global work marks the context with
-// database.WithRLSBypass.
+// policy sees as "no tenant rows"; it never invents a tenant. Background work
+// sets the tenant explicitly (the job worker restores the job's tenant_id),
+// and global work marks the context with database.WithRLSBypass.
 func RLSResolver(ctx context.Context) database.Scope {
 	return database.Scope{TenantID: tenant.IDFromContext(ctx), Bypass: database.RLSBypass(ctx)}
 }

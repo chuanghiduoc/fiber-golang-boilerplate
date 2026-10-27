@@ -7,6 +7,8 @@ package sqlc
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 const deleteNotificationPreferencesForPrivacy = `-- name: DeleteNotificationPreferencesForPrivacy :exec
@@ -15,8 +17,8 @@ WHERE tenant_id = $1 AND user_id = $2
 `
 
 type DeleteNotificationPreferencesForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteNotificationPreferencesForPrivacy(ctx context.Context, arg DeleteNotificationPreferencesForPrivacyParams) error {
@@ -30,8 +32,8 @@ WHERE tenant_id = $1 AND user_id = $2
 `
 
 type DeleteNotificationsForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) DeleteNotificationsForPrivacy(ctx context.Context, arg DeleteNotificationsForPrivacyParams) error {
@@ -47,8 +49,8 @@ ORDER BY id
 `
 
 type ListNotificationsForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 // Privacy export/erasure for the notification feed and preferences. The
@@ -85,14 +87,14 @@ func (q *Queries) ListNotificationsForPrivacy(ctx context.Context, arg ListNotif
 }
 
 const listPreferencesForPrivacy = `-- name: ListPreferencesForPrivacy :many
-SELECT id, tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
+SELECT tenant_id, user_id, type, channel, enabled, created_at, updated_at FROM notification_preferences
 WHERE tenant_id = $1 AND user_id = $2
-ORDER BY id
+ORDER BY type, channel
 `
 
 type ListPreferencesForPrivacyParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
 }
 
 func (q *Queries) ListPreferencesForPrivacy(ctx context.Context, arg ListPreferencesForPrivacyParams) ([]NotificationPreference, error) {
@@ -105,7 +107,6 @@ func (q *Queries) ListPreferencesForPrivacy(ctx context.Context, arg ListPrefere
 	for rows.Next() {
 		var i NotificationPreference
 		if err := rows.Scan(
-			&i.ID,
 			&i.TenantID,
 			&i.UserID,
 			&i.Type,

@@ -79,7 +79,7 @@ silently change a webhook contract.
 |---|---|---|---|
 | `user.registered` | 1 | Identity registration (actor: the new user) | `{userId, email, name, emailVerified, createdAt}` (`identity.UserRegistered`) |
 | `file.uploaded` | 1 | File upload | `{fileId, ownerId, originalName, mimeType, size, createdAt}` (`files.FileUploaded`) |
-| `file.deleted` | 1 | User soft delete and admin takedown (`DELETE /admin/files/:id`) | `{fileId, ownerId, originalName, deletedAt}` (`files.FileDeleted`) |
+| `file.deleted` | 1 | User soft delete and admin takedown (`DELETE /api/v1/files/{fileId}`) | `{fileId, ownerId, originalName, deletedAt}` (`files.FileDeleted`) |
 | `file.restored` | 1 | User restore and admin restore | `{fileId, ownerId, originalName}` (`files.FileRestored`) |
 
 To make a new type deliverable, add its payload struct and version constant to
@@ -130,7 +130,7 @@ sequenceDiagram
     end
     JW->>W: claim webhook.delivery
     W->>DB: claim attempt (attempts+1, lease)
-    W->>W: open snapshot secret, rebuild envelope body,<br/>sign id.timestamp.body
+    W->>W: load snapshot secret row, rebuild envelope body,<br/>sign id.timestamp.body
     W->>R: POST webhook-id / webhook-timestamp / webhook-signature<br/>(SSRF-checked, pinned IP, no redirects)
     R-->>W: status / error
     W->>DB: record attempt row (detached, bounded ctx)
@@ -152,7 +152,7 @@ Step by step, the fan-out:
    `webhook_deliveries` row, and a `webhook.delivery` job in **one
    transaction**. The event row stores the envelope once (id, type,
    `data_version`, actor, `occurred_at`, data); the delivery snapshots the
-   endpoint URL, secret ciphertext, max attempts, and timeout.
+   endpoint URL, secret id, max attempts, and timeout.
 4. Returns the number of newly created deliveries; handling the same event
    again is a no-op.
 
@@ -192,7 +192,7 @@ stateDiagram-v2
 | Platform job after interruption | On worker **shutdown** the jobs worker releases the job without consuming a platform attempt. A platform **job timeout** is a real failure: it consumes a platform job attempt and retries with job backoff (the delivery attempt itself was still given back). |
 | Per-endpoint timeout | A normal retryable failure that consumes the delivery attempt. |
 | Residual fencing gap (ABA) | The fence is the attempt number, and a release decrements it. If worker A stalls for more than ~55s beyond its request inside the 3-minute claim lease (120s max request + bookkeeping), worker B reclaims attempt N+1, and B is then released back to N, A's late write matches again. The worst case is one redundant `webhook.delivery` job, which receivers already absorb by deduplicating on `webhook-id`. |
-| Lease sizing | Keep the delivery claim lease (`WorkerOptions.Lease`, default 3m) and the jobs worker lease well above the maximum request timeout (`WEBHOOK_REQUEST_TIMEOUT_SECS`, max 120s) plus bookkeeping (5s), so a live attempt is never reclaimed. |
+| Lease sizing | Keep the delivery claim lease (`WorkerOptions.Lease`, default 3m) and the jobs worker lease well above the maximum request timeout (`WEBHOOK_REQUEST_TIMEOUT`, max 120s) plus bookkeeping (5s), so a live attempt is never reclaimed. |
 
 
 ### Signed request (Standard Webhooks)
@@ -322,10 +322,10 @@ whose snapshot is older than that previous secret is signed with the current
 | `5xx` | Retry while attempts remain. |
 | Transport/DNS/timeout | Retry while attempts remain. |
 | Blocked/invalid target | Dead immediately. |
-| Snapshot secret that predates Standard Webhooks (not `whsec_<base64>`) | Dead immediately, `endpoint secret predates Standard Webhooks; rotate it`. |
+| Snapshot secret that is not a Standard Webhooks `whsec_<base64>` value | Dead immediately, `secret snapshot is not a Standard Webhooks secret`. |
 | Undecodable `webhook.delivery` job or invalid `events.*.webhooks` envelope (missing id/tenant/actor, bad type or version) | The job is dead-lettered at once via `jobs.Permanent` (`last_error` starts with `permanent failure (not retried): `). |
 
-- Backoff is `base * 2^(attempt-1)` capped at `WEBHOOK_RETRY_MAX_SECS`.
+- Backoff is `base * 2^(attempt-1)` capped at `WEBHOOK_RETRY_MAX`.
 - A valid `Retry-After` (seconds or HTTP date) can only **lengthen** the
   backoff, never shorten it (`Retry-After: 0` or a past date cannot force an
   immediate retry), and is capped at the same maximum.
@@ -346,7 +346,7 @@ whose snapshot is older than that previous secret is signed with the current
 | `eventTypes` | Patterns: exact (`file.uploaded`), prefix (`file.*`), or `*`. Empty means `*`. Stored as a set and returned sorted. |
 | `status` | `active` or `disabled`. Disabled endpoints are not matched, and their pending deliveries are not retried. |
 | `maxAttempts` | 1-50 delivery attempts (default `WEBHOOK_MAX_ATTEMPTS`). |
-| `timeoutMs` | Per-attempt HTTP timeout, 100-120000 ms, snapshotted per delivery; can only shorten `WEBHOOK_REQUEST_TIMEOUT_SECS`. |
+| `timeoutMs` | Per-attempt HTTP timeout, 100-120000 ms, snapshotted per delivery; can only shorten `WEBHOOK_REQUEST_TIMEOUT`. |
 | `description` | Free-form label. |
 
 Delete is soft: the row keeps its delivery history but is excluded from
@@ -373,7 +373,7 @@ receiver is intentionally internal. Never use `0.0.0.0/0` or `::/0`.
 
 ## Inbound
 
-`POST /api/v1/webhooks/inbound/{sourceID}` is public: no JWT and no
+`POST /api/v1/webhooks/inbound/{sourceId}` is public: no JWT and no
 `X-Tenant-Slug`. The source ID selects the owning tenant; the source secret
 authenticates the request. Senders sign with any Standard Webhooks library
 using the source secret.
@@ -385,7 +385,7 @@ using the source secret.
 | `webhook-signature` | Required, space-separated `v1,<base64>` signatures (one must match). |
 
 The signature covers `<webhook-id>.<webhook-timestamp>.<raw-body>` and the
-timestamp must be within `WEBHOOK_TIMESTAMP_TOLERANCE_SECS`. Because the id is
+timestamp must be within `WEBHOOK_TIMESTAMP_TOLERANCE`. Because the id is
 signed, a captured request cannot be replayed under a new id to bypass
 deduplication, and because the body is signed, its `type` cannot be relabeled.
 The stored event type is the body's top-level `"type"` string (`inbound` when
@@ -408,7 +408,7 @@ sequenceDiagram
     SV->>SV: webhook-id present and well-formed (else 400)
     SV->>DB: load source (not soft-deleted)
     Note over SV: missing / disabled / suspended source, or a tenant-check DB error<br/>-> dummy tenant lookup + AES-GCM open + HMAC, then 401 (DB error logged)
-    SV->>SV: open sealed current secret, decode whsec_ key<br/>(legacy secret -> 401 + error log)
+    SV->>SV: open sealed current secret, decode whsec_ key<br/>(non-whsec_ value -> 401 + error log)
     SV->>SV: headers present, timestamp parses,<br/>inside tolerance window (else 401)
     SV->>SV: constant-time HMAC over id.timestamp.body<br/>(current, else unexpired previous; else 401)
     SV->>SV: body "type" valid if present (else 400)
@@ -421,7 +421,7 @@ sequenceDiagram
         SV-->>H: original receipt, duplicate=true
         H-->>S: 200 OK
     end
-    Note over H: handler installs the source tenant in locals/context,<br/>so audit records webhook.inbound.received under it
+    Note over H: the service installs the source tenant in the context,<br/>so the audit row records webhook.received under it
 ```
 
 | Outcome | Response |
@@ -429,7 +429,7 @@ sequenceDiagram
 | New event | `202 Accepted` with `{id, tenantId, sourceId, eventId, eventType, receivedAt, duplicate: false}`. |
 | Repeated `(source, webhook-id)` | `200 OK`, `duplicate: true`, and the original row. The body is stored once. |
 | Unknown, disabled, soft-deleted source, or suspended tenant | `401`, the same problem as a bad signature. The receiver still runs the HMAC against a dummy secret so the unknown-id path is not a cheap oracle. |
-| Missing/invalid signature, stale timestamp, or a source secret that predates Standard Webhooks | `401 webhook signature is invalid`. |
+| Missing/invalid signature, stale timestamp, or a source secret that is not a Standard Webhooks `whsec_<base64>` value | `401 webhook signature is invalid`. |
 | Malformed body, id, or body `type` | `400`. |
 
 The stored row keeps the signature and payload but does not echo them back.
@@ -439,49 +439,50 @@ The stored row keeps the signature and payload but does not echo them back.
 | Secret | Format | Storage |
 |---|---|---|
 | Endpoint signing secret | `whsec_` + standard base64 of 32 random bytes | `webhook_endpoint_secrets` (versioned, one active) |
-| Inbound source secret | `whsec_` + standard base64 of 32 random bytes | `webhook_inbound_sources` |
+| Inbound source secret | `whsec_` + standard base64 of 32 random bytes | `webhook_inbound_source_secrets` (versioned, one active) |
 
 Both use the Standard Webhooks secret format, so official libraries accept
 them unchanged; the HMAC key is the decoded 32 bytes (`webhook.DecodeSecret`
 requires the prefix and at least 24 decoded bytes).
 
-**Compatibility.** Secrets created before this format (`whsec_`/`whin_` +
-URL-safe base64, used as raw HMAC keys) cannot be decoded. They are not
-converted silently: a delivery whose snapshot secret predates the format is
-dead-lettered with `endpoint secret predates Standard Webhooks; rotate it`,
-and an inbound source with such a secret rejects every request with `401`
-(logged as an error). Rotate every endpoint and inbound source secret
-(`POST .../rotate-secret`) when upgrading, then replay dead deliveries.
+**Structural errors.** Every stored secret is a Standard Webhooks
+`whsec_<standard base64>` value; there is no pre-Standard format. A stored value
+without that prefix is a structural error, never silently converted: an
+outbound delivery whose snapshot secret is not `whsec_` is dead-lettered with
+`secret snapshot is not a Standard Webhooks secret`, and an inbound source with
+such a secret rejects every request with `401` (logged as an error). A row is
+only ever produced by create/rotate, so such a value indicates corruption or
+manual editing; fix the row and replay any dead deliveries.
 
 Both are sealed with AES-256-GCM using HKDF-SHA256 domain separation from
-`WEBHOOK_SECRET_ENCRYPTION_KEY`. Outside production an empty dedicated key
-falls back to `JWT_SECRET`; **production requires the dedicated key** (at
-least 32 characters). Only ciphertext is stored; plaintext is returned exactly
+`WEBHOOK_SECRET_ENCRYPTION_KEY`. The dedicated key is required in every
+environment (base64-encoded 32 random bytes) and there is no `JWT_SECRET`
+fallback. Only ciphertext is stored; plaintext is returned exactly
 once on create or rotate. The current envelope (v3) records the sealing key's
 `kid` and authenticates the secret's purpose, tenant, and owning endpoint or
 source id as AAD, so a ciphertext copied to another row by someone with
-database write access fails to open. Delivery snapshots are copies of the
-endpoint secret and use the endpoint binding. Only v3 envelopes are accepted:
-unbound v1/v2 envelopes are rejected as invalid (no database predates v3, so
-there is nothing to migrate).
+database write access fails to open. A delivery stores only the id of the
+secret version it snapshotted (and uses the endpoint binding to open it). Only
+v3 envelopes are accepted: unbound v1/v2 envelopes are rejected as invalid (no
+database predates v3, so there is nothing to migrate).
 
 | Rotation | Behavior |
 |---|---|
-| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. `POST /webhooks/endpoints/:id/rotate-secret` accepts `{"expirePrevious": true}` to close the grace immediately, so the previous secret stops co-signing at once. A failed signing-secret lookup or an unreadable current secret is a retryable attempt failure; the worker never falls back to the delivery snapshot (it may be past its grace), and a structurally invalid envelope or pre-Standard secret is dead. Replays use the current active secret. |
-| Inbound source | Keeps the replaced sealed secret as `previous_secret_ciphertext` with `previous_secret_expires_at = now() + 24h`. Verification accepts the current secret or, while unexpired, the immediately previous one; a second rotation within the window replaces it, so only that one survives. |
+| Endpoint | Locks the endpoint row, retires the old secret with `grace_expires_at = now() + 24h`, inserts the next version (concurrent rotations serialize), and expires any older retired row. Every delivery sent while the previous secret is unexpired is signed with both, current first (see [Signing during secret rotation](#signing-during-secret-rotation)); after it only the current secret signs. `POST /webhooks/endpoints/:id/rotate-secret` accepts `{"expirePrevious": true}` to close the grace immediately, so the previous secret stops co-signing at once. A failed signing-secret lookup or an unreadable current secret is a retryable attempt failure; the worker never falls back to the delivery snapshot (it may be past its grace), and a structurally invalid envelope or a non-`whsec_` secret is dead. Replays use the current active secret. |
+| Inbound source | Locks the source row, retires the old secret with `grace_expires_at = now() + 24h`, and inserts the next version into `webhook_inbound_source_secrets`. Verification accepts the current secret or, while unexpired, the immediately previous one; a second rotation within the window expires the older retired row, so only that one survives. |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | Two-phase: add the new key to `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` everywhere, then promote it and keep the old key listed. Rows keep the key that sealed them until their secret is rotated, so drop the old key only after every endpoint/source secret is rotated and no pending delivery snapshot uses it ([Key rotation](operations.md#key-rotation)). |
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `WEBHOOK_SECRET_ENCRYPTION_KEY` | empty (JWT fallback) | AES-256-GCM secret-encryption key; required in production. |
+| `WEBHOOK_SECRET_ENCRYPTION_KEY` | required | AES-256-GCM secret-encryption key (base64-encoded 32 random bytes); no JWT fallback. |
 | `WEBHOOK_SECRET_ENCRYPTION_PREVIOUS_KEYS` | empty | Comma-separated decrypt-only keys kept during a rotation; must not contain the active key. |
-| `WEBHOOK_CONNECT_TIMEOUT_SECS` | `5` | Bounds both the TCP dial and the TLS handshake. |
-| `WEBHOOK_REQUEST_TIMEOUT_SECS` | `10` | Per-attempt timeout, max 120. |
-| `WEBHOOK_RETRY_BASE_SECS` | `5` | First retry backoff. |
-| `WEBHOOK_RETRY_MAX_SECS` | `3600` | Backoff/Retry-After cap, max 7 days. |
+| `WEBHOOK_CONNECT_TIMEOUT` | `5s` | Bounds both the TCP dial and the TLS handshake. |
+| `WEBHOOK_REQUEST_TIMEOUT` | `10s` | Per-attempt timeout, max 120. |
+| `WEBHOOK_RETRY_BASE` | `5s` | First retry backoff. |
+| `WEBHOOK_RETRY_MAX` | `1h` | Backoff/Retry-After cap, max 7 days. |
 | `WEBHOOK_MAX_ATTEMPTS` | `8` | Default delivery attempt budget (1-50). |
-| `WEBHOOK_RETENTION_DAYS` | `30` | Terminal delivery/inbound-event retention. |
-| `WEBHOOK_TIMESTAMP_TOLERANCE_SECS` | `300` | Inbound signature clock skew. |
+| `WEBHOOK_RETENTION` | `720h` | Terminal delivery/inbound-event retention. |
+| `WEBHOOK_TIMESTAMP_TOLERANCE` | `5m` | Inbound signature clock skew. |
 | `WEBHOOK_SSRF_ALLOWLIST` | empty | Trusted private IPs/CIDRs/hosts. |
 | `WEBHOOK_ALLOWED_PORTS` | `443,80` | Additional outbound destination ports (comma-separated, 1-65535); 443 and 80 always stay allowed. |
 | `WEBHOOK_REQUIRE_HTTPS` | production: `true`; otherwise `false` | Reject `http://` endpoint URLs at create/update. Set explicitly to override the environment default. |
@@ -496,7 +497,7 @@ Administration routes accept a JWT or an API key scoped to these permissions
 | Route kind | Audit |
 |---|---|
 | Endpoint/source create, update, delete, rotate-secret; delivery replay | Tier 2: a required `audithttp.Guard` writes a `started` intent row before the handler and completes it with the outcome. An unavailable audit store returns `503 system.audit_unavailable` and the mutation does not run. The service then records the domain event as a child (`parent_id`) of the intent; a domain-event write failure is logged and does not fail the mutation. |
-| Public receiver | `webhook.inbound.received`, best-effort, under the source tenant. |
+| Public receiver | `webhook.received`, best-effort, under the source tenant. |
 
 Domain events: `webhook.endpoint.created|updated|deleted|secret_rotated`,
 `webhook.delivery.replayed`,
@@ -512,22 +513,22 @@ the logs) unwraps `*url.Error` to its inner cause for the same reason.
 |---|---|---|
 | GET | `/api/v1/webhooks/endpoints` | `webhooks:read` |
 | POST | `/api/v1/webhooks/endpoints` | `webhooks:write` |
-| GET | `/api/v1/webhooks/endpoints/:id` | `webhooks:read` |
-| PUT | `/api/v1/webhooks/endpoints/:id` | `webhooks:write` |
-| DELETE | `/api/v1/webhooks/endpoints/:id` | `webhooks:write` |
-| POST | `/api/v1/webhooks/endpoints/:id/rotate-secret` | `webhooks:write`; body `{"expirePrevious": true}` (optional, default false) ends the previous secret's co-signing grace immediately |
+| GET | `/api/v1/webhooks/endpoints/{endpointId}` | `webhooks:read` |
+| PATCH | `/api/v1/webhooks/endpoints/{endpointId}` | `webhooks:write`, `Idempotency-Key`, `If-Match` |
+| DELETE | `/api/v1/webhooks/endpoints/{endpointId}` | `webhooks:write`, `Idempotency-Key` |
+| POST | `/api/v1/webhooks/endpoints/{endpointId}/rotate-secret` | `webhooks:write`; body `{"expirePrevious": true}` (optional, default false) ends the previous secret's co-signing grace immediately |
 | GET | `/api/v1/webhooks/deliveries` | `webhooks:read` |
-| GET | `/api/v1/webhooks/deliveries/:id` | `webhooks:read` |
-| GET | `/api/v1/webhooks/deliveries/:id/attempts` | `webhooks:read` |
-| POST | `/api/v1/webhooks/deliveries/:id/replay` | `webhooks:write` |
+| GET | `/api/v1/webhooks/deliveries/{deliveryId}` | `webhooks:read` |
+| GET | `/api/v1/webhooks/deliveries/{deliveryId}/attempts` | `webhooks:read` |
+| POST | `/api/v1/webhooks/deliveries/{deliveryId}/replay` | `webhooks:write`, `Idempotency-Key` |
 | GET | `/api/v1/webhooks/inbound-sources` | `webhooks:read` |
 | POST | `/api/v1/webhooks/inbound-sources` | `webhooks:write` |
-| GET | `/api/v1/webhooks/inbound-sources/:id` | `webhooks:read` |
-| PUT | `/api/v1/webhooks/inbound-sources/:id` | `webhooks:write` |
-| DELETE | `/api/v1/webhooks/inbound-sources/:id` | `webhooks:write` |
-| POST | `/api/v1/webhooks/inbound-sources/:id/rotate-secret` | `webhooks:write` |
-| GET | `/api/v1/webhooks/inbound-sources/:id/events` | `webhooks:read` |
-| POST | `/api/v1/webhooks/inbound/{id}` | Public, HMAC |
+| GET | `/api/v1/webhooks/inbound-sources/{sourceId}` | `webhooks:read` |
+| PATCH | `/api/v1/webhooks/inbound-sources/{sourceId}` | `webhooks:write`, `Idempotency-Key`, `If-Match` |
+| DELETE | `/api/v1/webhooks/inbound-sources/{sourceId}` | `webhooks:write`, `Idempotency-Key` |
+| POST | `/api/v1/webhooks/inbound-sources/{sourceId}/rotate-secret` | `webhooks:write`; body `{"expirePrevious": true}` (optional, default false) ends the previous secret's verification grace immediately |
+| GET | `/api/v1/webhooks/inbound-sources/{sourceId}/events` | `webhooks:read` |
+| POST | `/api/v1/webhooks/inbound/{sourceId}` | Public, HMAC |
 
 Idempotency:
 
@@ -544,9 +545,9 @@ Idempotency:
 | `webhook_endpoints` + `webhook_endpoint_secrets` | Endpoints and versioned secrets (one active, plus at most one retired with an unexpired grace window). |
 | `webhook_endpoint_subscriptions` | One row per `eventTypes` pattern of an endpoint. |
 | `webhook_events` | Each dispatched event envelope once: id, type, `data_version`, `actor_type`/`actor_id`, `occurred_at`, and `payload` (the envelope data). The worker rebuilds the signed body from it. |
-| `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret ciphertext, timeout, max attempts) + state. |
+| `webhook_deliveries` | Outbox + endpoint snapshot (URL, secret id, timeout, max attempts) + state. |
 | `webhook_delivery_attempts` | One row per attempt. |
-| `webhook_inbound_sources` | Inbound receivers and sealed current/previous secrets. |
+| `webhook_inbound_sources` + `webhook_inbound_source_secrets` | Inbound receivers and their versioned sealed secrets (one active, plus at most one retired with an unexpired grace window). |
 | `webhook_inbound_events` | Received events, unique per source and external event ID. |
 
 - All tables carry `tenant_id` with tenant-leading indexes; there are no
@@ -557,7 +558,7 @@ Idempotency:
   attempts with their delivery; deliveries and inbound events are history and
   `RESTRICT` deletion of their endpoint/event/source.
 - A retention loop runs hourly (first pass at startup) and deletes
-  `succeeded`/`dead` deliveries older than `WEBHOOK_RETENTION_DAYS`, then
+  `succeeded`/`dead` deliveries older than `WEBHOOK_RETENTION`, then
   outbound events older than the window that no delivery references any more,
   then inbound events older than the window. Pending deliveries (and their
   events) are never purged.

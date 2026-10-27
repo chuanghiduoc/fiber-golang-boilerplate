@@ -29,6 +29,7 @@ spec:
         app.kubernetes.io/component: migrate
     spec:
       restartPolicy: Never
+      serviceAccountName: fiber-boilerplate-migrate
       automountServiceAccountToken: false
       enableServiceLinks: false
       terminationGracePeriodSeconds: 30
@@ -36,11 +37,11 @@ spec:
       # imagePullSecrets:
       #   - name: ghcr-pull
       securityContext:
-        # Match the Docker image user: appuser is UID 100 / GID 101.
+        # distroless/static:nonroot runs as UID/GID 65532.
         runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 101
-        fsGroup: 101
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -57,10 +58,13 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
-            # Only the migration Job may read the schema-owner credentials.
-            # The app Secret deliberately does not contain them.
-            - secretRef:
-                name: fiber-boilerplate-migrate-secrets
+          env:
+            # Only this Job mounts the schema-owner password, and only as a
+            # file: it never appears in the pod environment or `kubectl
+            # describe`. DB_MIGRATE_USERNAME is the non-secret owner role name
+            # in the ConfigMap.
+            - name: DB_MIGRATE_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate-migrate/DB_MIGRATE_PASSWORD
           resources:
             requests:
               cpu: 100m
@@ -70,10 +74,19 @@ spec:
               memory: 256Mi
           securityContext:
             runAsNonRoot: true
-            runAsUser: 100
-            runAsGroup: 101
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            - name: secrets
+              mountPath: /var/run/secrets/fiber-boilerplate-migrate
+              readOnly: true
+      volumes:
+        - name: secrets
+          secret:
+            secretName: fiber-boilerplate-migrate-secrets
+            defaultMode: 0440

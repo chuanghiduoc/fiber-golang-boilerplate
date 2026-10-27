@@ -4,47 +4,42 @@
 package repository
 
 import (
-	"context"
 	"errors"
 	"net/netip"
 	"strings"
-	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
+	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 )
-
-// tenantID returns the request tenant every tenant-owned query must scope to.
-// EffectiveID falls back to the default tenant only for background jobs,
-// internal callers, and tests; HTTP requests resolve an explicit tenant (and
-// production requires X-Tenant-Slug).
-func tenantID(ctx context.Context) int64 {
-	return tenant.EffectiveID(ctx)
-}
 
 const (
 	sqlStateRaiseException   = "P0001"
 	sqlStateDeadlockDetected = "40P01"
 	sqlStateUniqueViolation  = "23505"
+	// sqlStateLastOwner is raised by protect_last_owner, which guards the last
+	// active owner of an operational tenant. It is deliberately distinct from
+	// the generic raise_exception code so the repository maps by SQLSTATE
+	// instead of matching the message text.
+	sqlStateLastOwner = "LO001"
 )
 
 // wrapErr translates pgx errors to app-level sentinel errors. The repository
 // is the only layer that knows about database driver errors.
 func wrapErr(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apperror.ErrNotFound
+	if mapped := database.MapError(err); mapped != err {
+		return mapped
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch {
-		case pgErr.Code == sqlStateRaiseException && strings.Contains(pgErr.Message, "last owner"):
+		switch pgErr.Code {
+		case sqlStateLastOwner:
 			// protect_last_owner trigger: the database-level last-owner guard.
-			return apperror.NewCode(apperror.CodeUserLastAdmin, "cannot remove the last active owner")
-		case pgErr.Code == sqlStateDeadlockDetected:
+			return apperror.NewCode(identitycatalog.CodeUserLastAdmin, "cannot remove the last active owner")
+		case sqlStateDeadlockDetected:
 			// PostgreSQL aborted one side of a lock cycle (for example a
 			// concurrent admin change made outside the service lock). The
 			// other side committed; the caller can retry.
@@ -64,25 +59,6 @@ func uniqueConstraint(err error) (string, bool) {
 	return "", false
 }
 
-func timePtr(ts pgtype.Timestamptz) *time.Time {
-	if !ts.Valid {
-		return nil
-	}
-	t := ts.Time
-	return &t
-}
-
-func timestamptz(t time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: t, Valid: true}
-}
-
-func optionalTimestamptz(t *time.Time) pgtype.Timestamptz {
-	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return timestamptz(*t)
-}
-
 // optionalText stores "" as NULL.
 func optionalText(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: s != ""}
@@ -96,10 +72,6 @@ func ipAddr(s string) *netip.Addr {
 		return nil
 	}
 	return &addr
-}
-
-func pgInt8(v int64) pgtype.Int8 {
-	return pgtype.Int8{Int64: v, Valid: true}
 }
 
 func isNotFound(err error) bool {

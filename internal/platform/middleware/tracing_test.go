@@ -18,6 +18,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/requestctx"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror/apperrorhttp"
@@ -35,15 +36,15 @@ func newTracingTestApp(t *testing.T) (*fiber.App, *tracetest.SpanRecorder) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(provider, []string{"/healthz", "/readyz", "/health", "/metrics"}, true))
+	app.Use(Tracing(provider, []string{"/healthz", "/readyz", "/health", "/metrics"}, true, nil))
 	return app, recorder
 }
 
 func TestTracingMiddlewareRecordsRouteTemplate(t *testing.T) {
 	app, recorder := newTracingTestApp(t)
 	app.Get("/users/:id", func(c fiber.Ctx) error {
-		fiber.Locals[int64](c, "user_id", 7)
-		fiber.Locals[int64](c, "tenant_id", 2)
+		c.SetContext(requestctx.WithActorID(c.Context(), testID(7)))
+		c.SetContext(tenant.WithID(c.Context(), testID(2)))
 		return c.SendString("ok")
 	})
 
@@ -64,8 +65,8 @@ func TestTracingMiddlewareRecordsRouteTemplate(t *testing.T) {
 	assert.Equal(t, "/users/:id", attrString(span.Attributes(), semconv.HTTPRouteKey))
 	assert.Equal(t, int64(200), attrInt(span.Attributes(), semconv.HTTPResponseStatusCodeKey))
 	assert.NotEmpty(t, attrString(span.Attributes(), attribute.Key("app.request_id")))
-	assert.Equal(t, "7", attrString(span.Attributes(), semconv.EnduserIDKey))
-	assert.Equal(t, int64(2), attrInt(span.Attributes(), attribute.Key("tenant.id")))
+	assert.Equal(t, testID(7).String(), attrString(span.Attributes(), semconv.EnduserIDKey))
+	assert.Equal(t, testID(2).String(), attrString(span.Attributes(), attribute.Key("tenant.id")))
 
 	// Raw path segments, query parameters, and secrets must never be attached.
 	for _, attr := range span.Attributes() {
@@ -74,6 +75,49 @@ func TestTracingMiddlewareRecordsRouteTemplate(t *testing.T) {
 		assert.NotContains(t, value, "user@example.com")
 		assert.NotContains(t, value, "super-secret")
 	}
+}
+
+func TestTracingMiddlewareAddsSemconvConnectionAttributes(t *testing.T) {
+	app, recorder := newTracingTestApp(t)
+	app.Get("/users/:id", func(c fiber.Ctx) error { return c.SendString("ok") })
+
+	req, _ := http.NewRequest(http.MethodGet, "/users/42", http.NoBody)
+	req.Host = "api.example.com:8443"
+	resp, err := app.Test(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	ended := recorder.Ended()
+	require.Len(t, ended, 1)
+	span := ended[0]
+	assert.Equal(t, "http", attrString(span.Attributes(), semconv.URLSchemeKey))
+	assert.Equal(t, "api.example.com", attrString(span.Attributes(), semconv.ServerAddressKey))
+	assert.Equal(t, int64(8443), attrInt(span.Attributes(), semconv.ServerPortKey))
+	assert.Equal(t, "1.1", attrString(span.Attributes(), semconv.NetworkProtocolVersionKey))
+	assert.NotEmpty(t, attrString(span.Attributes(), semconv.ClientAddressKey))
+
+	// The default port is implied when the Host header has none.
+	app2, recorder2 := newTracingTestApp(t)
+	app2.Get("/default-port", func(c fiber.Ctx) error { return c.SendString("ok") })
+	req2, _ := http.NewRequest(http.MethodGet, "/default-port", http.NoBody)
+	req2.Host = "api.example.com"
+	resp2, err := app2.Test(req2)
+	require.NoError(t, err)
+	_ = resp2.Body.Close()
+	require.Len(t, recorder2.Ended(), 1)
+	assert.Equal(t, int64(80), attrInt(recorder2.Ended()[0].Attributes(), semconv.ServerPortKey))
+}
+
+func TestTracingMiddlewareUnknownMethodMapsToOther(t *testing.T) {
+	assert.Equal(t, "_OTHER", httpRequestMethod("BREW"))
+	assert.Equal(t, "_OTHER", httpRequestMethod(""))
+	assert.Equal(t, http.MethodGet, httpRequestMethod("get"))
+
+	// Fiber rejects an unregistered verb before middleware runs, so the
+	// mapping itself is the testable contract: the raw verb must never reach
+	// telemetry.
+	assert.Equal(t, "_OTHER /coffee", httpSpanName(httpRequestMethod("BREW"), "/coffee"))
 }
 
 func TestTracingMiddlewareExtractsW3CTraceParent(t *testing.T) {
@@ -128,7 +172,7 @@ func TestTracingMiddlewareIgnoresUntrustedTraceParent(t *testing.T) {
 
 			tc.cfg.ErrorHandler = apperrorhttp.FiberErrorHandler
 			app := fiber.New(tc.cfg)
-			app.Use(Tracing(provider, nil, tc.trustIncoming))
+			app.Use(Tracing(provider, nil, tc.trustIncoming, nil))
 			app.Get("/traced", func(c fiber.Ctx) error { return c.SendString("ok") })
 
 			req, _ := http.NewRequest("GET", "/traced", http.NoBody)
@@ -189,7 +233,7 @@ func TestTracingMiddlewareErrorSemantics(t *testing.T) {
 		assert.Empty(t, span.Status().Description)
 		assert.Empty(t, span.Events())
 		assert.Equal(t, "AppError", attrString(span.Attributes(), semconv.ErrorTypeKey))
-		assert.Equal(t, "internal_error", attrString(span.Attributes(), attribute.Key("app.error_code")))
+		assert.Equal(t, "system.internal", attrString(span.Attributes(), attribute.Key("app.error_code")))
 		for _, attr := range span.Attributes() {
 			assert.NotContains(t, attr.Value.String(), "user@example.com")
 			assert.NotContains(t, attr.Value.String(), "super-secret")
@@ -214,7 +258,7 @@ func TestTracingMiddlewareErrorSemantics(t *testing.T) {
 		assert.Equal(t, int64(404), attrInt(span.Attributes(), semconv.HTTPResponseStatusCodeKey))
 		assert.Equal(t, codes.Unset, span.Status().Code)
 		assert.Empty(t, attrString(span.Attributes(), semconv.ErrorTypeKey))
-		assert.Equal(t, "not_found", attrString(span.Attributes(), attribute.Key("app.error_code")))
+		assert.Equal(t, "resource.not_found", attrString(span.Attributes(), attribute.Key("app.error_code")))
 	})
 
 	t.Run("bare 5xx sets bounded error type", func(t *testing.T) {
@@ -259,7 +303,7 @@ func TestTracingMiddlewareUnmatchedRouteDoesNotUseRawPath(t *testing.T) {
 func TestTracingMiddlewareNilProviderIsSafe(t *testing.T) {
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(nil, nil, false))
+	app.Use(Tracing(nil, nil, false, nil))
 	app.Get("/ok", func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	req, _ := http.NewRequest("GET", "/ok", http.NoBody)
@@ -272,7 +316,7 @@ func TestTracingMiddlewareNilProviderIsSafe(t *testing.T) {
 func TestTracingMiddlewareTenantFromContext(t *testing.T) {
 	app, recorder := newTracingTestApp(t)
 	app.Use(func(c fiber.Ctx) error {
-		c.SetContext(tenant.WithID(c.Context(), 5))
+		c.SetContext(tenant.WithID(context.Background(), testID(5)))
 		return c.Next()
 	})
 	app.Get("/tenant", func(c fiber.Ctx) error { return c.SendString("ok") })
@@ -285,7 +329,7 @@ func TestTracingMiddlewareTenantFromContext(t *testing.T) {
 
 	ended := recorder.Ended()
 	require.Len(t, ended, 1)
-	assert.Equal(t, int64(5), attrInt(ended[0].Attributes(), attribute.Key("tenant.id")))
+	assert.Equal(t, testID(5).String(), attrString(ended[0].Attributes(), attribute.Key("tenant.id")))
 }
 
 func TestLoggerAddsTraceIdentifiers(t *testing.T) {
@@ -303,8 +347,8 @@ func TestLoggerAddsTraceIdentifiers(t *testing.T) {
 
 	app := fiber.New(fiber.Config{ErrorHandler: apperrorhttp.FiberErrorHandler})
 	app.Use(RequestID())
-	app.Use(Tracing(provider, nil, false))
-	app.Use(Logger())
+	app.Use(Tracing(provider, nil, false, nil))
+	app.Use(Logger(nil))
 	app.Get("/logged", func(c fiber.Ctx) error { return c.SendString("ok") })
 
 	req, _ := http.NewRequest("GET", "/logged", http.NoBody)
@@ -324,6 +368,14 @@ func TestLoggerAddsTraceIdentifiers(t *testing.T) {
 	sawSpan = hasStringAttr(records[0], "span_id", span.SpanContext().SpanID().String())
 	assert.True(t, sawTrace, "request log must carry the trace_id")
 	assert.True(t, sawSpan, "request log must carry the span_id")
+
+	// Request fields follow the OpenTelemetry semantic conventions.
+	assert.True(t, hasStringAttr(records[0], "http.request.method", http.MethodGet))
+	assert.True(t, hasStringAttr(records[0], "url.path", "/logged"))
+	assert.True(t, hasStringAttr(records[0], "http.route", "/logged"))
+	assert.True(t, hasAttr(records[0], "http.response.status_code"))
+	assert.True(t, hasAttr(records[0], "client.address"))
+	assert.True(t, hasAttr(records[0], "user_agent.original"))
 }
 
 func TestTraceAttrsEmptyWithoutSpan(t *testing.T) {
@@ -367,6 +419,18 @@ func (h *captureHandler) snapshot() []slog.Record {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]slog.Record(nil), h.records...)
+}
+
+func hasAttr(record slog.Record, key string) bool {
+	found := false
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == key {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func hasStringAttr(record slog.Record, key, want string) bool {

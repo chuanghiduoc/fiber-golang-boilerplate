@@ -8,6 +8,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
 	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/pkg/apperror"
@@ -20,8 +22,8 @@ const max{{.R.Pascal}}NameLength = 255
 // {{.R.Pascal}} is the service view of one {{.R.Table}} row. repository/
 // maps sqlc rows to it, so no persistence type crosses this package.
 type {{.R.Pascal}} struct {
-	ID        int64
-	TenantID  int64
+	ID        uuid.UUID
+	TenantID  uuid.UUID
 	Name      string
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -75,11 +77,11 @@ func (s *{{.R.Pascal}}Service) Create(ctx context.Context, in {{.R.Pascal}}Input
 }
 
 // Get returns one {{.R.Human}} of the request tenant.
-func (s *{{.R.Pascal}}Service) Get(ctx context.Context, id int64) ({{.R.Pascal}}, error) {
+func (s *{{.R.Pascal}}Service) Get(ctx context.Context, id uuid.UUID) ({{.R.Pascal}}, error) {
 	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Read); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
-	if id <= 0 {
+	if id == uuid.Nil {
 		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
 	}
 	found, err := s.repo.Get{{.R.Pascal}}(ctx, id)
@@ -119,7 +121,7 @@ func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfte
 	if len(items) > pageSize {
 		page.Items = items[:pageSize]
 		page.HasMore = true
-		page.NextCursor = pagination.NextCursor(page.Items, func(item {{.R.Pascal}}) (time.Time, int64) {
+		page.NextCursor = pagination.NextCursor(page.Items, func(item {{.R.Pascal}}) (time.Time, uuid.UUID) {
 			return item.CreatedAt, item.ID
 		})
 	}
@@ -129,11 +131,11 @@ func (s *{{.R.Pascal}}Service) List(ctx context.Context, limit int, startingAfte
 // Patch changes only the fields the caller supplied. An empty patch is a
 // validation error rather than a silent no-op, and a provided name follows the
 // same trim/length rules as create.
-func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id int64, in {{.R.Pascal}}Patch) ({{.R.Pascal}}, error) {
+func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id uuid.UUID, in {{.R.Pascal}}Patch, expected *time.Time) ({{.R.Pascal}}, error) {
 	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Write); err != nil {
 		return {{.R.Pascal}}{}, err
 	}
-	if id <= 0 {
+	if id == uuid.Nil {
 		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
 	}
 	if in.Name == nil {
@@ -152,7 +154,7 @@ func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id int64, in {{.R.Pasc
 			{Path: "name", Code: "max", Message: fmt.Sprintf("name must be at most %d characters", max{{.R.Pascal}}NameLength)},
 		})
 	}
-	updated, err := s.repo.Patch{{.R.Pascal}}(ctx, id, {{.R.Pascal}}Patch{Name: &name})
+	updated, err := s.repo.Patch{{.R.Pascal}}(ctx, id, {{.R.Pascal}}Patch{Name: &name}, expected)
 	if err != nil {
 		return {{.R.Pascal}}{}, {{.R.Camel}}Error("patch", err)
 	}
@@ -160,11 +162,11 @@ func (s *{{.R.Pascal}}Service) Patch(ctx context.Context, id int64, in {{.R.Pasc
 }
 
 // Delete removes one {{.R.Human}} of the request tenant.
-func (s *{{.R.Pascal}}Service) Delete(ctx context.Context, id int64) error {
+func (s *{{.R.Pascal}}Service) Delete(ctx context.Context, id uuid.UUID) error {
 	if err := authorize(ctx, {{.M.Ident}}catalog.Permission{{.R.PluralPascal}}Delete); err != nil {
 		return err
 	}
-	if id <= 0 {
+	if id == uuid.Nil {
 		return {{.R.Camel}}NotFound()
 	}
 	if err := s.repo.Delete{{.R.Pascal}}(ctx, id); err != nil {
@@ -194,7 +196,7 @@ func normalize{{.R.Pascal}}Input(in {{.R.Pascal}}Input) ({{.R.Pascal}}Input, err
 // tenant_id predicate: a row from another tenant is reported as not found,
 // never as forbidden, so ids in other tenants are not disclosed.
 func ensure{{.R.Pascal}}Tenant(ctx context.Context, item {{.R.Pascal}}) ({{.R.Pascal}}, error) {
-	if item.TenantID != tenant.EffectiveID(ctx) {
+	if item.TenantID != tenant.IDFromContext(ctx) {
 		return {{.R.Pascal}}{}, {{.R.Camel}}NotFound()
 	}
 	return item, nil

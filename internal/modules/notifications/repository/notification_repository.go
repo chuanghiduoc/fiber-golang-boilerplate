@@ -3,16 +3,15 @@ package repository
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/google/uuid"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	notificationservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/service"
 	notificationsqlc "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/notifications/sqlc"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
 )
 
@@ -32,14 +31,14 @@ func NewNotificationRepository(db notificationsqlc.DBTX) *NotificationRepository
 	return &NotificationRepository{q: notificationsqlc.New(db)}
 }
 
-func tenantID(ctx context.Context) int64 {
-	return tenant.EffectiveID(ctx)
-}
-
 func (r *NotificationRepository) Create(ctx context.Context, in notificationservice.NewNotification) (*notificationservice.Notification, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// The context tenant is authoritative; the input has no tenant field.
 	row, err := r.q.CreateNotification(ctx, notificationsqlc.CreateNotificationParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   in.UserID,
 		Type:     in.Type,
 		Title:    in.Title,
@@ -52,10 +51,14 @@ func (r *NotificationRepository) Create(ctx context.Context, in notificationserv
 	return toNotification(row), nil
 }
 
-func (r *NotificationRepository) GetByID(ctx context.Context, id, userID int64) (*notificationservice.Notification, error) {
+func (r *NotificationRepository) GetByID(ctx context.Context, id, userID uuid.UUID) (*notificationservice.Notification, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.GetNotificationByID(ctx, notificationsqlc.GetNotificationByIDParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -67,10 +70,14 @@ func (r *NotificationRepository) GetByID(ctx context.Context, id, userID int64) 
 // ListCursor picks a dedicated query per filter: a boolean "unread only"
 // parameter would hide the read_at IS NULL predicate from generic plans and
 // keep them off the partial unread index.
-func (r *NotificationRepository) ListCursor(ctx context.Context, userID int64, cur pagination.DBCursor, unreadOnly bool) ([]notificationservice.Notification, error) {
+func (r *NotificationRepository) ListCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, unreadOnly bool) ([]notificationservice.Notification, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if unreadOnly {
 		rows, err := r.q.ListUnreadNotificationsCursor(ctx, notificationsqlc.ListUnreadNotificationsCursorParams{
-			TenantID:        tenantID(ctx),
+			TenantID:        tenantID,
 			UserID:          userID,
 			CursorCreatedAt: cur.CreatedAtParam(),
 			CursorID:        cur.IDParam(),
@@ -82,7 +89,7 @@ func (r *NotificationRepository) ListCursor(ctx context.Context, userID int64, c
 		return toNotifications(rows), nil
 	}
 	rows, err := r.q.ListNotificationsCursor(ctx, notificationsqlc.ListNotificationsCursorParams{
-		TenantID:        tenantID(ctx),
+		TenantID:        tenantID,
 		UserID:          userID,
 		CursorCreatedAt: cur.CreatedAtParam(),
 		CursorID:        cur.IDParam(),
@@ -94,17 +101,25 @@ func (r *NotificationRepository) ListCursor(ctx context.Context, userID int64, c
 	return toNotifications(rows), nil
 }
 
-func (r *NotificationRepository) CountUnread(ctx context.Context, userID int64) (int64, error) {
+func (r *NotificationRepository) CountUnread(ctx context.Context, userID uuid.UUID) (int64, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return 0, err
+	}
 	return r.q.CountUnreadNotifications(ctx, notificationsqlc.CountUnreadNotificationsParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 }
 
-func (r *NotificationRepository) MarkRead(ctx context.Context, id, userID int64) (*notificationservice.Notification, error) {
+func (r *NotificationRepository) MarkRead(ctx context.Context, id, userID uuid.UUID) (*notificationservice.Notification, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.MarkNotificationRead(ctx, notificationsqlc.MarkNotificationReadParams{
 		ID:       id,
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -113,16 +128,40 @@ func (r *NotificationRepository) MarkRead(ctx context.Context, id, userID int64)
 	return toNotification(row), nil
 }
 
-func (r *NotificationRepository) MarkAllRead(ctx context.Context, userID int64) (int64, error) {
+func (r *NotificationRepository) MarkUnread(ctx context.Context, id, userID uuid.UUID) (*notificationservice.Notification, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
+	row, err := r.q.MarkNotificationUnread(ctx, notificationsqlc.MarkNotificationUnreadParams{
+		ID:       id,
+		TenantID: tenantID,
+		UserID:   userID,
+	})
+	if err != nil {
+		return nil, wrapErr(err)
+	}
+	return toNotification(row), nil
+}
+
+func (r *NotificationRepository) MarkAllRead(ctx context.Context, userID uuid.UUID) (int64, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return 0, err
+	}
 	return r.q.MarkAllNotificationsRead(ctx, notificationsqlc.MarkAllNotificationsReadParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 }
 
-func (r *NotificationRepository) GetPreference(ctx context.Context, userID int64, notificationType, channel string) (*notificationservice.Preference, error) {
+func (r *NotificationRepository) GetPreference(ctx context.Context, userID uuid.UUID, notificationType, channel string) (*notificationservice.Preference, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.GetNotificationPreference(ctx, notificationsqlc.GetNotificationPreferenceParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 		Type:     notificationType,
 		Channel:  channel,
@@ -133,9 +172,13 @@ func (r *NotificationRepository) GetPreference(ctx context.Context, userID int64
 	return toPreference(row), nil
 }
 
-func (r *NotificationRepository) ListPreferences(ctx context.Context, userID int64) ([]notificationservice.Preference, error) {
+func (r *NotificationRepository) ListPreferences(ctx context.Context, userID uuid.UUID) ([]notificationservice.Preference, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.q.ListNotificationPreferences(ctx, notificationsqlc.ListNotificationPreferencesParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   userID,
 	})
 	if err != nil {
@@ -145,8 +188,12 @@ func (r *NotificationRepository) ListPreferences(ctx context.Context, userID int
 }
 
 func (r *NotificationRepository) UpsertPreference(ctx context.Context, in notificationservice.NewPreference) (*notificationservice.Preference, error) {
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := r.q.UpsertNotificationPreference(ctx, notificationsqlc.UpsertNotificationPreferenceParams{
-		TenantID: tenantID(ctx),
+		TenantID: tenantID,
 		UserID:   in.UserID,
 		Type:     in.Type,
 		Channel:  in.Channel,
@@ -164,7 +211,7 @@ func toNotification(row notificationsqlc.Notification) *notificationservice.Noti
 	// row was written outside the service.
 	if len(row.Data) > 0 {
 		if err := json.Unmarshal(row.Data, &data); err != nil {
-			slog.Error("notification data is not a JSON object", slog.Int64("notification_id", row.ID), slog.Any("error", err))
+			slog.Error("notification data is not a JSON object", slog.String("notification_id", row.ID.String()), slog.Any("error", err))
 		}
 	}
 	n := &notificationservice.Notification{
@@ -194,7 +241,6 @@ func toNotifications(rows []notificationsqlc.Notification) []notificationservice
 
 func toPreference(row notificationsqlc.NotificationPreference) *notificationservice.Preference {
 	return &notificationservice.Preference{
-		ID:        row.ID,
 		TenantID:  row.TenantID,
 		UserID:    row.UserID,
 		Type:      row.Type,
@@ -218,8 +264,8 @@ func toPreferences(rows []notificationsqlc.NotificationPreference) []notificatio
 // details. A notification or preference can only reference a membership in the
 // same tenant, so a violation means the recipient is not an active member.
 func wrapErr(err error) error {
-	if errors.Is(err, pgx.ErrNoRows) {
-		return apperror.ErrNotFound
+	if mapped := database.MapError(err); mapped != err {
+		return mapped
 	}
 	if _, ok := database.ForeignKeyViolation(err); ok {
 		return apperror.ErrNotFound

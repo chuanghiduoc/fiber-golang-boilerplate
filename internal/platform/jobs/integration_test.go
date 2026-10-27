@@ -1,10 +1,13 @@
+//go:build integration
+
 package jobs
 
 import (
 	"context"
 	"encoding/json"
+
 	"errors"
-	"fmt"
+	"github.com/google/uuid"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,36 +16,35 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/email"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tracing"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/testutil/pgtest"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/email"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/metrics"
 )
 
 // TestStoreIntegrationReleaseGivesAttemptBack proves a shutdown release on the
 // final attempt requeues the job with its attempt restored, and that the
 // attempts fence still rejects a stale owner.
 func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{
 		Kind:        "jobs.integration.release",
 		MaxAttempts: 1,
 		RunAt:       time.Now().Add(-time.Minute),
 	})
 	require.NoError(t, err)
 
-	store := newPGStore(pgtest.Scoped(pool))
+	store := newPGStore(pgtest.Scoped(pools))
 	batch, err := store.Claim(ctx, "release-worker", 1, time.Minute)
 	require.NoError(t, err)
 	require.Len(t, batch.Jobs, 1)
@@ -75,12 +77,14 @@ func TestStoreIntegrationReleaseGivesAttemptBack(t *testing.T) {
 // PostgreSQL server. Without TEST_DATABASE_URL it skips, so the default unit
 // test run stays Docker-free.
 func TestWorkerIntegrationProcessesJob(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	id, err := queue.Enqueue(ctx, Job{
 		Kind:        "jobs.integration.echo",
 		Payload:     json.RawMessage(`{"value":42}`),
@@ -89,7 +93,7 @@ func TestWorkerIntegrationProcessesJob(t *testing.T) {
 	require.NoError(t, err)
 
 	received := make(chan string, 1)
-	worker := NewWorker(pgtest.Scoped(pool), "integration-worker", WithPollInterval(20*time.Millisecond))
+	worker := NewWorker(pgtest.Scoped(pools), "integration-worker", WithPollInterval(20*time.Millisecond))
 	worker.Register("jobs.integration.echo", func(_ context.Context, payload json.RawMessage) error {
 		received <- string(payload)
 		return nil
@@ -127,12 +131,14 @@ func TestWorkerIntegrationProcessesJob(t *testing.T) {
 // incremented per claim, retries are requeued, and the job becomes dead once
 // max_attempts is reached.
 func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	id, err := queue.Enqueue(ctx, Job{
 		Kind:        "jobs.integration.fail",
 		Payload:     json.RawMessage(`{}`),
@@ -140,7 +146,7 @@ func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	worker := NewWorker(pgtest.Scoped(pool), "integration-worker", WithPollInterval(10*time.Millisecond))
+	worker := NewWorker(pgtest.Scoped(pools), "integration-worker", WithPollInterval(10*time.Millisecond))
 	worker.retryBase = 5 * time.Millisecond
 	worker.retryMax = 20 * time.Millisecond
 	worker.Register("jobs.integration.fail", func(context.Context, json.RawMessage) error {
@@ -172,21 +178,23 @@ func TestWorkerIntegrationRetriesUntilDead(t *testing.T) {
 // payload intact, then is dead-lettered with the payload cleared once the
 // attempt budget is exhausted.
 func TestWorkerIntegrationUnknownKindRetriesThenDeadLetters(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.unregistered"
 	payload := json.RawMessage(`{"secret":"must-retry-then-clear"}`)
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{
 		Kind:        kind,
 		Payload:     payload,
 		MaxAttempts: 2,
 	})
 	require.NoError(t, err)
 
-	worker := NewWorker(pgtest.Scoped(pool), "unknown-kind-worker", WithPollInterval(10*time.Millisecond))
+	worker := NewWorker(pgtest.Scoped(pools), "unknown-kind-worker", WithPollInterval(10*time.Millisecond))
 	// A long retry delay gives the test a stable window to observe the queued
 	// retry before the second claim.
 	worker.retryBase = time.Second
@@ -228,12 +236,14 @@ func TestWorkerIntegrationUnknownKindRetriesThenDeadLetters(t *testing.T) {
 // crashes after consuming its last allowed attempt. Reclaiming it as queued
 // would let a poison job crash-loop forever, so it must become dead.
 func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{
 		Kind:        "jobs.integration.poison",
 		Payload:     json.RawMessage(`{"secret":"must-be-cleared"}`),
 		MaxAttempts: 1,
@@ -247,7 +257,7 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 		WHERE id = $1`, id)
 	require.NoError(t, err)
 
-	store := newPGStore(pgtest.Scoped(pool))
+	store := newPGStore(pgtest.Scoped(pools))
 	batch, err := store.Claim(ctx, "recovering-worker", 1, time.Minute)
 	require.NoError(t, err)
 	require.Empty(t, batch.Jobs, "terminal expired job must not be claimable")
@@ -274,13 +284,15 @@ func TestClaimIntegrationDeadLettersExpiredFinalAttempt(t *testing.T) {
 // must requeue it, claim it again, and process it without consuming an extra
 // attempt for the reclaim itself.
 func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.reclaim"
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	id, err := queue.Enqueue(ctx, Job{
 		Kind:        kind,
 		Payload:     json.RawMessage(`{"reclaimed":true}`),
@@ -305,7 +317,7 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 	}
 	observed := make(chan observation, 1)
 
-	worker := NewWorker(pgtest.Scoped(pool), "reclaim-worker",
+	worker := NewWorker(pgtest.Scoped(pools), "reclaim-worker",
 		WithPollInterval(20*time.Millisecond),
 		WithLeaseDuration(time.Minute),
 	)
@@ -356,7 +368,9 @@ func TestWorkerIntegrationReclaimsExpiredLease(t *testing.T) {
 // job, so only the attempt predicate can reject its stale writes. It also
 // covers Heartbeat and Fail, plus the current owner's ability to finish.
 func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
@@ -366,7 +380,7 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 		workerID = "fence-worker"
 	)
 	payload := json.RawMessage(`{"secret":"must-survive"}`)
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{
 		Kind:        kind,
 		Payload:     payload,
 		MaxAttempts: 5,
@@ -374,7 +388,7 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	store := newPGStore(pgtest.Scoped(pool))
+	store := newPGStore(pgtest.Scoped(pools))
 
 	first, err := store.Claim(ctx, workerID, 1, time.Minute)
 	require.NoError(t, err)
@@ -446,13 +460,15 @@ func TestSucceedIntegrationFencesStaleAttempt(t *testing.T) {
 // the heartbeat to commit and then recheck locked_at, leaving the live job
 // running instead of stealing it.
 func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.heartbeat"
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{Kind: kind, MaxAttempts: 5})
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{Kind: kind, MaxAttempts: 5})
 	require.NoError(t, err)
 
 	_, err = pool.Exec(ctx, `
@@ -479,7 +495,7 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 	}
 	claimDone := make(chan claimOutcome, 1)
 	go func() {
-		batch, err := newPGStore(pgtest.Scoped(pool)).Claim(ctx, "claiming-worker", 1, time.Minute)
+		batch, err := newPGStore(pgtest.Scoped(pools)).Claim(ctx, "claiming-worker", 1, time.Minute)
 		claimDone <- claimOutcome{batch: batch, err: err}
 	}()
 
@@ -513,12 +529,14 @@ func TestClaimIntegrationDoesNotReclaimHeartbeatedJob(t *testing.T) {
 // TestQueueIntegrationEnqueueTx covers the transactional enqueue path,
 // including rollback leaving no row behind.
 func TestQueueIntegrationEnqueueTx(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
@@ -557,19 +575,21 @@ func TestQueueIntegrationEnqueueTx(t *testing.T) {
 // the same tenant/key returns the original row, a different tenant gets its
 // own row, and a rolled-back transactional enqueue leaves nothing behind.
 func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
-	var tenantTwo int64
+	var tenantTwo uuid.UUID
 	err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('jobs-once-tenant-2', 'Jobs Once Tenant 2') RETURNING id`,
 	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	key := "event:evt-1:handler:1"
 	firstID, created, err := queue.EnqueueOnce(ctx, Job{
 		Kind:           "events.test",
@@ -591,10 +611,10 @@ func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
 	var (
 		count    int
 		payload  []byte
-		storedID int64
+		storedID uuid.UUID
 	)
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*), min(id) FROM jobs WHERE tenant_id = 1 AND idempotency_key = $1`, key,
+		`SELECT count(*), (array_agg(id))[1] FROM jobs WHERE tenant_id = $1 AND idempotency_key = $2`, testID(1), key,
 	).Scan(&count, &storedID))
 	assert.Equal(t, 1, count)
 	assert.Equal(t, firstID, storedID)
@@ -660,21 +680,23 @@ func TestQueueIntegrationEnqueueOnceDeduplicates(t *testing.T) {
 // restored by the worker, while an empty context falls back to the default
 // tenant.
 func TestQueueIntegrationPropagatesTenant(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	// tenants.id is GENERATED ALWAYS AS IDENTITY: let the database assign it.
-	var tenantTwo int64
+	var tenantTwo uuid.UUID
 	err := pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('jobs-tenant-2', 'Jobs Tenant 2') RETURNING id`,
 	).Scan(&tenantTwo)
 	require.NoError(t, err)
 
 	tenantCtx := tenant.WithID(ctx, tenantTwo)
-	queue := NewQueue(pgtest.Scoped(pool))
-	store := newPGStore(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
+	store := newPGStore(pgtest.Scoped(pools))
 
 	// Transactional enqueue inherits the context tenant.
 	tx, err := pool.Begin(tenantCtx)
@@ -686,7 +708,7 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tx.Commit(tenantCtx))
 
-	var storedTenant int64
+	var storedTenant uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT tenant_id FROM jobs WHERE id = $1`, txID).Scan(&storedTenant))
 	assert.Equal(t, tenantTwo, storedTenant)
@@ -699,9 +721,16 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 	assert.Equal(t, tenantTwo, batch.Jobs[0].TenantID)
 	require.NoError(t, store.Succeed(tenantCtx, txID, "tenant-claim-worker", batch.Jobs[0].Attempts))
 
-	// An empty context falls back to the compatibility tenant. RunAt is in the
+	// A job with no tenant on the row or in the context is rejected: there is
+	// no compatibility tenant to attribute it to. RunAt is in the
 	// past so the immediate claim below does not race a small host/container
 	// clock skew on run_at <= now().
+	_, err = queue.Enqueue(context.Background(), Job{
+		Kind:  "jobs.integration.tenant.missing",
+		RunAt: time.Now().Add(-time.Minute),
+	})
+	require.ErrorIs(t, err, ErrInvalidTenant)
+
 	defaultID, err := queue.Enqueue(ctx, Job{
 		Kind:  "jobs.integration.tenant.default",
 		RunAt: time.Now().Add(-time.Minute),
@@ -720,8 +749,8 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 
 	// The worker runs the handler with the job's tenant in context.
 	const kind = "jobs.integration.tenant.handler"
-	received := make(chan int64, 1)
-	worker := NewWorker(pgtest.Scoped(pool), "tenant-integration-worker", WithPollInterval(20*time.Millisecond))
+	received := make(chan uuid.UUID, 1)
+	worker := NewWorker(pgtest.Scoped(pools), "tenant-integration-worker", WithPollInterval(20*time.Millisecond))
 	worker.Register(kind, func(ctx context.Context, _ json.RawMessage) error {
 		received <- tenant.IDFromContext(ctx)
 		return nil
@@ -743,23 +772,25 @@ func TestQueueIntegrationPropagatesTenant(t *testing.T) {
 // dead rows older than the window are removed; recent terminal rows and old
 // queued/running rows are retained.
 func TestPurgeTerminalIntegration(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
-	insertJob := func(kind, status string, age time.Duration) int64 {
+	insertJob := func(kind, status string, age time.Duration) uuid.UUID {
 		t.Helper()
-		var id int64
+		var id uuid.UUID
 		err := pool.QueryRow(ctx, `
-			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, lease_expires_at, locked_by)
+			INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, lease_expires_at, locked_by, tenant_id)
 			VALUES ($1, '{}'::jsonb, $2, now(), 3,
 			        now() - make_interval(secs => $3::double precision),
 			        now() - make_interval(secs => $3::double precision),
 			        CASE WHEN $2 = 'running' THEN now() + interval '1 hour' END,
-			        CASE WHEN $2 = 'running' THEN 'live-worker' END)
+			        CASE WHEN $2 = 'running' THEN 'live-worker' END, $4)
 			RETURNING id`,
-			kind, status, age.Seconds(),
+			kind, status, age.Seconds(), tenant.DefaultID,
 		).Scan(&id)
 		require.NoError(t, err)
 		return id
@@ -771,11 +802,11 @@ func TestPurgeTerminalIntegration(t *testing.T) {
 	oldQueued := insertJob("jobs.integration.retention.queued", "queued", 31*24*time.Hour)
 	oldRunning := insertJob("jobs.integration.retention.running", "running", 31*24*time.Hour)
 
-	purged, err := newPGStore(pgtest.Scoped(pool)).PurgeTerminal(ctx, 30*24*time.Hour)
+	purged, err := newPGStore(pgtest.Scoped(pools)).PurgeTerminal(ctx, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, int64(2), purged, "only old terminal rows must be deleted")
 
-	exists := func(id int64) bool {
+	exists := func(id uuid.UUID) bool {
 		t.Helper()
 		var found bool
 		require.NoError(t, pool.QueryRow(ctx,
@@ -790,19 +821,21 @@ func TestPurgeTerminalIntegration(t *testing.T) {
 	assert.True(t, exists(oldRunning), "an old running job must be retained")
 
 	// The manual Queue path must count deleted rows too.
-	before := metricValue(t, metrics.JobsPurgedTotal)
+	before := metricValue(t, "jobs_purged_total")
 	manual := insertJob("jobs.integration.retention.manual", "succeeded", 31*24*time.Hour)
-	purged, err = NewQueue(pgtest.Scoped(pool)).PurgeTerminal(ctx, 30*24*time.Hour)
+	purged, err = NewQueue(pgtest.Scoped(pools)).PurgeTerminal(ctx, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), purged)
 	assert.False(t, exists(manual))
-	assert.Equal(t, before+1, metricValue(t, metrics.JobsPurgedTotal))
+	assert.Equal(t, before+1, metricValue(t, "jobs_purged_total"))
 }
 
 // TestPurgeTerminalIntegrationBatches proves the purge drains more than one
 // batch and stops with a short final batch.
 func TestPurgeTerminalIntegrationBatches(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
@@ -810,22 +843,22 @@ func TestPurgeTerminalIntegrationBatches(t *testing.T) {
 	const batchKind = "jobs.integration.retention.batch"
 	oldRows := purgeBatchSize + 1
 	_, err := pool.Exec(ctx, `
-		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
+		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, tenant_id)
 		SELECT $1, '{}'::jsonb, 'dead', now(), 3,
-		       now() - interval '31 days', now() - interval '31 days'
+		       now() - interval '31 days', now() - interval '31 days', $3
 		FROM generate_series(1, $2::int)`,
-		batchKind, oldRows,
+		batchKind, oldRows, tenant.DefaultID,
 	)
 	require.NoError(t, err)
 
-	var recentID int64
+	var recentID uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx, `
-		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at)
-		VALUES ($1, '{}'::jsonb, 'succeeded', now(), 3, now(), now())
-		RETURNING id`, batchKind,
+		INSERT INTO jobs (kind, payload, status, run_at, max_attempts, created_at, updated_at, tenant_id)
+		VALUES ($1, '{}'::jsonb, 'succeeded', now(), 3, now(), now(), $2)
+		RETURNING id`, batchKind, tenant.DefaultID,
 	).Scan(&recentID))
 
-	purged, err := newPGStore(pgtest.Scoped(pool)).PurgeTerminal(ctx, 30*24*time.Hour)
+	purged, err := newPGStore(pgtest.Scoped(pools)).PurgeTerminal(ctx, 30*24*time.Hour)
 	require.NoError(t, err)
 	assert.Equal(t, int64(oldRows), purged)
 
@@ -844,19 +877,21 @@ func TestPurgeTerminalIntegrationBatches(t *testing.T) {
 // bounded batches while its running rows (owned by a live worker lease) and
 // every other tenant's rows are retained.
 func TestPurgeTenantIntegration(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 30*time.Second)
 	defer cancel()
 
-	var otherTenant int64
+	var otherTenant uuid.UUID
 	require.NoError(t, pool.QueryRow(ctx,
 		`INSERT INTO tenants (slug, name) VALUES ('jobs-purge-other', 'Other') RETURNING id`,
 	).Scan(&otherTenant))
 
-	insertJob := func(tenantID int64, status string) int64 {
+	insertJob := func(tenantID uuid.UUID, status string) uuid.UUID {
 		t.Helper()
-		var id int64
+		var id uuid.UUID
 		err := pool.QueryRow(ctx, `
 			INSERT INTO jobs (tenant_id, kind, payload, status, run_at, max_attempts, lease_expires_at, locked_by)
 			VALUES ($1, 'email.send.encrypted', '{"sealed":"pii"}'::jsonb, $2, now(), 3,
@@ -871,7 +906,6 @@ func TestPurgeTenantIntegration(t *testing.T) {
 
 	queued := insertJob(tenant.DefaultID, "queued")
 	succeeded := insertJob(tenant.DefaultID, "succeeded")
-	failed := insertJob(tenant.DefaultID, "failed")
 	dead := insertJob(tenant.DefaultID, "dead")
 	running := insertJob(tenant.DefaultID, "running")
 	otherQueued := insertJob(otherTenant, "queued")
@@ -887,17 +921,17 @@ func TestPurgeTenantIntegration(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pool), tenant.DefaultID))
+	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pools), tenant.DefaultID))
 
-	exists := func(id int64) bool {
+	exists := func(id uuid.UUID) bool {
 		t.Helper()
 		var found bool
 		require.NoError(t, pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)`, id).Scan(&found))
 		return found
 	}
-	for name, id := range map[string]int64{
-		"queued": queued, "succeeded": succeeded, "failed": failed, "dead": dead,
+	for name, id := range map[string]uuid.UUID{
+		"queued": queued, "succeeded": succeeded, "dead": dead,
 	} {
 		assert.False(t, exists(id), "a %s job of the purged tenant must be deleted", name)
 	}
@@ -911,7 +945,7 @@ func TestPurgeTenantIntegration(t *testing.T) {
 	assert.Zero(t, remaining, "the batch loop must drain every non-running row")
 
 	// Idempotent: a second purge is a successful no-op.
-	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pool), tenant.DefaultID))
+	require.NoError(t, PurgeTenant(ctx, pgtest.Scoped(pools), tenant.DefaultID))
 	assert.True(t, exists(running))
 	assert.True(t, exists(otherQueued))
 }
@@ -920,7 +954,9 @@ func TestPurgeTenantIntegration(t *testing.T) {
 // wiring used by cmd/api stores an encrypted envelope instead of the reset
 // link, and that EmailHandler still delivers the decoded message.
 func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
@@ -935,7 +971,7 @@ func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 		HTML:    `<a href="https://app.example/reset?token=secret-token">Reset</a>`,
 	}
 
-	sender := NewQueuedSender(NewQueue(pgtest.Scoped(pool)), WithPayloadCodec(codec))
+	sender := NewQueuedSender(NewQueue(pgtest.Scoped(pools)), codec)
 	require.NoError(t, sender.Send(ctx, msg))
 
 	var raw []byte
@@ -962,7 +998,7 @@ func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 	assert.Equal(t, msg, decoded)
 
 	delivered := &recordingEmailSender{}
-	require.NoError(t, EmailHandler(delivered, WithEmailPayloadCodec(codec))(
+	require.NoError(t, EmailHandler(delivered, codec)(
 		ctx, json.RawMessage(raw),
 	))
 	require.Len(t, delivered.messages, 1)
@@ -972,7 +1008,9 @@ func TestQueuedSenderIntegrationEncryptsEmailPayload(t *testing.T) {
 // TestQueuedSenderIntegrationSendTxEncryptsEmailPayload covers the
 // transactional enqueue path with the same codec.
 func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
@@ -986,7 +1024,7 @@ func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
 		Body:    "Verify: https://app.example/verify?token=tx-secret-token",
 	}
 
-	sender := NewQueuedSender(NewQueue(pgtest.Scoped(pool)), WithPayloadCodec(codec))
+	sender := NewQueuedSender(NewQueue(pgtest.Scoped(pools)), codec)
 
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
@@ -1013,56 +1051,9 @@ func TestQueuedSenderIntegrationSendTxEncryptsEmailPayload(t *testing.T) {
 // init schema to it, and returns a pool whose connections use that schema.
 // TEST_DATABASE_URL must point at a PostgreSQL database where the user may
 // create schemas.
-func setupIntegrationDB(t *testing.T) *pgxpool.Pool {
+func setupIntegrationDB(t *testing.T) *pgtest.Fixture {
 	t.Helper()
-
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping jobs integration test")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	adminCfg, err := pgxpool.ParseConfig(dsn)
-	require.NoError(t, err)
-	admin, err := pgxpool.NewWithConfig(ctx, adminCfg)
-	require.NoError(t, err)
-	t.Cleanup(admin.Close)
-	require.NoError(t, admin.Ping(ctx))
-
-	schema := fmt.Sprintf("jobs_test_%d", time.Now().UnixNano())
-	schemaIdent := pgx.Identifier{schema}.Sanitize()
-	_, err = admin.Exec(ctx, "CREATE SCHEMA "+schemaIdent)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cleanupCancel()
-		_, _ = admin.Exec(cleanupCtx, "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE")
-	})
-
-	migrations, err := integrationSchema(t)
-	require.NoError(t, err)
-
-	conn, err := admin.Acquire(ctx)
-	require.NoError(t, err)
-	defer conn.Release()
-
-	_, err = conn.Exec(ctx, "SET search_path TO "+schemaIdent)
-	require.NoError(t, err)
-	// One Exec per file, like golang-migrate: a multi-statement string runs in
-	// an implicit transaction, which CREATE INDEX CONCURRENTLY rejects.
-	for _, migration := range migrations {
-		if _, err := conn.Conn().PgConn().Exec(ctx, migration.sql).ReadAll(); err != nil {
-			t.Fatalf("apply %s: %v", migration.name, err)
-		}
-	}
-
-	pools, err := pgtest.OpenAppPools(ctx, dsn, schema)
-	require.NoError(t, err)
-	t.Cleanup(func() { pgtest.ClosePools(pools) })
-
-	return pools.Bypass
+	return pgtest.New(t)
 }
 
 // integrationMigration is one up migration file.
@@ -1100,13 +1091,15 @@ func integrationSchema(t *testing.T) ([]integrationMigration, error) {
 // healthy (its lease has not expired), so the short-lease worker must never
 // reclaim it: expiry is the row's own deadline, not the claimer's lease.
 func TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
 
 	const kind = "jobs.integration.mixed_lease"
-	id, err := NewQueue(pgtest.Scoped(pool)).Enqueue(ctx, Job{Kind: kind, MaxAttempts: 5})
+	id, err := NewQueue(pgtest.Scoped(pools)).Enqueue(ctx, Job{Kind: kind, MaxAttempts: 5})
 	require.NoError(t, err)
 
 	var (
@@ -1140,7 +1133,7 @@ func TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob(t *testing.T) {
 		}
 	}
 
-	long := NewWorker(pgtest.Scoped(pool), "long-lease-worker",
+	long := NewWorker(pgtest.Scoped(pools), "long-lease-worker",
 		WithPollInterval(10*time.Millisecond),
 		WithLeaseDuration(time.Minute),
 	)
@@ -1153,7 +1146,7 @@ func TestWorkerIntegrationMixedLeasesDoNotStealHealthyJob(t *testing.T) {
 		t.Fatal("long-lease worker did not start the job")
 	}
 
-	short := NewWorker(pgtest.Scoped(pool), "short-lease-worker",
+	short := NewWorker(pgtest.Scoped(pools), "short-lease-worker",
 		WithPollInterval(10*time.Millisecond),
 		WithLeaseDuration(100*time.Millisecond),
 		WithHeartbeatInterval(20*time.Millisecond),
@@ -1203,7 +1196,9 @@ func runIntegrationWorker(t *testing.T, worker *Worker) {
 // span linked to it. The link, rather than parentage, keeps retries independent
 // while preserving causality in the trace UI.
 func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
-	pool := setupIntegrationDB(t)
+	fx := setupIntegrationDB(t)
+	pools := fx.Pools
+	pool := fx.Bypass
 
 	ctx, cancel := context.WithTimeout(tenant.WithID(context.Background(), tenant.DefaultID), 20*time.Second)
 	defer cancel()
@@ -1220,7 +1215,7 @@ func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 	traceparent := tracing.CaptureRemoteContext(enqueueCtx)
 	require.NotEmpty(t, traceparent)
 
-	queue := NewQueue(pgtest.Scoped(pool))
+	queue := NewQueue(pgtest.Scoped(pools))
 	id, err := queue.Enqueue(enqueueCtx, Job{
 		Kind:        "jobs.integration.traced",
 		Payload:     json.RawMessage(`{"value":1}`),
@@ -1246,7 +1241,7 @@ func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 	require.NotNil(t, onceStored)
 	assert.Equal(t, traceparent, *onceStored)
 
-	worker := NewWorker(pgtest.Scoped(pool), "trace-integration-worker",
+	worker := NewWorker(pgtest.Scoped(pools), "trace-integration-worker",
 		WithPollInterval(20*time.Millisecond),
 		WithTracerProvider(provider),
 	)
@@ -1262,7 +1257,7 @@ func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		for _, span := range recorder.Ended() {
-			if span.Name() == "job.process" {
+			if span.Name() == "jobs.integration.traced process" {
 				return true
 			}
 		}
@@ -1271,13 +1266,13 @@ func TestWorkerIntegrationPropagatesTraceParent(t *testing.T) {
 
 	var jobSpan sdktrace.ReadOnlySpan
 	for _, span := range recorder.Ended() {
-		if span.Name() == "job.process" {
+		if span.Name() == "jobs.integration.traced process" {
 			jobSpan = span
 			break
 		}
 	}
 	require.NotNil(t, jobSpan)
-	assert.False(t, jobSpan.Parent().IsValid(), "job.process must be a new root")
+	assert.False(t, jobSpan.Parent().IsValid(), "the job process span must be a new root")
 	require.Len(t, jobSpan.Links(), 1)
 	assert.Equal(t, enqueueSnapshot.TraceID(), jobSpan.Links()[0].SpanContext.TraceID())
 	assert.Equal(t, enqueueSnapshot.SpanID(), jobSpan.Links()[0].SpanContext.SpanID())

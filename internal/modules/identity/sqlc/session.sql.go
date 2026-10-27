@@ -9,6 +9,7 @@ import (
 	"context"
 	"net/netip"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -29,8 +30,8 @@ WHERE r.token_hash = $2 AND r.tenant_id = $3
 
 type ClassifyRefreshTokenRotationParams struct {
 	UsedAfter pgtype.Timestamptz `json:"used_after"`
-	TokenHash string             `json:"token_hash"`
-	TenantID  int64              `json:"tenant_id"`
+	TokenHash []byte             `json:"token_hash"`
+	TenantID  uuid.UUID          `json:"tenant_id"`
 }
 
 type ClassifyRefreshTokenRotationRow struct {
@@ -62,6 +63,8 @@ WHERE m.tenant_id = $6 AND m.user_id = $7
   AND (
       'otp' = ANY($4::text[])
       OR 'rc' = ANY($4::text[])
+      OR 'hwk' = ANY($4::text[])
+      OR 'swk' = ANY($4::text[])
       OR NOT EXISTS (
           SELECT 1 FROM mfa_factors f
           WHERE f.user_id = u.id AND f.confirmed_at IS NOT NULL
@@ -76,21 +79,22 @@ type CreateSessionParams struct {
 	Ip            *netip.Addr        `json:"ip"`
 	Amr           []string           `json:"amr"`
 	MfaVerifiedAt pgtype.Timestamptz `json:"mfa_verified_at"`
-	TenantID      int64              `json:"tenant_id"`
-	UserID        int64              `json:"user_id"`
+	TenantID      uuid.UUID          `json:"tenant_id"`
+	UserID        uuid.UUID          `json:"user_id"`
 	TokenVersion  int32              `json:"token_version"`
 }
 
 // A session is only created for an active member whose token version still
-// equals the one the caller authenticated at. This closes the bcrypt-length
+// equals the one the caller authenticated at. This closes the password-check
 // window where a password change commits after the password check, and the
 // MFA window where a login read "MFA not required" before a factor was
 // confirmed: bumping users.token_version on every credential/MFA change makes
 // the stale version check fail. The factor guard is the second line: once a
-// confirmed factor exists, a session whose amr has no otp/rc can never be
-// created, whatever the caller decided earlier. mfa_verified_at is set only
-// when the session already carries an otp/rc method (MFA verify or Google +
-// MFA); a first-factor session leaves it NULL.
+// confirmed TOTP factor exists, a session whose amr has no otp/rc/hwk/swk can
+// never be created, whatever the caller decided earlier. mfa_verified_at is
+// set only when the session already carries a second-factor method (MFA
+// verify, passkey login, or Google + MFA); a first-factor session leaves it
+// NULL.
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, createSession,
 		arg.ExpiresAt,
@@ -128,8 +132,8 @@ WHERE tenant_id = $1 AND session_id = $2
 `
 
 type DeleteSessionRefreshTokensParams struct {
-	TenantID  int64 `json:"tenant_id"`
-	SessionID int64 `json:"session_id"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	SessionID uuid.UUID `json:"session_id"`
 }
 
 // A re-issued session replaces its refresh-token family. A token minted before
@@ -147,8 +151,8 @@ WHERE tenant_id = $1 AND id = $2
 `
 
 type GetSessionParams struct {
-	TenantID int64 `json:"tenant_id"`
-	ID       int64 `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	ID       uuid.UUID `json:"id"`
 }
 
 func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session, error) {
@@ -174,7 +178,7 @@ func (q *Queries) GetSession(ctx context.Context, arg GetSessionParams) (Session
 }
 
 const getSessionState = `-- name: GetSessionState :one
-SELECT s.tenant_id, s.revoked_at, s.expires_at, s.mfa_verified_at, m.status AS membership_status,
+SELECT s.tenant_id, s.revoked_at, s.expires_at, s.mfa_verified_at, s.amr, m.status AS membership_status,
        u.token_version, u.status AS user_status,
        CASE
            WHEN t.status = 'active'
@@ -219,15 +223,16 @@ WHERE s.id = $1 AND s.user_id = $2
 `
 
 type GetSessionStateParams struct {
-	ID     int64 `json:"id"`
-	UserID int64 `json:"user_id"`
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
 }
 
 type GetSessionStateRow struct {
-	TenantID         int64              `json:"tenant_id"`
+	TenantID         uuid.UUID          `json:"tenant_id"`
 	RevokedAt        pgtype.Timestamptz `json:"revoked_at"`
 	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
 	MfaVerifiedAt    pgtype.Timestamptz `json:"mfa_verified_at"`
+	Amr              []string           `json:"amr"`
 	MembershipStatus string             `json:"membership_status"`
 	TokenVersion     int32              `json:"token_version"`
 	UserStatus       string             `json:"user_status"`
@@ -249,6 +254,7 @@ func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams
 		&i.RevokedAt,
 		&i.ExpiresAt,
 		&i.MfaVerifiedAt,
+		&i.Amr,
 		&i.MembershipStatus,
 		&i.TokenVersion,
 		&i.UserStatus,
@@ -262,19 +268,19 @@ func (q *Queries) GetSessionState(ctx context.Context, arg GetSessionStateParams
 
 const listLiveSessionsCursor = `-- name: ListLiveSessionsCursor :many
 SELECT id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr, mfa_verified_at, last_used_at, revoked_at, revoked_reason, created_at, updated_at FROM sessions
-WHERE tenant_id = $1::bigint AND user_id = $2::bigint
+WHERE tenant_id = $1::uuid AND user_id = $2::uuid
   AND revoked_at IS NULL
   AND expires_at > NOW()
-  AND (created_at, id) < ($3::timestamptz, $4::bigint)
+  AND (created_at, id) < ($3::timestamptz, $4::uuid)
 ORDER BY created_at DESC, id DESC
 LIMIT $5::int
 `
 
 type ListLiveSessionsCursorParams struct {
-	TenantID        int64              `json:"tenant_id"`
-	UserID          int64              `json:"user_id"`
+	TenantID        uuid.UUID          `json:"tenant_id"`
+	UserID          uuid.UUID          `json:"user_id"`
 	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        int64              `json:"cursor_id"`
+	CursorID        uuid.UUID          `json:"cursor_id"`
 	RowLimit        int32              `json:"row_limit"`
 }
 
@@ -328,9 +334,9 @@ RETURNING mfa_verified_at
 `
 
 type MarkSessionMFAVerifiedParams struct {
-	TenantID int64 `json:"tenant_id"`
-	UserID   int64 `json:"user_id"`
-	ID       int64 `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
 }
 
 // Step-up: record a fresh second-factor proof on the session that performed
@@ -338,6 +344,38 @@ type MarkSessionMFAVerifiedParams struct {
 // instead of refreshing a session the caller does not hold.
 func (q *Queries) MarkSessionMFAVerified(ctx context.Context, arg MarkSessionMFAVerifiedParams) (pgtype.Timestamptz, error) {
 	row := q.db.QueryRow(ctx, markSessionMFAVerified, arg.TenantID, arg.UserID, arg.ID)
+	var mfa_verified_at pgtype.Timestamptz
+	err := row.Scan(&mfa_verified_at)
+	return mfa_verified_at, err
+}
+
+const markSessionMFAVerifiedWithMethod = `-- name: MarkSessionMFAVerifiedWithMethod :one
+UPDATE sessions
+SET mfa_verified_at = NOW(), updated_at = NOW(),
+    amr = ARRAY(SELECT DISTINCT unnest(amr || $1::text))
+WHERE tenant_id = $2 AND user_id = $3 AND id = $4
+  AND revoked_at IS NULL
+RETURNING mfa_verified_at
+`
+
+type MarkSessionMFAVerifiedWithMethodParams struct {
+	Method   string    `json:"method"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	UserID   uuid.UUID `json:"user_id"`
+	ID       uuid.UUID `json:"id"`
+}
+
+// Passkey step-up: record the fresh proof and add the phishing-resistant amr
+// method to the session, so later RequireMFA checks accept the session without
+// re-issuing its tokens. Tenant-scoped and fail-closed on a foreign/revoked
+// session.
+func (q *Queries) MarkSessionMFAVerifiedWithMethod(ctx context.Context, arg MarkSessionMFAVerifiedWithMethodParams) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, markSessionMFAVerifiedWithMethod,
+		arg.Method,
+		arg.TenantID,
+		arg.UserID,
+		arg.ID,
+	)
 	var mfa_verified_at pgtype.Timestamptz
 	err := row.Scan(&mfa_verified_at)
 	return mfa_verified_at, err
@@ -387,11 +425,11 @@ RETURNING id, tenant_id, user_id, token_version, expires_at, user_agent, ip, amr
 `
 
 type RestampSessionParams struct {
-	TokenVersion int32    `json:"token_version"`
-	Amr          []string `json:"amr"`
-	TenantID     int64    `json:"tenant_id"`
-	UserID       int64    `json:"user_id"`
-	ID           int64    `json:"id"`
+	TokenVersion int32     `json:"token_version"`
+	Amr          []string  `json:"amr"`
+	TenantID     uuid.UUID `json:"tenant_id"`
+	UserID       uuid.UUID `json:"user_id"`
+	ID           uuid.UUID `json:"id"`
 }
 
 // Re-issues the session that performed an MFA change under the user's new
@@ -436,7 +474,7 @@ WHERE user_id = $2 AND revoked_at IS NULL
 
 type RevokeAllUserSessionsParams struct {
 	Reason pgtype.Text `json:"reason"`
-	UserID int64       `json:"user_id"`
+	UserID uuid.UUID   `json:"user_id"`
 }
 
 // Deliberately not tenant-scoped: global credential events (password, email,
@@ -454,8 +492,8 @@ WHERE user_id = $2 AND id <> $3 AND revoked_at IS NULL
 
 type RevokeOtherUserSessionsParams struct {
 	Reason pgtype.Text `json:"reason"`
-	UserID int64       `json:"user_id"`
-	KeepID int64       `json:"keep_id"`
+	UserID uuid.UUID   `json:"user_id"`
+	KeepID uuid.UUID   `json:"keep_id"`
 }
 
 // An MFA change ends every other sign-in (every tenant) but keeps the session
@@ -474,9 +512,9 @@ WHERE tenant_id = $2 AND user_id = $3 AND id = $4
 
 type RevokeSessionParams struct {
 	Reason   pgtype.Text `json:"reason"`
-	TenantID int64       `json:"tenant_id"`
-	UserID   int64       `json:"user_id"`
-	ID       int64       `json:"id"`
+	TenantID uuid.UUID   `json:"tenant_id"`
+	UserID   uuid.UUID   `json:"user_id"`
+	ID       uuid.UUID   `json:"id"`
 }
 
 func (q *Queries) RevokeSession(ctx context.Context, arg RevokeSessionParams) (int64, error) {
@@ -504,15 +542,15 @@ RETURNING s.user_id
 
 type RevokeSessionByRefreshTokenParams struct {
 	Reason    pgtype.Text `json:"reason"`
-	TokenHash string      `json:"token_hash"`
+	TokenHash []byte      `json:"token_hash"`
 }
 
 // Possession-based (logout and refresh-token reuse): presenting the opaque
 // token is sufficient to revoke its session, even without X-Tenant-Slug. It
 // cannot read or mint anything, so it does not weaken tenant isolation.
-func (q *Queries) RevokeSessionByRefreshToken(ctx context.Context, arg RevokeSessionByRefreshTokenParams) (int64, error) {
+func (q *Queries) RevokeSessionByRefreshToken(ctx context.Context, arg RevokeSessionByRefreshTokenParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, revokeSessionByRefreshToken, arg.Reason, arg.TokenHash)
-	var user_id int64
+	var user_id uuid.UUID
 	err := row.Scan(&user_id)
 	return user_id, err
 }
@@ -528,7 +566,7 @@ WHERE s.user_id = $2 AND u.id = s.user_id
 
 type RevokeStaleUserSessionsParams struct {
 	Reason pgtype.Text `json:"reason"`
-	UserID int64       `json:"user_id"`
+	UserID uuid.UUID   `json:"user_id"`
 }
 
 // The after-commit cleanup of a token-version bump: every session of the user
@@ -550,8 +588,8 @@ WHERE tenant_id = $2 AND user_id = $3 AND revoked_at IS NULL
 
 type RevokeTenantUserSessionsParams struct {
 	Reason   pgtype.Text `json:"reason"`
-	TenantID int64       `json:"tenant_id"`
-	UserID   int64       `json:"user_id"`
+	TenantID uuid.UUID   `json:"tenant_id"`
+	UserID   uuid.UUID   `json:"user_id"`
 }
 
 func (q *Queries) RevokeTenantUserSessions(ctx context.Context, arg RevokeTenantUserSessionsParams) error {
@@ -568,8 +606,8 @@ WHERE tenant_id = $3 AND id = $4
 type TouchSessionParams struct {
 	UserAgent pgtype.Text `json:"user_agent"`
 	Ip        *netip.Addr `json:"ip"`
-	TenantID  int64       `json:"tenant_id"`
-	ID        int64       `json:"id"`
+	TenantID  uuid.UUID   `json:"tenant_id"`
+	ID        uuid.UUID   `json:"id"`
 }
 
 func (q *Queries) TouchSession(ctx context.Context, arg TouchSessionParams) error {

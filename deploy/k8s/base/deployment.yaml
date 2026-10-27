@@ -9,9 +9,12 @@ metadata:
     app.kubernetes.io/part-of: fiber-boilerplate
     app.kubernetes.io/component: api
 spec:
-  # This Deployment never runs migrations and has no migration initContainer.
-  # Apply migration/job.yaml and wait for it to complete before rolling out
-  # this Deployment (see README.md).
+  # The API only serves HTTP and enqueues jobs: it never claims them. The
+  # separate worker Deployment (base/worker) runs the job worker, the scheduler,
+  # and module background loops. This Deployment never runs migrations and has
+  # no migration initContainer: apply migration/job.yaml and wait for it to
+  # complete before rolling out (see README.md).
+  #
   # The HPA owns the replica count (environment overlays set min/max); do not
   # add spec.replicas here, or the two controllers will fight over it.
   revisionHistoryLimit: 3
@@ -34,23 +37,23 @@ spec:
         app.kubernetes.io/part-of: fiber-boilerplate
         app.kubernetes.io/component: api
     spec:
+      serviceAccountName: fiber-boilerplate-api
       # The API does not call the Kubernetes API.
       automountServiceAccountToken: false
       enableServiceLinks: false
-      # 5s preStop + the API's 20s shared shutdown budget (HTTP drain, job
-      # worker/scheduler, module background loops, async goroutines, span flush,
-      # pool close) + 5s margin. Raise this together with config.ShutdownBudget;
-      # APP_REQUEST_TIMEOUT must stay within the budget minus its 5s reserve and
-      # the 3s post-handler reserve (12s max, enforced by config validation).
+      # 5s preStop sleep + the API's 20s shared shutdown budget (HTTP drain,
+      # async goroutines, span flush, pool close) + 5s margin. Raise this
+      # together with config.ShutdownBudget; APP_REQUEST_TIMEOUT must stay
+      # within the budget minus its reserves (12s max, enforced by config
+      # validation).
       terminationGracePeriodSeconds: 30
       securityContext:
-        # Match the Docker image user: appuser is UID 100 / GID 101. The
-        # appuser owns /app/uploads in the image, so local PVCs should use the
-        # same fsGroup or be made writable for 100:101.
+        # distroless/static:nonroot runs as UID/GID 65532. fsGroup lets the
+        # mounted Secret files (defaultMode 0440) be read by the group.
         runAsNonRoot: true
-        runAsUser: 100
-        runAsGroup: 101
-        fsGroup: 101
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
@@ -92,8 +95,42 @@ spec:
           envFrom:
             - configMapRef:
                 name: fiber-boilerplate-config
-            - secretRef:
-                name: fiber-boilerplate-secrets
+          env:
+            - name: APP_ROLE
+              value: api
+            # Go's soft memory limit follows the container limit (resourceFieldRef
+            # with divisor "1" yields bytes). The overlay's memory patch therefore
+            # adjusts GOMEMLIMIT automatically.
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: api
+                  resource: limits.memory
+                  divisor: "1"
+            # Secret values are files, never env values: the Secret is mounted
+            # below and config resolves each <NAME>_FILE at startup. Mounting
+            # also survives External Secrets refreshing the Secret (the kubelet
+            # updates the projected files) without an env/envFrom snapshot.
+            - name: JWT_SECRET_FILE
+              value: /var/run/secrets/fiber-boilerplate/JWT_SECRET
+            - name: DB_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_PASSWORD
+            - name: DB_BYPASS_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/DB_BYPASS_PASSWORD
+            - name: DATA_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/DATA_ENCRYPTION_KEY
+            - name: WEBHOOK_SECRET_ENCRYPTION_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/WEBHOOK_SECRET_ENCRYPTION_KEY
+            - name: OAUTH_STATE_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/OAUTH_STATE_KEY
+            - name: METRICS_AUTH_TOKEN_FILE
+              value: /var/run/secrets/fiber-boilerplate/METRICS_AUTH_TOKEN
+            - name: REDIS_URL_FILE
+              value: /var/run/secrets/fiber-boilerplate/REDIS_URL
+            - name: STORAGE_S3_SECRET_KEY_FILE
+              value: /var/run/secrets/fiber-boilerplate/STORAGE_S3_SECRET_KEY
+            - name: SMTP_PASSWORD_FILE
+              value: /var/run/secrets/fiber-boilerplate/SMTP_PASSWORD
           resources:
             requests:
               cpu: 250m
@@ -103,8 +140,8 @@ spec:
               memory: 512Mi
           securityContext:
             runAsNonRoot: true
-            runAsUser: 100
-            runAsGroup: 101
+            runAsUser: 65532
+            runAsGroup: 65532
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -137,15 +174,20 @@ spec:
           lifecycle:
             preStop:
               # Give kube-proxy/ingress time to stop sending new traffic before
-              # the process receives SIGTERM and drains its job worker.
-              exec:
-                command: ["/bin/sh", "-c", "sleep 5"]
+              # the process receives SIGTERM and drains in-flight requests. This
+              # is the Kubernetes-native sleep (1.30+): no shell in the
+              # distroless image.
+              sleep:
+                seconds: 5
           # Writable scratch space. Fiber buffers multipart bodies by default,
           # but a writable /tmp avoids surprises from library temp files while
           # the image root stays read-only.
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: secrets
+              mountPath: /var/run/secrets/fiber-boilerplate
+              readOnly: true
           # Production default is STORAGE_DRIVER=s3, so the root filesystem can
           # stay read-only. For STORAGE_DRIVER=local, the app writes under
           # /app/uploads and needs a WRITABLE volume shared by every replica.
@@ -158,6 +200,12 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 512Mi
+        - name: secrets
+          secret:
+            secretName: fiber-boilerplate-secrets
+            # 0440 + fsGroup 65532 lets the nonroot user read the files without
+            # making them world-readable.
+            defaultMode: 0440
       # - name: uploads
       #   persistentVolumeClaim:
       #     claimName: fiber-boilerplate-uploads

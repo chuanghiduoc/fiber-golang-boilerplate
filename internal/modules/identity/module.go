@@ -3,34 +3,35 @@ package identity
 import (
 	"context"
 	"io/fs"
-
-	"github.com/gofiber/fiber/v3"
+	"net/http"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
-	notificationcontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/notifications"
+	identitycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/identity"
 	privacycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/privacy"
 	tenancycontracts "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/contracts/tenancy"
 	identitycatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/catalog"
 	identityhandler "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/handler"
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit/audithttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/authz/authzhttp"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/middleware"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/httpapi"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/google/uuid"
 )
 
 // Module owns authentication, user profiles, sessions, and token lifecycle.
 type Module struct {
-	auth  *identityhandler.AuthHandler
-	users *identityhandler.UserHandler
+	auth    *identityhandler.AuthHandler
+	users   *identityhandler.UserHandler
+	members *identityhandler.MemberHandler
 	// sessions and invitations are set by Build (or WithSessions /
 	// WithInvitations); their routes are mounted only when present.
 	sessions    *identityhandler.SessionHandler
 	invitations *identityhandler.InvitationHandler
 	mfa         *identityhandler.MFAHandler
-	mfaStepUp   *identityhandler.MFAStepUpHandler
+	passkeys    *identityhandler.PasskeyHandler
 	privacy     *identityhandler.PrivacyHandler
 	roles       *identityhandler.RoleHandler
 	platform    *identityhandler.PlatformHandler
@@ -42,12 +43,15 @@ type Module struct {
 	privacySvc   *identityservice.PrivacyService
 	tenantPurger *identityservice.TenantPurgeService
 	startup      func(ctx context.Context) error
+
+	provides Provides
 }
 
 var (
 	_ app.JobProvider      = (*Module)(nil)
 	_ app.ScheduleProvider = (*Module)(nil)
 	_ app.PrivacyProvider  = (*Module)(nil)
+	_ app.RouteProvider    = (*Module)(nil)
 )
 
 // New builds the module from its handlers. Production uses Build.
@@ -61,7 +65,7 @@ func (m *Module) Name() string { return identitycatalog.Owner }
 func (m *Module) Permissions() []authz.Grant { return identitycatalog.Permissions() }
 
 // ErrorCodes implements app.ErrorProvider.
-func (m *Module) ErrorCodes() map[apperror.Code]apperror.Spec { return identitycatalog.ErrorCodes() }
+func (m *Module) Errors() []apperror.Spec { return identitycatalog.Errors() }
 
 // FeatureFlags implements app.FlagProvider.
 func (m *Module) FeatureFlags() []features.Definition { return identitycatalog.FeatureFlags() }
@@ -69,149 +73,428 @@ func (m *Module) FeatureFlags() []features.Definition { return identitycatalog.F
 // Locales implements app.LocaleProvider.
 func (m *Module) Locales() fs.FS { return identitycatalog.Locales() }
 
-func (m *Module) RegisterRoutes(v1 fiber.Router, deps app.Deps) {
-	cfg := deps.Config
-	rl := deps.Limiters
-	// Registration, Google OAuth, and email verification are gated inside the
-	// handler because the OAuth callback evaluates its signed-state tenant.
+const (
+	authTag     = "auth"
+	meTag       = "me"
+	membersTag  = "members"
+	inviteTag   = "invitations"
+	rolesTag    = "roles"
+	statsTag    = "stats"
+	platformTag = "platform"
+)
+
+// RegisterRoutes implements app.RouteProvider. Every operation is declared
+// through httpapi.Register with its exact policy from docs/api-routes.md.
+func (m *Module) RegisterRoutes(api *httpapi.API, deps app.Deps) {
 	m.auth.SetFeatureFlags(deps.Flags)
-	guard := func(action, resource string) fiber.Handler {
-		return audithttp.Guard(deps.Audit, audithttp.Policy{
-			Mode:     audithttp.ModeRequired,
-			Action:   action,
-			Resource: resource,
-		})
+	keyring := deps.Config.JWT.Keyring()
+	refreshCookie := identityhandler.RefreshCookieConfig{
+		Enabled: deps.Config.JWT.RefreshCookie,
+		TTL:     deps.Config.JWT.RefreshTTL,
+		Origins: deps.Config.CORS.Origins(),
 	}
-
-	auth := v1.Group("/auth")
-	// Register is Tier 1: UserService writes auth.registered in the account
-	// creation transaction, so no route-level intent row is added.
-	auth.Post("/register", rl.Strict, deps.Idempotency, m.auth.Register)
-	auth.Post("/login", rl.Strict, guard("auth.login", "auth"), m.auth.Login)
-	auth.Post("/refresh", rl.Normal, guard("auth.refresh", "auth"), m.auth.Refresh)
-	auth.Post("/logout", rl.Normal, guard("auth.logout", "auth"), m.auth.Logout)
-	// logout-all stays JWT-only: it revokes the caller's login sessions
-	// (refresh tokens + token version), which an API key does not have.
-	auth.Post("/logout-all", middleware.JWTAuthKeys(cfg.JWT.Keyring(), deps.Sessions), rl.Normal, authzhttp.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.logout_all", "auth"), m.auth.LogoutAll)
-	auth.Post("/forgot-password", rl.Strict, guard("auth.password_reset_requested", "auth"), m.auth.ForgotPassword)
-	auth.Post("/reset-password", rl.Strict, guard("auth.password_reset_completed", "auth"), m.auth.ResetPassword)
-	auth.Post("/verify-email", rl.Normal, guard("auth.email_verified", "auth"), m.auth.VerifyEmail)
-	auth.Post("/resend-verification", rl.Normal, guard("auth.verification_resent", "auth"), m.auth.ResendVerification)
-	auth.Get("/google", rl.Normal, m.auth.GoogleRedirect)
-	// The one-time code redeemed here is minted by the callback and expires
-	// after 60 seconds; the strict limiter bounds guessing at 256 bits.
-	auth.Post("/google/exchange", rl.Strict, m.auth.GoogleExchange)
-	// The callback is Tier 1: tenant middleware skips it and the tenant comes
-	// from the signed state, which a route-level Guard would record too early
-	// (tenant 1, anonymous). UserService writes auth.google_login with the
-	// state tenant and the signed-in user in the sign-in transaction.
-	auth.Get("/google/callback", rl.Normal, m.auth.GoogleCallback)
-
-	// Sessions belong to JWT sign-ins; an API key has none, so these routes
-	// are JWT-only like logout-all.
-	jwtOnly := middleware.JWTAuthKeys(cfg.JWT.Keyring(), deps.Sessions)
+	m.auth.SetRefreshCookie(refreshCookie)
 	if m.sessions != nil {
-		auth.Get("/sessions", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.sessions.List)
-		auth.Delete("/sessions/:id", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionSessionsRevoke), guard("auth.session_revoked", "session"), m.sessions.Revoke)
+		m.sessions.SetJWTKeyring(keyring)
 	}
+	if m.mfa != nil {
+		m.mfa.SetJWTKeyring(keyring)
+		m.mfa.SetRefreshCookie(refreshCookie)
+	}
+	if m.passkeys != nil {
+		m.passkeys.SetRefreshCookie(refreshCookie)
+	}
+
+	guard := func(action, resource string) *httpapi.GuardPolicy {
+		return &httpapi.GuardPolicy{Action: action, Resource: resource}
+	}
+
+	m.registerAuthRoutes(api, guard)
+	m.registerPasskeyRoutes(api, deps)
+	m.registerMeRoutes(api, guard)
+	m.registerMemberRoutes(api)
+	m.registerInvitationRoutes(api)
+	m.registerRoleRoutes(api)
+	m.registerPlatformRoutes(api)
+}
+
+func (m *Module) registerAuthRoutes(api *httpapi.API, guard func(string, string) *httpapi.GuardPolicy) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/register", OperationID: "register",
+		Tags: []string{authTag}, Summary: "Register an account",
+		Description: "Create a global account and an active membership in the request tenant.",
+	}, httpapi.Policy{Public: true, Feature: identitycatalog.KeyUserRegistration, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "auth.registered"}}, m.auth.Register)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/login", OperationID: "login",
+		Tags: []string{authTag}, Summary: "Sign in",
+		Description: "Authenticate the password and return a token pair, or an MFA challenge when a confirmed factor exists.",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, NoStore: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.login", "auth")}}, m.auth.Login)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/refresh", OperationID: "refresh",
+		Tags: []string{authTag}, Summary: "Rotate a refresh token",
+	}, httpapi.Policy{Public: true, CookieAuth: true, RateLimit: httpapi.RateLimitNormal, NoStore: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.refresh", "auth")}}, m.auth.Refresh)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/logout", OperationID: "logout",
+		Tags: []string{authTag}, Summary: "Revoke a session by refresh-token possession",
+	}, httpapi.Policy{Public: true, CookieAuth: true, RateLimit: httpapi.RateLimitNormal, NoStore: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.logout", "auth")}}, m.auth.Logout)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/password-resets", OperationID: "requestPasswordReset",
+		Tags: []string{authTag}, Summary: "Request a password reset",
+		Description: "Always answers 204: whether the address exists is never revealed.",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.password_reset_requested", "auth")}}, m.auth.ForgotPassword)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/password-resets/complete", OperationID: "completePasswordReset",
+		Tags: []string{authTag}, Summary: "Complete a password reset",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.password_reset_completed", "auth")}}, m.auth.ResetPassword)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/email-verifications", OperationID: "requestEmailVerification",
+		Tags: []string{authTag}, Summary: "Resend an email verification link",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.verification_resent", "auth")}}, m.auth.ResendVerification)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/email-verifications/complete", OperationID: "completeEmailVerification",
+		Tags: []string{authTag}, Summary: "Verify an email address",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.email_verified", "auth")}}, m.auth.VerifyEmail)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/auth/google", OperationID: "startGoogleLogin",
+		Tags: []string{authTag}, Summary: "Start Google OAuth",
+		Description: "Redirects to Google with PKCE and a signed, tenant-bound state.",
+		Errors:      []int{http.StatusFound},
+	}, httpapi.Policy{Public: true, Feature: identitycatalog.KeyGoogleOAuth, RateLimit: httpapi.RateLimitNormal}, m.auth.GoogleRedirect)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/auth/google/callback", OperationID: "completeGoogleLogin",
+		Tags: []string{authTag}, Summary: "Complete Google OAuth",
+		Description: "Redirects with a single-use exchange code in the fragment, or an MFA challenge.",
+		Errors:      []int{http.StatusFound},
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitNormal,
+		Audit: httpapi.AuditPolicy{Tier1Action: "auth.google_login"}}, m.auth.GoogleCallback)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/auth/google/exchanges", OperationID: "exchangeGoogleCode",
+		Tags: []string{authTag}, Summary: "Redeem a Google sign-in code",
+	}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, NoStore: true,
+		Audit: httpapi.AuditPolicy{Guard: guard("auth.google_exchange", "auth")}}, m.auth.GoogleExchange)
+
+	if m.mfa != nil {
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/auth/mfa/verifications", OperationID: "verifyMFAChallenge",
+			Tags: []string{authTag}, Summary: "Complete a two-step sign-in",
+		}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, NoStore: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "auth.mfa_login"}}, m.mfa.Verify)
+	}
+
 	if m.invitations != nil {
-		m.registerInvitationRoutes(v1, auth, jwtOnly, deps)
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/auth/invitations/accept", OperationID: "acceptInvitation",
+			Tags: []string{authTag}, Summary: "Accept an invitation",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "invitation.accepted"}}, m.invitations.Accept)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/auth/invitations/signup", OperationID: "signupFromInvitation",
+			Tags: []string{authTag}, Summary: "Sign up from an invitation",
+		}, httpapi.Policy{Public: true, RateLimit: httpapi.RateLimitStrict, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "invitation.accepted"}}, m.invitations.SignUp)
 	}
+}
+
+func (m *Module) registerMeRoutes(api *httpapi.API, guard func(string, string) *httpapi.GuardPolicy) {
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/me/profile", OperationID: "getMyProfile",
+		Tags: []string{meTag}, Summary: "Get my profile",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead, RateLimit: httpapi.RateLimitRelaxed}, m.users.GetMe)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPatch, Path: "/api/v1/me/profile", OperationID: "updateMyProfile",
+		Tags: []string{meTag}, Summary: "Update my profile",
+		Description: "RFC 7396 merge patch. Changing the email requires currentPassword.",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionProfileWrite, RateLimit: httpapi.RateLimitNormal,
+		Idempotent: true, Audit: httpapi.AuditPolicy{Tier1Action: "user.profile_updated"}}, m.users.UpdateMe)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/me/profile/password", OperationID: "changeMyPassword",
+		Tags: []string{meTag}, Summary: "Change my password",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionProfileWrite, RateLimit: httpapi.RateLimitNormal,
+		Idempotent: true, NoStore: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "user.password_changed"}}, m.users.ChangePassword)
+
+	if m.sessions != nil {
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/sessions", OperationID: "listMySessions",
+			Tags: []string{meTag}, Summary: "List my sessions",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed}, m.sessions.List)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodDelete, Path: "/api/v1/me/sessions/{sessionId}", OperationID: "deleteMySession",
+			Tags: []string{meTag}, Summary: "Revoke one of my sessions",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionSessionsRevoke, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal,
+			Audit:     httpapi.AuditPolicy{Guard: guard("auth.session_revoked", "session")}}, m.sessions.Revoke)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodDelete, Path: "/api/v1/me/sessions", OperationID: "deleteMySessions",
+			Tags: []string{meTag}, Summary: "Log out everywhere",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionSessionsRevoke, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal,
+			Audit:     httpapi.AuditPolicy{Guard: guard("auth.logout_all", "auth")}}, m.auth.LogoutAll)
+	}
+
 	if m.mfa != nil {
-		// MFA management is JWT-only: an API key has no session to keep and
-		// must not change the owner's second factor. Enroll/confirm/regenerate
-		// return one-time secrets, so they never take Idempotency-Key.
-		auth.Get("/mfa/status", jwtOnly, rl.Relaxed, authzhttp.Require(identitycatalog.PermissionMFARead), m.mfa.Status)
-		auth.Post("/mfa/totp/enroll", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Enroll)
-		auth.Post("/mfa/totp/confirm", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Confirm)
-		auth.Post("/mfa/disable", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Disable)
-		auth.Post("/mfa/recovery-codes/regenerate", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfa.Regenerate)
-		// Freshness refresh for MFA-gated routes whose session's second
-		// factor is older than MFA_MAX_AGE. It is Tier 1: StepUp writes
-		// auth.mfa_step_up in the mutation transaction.
-		if m.mfaStepUp != nil {
-			auth.Post("/mfa/step-up", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionMFAWrite), m.mfaStepUp.StepUp)
-		}
-		// The two-step login verification is public: the sealed, single-use
-		// challenge plus the second factor are the credentials.
-		auth.Post("/mfa/verify", rl.Strict, m.mfa.Verify)
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/mfa", OperationID: "getMyMFA",
+			Tags: []string{meTag}, Summary: "Get my MFA status",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFARead, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed, NoStore: true}, m.mfa.Status)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/mfa/totp", OperationID: "startTOTPEnrollment",
+			Tags: []string{meTag}, Summary: "Start TOTP enrollment",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFAWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, NoStore: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "auth.mfa_enrollment_started"}}, m.mfa.Enroll)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/mfa/totp/{factorId}/confirm", OperationID: "confirmTOTPEnrollment",
+			Tags: []string{meTag}, Summary: "Confirm TOTP enrollment",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFAWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, NoStore: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "auth.mfa_enabled"}}, m.mfa.Confirm)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/mfa/{factorId}/disable", OperationID: "disableMFAFactor",
+			Tags: []string{meTag}, Summary: "Disable an MFA factor",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFAWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal,
+			Audit:     httpapi.AuditPolicy{Tier1Action: "auth.mfa_disabled"}}, m.mfa.Disable)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/mfa/recovery-codes", OperationID: "createRecoveryCodes",
+			Tags: []string{meTag}, Summary: "Regenerate recovery codes",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionMFAWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, NoStore: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "auth.mfa_recovery_codes_regenerated"}}, m.mfa.Regenerate)
 	}
+
 	if m.privacy != nil {
-		m.registerPrivacyRoutes(v1, deps, jwtOnly, guard)
-	}
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/data-exports", OperationID: "listMyDataExports",
+			Tags: []string{meTag}, Summary: "List my data exports",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead,
+			RateLimit: httpapi.RateLimitRelaxed}, m.privacy.ListExports)
 
-	users := v1.Group("/users", deps.Authenticate())
-	users.Get("/me", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetMe)
-	users.Put("/me", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.UpdateMe)
-	users.Put("/me/password", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.ChangePassword)
-	users.Get("/:id", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.users.GetByID)
-	users.Get("/", rl.Relaxed, authzhttp.Require(authz.PermissionAdminUsersRead), m.users.List)
-	users.Put("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Update)
-	users.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.users.Delete)
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/data-exports", OperationID: "createDataExport",
+			Tags: []string{meTag}, Summary: "Request a data export",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead,
+			RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Guard: guard("data_export.requested", "data_export")}}, m.privacy.CreateExport)
 
-	if m.roles != nil {
-		m.registerRoleRoutes(v1, deps)
-	}
-	if m.platform != nil {
-		m.registerPlatformRoutes(v1, deps)
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/data-exports/{exportId}", OperationID: "getDataExport",
+			Tags: []string{meTag}, Summary: "Get a data export",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead,
+			RateLimit: httpapi.RateLimitRelaxed}, m.privacy.GetExport)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/data-exports/{exportId}/content", OperationID: "getDataExportContent",
+			Tags: []string{meTag}, Summary: "Download a data export",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead,
+			RateLimit: httpapi.RateLimitRelaxed, NoStore: true}, m.privacy.DownloadExport)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/me/erasure-requests", OperationID: "createMyErasureRequest",
+			Tags: []string{meTag}, Summary: "Request erasure of my account data",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileWrite, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "user.erasure_requested"}}, m.privacy.EraseMe)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/erasure-requests", OperationID: "listMyErasureRequests",
+			Tags: []string{meTag}, Summary: "List my erasure requests",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed}, m.privacy.ListErasureRequests)
+
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodGet, Path: "/api/v1/me/erasure-requests/{requestId}", OperationID: "getMyErasureRequest",
+			Tags: []string{meTag}, Summary: "Get my erasure request",
+		}, httpapi.Policy{Permission: identitycatalog.PermissionProfileRead, JWTOnly: true,
+			RateLimit: httpapi.RateLimitRelaxed}, m.privacy.GetErasureRequest)
 	}
 }
 
-// registerRoleRoutes mounts tenant role management. Every mutation is Tier 1:
-// RoleService writes its audit row in the mutation transaction.
-func (m *Module) registerRoleRoutes(v1 fiber.Router, deps app.Deps) {
-	rl := deps.Limiters
-	roles := v1.Group("/admin/roles", deps.Authenticate())
-	roles.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionAdminRolesRead), m.roles.ListRoles)
-	roles.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.CreateRole)
-	roles.Patch("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.UpdateRole)
-	roles.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionAdminRolesWrite), deps.Idempotency, m.roles.DeleteRole)
-	// The legacy role-change endpoint maps to replacing the member's roles;
-	// this one accepts several roles (including tenant-defined ones).
-	v1.Put("/admin/users/:id/roles", deps.Authenticate(), rl.Normal,
-		authzhttp.Require(authz.PermissionAdminUsersRole), deps.Idempotency, m.roles.ReplaceMemberRoles)
+func (m *Module) registerMemberRoutes(api *httpapi.API) {
+	if m.members == nil {
+		return
+	}
+	anyMemberWrite := []authz.Permission{authz.PermissionAdminUsersRole, authz.PermissionAdminUsersBan}
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/members", OperationID: "listMembers",
+		Tags: []string{membersTag}, Summary: "List members",
+	}, httpapi.Policy{Permission: authz.PermissionAdminUsersRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.members.List)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/members/{memberId}", OperationID: "getMember",
+		Tags: []string{membersTag}, Summary: "Get a member",
+	}, httpapi.Policy{Permission: authz.PermissionAdminUsersRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.members.Get)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPatch, Path: "/api/v1/members/{memberId}", OperationID: "updateMember",
+		Tags: []string{membersTag}, Summary: "Update a member",
+		Description: "RFC 7396 merge patch of roleIds and status (active, suspended, or removed).",
+	}, httpapi.Policy{AnyOf: anyMemberWrite, RateLimit: httpapi.RateLimitNormal,
+		Idempotent: true, Audit: httpapi.AuditPolicy{Tier1Action: "admin.user.updated"}}, m.members.Update)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodDelete, Path: "/api/v1/members/{memberId}", OperationID: "deleteMember",
+		Tags: []string{membersTag}, Summary: "Remove a member",
+	}, httpapi.Policy{Permission: authz.PermissionAdminUsersDelete,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "admin.user.removed"}}, m.members.Delete)
+
+	if m.privacy != nil {
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodPost, Path: "/api/v1/members/{memberId}/erasure-requests", OperationID: "createMemberErasureRequest",
+			Tags: []string{membersTag}, Summary: "Erase a member's tenant data",
+		}, httpapi.Policy{Permission: authz.PermissionAdminUsersDelete, JWTOnly: true,
+			RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "admin.user.erasure_requested"}}, m.privacy.EraseUser)
+	}
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/stats", OperationID: "getTenantStats",
+		Tags: []string{statsTag}, Summary: "Get tenant statistics",
+	}, httpapi.Policy{Permission: authz.PermissionAdminStatsRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.members.Stats)
 }
 
-// registerPlatformRoutes mounts cross-tenant tenant administration. It is
-// protected by platform permissions, which only a platform role assignment
-// grants.
-func (m *Module) registerPlatformRoutes(v1 fiber.Router, deps app.Deps) {
-	rl := deps.Limiters
-	// Platform-scope access requires a second factor no older than MFA_MAX_AGE.
-	mfa := authzhttp.RequireMFA(deps.Config.MFA.EffectiveMaxAge())
-	tenants := v1.Group("/platform/tenants", deps.Authenticate())
-	tenants.Get("/", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.ListTenants)
-	tenants.Post("/", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.CreateTenant)
-	tenants.Get("/:id", rl.Relaxed, mfa, authzhttp.Require(authz.PermissionPlatformTenantsRead), m.platform.GetTenant)
-	tenants.Patch("/:id/status", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformTenantsWrite), deps.Idempotency, m.platform.UpdateTenantStatus)
+func (m *Module) registerInvitationRoutes(api *httpapi.API) {
+	if m.invitations == nil {
+		return
+	}
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/invitations", OperationID: "listInvitations",
+		Tags: []string{inviteTag}, Summary: "List pending invitations",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionInvitationsRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.invitations.List)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/invitations", OperationID: "createInvitation",
+		Tags: []string{inviteTag}, Summary: "Invite a member",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionInvitationsWrite,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "invitation.created"}}, m.invitations.Create)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/invitations/{invitationId}", OperationID: "getInvitation",
+		Tags: []string{inviteTag}, Summary: "Get an invitation",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionInvitationsRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.invitations.Get)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodDelete, Path: "/api/v1/invitations/{invitationId}", OperationID: "deleteInvitation",
+		Tags: []string{inviteTag}, Summary: "Revoke an invitation",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionInvitationsWrite,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "invitation.revoked"}}, m.invitations.Revoke)
+}
+
+func (m *Module) registerRoleRoutes(api *httpapi.API) {
+	if m.roles == nil {
+		return
+	}
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/roles", OperationID: "listRoles",
+		Tags: []string{rolesTag}, Summary: "List roles",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionAdminRolesRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.roles.ListRoles)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/roles", OperationID: "createRole",
+		Tags: []string{rolesTag}, Summary: "Create a tenant role",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionAdminRolesWrite,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "admin.role.created"}}, m.roles.CreateRole)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/roles/{roleId}", OperationID: "getRole",
+		Tags: []string{rolesTag}, Summary: "Get a role",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionAdminRolesRead,
+		RateLimit: httpapi.RateLimitRelaxed}, m.roles.GetRole)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPatch, Path: "/api/v1/roles/{roleId}", OperationID: "updateRole",
+		Tags: []string{rolesTag}, Summary: "Update a tenant role",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionAdminRolesWrite,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "admin.role.updated"}}, m.roles.UpdateRole)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodDelete, Path: "/api/v1/roles/{roleId}", OperationID: "deleteRole",
+		Tags: []string{rolesTag}, Summary: "Delete a tenant role",
+	}, httpapi.Policy{Permission: identitycatalog.PermissionAdminRolesWrite,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "admin.role.deleted"}}, m.roles.DeleteRole)
+}
+
+func (m *Module) registerPlatformRoutes(api *httpapi.API) {
+	if m.platform == nil {
+		return
+	}
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/platform/tenants", OperationID: "listTenants",
+		Tags: []string{platformTag}, Summary: "List tenants",
+	}, httpapi.Policy{Permission: authz.PermissionPlatformTenantsRead, RequireMFA: true,
+		RateLimit: httpapi.RateLimitRelaxed}, m.platform.ListTenants)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPost, Path: "/api/v1/platform/tenants", OperationID: "createTenant",
+		Tags: []string{platformTag}, Summary: "Create a tenant",
+	}, httpapi.Policy{Permission: authz.PermissionPlatformTenantsWrite, RequireMFA: true,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "tenant.created"}}, m.platform.CreateTenant)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodGet, Path: "/api/v1/platform/tenants/{tenantId}", OperationID: "getTenant",
+		Tags: []string{platformTag}, Summary: "Get a tenant",
+	}, httpapi.Policy{Permission: authz.PermissionPlatformTenantsRead, RequireMFA: true,
+		RateLimit: httpapi.RateLimitRelaxed}, m.platform.GetTenant)
+
+	httpapi.Register(api, httpapi.Op{
+		Method: http.MethodPatch, Path: "/api/v1/platform/tenants/{tenantId}", OperationID: "updateTenant",
+		Tags: []string{platformTag}, Summary: "Update a tenant",
+	}, httpapi.Policy{Permission: authz.PermissionPlatformTenantsWrite, RequireMFA: true,
+		RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+		Audit: httpapi.AuditPolicy{Tier1Action: "tenant.status_changed"}}, m.platform.UpdateTenant)
 
 	if m.mfa != nil {
-		// MFA recovery is JWT-only (an API key has no second factor to
-		// recover) and runs the same platform chain: limiter, second factor,
-		// platform permission, idempotency, handler.
-		users := v1.Group("/platform/users", middleware.JWTAuthKeys(deps.Config.JWT.Keyring(), deps.Sessions))
-		users.Post("/:id/mfa/reset", rl.Normal, mfa, authzhttp.Require(authz.PermissionPlatformUsersMFAReset), deps.Idempotency, m.mfa.PlatformReset)
+		httpapi.Register(api, httpapi.Op{
+			Method: http.MethodDelete, Path: "/api/v1/platform/users/{userId}/mfa", OperationID: "resetUserMFA",
+			Tags: []string{platformTag}, Summary: "Reset a user's MFA",
+		}, httpapi.Policy{Permission: authz.PermissionPlatformUsersMFAReset, RequireMFA: true,
+			JWTOnly: true, RateLimit: httpapi.RateLimitNormal, Idempotent: true,
+			Audit: httpapi.AuditPolicy{Tier1Action: "admin.user.mfa_reset"}}, m.mfa.PlatformReset)
 	}
-}
-
-// registerPrivacyRoutes mounts the caller's exports/erasure and the admin
-// erasure variant. Erasure is Tier 1 (the service records in the mutation
-// transaction); export creation is Tier 2.
-func (m *Module) registerPrivacyRoutes(v1 fiber.Router, deps app.Deps, jwtOnly fiber.Handler, guard func(string, string) fiber.Handler) {
-	rl := deps.Limiters
-	me := v1.Group("/me", deps.Authenticate())
-	me.Post("/data-exports", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileRead), deps.Idempotency, guard("data_export.requested", "data_export"), m.privacy.CreateExport)
-	me.Get("/data-exports", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.ListExports)
-	me.Get("/data-exports/:id", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.GetExport)
-	me.Get("/data-exports/:id/download", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionProfileRead), m.privacy.DownloadExport)
-	me.Post("/erasure", rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.privacy.EraseMe)
-
-	// /admin is shared with the admin module, so middleware stays per route
-	// (a group middleware would run on the other module's admin routes).
-	// The route is JWT-only: a tenant-scoped API key must not trigger a
-	// destructive member erasure (it removes that tenant's membership).
-	admin := v1.Group("/admin")
-	admin.Post("/users/:id/erasure", jwtOnly, rl.Normal, authzhttp.Require(authz.PermissionAdminUsersDelete), deps.Idempotency, m.privacy.EraseUser)
 }
 
 // RegisterPrivacy implements app.PrivacyProvider: identity's own exporter and
@@ -223,37 +506,37 @@ func (m *Module) RegisterPrivacy(registry *privacycontracts.Registry) {
 	registry.Register(privacycontracts.Provider{Name: "identity", Exporter: m.privacySvc, Eraser: m.privacySvc})
 }
 
-// RegisterTenantPurge contributes identity's tenant-wide purger to the tenancy
-// registry. It runs last in the purge so the other modules can still reach the
-// memberships their rows reference.
-func (m *Module) RegisterTenantPurge(registry *tenancycontracts.Registry) {
+// TenantPurgers contributes identity's tenant-wide purger to the composition
+// root's tenancy registry. It runs last in the purge so the other modules can
+// still reach the memberships their rows reference.
+func (m *Module) TenantPurgers() []tenancycontracts.Provider {
 	if m.tenantPurger == nil {
-		return
+		return nil
 	}
-	registry.Register(tenancycontracts.Provider{Name: "identity", Purger: m.tenantPurger})
+	return []tenancycontracts.Provider{{Name: "identity", Purger: m.tenantPurger}}
 }
 
-// SetNotifier wires the export-ready notification after notifications.Build.
-func (m *Module) SetNotifier(notifier notificationcontracts.Notifier) {
-	if m.privacySvc != nil {
-		m.privacySvc.SetNotifier(notifier)
-	}
+// SessionStore returns the JWT session validator the app installs.
+func (m *Module) SessionStore() session.Store { return m.provides.Sessions }
+
+// TenantResolver returns the cached tenant slug resolver.
+func (m *Module) TenantResolver() tenant.Resolver { return m.provides.TenantResolver }
+
+// Principals returns the API-key principal reader.
+func (m *Module) Principals() identitycontracts.PrincipalReader { return m.provides.Principals }
+
+// MemberRanks returns the tenant role-hierarchy checker.
+func (m *Module) MemberRanks() identitycontracts.MemberRankChecker { return m.provides.MemberRanks }
+
+// Recipients returns the notification recipient lookup.
+func (m *Module) Recipients() identitycontracts.NotificationRecipientLookup {
+	return m.provides.Recipients
 }
 
-// registerInvitationRoutes mounts the invitation flow. Create, revoke,
-// accept, and sign-up are Tier 1: InvitationService writes invitation.* in
-// the mutation transaction, so no route-level Guard is added.
-func (m *Module) registerInvitationRoutes(v1, auth fiber.Router, jwtOnly fiber.Handler, deps app.Deps) {
-	rl := deps.Limiters
-	invitations := v1.Group("/invitations", deps.Authenticate())
-	invitations.Post("/", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), deps.Idempotency, m.invitations.Create)
-	invitations.Get("/", rl.Relaxed, authzhttp.Require(identitycatalog.PermissionInvitationsRead), m.invitations.List)
-	invitations.Delete("/:id", rl.Normal, authzhttp.Require(identitycatalog.PermissionInvitationsWrite), m.invitations.Revoke)
+// Admin returns the identity half of the admin surface.
+func (m *Module) Admin() identitycontracts.IdentityAdmin { return m.provides.Admin }
 
-	// Accepting joins another tenant with the global identity, which a
-	// tenant-scoped API key must not do: JWT only. Mounted under /auth (no
-	// group middleware) so /invitations' API-key chain does not apply.
-	auth.Post("/invitations/accept", jwtOnly, rl.Normal, authzhttp.Require(identitycatalog.PermissionProfileWrite), deps.Idempotency, m.invitations.Accept)
-	// Public: the emailed token authorizes creating the invited account.
-	auth.Post("/invitations/signup", rl.Strict, deps.Idempotency, m.invitations.SignUp)
+// TenantActive reports whether a tenant serves requests (used by webhooks).
+func (m *Module) TenantActive() func(ctx context.Context, tenantID uuid.UUID) (bool, error) {
+	return m.provides.TenantActive
 }

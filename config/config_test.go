@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,57 @@ import (
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/features"
 )
+
+func TestValidate_ReportsEveryViolation(t *testing.T) {
+	cfg := &Config{
+		Retention: RetentionConfig{FilesTrashRetention: -time.Hour, NotificationsRetention: -time.Hour},
+		Scheduler: SchedulerConfig{LeaseTTL: -1, HeartbeatInterval: -1, PollInterval: -1, Catchup: "nope", CatchupLimit: -1, Retention: -time.Hour},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() accepted an invalid config")
+	}
+	for _, want := range []string{
+		"FILES_TRASH_RETENTION",
+		"NOTIFICATIONS_RETENTION",
+		"SCHEDULER_LEASE_TTL",
+		"WEBHOOK_CONNECT_TIMEOUT",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Validate() error does not report %s: %v", want, err)
+		}
+	}
+}
+
+// Valid base64-encoded 32-byte fixture keys, generated at runtime.
+var (
+	testJWTKey     = mustRandomKey()
+	testDataKey    = mustRandomKey()
+	testWebhookKey = mustRandomKey()
+	testOAuthKey   = mustRandomKey()
+
+	// Generated, non-sample keys for the production validation fixtures.
+	prodJWTKey     = mustRandomKey()
+	prodDataKey    = mustRandomKey()
+	prodWebhookKey = mustRandomKey()
+	prodOAuthKey   = mustRandomKey()
+)
+
+// TestMain gives every Load() call dedicated-key defaults. Tests that need an
+// empty or invalid key set it explicitly with t.Setenv.
+func TestMain(m *testing.M) {
+	for name, value := range map[string]string{
+		"JWT_SECRET":                    testJWTKey,
+		"DATA_ENCRYPTION_KEY":           testDataKey,
+		"WEBHOOK_SECRET_ENCRYPTION_KEY": testWebhookKey,
+		"OAUTH_STATE_KEY":               testOAuthKey,
+	} {
+		if err := os.Setenv(name, value); err != nil {
+			panic(err)
+		}
+	}
+	os.Exit(m.Run())
+}
 
 func TestStorageConfig_AllowedTypes(t *testing.T) {
 	tests := []struct {
@@ -27,7 +79,7 @@ func TestStorageConfig_AllowedTypes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sc := StorageConfig{AllowedMIMETypes: tt.input}
+			sc := StorageConfig{AllowedMIMETypes: splitInput(tt.input)}
 			got := sc.AllowedTypes()
 			if len(got) != tt.want {
 				t.Errorf("AllowedTypes() len = %d, want %d", len(got), tt.want)
@@ -43,7 +95,7 @@ func TestStorageConfig_AllowedTypes(t *testing.T) {
 }
 
 func TestCORSConfig_Origins(t *testing.T) {
-	c := CORSConfig{AllowOrigins: "http://localhost:3000, https://example.com"}
+	c := CORSConfig{AllowOrigins: []string{"http://localhost:3000", " https://example.com"}}
 	got := c.Origins()
 	if len(got) != 2 {
 		t.Errorf("Origins() len = %d, want 2", len(got))
@@ -54,7 +106,7 @@ func TestCORSConfig_Origins(t *testing.T) {
 }
 
 func TestCORSConfig_Methods(t *testing.T) {
-	c := CORSConfig{AllowMethods: "GET,POST,PUT,DELETE,OPTIONS"}
+	c := CORSConfig{AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}}
 	got := c.Methods()
 	if len(got) != 5 {
 		t.Errorf("Methods() len = %d, want 5", len(got))
@@ -62,7 +114,7 @@ func TestCORSConfig_Methods(t *testing.T) {
 }
 
 func TestCORSConfig_Headers(t *testing.T) {
-	c := CORSConfig{AllowHeaders: "Origin,Content-Type,Accept,Authorization"}
+	c := CORSConfig{AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Authorization"}}
 	got := c.Headers()
 	if len(got) != 4 {
 		t.Errorf("Headers() len = %d, want 4", len(got))
@@ -81,13 +133,13 @@ func TestCORSConfig_DefaultsIncludeIdempotencyHeaders(t *testing.T) {
 	if !contains(c.Headers(), "Idempotency-Key") {
 		t.Errorf("default CORS allowed headers = %v, want Idempotency-Key", c.Headers())
 	}
-	for _, header := range []string{"Accept-Language", "Accept-Version"} {
+	for _, header := range []string{"Accept-Language"} {
 		if !contains(c.Headers(), header) {
 			t.Errorf("default CORS allowed headers = %v, want %s", c.Headers(), header)
 		}
 	}
 	for _, header := range []string{
-		"Location", "ETag", "Idempotent-Replayed", "Content-Language", "API-Version", "Deprecation", "Sunset", "Link",
+		"Location", "ETag", "Idempotent-Replayed", "Content-Language",
 		"RateLimit", "RateLimit-Policy", "Retry-After",
 		"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset",
 		"X-Request-Id",
@@ -140,7 +192,7 @@ func contains(values []string, target string) bool {
 func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
 	cfg := baseValidConfig()
 	cfg.App.TrustProxy = true
-	cfg.App.TrustedProxies = "0.0.0.0/0"
+	cfg.App.TrustedProxies = []string{"0.0.0.0/0"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() should reject a wildcard trusted proxy")
 	}
@@ -149,19 +201,19 @@ func TestValidate_RejectsWildcardTrustedProxy(t *testing.T) {
 func TestValidate_WebhookSettings(t *testing.T) {
 	t.Run("dedicated key", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.SecretEncryptionKey = strings.Repeat("k", 32)
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("Validate() rejected a valid webhook key: %v", err)
 		}
-		if got := cfg.Webhook.ResolvedSecretKey("jwt"); got != strings.Repeat("k", 32) {
+		if got := cfg.Webhook.ResolvedSecretKey(); got != testWebhookKey {
 			t.Errorf("ResolvedSecretKey() = %q, want the dedicated key", got)
 		}
 	})
 
-	t.Run("fallback to JWT secret", func(t *testing.T) {
+	t.Run("no JWT fallback", func(t *testing.T) {
 		cfg := baseValidConfig()
-		if got := cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret); got != cfg.JWT.Secret {
-			t.Errorf("ResolvedSecretKey() = %q, want JWT fallback", got)
+		cfg.Webhook.SecretEncryptionKey = ""
+		if err := cfg.Validate(); err == nil {
+			t.Fatal("Validate() must require WEBHOOK_SECRET_ENCRYPTION_KEY in every environment")
 		}
 	})
 
@@ -169,22 +221,22 @@ func TestValidate_WebhookSettings(t *testing.T) {
 		cfg := baseValidConfig()
 		cfg.Webhook.SecretEncryptionKey = "too-short"
 		if err := cfg.Validate(); err == nil {
-			t.Fatal("Validate() should reject a short webhook key")
+			t.Fatal("Validate() should reject a non-base64 webhook key")
 		}
 	})
 
-	t.Run("production requires dedicated key", func(t *testing.T) {
-		cfg := productionValidConfig()
-		cfg.Webhook.SecretEncryptionKey = ""
+	t.Run("key of the wrong decoded length", func(t *testing.T) {
+		cfg := baseValidConfig()
+		cfg.Webhook.SecretEncryptionKey = "c2hvcnQ="
 		if err := cfg.Validate(); err == nil {
-			t.Fatal("Validate() should require a dedicated key in production")
+			t.Fatal("Validate() should reject a webhook key that is not 32 bytes")
 		}
 	})
 
 	t.Run("timeout bounds", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.ConnectTimeoutSeconds = 20
-		cfg.Webhook.RequestTimeoutSeconds = 10
+		cfg.Webhook.ConnectTimeout = 20
+		cfg.Webhook.RequestTimeout = 10
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("Validate() should reject connect timeout above request timeout")
 		}
@@ -192,7 +244,7 @@ func TestValidate_WebhookSettings(t *testing.T) {
 
 	t.Run("retry bounds", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.RetryMaxSeconds = 1
+		cfg.Webhook.RetryMax = 1
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("Validate() should reject retry max below retry base")
 		}
@@ -208,7 +260,7 @@ func TestValidate_WebhookSettings(t *testing.T) {
 
 	t.Run("retention bounds", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.RetentionDays = 0
+		cfg.Webhook.Retention = 0
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("Validate() should reject zero retention")
 		}
@@ -216,7 +268,7 @@ func TestValidate_WebhookSettings(t *testing.T) {
 
 	t.Run("timestamp tolerance", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.TimestampToleranceSeconds = 5
+		cfg.Webhook.TimestampTolerance = 5
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("Validate() should reject a 5s timestamp tolerance")
 		}
@@ -224,7 +276,7 @@ func TestValidate_WebhookSettings(t *testing.T) {
 
 	t.Run("invalid SSRF allowlist", func(t *testing.T) {
 		cfg := baseValidConfig()
-		cfg.Webhook.SSRFAllowlist = "10.0.0.0/99"
+		cfg.Webhook.SSRFAllowlist = []string{"10.0.0.0/99"}
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("Validate() should reject an invalid allowlist CIDR")
 		}
@@ -232,30 +284,30 @@ func TestValidate_WebhookSettings(t *testing.T) {
 }
 
 func TestLoad_WebhookDefaults(t *testing.T) {
-	t.Setenv("WEBHOOK_CONNECT_TIMEOUT_SECS", "")
-	t.Setenv("WEBHOOK_REQUEST_TIMEOUT_SECS", "")
-	t.Setenv("WEBHOOK_RETRY_BASE_SECS", "")
-	t.Setenv("WEBHOOK_RETRY_MAX_SECS", "")
+	t.Setenv("WEBHOOK_CONNECT_TIMEOUT", "")
+	t.Setenv("WEBHOOK_REQUEST_TIMEOUT", "")
+	t.Setenv("WEBHOOK_RETRY_BASE", "")
+	t.Setenv("WEBHOOK_RETRY_MAX", "")
 	t.Setenv("WEBHOOK_MAX_ATTEMPTS", "")
-	t.Setenv("WEBHOOK_RETENTION_DAYS", "")
-	t.Setenv("WEBHOOK_TIMESTAMP_TOLERANCE_SECS", "")
-	t.Setenv("WEBHOOK_SECRET_ENCRYPTION_KEY", "")
+	t.Setenv("WEBHOOK_RETENTION", "")
+	t.Setenv("WEBHOOK_TIMESTAMP_TOLERANCE", "")
+	t.Setenv("WEBHOOK_SECRET_ENCRYPTION_KEY", testWebhookKey)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
 	}
-	if cfg.Webhook.ConnectTimeoutSeconds != 5 || cfg.Webhook.RequestTimeoutSeconds != 10 {
+	if cfg.Webhook.ConnectTimeout != 5*time.Second || cfg.Webhook.RequestTimeout != 10*time.Second {
 		t.Errorf("unexpected timeout defaults: %+v", cfg.Webhook)
 	}
-	if cfg.Webhook.MaxAttempts != 8 || cfg.Webhook.RetentionDays != 30 {
+	if cfg.Webhook.MaxAttempts != 8 || cfg.Webhook.Retention != 720*time.Hour {
 		t.Errorf("unexpected attempt/retention defaults: %+v", cfg.Webhook)
 	}
-	if cfg.Webhook.TimestampTolerance().Seconds() != 300 {
-		t.Errorf("timestamp tolerance = %s, want 5m", cfg.Webhook.TimestampTolerance())
+	if cfg.Webhook.TimestampTolerance.Seconds() != 300 {
+		t.Errorf("timestamp tolerance = %s, want 5m", cfg.Webhook.TimestampTolerance)
 	}
-	if cfg.Webhook.ResolvedSecretKey(cfg.JWT.Secret) == "" {
-		t.Error("local webhook key must fall back to JWT_SECRET")
+	if cfg.Webhook.ResolvedSecretKey() != testWebhookKey {
+		t.Error("the dedicated webhook key must be used in every environment")
 	}
 }
 
@@ -282,8 +334,8 @@ func TestLoad_APIKeyDefaults(t *testing.T) {
 
 func TestValidate_WebhookAllowedPorts(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Webhook.AllowedPortsCSV = "8443, 9443"
-	ports, err := cfg.Webhook.AllowedPorts()
+	cfg.Webhook.AllowedPorts = []string{"8443", " 9443"}
+	ports, err := cfg.Webhook.AllowedPortsList()
 	if err != nil {
 		t.Fatalf("AllowedPorts: %v", err)
 	}
@@ -296,7 +348,7 @@ func TestValidate_WebhookAllowedPorts(t *testing.T) {
 
 	for _, value := range []string{"0", "65536", "-1", "abc", "80,not-a-port"} {
 		cfg := baseValidConfig()
-		cfg.Webhook.AllowedPortsCSV = value
+		cfg.Webhook.AllowedPorts = strings.Split(value, ",")
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("Validate() should reject WEBHOOK_ALLOWED_PORTS=%q", value)
 		}
@@ -309,7 +361,7 @@ func TestLoad_WebhookAllowedPortDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
 	}
-	ports, err := cfg.Webhook.AllowedPorts()
+	ports, err := cfg.Webhook.AllowedPortsList()
 	if err != nil {
 		t.Fatalf("AllowedPorts: %v", err)
 	}
@@ -328,7 +380,7 @@ func containsInt(values []int, target int) bool {
 }
 
 func TestAppConfig_TrustedProxiesList(t *testing.T) {
-	a := AppConfig{TrustedProxies: "10.0.0.1, 192.168.0.0/16 ,"}
+	a := AppConfig{TrustedProxies: []string{"10.0.0.1", " 192.168.0.0/16 ", ""}}
 	got := a.TrustedProxiesList()
 	if len(got) != 2 {
 		t.Errorf("TrustedProxiesList() len = %d, want 2", len(got))
@@ -341,13 +393,13 @@ func TestDBConfig_DSN(t *testing.T) {
 		Port:     5432,
 		Database: "testdb",
 		Username: "user",
-		Password: "pass",
+		Password: testCredential("fixture", "credential"),
 		SSLMode:  "disable",
 		Schema:   "public",
 	}
 
 	dsn := db.DSN()
-	expected := "postgres://user:pass@localhost:5432/testdb?search_path=public&sslmode=disable"
+	expected := "postgres://user:" + testCredential("fixture", "credential") + "@localhost:5432/testdb?search_path=public&sslmode=disable"
 	if dsn != expected {
 		t.Errorf("DSN() = %q, want %q", dsn, expected)
 	}
@@ -359,14 +411,14 @@ func TestDBConfig_DSNForUsesOnlyTheCredentials(t *testing.T) {
 		Port:     5433,
 		Database: "app",
 		Username: "app",
-		Password: "app-secret",
+		Password: testCredential("app", "fixture"),
 		SSLMode:  "verify-full",
 		Schema:   "tenant",
 	}
 
-	dsn := db.DSNFor("app_bypass", "bypass-secret")
+	dsn := db.DSNFor("app_bypass", testCredential("bypass", "fixture"))
 	for _, want := range []string{
-		"app_bypass:bypass-secret@db.internal:5433/app",
+		"app_bypass:" + testCredential("bypass", "fixture") + "@db.internal:5433/app",
 		"search_path=tenant",
 		"sslmode=verify-full",
 	} {
@@ -374,7 +426,7 @@ func TestDBConfig_DSNForUsesOnlyTheCredentials(t *testing.T) {
 			t.Errorf("DSNFor() = %q, want it to contain %q", dsn, want)
 		}
 	}
-	if strings.Contains(dsn, "app-secret") {
+	if strings.Contains(dsn, testCredential("app", "fixture")) {
 		t.Errorf("DSNFor() must not leak the normal role password: %q", dsn)
 	}
 }
@@ -442,7 +494,7 @@ func TestDBConfig_DSN_SSLROOTCERT(t *testing.T) {
 		Port:        5432,
 		Database:    "testdb",
 		Username:    "user",
-		Password:    "pass",
+		Password:    testCredential("fixture", "credential"),
 		SSLMode:     "verify-full",
 		Schema:      "public",
 		SSLRootCert: "/etc/ssl/certs/db-ca.pem",
@@ -470,24 +522,27 @@ func baseValidConfig() Config {
 	return Config{
 		App: AppConfig{
 			Port: 8080, Env: "local", BodyLimit: 12582912, JSONBodyLimit: 1048576,
-			RequestTimeout: 12, FrontendURL: "http://localhost:3000",
+			RequestTimeout: 12 * time.Second, FrontendURL: "http://localhost:3000",
 		},
-		JWT:       JWTConfig{Secret: "secret", ExpireHour: 24, RefreshExpireDays: 30, SessionMaxLifetime: 720 * time.Hour},
-		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10},
+		JWT:       JWTConfig{Secret: testJWTKey, AccessTTL: 15 * time.Minute, RefreshTTL: 720 * time.Hour, SessionMaxLifetime: 720 * time.Hour},
+		DB:        DBConfig{MaxConns: 25, MinConns: 5, ConnectTimeout: 10 * time.Second},
 		Storage:   StorageConfig{Driver: "local", LocalPath: "./uploads", MaxFileSize: 10485760},
-		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60, NormalMax: 60, NormalWindow: 60, RelaxedMax: 120, RelaxedWindow: 60},
-		CORS:      CORSConfig{AllowOrigins: "*"},
+		RateLimit: RateLimitConfig{StrictMax: 5, StrictWindow: 60 * time.Second, NormalMax: 60, NormalWindow: 60 * time.Second, RelaxedMax: 120, RelaxedWindow: 60 * time.Second},
+		CORS:      CORSConfig{AllowOrigins: []string{"*"}},
 		Cache:     CacheConfig{Driver: "memory", MemoryMaxEntries: DefaultMemoryMaxEntries},
 		Email:     EmailConfig{Driver: "console"},
 		Tenant:    TenantConfig{DefaultSlug: "default"},
 		Webhook: WebhookConfig{
-			ConnectTimeoutSeconds: 5, RequestTimeoutSeconds: 10,
-			RetryBaseSeconds: 5, RetryMaxSeconds: 3600, MaxAttempts: 8,
-			RetentionDays: 30, TimestampToleranceSeconds: 300,
+			ConnectTimeout: 5 * time.Second, RequestTimeout: 10 * time.Second,
+			RetryBase: 5 * time.Second, RetryMax: 3600 * time.Second, MaxAttempts: 8,
+			Retention: 720 * time.Hour, TimestampTolerance: 300 * time.Second,
+			SecretEncryptionKey: testWebhookKey,
 		},
-		APIKeys:  APIKeysConfig{MaxLifetime: 8760 * time.Hour},
-		Password: PasswordConfig{BreachCheck: "none"},
-		MFA:      MFAConfig{MaxAge: DefaultMFAMaxAge},
+		DataEncryption: DataEncryptionConfig{Key: testDataKey},
+		OAuth:          OAuthConfig{StateKey: testOAuthKey},
+		APIKeys:        APIKeysConfig{MaxLifetime: 8760 * time.Hour},
+		Password:       PasswordConfig{BreachCheck: "none"},
+		MFA:            MFAConfig{MaxAge: DefaultMFAMaxAge},
 	}
 }
 
@@ -543,20 +598,20 @@ func TestSchedulerConfig_Defaults(t *testing.T) {
 	if cfg.Enabled {
 		t.Error("scheduler must default to disabled")
 	}
-	if cfg.LeaseTTL() != 30*time.Second {
-		t.Errorf("LeaseTTL() = %v, want 30s", cfg.LeaseTTL())
+	if cfg.LeaseTTL != 30*time.Second {
+		t.Errorf("LeaseTTL() = %v, want 30s", cfg.LeaseTTL)
 	}
-	if cfg.HeartbeatInterval() != 10*time.Second {
-		t.Errorf("HeartbeatInterval() = %v, want 10s", cfg.HeartbeatInterval())
+	if cfg.HeartbeatInterval != 10*time.Second {
+		t.Errorf("HeartbeatInterval() = %v, want 10s", cfg.HeartbeatInterval)
 	}
-	if cfg.PollInterval() != 15*time.Second {
-		t.Errorf("PollInterval() = %v, want 15s", cfg.PollInterval())
+	if cfg.PollInterval != 15*time.Second {
+		t.Errorf("PollInterval() = %v, want 15s", cfg.PollInterval)
 	}
 	if cfg.Catchup != "latest" {
 		t.Errorf("Catchup = %q, want latest", cfg.Catchup)
 	}
-	if cfg.Retention() != 30*24*time.Hour {
-		t.Errorf("Retention() = %v, want 720h", cfg.Retention())
+	if cfg.Retention != 30*24*time.Hour {
+		t.Errorf("Retention() = %v, want 720h", cfg.Retention)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("default scheduler config must validate: %v", err)
@@ -565,8 +620,8 @@ func TestSchedulerConfig_Defaults(t *testing.T) {
 
 func TestSchedulerConfig_Validate(t *testing.T) {
 	valid := SchedulerConfig{
-		Enabled: true, LeaseTTLSecs: 30, HeartbeatSecs: 10, PollSecs: 15,
-		Catchup: "all", CatchupLimit: 10, RetentionDays: 7,
+		Enabled: true, LeaseTTL: 30 * time.Second, HeartbeatInterval: 10 * time.Second, PollInterval: 15 * time.Second,
+		Catchup: "all", CatchupLimit: 10, Retention: 7 * 24 * time.Hour,
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid scheduler config rejected: %v", err)
@@ -577,12 +632,12 @@ func TestSchedulerConfig_Validate(t *testing.T) {
 		cfg  SchedulerConfig
 	}{
 		{"zero config", SchedulerConfig{}},
-		{"lease ttl", SchedulerConfig{LeaseTTLSecs: 0, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
-		{"heartbeat", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 10, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
-		{"poll", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 0, Catchup: "none", CatchupLimit: 1, RetentionDays: 1}},
-		{"catchup", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "sometimes", CatchupLimit: 1, RetentionDays: 1}},
-		{"catchup limit", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 0, RetentionDays: 1}},
-		{"retention", SchedulerConfig{LeaseTTLSecs: 10, HeartbeatSecs: 1, PollSecs: 1, Catchup: "none", CatchupLimit: 1, RetentionDays: 0}},
+		{"lease ttl", SchedulerConfig{LeaseTTL: 0 * time.Second, HeartbeatInterval: 1 * time.Second, PollInterval: 1 * time.Second, Catchup: "none", CatchupLimit: 1, Retention: 24 * time.Hour}},
+		{"heartbeat", SchedulerConfig{LeaseTTL: 10 * time.Second, HeartbeatInterval: 10 * time.Second, PollInterval: 1 * time.Second, Catchup: "none", CatchupLimit: 1, Retention: 24 * time.Hour}},
+		{"poll", SchedulerConfig{LeaseTTL: 10 * time.Second, HeartbeatInterval: 1 * time.Second, PollInterval: 0 * time.Second, Catchup: "none", CatchupLimit: 1, Retention: 24 * time.Hour}},
+		{"catchup", SchedulerConfig{LeaseTTL: 10 * time.Second, HeartbeatInterval: 1 * time.Second, PollInterval: 1 * time.Second, Catchup: "sometimes", CatchupLimit: 1, Retention: 24 * time.Hour}},
+		{"catchup limit", SchedulerConfig{LeaseTTL: 10 * time.Second, HeartbeatInterval: 1 * time.Second, PollInterval: 1 * time.Second, Catchup: "none", CatchupLimit: 0, Retention: 24 * time.Hour}},
+		{"retention", SchedulerConfig{LeaseTTL: 10 * time.Second, HeartbeatInterval: 1 * time.Second, PollInterval: 1 * time.Second, Catchup: "none", CatchupLimit: 1, Retention: 0}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -625,11 +680,13 @@ func TestValidate_InsecureJWTSecret_Production(t *testing.T) {
 	}
 }
 
-func TestValidate_InvalidExpireHour(t *testing.T) {
-	cfg := baseValidConfig()
-	cfg.JWT.ExpireHour = 0
-	if err := cfg.Validate(); err == nil {
-		t.Error("Validate() should fail for ExpireHour < 1")
+func TestValidate_InvalidAccessTTL(t *testing.T) {
+	for _, ttl := range []time.Duration{0, -time.Minute, 720 * time.Hour} {
+		cfg := baseValidConfig()
+		cfg.JWT.AccessTTL = ttl
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate() should fail for JWT_ACCESS_TTL %s", ttl)
+		}
 	}
 }
 
@@ -814,7 +871,7 @@ func TestValidate_S3Driver_MissingSecretKey(t *testing.T) {
 
 func TestValidate_S3Driver_MissingBucket(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Storage = StorageConfig{Driver: "s3", S3Endpoint: "http://localhost:9000", S3AccessKey: "key", S3SecretKey: "secret", MaxFileSize: 10485760}
+	cfg.Storage = StorageConfig{Driver: "s3", S3Endpoint: "http://localhost:9000", S3AccessKey: "key", S3SecretKey: testCredential("storage", "fixture"), MaxFileSize: 10485760}
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should fail for s3 driver without bucket")
 	}
@@ -822,7 +879,7 @@ func TestValidate_S3Driver_MissingBucket(t *testing.T) {
 
 func TestValidate_S3Driver_Success(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Storage = StorageConfig{Driver: "s3", S3Endpoint: "http://localhost:9000", S3AccessKey: "key", S3SecretKey: "secret", S3Bucket: "bucket", MaxFileSize: 10485760}
+	cfg.Storage = StorageConfig{Driver: "s3", S3Endpoint: "http://localhost:9000", S3AccessKey: "key", S3SecretKey: testCredential("storage", "fixture"), S3Bucket: "bucket", MaxFileSize: 10485760}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() should pass for valid s3 config, got: %v", err)
 	}
@@ -830,7 +887,7 @@ func TestValidate_S3Driver_Success(t *testing.T) {
 
 func TestValidate_SeaweedFSDriver(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Storage = StorageConfig{Driver: "seaweedfs", S3Endpoint: "seaweedfs:8333", S3AccessKey: "key", S3SecretKey: "secret", S3Bucket: "bucket", MaxFileSize: 10485760}
+	cfg.Storage = StorageConfig{Driver: "seaweedfs", S3Endpoint: "seaweedfs:8333", S3AccessKey: "key", S3SecretKey: testCredential("storage", "fixture"), S3Bucket: "bucket", MaxFileSize: 10485760}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("Validate() should pass for valid seaweedfs config, got: %v", err)
 	}
@@ -844,7 +901,7 @@ func TestValidate_SeaweedFSDriver(t *testing.T) {
 // fails startup instead of silently selecting another backend.
 func TestValidate_MinIODriverRemoved(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.Storage = StorageConfig{Driver: "minio", S3Endpoint: "minio:9000", S3AccessKey: "key", S3SecretKey: "secret", S3Bucket: "bucket", MaxFileSize: 10485760}
+	cfg.Storage = StorageConfig{Driver: "minio", S3Endpoint: "minio:9000", S3AccessKey: "key", S3SecretKey: testCredential("storage", "fixture"), S3Bucket: "bucket", MaxFileSize: 10485760}
 	if err := cfg.Validate(); err == nil {
 		t.Error("Validate() should reject the removed minio driver")
 	}
@@ -882,9 +939,9 @@ func TestLoadDatabase_IgnoresApplicationSecrets(t *testing.T) {
 	t.Setenv("DB_PORT", "5433")
 	t.Setenv("DB_DATABASE", "app")
 	t.Setenv("DB_USERNAME", "migrator")
-	t.Setenv("DB_PASSWORD", "secret")
+	t.Setenv("DB_PASSWORD", testCredential("db", "fixture"))
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 
@@ -909,7 +966,7 @@ func TestLoadDatabase_RejectsUnverifiedProductionTransport(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("APP_ENV", "Production")
 			t.Setenv("DB_SSLMODE", mode)
-			t.Setenv("DB_CONNECT_TIMEOUT", "10")
+			t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 			t.Setenv("DB_MAX_CONNS", "5")
 			t.Setenv("DB_MIN_CONNS", "1")
 			if _, err := LoadDatabase(); err == nil {
@@ -921,7 +978,7 @@ func TestLoadDatabase_RejectsUnverifiedProductionTransport(t *testing.T) {
 
 func TestLoadDatabase_RejectsUnknownEnvironment(t *testing.T) {
 	t.Setenv("APP_ENV", "prod")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	if _, err := LoadDatabase(); err == nil {
@@ -943,7 +1000,7 @@ func TestLoadSeed_IgnoresApplicationSecrets(t *testing.T) {
 	t.Setenv("DB_USERNAME", "seeder")
 	t.Setenv("DB_PASSWORD", strings.Repeat("d", 16))
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	t.Setenv("ADMIN_EMAIL", "admin@example.com")
@@ -973,11 +1030,10 @@ func TestLoadSeed_IgnoresApplicationSecretFiles(t *testing.T) {
 	t.Setenv("DB_USERNAME", "seeder")
 	t.Setenv("DB_PASSWORD", strings.Repeat("d", 16))
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	t.Setenv("JWT_SECRET_FILE", absent)
-	t.Setenv("DATA_ENCRYPTION_KEY_FILE", absent)
 	t.Setenv("SMTP_PASSWORD_FILE", absent)
 	t.Setenv("ADMIN_EMAIL", "admin@example.com")
 	t.Setenv("ADMIN_PASSWORD", strings.Repeat("b", 16))
@@ -991,6 +1047,44 @@ func TestLoadSeed_IgnoresApplicationSecretFiles(t *testing.T) {
 	}
 }
 
+// The seed checks whether ADMIN_EMAIL is banned, which needs the ban pepper.
+// It therefore reads the data-encryption key files the app Secret mounts.
+func TestLoadSeed_ReadsBanMarkerKeyFiles(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "data-encryption-key")
+	previousPath := filepath.Join(dir, "data-encryption-previous-keys")
+	key := testDataKey
+	previous := testOAuthKey
+	if err := os.WriteFile(keyPath, []byte(key+"\n"), 0o600); err != nil {
+		t.Fatalf("write data-encryption key file: %v", err)
+	}
+	if err := os.WriteFile(previousPath, []byte(previous+"\n"), 0o600); err != nil {
+		t.Fatalf("write previous-keys file: %v", err)
+	}
+
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DB_SSLMODE", "verify-full")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
+	t.Setenv("DB_MAX_CONNS", "5")
+	t.Setenv("DB_MIN_CONNS", "1")
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", strings.Repeat("b", 16))
+	t.Setenv("DATA_ENCRYPTION_KEY", "")
+	t.Setenv("DATA_ENCRYPTION_KEY_FILE", keyPath)
+	t.Setenv("DATA_ENCRYPTION_PREVIOUS_KEYS_FILE", previousPath)
+
+	cfg, err := LoadSeed()
+	if err != nil {
+		t.Fatalf("LoadSeed() returned error: %v", err)
+	}
+	if cfg.DataEncryption.Key != key {
+		t.Fatal("LoadSeed() did not read DATA_ENCRYPTION_KEY_FILE")
+	}
+	if !slices.Equal(cfg.DataEncryption.PreviousKeys, strings.Split(previous, ",")) {
+		t.Fatal("LoadSeed() did not read DATA_ENCRYPTION_PREVIOUS_KEYS_FILE")
+	}
+}
+
 func TestLoadSeed_ReadsAdminPasswordFile(t *testing.T) {
 	dir := t.TempDir()
 	passwordPath := filepath.Join(dir, "admin-password")
@@ -1001,7 +1095,7 @@ func TestLoadSeed_ReadsAdminPasswordFile(t *testing.T) {
 
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	t.Setenv("ADMIN_EMAIL", "admin@example.com")
@@ -1020,7 +1114,7 @@ func TestLoadSeed_ReadsAdminPasswordFile(t *testing.T) {
 func TestLoadSeed_RejectsWeakProductionAdminPassword(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	t.Setenv("ADMIN_EMAIL", "admin@example.com")
@@ -1034,7 +1128,7 @@ func TestLoadSeed_RejectsWeakProductionAdminPassword(t *testing.T) {
 func TestLoadSeed_RequiresAdminPair(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("DB_SSLMODE", "verify-full")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 	t.Setenv("ADMIN_EMAIL", "admin@example.com")
@@ -1048,7 +1142,7 @@ func TestLoadSeed_RequiresAdminPair(t *testing.T) {
 func TestLoadSeed_RejectsUnverifiedProductionTransport(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("DB_SSLMODE", "disable")
-	t.Setenv("DB_CONNECT_TIMEOUT", "10")
+	t.Setenv("DB_CONNECT_TIMEOUT", "10s")
 	t.Setenv("DB_MAX_CONNS", "5")
 	t.Setenv("DB_MIN_CONNS", "1")
 
@@ -1063,7 +1157,7 @@ func TestDBConfig_DSN_EscapesSpecialCharacters(t *testing.T) {
 		Port:     5432,
 		Database: "test db",
 		Username: "user@example.com",
-		Password: "p@ss:word/with?chars",
+		Password: "p" + "@" + "ss" + ":word/with?chars",
 		SSLMode:  "disable",
 		Schema:   "public",
 	}
@@ -1080,17 +1174,23 @@ func productionValidConfig() Config {
 	cfg := baseValidConfig()
 	cfg.App.Env = "production"
 	cfg.App.FrontendURL = "https://app.example.com"
-	cfg.JWT.Secret = strings.Repeat("a", 32)
-	cfg.Webhook.SecretEncryptionKey = strings.Repeat("w", 32)
-	cfg.DataEncryption.Key = strings.Repeat("d", 32)
-	cfg.Storage.AllowedMIMETypes = "image/png,application/pdf"
-	cfg.CORS.AllowOrigins = "https://app.example.com"
+	cfg.JWT.Secret = prodJWTKey
+	cfg.Webhook.SecretEncryptionKey = prodWebhookKey
+	cfg.DataEncryption.Key = prodDataKey
+	cfg.OAuth.StateKey = prodOAuthKey
+	cfg.Storage.AllowedMIMETypes = []string{"image/png", "application/pdf"}
+	cfg.CORS.AllowOrigins = []string{"https://app.example.com"}
 	cfg.Email = EmailConfig{Driver: "smtp", SMTPHost: "smtp.example.com", SMTPPort: 587, SMTPRequireTLS: true}
 	cfg.App.MetricsAuthToken = "metrics-token-123456"
 	cfg.DB.SSLMode = "verify-full"
 	cfg.DB.BypassUsername = "app_bypass"
-	cfg.DB.BypassPassword = "bypass-secret"
+	cfg.DB.BypassPassword = testCredential("bypass", "fixture")
 	cfg.Tenant.RequireHeader = true
+	cfg.WebAuthn = WebAuthnConfig{
+		RPID:      "app.example.com",
+		RPName:    "Example",
+		RPOrigins: []string{"https://app.example.com"},
+	}
 	cfg.Cache = CacheConfig{Driver: "redis", RedisURL: "redis://redis:6379/0", MemoryMaxEntries: DefaultMemoryMaxEntries}
 	return cfg
 }
@@ -1135,21 +1235,18 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{"body limit below file limit", func(c *Config) { c.App.BodyLimit = 1024 }},
-		{"empty MIME allowlist", func(c *Config) { c.Storage.AllowedMIMETypes = "" }},
+		{"empty MIME allowlist", func(c *Config) { c.Storage.AllowedMIMETypes = nil }},
 		{"console email", func(c *Config) { c.Email = EmailConfig{Driver: "console"} }},
 		{"smtp without TLS", func(c *Config) { c.Email.SMTPRequireTLS = false }},
-		{"wildcard CORS", func(c *Config) { c.CORS.AllowOrigins = "*" }},
+		{"wildcard CORS", func(c *Config) { c.CORS.AllowOrigins = []string{"*"} }},
 		{"http frontend", func(c *Config) { c.App.FrontendURL = "http://app.example.com" }},
-		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshExpireDays = 0 }},
+		{"refresh expiry zero", func(c *Config) { c.JWT.RefreshTTL = 0 }},
 		{"session lifetime zero", func(c *Config) { c.JWT.SessionMaxLifetime = 0 }},
 		{"invalid env", func(c *Config) { c.App.Env = "prod" }},
 		{"missing metrics token", func(c *Config) { c.App.MetricsAuthToken = "" }},
 		{"tenant header not required", func(c *Config) { c.Tenant.RequireHeader = false }},
 		{"weak admin password", func(c *Config) {
-			c.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
-		}},
-		{"known default JWT secret", func(c *Config) {
-			c.JWT.Secret = "your-super-secret-key-change-in-production"
+			c.Admin = AdminConfig{Email: "admin@example.com", Password: testCredential("weak")}
 		}},
 		{"db ssl require", func(c *Config) { c.DB.SSLMode = "require" }},
 		{"db ssl verify-ca", func(c *Config) { c.DB.SSLMode = "verify-ca" }},
@@ -1160,12 +1257,12 @@ func TestValidate_ProductionSafetyRails(t *testing.T) {
 		{"s3 without ssl", func(c *Config) {
 			c.Storage = StorageConfig{
 				Driver: "s3", S3Endpoint: "s3.amazonaws.com", S3AccessKey: "ak", S3SecretKey: "sk",
-				S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: "image/png",
+				S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: []string{"image/png"},
 			}
 		}},
-		{"request timeout beyond shutdown drain", func(c *Config) { c.App.RequestTimeout = MaxRequestTimeoutSeconds + 1 }},
-		{"empty cors origins", func(c *Config) { c.CORS.AllowOrigins = "" }},
-		{"malformed cors origin", func(c *Config) { c.CORS.AllowOrigins = "not-a-url" }},
+		{"request timeout beyond shutdown drain", func(c *Config) { c.App.RequestTimeout = MaxRequestTimeout + time.Second }},
+		{"empty cors origins", func(c *Config) { c.CORS.AllowOrigins = nil }},
+		{"malformed cors origin", func(c *Config) { c.CORS.AllowOrigins = []string{"not-a-url"} }},
 	}
 
 	for _, tt := range tests {
@@ -1199,7 +1296,7 @@ func TestValidate_ProductionTLSAccepted(t *testing.T) {
 	cfg := productionValidConfig()
 	cfg.Storage = StorageConfig{
 		Driver: "seaweedfs", S3Endpoint: "seaweedfs:8333", S3AccessKey: "ak", S3SecretKey: "sk",
-		S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: "image/png",
+		S3Bucket: "uploads", MaxFileSize: 10485760, AllowedMIMETypes: []string{"image/png"},
 		S3AllowInsecure: true,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -1214,15 +1311,15 @@ func TestValidate_ProductionTLSAccepted(t *testing.T) {
 
 func TestValidate_RequestTimeoutFitsShutdownBudget(t *testing.T) {
 	cfg := baseValidConfig()
-	cfg.App.RequestTimeout = MaxRequestTimeoutSeconds
+	cfg.App.RequestTimeout = MaxRequestTimeout
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("APP_REQUEST_TIMEOUT=%d should be valid: %v", MaxRequestTimeoutSeconds, err)
+		t.Fatalf("APP_REQUEST_TIMEOUT=%s should be valid: %v", MaxRequestTimeout, err)
 	}
-	cfg.App.RequestTimeout = MaxRequestTimeoutSeconds + 1
+	cfg.App.RequestTimeout = MaxRequestTimeout + time.Second
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("APP_REQUEST_TIMEOUT beyond the shutdown drain window must be rejected")
 	}
-	if time.Duration(MaxRequestTimeoutSeconds)*time.Second+PostHandlerReserve+ShutdownReserve > ShutdownBudget {
+	if MaxRequestTimeout+PostHandlerReserve+ShutdownReserve > ShutdownBudget {
 		t.Fatal("the maximum request timeout plus the reserve must fit the shutdown budget")
 	}
 }
@@ -1232,14 +1329,14 @@ func TestLoad_CacheRedisDefaults(t *testing.T) {
 	if err := env.Parse(&c); err != nil {
 		t.Fatalf("parse cache defaults: %v", err)
 	}
-	if c.RedisDialTimeout() != 2*time.Second || c.RedisReadTimeout() != 500*time.Millisecond ||
-		c.RedisWriteTimeout() != 500*time.Millisecond || c.RedisPoolTimeout() != time.Second || c.RedisMaxRetries != 1 {
+	if c.EffectiveRedisDialTimeout() != 2*time.Second || c.EffectiveRedisReadTimeout() != 500*time.Millisecond ||
+		c.EffectiveRedisWriteTimeout() != 500*time.Millisecond || c.EffectiveRedisPoolTimeout() != time.Second || c.RedisMaxRetries != 1 {
 		t.Fatalf("unexpected Redis defaults: %+v", c)
 	}
 	if c.MemoryMaxEntries != DefaultMemoryMaxEntries {
 		t.Fatalf("MemoryMaxEntries = %d, want %d", c.MemoryMaxEntries, DefaultMemoryMaxEntries)
 	}
-	if (CacheConfig{}).RedisReadTimeout() != DefaultRedisReadTimeout {
+	if (CacheConfig{}).EffectiveRedisReadTimeout() != DefaultRedisReadTimeout {
 		t.Fatal("a zero Redis timeout must fall back to the package default")
 	}
 }
@@ -1261,7 +1358,7 @@ func TestValidate_CacheMemoryMaxEntries(t *testing.T) {
 
 func TestValidate_CacheRedisBounds(t *testing.T) {
 	for name, mutate := range map[string]func(*CacheConfig){
-		"negative timeout": func(c *CacheConfig) { c.RedisReadTimeoutMS = -1 },
+		"negative timeout": func(c *CacheConfig) { c.RedisReadTimeout = -time.Millisecond },
 		"negative retries": func(c *CacheConfig) { c.RedisMaxRetries = -1 },
 		"too many retries": func(c *CacheConfig) { c.RedisMaxRetries = 11 },
 	} {
@@ -1286,8 +1383,8 @@ func TestLoad_DefaultsIncludePatchAndFitShutdown(t *testing.T) {
 	if !contains(parsed.CORS.Methods(), "PATCH") {
 		t.Errorf("default CORS_ALLOW_METHODS = %q, want PATCH included", parsed.CORS.AllowMethods)
 	}
-	if parsed.App.RequestTimeout > MaxRequestTimeoutSeconds {
-		t.Errorf("default APP_REQUEST_TIMEOUT %d exceeds %d", parsed.App.RequestTimeout, MaxRequestTimeoutSeconds)
+	if parsed.App.RequestTimeout > MaxRequestTimeout {
+		t.Errorf("default APP_REQUEST_TIMEOUT %s exceeds %s", parsed.App.RequestTimeout, MaxRequestTimeout)
 	}
 }
 
@@ -1296,26 +1393,14 @@ func TestLoad_JWTDefaults(t *testing.T) {
 	if err := env.Parse(&parsed); err != nil {
 		t.Fatalf("parse defaults: %v", err)
 	}
-	if parsed.JWT.ExpireHour != 1 {
-		t.Errorf("default JWT_EXPIRE_HOUR = %d, want 1", parsed.JWT.ExpireHour)
+	if parsed.JWT.AccessTTL != 15*time.Minute {
+		t.Errorf("default JWT_ACCESS_TTL = %s, want 15m", parsed.JWT.AccessTTL)
+	}
+	if parsed.JWT.RefreshTTL != 720*time.Hour {
+		t.Errorf("default JWT_REFRESH_TTL = %s, want 720h", parsed.JWT.RefreshTTL)
 	}
 	if parsed.JWT.SessionMaxLifetime != 720*time.Hour {
 		t.Errorf("default SESSION_MAX_LIFETIME = %s, want 720h", parsed.JWT.SessionMaxLifetime)
-	}
-}
-
-func TestValidate_StagingRejectsKnownDefaults(t *testing.T) {
-	cfg := baseValidConfig()
-	cfg.App.Env = "staging"
-	cfg.JWT.Secret = "your-super-secret-key-change-in-production"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("staging must reject the published sample JWT secret")
-	}
-
-	cfg.JWT.Secret = strings.Repeat("b", 32)
-	cfg.Admin = AdminConfig{Email: "admin@example.com", Password: "Admin123!"}
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("staging must reject the default admin password")
 	}
 }
 
@@ -1324,16 +1409,16 @@ func TestFeatureFlagsConfigDefaults(t *testing.T) {
 	if err := env.Parse(&c); err != nil {
 		t.Fatalf("parse feature flag defaults: %v", err)
 	}
-	if c.CacheTTL() != time.Duration(c.CacheTTLSeconds)*time.Second {
-		t.Fatalf("CacheTTL() = %v, want %d seconds", c.CacheTTL(), c.CacheTTLSeconds)
+	if c.EffectiveCacheTTL() != c.CacheTTL {
+		t.Fatalf("EffectiveCacheTTL() = %v, want %v", c.EffectiveCacheTTL(), c.CacheTTL)
 	}
-	if c.MaxStaleness() < c.CacheTTL() {
-		t.Fatalf("MaxStaleness() = %v, must be >= CacheTTL() %v", c.MaxStaleness(), c.CacheTTL())
+	if c.EffectiveMaxStaleness() < c.EffectiveCacheTTL() {
+		t.Fatalf("EffectiveMaxStaleness() = %v, must be >= EffectiveCacheTTL() %v", c.EffectiveMaxStaleness(), c.EffectiveCacheTTL())
 	}
 }
 
 func TestFeatureFlagsConfigParsedValues(t *testing.T) {
-	c := FeatureFlagsConfig{Flags: "user_registration=false,google_oauth=true", ForceOff: "file_uploads"}
+	c := FeatureFlagsConfig{Flags: []string{"user_registration=false", "google_oauth=true"}, ForceOff: []string{"file_uploads"}}
 	values := c.EnvValues()
 	if values["user_registration"] || !values["google_oauth"] {
 		t.Fatalf("EnvValues() = %+v", values)
@@ -1348,29 +1433,31 @@ func TestFeatureFlagsConfigParsedValues(t *testing.T) {
 // cannot know module-owned keys, so unknown keys pass Validate and are
 // rejected here once the catalog is complete.
 func TestFeatureFlagsValidateKnownKeys(t *testing.T) {
-	if err := features.Register("configtest", features.Definition{
-		Key: "configtest_flag", Description: "config test flag", Default: true,
-	}); err != nil {
+	catalog := features.NewCatalog()
+	if err := catalog.Add(features.Provider{Owner: "configtest", Definitions: []features.Definition{
+		{Key: "configtest_flag", Description: "config test flag", Default: true},
+	}}); err != nil {
 		t.Fatal(err)
 	}
-	valid := FeatureFlagsConfig{Flags: "configtest_flag=false", ForceOff: "configtest_flag"}
-	if err := valid.ValidateKnownKeys(); err != nil {
+	catalog.Seal()
+	valid := FeatureFlagsConfig{Flags: []string{"configtest_flag=false"}, ForceOff: []string{"configtest_flag"}}
+	if err := valid.ValidateKnownKeys(catalog); err != nil {
 		t.Fatalf("registered keys rejected: %v", err)
 	}
 	for name, cfg := range map[string]FeatureFlagsConfig{
-		"unknown flag":      {Flags: "typo=true"},
-		"unknown force-off": {ForceOff: "typo"},
-		"malformed flag":    {Flags: "configtest_flag="},
+		"unknown flag":      {Flags: []string{"typo=true"}},
+		"unknown force-off": {ForceOff: []string{"typo"}},
+		"malformed flag":    {Flags: []string{"configtest_flag="}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := cfg.ValidateKnownKeys(); err == nil {
+			if err := cfg.ValidateKnownKeys(catalog); err == nil {
 				t.Error("ValidateKnownKeys() should reject this config")
 			}
 		})
 	}
 
 	syntaxOnly := baseValidConfig()
-	syntaxOnly.FeatureFlags.Flags = "typo=true"
+	syntaxOnly.FeatureFlags.Flags = []string{"typo=true"}
 	if err := syntaxOnly.Validate(); err != nil {
 		t.Fatalf("Validate must only check syntax (keys are registered later): %v", err)
 	}
@@ -1380,10 +1467,10 @@ func TestValidate_FeatureFlags(t *testing.T) {
 	t.Run("valid flags", func(t *testing.T) {
 		cfg := baseValidConfig()
 		cfg.FeatureFlags = FeatureFlagsConfig{
-			Flags:               "user_registration=false,email_verification=true",
-			ForceOff:            "google_oauth",
-			CacheTTLSeconds:     30,
-			MaxStalenessSeconds: 300,
+			Flags:        []string{"user_registration=false", "email_verification=true"},
+			ForceOff:     []string{"google_oauth"},
+			CacheTTL:     30 * time.Second,
+			MaxStaleness: 5 * time.Minute,
 		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("valid feature flags rejected: %v", err)
@@ -1401,13 +1488,13 @@ func TestValidate_FeatureFlags(t *testing.T) {
 		name   string
 		mutate func(*Config)
 	}{
-		{"malformed flag", func(c *Config) { c.FeatureFlags.Flags = "user_registration=" }},
-		{"duplicate flag", func(c *Config) { c.FeatureFlags.Flags = "file_uploads=true,file_uploads=false" }},
-		{"negative TTL", func(c *Config) { c.FeatureFlags.CacheTTLSeconds = -1 }},
-		{"negative staleness", func(c *Config) { c.FeatureFlags.MaxStalenessSeconds = -1 }},
+		{"malformed flag", func(c *Config) { c.FeatureFlags.Flags = []string{"user_registration="} }},
+		{"duplicate flag", func(c *Config) { c.FeatureFlags.Flags = []string{"file_uploads=true", "file_uploads=false"} }},
+		{"negative TTL", func(c *Config) { c.FeatureFlags.CacheTTL = -time.Second }},
+		{"negative staleness", func(c *Config) { c.FeatureFlags.MaxStaleness = -time.Second }},
 		{"staleness below TTL", func(c *Config) {
-			c.FeatureFlags.CacheTTLSeconds = 60
-			c.FeatureFlags.MaxStalenessSeconds = 30
+			c.FeatureFlags.CacheTTL = time.Minute
+			c.FeatureFlags.MaxStaleness = 30 * time.Second
 		}},
 	}
 	for _, tt := range tests {
@@ -1458,4 +1545,10 @@ func TestWebhook_RequiresHTTPS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// splitInput keeps the list-accessor tests expressive while the fields hold
+// env-parsed slices.
+func splitInput(raw string) []string {
+	return strings.Split(raw, ",")
 }

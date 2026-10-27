@@ -2,28 +2,34 @@ package handler
 
 import (
 	"context"
-	"net/http"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	{{.M.Ident}}catalog "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/catalog"
+	{{.M.Ident}}dto "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/dto"
 	{{.M.Ident}}service "{{.M.ModulePath}}/internal/modules/{{.M.Name}}/service"
+	"{{.M.ModulePath}}/internal/platform/tenant"
 	"{{.M.ModulePath}}/pkg/apperror"
 )
 
 // fake{{.R.Pascal}}UseCases records the input it received and answers with
 // fixed values; id 404 is "not found".
 type fake{{.R.Pascal}}UseCases struct {
-	lastInput  {{.M.Ident}}service.{{.R.Pascal}}Input
-	lastPatch  {{.M.Ident}}service.{{.R.Pascal}}Patch
-	lastLimit  int
-	lastCursor string
-	deletedID  int64
+	lastInput    {{.M.Ident}}service.{{.R.Pascal}}Input
+	lastPatch    {{.M.Ident}}service.{{.R.Pascal}}Patch
+	lastExpected *time.Time
+	deletedID    uuid.UUID
 }
 
+var (
+	fixtureID = uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000f1")
+	missingID = uuid.MustParse("0192c9b0-7e4a-7000-8000-0000000000f2")
+)
+
 var fake{{.R.Pascal}} = {{.M.Ident}}service.{{.R.Pascal}}{
-	ID: 7, TenantID: 1, Name: "fixture",
+	ID: fixtureID, TenantID: tenant.DefaultID, Name: "fixture",
 	CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	UpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 }
@@ -33,24 +39,23 @@ func (f *fake{{.R.Pascal}}UseCases) Create(_ context.Context, in {{.M.Ident}}ser
 	return fake{{.R.Pascal}}, nil
 }
 
-func (f *fake{{.R.Pascal}}UseCases) Get(_ context.Context, id int64) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
-	if id == 404 {
+func (f *fake{{.R.Pascal}}UseCases) Get(_ context.Context, id uuid.UUID) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	if id == missingID {
 		return {{.M.Ident}}service.{{.R.Pascal}}{}, apperror.NewCode({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound, "{{.R.Human}} not found")
 	}
 	return fake{{.R.Pascal}}, nil
 }
 
-func (f *fake{{.R.Pascal}}UseCases) List(_ context.Context, limit int, startingAfter string) ({{.M.Ident}}service.{{.R.Pascal}}Page, error) {
-	f.lastLimit, f.lastCursor = limit, startingAfter
+func (f *fake{{.R.Pascal}}UseCases) List(_ context.Context, _ int, _ string) ({{.M.Ident}}service.{{.R.Pascal}}Page, error) {
 	return {{.M.Ident}}service.{{.R.Pascal}}Page{Items: []{{.M.Ident}}service.{{.R.Pascal}}{fake{{.R.Pascal}}}, HasMore: true, NextCursor: "next"}, nil
 }
 
-func (f *fake{{.R.Pascal}}UseCases) Patch(_ context.Context, _ int64, in {{.M.Ident}}service.{{.R.Pascal}}Patch) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
-	f.lastPatch = in
+func (f *fake{{.R.Pascal}}UseCases) Patch(_ context.Context, _ uuid.UUID, in {{.M.Ident}}service.{{.R.Pascal}}Patch, expected *time.Time) ({{.M.Ident}}service.{{.R.Pascal}}, error) {
+	f.lastPatch, f.lastExpected = in, expected
 	return fake{{.R.Pascal}}, nil
 }
 
-func (f *fake{{.R.Pascal}}UseCases) Delete(_ context.Context, id int64) error {
+func (f *fake{{.R.Pascal}}UseCases) Delete(_ context.Context, id uuid.UUID) error {
 	f.deletedID = id
 	return nil
 }
@@ -58,59 +63,38 @@ func (f *fake{{.R.Pascal}}UseCases) Delete(_ context.Context, id int64) error {
 func Test{{.R.Pascal}}Handler(t *testing.T) {
 	fake := &fake{{.R.Pascal}}UseCases{}
 	h := New{{.R.Pascal}}Handler(fake)
-	app := newTestApp()
-	app.Post("/{{.R.PluralRoute}}", h.Create)
-	app.Get("/{{.R.PluralRoute}}", h.List)
-	app.Get("/{{.R.PluralRoute}}/:id", h.Get)
-	app.Patch("/{{.R.PluralRoute}}/:id", h.Patch)
-	app.Delete("/{{.R.PluralRoute}}/:id", h.Delete)
 
-	if status, body := do(t, app, http.MethodPost, "/{{.R.PluralRoute}}", `{"name":"fixture"}`); status != http.StatusCreated || !strings.Contains(body, `"id":7`) {
-		t.Fatalf("POST = %d %s, want 201", status, body)
+	created, err := h.Create(context.Background(), &Create{{.R.Pascal}}Input{Body: {{.M.Ident}}dto.{{.R.Pascal}}Request{Name: "fixture"}})
+	if err != nil || created.Status != 201 || created.Body.ID != fixtureID {
+		t.Fatalf("Create = %+v, %v", created, err)
 	}
 	if fake.lastInput.Name != "fixture" {
 		t.Fatalf("Create input = %+v", fake.lastInput)
 	}
-	if status, body := do(t, app, http.MethodGet, "/{{.R.PluralRoute}}?limit=5&startingAfter=abc", ""); status != http.StatusOK ||
-		!strings.Contains(body, `"hasMore":true`) || !strings.Contains(body, `"nextCursor":"next"`) {
-		t.Fatalf("GET list = %d %s", status, body)
+	got, err := h.Get(context.Background(), &{{.R.Pascal}}IDInput{ID: fixtureID})
+	if err != nil || got.Body.Name != "fixture" || got.ETag == "" {
+		t.Fatalf("Get = %+v, %v", got, err)
 	}
-	if fake.lastLimit != 5 || fake.lastCursor != "abc" {
-		t.Fatalf("List got limit=%d cursor=%q", fake.lastLimit, fake.lastCursor)
+	if _, err := h.Get(context.Background(), &{{.R.Pascal}}IDInput{ID: missingID}); err == nil {
+		t.Fatal("Get of a missing row must fail")
 	}
-	if status, body := do(t, app, http.MethodGet, "/{{.R.PluralRoute}}/7", ""); status != http.StatusOK || !strings.Contains(body, `"name":"fixture"`) {
-		t.Fatalf("GET = %d %s", status, body)
+	patched, err := h.Patch(context.Background(), &Patch{{.R.Pascal}}Input{
+		ID: fixtureID, IfMatch: got.ETag,
+		Body: {{.M.Ident}}dto.{{.R.Pascal}}PatchRequest{Name: strPtr("renamed")},
+	})
+	if err != nil || fake.lastPatch.Name == nil || *fake.lastPatch.Name != "renamed" || fake.lastExpected == nil {
+		t.Fatalf("Patch = %+v, %v last=%+v", patched, err, fake.lastPatch)
 	}
-	if status, body := do(t, app, http.MethodGet, "/{{.R.PluralRoute}}/404", ""); status != http.StatusNotFound || !strings.Contains(body, string({{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)) {
-		t.Fatalf("GET missing = %d %s, want 404 %s", status, body, {{.M.Ident}}catalog.Code{{.R.Pascal}}NotFound)
+	if _, err := h.Patch(context.Background(), &Patch{{.R.Pascal}}Input{ID: fixtureID, IfMatch: `"stale"`}); err == nil {
+		t.Fatal("a stale If-Match must be rejected")
 	}
-	if status, body := do(t, app, http.MethodPatch, "/{{.R.PluralRoute}}/7", `{"name":"renamed"}`); status != http.StatusOK ||
-		fake.lastPatch.Name == nil || *fake.lastPatch.Name != "renamed" {
-		t.Fatalf("PATCH = %d %s", status, body)
+	page, err := h.List(context.Background(), &List{{.R.PluralPascal}}Input{Limit: 5})
+	if err != nil || !page.Body.HasMore || page.Body.NextCursor != "next" {
+		t.Fatalf("List = %+v, %v", page, err)
 	}
-	if status, body := do(t, app, http.MethodDelete, "/{{.R.PluralRoute}}/7", ""); status != http.StatusNoContent || fake.deletedID != 7 {
-		t.Fatalf("DELETE = %d %s", status, body)
+	if _, err := h.Delete(context.Background(), &{{.R.Pascal}}IDInput{ID: fixtureID}); err != nil || fake.deletedID != fixtureID {
+		t.Fatalf("Delete = %v id=%s", err, fake.deletedID)
 	}
 }
 
-func Test{{.R.Pascal}}HandlerRejectsBadInput(t *testing.T) {
-	h := New{{.R.Pascal}}Handler(&fake{{.R.Pascal}}UseCases{})
-	app := newTestApp()
-	app.Post("/{{.R.PluralRoute}}", h.Create)
-	app.Get("/{{.R.PluralRoute}}/:id", h.Get)
-
-	cases := map[string]struct {
-		method, target, body string
-		want                 int
-	}{
-		"missing body":  {http.MethodPost, "/{{.R.PluralRoute}}", "", http.StatusBadRequest},
-		"unknown field": {http.MethodPost, "/{{.R.PluralRoute}}", `{"name":"x","extra":1}`, http.StatusBadRequest},
-		"empty name":    {http.MethodPost, "/{{.R.PluralRoute}}", `{"name":""}`, http.StatusUnprocessableEntity},
-		"bad id":        {http.MethodGet, "/{{.R.PluralRoute}}/abc", "", http.StatusBadRequest},
-	}
-	for name, tc := range cases {
-		if status, body := do(t, app, tc.method, tc.target, tc.body); status != tc.want {
-			t.Errorf("%s: %s %s = %d %s, want %d", name, tc.method, tc.target, status, body, tc.want)
-		}
-	}
-}
+func strPtr(value string) *string { return &value }

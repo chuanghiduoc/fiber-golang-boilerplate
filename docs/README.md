@@ -5,12 +5,13 @@
 | [Architecture](architecture.md) | Module map and dependency rules, request lifecycle, cross-module communication, tenant model, authorization, transactions/outbox, migration policy |
 | [Data Model](data-model.md) | ER diagrams of the baseline schema, table ownership, keys, and FK delete actions |
 | [API Design System](api-design.md) | URLs/versioning, JSON conventions, success/error (RFC 9457) shapes, pagination, JWT vs API-key auth, tenants, headers, rate limits, idempotency, compatibility rules |
+| [Canonical Route Map](api-routes.md) | Target method/path, operationId, policy, request/response, and replaced legacy route for every module |
 | [Module Template](module-template.md) | Canonical module layout, skeleton, route/permission/audit/idempotency wiring, table ownership, contracts, migrations, tests, add-a-module checklist |
 | [Operations](operations.md) | Health/readiness, metrics, logs and request IDs, jobs, scheduler, shutdown, idempotency and Redis, migrations, Kubernetes caveats, incident checklists |
 | [Feature Flags](feature-flags.md) | Compile-time catalog, precedence, environment force-off, database defaults and tenant/user targets, cache staleness, admin API, metrics |
 | [Webhooks](webhooks.md) | Outbound dispatch, HMAC signing and verification, SSRF-safe delivery, retries, replay, inbound sources, secrets, configuration |
 | [Tracing](tracing.md) | OpenTelemetry configuration, span privacy rules, collector, job trace links |
-| [Swagger](swagger.json) | Generated OpenAPI, also as [YAML](swagger.yaml) (served at `/swagger` outside production) |
+| [OpenAPI](openapi.yaml) | Generated OpenAPI 3.1 for the registered huma operations (served at `/openapi.json` and `/openapi.yaml`; regenerate with `make openapi`) |
 
 Deployment and tooling:
 

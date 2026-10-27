@@ -1,25 +1,35 @@
 package dto
 
-import "time"
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
 
 // ErasureRequest re-authenticates the caller before a self-service erasure.
 type ErasureRequest struct {
-	CurrentPassword string `json:"currentPassword" validate:"required"`
+	CurrentPassword string `json:"currentPassword" required:"true"`
 }
 
 // DataExportResponse is one export request. The storage path is never exposed.
 type DataExportResponse struct {
-	ID          int64      `json:"id"`
-	TenantID    int64      `json:"tenantId"`
-	UserID      int64      `json:"userId"`
-	Status      string     `json:"status" enums:"queued,running,ready,failed,expired"`
-	ExpiresAt   *time.Time `json:"expiresAt,omitempty"`
-	CreatedAt   time.Time  `json:"createdAt"`
-	UpdatedAt   time.Time  `json:"updatedAt"`
-	DownloadURL string     `json:"downloadUrl,omitempty"`
+	ID         uuid.UUID  `json:"id"`
+	TenantID   uuid.UUID  `json:"tenantId"`
+	UserID     uuid.UUID  `json:"userId"`
+	Status     string     `json:"status" enum:"queued,running,ready,failed,expired"`
+	ExpiresAt  *time.Time `json:"expiresAt,omitempty"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+	ContentURL string     `json:"contentUrl,omitempty"`
 }
 
-// ErasureAccepted reports that erasure work was queued.
-type ErasureAccepted struct {
-	Status string `json:"status"`
+// ErasureRequestResponse is the status resource for an erasure request.
+type ErasureRequestResponse struct {
+	ID          uuid.UUID  `json:"id"`
+	TenantID    uuid.UUID  `json:"tenantId"`
+	UserID      uuid.UUID  `json:"userId"`
+	Scope       string     `json:"scope" enum:"self,member"`
+	Status      string     `json:"status" enum:"queued,processing,completed"`
+	RequestedAt time.Time  `json:"requestedAt"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
 }

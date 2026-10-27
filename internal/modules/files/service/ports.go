@@ -5,6 +5,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/pagination"
@@ -14,9 +16,9 @@ import (
 // File is the files module's view of one metadata row. DeletedAt is nil for a
 // live file and set for a soft-deleted one.
 type File struct {
-	ID           int64
-	TenantID     int64
-	UserID       int64
+	ID           uuid.UUID
+	TenantID     uuid.UUID
+	UserID       uuid.UUID
 	OriginalName string
 	StoragePath  string
 	MimeType     string
@@ -29,7 +31,7 @@ type File struct {
 // field: the repository always takes it from the request context, so a caller
 // cannot create a file on behalf of another tenant.
 type NewFile struct {
-	UserID       int64
+	UserID       uuid.UUID
 	OriginalName string
 	StoragePath  string
 	MimeType     string
@@ -55,16 +57,19 @@ type UploadOptions struct {
 }
 
 // FileRepository is the metadata persistence port. Implementations scope every
-// query to the request tenant (tenant.EffectiveID(ctx)) and return
+// query to the request tenant (tenant.Require(ctx)) and return
 // apperror.ErrNotFound when no row matches.
 type FileRepository interface {
 	Create(ctx context.Context, file NewFile) (*File, error)
-	GetByID(ctx context.Context, id int64) (*File, error)
-	GetByIDIncludingDeleted(ctx context.Context, id int64) (*File, error)
-	ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]File, error)
+	GetByID(ctx context.Context, id uuid.UUID) (*File, error)
+	GetByIDIncludingDeleted(ctx context.Context, id uuid.UUID) (*File, error)
+	ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, includeDeleted bool) ([]File, error)
 	AdminListCursor(ctx context.Context, cur pagination.DBCursor) ([]File, error)
-	Delete(ctx context.Context, id int64) (*File, error)
-	Restore(ctx context.Context, id int64) (*File, error)
+	// ListCursor is the tenant-wide page for an admin caller of the collection
+	// route; includeDeleted honours the caller's query parameter.
+	ListCursor(ctx context.Context, cur pagination.DBCursor, includeDeleted bool) ([]File, error)
+	Delete(ctx context.Context, id uuid.UUID) (*File, error)
+	Restore(ctx context.Context, id uuid.UUID) (*File, error)
 	AdminFileStats(ctx context.Context) (FileStats, error)
 	// LockQuota serializes uploads of the context tenant for the rest of the
 	// transaction. It must be called inside the upload's metadata transaction,
@@ -73,7 +78,7 @@ type FileRepository interface {
 	LockQuota(ctx context.Context) error
 	// StorageUsage returns the tenant's total stored bytes (live plus trash)
 	// and the same total for one user.
-	StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error)
+	StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error)
 }
 
 // AuditWriter records a Tier 1 audit event in the current transaction, so the

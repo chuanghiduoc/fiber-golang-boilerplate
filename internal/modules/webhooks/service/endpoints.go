@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	webhookscatalog "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/webhooks/catalog"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/tenant"
@@ -20,7 +22,14 @@ const urlValidationTimeout = 3 * time.Second
 
 // CreateEndpoint validates configuration, seals a fresh signing secret, and
 // returns the plaintext secret exactly once.
-func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEndpointInput) (*Endpoint, string, error) {
+func (s *service) CreateEndpoint(ctx context.Context, actorID uuid.UUID, in CreateEndpointInput) (*Endpoint, string, error) {
+	status := in.Status
+	if status == "" {
+		status = StatusActive
+	}
+	if !validStatus(status) {
+		return nil, "", apperror.NewBadRequest("status must be one of: active, disabled")
+	}
 	if err := s.validateURL(ctx, in.URL); err != nil {
 		return nil, "", err
 	}
@@ -32,27 +41,30 @@ func (s *service) CreateEndpoint(ctx context.Context, actorID int64, in CreateEn
 	if err != nil {
 		return nil, "", err
 	}
-	tenantID := tenant.EffectiveID(ctx)
+	tenantID, err := tenant.Require(ctx)
+	if err != nil {
+		return nil, "", apperror.Internal(err, "tenant context is required")
+	}
 	endpoint, err := s.endpoints.CreateEndpoint(ctx, CreateEndpointDraft{
 		URL:         in.URL,
 		Description: in.Description,
 		EventTypes:  eventTypes,
-		Status:      StatusActive,
+		Status:      status,
 		MaxAttempts: s.maxAttempts(in.MaxAttempts),
 		TimeoutMS:   s.timeoutMS(in.TimeoutMS),
-		SealSecret: func(endpointID int64) (string, error) {
+		SealSecret: func(endpointID uuid.UUID) (string, error) {
 			return s.sealSecret(endpointSecretLabel, EndpointSecretBinding(tenantID, endpointID), secret)
 		},
 	})
 	if err != nil {
-		return nil, "", apperror.NewInternal("failed to create webhook endpoint")
+		return nil, "", apperror.Internal(err, "failed to create webhook endpoint")
 	}
 
 	s.recordAudit(ctx, actorID, "webhook.endpoint.created", "webhook_endpoint", endpoint.ID, endpointAuditMetadata(endpoint))
 	return endpoint, secret, nil
 }
 
-func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, in UpdateEndpointInput) (*Endpoint, error) {
+func (s *service) UpdateEndpoint(ctx context.Context, actorID, id uuid.UUID, in UpdateEndpointInput) (*Endpoint, error) {
 	if err := s.validateURL(ctx, in.URL); err != nil {
 		return nil, err
 	}
@@ -64,42 +76,43 @@ func (s *service) UpdateEndpoint(ctx context.Context, actorID, id int64, in Upda
 		return nil, apperror.NewBadRequest("status must be one of: active, disabled")
 	}
 	endpoint, err := s.endpoints.UpdateEndpoint(ctx, UpdateEndpointDraft{
-		ID:          id,
-		URL:         in.URL,
-		Description: in.Description,
-		EventTypes:  eventTypes,
-		Status:      in.Status,
-		MaxAttempts: s.maxAttempts(in.MaxAttempts),
-		TimeoutMS:   s.timeoutMS(in.TimeoutMS),
+		ID:                id,
+		URL:               in.URL,
+		Description:       in.Description,
+		EventTypes:        eventTypes,
+		Status:            in.Status,
+		MaxAttempts:       s.maxAttempts(in.MaxAttempts),
+		TimeoutMS:         s.timeoutMS(in.TimeoutMS),
+		ExpectedUpdatedAt: in.ExpectedUpdatedAt,
 	})
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("webhook endpoint not found")
 		}
-		return nil, apperror.NewInternal("failed to update webhook endpoint")
+		return nil, apperror.Internal(err, "failed to update webhook endpoint")
 	}
 	s.recordAudit(ctx, actorID, "webhook.endpoint.updated", "webhook_endpoint", id, endpointAuditMetadata(endpoint))
 	return endpoint, nil
 }
 
-func (s *service) DeleteEndpoint(ctx context.Context, actorID, id int64) error {
+func (s *service) DeleteEndpoint(ctx context.Context, actorID, id uuid.UUID) error {
 	if err := s.endpoints.DeleteEndpoint(ctx, id); err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return apperror.NewNotFound("webhook endpoint not found")
 		}
-		return apperror.NewInternal("failed to delete webhook endpoint")
+		return apperror.Internal(err, "failed to delete webhook endpoint")
 	}
 	s.recordAudit(ctx, actorID, "webhook.endpoint.deleted", "webhook_endpoint", id, nil)
 	return nil
 }
 
-func (s *service) GetEndpoint(ctx context.Context, id int64) (*Endpoint, error) {
+func (s *service) GetEndpoint(ctx context.Context, id uuid.UUID) (*Endpoint, error) {
 	endpoint, err := s.endpoints.GetEndpoint(ctx, id)
 	if err != nil {
 		if errors.Is(err, apperror.ErrNotFound) {
 			return nil, apperror.NewNotFound("webhook endpoint not found")
 		}
-		return nil, apperror.NewInternal("failed to get webhook endpoint")
+		return nil, apperror.Internal(err, "failed to get webhook endpoint")
 	}
 	return endpoint, nil
 }
@@ -111,7 +124,7 @@ func (s *service) ListEndpoints(ctx context.Context, limit int, startingAfter st
 	}
 	endpoints, err := s.endpoints.ListEndpoints(ctx, cur)
 	if err != nil {
-		return nil, false, apperror.NewInternal("failed to list webhook endpoints")
+		return nil, false, apperror.Internal(err, "failed to list webhook endpoints")
 	}
 	hasMore := len(endpoints) > pageSize
 	if hasMore {
@@ -200,7 +213,7 @@ func normalizeEventTypes(types []string) ([]string, error) {
 	// Subscriptions are a set (webhook_endpoint_subscriptions); sorting here
 	// makes the create/update response match every later read, which returns
 	// them in the same byte order.
-	sort.Strings(out)
+	slices.Sort(out)
 	return out, nil
 }
 

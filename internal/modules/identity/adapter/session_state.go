@@ -5,6 +5,7 @@ import (
 
 	identityservice "github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/session"
+	"github.com/google/uuid"
 )
 
 // SessionStateReader adapts identity sessions to session.StateReader, the
@@ -19,7 +20,7 @@ func NewSessionStateReader(sessions identityservice.SessionRepository) *SessionS
 	return &SessionStateReader{sessions: sessions}
 }
 
-func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID int64) (session.State, error) {
+func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID uuid.UUID) (session.State, error) {
 	state, err := r.sessions.State(ctx, sessionID, userID)
 	if err != nil {
 		return session.State{}, err
@@ -32,6 +33,7 @@ func (r *SessionStateReader) SessionState(ctx context.Context, sessionID, userID
 		TokenVersion:  state.TokenVersion,
 		ExpiresAt:     state.ExpiresAt,
 		MFAVerifiedAt: state.MFAVerifiedAt,
+		AMR:           state.AMR,
 		Active: !state.Revoked &&
 			state.MembershipStatus == identityservice.MembershipStatusActive &&
 			state.UserStatus == identityservice.UserStatusActive,

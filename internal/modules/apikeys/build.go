@@ -24,14 +24,23 @@ type Provides struct {
 
 // Build constructs the API-key lifecycle surface and the request verifier.
 // The verifier only needs a hash lookup plus the identity principal contract.
-func Build(infra app.Infra, principals identitycontracts.PrincipalReader, ranks identitycontracts.MemberRankChecker, settings Settings) (*Module, Provides) {
+// Deps are the contracts apikeys consumes from identity.
+type Deps struct {
+	Principals  identitycontracts.PrincipalReader
+	MemberRanks identitycontracts.MemberRankChecker
+}
+
+func Build(infra app.Infra, settings Settings, deps Deps) (*Module, error) {
+	principals, ranks := deps.Principals, deps.MemberRanks
 	repo := apikeyrepo.NewAPIKeyRepository(infra.DB)
 	verifier := apikey.NewVerifier(apikeyadapter.NewVerifierStore(repo), principals)
-	svc := apikeyservice.NewService(repo, principals, ranks, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals), settings.MaxLifetime)
+	svc := apikeyservice.NewService(repo, principals, ranks, apikeyrepo.NewTransactor(infra.Tx, infra.Audit, principals),
+		authz.NewAuthorizer(infra.Catalogs.Permissions), settings.MaxLifetime)
 	m := New(apikeyhandler.NewHandler(svc))
 	m.privacy = apikeysprivacy.New(apikeyrepo.NewPrivacyStore(infra.DB))
 	m.tenantPurger = apikeyrepo.NewTenantPurger(infra.DB)
-	return m, Provides{Verifier: verifier}
+	m.provides = Provides{Verifier: verifier}
+	return m, nil
 }
 
 // Settings are the API-key configuration the composition root passes in.

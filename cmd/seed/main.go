@@ -7,14 +7,13 @@ import (
 	"os"
 	"time"
 
-	_ "github.com/joho/godotenv/autoload"
-
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/config"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/app"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/database"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/repository"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/seed"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/modules/identity/service"
-	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/banhash"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/logger"
 )
 
@@ -52,10 +51,17 @@ func run() error {
 	// Schema management is owned by cmd/migrate; fail fast if it has not run.
 	// Seeding reads and writes tenant-owned rows, so it uses the scoped handle
 	// like the API. Cross-tenant seeding paths use the same bypass pool.
-	stores := repository.NewStores(database.NewScopedPools(pools, database.WithResolver(app.RLSResolver)))
+	banHasher, err := banhash.New(
+		cfg.DataEncryption.ResolvedKey(),
+		cfg.DataEncryption.PreviousKeyList()...,
+	)
+	if err != nil {
+		return fmt.Errorf("ban marker key: %w", err)
+	}
+	stores := repository.NewStores(database.NewScopedPools(pools, database.WithResolver(app.RLSResolver)), banHasher)
 	// The seed writes no audit rows, so the transactor has no recorder.
 	transactor := repository.NewTransactor(
-		database.NewTxManagerPools(pools, database.WithResolver(app.RLSResolver)), nil, nil, nil)
+		database.NewTxManagerPools(pools, database.WithResolver(app.RLSResolver)), nil, nil, nil, banHasher)
 	// Seeding checks existence, not request eligibility: an operator may need
 	// to seed an admin before reactivating a suspended default tenant.
 	_, defaultTenant, err := service.StartupTenants(ctx, stores.Tenants, cfg.Tenant.DefaultSlug)
@@ -65,7 +71,7 @@ func run() error {
 	if !defaultTenant.Status.Operational() {
 		slog.Warn("configured default tenant is not operational; seeding anyway",
 			slog.String("tenant", defaultTenant.Slug),
-			slog.Int64("tenant_id", defaultTenant.ID),
+			slog.String("tenant_id", defaultTenant.ID.String()),
 			slog.String("status", string(defaultTenant.Status)),
 		)
 	}

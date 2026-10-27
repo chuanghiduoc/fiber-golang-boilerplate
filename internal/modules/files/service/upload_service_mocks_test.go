@@ -1,11 +1,14 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/audit"
 	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/platform/events"
@@ -19,9 +22,9 @@ func timePtr(t time.Time) *time.Time { return &t }
 
 // cursorLess reports whether (ts1,id1) sorts before (ts2,id2) in the
 // (created_at DESC, id DESC) order used by cursor pagination.
-func cursorLess(ts1 time.Time, id1 int64, ts2 time.Time, id2 int64) bool {
+func cursorLess(ts1 time.Time, id1 uuid.UUID, ts2 time.Time, id2 uuid.UUID) bool {
 	if ts1.Equal(ts2) {
-		return id1 < id2
+		return bytes.Compare(id1[:], id2[:]) < 0
 	}
 	return ts1.Before(ts2)
 }
@@ -77,7 +80,7 @@ func (p *recordingPublisher) Publish(_ context.Context, event events.Event) erro
 // ---------------------------------------------------------------------------
 
 type mockFileRepo struct {
-	files  map[int64]*File
+	files  map[uuid.UUID]*File
 	nextID int64
 	// quotaLocks counts LockQuota calls; the usage totals are computed from
 	// files, so tests seed rows instead of stubbing them.
@@ -87,19 +90,20 @@ type mockFileRepo struct {
 // scoped mirrors the repository's tenant predicate so service tests cannot
 // accidentally read another tenant's rows.
 func (m *mockFileRepo) scoped(ctx context.Context, f *File) bool {
-	return f.TenantID == tenant.EffectiveID(ctx)
+	return f.TenantID == tenant.IDFromContext(ctx)
 }
 
 var _ FileRepository = (*mockFileRepo)(nil)
 
 func newMockFileRepo() *mockFileRepo {
-	return &mockFileRepo{files: make(map[int64]*File), nextID: 1}
+	return &mockFileRepo{files: make(map[uuid.UUID]*File), nextID: 1}
 }
 
 func (m *mockFileRepo) Create(ctx context.Context, input NewFile) (*File, error) {
+	id := testID(int(m.nextID))
 	f := &File{
-		ID:           m.nextID,
-		TenantID:     tenant.EffectiveID(ctx),
+		ID:           id,
+		TenantID:     tenant.IDFromContext(ctx),
 		UserID:       input.UserID,
 		OriginalName: input.OriginalName,
 		StoragePath:  input.StoragePath,
@@ -107,12 +111,12 @@ func (m *mockFileRepo) Create(ctx context.Context, input NewFile) (*File, error)
 		Size:         input.Size,
 		CreatedAt:    time.Now(),
 	}
-	m.files[m.nextID] = f
+	m.files[id] = f
 	m.nextID++
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByID(ctx context.Context, id int64) (*File, error) {
+func (m *mockFileRepo) GetByID(ctx context.Context, id uuid.UUID) (*File, error) {
 	f, ok := m.files[id]
 	if !ok || f.DeletedAt != nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
@@ -120,7 +124,7 @@ func (m *mockFileRepo) GetByID(ctx context.Context, id int64) (*File, error) {
 	return f, nil
 }
 
-func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*File, error) {
+func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id uuid.UUID) (*File, error) {
 	f, ok := m.files[id]
 	if !ok || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
@@ -128,7 +132,7 @@ func (m *mockFileRepo) GetByIDIncludingDeleted(ctx context.Context, id int64) (*
 	return f, nil
 }
 
-func (m *mockFileRepo) ListByUserCursor(ctx context.Context, userID int64, cur pagination.DBCursor, includeDeleted bool) ([]File, error) {
+func (m *mockFileRepo) ListByUserCursor(ctx context.Context, userID uuid.UUID, cur pagination.DBCursor, includeDeleted bool) ([]File, error) {
 	return m.listCursor(ctx, &userID, cur, includeDeleted), nil
 }
 
@@ -136,7 +140,11 @@ func (m *mockFileRepo) AdminListCursor(ctx context.Context, cur pagination.DBCur
 	return m.listCursor(ctx, nil, cur, true), nil
 }
 
-func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagination.DBCursor, includeDeleted bool) []File {
+func (m *mockFileRepo) ListCursor(ctx context.Context, cur pagination.DBCursor, includeDeleted bool) ([]File, error) {
+	return m.listCursor(ctx, nil, cur, includeDeleted), nil
+}
+
+func (m *mockFileRepo) listCursor(ctx context.Context, userID *uuid.UUID, cur pagination.DBCursor, includeDeleted bool) []File {
 	all := make([]File, 0, len(m.files))
 	for _, f := range m.files {
 		if !m.scoped(ctx, f) {
@@ -166,7 +174,7 @@ func (m *mockFileRepo) listCursor(ctx context.Context, userID *int64, cur pagina
 	return out
 }
 
-func (m *mockFileRepo) Delete(ctx context.Context, id int64) (*File, error) {
+func (m *mockFileRepo) Delete(ctx context.Context, id uuid.UUID) (*File, error) {
 	f, ok := m.files[id]
 	if !ok || f.DeletedAt != nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
@@ -175,7 +183,7 @@ func (m *mockFileRepo) Delete(ctx context.Context, id int64) (*File, error) {
 	return f, nil
 }
 
-func (m *mockFileRepo) Restore(ctx context.Context, id int64) (*File, error) {
+func (m *mockFileRepo) Restore(ctx context.Context, id uuid.UUID) (*File, error) {
 	f, ok := m.files[id]
 	if !ok || f.DeletedAt == nil || !m.scoped(ctx, f) {
 		return nil, apperror.ErrNotFound
@@ -201,7 +209,7 @@ func (m *mockFileRepo) LockQuota(context.Context) error {
 	return nil
 }
 
-func (m *mockFileRepo) StorageUsage(ctx context.Context, userID int64) (tenantBytes, userBytes int64, err error) {
+func (m *mockFileRepo) StorageUsage(ctx context.Context, userID uuid.UUID) (tenantBytes, userBytes int64, err error) {
 	for _, f := range m.files {
 		if !m.scoped(ctx, f) {
 			continue
