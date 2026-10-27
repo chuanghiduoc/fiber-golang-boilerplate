@@ -20,7 +20,6 @@
   "errors.auth.oauth_email_not_verified.title": "Địa chỉ email Google chưa được xác minh",
   "errors.auth.oauth_userinfo_incomplete.title": "Thông tin người dùng Google không đầy đủ",
   "errors.user.email_taken.title": "Email đã được sử dụng",
-  "errors.user.not_found.title": "Không tìm thấy người dùng",
   "errors.invitation.invalid.title": "Lời mời không hợp lệ",
   "errors.invitation.inviter_ineligible.title": "Người mời không còn quyền cấp vai trò này",
   "errors.membership.exists.title": "Đã là thành viên",

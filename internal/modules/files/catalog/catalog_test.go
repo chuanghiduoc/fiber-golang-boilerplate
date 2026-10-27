@@ -14,7 +14,6 @@ func TestPublicValuesAreStable(t *testing.T) {
 		string(PermissionFilesWrite):    "files:write",
 		string(PermissionFilesDelete):   "files:delete",
 		string(PermissionFilesRestore):  "files:restore",
-		string(CodeFileNotFound):        "file.not_found",
 		string(CodeFileTooLarge):        "file.too_large",
 		string(CodeFileUnsupportedType): "file.unsupported_type",
 		string(CodeFileNotDeleted):      "file.not_deleted",

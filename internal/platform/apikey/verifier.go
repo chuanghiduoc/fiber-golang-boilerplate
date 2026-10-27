@@ -48,20 +48,13 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
-// WithLastUsedInterval controls how often a successful authentication writes
-// last_used_at. A negative interval disables the write.
-func WithLastUsedInterval(interval time.Duration) Option {
-	return func(v *Verifier) {
-		v.touchInterval = interval
-	}
-}
-
-// NewVerifier builds a verifier. principals may be nil for tests or minimal
-// deployments; in that case the key's own tenant/user binding is used and the
-// principal role is left empty. Production always supplies the identity
-// adapter so bans, role changes, and permission changes take effect
-// immediately.
+// NewVerifier builds a verifier. Both dependencies are required: the principal
+// reader is what makes bans, role changes, permission changes, and tenant
+// suspension take effect on the next request, so there is no mode without it.
 func NewVerifier(store Store, principals identitycontracts.PrincipalReader, opts ...Option) *Verifier {
+	if store == nil || principals == nil {
+		panic("apikey: NewVerifier requires a store and a principal reader")
+	}
 	v := &Verifier{
 		store:           store,
 		principals:      principals,
@@ -118,31 +111,24 @@ func (v *Verifier) Verify(ctx context.Context, raw string, expectedTenantID uuid
 		}
 	}
 
-	principal := identitycontracts.Principal{
-		ID:       key.UserID,
-		TenantID: key.TenantID,
+	principal, loadErr := v.principals.GetPrincipal(ctx, key.TenantID, key.UserID)
+	if loadErr != nil {
+		if errors.Is(loadErr, apperror.ErrNotFound) {
+			return Verified{}, apperror.NewUnauthorized("API key owner is not active")
+		}
+		return Verified{}, apperror.Internal(loadErr, "failed to verify API key owner")
 	}
-	if v.principals != nil {
-		loaded, loadErr := v.principals.GetPrincipal(ctx, key.TenantID, key.UserID)
-		if loadErr != nil {
-			if errors.Is(loadErr, apperror.ErrNotFound) {
-				return Verified{}, apperror.NewUnauthorized("API key owner is not active")
-			}
-			return Verified{}, apperror.NewInternal("failed to verify API key owner")
-		}
-		// The JWT path rejects suspended tenants through the session store;
-		// keys must not outlive a tenant suspension either. The request tenant
-		// middleware cannot catch this because the key's tenant is
-		// authoritative and may differ from the header-less default.
-		if loaded.TenantStatus != identitycontracts.TenantStatusActive {
-			return Verified{}, apperror.NewUnauthorized("tenant is not active")
-		}
-		// A ban revokes every key issued before it; unban restores the account
-		// but not those keys. Both timestamps come from the database clock.
-		if loaded.CredentialsRevokedAt != nil && !key.CreatedAt.After(*loaded.CredentialsRevokedAt) {
-			return Verified{}, apperror.NewUnauthorized("API key has been revoked")
-		}
-		principal = loaded
+	// The JWT path rejects suspended tenants through the session store;
+	// keys must not outlive a tenant suspension either. The request tenant
+	// middleware cannot catch this because the key's tenant is
+	// authoritative and may differ from the header-less default.
+	if principal.TenantStatus != identitycontracts.TenantStatusActive {
+		return Verified{}, apperror.NewUnauthorized("tenant is not active")
+	}
+	// A ban revokes every key issued before it; unban restores the account
+	// but not those keys. Both timestamps come from the database clock.
+	if principal.CredentialsRevokedAt != nil && !key.CreatedAt.After(*principal.CredentialsRevokedAt) {
+		return Verified{}, apperror.NewUnauthorized("API key has been revoked")
 	}
 	if principal.ID != key.UserID || principal.TenantID != key.TenantID {
 		// Defensive: a principal lookup that crosses the key binding is invalid.

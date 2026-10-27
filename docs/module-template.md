@@ -161,7 +161,7 @@ it, and fixing one means deleting its line. `test/arch/framework_free_test.go`
 walks the transitive imports of every `service`/`repository` and of the core
 platform packages and fails on Fiber or fasthttp. Fiber code goes in
 `handler/` or a platform `<pkg>http` adapter (`authzhttp`, `audithttp`,
-`tenanthttp`, `featureshttp`, `apikeyhttp`, `apperrorhttp`).
+`tenanthttp`, `apikeyhttp`, `apperrorhttp`).
 
 ### Reference module: `files`
 

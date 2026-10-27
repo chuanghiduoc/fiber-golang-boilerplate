@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // rollbackTimeout bounds the detached rollback in WithTx. pgx closes the
@@ -23,13 +22,6 @@ const rollbackTimeout = 5 * time.Second
 type TxManager struct {
 	pools   Pools
 	resolve ScopeResolver
-}
-
-// NewTxManager creates a TxManager over one pool. It is the single-pool form
-// used where both roles share a connection (tests with an owner pool); prefer
-// NewTxManagerPools in a process that has a bypass role.
-func NewTxManager(pool *pgxpool.Pool, opts ...ScopeOption) *TxManager {
-	return NewTxManagerPools(Pools{Primary: pool}, opts...)
 }
 
 // NewTxManagerPools creates a TxManager that starts cross-tenant transactions

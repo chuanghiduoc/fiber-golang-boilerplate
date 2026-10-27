@@ -8,7 +8,6 @@ import (
 
 // Error codes owned by files.
 const (
-	CodeFileNotFound        apperror.Code = "file.not_found"
 	CodeFileTooLarge        apperror.Code = "file.too_large"
 	CodeFileUnsupportedType apperror.Code = "file.unsupported_type"
 	CodeFileNotDeleted      apperror.Code = "file.not_deleted"
@@ -20,12 +19,6 @@ const (
 // Errors returns the files error catalog for app.ErrorProvider.
 func Errors() []apperror.Spec {
 	return []apperror.Spec{
-		{
-			Code:    CodeFileNotFound,
-			Status:  http.StatusNotFound,
-			Title:   "File not found",
-			DocPath: "/errors/file-not-found",
-		},
 		{
 			Code:    CodeFileTooLarge,
 			Status:  http.StatusRequestEntityTooLarge,

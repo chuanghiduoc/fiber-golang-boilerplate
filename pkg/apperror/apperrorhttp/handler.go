@@ -45,12 +45,6 @@ func FiberErrorHandler(c fiber.Ctx, err error) error {
 	return handleError(c, err, apperror.PlatformCatalog(), nil)
 }
 
-// FiberErrorHandlerWithLocalizer is the platform-only catalog with
-// localization. Application wiring uses New instead.
-func FiberErrorHandlerWithLocalizer(localizer Localizer) fiber.ErrorHandler {
-	return New(apperror.PlatformCatalog(), localizer)
-}
-
 func handleError(c fiber.Ctx, err error, catalog *apperror.Catalog, localizer Localizer) error {
 	var appErr *apperror.AppError
 	if errors.As(err, &appErr) {

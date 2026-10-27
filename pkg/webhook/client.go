@@ -274,15 +274,6 @@ func RetryDelay(attempt int, base, maxDelay time.Duration, retryAfter string, no
 	return backoff, false
 }
 
-// TransportError is a non-HTTP failure. Blocked and invalid targets are
-// permanent; timeouts, DNS failures, and connection errors are retryable.
-type TransportError struct {
-	Err error
-}
-
-func (e *TransportError) Error() string { return "webhook: " + e.Err.Error() }
-func (e *TransportError) Unwrap() error { return e.Err }
-
 // ClassifyError maps a Do error to an outcome. A permanent target error is
 // dead on arrival; everything else (including context cancellation from a
 // worker timeout) is retryable while attempts remain.

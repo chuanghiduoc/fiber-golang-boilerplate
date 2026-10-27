@@ -91,7 +91,7 @@ Arrows are the **only** allowed import directions. `test/arch/imports_test.go`
 | `authz` | Subject/policies, the injected `Catalog` (permissions + system-role scopes) and `Authorizer`, ABAC, `SystemContext`; route middleware in `authzhttp` (`Require`, `RequireAny`, `SetSubject`, `SubjectFromFiber`) |
 | `audit` | Audit recorder and Tier 1 `TxRecorder`; `audithttp` holds `Guard`, `Policy`/`Mode*`, `AddMetadata`, and the fallback mutating-request middleware |
 | `events` | Typed in-process bus + durable job-backed subscriptions |
-| `features` | Compile-time flag catalog, evaluator, snapshot cache, DB store; route gate in `featureshttp` |
+| `features` | Compile-time flag catalog, evaluator, snapshot cache, DB store; routes gate on a flag through `httpapi.Policy.Feature` |
 | `i18n` | Embedded `en`/`vi` catalogs, `Accept-Language` negotiation, localization |
 | `jobs` | Durable PostgreSQL queue, worker, leases, retention |
 | `requestctx` | Request ID + actor propagation through context |
@@ -336,7 +336,7 @@ limits remain future work.
 - Framework split: core packages (`pkg/apperror`, `platform/authz`, `tenant`,
   `audit`, `apikey`, `features`) and every module `service`/`repository` are
   Fiber-free; Fiber adapters live in `*http` subpackages (`apperrorhttp`,
-  `authzhttp`, `tenanthttp`, `audithttp`, `apikeyhttp`, `featureshttp`).
+  `authzhttp`, `tenanthttp`, `audithttp`, `apikeyhttp`).
   `test/arch/framework_free_test.go` enforces it, and keeps the AWS SDK in
   `internal/storage/s3store` (driver selection: `internal/storage/drivers`).
 

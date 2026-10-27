@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -547,12 +546,4 @@ func cappedBackoff(d time.Duration) time.Duration {
 		return maxAcquireBackoff
 	}
 	return d
-}
-
-// String makes scheduler metrics and logs easier to read.
-func (s *Scheduler) String() string {
-	if s == nil {
-		return "scheduler(<nil>)"
-	}
-	return fmt.Sprintf("scheduler(%s)", s.holder)
 }

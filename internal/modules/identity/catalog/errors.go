@@ -63,7 +63,6 @@ const (
 	CodeAuthOAuthUserInfoIncomplete apperror.Code = "auth.oauth_userinfo_incomplete"
 
 	CodeUserEmailTaken apperror.Code = "user.email_taken"
-	CodeUserNotFound   apperror.Code = "user.not_found"
 	// CodeUserLastAdmin: removing the last active owner of an operational
 	// tenant is refused by the protect_last_owner trigger and the service
 	// pre-check.
@@ -220,12 +219,6 @@ func Errors() []apperror.Spec {
 			Status:  http.StatusConflict,
 			Title:   "Email already in use",
 			DocPath: "/errors/user-email-taken",
-		},
-		{
-			Code:    CodeUserNotFound,
-			Status:  http.StatusNotFound,
-			Title:   "User not found",
-			DocPath: "/errors/user-not-found",
 		},
 		{
 			Code:    CodeUserLastAdmin,

@@ -58,9 +58,6 @@ func OpenAppPools(ctx context.Context, adminDSN, schema string) (database.Pools,
 	return database.Pools{Primary: appPool, Bypass: bypassPool}, nil
 }
 
-// AppPool returns the normal application pool from an explicit pool pair.
-func AppPool(pools database.Pools) *pgxpool.Pool { return pools.Primary }
-
 // ClosePools closes both runtime pools. It is a plain close: pools are passed
 // explicitly, so there is no registry to forget.
 func ClosePools(pools database.Pools) {

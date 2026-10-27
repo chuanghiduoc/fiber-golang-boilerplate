@@ -91,14 +91,6 @@ func WithRequestMeta(ctx context.Context, requestID, ip, userAgent string) conte
 	return ctx
 }
 
-// EventIDFromContext returns the pre-write intent row ID associated with ctx.
-func EventIDFromContext(ctx context.Context) uuid.UUID {
-	if info := RequestInfoFromContext(ctx); info != nil {
-		return info.EventID
-	}
-	return uuid.Nil
-}
-
 // NewServiceEvent builds a terminal service event enriched from the request
 // context. Services should set ResourceID and any non-sensitive metadata before
 // calling RecordTx. Creating the event marks the request as having a domain
